@@ -37697,9 +37697,12 @@ const HC_FUSED_U_SOURCE =
 
 const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int };
 var hc_fused_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
-/// One config set per row count: MTP alternates decode and verify widths every round.
+/// One config set per row count, inject and pending write: MTP alternates widths every round, a
+/// forward's first read and any read after a flush have no pending write, and the mixer no inject.
 const HcFusedSlot = struct { key: HcFusedKey, cfgs: [3]mlx.mlx_fast_metal_kernel_config };
-var hc_fused_slots: [HC_FUSED_MAX_ROWS + 1]?HcFusedSlot = @splat(null);
+var hc_fused_slots: [HC_FUSED_MAX_ROWS + 1][2][2]?HcFusedSlot = @splat(@splat(@splat(null)));
+/// Config sets built, for the slot test.
+var hc_fused_cfg_builds: usize = 0;
 /// Rows one D/U dispatch group carries (each lane holds four accumulators per row).
 const HC_ROW_GROUP: c_int = 8;
 var hc_fused_eps: ?mlx.mlx_array = null;
@@ -38005,7 +38008,7 @@ pub fn hcReadFused(
     }
 
     const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = group_size, .dtype = xd, .rows = rows };
-    const slot = &hc_fused_slots[@intCast(rows)];
+    const slot = &hc_fused_slots[@intCast(rows)][@intCast(inj)][@intCast(wr)];
     if (slot.* == null or !std.meta.eql(slot.*.?.key, key)) {
         if (slot.*) |old| for (old.cfgs) |cfg| {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -38056,6 +38059,7 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "ROWS", rows_per));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "NROWS", rows));
         slot.* = .{ .key = key, .cfgs = .{ cn, cd, cu } };
+        hc_fused_cfg_builds += 1;
     }
     const cfgs = slot.*.?.cfgs;
     if (hc_fused_eps == null or hc_fused_eps_val != eps) {
@@ -46853,6 +46857,74 @@ test "fused residual+RMSNorm declines what it cannot reproduce" {
     const small = mlx.mlx_array_new_data(&buf, &s2, 2, .float32);
     defer _ = mlx.mlx_array_free(small);
     try testing.expect((try fusedAddRmsNorm(s, a, small, w, eps)) == null);
+}
+
+test "fused hyper-connection read keeps one config set per row count, inject and pending write" {
+    // Reads that differ only in inject or pending write keep their own configs: alternating
+    // them builds nothing after the first pass.
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    hc_fused_override = true;
+    defer hc_fused_override = null;
+    const HC: c_int = 4;
+    const H: c_int = 512;
+    const K: c_int = HC * H;
+    const R: c_int = 64;
+    const filled = struct {
+        fn f(st: mlx.mlx_stream, shape: []const c_int) !mlx.mlx_array {
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&out, shape.ptr, shape.len, .bfloat16, st));
+            return out;
+        }
+    }.f;
+    const quantized = struct {
+        fn f(st: mlx.mlx_stream, r: c_int, c: c_int) ![3]mlx.mlx_array {
+            const w = try filled(st, &.{ r, c });
+            defer _ = mlx.mlx_array_free(w);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, st));
+            var q: [3]mlx.mlx_array = undefined;
+            for (&q, 0..) |*a, i| {
+                a.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+            }
+            return q;
+        }
+    }.f;
+    const down = try quantized(s, R, K);
+    defer for (down) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const up = try quantized(s, K, R);
+    defer for (up) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const nw = try filled(s, &.{ HC, H });
+    defer _ = mlx.mlx_array_free(nw);
+    const iw = try filled(s, &.{ K, HC });
+    defer _ = mlx.mlx_array_free(iw);
+
+    var builds_after_warm: usize = 0;
+    for (0..3) |pass| {
+        if (pass == 1) builds_after_warm = hc_fused_cfg_builds;
+        for ([_]c_int{ 3, 11 }) |rows| {
+            const x = try filled(s, &.{ 1, rows, K });
+            defer _ = mlx.mlx_array_free(x);
+            const wo = try filled(s, &.{ 1, rows, H });
+            defer _ = mlx.mlx_array_free(wo);
+            const wi = try filled(s, &.{ 1, rows, HC, 1 });
+            defer _ = mlx.mlx_array_free(wi);
+            for ([_][2]bool{ .{ true, true }, .{ true, false }, .{ false, true }, .{ false, false } }) |arm| {
+                const pend: ?HcPending = if (arm[1]) .{ .out = wo, .inj = wi } else null;
+                const out = (try hcReadFused(s, x, 1, rows, nw, down[0], down[1], down[2], up[0], up[1], up[2], if (arm[0]) iw else .{ .ctx = null }, 1e-6, HC, H, 4, 64, pend)) orelse return error.HcFusedDeclined;
+                _ = mlx.mlx_array_free(out.mixed);
+                if (out.inj.ctx != null) _ = mlx.mlx_array_free(out.inj);
+                if (out.stream.ctx != null) _ = mlx.mlx_array_free(out.stream);
+            }
+        }
+    }
+    try testing.expectEqual(builds_after_warm, hc_fused_cfg_builds);
 }
 
 test "fused hyper-connection read matches the op chain per element" {

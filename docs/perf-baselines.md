@@ -153,6 +153,12 @@ NOT a quiet box (a system daemon at ~100% of one core). Greedy, 4 prompts x 256 
   unchanged, so the MTP-off cell above is boot noise.
 - `[spec-warmup]` over 16 boots per arm: 1.20-1.34 s on B and 1.23-1.73 s on A, apart from one ~2.2 s boot in each
   (B's first, 2290 ms; A 2171 ms). The per-width D/U kernel variants add no measurable load time.
+- Follow-ups on the M2 Max 64 GB (2f1e4bf vs + change, decode meter at 4096 keys, `taskpolicy -a`, lock per boot, one
+  binary per arm, A B C C B A; ms per forward at 1 / 2 / 4 / 7 rows). Configs keyed on (rows, inject, pending write):
+  33.67 / 48.35 / 76.69 / 126.84 -> 34.08 / 48.79 / 78.49 / 128.27, and in a second A B B A 33.78 / 48.43 / 76.36 /
+  126.15 -> 33.73 / 49.10 / 77.76 / 128.17 with live decode +0.8% (MTP) / -1.5% (MTP off): no change beyond boot noise;
+  outputs identical. The row count as a scalar D/U input on top: 33.81 / 50.69 / 79.12 / 130.29, 1-4% slower at 2-7
+  rows (one more buffer per dispatch, a runtime clamp); dropped.
 
 <a id="m2max-64gb"></a>
 ## Flash-Next Sushi-3bpw on an M2 Max 64 GB
