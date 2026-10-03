@@ -732,6 +732,11 @@ pub fn noteQsaArmForSlots(slots: []const *ForwardCtx, arm: QsaArm) void {
 }
 
 pub fn qsaAlignedSparseAttn(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, blocks: mlx.mlx_array, ratio: c_int, scale: f32, budget: c_int) !?mlx.mlx_array {
+    // TBQ declines the whole aligned arm (same reasoning as qsaSparseAttn):
+    // its gather bodies would read the lazy dense views and materialize the
+    // full-cache dequant per call. Decode/verify widths instead take the
+    // packed-row subset gathers in qsaDecodeGatherAttn/qsaVerifyGatherAttn.
+    if (view.tbq_triple) return null;
     const width = mlx.getShape(q)[2];
     const length = mlx.getShape(view.k)[2];
     const cut = std.math.clamp(budget + ratio - 1 - (length - width), 0, width);

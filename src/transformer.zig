@@ -4582,6 +4582,10 @@ pub fn qsaSparseAttn(
     _ = bs[2];
     if (ratio <= 0) return null;
 
+    // A TBQ view's packed buffers are not affine triples, and the dense-row
+    // body below would evaluate the whole-cache lazy dequant on every call;
+    // the widths this kernel serves go to the subset-dequant gather arms.
+    if (kv_view.tbq_triple) return null;
     const quant = kv_view.has_quant_triple;
     const bits: u8 = if (quant) kv_view.bits else 8;
     const gs: u32 = if (quant) kv_view.group_size else 64;
@@ -5033,14 +5037,52 @@ pub fn qsaDecodeGatherAttn(
     defer _ = mlx.mlx_array_free(add4);
     try mlx.check(mlx.mlx_reshape(&add4, addv, &[_]c_int{ 1, 1, 1, gathered_len }, 4, s));
 
-    // Gather rows: quant triples when the view carries affine 4/8-bit (then
-    // dequantize ONLY the subset), else dense rows. Dequantize is per-token
-    // along D, so subset-first is exactly full-first-restricted.
+    // Gather rows: TBQ packed triples at bits 3/4, affine triples at 4/8
+    // (dequantizing ONLY the gathered rows in both cases), else dense rows.
+    // Dequantize is per-token along D, so subset-first is full-first-
+    // restricted within one output ULP (pinned by the tbq take-then-dequantize test).
     var gk = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gk);
     var gv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gv);
-    if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
+    if (kv_view.tbq_triple and (kv_view.bits == 3 or kv_view.bits == 4)) {
+        // Packed rows + fp16 block norms; dequantize ONLY the gathered
+        // subset. TBQ norms ride `*_triple_scales`; the biases copy is never
+        // read (the codebook is absolute, not per-group affine).
+        const kq = kv_view.k_triple_q;
+        const kn = kv_view.k_triple_scales;
+        const vq = kv_view.v_triple_q;
+        const vn = kv_view.v_triple_scales;
+        if (kq.ctx == null or kn.ctx == null or vq.ctx == null or vn.ctx == null) return dq.no(.quant_layout);
+        if (@mod(head_dim, 128) != 0) return dq.no(.quant_layout);
+        const p_exp: c_int = if (kv_view.bits == 4) @divExact(head_dim, 2) else @divExact(head_dim * 3, 8);
+        const blk_exp: c_int = @divExact(head_dim, 128);
+        const kqs = mlx.getShape(kq);
+        const kns = mlx.getShape(kn);
+        const vqs = mlx.getShape(vq);
+        const vns = mlx.getShape(vn);
+        if (kqs.len != 4 or kns.len != 4 or vqs.len != 4 or vns.len != 4 or
+            kqs[0] != 1 or kns[0] != 1 or vqs[0] != 1 or vns[0] != 1 or
+            kqs[1] != h_kv or kns[1] != h_kv or vqs[1] != h_kv or vns[1] != h_kv or
+            kqs[2] != kv or kns[2] != kv or vqs[2] != kv or vns[2] != kv or
+            kqs[3] != p_exp or vqs[3] != p_exp or
+            kns[3] != blk_exp or vns[3] != blk_exp) return dq.no(.quant_layout);
+        // Contiguous copies: dequantize misreads the strided take views.
+        const gkq = try takeContig(s, kq, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gkq);
+        const gkn = try takeContig(s, kn, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gkn);
+        const gvq = try takeContig(s, vq, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gvq);
+        const gvn = try takeContig(s, vn, idx_u32, 2);
+        defer _ = mlx.mlx_array_free(gvn);
+        const gkdt = try kv_quant.dequantizeTBQ(s, gkq, gkn, kv_view.bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(gkdt);
+        const gvdt = try kv_quant.dequantizeTBQ(s, gvq, gvn, kv_view.bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(gvdt);
+        try mlx.check(mlx.mlx_array_set(&gk, gkdt));
+        try mlx.check(mlx.mlx_array_set(&gv, gvdt));
+    } else if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
         if (kq.ctx == null or vq.ctx == null) return dq.no(.quant_layout);
@@ -5103,7 +5145,7 @@ pub const KvPrefixView = struct {
         var result = KvPrefixView{ .view = source };
         errdefer result.deinit();
         inline for (.{ "k", "v", "k_triple_q", "k_triple_scales", "k_triple_biases", "v_triple_q", "v_triple_scales", "v_triple_biases" }, 0..) |name, i| {
-            if (i < 2 or source.has_quant_triple) {
+            if (i < 2 or source.has_quant_triple or source.tbq_triple) {
                 result.owned[i] = try sliceAttentionSeq(s, @field(source, name), start, end);
                 @field(result.view, name) = result.owned[i];
             }
@@ -5118,6 +5160,7 @@ pub const KvPrefixView = struct {
         };
     }
 };
+
 
 
 
@@ -5144,7 +5187,7 @@ pub const QSA_VERIFY_GATHER_MIN_KV_QUANT: c_int = 16384;
 pub var qsa_verify_gather_min_kv_override: ?c_int = null;
 
 /// `quantized` = the arm will dequantize only the gathered rows, i.e. the
-/// view carries affine triples (`DenseKVView.has_quant_triple`).
+/// view carries affine or TBQ triples (`has_quant_triple` / `tbq_triple`).
 pub fn qsaVerifyGatherMinKvFor(quantized: bool) c_int {
     if (qsa_verify_gather_min_kv_override) |v| return v;
     return if (quantized) QSA_VERIFY_GATHER_MIN_KV_QUANT else QSA_VERIFY_GATHER_MIN_KV_DENSE;
@@ -5437,7 +5480,7 @@ pub fn qsaVerifyGatherAttn(
     if (ks[3] != head_dim) return dq.no(.geometry);
     const vs = mlx.getShape(kv_view.v);
     if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
-    if (kv <= qsaVerifyGatherMinKvFor(kv_view.has_quant_triple)) return dq.no(.kv_floor);
+    if (kv <= qsaVerifyGatherMinKvFor(kv_view.has_quant_triple or kv_view.tbq_triple)) return dq.no(.kv_floor);
 
     const geom = QsaVerifyGeom.compute(seq_len, kv, ratio, kb) orelse return dq.no(.width);
     if (geom.k_blocks <= 0 or geom.rows <= 0 or geom.rows >= kv) return dq.no(.no_win);
@@ -5596,15 +5639,52 @@ pub fn qsaVerifyGatherAttn(
     defer _ = mlx.mlx_array_free(add4);
     try mlx.check(mlx.mlx_reshape(&add4, addv, &[_]c_int{ 1, 1, seq_len, geom.rows }, 4, s));
 
-    // Gather rows: quant triples when the view carries affine 4/8-bit (then
-    // dequantize ONLY the subset — the whole point at `--kv-quant 8`), else
-    // dense rows. Dequantize groups along D, so subset-first is exactly
-    // full-first-restricted (pinned by the take-then-dequantize test).
+    // Gather rows: TBQ packed triples at bits 3/4, affine triples at 4/8
+    // (dequantizing ONLY the gathered subset — the whole point at
+    // `--kv-quant tbqN`/`8`), else dense rows. Dequantize groups along D, so
+    // subset-first is full-first-restricted within one output ULP (pinned by
+    // the take-then-dequantize tests).
     var gk = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gk);
     var gv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gv);
-    if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
+    if (kv_view.tbq_triple and (kv_view.bits == 3 or kv_view.bits == 4)) {
+        // Packed rows + fp16 block norms; dequantize ONLY the union subset.
+        // TBQ norms ride `*_triple_scales`; biases are never read.
+        const kq = kv_view.k_triple_q;
+        const kn = kv_view.k_triple_scales;
+        const vq = kv_view.v_triple_q;
+        const vn = kv_view.v_triple_scales;
+        if (kq.ctx == null or kn.ctx == null or vq.ctx == null or vn.ctx == null) return dq.no(.quant_layout);
+        if (@mod(head_dim, 128) != 0) return dq.no(.quant_layout);
+        const p_exp: c_int = if (kv_view.bits == 4) @divExact(head_dim, 2) else @divExact(head_dim * 3, 8);
+        const blk_exp: c_int = @divExact(head_dim, 128);
+        const kqs = mlx.getShape(kq);
+        const kns = mlx.getShape(kn);
+        const vqs = mlx.getShape(vq);
+        const vns = mlx.getShape(vn);
+        if (kqs.len != 4 or kns.len != 4 or vqs.len != 4 or vns.len != 4 or
+            kqs[0] != 1 or kns[0] != 1 or vqs[0] != 1 or vns[0] != 1 or
+            kqs[1] != h_kv or kns[1] != h_kv or vqs[1] != h_kv or vns[1] != h_kv or
+            kqs[2] != kv or kns[2] != kv or vqs[2] != kv or vns[2] != kv or
+            kqs[3] != p_exp or vqs[3] != p_exp or
+            kns[3] != blk_exp or vns[3] != blk_exp) return dq.no(.quant_layout);
+        // Contiguous copies: dequantize misreads the strided take views.
+        const gkq = try takeContig(s, kq, tok_u32, 2);
+        defer _ = mlx.mlx_array_free(gkq);
+        const gkn = try takeContig(s, kn, tok_u32, 2);
+        defer _ = mlx.mlx_array_free(gkn);
+        const gvq = try takeContig(s, vq, tok_u32, 2);
+        defer _ = mlx.mlx_array_free(gvq);
+        const gvn = try takeContig(s, vn, tok_u32, 2);
+        defer _ = mlx.mlx_array_free(gvn);
+        const gkdt = try kv_quant.dequantizeTBQ(s, gkq, gkn, kv_view.bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(gkdt);
+        const gvdt = try kv_quant.dequantizeTBQ(s, gvq, gvn, kv_view.bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(gvdt);
+        try mlx.check(mlx.mlx_array_set(&gk, gkdt));
+        try mlx.check(mlx.mlx_array_set(&gv, gvdt));
+    } else if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
         if (kq.ctx == null or vq.ctx == null) return dq.no(.quant_layout);
@@ -6385,9 +6465,20 @@ pub const DenseKVView = struct {
     v_triple_q: mlx.mlx_array = .{ .ctx = null },
     v_triple_scales: mlx.mlx_array = .{ .ctx = null },
     v_triple_biases: mlx.mlx_array = .{ .ctx = null },
-    /// True iff the triple fields above are populated. Lets call sites
-    /// avoid checking `.ctx == null` on every field.
+    /// True iff the triple fields above carry an AFFINE triple (the fused
+    /// kernels' `bits`-packed uint32 nibble layout). Lets call sites avoid
+    /// checking `.ctx == null` on every field.
     has_quant_triple: bool = false,
+    /// True iff the triple fields above carry a TBQ triple: `k_triple_q` is
+    /// the packed codebook-index stream ([B,H,T,D/2] u8 at 4-bit,
+    /// [B,H,T,3D/8] u8 at 3-bit) and `k_triple_scales` the fp16 block norms
+    /// ([B,H,T,D/128]); the biases fields are a never-read duplicate.
+    /// Affine fused arms MUST NOT consume these views — tbq4's nibbles are
+    /// not affine codes, so the two 4-bit schemes are discriminated by this
+    /// flag, never by `bits`. The QSA gather arms dequantize gathered rows
+    /// with `kv_quant.dequantizeTBQ` instead of reading the lazy dense
+    /// `k`/`v` (which would materialize the whole-cache dequant per call).
+    tbq_triple: bool = false,
     /// Quant params copied off the cache config so call sites don't need
     /// a pointer to it.
     bits: u8 = 0,
@@ -7113,8 +7204,12 @@ pub const KVCache = struct {
             .v_triple_biases = trip[5],
             // The fused affine kernels read `bits`-packed uint32 triples —
             // TBQ's buffers are codebook bytes in a different layout, so a
-            // TBQ view never advertises a triple. Dense SDPA/QSA-mask only.
+            // TBQ view never advertises an affine triple: it advertises
+            // `tbq_triple`, and the QSA gather arms subset-dequantize the
+            // packed rows instead of reading `k`/`v` (whose lazy whole-range
+            // dequant would be re-evaluated every decode step).
             .has_quant_triple = cfg.scheme != .tbq,
+            .tbq_triple = cfg.scheme == .tbq,
             .bits = bits,
             .group_size = group_size,
             .owns_triple = compacted,
@@ -7399,6 +7494,16 @@ pub const KVCache = struct {
                     .k = dense_k,
                     .v = dense_v,
                     .owned = true,
+                    // Borrow the cache's packed rows + block norms so a
+                    // gather arm reaching through this view subset-
+                    // dequantizes instead of re-reading the dense arrays.
+                    .k_triple_q = entry.key_view,
+                    .k_triple_scales = entry.key_scales_view,
+                    .k_triple_biases = entry.key_biases_view,
+                    .v_triple_q = entry.value_view,
+                    .v_triple_scales = entry.value_scales_view,
+                    .v_triple_biases = entry.value_biases_view,
+                    .tbq_triple = true,
                     .bits = self.config.bits,
                     .group_size = self.config.group_size,
                 };
@@ -42159,6 +42264,121 @@ test "qsa decode gather: subset SDPA matches masked full SDPA at decode width" {
     try std.testing.expect((try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) == null);
 }
 
+test "qsa decode gather tbq: take-then-dequantize equals dequantize-then-take (tbq4, tbq3)" {
+    // The exactness claim the TBQ gather branches are built on: dequant
+    // touches only a row's own elements, so gathering rows before or after
+    // dequantizing must agree. Production-like sizes (T=256, 64 scattered
+    // rows); head_dim 128 is the TBQ minimum block multiple.
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x7b9c0dec);
+    const rnd = prng.random();
+    const dense = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 256, 128 }, s);
+    defer _ = mlx.mlx_array_free(dense);
+    const n_take = 64;
+    var idx_host: [n_take]i32 = undefined;
+    var i: usize = 0;
+    while (i < n_take) : (i += 1) idx_host[i] = @intCast((i * 37 + 11) % 256);
+    const idx_sh = [_]c_int{n_take};
+    const idx_i32 = mlx.mlx_array_new_data(&idx_host, &idx_sh, 1, .int32);
+    defer _ = mlx.mlx_array_free(idx_i32);
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_astype(&idx, idx_i32, .uint32, s));
+    for ([_]u8{ 4, 3 }) |bits| {
+        var qq = try kv_quant.quantizeTBQ(s, dense, bits);
+        defer qq.deinit();
+        const tq = try takeContig(s, qq.q, idx, 2);
+        defer _ = mlx.mlx_array_free(tq);
+        const tn = try takeContig(s, qq.scales, idx, 2);
+        defer _ = mlx.mlx_array_free(tn);
+        const sub = try kv_quant.dequantizeTBQ(s, tq, tn, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(sub);
+        const full = try kv_quant.dequantizeTBQ(s, qq.q, qq.scales, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(full);
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_take_axis(&want, full, idx, 2, s));
+        // Compare through explicit contiguous copies on BOTH sides (the
+        // shared comparator's +0 materializer misreads strided take views).
+        var subc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(subc);
+        try mlx.check(mlx.mlx_contiguous(&subc, sub, false, s));
+        var wantc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wantc);
+        try mlx.check(mlx.mlx_contiguous(&wantc, want, false, s));
+        // Not bitwise: the 128x128 inverse-rotation matmul accumulates in a
+        // batch-shape-dependent order (the subset IS a smaller batch), so
+        // subset-vs-full drifts by a few bf16 ULPs of the reference scale
+        // (measured 2^-14 abs at tbq4, 2^-9 at tbq3). The affine dequant is
+        // pure elementwise and stays bitwise (pinned by its own
+        // take-then-dequantize test). The meaningful bound is RELATIVE to
+        // the reference magnitude, kept far below the SDPA parity threshold.
+        var sub_f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sub_f);
+        try mlx.check(mlx.mlx_astype(&sub_f, subc, .float32, s));
+        var want_f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want_f);
+        try mlx.check(mlx.mlx_astype(&want_f, wantc, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(sub_f));
+        try mlx.check(mlx.mlx_array_eval(want_f));
+        const n_f = mlx.mlx_array_size(sub_f);
+        const ps = mlx.mlx_array_data_float32(sub_f) orelse return error.NoData;
+        const pw = mlx.mlx_array_data_float32(want_f) orelse return error.NoData;
+        var ref_abs: f32 = 0;
+        var d_abs: f32 = 0;
+        for (0..n_f) |j| {
+            ref_abs = @max(ref_abs, @abs(pw[j]));
+            const d = @abs(ps[j] - pw[j]);
+            if (!std.math.isFinite(d)) return error.NonFiniteValue;
+            d_abs = @max(d_abs, d);
+        }
+        const rel = d_abs / ref_abs;
+        errdefer std.debug.print("[qsa-take-dequant] tbq{d} relative drift {d:.6}\n", .{ bits, rel });
+        try std.testing.expect(rel < 0.02);
+    }
+}
+
+test "qsa decode gather tbq: subset SDPA matches masked full SDPA (tbq4, tbq3, live KVCache)" {
+    // End-to-end parity of the TBQ gather branch on the real strided cache
+    // layout, against the mask arm's own computation over the FULL dequant.
+    const s = mlx.gpuStream();
+    qsa_decode_gather_override = true;
+    defer qsa_decode_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x7b9c0de1);
+    const rnd = prng.random();
+    const kL: c_int = 50;
+    const kb: c_int = 3;
+    const ratio: c_int = 4;
+    const q_shape = [_]c_int{ 1, 4, 1, 128 };
+    const kv_shape = [_]c_int{ 1, 2, kL, 128 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try testRandWeightBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try testRandWeightBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v_dense);
+    var fx = try QsaBlockFixture.build(rnd, 1, kL, kb, ratio);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 8.0;
+    for ([_]u8{ 4, 3 }) |bits| {
+        var cache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.tbq(bits));
+        defer cache.deinit();
+        var view = try cache.update(0, k_dense, v_dense, s, 0);
+        defer view.deinit();
+        try std.testing.expect(!view.has_quant_triple);
+        try std.testing.expect(view.tbq_triple);
+        // The aligned fused arm declines before touching the lazy dense views.
+        try std.testing.expect((try qsaAlignedSparseAttn(s, q, &view, fx.blocks, ratio, scale, 512)) == null);
+        const got = (try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        const ref = try attn256Reference(q, view.k, view.v, scale, "array", fx.mask, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const diff = try attn256MaxDiff(got, ref, s);
+        errdefer std.debug.print("[qsa-decode-gather] tbq{d} max diff {d:.6}\n", .{ bits, diff });
+        try std.testing.expect(diff < 0.01);
+    }
+}
+
 test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slot solos" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -42905,6 +43125,59 @@ test "qsa verify gather: subset SDPA matches masked full SDPA at verify widths (
     qsa_verify_gather_override = true;
     qsa_verify_gather_min_kv_override = 16384;
     try std.testing.expect((try qsaVerifyGatherAttn(s, q, &dv2, bl, ratio, 1.0)) == null);
+}
+
+test "qsa verify gather tbq: subset SDPA matches masked full SDPA (tbq4, tbq3, live KVCache)" {
+    // The TBQ branch of the verify gatherer against the arm it replaces, on
+    // the real strided layout (`KVCache.update` views over capacity).
+    const s = mlx.gpuStream();
+    qsa_verify_gather_override = true;
+    qsa_verify_gather_min_kv_override = 1024;
+    defer qsa_verify_gather_override = null;
+    defer qsa_verify_gather_min_kv_override = null;
+    var prng = std.Random.DefaultPrng.init(0x7b10);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, bits: u8 }{
+        .{ .s = 2, .kv = 4096, .kb = 32, .bits = 4 },
+        .{ .s = 7, .kv = 4096, .kb = 32, .bits = 3 },
+    };
+    for (cases) |c| {
+        const q_shape = [_]c_int{ 1, 24, c.s, 256 }; // gqa 12, hd 256
+        const kv_shape = [_]c_int{ 1, 2, c.kv, 256 };
+        const q = try attn256RandBf16(rnd, &q_shape, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k_dense = try testRandWeightBf16(rnd, &kv_shape, s);
+        defer _ = mlx.mlx_array_free(k_dense);
+        const v_dense = try testRandWeightBf16(rnd, &kv_shape, s);
+        defer _ = mlx.mlx_array_free(v_dense);
+        const blocks_host = try qsaVerifyBlocksHost(std.testing.allocator, rnd, c.s, c.kv, c.kb, ratio);
+        defer std.testing.allocator.free(blocks_host);
+        const bshape = [_]c_int{ 1, c.s, c.kb };
+        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &bshape, 3, .int32);
+        defer _ = mlx.mlx_array_free(blocks);
+        const mask = try qsaMaskFromBlocks(s, blocks, c.kv, ratio);
+        defer _ = mlx.mlx_array_free(mask);
+        const scale: f32 = 1.0 / 16.0;
+
+        var cache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.tbq(c.bits));
+        defer cache.deinit();
+        var view = try cache.update(0, k_dense, v_dense, s, 0);
+        defer view.deinit();
+        try std.testing.expect(!view.has_quant_triple);
+        try std.testing.expect(view.tbq_triple);
+        // The aligned fused arm declines before touching the lazy dense views.
+        try std.testing.expect((try qsaAlignedSparseAttn(s, q, &view, blocks, ratio, scale, 512)) == null);
+        const got = (try qsaVerifyGatherAttn(s, q, &view, blocks, ratio, scale)) orelse return error.VerifyGatherDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        const ref = try attn256Reference(q, view.k, view.v, scale, "array", mask, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const diff = try attn256MaxDiff(got, ref, s);
+        const cos = try attn256Cosine(got, ref, s);
+        errdefer std.debug.print("[qsa-verify-gather] S={d} kv={d} tbq{d}: max diff {d:.6} cos {d:.7}\n", .{ c.s, c.kv, c.bits, diff, cos });
+        try std.testing.expect(diff < 0.01);
+        try std.testing.expect(cos > 0.9999);
+    }
 }
 
 // ── Fused sparse attention at verify widths (sushi_attn_qsa256_q) ──
