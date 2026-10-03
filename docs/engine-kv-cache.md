@@ -26,14 +26,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 ## The kv-quant contract
 
 - Attention reads every cache through `KVCache.denseView` on EVERY path (batched included). The returned
-  `DenseKVView` carries the packed triple when the cache is quantized (`has_quant_triple`), so a kernel either reads
-  it packed or gets the dense rebuild; nothing else touches the storage.
+  `DenseKVView` carries the packed triple when the cache is quantized (`has_quant_triple` affine, `tbq_triple`
+  TBQ), so a kernel either reads it packed or gets the dense rebuild; nothing else touches the storage.
 - Schemes extend via enum + two switch arms; a prefix-cache entry records its scheme (`Entry.quant_config`), so a
   slot running `kv_quant=4` never restores from an entry committed at another width
   (`tests/test_kv_quant_per_request.sh`). Every generation endpoint, `/v1/completions` included, reads the per-request
   `kv_quant` through `parseKvQuantOverride` and logs the override it applied.
-- Packed reads are kernel-or-DENSE per WIDTH (`kvAttnFusedEligible` t_q==1, `kvAttnVerifyEligible` t_q 2..8; verify
-  kernel OFF on G17, `SUSHI_KV_ATTN_VERIFY=1|0`; floor 2048). Guard: `tests/test_kv_quant_fused_equivalence.sh`.
+- Packed reads are kernel-or-DENSE per WIDTH for both schemes (`kvAttnFusedEligible` t_q==1, `kvAttnVerifyEligible`
+  t_q 2..8; verify kernel OFF on G17, `SUSHI_KV_ATTN_VERIFY=1|0`; floor 2048). The TBQ fused kernels
+  (`qkv_attn_dec_tbq`) dequantize packed rows in-kernel in the rotated domain — Q pre-rotated by the folded M1,
+  the merged output inverse-rotated by M2 = M1ᵀ — so decode/verify never rebuild the whole cache; the dense
+  fallback stays a whole-cache dequant and the affine path is bit-identical.
+  Guard: `tests/test_kv_quant_fused_equivalence.sh`.
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
   matmul2d decode kernel and the fused prefill on MiMo's global layers ([mimo2-arch](mimo2-arch.md#attention-kernels)).
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width

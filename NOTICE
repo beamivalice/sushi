@@ -506,6 +506,19 @@ Modifications by mlx-serve: reimplemented in Zig against mlx-c; the query
 split is gated per shape and kill-switched (`SUSHI_SDPA_SPLIT`), the
 head requantization uses our existing per-weight quantization path.
 
+--------------------------------------------------------------------------------
+llama.cpp-turboq-mtp (TBQ KV quantization tables)
+https://github.com/Indras-Mirror/llama.cpp-turboq-mtp
+Copyright (c) Georgi Gerganov and llama.cpp contributors
+Licensed under the MIT License.
+
+The seed-42 FWHT sign arrays, the 128x128 Hadamard constants and the
+tbq3/tbq4 rotated-domain centroid codebooks in `src/tbq_tables.zig` are ported
+from the fork's `ggml/src/ggml-turboq-tables.h` (via the sashimi fork). The
+quantizer and the fused Metal attention kernels that read the packed rows in
+the rotated domain are our own implementations, written in Zig/MSL against
+mlx-c; no CUDA code is shipped.
+
 
 ================================================================================
 Other licenses

@@ -296,6 +296,36 @@ const TBQTables = struct {
     }
 };
 
+/// Folded query/output rotations for fused packed reads: row-major 128x128
+/// f32, built at module load. Module-static so non-owning host wraps into
+/// lazy graphs stay alive.
+pub const TbqRot = struct { m1: [128 * 128]f32, m2: [128 * 128]f32 };
+
+fn tbqRotBuild(s1: []const f32, s2: []const f32) TbqRot {
+    var r: TbqRot = .{ .m1 = undefined, .m2 = undefined };
+    @setEvalBranchQuota(100000); // built once at comptime: 2 x 128 x 128 products
+    for (0..128) |i| for (0..128) |j| {
+        const h = tbq_tables.h128[i * 128 + j];
+        r.m1[i * 128 + j] = s1[i] * h * s2[j] * tbq_tables.inv_sqrt_128;
+        r.m2[i * 128 + j] = s2[i] * h * s1[j] * tbq_tables.inv_sqrt_128;
+    };
+    return r;
+}
+
+// M1 folds the whole forward rotation (c -> c.s2 @H .s1 .isv): dot(q@M1, raw)
+// equals dot(q, dequant(raw)). M2 = M1^T inverse-rotates the merged output,
+// which the kernel accumulates against raw V codes.
+const tbq_rot_4 = tbqRotBuild(&tbq_tables.signs1_4, &tbq_tables.signs2_4);
+const tbq_rot_3 = tbqRotBuild(&tbq_tables.signs1_3, &tbq_tables.signs2_3);
+
+pub fn tbqRot(bits: u8) *const TbqRot {
+    return if (bits == 4) &tbq_rot_4 else if (bits == 3) &tbq_rot_3 else unreachable;
+}
+
+pub fn tbqCentroids(bits: u8) []const f32 {
+    return if (bits == 4) &tbq_tables.centroids4 else &tbq_tables.centroids3;
+}
+
 /// Rotated-codebook quantize `[B, H, T, D]` (D a multiple of 128).
 pub fn quantizeTBQ(s: mlx.mlx_stream, dense_x: mlx.mlx_array, bits: u8) !QuantizedKV {
     if (bits != 3 and bits != 4) return error.UnsupportedKvBits;
@@ -1281,6 +1311,79 @@ test "tbq: fixed-point pack/unpack is byte-identical through quant→dequant→q
     for (sc1, sc2) |a, b| {
         const tol = @max(@abs(a), @abs(b)) * 0.01 + 1e-3;
         try testing.expectApproxEqAbs(a, b, tol);
+    }
+}
+
+test "tbq fused: M1 rotation preserves scores (tbq4, tbq3)" {
+    // The fused decode/verify kernel's identity: with q_rot = q @ M1,
+    // dot(q_rot, c·d) equals the dense dequant's dot(q, ((c∘s2)@H∘s1∘isv)·d)
+    // for one 128-block — the kernel never leaves the rotated domain.
+    for ([_]u8{ 4, 3 }) |bits| {
+        const rot = tbqRot(bits);
+        const tb = TBQTables.forBits(bits);
+        var prng = std.Random.DefaultPrng.init(0xF0 + bits);
+        const rnd = prng.random();
+        var q: [128]f32 = undefined;
+        for (&q) |*x| x.* = rnd.float(f32) * 2.0 - 1.0;
+        var qrot: [128]f32 = @splat(0);
+        for (0..128) |j| {
+            var acc: f32 = 0;
+            for (0..128) |e| acc += q[e] * rot.m1[e * 128 + j];
+            qrot[j] = acc;
+        }
+        var codes: [128]f32 = undefined;
+        for (&codes) |*x| x.* = tb.centroids[rnd.uintLessThan(usize, tb.centroids.len)];
+        var s2c: [128]f32 = undefined;
+        for (0..128) |j| s2c[j] = codes[j] * tb.signs2[j];
+        const d: f32 = 0.25 + rnd.float(f32);
+        var lhs: f32 = 0;
+        var rhs: f32 = 0;
+        for (0..128) |j| lhs += qrot[j] * codes[j];
+        for (0..128) |e| {
+            var inner: f32 = 0;
+            for (0..128) |j| inner += s2c[j] * tbq_tables.h128[j * 128 + e];
+            rhs += q[e] * inner * tbq_tables.inv_sqrt_128 * tb.signs1[e];
+        }
+        lhs *= d;
+        rhs *= d;
+        try testing.expectApproxEqAbs(lhs, rhs, 1e-3 * @max(1.0, @abs(rhs)));
+    }
+}
+
+test "tbq fused: M2 inverts the rotation on outputs (tbq4, tbq3)" {
+    // o_orig = o_rot @ M2, element-for-element with the dense dequant's
+    // inverse-rotation formula; and the fold keeps (o@M2)@M1 == o.
+    for ([_]u8{ 4, 3 }) |bits| {
+        const rot = tbqRot(bits);
+        const tb = TBQTables.forBits(bits);
+        var prng = std.Random.DefaultPrng.init(0xBA + bits);
+        const rnd = prng.random();
+        var o: [128]f32 = undefined;
+        for (&o) |*x| x.* = rnd.float(f32) * 2.0 - 1.0;
+        var o2: [128]f32 = @splat(0);
+        for (0..128) |e| {
+            var acc: f32 = 0;
+            for (0..128) |j| acc += o[j] * rot.m2[j * 128 + e];
+            o2[e] = acc;
+        }
+        var want: [128]f32 = undefined;
+        for (0..128) |e| {
+            var inner: f32 = 0;
+            for (0..128) |j| inner += o[j] * tb.signs2[j] * tbq_tables.h128[j * 128 + e];
+            want[e] = inner * tbq_tables.inv_sqrt_128 * tb.signs1[e];
+        }
+        for (o2, want) |a, b| {
+            try testing.expectApproxEqAbs(a, b, 1e-3 * @max(1.0, @abs(b)));
+        }
+        var back: [128]f32 = @splat(0);
+        for (0..128) |i| {
+            var acc: f32 = 0;
+            for (0..128) |j| acc += o2[j] * rot.m1[j * 128 + i];
+            back[i] = acc;
+        }
+        for (back, o) |a, b| {
+            try testing.expectApproxEqAbs(a, b, 1e-2 * @max(1.0, @abs(b)));
+        }
     }
 }
 
