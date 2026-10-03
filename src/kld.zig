@@ -875,6 +875,7 @@ pub fn kvCacheFormat(cfg: transformer_mod.KVQuantConfig) []const u8 {
             8 => "affine8",
             else => "affine",
         },
+        .tbq => if (cfg.bits == 4) "tbq4" else "tbq3",
     };
 }
 

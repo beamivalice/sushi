@@ -8090,7 +8090,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const disk = lm.disk_stats.snapshot();
     return .{
         .engine = "mlx",
-        .kv_quant = if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
+        .kv_quant = if (kv.isQuant()) kv.wireName() else "off",
         .kv_cache = kv_cache,
         .kv_attn_mode = server_config.kv_attn_mode,
         .prefill_chunk = generate_mod.prefill_chunk_override,
@@ -9240,6 +9240,7 @@ fn handleChatCompletions(
     // hot-prefix-cache hits never happen — entries record their scheme and
     // findBestMatch filters on it.
     const kv_quant_override = parseKvQuantOverride(root);
+
     const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Parse enable_drafter: per-request override of the --drafter default.
@@ -13553,16 +13554,17 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
 }
 
 /// Wave 1.A — parse the optional per-request `kv_quant` body field. Accepts
-/// the string forms `"off"`, `"0"`, `"4"`, `"8"` and the integer forms `0`,
-/// `4`, `8`. Returns null when the field is absent or unrecognized (the
-/// caller falls back to the process-level `--kv-quant` default carried on
-/// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
+/// the string forms `"off"`, `"0"`, `"4"`, `"8"`, `"tbq4"`, `"tbq3"` and the
+/// integer forms `0`, `4`, `8`. Returns null when the field is absent or
+/// unrecognized (the caller falls back to the process-level `--kv-quant`
+/// default carried on the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
 fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
     const v = root.get("kv_quant") orelse return null;
     const kq = transformer_mod.KVQuantConfig.fromJsonValue(v) orelse return null;
     switch (kq.scheme) {
         .off => log.info("  kv-quant override: off (per-request)\n", .{}),
         .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),
+        .tbq => log.info("  kv-quant override: tbq {d}-bit (per-request)\n", .{kq.bits}),
     }
     return kq;
 }

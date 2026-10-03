@@ -234,7 +234,10 @@ fn printUsage(io: std.Io) void {
         \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8 or 4 — affine group quant; default 8 on
-        \\                          every model (GLM refuses 4). 16 (or `off`)
+        \\                          every model (GLM refuses 4). tbq4/tbq3 are
+        \\                          rotated fixed-codebook KV (block=128,
+        \\                          ~3.7/~2.6 effective bits/token byte);
+        \\                          decode is dense-read in v1. 16 (or `off`)
         \\                          keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`
@@ -840,7 +843,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             kv_quant_explicit = true;
             kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
-                log.err("--kv-quant: expected one of {{16, 8, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
+                log.err("--kv-quant: expected one of {{16, 8, 4, tbq4, tbq3}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--ssd-budget-gb") and i + 1 < args.len) {
@@ -1105,6 +1108,7 @@ pub fn main(init: std.process.Init) !void {
     } else switch (kv_quant_config.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
+        .tbq => log.info("[args] kv-quant: tbq {d}-bit (block=128)\n", .{kv_quant_config.bits}),
     }
 
     // Set GPU as default

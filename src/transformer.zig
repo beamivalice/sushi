@@ -6941,7 +6941,9 @@ pub const KVCache = struct {
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
         switch (self.config.scheme) {
             .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
-            .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq),
+            // TBQ reuses the affine write/read plumbing (6-buffer entries,
+            // per-slot appends); the quantizer pair and triple gate differ.
+            .affine, .tbq => return self.updateAffine(layer, new_k, new_v, s, max_seq),
         }
     }
 
@@ -7063,9 +7065,9 @@ pub const KVCache = struct {
 
         // 1. Free stale views (6 of them — dense + 4 quant scale/bias views).
         // 2. Quantize incoming K/V.
-        var new_kq = try kv_quant.quantizeAffine(s, new_k, group_size, bits);
+        var new_kq = if (cfg.scheme == .tbq) try kv_quant.quantizeTBQ(s, new_k, bits) else try kv_quant.quantizeAffine(s, new_k, group_size, bits);
         defer new_kq.deinit();
-        var new_vq = try kv_quant.quantizeAffine(s, new_v, group_size, bits);
+        var new_vq = if (cfg.scheme == .tbq) try kv_quant.quantizeTBQ(s, new_v, bits) else try kv_quant.quantizeAffine(s, new_v, group_size, bits);
         defer new_vq.deinit();
 
         // 3. Shape info: new_k is [B, heads, new_len, head_dim]. The V widths
@@ -7096,9 +7098,9 @@ pub const KVCache = struct {
         //    actually reads `.k`/`.v`. (Engagement bug class: the decode
         //    forward calls update(), not denseView() — omitting the triples
         //    here made `kv_attn_mode: "fused"` a silent no-op.)
-        const dense_k = try kv_quant.dequantizeAffine(s, trip[0], trip[1], trip[2], group_size, bits);
+        const dense_k = if (cfg.scheme == .tbq) try kv_quant.dequantizeTBQ(s, trip[0], trip[1], bits, mlx.mlx_array_dtype(new_k)) else try kv_quant.dequantizeAffine(s, trip[0], trip[1], trip[2], group_size, bits);
         errdefer _ = mlx.mlx_array_free(dense_k);
-        const dense_v = try kv_quant.dequantizeAffine(s, trip[3], trip[4], trip[5], group_size, bits);
+        const dense_v = if (cfg.scheme == .tbq) try kv_quant.dequantizeTBQ(s, trip[3], trip[4], bits, mlx.mlx_array_dtype(new_v)) else try kv_quant.dequantizeAffine(s, trip[3], trip[4], trip[5], group_size, bits);
         return .{
             .k = dense_k,
             .v = dense_v,
@@ -7109,7 +7111,10 @@ pub const KVCache = struct {
             .v_triple_q = trip[3],
             .v_triple_scales = trip[4],
             .v_triple_biases = trip[5],
-            .has_quant_triple = true,
+            // The fused affine kernels read `bits`-packed uint32 triples —
+            // TBQ's buffers are codebook bytes in a different layout, so a
+            // TBQ view never advertises a triple. Dense SDPA/QSA-mask only.
+            .has_quant_triple = cfg.scheme != .tbq,
             .bits = bits,
             .group_size = group_size,
             .owns_triple = compacted,
@@ -7183,8 +7188,10 @@ pub const KVCache = struct {
             const cur_cap = if (entry.initialized and !shared) bufferCapacity(entry.keys) else 0;
             const new_cap: c_int = @intCast(self.growCapacityFor(entry, cur_cap, needed));
             kv_cap_buf_grows += 1;
-            try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
-            try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
+            const kq_dt = mlx.mlx_array_dtype(new_kq.q);
+            const vq_dt = mlx.mlx_array_dtype(new_vq.q);
+            try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, kq_dt);
+            try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, vq_dt);
             // Quantizer scales retain the activation dtype through allocation and growth.
             const ksc_dt = mlx.mlx_array_dtype(new_kq.scales);
             const vsc_dt = mlx.mlx_array_dtype(new_vq.scales);
@@ -7377,6 +7384,21 @@ pub const KVCache = struct {
                     .v_triple_scales = entry.value_scales_view,
                     .v_triple_biases = entry.value_biases_view,
                     .has_quant_triple = true,
+                    .bits = self.config.bits,
+                    .group_size = self.config.group_size,
+                };
+            },
+            .tbq => {
+                if (!entry.initialized) {
+                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+                }
+                const dense_k = try kv_quant.dequantizeTBQ(s, entry.key_view, entry.key_scales_view, self.config.bits, .bfloat16);
+                errdefer _ = mlx.mlx_array_free(dense_k);
+                const dense_v = try kv_quant.dequantizeTBQ(s, entry.value_view, entry.value_scales_view, self.config.bits, .bfloat16);
+                return .{
+                    .k = dense_k,
+                    .v = dense_v,
+                    .owned = true,
                     .bits = self.config.bits,
                     .group_size = self.config.group_size,
                 };
