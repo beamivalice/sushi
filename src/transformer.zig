@@ -28451,6 +28451,77 @@ test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
     try testing.expectEqual(@as(c_int, 128), mlx.getShape(restored.v)[3]);
 }
 
+test "tbq: KVCache update + denseView carry packed rotated-codebook KV" {
+    // The transformer-side branches (update → updateAffine routing, the TBQ
+    // wrappers on the K/V pairs, has_quant_triple=false forcing denseView,
+    // grow + truncate on the packed buffers) only run through the cache.
+    // Head dim 256 = two 128-blocks; all-ones input must survive both
+    // codebooks (the Hadamard domain of a constant block is a single DC
+    // spike, which the top centroid scales back to ~1.0 per coordinate).
+    const s = mlx.gpuStream();
+    const mk = struct {
+        fn f(str: mlx.mlx_stream, len: c_int, d: c_int) !mlx.mlx_array {
+            const shape = [_]c_int{ 1, 2, len, d };
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str));
+            return a;
+        }
+    }.f;
+
+    for ([_]kv_quant.KVQuantConfig{ kv_quant.KVQuantConfig.tbq(4), kv_quant.KVQuantConfig.tbq(3) }) |cfg| {
+        var cache = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+        defer cache.deinit();
+
+        {
+            const k = try mk(s, 4, 256);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try mk(s, 4, 256);
+            defer _ = mlx.mlx_array_free(v);
+            var dv = try cache.update(0, k, v, s, 0);
+            defer dv.deinit();
+            // Packed reads always go through denseView: no fused triple.
+            try testing.expect(!dv.has_quant_triple);
+            try mlx.check(mlx.mlx_array_eval(dv.k));
+            try testing.expectEqual(@as(c_int, 256), mlx.getShape(dv.k)[3]);
+        }
+        // Two decode steps — the second crosses a growth event, which must
+        // re-derive the packed dtype from the live q array, not the f16 path.
+        for (0..2) |_| {
+            const k = try mk(s, 1, 256);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try mk(s, 1, 256);
+            defer _ = mlx.mlx_array_free(v);
+            var dv = try cache.update(0, k, v, s, 0);
+            defer dv.deinit();
+            try mlx.check(mlx.mlx_array_eval(dv.k));
+            try mlx.check(mlx.mlx_array_eval(dv.v));
+        }
+        try testing.expectEqual(@as(usize, 6), cache.entries[0].offset);
+
+        try cache.truncate(3, s);
+        var restored = try cache.denseView(0, s);
+        defer restored.deinit();
+        try testing.expectEqual(@as(c_int, 3), mlx.getShape(restored.k)[2]);
+        var kf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kf);
+        try mlx.check(mlx.mlx_astype(&kf, restored.k, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(kf));
+        const kd = mlx.mlx_array_data_float32(kf) orelse return error.InvalidDtype;
+        // A constant block is pathological for a GAUSSIAN-optimal codebook
+        // (DC spike clips to the top centroid; per-coordinate err up to 0.6
+        // for 3-bit — same in the C reference). What d guarantees is block
+        // L2 norm: ‖rec‖ = d·‖c[idx]‖ = ‖orig‖, for every 128-block.
+        const expect_norm = @sqrt(@as(f32, 128.0));
+        var blk: usize = 0;
+        while (blk < 3 * 2 * 2) : (blk += 1) {
+            const base = blk * 128;
+            var norm_sq: f32 = 0;
+            for (kd[base..][0..128]) |x| norm_sq += x * x;
+            try testing.expectApproxEqRel(expect_norm, @sqrt(norm_sq), 0.02);
+        }
+    }
+}
+
 test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
     // Every re-init site once read `cache.deinit(); cache = try init(...)`, so
     // a failed init left a FREED cache installed on the Transformer and its
