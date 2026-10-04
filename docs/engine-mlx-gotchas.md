@@ -90,6 +90,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - `std.testing.expectError` and `expectEqual` on a pointer print the value with `{any}`: one printer per payload
   type, tens of KiB of code for an engine struct. Use `test_expect.expectError` or `expect(a == b)` there.
 - The unit tests compile as one binary per `test_buckets` entry in `build.zig`; a new file joins the last bucket.
+- Assigning `blk: { break :blk null }` to a `??T` cache coerces the `null` to the OUTER level, erasing the
+  "read-and-unset" sentinel; build the inner `?T` through a typed intermediate first.
 
 ## Tokenizer
 

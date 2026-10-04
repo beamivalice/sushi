@@ -2436,6 +2436,7 @@ pub var fused256_budget_override: ?i64 = null;
 
 pub fn fused256DispatchBudget(arm: AttnPdArm) i64 {
     if (fused256_budget_override) |v| return v;
+
     return if (arm == .nax) ATTN_PD_NAX_DISPATCH_BUDGET else FUSED256_DEFAULT_DISPATCH_BUDGET;
 }
 
@@ -44786,6 +44787,18 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     const banded = try fusedSdpaPrefill(s, q, k, k, 1.0, 40);
     try std.testing.expect(banded != null);
     if (banded) |f| _ = mlx.mlx_array_free(f);
+}
+
+test "fused256DispatchBudget: unset env caches inner null, not outer" {
+    const t = std.testing;
+    fused256_budget_override = null;
+    _ = unsetenv("SUSHI_FUSED_256_BUDGET");
+    fused256_budget_env_cached = null;
+    try t.expectEqual(FUSED256_DEFAULT_DISPATCH_BUDGET, fused256DispatchBudget(.simd));
+    try t.expectEqual(ATTN_PD_NAX_DISPATCH_BUDGET, fused256DispatchBudget(.nax));
+    // Absent env must land as outer=Some(inner=null); the coercion bug left
+    // the outer null, so the next call's `.?` unwrap crashed prefill.
+    try t.expect(fused256_budget_env_cached != null);
 }
 
 test "fused256KvChunkLen: BK alignment, one-block floor, kl cap, budget-off" {
