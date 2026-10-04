@@ -22954,7 +22954,7 @@ pub const Transformer = struct {
     /// gather only fills the tokens.
     fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) bool {
         const ctx_len: usize = self.qwen4.?.hash.ngram_size - 1;
-        return claimPleSpecCapture(entry, n, ctx_len, self.expert_stream == null and self.spec_capture_ssm);
+        return claimPleSpecCapture(entry, n, ctx_len, self.spec_capture_ssm);
     }
 
     /// Every eval inside a `ple_defer` build reads the leaf as it stands, and
@@ -25175,6 +25175,8 @@ pub const Transformer = struct {
             return false;
         }
         if (qwen4_trace != null or diagEnvOn("QWEN4_PROFILE_FWD")) return false;
+        // The grouped verify reads resident expert banks; a streamed trunk has none.
+        if (self.expert_stream != null) return false;
         const si = qwen4Standin();
         if (si.gdn or si.attn or si.mlp or si.gdn_recur or si.gdn_proj or si.attn_qsa or si.attn_sdpa or si.hc or si.moe_shared or si.moe_router or si.moe_gateup or si.moe_down) return false;
         for (self.moe_layers.?) |lw| switch (lw.mlp) {
@@ -25452,7 +25454,6 @@ pub const Transformer = struct {
         const dumping = moeDumpBeginForward();
         defer if (dumping) moeDumpForwardDone();
         self.fwd_gen +%= 1; // per-forward QSA scratch key
-        if (self.expert_stream != null and ctx.capture_ssm_seq) return error.StreamingSpecCaptureUnsupported;
         if (self.expert_stream) |engine| engine.beginForward();
         const ml = self.moe_layers.?;
         const cfg = &self.config;
@@ -47630,7 +47631,7 @@ fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int
     return delta;
 }
 
-test "qwen4 streamed PLE refuses spec capture and clears the claimed length" {
+test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
     var state: qwen4_mod.Qwen4State = undefined;
     state.hash.ngram_size = 3;
     var xfm: Transformer = undefined;
@@ -47647,6 +47648,9 @@ test "qwen4 streamed PLE refuses spec capture and clears the claimed length" {
     var engine: expert_stream_mod.Engine = undefined;
     xfm.expert_stream = &engine;
     entry.spec_ple_len = 17;
+    try testing.expect(xfm.pleClaimSpecCapture(&entry, 4));
+    try testing.expectEqual(@as(u32, 6), entry.spec_ple_len);
+    xfm.spec_capture_ssm = false;
     try testing.expect(!xfm.pleClaimSpecCapture(&entry, 4));
     try testing.expectEqual(@as(u32, 0), entry.spec_ple_len);
 }
@@ -74818,7 +74822,7 @@ test "mimo v2 mixed-precision streamed and resident forwards agree" {
     defer config.deinit(a);
     var resident_weights = try model_mod.loadWeights(io, a, path);
     defer resident_weights.deinit();
-    var streamed_weights = try model_mod.loadWeightsStreaming(io, a, path, .mxfp4_split);
+    var streamed_weights = try model_mod.loadWeightsStreaming(io, a, path, .mxfp4_split, false);
     defer streamed_weights.deinit();
     const per_expert = try expert_stream_mod.mxfp4ExpertBytes(config.hidden_size, config.moe_intermediate_size);
     var stream_config = config;

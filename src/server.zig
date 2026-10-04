@@ -2181,8 +2181,8 @@ pub fn serve(
     }
     if (config.isGlm5()) {
         log.info("MTP: off (GLM native serving has no integrated MTP head)\n", .{});
-    } else if (config.expert_streaming) {
-        log.info("MTP: off under expert streaming (--mtp is refused there)\n", .{});
+    } else if (config.expert_streaming and !config.stream_mtp_head) {
+        log.info("MTP: off under expert streaming (--mtp keeps the head resident)\n", .{});
     } else if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
@@ -9158,7 +9158,7 @@ fn handleChatCompletions(
     // subject to the n-gram spec gate below — the trained head holds ~73%
     // per-draft acceptance even on fully novel content.
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
@@ -9527,7 +9527,7 @@ fn handleCompletions(
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
@@ -15922,7 +15922,7 @@ fn handleAnthropicMessages(
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
@@ -17813,7 +17813,7 @@ fn handleResponsesInner(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }

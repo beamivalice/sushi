@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`--mtp` works with SSD-streamed Qwen3.8-Flash-Next packs**: the head and its own routed experts load resident and
+  are billed in the budget, verify rows run on the streamed decode path, and the n-gram window rolls back after a
+  partially accepted round, so a greedy reply equals the resident and the serial one. The default stays off.
 - **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
   instead of failing to compile mlx-c after a plain `git pull`.
 - **GLM-5.3 now stores its MLA latent at 8 bits by default**, like every model: 6,688 instead of 11,968 bytes per

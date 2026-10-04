@@ -290,9 +290,9 @@ test "flat EXL3 resident split drops co-located routed banks and isolates MTP" {
 
     const split = try model.streamingResidentSplit(io, allocator, model_path, &.{ .expert_layout = .exl3_k4 });
     // embed (64) + lm_head (1024) + two trunk tensors (2048); the nine routed EXL3
-    // tensors, the MTP routed tensor, and model.visual are not trunk bytes.
+    // tensors and model.visual are not trunk bytes. A kept head bills its own routed tensor.
     try std.testing.expectEqual(@as(u64, 3136), split.trunk);
-    try std.testing.expectEqual(@as(u64, 1024), split.mtp);
+    try std.testing.expectEqual(@as(u64, 1408), split.mtp);
 }
 
 test "Sushi quant memory bills resident routed banks and enabled vision and MTP exactly" {
@@ -351,8 +351,8 @@ test "EXL3 streaming CPU config engages only with a budget and refuses MTP" {
     try std.testing.expect(!stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 0, 0));
     try std.testing.expect(stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 0, 20 << 30));
     try std.testing.expect(stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 1 << 30, 0));
-    try std.testing.expect(stream.mtpRefusal(true, true) != null);
-    try std.testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false));
+    try std.testing.expect(stream.mtpRefusal(true, true, false) != null);
+    try std.testing.expectEqual(stream.MtpUnderStreaming.keep, stream.mtpUnderStreaming(true, false, false));
 }
 
 test "EXL3 streaming CPU store spans all nine tensors with exact source bytes" {

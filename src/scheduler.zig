@@ -1793,8 +1793,9 @@ pub const Scheduler = struct {
         )) blk: {
             if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
-            switch (mtpStreamingVerdict(mtp)) {
-                .refuse => return error.ExpertStreamingMtpUnsupported,
+            const verdict = mtpStreamingVerdict(mtp);
+            switch (verdict) {
+                .keep => owned.config.stream_mtp_head = true,
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
             }
@@ -2700,7 +2701,7 @@ test "--fast: its preset, named --fast, outranks model-settings.json; an explici
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
 }
 
-test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp still refuses" {
+test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp keeps the head" {
     const saved = LaunchGlobals.save();
     defer saved.restore();
     model_settings.fast = true;
@@ -2714,7 +2715,7 @@ test "--fast drops its MTP on a streamed load, before and after the load marks i
     try testing.expectEqualStrings("--fast", loaded.sourceName());
     try testing.expect(!loaded.forced());
     const asked = mtpChoiceFor(true, true, &ModelConfig{});
-    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked));
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.keep, mtpStreamingVerdict(asked));
     try testing.expect(mtpChoiceFor(true, true, &streamed).on);
 }
 
@@ -2808,7 +2809,7 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
     split.trunk +|= mimoCoarseHeadBytes(&streamed);
     const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
-    const resolved = try resolveExpertCache(explicit_cache_bytes, budget_bytes, config, split, false, per_expert);
+    const resolved = try resolveExpertCache(explicit_cache_bytes, budget_bytes, config, split, config.stream_mtp_head, per_expert);
     const cache = try expert_stream_mod.cachePlanBytesForGeometry(resolved.cache_bytes, geometry, per_expert);
     return .{ .layout = streamed.expert_layout, .split = split, .resolved = resolved, .cache = cache };
 }
@@ -3774,10 +3775,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
         if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
-        switch (mtpStreamingVerdict(mtp)) {
-            .refuse => {
-                log.err("[expert-stream] {s}; MTP is on ({s}), pass --no-mtp\n", .{ expert_stream_mod.MTP_UNSUPPORTED, mtp.sourceName() });
-                return error.ExpertStreamingMtpUnsupported;
+        const verdict = mtpStreamingVerdict(mtp);
+        switch (verdict) {
+            .keep => {
+                log.info("[expert-stream] MTP head resident ({s}); routed experts stream\n", .{mtp.sourceName()});
+                params.config.stream_mtp_head = true;
             },
             .drop_settings => {
                 log.info("[expert-stream] model-settings mtp=true ignored: {s}\n", .{expert_stream_mod.MTP_UNSUPPORTED});

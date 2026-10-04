@@ -863,8 +863,8 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         if (opts.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = model_settings_mod.MtpChoice.resolve(model_settings_mod.launchFlag(bool, opts.enable_mtp, opts.mtp_explicit), self.config.mtp_override, false);
         switch (expert_stream_mod.mtpUnderStreaming(mtp.on, mtp.source == .model_settings, mtp.source == .default)) {
-            .refuse => {
-                log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
+            .keep => {
+                log.err("[expert-stream] KLD scoring under expert streaming runs without the MTP head; drop --mtp\n", .{});
                 return error.ExpertStreamingMtpUnsupported;
             },
             .drop_settings => {

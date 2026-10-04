@@ -123,25 +123,23 @@ pub fn cachePlanBytesForGeometry(requested_bytes: u64, geometry: Geometry, exper
     return cachePlanBytes(requested_bytes, moeLayerCount(geometry), geometry.experts, expert_bytes);
 }
 
-pub const MTP_UNSUPPORTED: []const u8 = "MTP speculative decode is not supported under expert streaming; disable MTP for this model";
+pub const MTP_UNSUPPORTED: []const u8 = "MTP under expert streaming needs the head loaded: launch with --mtp";
 
-/// PURE: why MTP cannot serve a streamed model, or null. Refused at the door — at load for
-/// `--mtp` and at request parse for an explicit `enable_mtp` — because an armed head reaches
-/// `error.StreamingSpecCaptureUnsupported` inside the forward instead.
-pub const MtpUnderStreaming = enum { off, refuse, drop_settings, drop_default };
+/// A streamed load keeps the MTP head resident only when `--mtp` asks for it: the head's own
+/// experts stay in RAM and its verify rows take the streamed decode path.
+pub const MtpUnderStreaming = enum { off, keep, drop_settings, drop_default };
 
-/// Takes the load's RESOLVED MTP choice. On from a launch flag is refused; on from a
+/// Takes the load's RESOLVED MTP choice. On from a launch flag keeps the head; on from a
 /// per-model `mtp: true` is dropped with a warning (the setting was written for the resident
-/// load of the same pack, and a dead server is the wrong answer to it); the engine default
-/// quietly resolves off, since nobody asked for the head.
+/// load of the same pack); the engine default quietly resolves off, since nobody asked for the head.
 pub fn mtpUnderStreaming(mtp_on: bool, from_settings: bool, from_default: bool) MtpUnderStreaming {
     if (!mtp_on) return .off;
     if (from_default) return .drop_default;
-    return if (from_settings) .drop_settings else .refuse;
+    return if (from_settings) .drop_settings else .keep;
 }
 
-pub fn mtpRefusal(expert_streaming: bool, mtp_requested: bool) ?[]const u8 {
-    if (!expert_streaming or !mtp_requested) return null;
+pub fn mtpRefusal(expert_streaming: bool, mtp_requested: bool, head_loaded: bool) ?[]const u8 {
+    if (!expert_streaming or !mtp_requested or head_loaded) return null;
     return MTP_UNSUPPORTED;
 }
 
@@ -1918,10 +1916,11 @@ test "exl3 expert bytes at the MiMo K2.5 geometry size the resident admission" {
 
 test "expert stream refuses MTP by name, at load and at request parse" {
     const t = std.testing;
-    try t.expect(mtpRefusal(false, true) == null);
-    try t.expect(mtpRefusal(true, false) == null);
-    try t.expect(mtpRefusal(false, false) == null);
-    const why = mtpRefusal(true, true) orelse return error.TestExpectedRefusal;
+    try t.expect(mtpRefusal(false, true, false) == null);
+    try t.expect(mtpRefusal(true, false, false) == null);
+    try t.expect(mtpRefusal(false, false, false) == null);
+    try t.expect(mtpRefusal(true, true, true) == null);
+    const why = mtpRefusal(true, true, false) orelse return error.TestExpectedRefusal;
     try t.expect(std.mem.indexOf(u8, why, "expert streaming") != null);
 }
 
@@ -3144,7 +3143,7 @@ test "expert stream quantized slabs alias the nine pack tensors and remap ids" {
 
 test "expert stream: under streaming an MTP on by flag refuses, a settings mtp is dropped, else off" {
     const t = std.testing;
-    try t.expectEqual(MtpUnderStreaming.refuse, mtpUnderStreaming(true, false, false));
+    try t.expectEqual(MtpUnderStreaming.keep, mtpUnderStreaming(true, false, false));
     try t.expectEqual(MtpUnderStreaming.drop_settings, mtpUnderStreaming(true, true, false));
     try t.expectEqual(MtpUnderStreaming.off, mtpUnderStreaming(false, true, false));
     try t.expectEqual(MtpUnderStreaming.off, mtpUnderStreaming(false, false, false));

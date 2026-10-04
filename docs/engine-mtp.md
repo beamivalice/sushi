@@ -124,7 +124,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - **MTP is ON by default for both served models** (owner policy, `server.defaultEnableMtp` `served`): a request
   that omits `enable_mtp` runs the loaded head. `--no-mtp`, `"mtp": false` in `model-settings.json` or
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
-  `scheduler.mtpDefaultOffUnderStreaming`) and an explicit `--mtp` there still refuses. The load-time bill prices the head's
+  `scheduler.mtpDefaultOffUnderStreaming`) unless an explicit `--mtp` keeps it resident. The load-time bill prices the head's
   KV whenever it runs by default (`server.mtpHeadDefaultOn`).
 - **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default, `SUSHI_MTP_GROUP_PLANNER`;
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis

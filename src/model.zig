@@ -173,6 +173,8 @@ pub const ModelConfig = struct {
     quant_group_size: u32 = 64,
     quant_mode: QuantMode = .affine,
     expert_streaming: bool = false,
+    /// A streamed load that serves `--mtp` keeps the head, and its own routed experts, resident.
+    stream_mtp_head: bool = false,
     expert_layout: expert_quant.Layout = .bf16_fused,
     expert_quant_rate: expert_exl3.Rate = .{ .n = 64 },
     expert_quant_codebook: expert_exl3.Codebook = .mul1,
@@ -4308,6 +4310,15 @@ pub fn streamingDropsWeightKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "language_model.mtp.");
 }
 
+pub const StreamingLoad = struct { layout: expert_quant.Layout, keep_mtp: bool = false };
+
+/// The resident key a streamed load keeps, or null. A kept MTP head loads its own routed
+/// experts: the stream engine serves only the trunk's MoE layers.
+pub fn streamedResidentKey(load: StreamingLoad, buf: []u8, key: []const u8) ?[]const u8 {
+    if (load.keep_mtp and std.mem.startsWith(u8, key, "language_model.mtp.") and expert_quant.isRoutedExpertKey(load.layout, key)) return key;
+    return qwen4StreamingWeightKey(load.layout, buf, key);
+}
+
 pub fn qwen4StreamingWeightKey(layout: expert_quant.Layout, buf: []u8, key: []const u8) ?[]const u8 {
     if (expert_quant.isRoutedExpertKey(layout, key)) return null;
     if (layout == .mxfp4_split or layout == .mxfp4_individual) {
@@ -4387,7 +4398,7 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
                 if (owner == .string and !std.mem.eql(u8, owner.string, entry.name) and referenced.contains(owner.string)) continue;
             };
             const canonical = if (streaming) |layout|
-                qwen4StreamingWeightKey(layout, &key_buf, tensor.key_ptr.*) orelse continue
+                streamedResidentKey(.{ .layout = layout, .keep_mtp = true }, &key_buf, tensor.key_ptr.*) orelse continue
             else
                 tensor.key_ptr.*;
             if (!shouldKeepWeightKey(canonical, vision)) continue;
@@ -4575,7 +4586,7 @@ pub fn loadWeightsForConfig(
         logMimoSourceLoad(config, false);
         return @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
     }
-    if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout);
+    if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, config.stream_mtp_head);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
     var weights = if (load_vision)
         try loadWeightsWithVision(io, allocator, model_dir)
@@ -4587,11 +4598,11 @@ pub fn loadWeightsForConfig(
     return weights;
 }
 
-pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !Weights {
+pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout, keep_mtp: bool) !Weights {
     if (layout == .mxfp4_individual) return loadWeightsMimoSource(io, allocator, model_dir, false);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, false, layout);
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, false, .{ .layout = layout, .keep_mtp = keep_mtp });
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -4634,7 +4645,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null);
 }
 
-fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?expert_quant.Layout) !Weights {
+fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?StreamingLoad) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
@@ -4882,13 +4893,13 @@ fn loadSafetensorsFileMode(
     path: [*:0]const u8,
     s: mlx.mlx_stream,
     load_vision: bool,
-    streaming: ?expert_quant.Layout,
+    streaming: ?StreamingLoad,
     shard: ?ShardOwners,
 ) !void {
     // Only the dense HF layout needs the converter's work at load time: the
     // fused bank split, the delta norms and the conv transpose. An MLX pack
     // ships every resident tensor in its serving layout already.
-    const fused_streaming = streaming != null and streaming.? == .bf16_fused;
+    const fused_streaming = streaming != null and streaming.?.layout == .bf16_fused;
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
 
@@ -4918,15 +4929,15 @@ fn loadSafetensorsFileMode(
             }
         };
         var key_buf: [512]u8 = undefined;
-        const key_str = if (streaming) |layout|
-            qwen4StreamingWeightKey(layout, &key_buf, key_str_raw) orelse {
+        const key_str = if (streaming) |load|
+            streamedResidentKey(load, &key_buf, key_str_raw) orelse {
                 _ = mlx.mlx_array_free(value);
                 continue;
             }
         else
             key_str_raw;
 
-        if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and streamingDropsWeightKey(key_str))) {
+        if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and !streaming.?.keep_mtp and streamingDropsWeightKey(key_str))) {
             _ = mlx.mlx_array_free(value);
             continue;
         }
@@ -8118,7 +8129,7 @@ test "qwen4 streaming loader materializes only transformed resident tensors" {
     @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
 
-    var weights = try loadWeightsStreaming(io, allocator, model_dir, .bf16_fused);
+    var weights = try loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false);
     defer weights.deinit();
     try t.expect(weights.get("model.language_model.layers.0.mlp.experts.gate_up_proj") == null);
     try t.expect(weights.get("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight") == null);
@@ -8162,10 +8173,10 @@ test "a streamed load that fails mid-transform frees the tensor it was holding" 
             return n;
         }
     };
-    try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused));
+    try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false));
     const before = FdProbe.count(io);
     for (0..8) |_| {
-        try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused));
+        try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false));
     }
     const after = FdProbe.count(io);
     try t.expect(after <= before + 1);
@@ -8191,7 +8202,7 @@ test "the streamed load drops the MTP head the ledger bills at zero" {
     @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
 
-    var weights = try loadWeightsStreaming(io, allocator, path_buf[0..path_len], .bf16_fused);
+    var weights = try loadWeightsStreaming(io, allocator, path_buf[0..path_len], .bf16_fused, false);
     defer weights.deinit();
     try t.expect(weights.get("language_model.model.layers.0.mlp.gate.weight") != null);
     var it = weights.map.iterator();
@@ -9295,7 +9306,7 @@ test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default
     try testing.expectEqual(@as(u32, 47), c.expertLayerCount());
     try testing.expect(!stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 0));
     try testing.expect(stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 20 << 30));
-    try testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false));
+    try testing.expectEqual(stream.MtpUnderStreaming.keep, stream.mtpUnderStreaming(true, false, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_settings, stream.mtpUnderStreaming(true, true, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_default, stream.mtpUnderStreaming(true, false, true));
 }
