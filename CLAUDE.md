@@ -44,6 +44,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`); `engine-`, `serve
 | [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | mlx-serve's pin of `sushi_exl3`, the API it calls, handoff |
+| [docs/mlx-serve-sync.md](docs/mlx-serve-sync.md) | ledger of upstream mlx-serve reviews: cursor, speed and bug-fix verdicts, how to run the next pass |
 | [docs/engine-expert-streaming.md](docs/engine-expert-streaming.md) | SSD budget ledger, per-layer LRU, slab I/O, imatrix capture, discovery |
 | [docs/engine-mtp.md](docs/engine-mtp.md) | native MTP head, verify invariant, draft re-scoring, round-cost table, head KV/norms |
 | [docs/engine-kv-cache.md](docs/engine-kv-cache.md) | kv8 default, kv-quant contract, growth, GDN step, byte-stability settings |
