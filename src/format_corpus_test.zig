@@ -402,6 +402,16 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
         .tool_arg_value = "mkdir -p src/app",
     },
+    .{
+        // The `>` after the function name is missing; a `>`-scan ran into the next
+        // tag and made the name `read_file\n<parameter=path`, which dropped the call.
+        .family = "hermes",
+        .name = "function name with a missing > ends at the line break",
+        .raw = "<tool_call>\n<function=read_file\n<parameter=path>\n./notes.md\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "./notes.md",
+    },
     // ── MiMo-V2.6 (<think> family, the model opens its own block) ───────────
     // Shaped as the checkpoint's own template renders an assistant turn:
     // `<think>R</think>` then content, tool calls unframed inside
@@ -2057,6 +2067,10 @@ test "format corpus: recorded model outputs across families" {
                 }
                 if (std.mem.indexOf(u8, tc.name, "<|") != null) {
                     try fail(entry, "tool NAME carries a channel marker", tc.name);
+                }
+                // A tool name never spans a line or a tag.
+                if (std.mem.indexOfAny(u8, tc.name, "\n\r<>") != null) {
+                    try fail(entry, "tool NAME carries a line break or markup", tc.name);
                 }
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch {
                     try fail(entry, "tool arguments are not valid JSON", tc.arguments);

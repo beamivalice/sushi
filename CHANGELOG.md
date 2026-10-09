@@ -17,6 +17,7 @@ earlier history is mlx-serve's, in that project's changelog.
   architecture, including GLM-5.3-Flash's, with output identical to the reference readers.
 - **Structured output**: a `response_format` schema property that names no type (a bare `description`, `true` or `{}`) now accepts any JSON object instead of only `{}`.
 - **Structured output**: `response_format` schemas may use `$ref` to `#`, `#/$defs/Name` or `#/definitions/Name`, recursive refs included, so nested Pydantic or Zod models are enforced instead of collapsing to `{}`.
+- **Tool calls**: a `<function=name` whose closing `>` the model dropped is recovered with its parameters instead of the call being lost as plain text.
 
 ---
 
