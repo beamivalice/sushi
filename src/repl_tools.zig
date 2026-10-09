@@ -76,7 +76,7 @@ const refuse_hidden = "refused: hidden files and folders are off limits";
 const refuse_secret = "refused: that file may hold secrets";
 const refuse_missing = "no such file or folder";
 const refuse_not_a_file = "refused: that names a folder; the write tools need a file name";
-const refuse_write_off = "refused: writing files is off; the user turns it on with the pencil chip in the chat page or /edit on in the REPL, so ask for that instead of trying other paths";
+const refuse_write_off = "refused: writing files is off; the user turns it on with the Edit chip in the chat page or /edit on in the REPL, so ask for that instead of trying other paths";
 
 fn componentRefusal(rel: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeScalar(u8, rel, '/');

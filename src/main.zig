@@ -88,9 +88,10 @@ fn printUsage(io: std.Io) void {
         \\                      /think <effort> changes it in the chat;
         \\                      --tool on (or /tool on) lets the model search the
         \\                      web, fetch pages and read files in the current
-        \\                      folder, read-only (off by default); --edit on (or
-        \\                      /edit on) adds write_file and edit_file, still
-        \\                      inside that folder and off by default; /cd
+        \\                      folder, read-only (off by default); /edit on|off
+        \\                      (or the browser's Edit chip) adds write_file and
+        \\                      edit_file, still inside that folder; they start
+        \\                      off unless launched with --edit on; /cd
         \\                      <folder> moves that folder; /image <path> shows a
         \\                      vision model an image (a relative path is read
         \\                      from that folder). The prompt shows the folder and

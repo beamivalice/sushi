@@ -96,10 +96,11 @@ import json, pathlib, sys
 work = pathlib.Path(sys.argv[1])
 for filename, path in [("read.json", "note.txt"), ("outside.json", "../outside")]:
     (work / filename).write_text(json.dumps({"directory": str(work / "picked"), "name": "read_file", "arguments": json.dumps({"path": path})}))
-# A write call the server was not started with --edit for; a file keeps the nested JSON quoting out of bash.
-(work / "write_off.json").write_text(json.dumps({
-    "directory": str(work / "picked"), "name": "write_file", "write": True,
-    "arguments": json.dumps({"path": "off.md", "content": "x\n"})}))
+# Write calls from a chat with its pencil off and on; a file keeps the nested JSON quoting out of bash.
+for filename, path, on in [("write_off.json", "off.md", False), ("write_on.json", "on.md", True)]:
+    (work / filename).write_text(json.dumps({
+        "directory": str(work / "picked"), "name": "write_file", "write": on,
+        "arguments": json.dumps({"path": path, "content": "x\n"})}))
 PYDATA
     check "tools read from the chosen folder" \
         "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
@@ -111,14 +112,17 @@ PYDATA
         "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{}' | python3 -c 'import json,os,sys; assert json.load(sys.stdin)["root"] == os.path.realpath(".")' && echo 1 || echo 0)"
     check "invalid selected directory is rejected" \
         "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{"directory":"/sushi-folder-does-not-exist"}')" 400)"
-    check "the listing says this server was started without --edit" \
-        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{"write":true}' \
-            | grep -q '"edit_allowed":false' && echo 1 || echo 0)"
-    check "a write call is refused while editing is off" \
+    check "without --edit a new chat starts with editing off" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{}' \
+            | grep -q '"edit_default":false' && echo 1 || echo 0)"
+    check "a write call is refused while the chat's editing is off" \
         "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
         --data-binary @"$WORK/write_off.json" | grep -q 'writing files is off' && echo 1 || echo 0)"
     check "a refused write leaves no file behind" \
         "$(is "$(find "$WORK/picked" -name 'off.md' | wc -l | tr -d ' ')" 0)"
+    check "a chat that turns editing on writes without any launch flag" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
+        --data-binary @"$WORK/write_on.json" | grep -q 'wrote 2 bytes' && [ -f "$WORK/picked/on.md" ] && echo 1 || echo 0)"
     check "POST / is 405" "$(is "$(code -X POST "$BASE/" -d '{}')" 405)"
     check "GET /health still answers ok" "$(is "$(curl -s "$BASE/health")" '{"status":"ok"}')"
     check "GET /v1/models still lists" "$(is "$(curl -s "$BASE/v1/models")" '{"object":"list","data":[]}')"
@@ -131,14 +135,14 @@ else
     check "boot" 0
 fi
 
-echo "[2/5] --edit on: the chat page writes inside the folder it picked"
+echo "[2/5] --edit on: new chats start with editing on, and writes stay in the folder"
 if boot --edit on; then
     python3 - "$WORK" <<'PYDATA'
 import json, pathlib, sys
 work = pathlib.Path(sys.argv[1])
 picked = str(work / "picked")
 calls = {
-    "edit_allowed.json": {"write": True},
+    "listing.json": {"write": True},
     "write_note.json": {"directory": picked, "write": True, "name": "write_file",
                         "arguments": json.dumps({"path": "written.md", "content": "first line\n"})},
     "edit_note.json": {"directory": picked, "write": True, "name": "edit_file",
@@ -154,8 +158,8 @@ for filename, body in calls.items():
     (work / filename).write_text(json.dumps(body))
 PYDATA
     tools_post() { curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' --data-binary @"$WORK/$1"; }
-    check "the listing says editing is allowed and offers both write tools" \
-        "$(tools_post edit_allowed.json | python3 -c 'import json,sys; x=json.load(sys.stdin); names=[t["function"]["name"] for t in x["tools"]]; assert x["edit_allowed"] is True and "write_file" in names and "edit_file" in names' 2>/dev/null && echo 1 || echo 0)"
+    check "the listing says new chats start with editing on and offers both write tools" \
+        "$(tools_post listing.json | python3 -c 'import json,sys; x=json.load(sys.stdin); names=[t["function"]["name"] for t in x["tools"]]; assert x["edit_default"] is True and "write_file" in names and "edit_file" in names' 2>/dev/null && echo 1 || echo 0)"
     check "write_file creates the file in the chosen folder" \
         "$(tools_post write_note.json | grep -q 'wrote 11 bytes' && [ "$(cat "$WORK/picked/written.md" 2>/dev/null)" = "first line" ] && echo 1 || echo 0)"
     check "edit_file changes that file in place" \

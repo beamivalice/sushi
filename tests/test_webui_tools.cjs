@@ -114,7 +114,7 @@ assert.equal(context.toolCallLabel({ function: { name: 'edit_file', arguments: '
 assert.equal(context.toolCallLabel({ function: { name: 'fetch_url', arguments: '{' } }), 'fetch_url');
 assert.equal(context.toolCallLabel({ function: { name: 'web_search', arguments: 'null' } }), 'web_search');
 console.log('Web UI tool labels: passed');
-/* The pencil chip: per-chat state, reset when the folder changes, gated by the server ceiling. */
+/* The pencil chip: per-chat state, reset to the --edit default when the folder changes. */
 const editStart = script.indexOf('function chatDirectory(');
 const editNodes = {};
 const editEl = (id) => (editNodes[id] ??= { id, textContent: '', title: '', disabled: null, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
@@ -125,57 +125,48 @@ const editCtx = vm.createContext({
   currentChat: null,
   draftDirectory: '',
   draftEdit: false,
-  editCeiling: true,
+  editDefault: false,
   touchChat: () => {},
-  callResearchTools: async () => ({ edit_allowed: true }),
-  toast: (message) => { editCtx.toasted = message; },
+  callResearchTools: async () => ({ edit_default: true }),
 });
 vm.runInContext(script.slice(editStart, script.indexOf('let folderSelection', editStart)), editCtx);
 
-editCtx.currentChat = { id: 'c1', directory: '/a', edit: false };
-editCtx.renderDirectoryButton();
-assert.equal(editCtx.chatEdit(), false);
-editNodes.editButton.onclick();
-assert.equal(editCtx.currentChat.edit, true);
-editCtx.setChatDirectory('/b');
-assert.equal(editCtx.currentChat.directory, '/b');
-assert.equal(editCtx.currentChat.edit, false, 'editing starts off again on another folder');
+(async () => {
+  editCtx.currentChat = { id: 'c1', directory: '/a', edit: false };
+  editCtx.renderDirectoryButton();
+  assert.equal(editCtx.chatEdit(), false);
+  assert.equal(editNodes.editButton.hidden, false, 'no server flag is needed to switch it');
+  editNodes.editButton.onclick();
+  assert.equal(editCtx.currentChat.edit, true);
+  assert.equal(editNodes.editName.textContent, 'Edit on');
+  assert.equal(editNodes.editButton.attrs['aria-pressed'], 'true');
+  editCtx.setChatDirectory('/b');
+  assert.equal(editCtx.currentChat.directory, '/b');
+  assert.equal(editCtx.currentChat.edit, false, 'editing starts over from the default on another folder');
 
-editCtx.currentChat = null;
-editCtx.draftEdit = true;
-editNodes.editButton.onclick();
-assert.equal(editCtx.draftEdit, false, 'the pencil toggles the draft chat too');
-editNodes.editButton.onclick();
-editCtx.setChatDirectory('/c');
-assert.equal(editCtx.draftDirectory, '/c');
-assert.equal(editCtx.draftEdit, false);
+  editCtx.currentChat = null;
+  editCtx.draftEdit = true;
+  editNodes.editButton.onclick();
+  assert.equal(editCtx.draftEdit, false, 'the pencil toggles the draft chat too');
 
-editCtx.editCeiling = null;
-editCtx.renderEditButton();
-assert.equal(editNodes.editButton.attrs['aria-disabled'], 'true');
-assert.match(editNodes.editButton.title, /Asking/);
-editCtx.editCeiling = false;
-editCtx.renderEditButton();
-assert.equal(editNodes.editButton.disabled, false, 'a click must still explain why');
-assert.equal(editNodes.editButton.attrs['aria-disabled'], 'true');
-assert.match(editNodes.editButton.title, /--edit/);
-editNodes.editButton.onclick();
-assert.equal(editCtx.chatEdit(), false, 'the server ceiling keeps writes off');
-assert.match(editCtx.toasted, /--edit on/);
-editCtx.editCeiling = true;
-editCtx.renderEditButton();
-assert.equal(editNodes.editButton.attrs['aria-disabled'], 'false');
-editCtx.setChatEdit(true);
-assert.equal(editNodes.editName.textContent, 'Edit on');
-assert.equal(editNodes.editButton.attrs['aria-pressed'], 'true');
-editCtx.toolsEnabled = false;
-editCtx.renderEditButton();
-assert.equal(editNodes.editButton.attrs['aria-disabled'], 'true', 'no tool pack means no writes');
-assert.equal(editNodes.editName.textContent, 'Edit off');
-editCtx.toasted = '';
-editNodes.editButton.onclick();
-assert.match(editCtx.toasted, /Tools/);
-editCtx.chatAbort = {};
-editCtx.renderEditButton();
-assert.equal(editNodes.editButton.disabled, true, 'fixed while a reply runs');
-console.log('Web UI edit chip: per-chat state, folder reset, server ceiling passed');
+  await editCtx.loadEditDefault();
+  assert.equal(editCtx.editDefault, true);
+  assert.equal(editCtx.draftEdit, true, '--edit on starts a new chat with editing on');
+  editCtx.currentChat = { id: 'c2', directory: '/a', edit: false };
+  editCtx.setChatDirectory('/c');
+  assert.equal(editCtx.currentChat.edit, true);
+  editNodes.editButton.onclick();
+  assert.equal(editCtx.currentChat.edit, false, '--edit on is a default, not a lock');
+
+  editCtx.toolsEnabled = false;
+  editCtx.renderEditButton();
+  assert.equal(editNodes.editButton.hidden, true, 'no tool pack, no edit chip');
+  editCtx.toolsEnabled = true;
+  editCtx.renderEditButton();
+  assert.equal(editNodes.editButton.hidden, false);
+  assert.equal(editNodes.editName.textContent, 'Edit off');
+  editCtx.chatAbort = {};
+  editCtx.renderEditButton();
+  assert.equal(editNodes.editButton.disabled, true, 'fixed while a reply runs');
+  console.log('Web UI edit chip: per-chat state, folder reset, --edit default passed');
+})().catch((error) => { console.error(error); process.exit(1); });

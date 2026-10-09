@@ -315,10 +315,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 
 - The composer's **Tools on/off** button enables the same research pack as `sushi run`, off by default.
   The preference persists in this browser. It is fixed for a turn; the button is disabled while a reply runs.
-- The **pencil chip** next to Folder turns `write_file` and `edit_file` on for that chat only. It starts
-  off for every new chat, travels with the saved chat, and goes back off the moment the chat's folder
-  changes. With Tools off or a server started without `--edit on` it stays off and dimmed, and a click
-  says why in a toast — the page can ask for less than the server allows, never more.
+- The **Edit chip** after Tools shows only while Tools is on and turns `write_file` and `edit_file` on for that
+  chat only. A new chat starts from the server's `--edit` (off unless launched with `--edit on`); the state
+  travels with the saved chat and returns to that default when the chat's folder changes.
 - The browser sends definitions, assembles streamed tool calls, executes them through `POST /v1/tools`, and
   sends results back to the model. Eight tool rounds maximum, then the REPL's nudge (never saved to the chat) and a final request without tools.
   Results are collapsible in the transcript. Tool rows show the query, URL or file argument on one line,
@@ -331,8 +330,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - `POST /v1/tools` with `{ "vision": false }` lists definitions and the file root. With `name`, JSON-string
   `arguments`, and `vision`, it executes one call and returns `text` plus optional `image` data URL.
   `directory` optionally selects an absolute folder, resolved and validated with the REPL's `/cd` checks.
-  `write` (boolean) is the chat's pencil chip; the listing answers with `edit_allowed` (the server's `--edit`
-  ceiling) and offers the two write tools only when ceiling and request are both on.
+  `write` (boolean) is the chat's Edit chip and alone decides whether the two write tools are offered and run;
+  the listing answers with `edit_default` (the server's `--edit`, what a new chat starts with).
   With `browse: true`, the endpoint instead returns `root`, `parent`, `directories`, and `truncated` for the
   picker (up to 1000 visible, non-secret subfolders). The browser passes the selected canonical directory
   separately from model arguments on every call. Vision models get `view_image`; returned images remain in memory only.
@@ -340,7 +339,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   It works from `localhost` or `127.0.0.1`, not a remote browser or wildcard bind. File tools are confined to
   the chat's selected folder, with the existing hidden/secret-file and symlink checks; network tools keep
   the REPL's public-address restrictions. No MCP configuration is added.
-- Writing rides the same bridge and gate (loopback peer, loopback bind, the page's Origin); `--edit` defaults off.
+- Writing rides the same bridge and gate (loopback peer, loopback bind, the page's Origin); every chat starts off.
   The model never supplies `directory`: the page does, from its own per-chat state, so no tool call moves the root.
 - Same-origin rule: `POST /v1/load-model`, `/v1/unload-model`, `/v1/models/rescan` and the `/v1/responses` WebSocket
   upgrade answer 403 when the request carries an Origin other than this server's own page (`crossOriginRefused`);
@@ -379,9 +378,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   a secret name refused; bare `/cd` shows it). `..`, outside absolutes and escaping symlinks are refused, as are dot
   entries and secret names (`.env*`, `*.pem`, `*.key`, `id_*`, `*.p12`, `credentials*`, `*.keychain*`, `.ssh`,
   `.aws`, `.gnupg`), checked both as typed and after resolution (`confinePath`).
-- **Editing is a second switch on top of the file tools**: `--edit on|off` and `/edit on|off` (needs `/tool on` too),
-  the per-chat pencil chip on the page (capped by `--edit`). `write_file`/`edit_file` are offered only while it is on;
-  a write call with it off is refused with how to turn it on.
+- **Editing is a second switch on top of the file tools**: `/edit on|off` in the REPL (needs `/tool on` too) and the
+  per-chat Edit chip on the page; `--edit on` only sets the starting state of both. `write_file`/`edit_file` are
+  offered only while it is on; a write call with it off is refused with how to turn it on.
 - **A new file is confined through its parent.** `realpath(3)` fails on a missing last component, so
   `confineWriteTarget` falls back to `confineNewPath` (real parent re-checked with `within` + `componentRefusal`);
   dot and secret names stay refused, so a chat at `$HOME` cannot touch `.zshrc`.

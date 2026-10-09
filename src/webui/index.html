@@ -540,7 +540,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 #toolsButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
 #editButton { flex: none; white-space: nowrap; }
 #editButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
-#editButton[aria-disabled="true"] { opacity: .6; }
+#editButton[hidden] { display: none; }
 .tool-write > summary { color: var(--accent); }
 .chip-toggle svg { width: 13px; height: 13px; flex: none; }
 .chip-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -772,8 +772,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
             <input id="attachInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple hidden>
             <button class="chip-toggle" id="composerModelLabel" title="Choose the model and thinking effort" aria-label="Choose the model and thinking effort"><svg><use href="#i-box"/></svg><span id="composerModelName">no model</span><span>/</span><span id="composerEffortName">—</span></button>
             <button class="chip-toggle" id="directoryButton" title="Choose the folder for this chat's file tools" aria-haspopup="dialog"><span id="directoryName">Folder</span></button>
-            <button class="chip-toggle" id="editButton" aria-pressed="false" title="Let the model write and edit files in this chat's folder"><svg><use href="#i-pencil"/></svg><span id="editName">Edit off</span></button>
             <button class="chip-toggle" id="toolsButton" aria-pressed="false" title="Enable web search, page fetching and file tools in the server folder">Tools off</button>
+            <button class="chip-toggle" id="editButton" aria-pressed="false" hidden title="Let the model write and edit files in this chat's folder"><svg><use href="#i-pencil"/></svg><span id="editName">Edit off</span></button>
             <span class="spacer"></span>
             <button id="stopButton" aria-label="Stop generating" title="Stop" hidden><svg><use href="#i-stop"/></svg></button>
             <button id="sendButton" aria-label="Send message" title="Send"><svg><use href="#i-send"/></svg></button>
@@ -1616,8 +1616,8 @@ let chats = loadChats();
 let currentChat = null;
 let draftDirectory = "";
 let draftEdit = false;
-// What the server allows for writing, from the last /v1/tools listing: null until asked.
-let editCeiling = null;
+// Whether a new chat starts with editing on: the server's --edit, read once at load.
+let editDefault = false;
 let chatAbort = null;
 let lastTurnError = null;
 let renamingChatId = null;
@@ -1760,7 +1760,7 @@ function newChat() {
   if (chatAbort) chatAbort.abort();
   currentChat = null;
   draftDirectory = "";
-  draftEdit = false;
+  draftEdit = editDefault;
   lastTurnError = null;
   renderTranscript();
   renderConversationList();
@@ -2033,7 +2033,7 @@ $("toolsButton").onclick = () => {
   toolsEnabled = !toolsEnabled;
   writeStore("sushi-tools", toolsEnabled ? "on" : "off");
   renderToolsButton();
-  refreshEditCeiling();
+  renderEditButton();
 };
 renderToolsButton();
 renderEditButton();
@@ -2052,15 +2052,15 @@ function chatDirectory() {
 function chatEdit() {
   return currentChat ? !!currentChat.edit : draftEdit;
 }
-// Write access is granted to one folder: choosing another one starts editing off again.
+// Write access is granted to one folder: choosing another one starts editing over from the default.
 function setChatDirectory(root) {
   if (currentChat) {
     currentChat.directory = root;
-    currentChat.edit = false;
+    currentChat.edit = editDefault;
     touchChat(currentChat);
   } else {
     draftDirectory = root;
-    draftEdit = false;
+    draftEdit = editDefault;
   }
   renderDirectoryButton();
 }
@@ -2078,41 +2078,26 @@ function renderDirectoryButton() {
   $("toolsButton").title = path ? `Web search, page fetching and files under ${path}` : "Enable web search, page fetching and file tools in the server folder";
   renderEditButton();
 }
+// Editing works through the file tools, so the chip shows only while Tools is on.
 function renderEditButton() {
   const on = chatEdit();
-  const allowed = editCeiling === true;
-  const live = on && allowed && toolsEnabled;
-  $("editName").textContent = live ? "Edit on" : "Edit off";
-  $("editButton").setAttribute("aria-pressed", String(live));
-  // Clickable even when writes are unavailable, so a click can say why; only a running reply fixes it.
+  $("editButton").hidden = !toolsEnabled;
   $("editButton").disabled = !!chatAbort;
-  $("editButton").setAttribute("aria-disabled", String(!toolsEnabled || !allowed));
-  $("editButton").title = !toolsEnabled ? "Turn the file tools on first"
-    : editCeiling === null ? "Asking this server what it allows for writing…"
-    : !allowed ? "This server was started without --edit, so the model cannot write files"
-    : on ? `The model can write and edit files under ${chatDirectory() || "this chat's folder"}`
+  $("editName").textContent = on ? "Edit on" : "Edit off";
+  $("editButton").setAttribute("aria-pressed", String(on));
+  $("editButton").title = on ? `The model can write and edit files under ${chatDirectory() || "this chat's folder"}`
     : "Let the model write and edit files in this chat's folder";
 }
-// Asks the bridge what it allows for writing, so the pencil can say why before a turn runs.
-async function refreshEditCeiling() {
-  if (!toolsEnabled) {
-    editCeiling = null;
-    renderEditButton();
+async function loadEditDefault() {
+  try {
+    editDefault = (await callResearchTools({})).edit_default === true;
+  } catch {
     return;
   }
-  try {
-    editCeiling = (await callResearchTools({})).edit_allowed === true;
-  } catch {
-    editCeiling = false;
-  }
+  if (!currentChat) draftEdit = editDefault;
   renderEditButton();
 }
-$("editButton").onclick = () => {
-  if (!toolsEnabled) return toast("Turn Tools on first: editing works through the file tools", "err");
-  if (editCeiling === null) return toast("Still asking this server whether it allows writing", "err");
-  if (!editCeiling) return toast("This server was started without --edit on; restart it with --edit on to let the model write files", "err");
-  setChatEdit(!chatEdit());
-};
+$("editButton").onclick = () => setChatEdit(!chatEdit());
 let folderSelection = null;
 let folderAbort = null;
 async function browseChatFolder(directory) {
@@ -2406,7 +2391,6 @@ async function runTurn(chat) {
     const pack = toolsEnabled ? await callResearchTools({ vision, write: !!chat.edit, ...(chat.directory ? { directory: chat.directory } : {}) }, chatAbort.signal) : null;
     if (pack) {
       chat.directory = pack.root;
-      editCeiling = pack.edit_allowed === true;
       renderDirectoryButton();
       $("toolsButton").title = `Web search, page fetching and files under ${pack.root}`;
     }
@@ -2510,7 +2494,7 @@ async function init() {
   refreshServerDot();
   setInterval(refreshServerDot, 10_000);
   await refreshModels().catch(() => {});
-  refreshEditCeiling();
+  loadEditDefault();
   loadVersion();
   setInterval(loadVersion, 300_000);
   setInterval(() => {
