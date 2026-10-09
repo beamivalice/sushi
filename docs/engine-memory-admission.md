@@ -280,7 +280,28 @@ Sushi-2.4bpw, `serve` defaults, `taskpolicy -a`, lock held, 2026-10-08, ~90 GB f
 source trunk (`mimo_source.readTensor`) and every `model.loadSafetensorsFile` shard (Qwen, streamed trunks) read the
 same way; the latter no longer goes through `mlx_load_safetensors`, whose descriptor cannot take `F_NOCACHE`. Qwen3.8-Flash-Next-Sushi-4bpw
 (64 GB resident), same settings, A F A F: compressor +5.7/+4.3 GB → +0.0/+0.0 GB, no swap either way, listening 12/8 s →
-13/10 s (`mlx_load_safetensors` → sushi's own aligned reader). MLX lazy safetensor Load nodes
+13/10 s (`mlx_load_safetensors` → sushi's own aligned reader).
+
+Landing A/B of the merged loader (`39e546a4` vs its base `d28a87ee`, first run then four reruns; `serve` defaults, `taskpolicy -a`,
+one GPU lock per boot, M5 Max 128 GB, 2026-10-10). To `[kv-cache]` is the weight-upload phase, Listening the full
+boot, Warmup the first-prompt weight warmup, Compressor the memory-compressor growth during the load:
+
+| Pack        | Arm  | To `[kv-cache]` | Listening | Warmup  | Compressor |
+| ----------- | ---- | --------------: | --------: | ------: | ---------: |
+| Qwen 4bpw   | main | 5.36 s          | 8.30 s    | —       | +4.3 GB    |
+| Qwen 4bpw   | PR   | 7.27 s          | 11.65 s   | 949 ms  | +0.2 GB    |
+| GLM 2.4bpw  | main | 14.25 s         | 22.18 s   | 6219 ms | +57.3 GB   |
+| GLM 2.4bpw  | PR   | 9.47 s          | 12.23 s   | 1427 ms | +6.7 GB    |
+| MiMo 2.3bpw | main | 14.95 s         | 25.67 s   | 843 ms  | +56.1 GB   |
+| MiMo 2.3bpw | PR   | 9.56 s          | 15.06 s   | 859 ms  | +4.6 GB    |
+
+Qwen 4bpw, the four reruns: main 5.26/5.25/5.22/5.27 s to `[kv-cache]`, listening 10.00/9.28/8.99/9.14 s, warmup
+543 then 80/81/80 ms, spec-warmup 3.04/2.73/2.67/2.66 s, compressor +3.5 to +4.0 GB; PR 6.66/6.74/6.58/6.69 s,
+listening 10.67/9.96/9.72/9.89 s, warmup 683 then 88/85/86 ms, spec-warmup 2.82/2.63/2.55/2.61 s, compressor
++0.2 then 0. Qwen pays ~1.4 s of upload (per-tensor page-mapped reads instead of one bulk MLX read) for a
+compressor at ~zero; GLM and MiMo win on time and compression alike, ~57 GB of load-time compression down to <7 GB.
+
+MLX lazy safetensor Load nodes
 kept one descriptor per shard alive until evaluation, so the 566-shard affine pack
 exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from
