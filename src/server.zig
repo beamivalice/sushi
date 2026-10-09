@@ -1436,6 +1436,15 @@ fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const T
 
 const TOOL_CHOICE_UNDECLARED = "tool_choice names a function that is not in tools";
 
+/// The decode-time half of tool_choice "none": the template's call opener, banned when it is one
+/// token, so a model that sees earlier calls in the history cannot write one as plain text.
+fn noneCallBan(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig) ?@import("logit_bias.zig").Bias {
+    const opener = (chat_mod.callOpener(allocator, chat_config) catch null) orelse return null;
+    defer allocator.free(opener);
+    const id = atomicTokenId(allocator, tok, opener) orelse return null;
+    return .{ .id = id, .delta = -100 };
+}
+
 /// Arm the decode-time half of a forced tool_choice (required or named), or
 /// null when the choice forces nothing or the call cannot be committed: no
 /// call markup the template writes after a closed thought, a prompt-opened
@@ -9706,7 +9715,10 @@ fn handleChatCompletions(
         return;
     } else &.{};
     defer allocator.free(request_bias);
-    sampling.think_penalty.biases = request_bias;
+    const none_ban = if (tool_choice == .none and lm.transformer != null) noneCallBan(allocator, tok, chat_config) else null;
+    const biases = if (none_ban) |ban| try std.mem.concat(allocator, @import("logit_bias.zig").Bias, &.{ request_bias, &.{ban} }) else request_bias;
+    defer if (none_ban != null) allocator.free(biases);
+    sampling.think_penalty.biases = biases;
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
@@ -25723,6 +25735,28 @@ test "tool_choice auto and none arm no forced call" {
     defer a.free(ids);
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .auto, null) == null);
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .none, null) == null);
+}
+
+test "tool_choice none bans each family's one-token call opener, and nothing else" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>" });
+    defer deinitTestTokenizer(&tok);
+    var split = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    defer deinitTestTokenizer(&split);
+    for ([_][]const u8{
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+        @embedFile("fixtures/mimo_v26_chat_template.jinja"),
+        @embedFile("fixtures/glm53_chat_template.jinja"),
+    }) |tpl| {
+        var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        const ban = noneCallBan(a, &tok, &config) orelse return error.OpenerNotBanned;
+        try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, ban.id);
+        try std.testing.expectEqual(@as(f32, -100), ban.delta);
+        // An opener the tokenizer splits would ban its first piece, a plain `<`, everywhere.
+        try std.testing.expect(noneCallBan(a, &split, &config) == null);
+    }
 }
 
 /// Render one turn as the surface builds it: Responses input (with `instructions`)

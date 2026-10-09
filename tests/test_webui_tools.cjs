@@ -17,7 +17,9 @@ const history = [
   { role: 'tool', tool_call_id: 'c1', content: 'Found a page' },
 ];
 assert.equal(context.buildRequest('test', history).tools, undefined);
+assert.equal(context.buildRequest('test', history).tool_choice, 'none', 'no tools offered: the server bans call markup');
 assert.deepEqual(context.buildRequest('test', history, tools).tools, tools);
+assert.equal(context.buildRequest('test', history, tools).tool_choice, undefined);
 const wire = context.wireMessages(history);
 assert.equal(wire.length, 3);
 assert.equal(wire[1].tool_calls[0].id, 'c1');
@@ -38,6 +40,8 @@ const call = (id) => ({ id, type: 'function', function: { name: 'web_search', ar
       return { text: '', tool_calls: [call(`c${count}`)] };
     }
     assert.equal(defs, null);
+    assert.equal(messages.at(-1).role, 'user');
+    assert.match(messages.at(-1).content, /Answer now/);
     return { text: 'Done', tool_calls: [] };
   };
   context.callResearchTools = async (body) => { assert.equal(body.directory, "/selected/chat/folder"); assert.equal(body.write, true); executed++; return { text: 'Result' }; };
@@ -47,6 +51,7 @@ const call = (id) => ({ id, type: 'function', function: { name: 'web_search', ar
   assert.equal(executed, 8);
   assert.equal(messages.at(-1).content, 'Done');
   assert.equal(messages.filter((m) => m.role === 'tool').length, 8);
+  assert.ok(!messages.some((m) => /Answer now/.test(m.content)), 'the nudge rides the last request only, never the saved chat');
 
   const signal = { aborted: false };
   context.streamReply = async () => ({ text: '', tool_calls: [call('a'), call('b')] });

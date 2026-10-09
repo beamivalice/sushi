@@ -2183,7 +2183,9 @@ function wireMessages(history) {
 }
 function buildRequest(model, history, tools = null) {
   const body = { model, messages: wireMessages(history), stream: true, stream_options: { include_usage: true } };
+  // With no tools offered, the server bans call markup, so earlier calls cannot leak as text.
   if (tools?.length) body.tools = tools;
+  else body.tool_choice = "none";
   const effort = $("effortSelect").value;
   if (effort) body.reasoning_effort = effort;
   const numeric = [
@@ -2348,9 +2350,11 @@ function setChatBusy(busy) {
   renderEditButton();
 }
 async function runResearchTurn(model, messages, signal, tools, vision, directory, edit) {
+  const nudge = { role: "user", content: "You have used every tool round for this question. Answer now from the results above, without calling tools." };
   for (let round = 0; round <= 8; round++) {
     if (signal.aborted) return;
-    const result = await streamReply(model, messages, signal, round < 8 ? tools : null);
+    const final = round === 8 && tools?.length;
+    const result = await streamReply(model, final ? [...messages, nudge] : messages, signal, round < 8 ? tools : null);
     const calls = result.tool_calls ?? [];
     if (calls.length && (!tools?.length || round === 8)) throw new Error("Unexpected tool call with tools disabled");
     if (calls.some((call) => !call.id || !call.function?.name)) throw new Error("Incomplete tool call");

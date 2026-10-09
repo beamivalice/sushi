@@ -868,7 +868,9 @@ fn buildChatBody(allocator: std.mem.Allocator, history: []const Turn, think: Thi
         .on => try out.appendSlice(allocator, "\"enable_thinking\":true,"),
         .effort => |e| try out.print(allocator, "\"reasoning_effort\":\"{s}\",", .{@tagName(e)}),
     }
-    if (tools) |t| try out.print(allocator, "\"tools\":{s},", .{t});
+    // With no tools offered, the server bans call markup, so earlier calls in the history cannot
+    // lure the model into writing one as text.
+    if (tools) |t| try out.print(allocator, "\"tools\":{s},", .{t}) else try out.appendSlice(allocator, "\"tool_choice\":\"none\",");
     try out.appendSlice(allocator, "\"messages\":[");
     for (history, 0..) |turn, i| {
         if (i > 0) try out.append(allocator, ',');
@@ -2203,6 +2205,7 @@ test "cli: the tool loop stops offering tools after 8 rounds and asks for an ans
     try testing.expectEqual(@as(usize, max_tool_rounds + 1), stub.requests);
     try testing.expectEqual(@as(usize, max_tool_rounds), stub.requests_with_tools);
     try testing.expect(std.mem.indexOf(u8, stub.last_body.?, "\"tools\"") == null);
+    try testing.expect(std.mem.indexOf(u8, stub.last_body.?, "\"tool_choice\":\"none\"") != null);
     try testing.expectEqualStrings("final answer", history.items[history.items.len - 1].content);
     try testing.expectEqualStrings("user", history.items[history.items.len - 2].role);
     try testing.expectEqualStrings(tool_cap_nudge, history.items[history.items.len - 2].content);

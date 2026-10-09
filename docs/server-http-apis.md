@@ -320,7 +320,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   changes. It is disabled, with the reason in its tooltip, when the Tools chip is off or when the server
   was started without `--edit on` — the page can ask for less than the server allows, never more.
 - The browser sends definitions, assembles streamed tool calls, executes them through `POST /v1/tools`, and
-  sends results back to the model. Eight tool rounds maximum, followed by a final request without tools.
+  sends results back to the model. Eight tool rounds maximum, then the REPL's nudge (never saved to the chat) and a final request without tools.
   Results are collapsible in the transcript. Tool rows show the query, URL or file argument on one line,
   ellipsized to fit with the full label on hover (including saved conversations).
   Stop cancels browser requests and records cancelled results for

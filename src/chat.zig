@@ -835,8 +835,10 @@ pub const ForcedCall = struct {
 /// Read the forced call from the template's own rendering of an assistant tool
 /// call. Null when the template renders no think closer before the call to
 /// anchor on, or no delimiter after the function name.
-pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConfig, name: ?[]const u8) !?ForcedCall {
-    const probe_name = "__sushi_forced_call_probe__";
+const probe_name = "__sushi_forced_call_probe__";
+
+/// The template's rendering of a turn whose assistant calls `probe_name` after a closed thought.
+fn renderProbeCall(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?[]u8 {
     const calls = [_]ToolCall{.{ .id = "call_probe", .name = probe_name, .arguments = "{\"a\": \"v\"}" }};
     const probe = [_]Message{
         .{ .role = "user", .content = "u" },
@@ -844,17 +846,40 @@ pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConf
     };
     const extra_json = try serializeExtraContext(allocator, chat_config, true, null);
     defer allocator.free(extra_json);
-    const rendered = (try templateProbeRender(allocator, chat_config.chat_template, extra_json, &probe)) orelse return null;
-    defer allocator.free(rendered);
+    return templateProbeRender(allocator, chat_config.chat_template, extra_json, &probe);
+}
 
+/// Where the probe's call markup sits: `between` runs from the think closer to the name.
+const ProbeCall = struct { between: []const u8, head: []const u8, after: []const u8 };
+
+fn locateProbeCall(rendered: []const u8) ?ProbeCall {
     const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
     const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], BARE_THINK_CLOSER) orelse return null;
     const between = rendered[closer_at + BARE_THINK_CLOSER.len .. name_at];
     const head = std.mem.trimStart(u8, between, " \t\r\n");
     if (head.len == 0) return null;
-    const sep = between[0 .. between.len - head.len];
+    return .{ .between = between, .head = head, .after = rendered[name_at + probe_name.len ..] };
+}
 
-    const after = rendered[name_at + probe_name.len ..];
+/// The `<tag>` the template opens every tool call with (`<tool_call>`), or null when its call
+/// markup does not start with one.
+pub fn callOpener(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?[]u8 {
+    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    defer allocator.free(rendered);
+    const head = (locateProbeCall(rendered) orelse return null).head;
+    if (head[0] != '<') return null;
+    const end = std.mem.indexOfScalar(u8, head, '>') orelse return null;
+    return try allocator.dupe(u8, head[0 .. end + 1]);
+}
+
+pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConfig, name: ?[]const u8) !?ForcedCall {
+    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    defer allocator.free(rendered);
+    const at = locateProbeCall(rendered) orelse return null;
+    const head = at.head;
+    const sep = at.between[0 .. at.between.len - head.len];
+
+    const after = at.after;
     var delim: usize = 0;
     while (delim < after.len and delim < 4 and !nameByte(after[delim]) and !std.ascii.isWhitespace(after[delim]) and after[delim] != '<') delim += 1;
     if (delim == 0) return null;

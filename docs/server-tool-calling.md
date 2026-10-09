@@ -97,8 +97,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - **One parser, every wire shape** (`chat.parseToolChoice`): chat nests the name under `function`, Responses and
   Anthropic carry it flat, Anthropic spells required `any`; anything else is `auto`, which is unchanged.
-- **`none` is prompt-level plus the parser**: tools are withheld from the prompt and the reply is never parsed for
-  calls. No decode mask.
+- **`none` withholds the tools, skips the parser, and on chat completions bans the call opener**: a model that sees
+  earlier calls in the history writes one anyway, as raw text in the answer. `server.noneCallBan` adds a -100 bias on
+  the template's opener tag (`chat.callOpener`, `<tool_call>` on all three families) when it is one token, and leaves
+  it unbanned when the tokenizer splits it (its first piece would be a plain `<`). Drafts stay on: it is a request bias.
+  The chat page and `sushi run` send `tool_choice: "none"` on every request that offers no tools.
 - **`required`/`any` and a named function are enforced at decode** (`generate.CallForce`, armed by
   `server.armCallForce`): the markup the template itself writes after a closed thought (`chat.forcedCallText`; Qwen3.8
   `\n\n<tool_call>\n<function=`, MiMo `<tool_call><function=`) is committed as tokens, through the name and its
