@@ -57,10 +57,10 @@ per row stays flat enough. Wider trees and a measured-cost planner are already r
 
 | upstream | what | verdict | status |
 |---|---|---|---|
-| `9c0ca7fe`, `3129a772` | json_schema: `$ref` resolution, typeless nodes accept objects, cyclic `$ref` relaxes to any, `~0`/`~1` | **HAS-BUG**: no `$ref` handling; a typeless node forbids every key, so `items: {"$ref": ...}` completes only as `{}` (`response_format` without tools) | open; S for the typeless nodes, M for `$ref` |
+| `9c0ca7fe`, `3129a772` | json_schema: `$ref` resolution, typeless nodes accept objects, cyclic `$ref` relaxes to any, `~0`/`~1` | **HAS-BUG**: no `$ref` handling; a typeless node forbids every key, so `items: {"$ref": ...}` completes only as `{}` (`response_format` without tools) | fixed: `c7817d3b` (typeless nodes), `d73273a5` (`$ref`, cyclic relax, `~0`/`~1`) |
 | `f3da8d69` | `min_p` from the request and `generation_config.json` | **HAS-BUG**: the field is dropped silently | open; L (five sampling sites, spec/MTP densities must stay identical); only if llama.cpp-style clients matter |
-| `6ddac95f` | tool name escaping in the stream delta; name ends at `>`, newline or `<` | partial: delta already escapes; a missing `>` drops the call and leaks the tool markup as content | open; S, rare on Qwen3.8 and MiMo |
-| `348fd414` | `/v1/completions` token-id prompts, `echo` refused | **HAS-BUG (minor)**: ids get a misleading 400; `echo:true` is ignored | open; S, port `parseCompletionPrompt` and the `echo` 400 |
+| `6ddac95f` | tool name escaping in the stream delta; name ends at `>`, newline or `<` | partial: delta already escapes; a missing `>` drops the call and leaks the tool markup as content | fixed: `88c7773f` |
+| `348fd414` | `/v1/completions` token-id prompts, `echo` refused | **HAS-BUG (minor)**: ids get a misleading 400; `echo:true` is ignored | fixed: `5bbf5f5d` |
 | `2baca521` | forced tool opener must not end on a lone `=` | partial: no double open, no wrong name; the opener ends on `=` and names are encoded without it, so a multi-tool `required` choice starts off-distribution | open; needs a live multi-tool `required` test before changing |
 | `8f7f79f3` | coerce `oneOf`/`anyOf` object params from JSON text | not affected: `declaredJsonType` already resolves unions | closed |
 
