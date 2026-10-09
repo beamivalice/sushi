@@ -125,9 +125,10 @@ const editCtx = vm.createContext({
   currentChat: null,
   draftDirectory: '',
   draftEdit: false,
-  editCeiling: null,
+  editCeiling: true,
   touchChat: () => {},
   callResearchTools: async () => ({ edit_allowed: true }),
+  toast: (message) => { editCtx.toasted = message; },
 });
 vm.runInContext(script.slice(editStart, script.indexOf('let folderSelection', editStart)), editCtx);
 
@@ -151,19 +152,30 @@ assert.equal(editCtx.draftEdit, false);
 
 editCtx.editCeiling = null;
 editCtx.renderEditButton();
-assert.equal(editNodes.editButton.disabled, true);
+assert.equal(editNodes.editButton.attrs['aria-disabled'], 'true');
 assert.match(editNodes.editButton.title, /Asking/);
 editCtx.editCeiling = false;
 editCtx.renderEditButton();
-assert.equal(editNodes.editButton.disabled, true);
+assert.equal(editNodes.editButton.disabled, false, 'a click must still explain why');
+assert.equal(editNodes.editButton.attrs['aria-disabled'], 'true');
 assert.match(editNodes.editButton.title, /--edit/);
+editNodes.editButton.onclick();
+assert.equal(editCtx.chatEdit(), false, 'the server ceiling keeps writes off');
+assert.match(editCtx.toasted, /--edit on/);
 editCtx.editCeiling = true;
 editCtx.renderEditButton();
-assert.equal(editNodes.editButton.disabled, false);
+assert.equal(editNodes.editButton.attrs['aria-disabled'], 'false');
 editCtx.setChatEdit(true);
 assert.equal(editNodes.editName.textContent, 'Edit on');
 assert.equal(editNodes.editButton.attrs['aria-pressed'], 'true');
 editCtx.toolsEnabled = false;
 editCtx.renderEditButton();
-assert.equal(editNodes.editButton.disabled, true, 'no tool pack means no writes');
+assert.equal(editNodes.editButton.attrs['aria-disabled'], 'true', 'no tool pack means no writes');
+assert.equal(editNodes.editName.textContent, 'Edit off');
+editCtx.toasted = '';
+editNodes.editButton.onclick();
+assert.match(editCtx.toasted, /Tools/);
+editCtx.chatAbort = {};
+editCtx.renderEditButton();
+assert.equal(editNodes.editButton.disabled, true, 'fixed while a reply runs');
 console.log('Web UI edit chip: per-chat state, folder reset, server ceiling passed');

@@ -317,8 +317,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   The preference persists in this browser. It is fixed for a turn; the button is disabled while a reply runs.
 - The **pencil chip** next to Folder turns `write_file` and `edit_file` on for that chat only. It starts
   off for every new chat, travels with the saved chat, and goes back off the moment the chat's folder
-  changes. It is disabled, with the reason in its tooltip, when the Tools chip is off or when the server
-  was started without `--edit on` — the page can ask for less than the server allows, never more.
+  changes. With Tools off or a server started without `--edit on` it stays off and dimmed, and a click
+  says why in a toast — the page can ask for less than the server allows, never more.
 - The browser sends definitions, assembles streamed tool calls, executes them through `POST /v1/tools`, and
   sends results back to the model. Eight tool rounds maximum, then the REPL's nudge (never saved to the chat) and a final request without tools.
   Results are collapsible in the transcript. Tool rows show the query, URL or file argument on one line,
