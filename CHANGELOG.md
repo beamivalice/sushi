@@ -15,6 +15,7 @@ earlier history is mlx-serve's, in that project's changelog.
   output.
 - **EXL3 packs**: expert rates from 1.5 bits per weight take the fast decode and prefill kernels on every served
   architecture, including GLM-5.3-Flash's, with output identical to the reference readers.
+- **Structured output**: a `response_format` schema property that names no type (a bare `description`, `true` or `{}`) now accepts any JSON object instead of only `{}`.
 
 ---
 
