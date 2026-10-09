@@ -18,6 +18,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Structured output**: a `response_format` schema property that names no type (a bare `description`, `true` or `{}`) now accepts any JSON object instead of only `{}`.
 - **Structured output**: `response_format` schemas may use `$ref` to `#`, `#/$defs/Name` or `#/definitions/Name`, recursive refs included, so nested Pydantic or Zod models are enforced instead of collapsing to `{}`.
 - **Tool calls**: a `<function=name` whose closing `>` the model dropped is recovered with its parameters instead of the call being lost as plain text.
+- **Completions**: `/v1/completions` reads `prompt` given as token ids (`[1,2,3]`, `[[1,2,3]]`), refuses a batch of prompts and `echo: true` with a named 400 instead of a misleading "prompt is required" or a silent drop.
 
 ---
 

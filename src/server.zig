@@ -9096,6 +9096,49 @@ fn hashTextValue(v: std.json.Value) ?u64 {
     return if (n == 0) null else h.final();
 }
 
+const CompletionPrompt = union(enum) {
+    text: []const u8,
+    /// Caller frees.
+    ids: []u32,
+    invalid: []const u8,
+    missing,
+};
+
+/// `/v1/completions` `prompt`: a string or token ids (OpenAI's `int[]`, what lm-eval sends),
+/// either also as a one-item list. A real batch is a named 400, like `n`.
+fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab_size: u32) !CompletionPrompt {
+    const val = v orelse return .missing;
+    switch (val) {
+        .null => return .missing,
+        .string => |s| return .{ .text = s },
+        .array => |arr| {
+            if (arr.items.len == 0) return .{ .invalid = "'prompt' is empty" };
+            if (arr.items[0] == .string or arr.items[0] == .array) {
+                if (arr.items.len > 1) return .{ .invalid = "batched prompts are not supported: send one prompt per request" };
+                return parseCompletionPrompt(allocator, arr.items[0], vocab_size);
+            }
+            const ids = try allocator.alloc(u32, arr.items.len);
+            for (arr.items, ids) |item, *id| {
+                if (item != .integer or item.integer < 0 or item.integer >= vocab_size) {
+                    allocator.free(ids);
+                    return .{ .invalid = "'prompt' token ids must be integers inside the model's vocabulary" };
+                }
+                id.* = @intCast(item.integer);
+            }
+            return .{ .ids = ids };
+        },
+        else => return .{ .invalid = "'prompt' must be a string or a list of token ids" },
+    }
+}
+
+/// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty sum it
+/// reads as perplexity 1; refused by name instead.
+fn echoRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const v = root.get("echo") orelse return null;
+    if (v != .bool or !v.bool) return null;
+    return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
+}
+
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
     switch (v) {
@@ -9724,16 +9767,22 @@ fn handleCompletions(
         else => 0,
     } else 0;
 
-    // Extract prompt (required)
-    const prompt_text = if (root.get("prompt")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
-
-    if (prompt_text == null) {
-        log.warn("POST /v1/completions -> 400 (missing prompt)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'prompt' is a required field", 400);
+    if (echoRejectReason(root)) |reason| {
+        log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
+    }
+
+    const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), @min(config.vocab_size, tok.definedVocabSize()));
+    defer if (prompt == .ids) allocator.free(prompt.ids);
+    switch (prompt) {
+        .missing, .invalid => {
+            const reason = if (prompt == .invalid) prompt.invalid else "'prompt' is a required field";
+            log.warn("POST /v1/completions -> 400 ({s})\n", .{reason});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        },
+        .text, .ids => {},
     }
 
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
@@ -9817,13 +9866,20 @@ fn handleCompletions(
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
     // Log the request
-    const preview_len = @min(prompt_text.?.len, 80);
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
-    log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
+    switch (prompt) {
+        .text => |s| log.info("  > \"{s}{s}\"\n", .{ s[0..@min(s.len, 80)], if (s.len > 80) "..." else "" }),
+        .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
+        else => unreachable,
+    }
 
-    // Tokenize prompt directly (no chat template).
-    const prompt_ids = try tok.encode(allocator, prompt_text.?);
+    // Tokenize prompt directly (no chat template); token ids are taken as sent.
+    const prompt_ids = switch (prompt) {
+        .text => |s| try tok.encode(allocator, s),
+        .ids => |ids| try allocator.dupe(u32, ids),
+        else => unreachable,
+    };
     defer allocator.free(prompt_ids);
     if (prompt_ids.len == 0) {
         log.warn("POST /v1/completions -> 400 (prompt tokenizes to zero tokens)\n", .{});
@@ -21564,6 +21620,49 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     // must emit everything rather than slice out of bounds.
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 5));
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
+}
+
+test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 400" {
+    const allocator = std.testing.allocator;
+    const Want = union(enum) { text: []const u8, ids: []const u32, invalid, missing };
+    const cases = [_]struct { body: []const u8, want: Want }{
+        .{ .body = "{\"prompt\":\"hi\"}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[\"hi\"]}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[1,2,3]}", .want = .{ .ids = &.{ 1, 2, 3 } } },
+        .{ .body = "{\"prompt\":[[5,6]]}", .want = .{ .ids = &.{ 5, 6 } } },
+        .{ .body = "{\"prompt\":[[1],[2]]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[\"a\",\"b\"]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,-2]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,100]}", .want = .invalid },
+        .{ .body = "{\"prompt\":7}", .want = .invalid },
+        .{ .body = "{}", .want = .missing },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = try parseCompletionPrompt(allocator, parsed.value.object.get("prompt"), 100);
+        defer if (got == .ids) allocator.free(got.ids);
+        switch (case.want) {
+            .text => |t| try std.testing.expectEqualStrings(t, got.text),
+            .ids => |ids| try std.testing.expectEqualSlices(u32, ids, got.ids),
+            .invalid => try std.testing.expect(got == .invalid),
+            .missing => try std.testing.expect(got == .missing),
+        }
+    }
+}
+
+test "echoRejectReason: echo is refused by name, never silently dropped" {
+    const allocator = std.testing.allocator;
+    for ([_]struct { body: []const u8, rejected: bool }{
+        .{ .body = "{}", .rejected = false },
+        .{ .body = "{\"echo\":false}", .rejected = false },
+        .{ .body = "{\"echo\":true}", .rejected = true },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.rejected, echoRejectReason(parsed.value.object) != null);
+    }
 }
 
 test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
