@@ -3,6 +3,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
+const expert_io = @import("expert_io.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
 const tokenizer_mod = @import("tokenizer.zig");
@@ -2800,7 +2801,7 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 
 /// Load every `*.safetensors` in an already-open `dir` into a Weights map.
 /// `model_dir` is the on-disk path string, used both to build the per-file
-/// absolute path for `mlx_load_safetensors` and to phrase the error message.
+/// absolute path for `loadSafetensorsFile` and to phrase the error message.
 /// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
 /// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
 fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool) !Weights {
@@ -2834,11 +2835,13 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         }
     }
 
+    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
+    defer reader.deinit();
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         // Accept regular files AND symlinks: HuggingFace cache snapshots store
-        // every weight file as a symlink into ../../blobs/<hash>. mlx_load_safetensors
+        // every weight file as a symlink into ../../blobs/<hash>. open(2)
         // resolves the link at the OS level, so a symlinked *.safetensors loads fine.
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
@@ -2854,7 +2857,7 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 
         log.info("Loading {s}...\n", .{entry.name});
         const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .present = &present, .file = entry.name } else null;
-        try loadSafetensorsFileMode(allocator, &weights, path, s, load_vision, streaming, shard);
+        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, shard);
         file_count += 1;
     }
 
@@ -2942,7 +2945,9 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     load_vision: bool,
 ) !void {
-    return loadSafetensorsFileMode(allocator, weights, path, s, load_vision, null, null);
+    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
+    defer reader.deinit();
+    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, null);
 }
 
 fn qwen4NormFold(key: []const u8) bool {
@@ -3049,8 +3054,105 @@ fn indexWeightMap(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?st
     return null;
 }
 
+/// MLX's safetensors dtype table (`dtype_from_safetensor_str`): FP8 codes load as `uint8`.
+fn safetensorsDtype(name: []const u8) ?struct { mlx.mlx_dtype, u64 } {
+    const table = [_]struct { []const u8, mlx.mlx_dtype, u64 }{
+        .{ "F32", .float32, 4 },  .{ "F16", .float16, 2 }, .{ "BF16", .bfloat16, 2 }, .{ "I64", .int64, 8 },
+        .{ "I32", .int32, 4 },    .{ "I16", .int16, 2 },   .{ "I8", .int8, 1 },       .{ "U64", .uint64, 8 },
+        .{ "U32", .uint32, 4 },   .{ "U16", .uint16, 2 },  .{ "U8", .uint8, 1 },      .{ "BOOL", .bool_, 1 },
+        .{ "C64", .complex64, 8 }, .{ "F8_E4M3", .uint8, 1 }, .{ "F8_E8M0", .uint8, 1 },
+    };
+    for (table) |row| if (std.mem.eql(u8, row[0], name)) return .{ row[1], row[2] };
+    return null;
+}
+
+pub const TensorArray = struct {
+    array: mlx.mlx_array,
+    /// The array's own bytes; valid as long as `array`.
+    bytes: []const u8,
+    /// The mapping MLX imported as the array's buffer; null when it copied instead.
+    mapped: ?[*]const u8 = null,
+};
+
+/// From this size a tensor is read into its own mapping that MLX imports without a copy;
+/// below it, the scratch copy into a fresh MLX buffer costs less than a page per tensor.
+const import_min_bytes: usize = 1 << 20;
+
+/// `len` bytes at `offset` as a `shape`/`dtype` array, read around the file cache with the read
+/// and copy of its chunks spread over several threads (`expert_io.ParallelReader`). A large tensor
+/// lands at offset 0 of an anonymous mapping MLX imports as its buffer: a view at an offset
+/// inside a buffer is not safe in this engine. Caller frees `array`.
+pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset: u64, len: usize, shape: []const c_int, dtype: mlx.mlx_dtype) !TensorArray {
+    if (len < import_min_bytes) {
+        const host = try reader.allocator.alloc(u8, @max(len, 1));
+        defer reader.allocator.free(host);
+        try reader.fill(fd, host[0..len], offset);
+        const array = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype);
+        if (array.ctx == null) return error.OutOfMemory;
+        errdefer _ = mlx.mlx_array_free(array);
+        try mlx.check(mlx.mlx_array_eval(array));
+        return .{ .array = array, .bytes = if (len == 0) &.{} else mlx.mlx_array_data_uint8(array).?[0..len] };
+    }
+    const size: usize = @intCast(expert_io.pageRoundUp(len));
+    const mapped = std.c.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (mapped == std.c.MAP_FAILED) return error.OutOfMemory;
+    const region = std.heap.c_allocator.create(MappedRegion) catch {
+        _ = std.c.munmap(@alignCast(mapped), size);
+        return error.OutOfMemory;
+    };
+    region.* = .{ .ptr = @ptrCast(@alignCast(mapped)), .len = size };
+    reader.fill(fd, region.ptr[0..len], offset) catch |err| {
+        unmapRegion(region);
+        return err;
+    };
+    // When Metal refuses the mapping MLX copies it and runs `unmapRegion` before returning:
+    // `region` is not touched after this call.
+    const ptr = region.ptr;
+    const array = mlx.mlx_array_new_data_managed_payload(ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
+    if (array.ctx == null) {
+        // MLX throws from this constructor only before adopting the mapping (its copy
+        // branch runs the deleter last), so this is the region's only release.
+        unmapRegion(region);
+        return error.OutOfMemory;
+    }
+    errdefer _ = mlx.mlx_array_free(array);
+    try mlx.check(mlx.mlx_array_eval(array));
+    const data = mlx.mlx_array_data_uint8(array).?;
+    return .{ .array = array, .bytes = data[0..len], .mapped = if (data == ptr) ptr else null };
+}
+
+const MappedRegion = struct { ptr: [*]align(std.heap.page_size_min) u8, len: usize };
+
+fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
+    const region: *MappedRegion = @ptrCast(@alignCast(payload.?));
+    _ = std.c.munmap(region.ptr, region.len);
+    std.heap.c_allocator.destroy(region);
+}
+
+/// One header entry's payload as an MLX array. Caller frees.
+fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
+    if (meta != .object) return error.InvalidSafetensorsTensor;
+    const dtype_value = meta.object.get("dtype") orelse return error.InvalidSafetensorsTensor;
+    const dims = meta.object.get("shape") orelse return error.InvalidSafetensorsTensor;
+    const offsets = meta.object.get("data_offsets") orelse return error.InvalidSafetensorsTensor;
+    if (dtype_value != .string or dims != .array or dims.array.items.len > 16 or offsets != .array or offsets.array.items.len != 2) return error.InvalidSafetensorsTensor;
+    const dtype, const itemsize = safetensorsDtype(dtype_value.string) orelse return error.UnsupportedSafetensorsDtype;
+    var shape: [16]c_int = undefined;
+    var bytes: u64 = itemsize;
+    for (dims.array.items, 0..) |dim, i| {
+        if (dim != .integer or dim.integer < 0 or dim.integer > std.math.maxInt(c_int)) return error.InvalidSafetensorsTensor;
+        shape[i] = @intCast(dim.integer);
+        bytes = try std.math.mul(u64, bytes, @intCast(dim.integer));
+    }
+    const lo = offsets.array.items[0];
+    const hi = offsets.array.items[1];
+    if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != bytes) return error.InvalidSafetensorsTensor;
+    return (try readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype)).array;
+}
+
 fn loadSafetensorsFileMode(
     allocator: std.mem.Allocator,
+    reader: *expert_io.ParallelReader,
     weights: *Weights,
     path: [*:0]const u8,
     s: mlx.mlx_stream,
@@ -3062,47 +3164,27 @@ fn loadSafetensorsFileMode(
     // fused bank split, the delta norms and the conv transpose. An MLX pack
     // ships every resident tensor in its serving layout already.
     const fused_streaming = streaming != null and streaming.?.layout == .bf16_fused;
-    var tensor_map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-
-    var meta_map = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
-
-    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
-
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var value = mlx.mlx_array_new();
-
-        const ret = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
-        if (ret != 0 or key == null) {
-            _ = mlx.mlx_array_free(value);
-            break;
-        }
-
-        const key_str_raw = std.mem.span(key.?);
+    // Read here rather than through MLX's loader, whose descriptor cannot take F_NOCACHE:
+    // filtered tensors are never read, kept ones bypass the file cache (`readTensorArray`).
+    const fd = try expert_io.openHinted(std.mem.span(path), .{ .readahead_off = false });
+    defer _ = std.c.close(fd);
+    var header = try expert_io.SafetensorsHeader.read(allocator, fd);
+    defer header.deinit();
+    var tensors = header.parsed.value.object.iterator();
+    while (tensors.next()) |entry| {
+        const key_str_raw = entry.key_ptr.*;
+        if (std.mem.eql(u8, key_str_raw, "__metadata__")) continue;
         if (shard) |sh| if (sh.map.get(key_str_raw)) |owner| {
-            if (owner == .string and !std.mem.eql(u8, owner.string, sh.file) and sh.present.contains(owner.string)) {
-                _ = mlx.mlx_array_free(value);
-                continue;
-            }
+            if (owner == .string and !std.mem.eql(u8, owner.string, sh.file) and sh.present.contains(owner.string)) continue;
         };
         var key_buf: [512]u8 = undefined;
         const key_str = if (streaming) |load|
-            streamedResidentKey(load, &key_buf, key_str_raw) orelse {
-                _ = mlx.mlx_array_free(value);
-                continue;
-            }
+            streamedResidentKey(load, &key_buf, key_str_raw) orelse continue
         else
             key_str_raw;
 
-        if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and !streaming.?.keep_mtp and streamingDropsWeightKey(key_str))) {
-            _ = mlx.mlx_array_free(value);
-            continue;
-        }
+        if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and !streaming.?.keep_mtp and streamingDropsWeightKey(key_str))) continue;
+        const value = try readSafetensor(reader, fd, &header, entry.value_ptr.*);
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's
         // ndim is a use-after-free, not a zero.
@@ -5868,4 +5950,141 @@ test "GLM raw FP8 config identifies source storage without changing native KV" {
     const other_block = try std.fmt.allocPrint(std.testing.allocator, "{{\"quantization_config\":{{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"weight_block_size\":[64,64]}},{s}", .{source[1..]});
     defer std.testing.allocator.free(other_block);
     try expectError(error.UnsupportedGlmConfig, parseConfigFromJson(std.testing.allocator, other_block));
+}
+
+test "loadSafetensorsFile returns what MLX's own safetensors loader returns, dtype, shape and bytes" {
+    const t = std.testing;
+    const a = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    // Odd payload sizes leave every later tensor at an unaligned file offset.
+    const Spec = struct { name: []const u8, dtype: []const u8, shape: []const usize, item: usize };
+    const specs = [_]Spec{
+        .{ .name = "model.layers.0.a.weight", .dtype = "BF16", .shape = &.{ 3, 5 }, .item = 2 },
+        .{ .name = "model.layers.0.b.weight", .dtype = "F32", .shape = &.{7}, .item = 4 },
+        .{ .name = "model.layers.0.c.weight", .dtype = "U32", .shape = &.{ 2, 3 }, .item = 4 },
+        .{ .name = "model.layers.0.e.weight", .dtype = "F16", .shape = &.{ 2, 3 }, .item = 2 },
+        .{ .name = "model.layers.0.f.weight", .dtype = "U8", .shape = &.{5}, .item = 1 },
+        .{ .name = "model.layers.0.g.weight", .dtype = "I32", .shape = &.{3}, .item = 4 },
+        .{ .name = "vision_tower.dropped.weight", .dtype = "F32", .shape = &.{2}, .item = 4 },
+    };
+    var header = std.ArrayList(u8).empty;
+    defer header.deinit(a);
+    var data = std.ArrayList(u8).empty;
+    defer data.deinit(a);
+    try header.appendSlice(a, "{\"__metadata__\":{\"format\":\"mlx\"}");
+    for (specs, 0..) |spec, n| {
+        var count: usize = 1;
+        for (spec.shape) |d| count *= d;
+        const begin = data.items.len;
+        // Finite bit patterns for every dtype: small integers in each element's low byte.
+        for (0..count) |i| for (0..spec.item) |b| try data.append(a, if (b == spec.item - 1 and spec.item > 1) 0x3c else @truncate(n * 31 + i * 7 + b));
+        try header.print(a, ",\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ spec.name, spec.dtype });
+        for (spec.shape, 0..) |d, i| try header.print(a, "{s}{d}", .{ if (i == 0) "" else ",", d });
+        try header.print(a, "],\"data_offsets\":[{d},{d}]}}", .{ begin, data.items.len });
+    }
+    try header.append(a, '}');
+    var file = std.ArrayList(u8).empty;
+    defer file.deinit(a);
+    var len_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_bytes, header.items.len, .little);
+    try file.appendSlice(a, &len_bytes);
+    try file.appendSlice(a, header.items);
+    try file.appendSlice(a, data.items);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "model.safetensors", .data = file.items });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(t.io, &path_buf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{path_buf[0..path_len]}, 0);
+    defer a.free(path);
+
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    try loadSafetensorsFile(a, &weights, path, cpu, false);
+
+    var want = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(want);
+    var meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_load_safetensors(&want, &meta, path, cpu));
+    try t.expectEqual(specs.len - 1, weights.count());
+    try t.expect(weights.get("vision_tower.dropped.weight") == null);
+    for (specs[0 .. specs.len - 1]) |spec| {
+        const name = try a.dupeSentinel(u8, spec.name, 0);
+        defer a.free(name);
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_map_string_to_array_get(&ref, want, name));
+        const got = weights.get(spec.name).?;
+        try t.expectEqual(mlx.mlx_array_dtype(ref), mlx.mlx_array_dtype(got));
+        try t.expectEqualSlices(c_int, mlx.getShape(ref), mlx.getShape(got));
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, ref, got, true, cpu));
+        try mlx.check(mlx.mlx_array_eval(eq));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try t.expect(same);
+    }
+}
+
+test "readTensorArray returns the file's tensor, imported without a copy when large" {
+    const t = std.testing;
+    const a = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const page = expert_io.pageSize();
+    const size = (2 << 20) + 3 * page + 77;
+    const bytes = try a.alloc(u8, size);
+    defer a.free(bytes);
+    for (bytes, 0..) |*b, i| b.* = @truncate(i *% 13 +% i / 509);
+    for (bytes, 0..) |*b, i| if (i % 2 == 1) {
+        b.* &= 0x3f; // finite BF16/F32 elements
+    };
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "t.safetensors", .data = bytes });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(t.io, &path_buf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/t.safetensors", .{path_buf[0..path_len]}, 0);
+    defer a.free(path);
+    const fd = try expert_io.openHinted(path, .{ .readahead_off = false });
+    defer _ = std.c.close(fd);
+    var reader = expert_io.ParallelReader.init(a, page, 3);
+    defer reader.deinit();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const Case = struct { offset: usize, shape: []const c_int, dtype: mlx.mlx_dtype, item: usize, imported: bool };
+    for ([_]Case{
+        .{ .offset = 100, .shape = &.{ 3, 5 }, .dtype = .bfloat16, .item = 2, .imported = false },
+        .{ .offset = page - 8, .shape = &.{ 64, 64 }, .dtype = .uint32, .item = 4, .imported = false },
+        .{ .offset = 777, .shape = &.{ 512, 1024 }, .dtype = .float32, .item = 4, .imported = true },
+        .{ .offset = size - (1 << 20) - 1, .shape = &.{ 1 << 20, 1 }, .dtype = .uint8, .item = 1, .imported = true },
+        // Large but not a page multiple: Metal may import it or refuse it (MLX then copies and frees the mapping).
+        .{ .offset = 5, .shape = &.{ (1 << 20) + 3, 1 }, .dtype = .uint8, .item = 1, .imported = false },
+    }) |case| {
+        var count: usize = 1;
+        for (case.shape) |d| count *= @intCast(d);
+        const len = count * case.item;
+        const got = try readTensorArray(&reader, fd, case.offset, len, case.shape, case.dtype);
+        defer _ = mlx.mlx_array_free(got.array);
+        try t.expectEqualSlices(u8, bytes[case.offset..][0..len], got.bytes);
+        try t.expectEqual(case.dtype, mlx.mlx_array_dtype(got.array));
+        try t.expectEqualSlices(c_int, case.shape, mlx.getShape(got.array));
+        const want = mlx.mlx_array_new_data(bytes[case.offset..].ptr, case.shape.ptr, @intCast(case.shape.len), case.dtype);
+        defer _ = mlx.mlx_array_free(want);
+        for ([_]mlx.mlx_stream{ cpu, mlx.gpuStream() }) |s| {
+            var copy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(copy);
+            try mlx.check(mlx.mlx_copy(&copy, got.array, s));
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, want, copy, true, cpu));
+            try mlx.check(mlx.mlx_array_eval(eq));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            try t.expect(same);
+        }
+        if (case.imported) try t.expect(got.mapped != null);
+        if (got.mapped) |m| try t.expectEqual(@intFromPtr(got.bytes.ptr), @intFromPtr(m));
+    }
 }

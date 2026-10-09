@@ -141,7 +141,7 @@ fn selectedBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8
 /// per shard, which exceeds a terminal's default limit on finely sharded packs.
 /// One descriptor and one temporary payload suffice here. Source E4M3 codes use
 /// U8 storage as in mimo_source; no tensor is converted or requantized.
-fn loadStoredShard(allocator: std.mem.Allocator, path: [:0]const u8, file: []const u8, owners: std.json.ObjectMap, layers: usize, trunk_only: bool, vision: bool, result: *model.Weights, max_bytes: u64) !void {
+fn loadStoredShard(allocator: std.mem.Allocator, reader: *@import("expert_io.zig").ParallelReader, path: [:0]const u8, file: []const u8, owners: std.json.ObjectMap, layers: usize, trunk_only: bool, vision: bool, result: *model.Weights, max_bytes: u64) !void {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) {
         const code = std.c._errno().*;
@@ -154,8 +154,10 @@ fn loadStoredShard(allocator: std.mem.Allocator, path: [:0]const u8, file: []con
         };
     }
     defer _ = std.c.close(fd);
+    const expert_io = @import("expert_io.zig");
+    expert_io.applyReadHints(fd, .{ .readahead_off = false });
     var size: [8]u8 = undefined;
-    const readExact = @import("expert_io.zig").readExact;
+    const readExact = expert_io.readExact;
     try readExact(fd, &size, 0);
     const len = std.mem.readInt(u64, &size, .little);
     if (len == 0 or len > 128 * 1024 * 1024) return error.InvalidSafetensorsHeader;
@@ -195,9 +197,10 @@ fn loadStoredShard(allocator: std.mem.Allocator, path: [:0]const u8, file: []con
         if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != expected) return error.InvalidSafetensorsTensor;
         bytes = try std.math.add(u64, bytes, expected);
         if (bytes > max_bytes) return error.GlmResidentBudgetExceeded;
-        const raw = try allocator.alignedAlloc(u8, .@"16", @intCast(expected));
-        defer allocator.free(raw);
-        try readExact(fd, raw, try std.math.add(u64, len + 8, @intCast(lo.integer)));
+        const read = try model.readTensorArray(reader, fd, try std.math.add(u64, len + 8, @intCast(lo.integer)), @intCast(expected), shape[0..dims.array.items.len], dt);
+        const value = read.array;
+        errdefer _ = mlx.mlx_array_free(value);
+        const raw = read.bytes;
         if (isFp8Dtype(dtype.string)) {
             for (raw) |code| if (code & 0x7f == 0x7f) return error.InvalidFp8Value;
         } else if (std.mem.endsWith(u8, name, ".weight_scale_inv")) {
@@ -209,9 +212,6 @@ fn loadStoredShard(allocator: std.mem.Allocator, path: [:0]const u8, file: []con
             }
         }
         if (result.get(name) != null) return error.DuplicateGlmWeight;
-        const value = mlx.mlx_array_new_data(raw.ptr, &shape, @intCast(dims.array.items.len), dt);
-        if (value.ctx == null) return error.OutOfMemory;
-        errdefer _ = mlx.mlx_array_free(value);
         const key = try allocator.dupe(u8, name);
         errdefer allocator.free(key);
         try result.map.put(key, value);
@@ -267,11 +267,13 @@ pub fn loadWeightsBoundedWithVision(io: std.Io, allocator: std.mem.Allocator, mo
     if (expected == 0) return error.MissingIndexedGlmWeight;
     var result = model.Weights.init(allocator);
     errdefer result.deinit();
+    var reader = @import("expert_io.zig").ParallelReader.init(allocator, @import("expert_io.zig").ParallelReader.default_chunk, @import("expert_io.zig").ParallelReader.default_workers);
+    defer reader.deinit();
     var file_it = files.keyIterator();
     while (file_it.next()) |file| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file.* }, 0);
         defer allocator.free(path);
-        try loadStoredShard(allocator, path, file.*, wm.object, layers, trunk_only, vision, &result, max_bytes);
+        try loadStoredShard(allocator, &reader, path, file.*, wm.object, layers, trunk_only, vision, &result, max_bytes);
     }
     if (result.count() != expected) {
         @import("log.zig").err("[glm-loader] loaded {d}/{d} indexed tensors\n", .{ result.count(), expected });
