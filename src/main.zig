@@ -88,10 +88,12 @@ fn printUsage(io: std.Io) void {
         \\                      /think <effort> changes it in the chat;
         \\                      --tool on (or /tool on) lets the model search the
         \\                      web, fetch pages and read files in the current
-        \\                      folder, read-only (off by default); /cd <folder>
-        \\                      moves that folder; /image <path> shows a vision
-        \\                      model an image (a relative path is read from
-        \\                      that folder). The prompt shows the folder and
+        \\                      folder, read-only (off by default); --edit on (or
+        \\                      /edit on) adds write_file and edit_file, still
+        \\                      inside that folder and off by default; /cd
+        \\                      <folder> moves that folder; /image <path> shows a
+        \\                      vision model an image (a relative path is read
+        \\                      from that folder). The prompt shows the folder and
         \\                      whether tools are on. The same chat opens in a
         \\                      browser at the URL it prints. /update installs
         \\                      a newer release and restarts the chat.
@@ -631,6 +633,13 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--tool takes on or off, not '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--edit") and i + 1 < args.len) {
+            i += 1;
+            run_opts.edit = cli_mod.parseToolSwitch(args[i]) orelse {
+                log.err("--edit takes on or off, not '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            server_mod.g_web_edit = run_opts.edit;
         } else if (std.mem.eql(u8, args[i], "--stream")) {
             stream_mode = true;
         } else if (cli_mod.isPromptFlag(args[i]) and i + 1 < args.len) {

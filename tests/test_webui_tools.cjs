@@ -40,9 +40,9 @@ const call = (id) => ({ id, type: 'function', function: { name: 'web_search', ar
     assert.equal(defs, null);
     return { text: 'Done', tool_calls: [] };
   };
-  context.callResearchTools = async (body) => { assert.equal(body.directory, "/selected/chat/folder"); executed++; return { text: 'Result' }; };
+  context.callResearchTools = async (body) => { assert.equal(body.directory, "/selected/chat/folder"); assert.equal(body.write, true); executed++; return { text: 'Result' }; };
   const messages = [];
-  await context.runResearchTurn('test', messages, { aborted: false }, tools, false, '/selected/chat/folder');
+  await context.runResearchTurn('test', messages, { aborted: false }, tools, false, '/selected/chat/folder', true);
   assert.equal(count, 9);
   assert.equal(executed, 8);
   assert.equal(messages.at(-1).content, 'Done');
@@ -104,6 +104,61 @@ assert.equal(context.toolCallLabel(history[1].tool_calls[0]), 'web_search · sus
 assert.equal(context.toolCallLabel({ function: { name: 'fetch_url', arguments: '{"url":"https://example.com/article"}' } }), 'fetch_url · https://example.com/article');
 assert.equal(context.toolCallLabel({ function: { name: 'web_search', arguments: '{"query":"one\\ntwo"}' } }), 'web_search · one two');
 assert.equal(context.toolCallLabel({ function: { name: 'read_file', arguments: '{"path":"README.md"}' } }), 'read_file · README.md');
+assert.equal(context.toolCallLabel({ function: { name: 'write_file', arguments: '{"path":"notes.md","content":"x"}' } }), 'write_file · notes.md');
+assert.equal(context.toolCallLabel({ function: { name: 'edit_file', arguments: '{"path":"sub/a.md","old_string":"x"}' } }), 'edit_file · sub/a.md');
 assert.equal(context.toolCallLabel({ function: { name: 'fetch_url', arguments: '{' } }), 'fetch_url');
 assert.equal(context.toolCallLabel({ function: { name: 'web_search', arguments: 'null' } }), 'web_search');
 console.log('Web UI tool labels: passed');
+/* The pencil chip: per-chat state, reset when the folder changes, gated by the server ceiling. */
+const editStart = script.indexOf('function chatDirectory(');
+const editNodes = {};
+const editEl = (id) => (editNodes[id] ??= { id, textContent: '', title: '', disabled: null, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
+const editCtx = vm.createContext({
+  $: editEl,
+  toolsEnabled: true,
+  chatAbort: null,
+  currentChat: null,
+  draftDirectory: '',
+  draftEdit: false,
+  editCeiling: null,
+  touchChat: () => {},
+  callResearchTools: async () => ({ edit_allowed: true }),
+});
+vm.runInContext(script.slice(editStart, script.indexOf('let folderSelection', editStart)), editCtx);
+
+editCtx.currentChat = { id: 'c1', directory: '/a', edit: false };
+editCtx.renderDirectoryButton();
+assert.equal(editCtx.chatEdit(), false);
+editNodes.editButton.onclick();
+assert.equal(editCtx.currentChat.edit, true);
+editCtx.setChatDirectory('/b');
+assert.equal(editCtx.currentChat.directory, '/b');
+assert.equal(editCtx.currentChat.edit, false, 'editing starts off again on another folder');
+
+editCtx.currentChat = null;
+editCtx.draftEdit = true;
+editNodes.editButton.onclick();
+assert.equal(editCtx.draftEdit, false, 'the pencil toggles the draft chat too');
+editNodes.editButton.onclick();
+editCtx.setChatDirectory('/c');
+assert.equal(editCtx.draftDirectory, '/c');
+assert.equal(editCtx.draftEdit, false);
+
+editCtx.editCeiling = null;
+editCtx.renderEditButton();
+assert.equal(editNodes.editButton.disabled, true);
+assert.match(editNodes.editButton.title, /Asking/);
+editCtx.editCeiling = false;
+editCtx.renderEditButton();
+assert.equal(editNodes.editButton.disabled, true);
+assert.match(editNodes.editButton.title, /--edit/);
+editCtx.editCeiling = true;
+editCtx.renderEditButton();
+assert.equal(editNodes.editButton.disabled, false);
+editCtx.setChatEdit(true);
+assert.equal(editNodes.editName.textContent, 'Edit on');
+assert.equal(editNodes.editButton.attrs['aria-pressed'], 'true');
+editCtx.toolsEnabled = false;
+editCtx.renderEditButton();
+assert.equal(editNodes.editButton.disabled, true, 'no tool pack means no writes');
+console.log('Web UI edit chip: per-chat state, folder reset, server ceiling passed');

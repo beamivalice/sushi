@@ -693,9 +693,12 @@ pub const ReplOptions = struct {
     think: Think = .model_default,
     /// Client-side research tools (`repl_tools`); off unless asked for.
     tools: bool = false,
+    /// `write_file` and `edit_file` inside the tools' folder; off unless asked for, and only ever
+    /// offered together with `tools`.
+    edit: bool = false,
 
     pub fn toolsJson(o: ReplOptions, vision: bool) ?[]const u8 {
-        return if (o.tools) repl_tools.definitionsJson(vision) else null;
+        return if (o.tools) repl_tools.definitionsJson(vision, o.edit) else null;
     }
 };
 
@@ -717,6 +720,13 @@ pub const ToolCommand = union(enum) { show, set: bool, refuse: []const u8 };
 /// `/tool [on|off]`; null when the line is not that command.
 pub fn parseToolCommand(line: []const u8) ?ToolCommand {
     const word = commandArg(line, "/tool") orelse return null;
+    if (word.len == 0) return .show;
+    return .{ .set = parseToolSwitch(word) orelse return .{ .refuse = word } };
+}
+
+/// `/edit [on|off]`: the same switch as `/tool`, for the file-writing pair.
+pub fn parseEditCommand(line: []const u8) ?ToolCommand {
+    const word = commandArg(line, "/edit") orelse return null;
     if (word.len == 0) return .show;
     return .{ .set = parseToolSwitch(word) orelse return .{ .refuse = word } };
 }
@@ -1239,7 +1249,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
         .url = chat_url,
         .w = w,
         .input = &input,
-        .tools = .{ .allocator = allocator, .io = io, .root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator), .vision = vision },
+        .tools = .{ .allocator = allocator, .io = io, .root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator), .vision = vision, .writable = opts.tools and opts.edit },
     };
     defer allocator.free(driver.tools.root);
     var state_buf: [512]u8 = undefined;
@@ -1281,10 +1291,29 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
         if (parseToolCommand(trimmed)) |cmd| {
             switch (cmd) {
                 .show => {},
-                .set => |on| opts.tools = on,
+                .set => |on| {
+                    opts.tools = on;
+                    driver.tools.writable = on and opts.edit;
+                },
                 .refuse => |word| try w.print("/tool takes on or off, not '{s}'\n", .{word}),
             }
-            try w.print("tools: {s} ({s}; files under {s}, /cd <folder> moves them)\n", .{ if (opts.tools) "on" else "off", repl_tools.toolNames(vision), driver.tools.root });
+            try w.print("tools: {s} ({s}; files under {s}, /cd <folder> moves them)\n", .{ if (opts.tools) "on" else "off", repl_tools.toolNames(vision, opts.tools and opts.edit), driver.tools.root });
+            continue;
+        }
+        if (parseEditCommand(trimmed)) |cmd| {
+            switch (cmd) {
+                .show => {},
+                .set => |on| {
+                    opts.edit = on;
+                    driver.tools.writable = opts.tools and on;
+                },
+                .refuse => |word| try w.print("/edit takes on or off, not '{s}'\n", .{word}),
+            }
+            try w.print("edit: {s} (write_file, edit_file under {s}{s})\n", .{
+                if (opts.edit) "on" else "off",
+                driver.tools.root,
+                if (opts.edit and !opts.tools) "; the file tools are off, turn them on with /tool on" else "",
+            });
             continue;
         }
         if (parseCdCommand(trimmed)) |arg| {
@@ -1317,7 +1346,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
 
 /// The lines `sushi run` prints once the model answers; `state` is `formatPromptStatus`.
 pub fn writeReadyBanner(w: *std.Io.Writer, vision: bool, port: u16, state: []const u8) !void {
-    try w.writeAll("\n>>> chat is live — /bye to exit, /tool on for web search and file tools");
+    try w.writeAll("\n>>> chat is live — /bye to exit, /tool on for web search and file tools, /edit on to let the model write files there");
     try w.writeAll(if (vision) ", /image <path> to show an image\n" else "\n");
     try w.print(">>> {s} (shown before each prompt); /cd <folder> moves the folder the file tools{s} read\n", .{ state, if (vision) " and relative /image paths" else "" });
     try w.print(">>> chat in your browser: http://127.0.0.1:{d}/\n", .{port});
@@ -1862,7 +1891,7 @@ test "cli: the REPL reads the model's efforts from /v1/models and streams reason
     try testing.expectEqualStrings("", d.content);
 }
 
-test "cli: tools are off by default; --tool, /tool and /image parse" {
+test "cli: tools and editing are off by default; --tool, --edit, /tool, /edit and /image parse" {
     const defaults: ReplOptions = .{};
     try testing.expect(!defaults.tools);
 
@@ -1877,6 +1906,18 @@ test "cli: tools are off by default; --tool, /tool and /image parse" {
     try testing.expectEqual(@as(?ToolCommand, null), parseToolCommand("/tools on"));
     try testing.expectEqual(@as(?ToolCommand, null), parseToolCommand("/toolbox"));
     try testing.expectEqual(@as(?ToolCommand, null), parseToolCommand("tool on"));
+
+    try testing.expectEqual(@as(?ToolCommand, .show), parseEditCommand("/edit"));
+    try testing.expectEqual(@as(?ToolCommand, .{ .set = true }), parseEditCommand("/edit on"));
+    try testing.expectEqual(@as(?ToolCommand, .{ .set = false }), parseEditCommand("/edit  off "));
+    try testing.expectEqualStrings("maybe", parseEditCommand("/edit maybe").?.refuse);
+    try testing.expectEqual(@as(?ToolCommand, null), parseEditCommand("/editor on"));
+    try testing.expectEqual(@as(?ToolCommand, null), parseEditCommand("edit on"));
+    try testing.expect(!@as(ReplOptions, .{}).edit);
+    // The pack the REPL offers grows the write pair only when both switches are on.
+    try testing.expectEqual(@as(?[]const u8, null), @as(ReplOptions, .{}).toolsJson(false));
+    try testing.expect(std.mem.indexOf(u8, @as(ReplOptions, .{ .tools = true }).toolsJson(false).?, "write_file") == null);
+    try testing.expect(std.mem.indexOf(u8, @as(ReplOptions, .{ .tools = true, .edit = true }).toolsJson(false).?, "edit_file") != null);
 
     try testing.expectEqualStrings("shot.png", parseImageCommand("/image shot.png").?);
     try testing.expectEqualStrings("", parseImageCommand("/image").?);
@@ -2023,7 +2064,7 @@ test "cli: the chat body carries tools only while they are on, plus tool turns a
         .{ .role = "assistant", .content = "", .tool_calls_json = "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"x\\\"}\"}}]" },
         .{ .role = "tool", .content = "1. result", .tool_call_id = "call_1" },
     };
-    const tools = repl_tools.definitionsJson(false);
+    const tools = repl_tools.definitionsJson(false, false);
     for ([_]?[]const u8{ tools, null }) |offered| {
         const body = try buildReplChatBody(allocator, &history, .model_default, offered);
         defer allocator.free(body);
@@ -2136,7 +2177,7 @@ test "cli: the tool loop runs calls client-side until the model answers" {
     var history = std.ArrayList(Turn).empty;
     defer freeHistory(allocator, &history);
     try history.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, "latest zig?") });
-    try runToolTurn(allocator, &history, .model_default, repl_tools.definitionsJson(false), stub.driver());
+    try runToolTurn(allocator, &history, .model_default, repl_tools.definitionsJson(false, false), stub.driver());
 
     try testing.expectEqual(@as(usize, 3), stub.requests);
     try testing.expectEqual(@as(usize, 3), stub.requests_with_tools);
@@ -2157,7 +2198,7 @@ test "cli: the tool loop stops offering tools after 8 rounds and asks for an ans
     var history = std.ArrayList(Turn).empty;
     defer freeHistory(allocator, &history);
     try history.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, "dig forever") });
-    try runToolTurn(allocator, &history, .model_default, repl_tools.definitionsJson(false), stub.driver());
+    try runToolTurn(allocator, &history, .model_default, repl_tools.definitionsJson(false, false), stub.driver());
 
     try testing.expectEqual(@as(usize, max_tool_rounds + 1), stub.requests);
     try testing.expectEqual(@as(usize, max_tool_rounds), stub.requests_with_tools);
@@ -2174,7 +2215,7 @@ test "cli: a tool image reaches the next request as a user image part; tools off
     var history = std.ArrayList(Turn).empty;
     defer freeHistory(allocator, &history);
     try history.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, "look at cat.png") });
-    try runToolTurn(allocator, &history, .model_default, repl_tools.definitionsJson(true), stub.driver());
+    try runToolTurn(allocator, &history, .model_default, repl_tools.definitionsJson(true, false), stub.driver());
     const r = try roles(allocator, history.items);
     defer allocator.free(r);
     try testing.expectEqualStrings("user assistant tool user assistant ", r);

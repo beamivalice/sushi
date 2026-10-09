@@ -922,6 +922,11 @@ fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const u8,
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
 }
 
+/// `--edit on|off`: the ceiling on the chat page's write tools. Off by default, because it turns
+/// the `/v1/tools` bridge from a reader of one folder into a writer of it; the chat page's per-chat
+/// pencil chip can only ask for less than this allows, never more.
+pub var g_web_edit: bool = false;
+
 /// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
 fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, body: []const u8) !void {
     const origin = findHeaderValueCI(headers, "origin") orelse "";
@@ -952,18 +957,24 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const 
         if (browse.bool) return sendWebToolFolders(allocator, stream, root);
     }
     const vision = if (parsed.value.object.get("vision")) |v| v == .bool and v.bool else false;
+    if (parsed.value.object.get("write")) |w| {
+        if (w != .bool) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Write must be a boolean", 400);
+    }
+    // The page asks for writes per chat; `g_web_edit` (--edit) is the operator's ceiling, so a chat
+    // page cannot talk a server into a write surface it was not started with.
+    const writable = g_web_edit and (if (parsed.value.object.get("write")) |w| w.bool else false);
     const name = parsed.value.object.get("name");
     if (name == null) {
-        const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision), .{});
+        const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision, writable), .{});
         defer defs.deinit();
-        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root }, .{});
+        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root, .edit_allowed = g_web_edit }, .{});
         defer allocator.free(json);
         return sendResponse(stream, "200 OK", "application/json", json);
     }
     const args = parsed.value.object.get("arguments");
     if (name.? != .string or args == null or args.? != .string)
         return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Tool name and arguments must be strings", 400);
-    const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision }, name.?.string, args.?.string);
+    const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision, .writable = writable }, name.?.string, args.?.string);
     defer result.deinit(allocator);
     const json = try std.json.Stringify.valueAlloc(allocator, result, .{});
     defer allocator.free(json);
@@ -26058,7 +26069,9 @@ test "web tools: list, confined execution, and browser origin guard" {
     }
     listen_host = "127.0.0.1";
     listen_port = 12345;
-    const cases = [_]struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8 }{
+    const Case = struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8, lacks: []const u8 = "" };
+    const write_call = "{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside.md\\\",\\\"content\\\":\\\"x\\\"}\",\"write\":true}";
+    const cases = [_]Case{
         .{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = "web_search" },
         .{ .origin = "http://evil.test", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
         .{ .origin = "null", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
@@ -26068,6 +26081,11 @@ test "web tools: list, confined execution, and browser origin guard" {
         .{ .origin = "http://localhost:12345", .body = "{\"directory\":\"/sushi-folder-does-not-exist\"}", .status = "400 Bad Request", .contains = "no such folder" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside\\\"}\"}", .status = "200 OK", .contains = "refused" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"exec\",\"arguments\":\"{}\"}", .status = "200 OK", .contains = "unknown tool" },
+        // --edit is off, so the page cannot raise the ceiling by asking for writes.
+        .{ .origin = "http://localhost:12345", .body = write_call, .status = "200 OK", .contains = "writing files is off", .lacks = "outside.md" },
+        .{ .origin = "http://localhost:12345", .body = "{\"write\":true}", .status = "200 OK", .contains = "\"edit_allowed\":false", .lacks = "write_file" },
+        .{ .origin = "http://localhost:12345", .body = "{\"write\":\"yes\"}", .status = "400 Bad Request", .contains = "boolean" },
+        .{ .origin = "http://evil.test", .body = write_call, .status = "403 Forbidden", .contains = "Origin" },
     };
     for (cases) |c| {
         const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ c.origin, c.body.len, c.body });
@@ -26076,6 +26094,29 @@ test "web tools: list, confined execution, and browser origin guard" {
         defer t.allocator.free(response);
         try t.expect(std.mem.indexOf(u8, response, c.status) != null);
         try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
+        if (c.lacks.len > 0) try t.expect(std.mem.indexOf(u8, responseBody(response), c.lacks) == null);
+    }
+
+    const old_edit = g_web_edit;
+    g_web_edit = true;
+    defer g_web_edit = old_edit;
+    for ([_]Case{
+        .{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = "web_search", .lacks = "write_file" },
+        .{ .origin = "http://localhost:12345", .body = "{\"write\":true}", .status = "200 OK", .contains = "\"edit_allowed\":true" },
+        .{ .origin = "http://localhost:12345", .body = "{\"write\":true,\"vision\":true}", .status = "200 OK", .contains = "edit_file" },
+        // With both switches on the call reaches the confinement check, which is what keeps the
+        // test from writing anything: the path names a file outside the server's own folder.
+        .{ .origin = "http://localhost:12345", .body = write_call, .status = "200 OK", .contains = "outside the folder" },
+        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"edit_file\",\"arguments\":\"{\\\"path\\\":\\\"/etc/hosts\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"b\\\"}\",\"write\":true}", .status = "200 OK", .contains = "outside the folder" },
+        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"x.md\\\",\\\"content\\\":\\\"x\\\"}\"}", .status = "200 OK", .contains = "writing files is off" },
+    }) |c| {
+        const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ c.origin, c.body.len, c.body });
+        defer t.allocator.free(req);
+        const response = try serveOneForTest(req);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.indexOf(u8, response, c.status) != null);
+        try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
+        if (c.lacks.len > 0) try t.expect(std.mem.indexOf(u8, responseBody(response), c.lacks) == null);
     }
 }
 

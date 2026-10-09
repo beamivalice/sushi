@@ -68,7 +68,7 @@ code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 echo "Chat page (port $PORT)"
 
-echo "[1/4] the page and its neighbours"
+echo "[1/5] the page and its neighbours"
 if boot; then
     for path in / /chat; do
         curl -s -D "$WORK/headers" -o "$WORK/body" "$BASE$path"
@@ -96,6 +96,10 @@ import json, pathlib, sys
 work = pathlib.Path(sys.argv[1])
 for filename, path in [("read.json", "note.txt"), ("outside.json", "../outside")]:
     (work / filename).write_text(json.dumps({"directory": str(work / "picked"), "name": "read_file", "arguments": json.dumps({"path": path})}))
+# A write call the server was not started with --edit for; a file keeps the nested JSON quoting out of bash.
+(work / "write_off.json").write_text(json.dumps({
+    "directory": str(work / "picked"), "name": "write_file", "write": True,
+    "arguments": json.dumps({"path": "off.md", "content": "x\n"})}))
 PYDATA
     check "tools read from the chosen folder" \
         "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
@@ -107,6 +111,14 @@ PYDATA
         "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{}' | python3 -c 'import json,os,sys; assert json.load(sys.stdin)["root"] == os.path.realpath(".")' && echo 1 || echo 0)"
     check "invalid selected directory is rejected" \
         "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{"directory":"/sushi-folder-does-not-exist"}')" 400)"
+    check "the listing says this server was started without --edit" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{"write":true}' \
+            | grep -q '"edit_allowed":false' && echo 1 || echo 0)"
+    check "a write call is refused while editing is off" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
+        --data-binary @"$WORK/write_off.json" | grep -q 'writing files is off' && echo 1 || echo 0)"
+    check "a refused write leaves no file behind" \
+        "$(is "$(find "$WORK/picked" -name 'off.md' | wc -l | tr -d ' ')" 0)"
     check "POST / is 405" "$(is "$(code -X POST "$BASE/" -d '{}')" 405)"
     check "GET /health still answers ok" "$(is "$(curl -s "$BASE/health")" '{"status":"ok"}')"
     check "GET /v1/models still lists" "$(is "$(curl -s "$BASE/v1/models")" '{"object":"list","data":[]}')"
@@ -119,7 +131,46 @@ else
     check "boot" 0
 fi
 
-echo "[2/4] --api-key --api-key-strict: page open, API behind the key"
+echo "[2/5] --edit on: the chat page writes inside the folder it picked"
+if boot --edit on; then
+    python3 - "$WORK" <<'PYDATA'
+import json, pathlib, sys
+work = pathlib.Path(sys.argv[1])
+picked = str(work / "picked")
+calls = {
+    "edit_allowed.json": {"write": True},
+    "write_note.json": {"directory": picked, "write": True, "name": "write_file",
+                        "arguments": json.dumps({"path": "written.md", "content": "first line\n"})},
+    "edit_note.json": {"directory": picked, "write": True, "name": "edit_file",
+                       "arguments": json.dumps({"path": "written.md", "old_string": "first", "new_string": "second"})},
+    "write_outside.json": {"directory": picked, "write": True, "name": "write_file",
+                           "arguments": json.dumps({"path": "../escaped.md", "content": "x\n"})},
+    "write_secret.json": {"directory": picked, "write": True, "name": "write_file",
+                          "arguments": json.dumps({"path": "server.key", "content": "x\n"})},
+    "edit_missing.json": {"directory": picked, "write": True, "name": "edit_file",
+                          "arguments": json.dumps({"path": "gone.md", "old_string": "a", "new_string": "b"})},
+}
+for filename, body in calls.items():
+    (work / filename).write_text(json.dumps(body))
+PYDATA
+    tools_post() { curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' --data-binary @"$WORK/$1"; }
+    check "the listing says editing is allowed and offers both write tools" \
+        "$(tools_post edit_allowed.json | python3 -c 'import json,sys; x=json.load(sys.stdin); names=[t["function"]["name"] for t in x["tools"]]; assert x["edit_allowed"] is True and "write_file" in names and "edit_file" in names' 2>/dev/null && echo 1 || echo 0)"
+    check "write_file creates the file in the chosen folder" \
+        "$(tools_post write_note.json | grep -q 'wrote 11 bytes' && [ "$(cat "$WORK/picked/written.md" 2>/dev/null)" = "first line" ] && echo 1 || echo 0)"
+    check "edit_file changes that file in place" \
+        "$(tools_post edit_note.json | grep -q 'edited written.md: 1 replacement' && [ "$(cat "$WORK/picked/written.md" 2>/dev/null)" = "second line" ] && echo 1 || echo 0)"
+    check "a write outside the chosen folder is refused and nothing appears there" \
+        "$(tools_post write_outside.json | grep -q 'refused' && [ ! -e "$WORK/escaped.md" ] && echo 1 || echo 0)"
+    check "a secret-named file is refused and not created" \
+        "$(tools_post write_secret.json | grep -q 'secrets' && [ ! -e "$WORK/picked/server.key" ] && echo 1 || echo 0)"
+    check "editing a file that is not there names it" \
+        "$(tools_post edit_missing.json | grep -q 'no such file' && echo 1 || echo 0)"
+else
+    check "boot with --edit on" 0
+fi
+
+echo "[3/5] --api-key --api-key-strict: page open, API behind the key"
 if boot --api-key webui-test-key --api-key-strict; then
     check "tools require the configured API key" \
         "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{}')" 401)"
@@ -135,12 +186,12 @@ else
     check "boot with --api-key" 0
 fi
 
-echo "[3/4] the page stays self-contained"
+echo "[4/5] the page stays self-contained"
 check "no external http(s) fetch or CDN in the page" \
     "$(grep -Eq '(src|href)="https?://|@import|fetch\("https?://' "$PAGE" && echo 0 || echo 1)"
 check "the page is under 200 KB" "$([ "$(wc -c < "$PAGE")" -lt 204800 ] && echo 1 || echo 0)"
 
-echo "[4/4] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter"
+echo "[5/5] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter"
 if command -v node >/dev/null 2>&1; then
     for t in effort tools prefix_cache; do
         check "tests/test_webui_$t.cjs passes" "$(node "tests/test_webui_$t.cjs" >/dev/null 2>&1 && echo 1 || echo 0)"

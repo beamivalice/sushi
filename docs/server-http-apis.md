@@ -315,6 +315,10 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 
 - The composer's **Tools on/off** button enables the same research pack as `sushi run`, off by default.
   The preference persists in this browser. It is fixed for a turn; the button is disabled while a reply runs.
+- The **pencil chip** next to Folder turns `write_file` and `edit_file` on for that chat only. It starts
+  off for every new chat, travels with the saved chat, and goes back off the moment the chat's folder
+  changes. It is disabled, with the reason in its tooltip, when the Tools chip is off or when the server
+  was started without `--edit on` — the page can ask for less than the server allows, never more.
 - The browser sends definitions, assembles streamed tool calls, executes them through `POST /v1/tools`, and
   sends results back to the model. Eight tool rounds maximum, followed by a final request without tools.
   Results are collapsible in the transcript. Tool rows show the query, URL or file argument on one line,
@@ -327,6 +331,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - `POST /v1/tools` with `{ "vision": false }` lists definitions and the file root. With `name`, JSON-string
   `arguments`, and `vision`, it executes one call and returns `text` plus optional `image` data URL.
   `directory` optionally selects an absolute folder, resolved and validated with the REPL's `/cd` checks.
+  `write` (boolean) is the chat's pencil chip; the listing answers with `edit_allowed` (the server's `--edit`
+  ceiling) and offers the two write tools only when ceiling and request are both on.
   With `browse: true`, the endpoint instead returns `root`, `parent`, `directories`, and `truncated` for the
   picker (up to 1000 visible, non-secret subfolders). The browser passes the selected canonical directory
   separately from model arguments on every call. Vision models get `view_image`; returned images remain in memory only.
@@ -334,6 +340,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   It works from `localhost` or `127.0.0.1`, not a remote browser or wildcard bind. File tools are confined to
   the chat's selected folder, with the existing hidden/secret-file and symlink checks; network tools keep
   the REPL's public-address restrictions. No MCP configuration is added.
+- Writing rides the same bridge and gate (loopback peer, loopback bind, the page's Origin); `--edit` defaults off.
+  The model never supplies `directory`: the page does, from its own per-chat state, so no tool call moves the root.
 - Same-origin rule: `POST /v1/load-model`, `/v1/unload-model`, `/v1/models/rescan` and the `/v1/responses` WebSocket
   upgrade answer 403 when the request carries an Origin other than this server's own page (`crossOriginRefused`);
   requests without an Origin (curl, SDKs) pass, and the inference routes stay CORS-open.
@@ -361,7 +369,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   bare `/tool` shows the state and list. One dim trace line per call (`search:`, `fetch:`, `read:` …).
 - Tools: `web_search` (GET html.duckduckgo.com, top 8 title/url/snippet, `uddg=` unwrapped, ads dropped),
   `fetch_url` (GET, ≤5 redirects, 10 s wall clock, 2 MB, HTML → text ≤20k chars), `read_file` (≤256 KB),
-  `list_dir`, `search_files` (substring or regex, ≤100 hits), `view_image` (only when `/v1/models` lists `vision`).
+  `list_dir`, `search_files` (substring or regex, ≤100 hits), `view_image` (only when `/v1/models` lists `vision`),
+  and with `/edit on` also `write_file` and `edit_file` (see the writing rules below).
 - **8 tool rounds per user turn**, then a user nudge and one request WITHOUT tools for the final answer.
 - **Only the latest USER turn's images are decoded** (`server.activeWireMediaIndex`): a tool image rides a synthetic
   user turn after the tool results. `/image <path>` attaches to the next message; a pasted path is never attached.
@@ -370,6 +379,19 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   a secret name refused; bare `/cd` shows it). `..`, outside absolutes and escaping symlinks are refused, as are dot
   entries and secret names (`.env*`, `*.pem`, `*.key`, `id_*`, `*.p12`, `credentials*`, `*.keychain*`, `.ssh`,
   `.aws`, `.gnupg`), checked both as typed and after resolution (`confinePath`).
+- **Editing is a second switch on top of the file tools**: `--edit on|off` and `/edit on|off` (needs `/tool on` too),
+  the per-chat pencil chip on the page (capped by `--edit`). `write_file`/`edit_file` are offered only while it is on;
+  a write call with it off is refused with how to turn it on.
+- **A new file is confined through its parent.** `realpath(3)` fails on a missing last component, so
+  `confineWriteTarget` falls back to `confineNewPath` (real parent re-checked with `within` + `componentRefusal`);
+  dot and secret names stay refused, so a chat at `$HOME` cannot touch `.zshrc`.
+- **A replacement lands atomically.** `replaceFileBytes` writes through `createFileAtomic` (a random exclusive temp
+  name in the target's folder, then one rename) and copies the old file's permissions onto it, so a failed write
+  leaves the original whole and an edited script stays executable.
+- **`write_file`** holds at most `max_write_bytes` (= the 256 KiB read cap, so every write reads back whole) and
+  refuses a folder or a binary target. **`edit_file`** reads to EOF, refuses a file over the cap rather than rewrite
+  a partial read, needs a non-empty `old_string`, and one match unless `replace_all`. Both arm the `fetch_url`
+  approval like the reads.
 - An outside path's refusal tells the model the folder is fixed and the user can type `/cd <folder>`, so it asks for
   that instead of guessing other paths.
 - The user's `/image <path>` (`loadUserImage`): a RELATIVE path resolves in the `/cd` folder under the same

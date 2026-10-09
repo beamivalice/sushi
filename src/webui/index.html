@@ -538,6 +538,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 #folderError { color: var(--err); }
 #toolsButton { flex: none; white-space: nowrap; }
 #toolsButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
+#editButton { flex: none; white-space: nowrap; }
+#editButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
+.tool-write > summary { color: var(--accent); }
 .chip-toggle svg { width: 13px; height: 13px; flex: none; }
 .chip-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #composerEffortName { color: var(--accent); flex: none; }
@@ -665,6 +668,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   }
   #chatPanel.right-open #chatRightbar { transform: translateX(0); }
   .chip-toggle { max-width: 180px; }
+  #editButton { padding: 4px 9px; }
+  #editName { display: none; }
 }
 @media (max-width: 560px) {
   .brand .ver { display: none; }
@@ -766,7 +771,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
             <input id="attachInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple hidden>
             <button class="chip-toggle" id="composerModelLabel" title="Choose the model and thinking effort" aria-label="Choose the model and thinking effort"><svg><use href="#i-box"/></svg><span id="composerModelName">no model</span><span>/</span><span id="composerEffortName">—</span></button>
             <button class="chip-toggle" id="directoryButton" title="Choose the folder for this chat's file tools" aria-haspopup="dialog"><span id="directoryName">Folder</span></button>
-            <button class="chip-toggle" id="toolsButton" aria-pressed="false" title="Enable web search, page fetching and read-only files in the server folder">Tools off</button>
+            <button class="chip-toggle" id="editButton" aria-pressed="false" title="Let the model write and edit files in this chat's folder"><svg><use href="#i-pencil"/></svg><span id="editName">Edit off</span></button>
+            <button class="chip-toggle" id="toolsButton" aria-pressed="false" title="Enable web search, page fetching and file tools in the server folder">Tools off</button>
             <span class="spacer"></span>
             <button id="stopButton" aria-label="Stop generating" title="Stop" hidden><svg><use href="#i-stop"/></svg></button>
             <button id="sendButton" aria-label="Send message" title="Send"><svg><use href="#i-send"/></svg></button>
@@ -829,7 +835,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 
 <dialog id="folderPicker" aria-labelledby="folderTitle">
   <h2 id="folderTitle">Chat folder</h2>
-  <p>Choose where this chat's file tools can read. Web search works independently of this folder.</p>
+  <p>Choose the folder this chat's file tools work in. Editing stays off until you turn it on for this chat. Web search works independently of this folder.</p>
   <form id="folderForm" class="folder-row">
     <input id="folderPath" type="text" aria-label="Folder path" placeholder="Absolute folder path" autocomplete="off">
     <button class="btn" type="submit">Go</button>
@@ -1608,6 +1614,9 @@ const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif", "imag
 let chats = loadChats();
 let currentChat = null;
 let draftDirectory = "";
+let draftEdit = false;
+// What the server allows for writing, from the last /v1/tools listing: null until asked.
+let editCeiling = null;
 let chatAbort = null;
 let lastTurnError = null;
 let renamingChatId = null;
@@ -1750,6 +1759,7 @@ function newChat() {
   if (chatAbort) chatAbort.abort();
   currentChat = null;
   draftDirectory = "";
+  draftEdit = false;
   lastTurnError = null;
   renderTranscript();
   renderConversationList();
@@ -1785,7 +1795,7 @@ function toolCallLabel(call) {
   const name = call?.function?.name || "Tool result";
   try {
     const args = JSON.parse(call.function.arguments);
-    const key = { web_search: "query", fetch_url: "url", read_file: "path", list_dir: "path", search_files: "pattern", view_image: "path_or_url" }[name];
+    const key = { web_search: "query", fetch_url: "url", read_file: "path", write_file: "path", edit_file: "path", list_dir: "path", search_files: "pattern", view_image: "path_or_url" }[name];
     const detail = typeof args?.[key] === "string" ? args[key].replace(/\s+/g, " ").trim() : "";
     return detail ? `${name} · ${detail}` : name;
   } catch {
@@ -1795,8 +1805,10 @@ function toolCallLabel(call) {
 function appendMessageNode(message, { last = false, toolCall = null } = {}) {
   if (message.toolImages) return;
   if (message.role === "tool") {
-    const details = el("details", "thinking tool-result");
-    const label = toolCallLabel(toolCall || { function: { name: message.name } });
+    const named = toolCall || { function: { name: message.name } };
+    const writing = named.function?.name === "write_file" || named.function?.name === "edit_file";
+    const details = el("details", `thinking tool-result${writing ? " tool-write" : ""}`);
+    const label = toolCallLabel(named);
     const summary = el("summary");
     summary.title = label;
     summary.appendChild(el("span", "tool-call-label", label));
@@ -2020,8 +2032,10 @@ $("toolsButton").onclick = () => {
   toolsEnabled = !toolsEnabled;
   writeStore("sushi-tools", toolsEnabled ? "on" : "off");
   renderToolsButton();
+  refreshEditCeiling();
 };
 renderToolsButton();
+renderEditButton();
 async function callResearchTools(body, signal) {
   const response = await api("/v1/tools", {
     method: "POST", headers: { "content-type": "application/json" },
@@ -2034,12 +2048,62 @@ async function callResearchTools(body, signal) {
 function chatDirectory() {
   return currentChat ? currentChat.directory || "" : draftDirectory;
 }
+function chatEdit() {
+  return currentChat ? !!currentChat.edit : draftEdit;
+}
+// Write access is granted to one folder: choosing another one starts editing off again.
+function setChatDirectory(root) {
+  if (currentChat) {
+    currentChat.directory = root;
+    currentChat.edit = false;
+    touchChat(currentChat);
+  } else {
+    draftDirectory = root;
+    draftEdit = false;
+  }
+  renderDirectoryButton();
+}
+function setChatEdit(on) {
+  if (currentChat) {
+    currentChat.edit = on;
+    touchChat(currentChat);
+  } else draftEdit = on;
+  renderEditButton();
+}
 function renderDirectoryButton() {
   const path = chatDirectory();
   $("directoryName").textContent = path ? path.split("/").filter(Boolean).pop() || "/" : "Folder";
   $("directoryButton").title = path || "Choose the folder for this chat's file tools";
-  $("toolsButton").title = path ? `Web search, page fetching and read-only files under ${path}` : "Enable web search, page fetching and read-only files in the server folder";
+  $("toolsButton").title = path ? `Web search, page fetching and files under ${path}` : "Enable web search, page fetching and file tools in the server folder";
+  renderEditButton();
 }
+function renderEditButton() {
+  const on = chatEdit();
+  const allowed = editCeiling === true;
+  $("editName").textContent = on && allowed ? "Edit on" : "Edit off";
+  $("editButton").setAttribute("aria-pressed", String(on && allowed));
+  $("editButton").disabled = !toolsEnabled || !allowed || !!chatAbort;
+  $("editButton").title = !toolsEnabled ? "Turn the file tools on first"
+    : editCeiling === null ? "Asking this server what it allows for writing…"
+    : !allowed ? "This server was started without --edit, so the model cannot write files"
+    : on ? `The model can write and edit files under ${chatDirectory() || "this chat's folder"}`
+    : "Let the model write and edit files in this chat's folder";
+}
+// Asks the bridge what it allows for writing, so the pencil can say why before a turn runs.
+async function refreshEditCeiling() {
+  if (!toolsEnabled) {
+    editCeiling = null;
+    renderEditButton();
+    return;
+  }
+  try {
+    editCeiling = (await callResearchTools({})).edit_allowed === true;
+  } catch {
+    editCeiling = false;
+  }
+  renderEditButton();
+}
+$("editButton").onclick = () => setChatEdit(!chatEdit());
 let folderSelection = null;
 let folderAbort = null;
 async function browseChatFolder(directory) {
@@ -2089,11 +2153,7 @@ $("folderCancel").onclick = () => $("folderPicker").close();
 $("folderPicker").addEventListener("close", () => { folderAbort?.abort(); });
 $("folderChoose").onclick = () => {
   if (!folderSelection || chatAbort) return;
-  if (currentChat) {
-    currentChat.directory = folderSelection.root;
-    touchChat(currentChat);
-  } else draftDirectory = folderSelection.root;
-  renderDirectoryButton();
+  setChatDirectory(folderSelection.root);
   $("folderPicker").close();
 };
 function wireMessages(history) {
@@ -2285,8 +2345,9 @@ function setChatBusy(busy) {
   $("directoryButton").disabled = busy;
   $("sendButton").hidden = busy;
   $("stopButton").hidden = !busy;
+  renderEditButton();
 }
-async function runResearchTurn(model, messages, signal, tools, vision, directory) {
+async function runResearchTurn(model, messages, signal, tools, vision, directory, edit) {
   for (let round = 0; round <= 8; round++) {
     if (signal.aborted) return;
     const result = await streamReply(model, messages, signal, round < 8 ? tools : null);
@@ -2305,7 +2366,7 @@ async function runResearchTurn(model, messages, signal, tools, vision, directory
       if (!signal.aborted) {
         try {
           if (!tools.some((tool) => tool.function.name === call.function.name)) throw new Error("Tool is not in the enabled pack");
-          output = await callResearchTools({ name: call.function.name, arguments: call.function.arguments, vision, directory }, signal);
+          output = await callResearchTools({ name: call.function.name, arguments: call.function.arguments, vision, directory, write: edit }, signal);
         } catch (error) {
           output = { text: signal.aborted ? "Tool call cancelled" : `Tool error: ${error.message}` };
         }
@@ -2329,13 +2390,14 @@ async function runTurn(chat) {
   renderTranscript();
   try {
     const vision = modelSeesImages(selectedModel());
-    const pack = toolsEnabled ? await callResearchTools({ vision, ...(chat.directory ? { directory: chat.directory } : {}) }, chatAbort.signal) : null;
+    const pack = toolsEnabled ? await callResearchTools({ vision, write: !!chat.edit, ...(chat.directory ? { directory: chat.directory } : {}) }, chatAbort.signal) : null;
     if (pack) {
       chat.directory = pack.root;
+      editCeiling = pack.edit_allowed === true;
       renderDirectoryButton();
-      $("toolsButton").title = `Web search, page fetching and read-only files under ${pack.root}`;
+      $("toolsButton").title = `Web search, page fetching and files under ${pack.root}`;
     }
-    await runResearchTurn(model, chat.messages, chatAbort.signal, pack?.tools, vision, pack?.root);
+    await runResearchTurn(model, chat.messages, chatAbort.signal, pack?.tools, vision, pack?.root, !!chat.edit);
     if (chatAbort.signal.aborted) toast("Stopped", "ok");
   } catch (error) {
     if (chatAbort.signal.aborted) toast("Stopped", "ok");
@@ -2359,7 +2421,7 @@ async function sendChat(text) {
     toast("No chat model is available yet", "err");
     return;
   }
-  if (!currentChat) currentChat = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`, title: "", messages: [], directory: draftDirectory };
+  if (!currentChat) currentChat = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`, title: "", messages: [], directory: draftDirectory, edit: draftEdit };
   pendingImages = [];
   renderComposerAttachments();
   currentChat.messages.push({ role: "user", content, images });
@@ -2435,6 +2497,7 @@ async function init() {
   refreshServerDot();
   setInterval(refreshServerDot, 10_000);
   await refreshModels().catch(() => {});
+  refreshEditCeiling();
   loadVersion();
   setInterval(loadVersion, 300_000);
   setInterval(() => {

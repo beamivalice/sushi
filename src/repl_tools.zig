@@ -1,5 +1,5 @@
-//! Read-only research tools shared by `sushi run` and the local web UI bridge:
-//! web search, page fetch, confined file reads and image viewing.
+//! Research tools shared by `sushi run` and the local web UI bridge: web search, page fetch,
+//! confined file reads, image viewing, and — when the user turns editing on — file writes.
 
 const std = @import("std");
 const regex = @import("regex.zig");
@@ -74,6 +74,9 @@ pub const Confined = union(enum) { ok: []u8, refused: []const u8 };
 const refuse_outside = "refused: that path is outside the folder the file tools are fixed to; the user can move it by typing /cd <folder> in the chat, so suggest that instead of trying other paths";
 const refuse_hidden = "refused: hidden files and folders are off limits";
 const refuse_secret = "refused: that file may hold secrets";
+const refuse_missing = "no such file or folder";
+const refuse_not_a_file = "refused: that names a folder; the write tools need a file name";
+const refuse_write_off = "refused: writing files is off; the user turns it on with the pencil chip in the chat page or /edit on in the REPL, so ask for that instead of trying other paths";
 
 fn componentRefusal(rel: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeScalar(u8, rel, '/');
@@ -104,12 +107,46 @@ pub fn confinePath(allocator: std.mem.Allocator, io: std.Io, root: []const u8, u
     defer allocator.free(joined);
     const real_z = std.Io.Dir.realPathFileAbsoluteAlloc(io, joined, allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .refused = "no such file or folder" },
+        else => return .{ .refused = refuse_missing },
     };
     defer allocator.free(real_z);
     const real_rel = within(root, real_z) orelse return .{ .refused = refuse_outside };
     if (componentRefusal(real_rel)) |msg| return .{ .refused = msg };
     return .{ .ok = try allocator.dupe(u8, real_z) };
+}
+
+/// The real path a write to `user_path` may land on when that name does not exist yet.
+/// `confinePath` cannot answer for it — realpath(3) fails on a missing final component — so a new
+/// file is confined through its parent folder, which must exist and stay inside `root`.
+pub fn confineNewPath(allocator: std.mem.Allocator, io: std.Io, root: []const u8, user_path: []const u8) !Confined {
+    var rel = std.mem.trim(u8, user_path, " \t\r\n");
+    if (std.fs.path.isAbsolute(rel)) rel = within(root, rel) orelse return .{ .refused = refuse_outside };
+    if (rel.len == 0 or rel[rel.len - 1] == '/') return .{ .refused = refuse_not_a_file };
+    if (componentRefusal(rel)) |msg| return .{ .refused = msg };
+    const joined = try std.fs.path.join(allocator, &.{ root, rel });
+    defer allocator.free(joined);
+    const base = std.fs.path.basename(joined);
+    if (base.len == 0 or std.mem.eql(u8, base, ".")) return .{ .refused = refuse_not_a_file };
+    const parent = std.fs.path.dirname(joined) orelse return .{ .refused = refuse_outside };
+    const real_parent = std.Io.Dir.realPathFileAbsoluteAlloc(io, parent, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .refused = "refused: that folder does not exist; the parent of a written file has to" },
+    };
+    defer allocator.free(real_parent);
+    const parent_rel = within(root, real_parent) orelse return .{ .refused = refuse_outside };
+    if (componentRefusal(parent_rel)) |msg| return .{ .refused = msg };
+    return .{ .ok = try std.fs.path.join(allocator, &.{ real_parent, base }) };
+}
+
+/// The real path a write may change: `confinePath` when the name already exists, its parent
+/// folder when it does not. Anything else the reads refuse (outside, hidden, secret, escaping
+/// symlink) the writes refuse too.
+pub fn confineWriteTarget(allocator: std.mem.Allocator, io: std.Io, root: []const u8, user_path: []const u8) !Confined {
+    switch (try confinePath(allocator, io, root, user_path)) {
+        .ok => |real| return .{ .ok = real },
+        .refused => |msg| if (!std.mem.eql(u8, msg, refuse_missing)) return .{ .refused = msg },
+    }
+    return confineNewPath(allocator, io, root, user_path);
 }
 
 pub const RootChange = union(enum) { ok: [:0]u8, refused: []const u8 };
@@ -776,6 +813,9 @@ fn webGet(ctx: Context, url: []const u8, max_bytes: usize) !WebResult {
 // ── Tools ───────────────────────────────────────────────────────────────
 
 pub const max_read_bytes = 256 * 1024;
+/// One cap for what the file tools can read and what they can write: nothing gets written that
+/// the same tools could not read back whole.
+pub const max_write_bytes = max_read_bytes;
 const max_list_entries = 500;
 const max_search_hits = 100;
 const max_search_files = 5000;
@@ -787,6 +827,8 @@ pub const Context = struct {
     /// Real path of the folder the file tools stay inside; `/cd` moves it.
     root: [:0]const u8,
     vision: bool,
+    /// The user has turned editing on: `write_file` and `edit_file` may change files under `root`.
+    writable: bool = false,
 };
 
 pub const Output = struct {
@@ -813,18 +855,38 @@ const text_tools = tool("web_search", "Search the web with DuckDuckGo. Returns u
 
 const image_tool = tool("view_image", "Look at an image: a file inside the current folder or a public image URL. To show an online image to the user, include ![description](https://direct-image-url) in your answer.", "\"path_or_url\":{\"type\":\"string\",\"description\":\"Image path or http(s) URL\"}", "\"path_or_url\"");
 
-/// The OpenAI `tools` array; `view_image` only for a model that sees images.
-pub fn definitionsJson(vision: bool) []const u8 {
-    return if (vision) "[" ++ text_tools ++ "," ++ image_tool ++ "]" else "[" ++ text_tools ++ "]";
+const write_tools = tool("write_file", "Create a text file in the current folder, or replace one that is already there. Give the whole content at once, up to 262144 bytes.", "\"path\":{\"type\":\"string\",\"description\":\"Path relative to the current folder\"},\"content\":{\"type\":\"string\",\"description\":\"The complete file content\"}", "\"path\",\"content\"") ++ "," ++
+    tool("edit_file", "Change a text file in the current folder by replacing old_string with new_string. Read the file first, so old_string matches the stored text exactly. It refuses when old_string matches more than once, unless replace_all is true.", "\"path\":{\"type\":\"string\",\"description\":\"Path relative to the current folder\"},\"old_string\":{\"type\":\"string\",\"description\":\"Exact text to find\"},\"new_string\":{\"type\":\"string\",\"description\":\"Text to put in its place\"},\"replace_all\":{\"type\":\"boolean\",\"description\":\"Replace every match; default false\"}", "\"path\",\"old_string\",\"new_string\"");
+
+/// The OpenAI `tools` array; `view_image` only for a model that sees images, the write tools only
+/// when the user turned editing on, so a model never offers a call the bridge would refuse.
+pub fn definitionsJson(vision: bool, writable: bool) []const u8 {
+    if (vision) return if (writable)
+        "[" ++ text_tools ++ "," ++ image_tool ++ "," ++ write_tools ++ "]"
+    else
+        "[" ++ text_tools ++ "," ++ image_tool ++ "]";
+    return if (writable) "[" ++ text_tools ++ "," ++ write_tools ++ "]" else "[" ++ text_tools ++ "]";
 }
 
-pub fn toolNames(vision: bool) []const u8 {
-    return if (vision) "web_search, fetch_url, read_file, list_dir, search_files, view_image" else "web_search, fetch_url, read_file, list_dir, search_files";
+const tool_name_base = "web_search, fetch_url, read_file, list_dir, search_files";
+
+pub fn toolNames(vision: bool, writable: bool) []const u8 {
+    if (vision) return if (writable)
+        tool_name_base ++ ", view_image, write_file, edit_file"
+    else
+        tool_name_base ++ ", view_image";
+    return if (writable) tool_name_base ++ ", write_file, edit_file" else tool_name_base;
 }
 
 fn stringArg(args: std.json.Value, key: []const u8) ?[]const u8 {
     const v = args.object.get(key) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+/// A boolean argument that a model may leave out or send as anything: only `true` counts.
+fn boolArg(args: std.json.Value, key: []const u8) bool {
+    const v = args.object.get(key) orelse return false;
+    return v == .bool and v.bool;
 }
 
 /// Filters bytes bound for the user's terminal: text, `\n`, `\t` and valid UTF-8 pass; other control bytes, DEL, C1
@@ -925,9 +987,16 @@ pub fn fetchNeedingApproval(allocator: std.mem.Allocator, name: []const u8, args
     return try sanitizeForTerminal(allocator, url);
 }
 
-/// Tools whose result is local file content.
+/// Tools whose result is local file content, or that put model content into a local file. Both
+/// mean content from this machine is in the session, which is what arms the `fetch_url` approval.
 pub fn isFileTool(name: []const u8) bool {
-    for ([_][]const u8{ "read_file", "list_dir", "search_files", "view_image" }) |n| if (std.mem.eql(u8, n, name)) return true;
+    for ([_][]const u8{ "read_file", "list_dir", "search_files", "view_image", "write_file", "edit_file" }) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// The tools that change files, and so need the user's editing switch on top of the file tools.
+pub fn isWriteTool(name: []const u8) bool {
+    for ([_][]const u8{ "write_file", "edit_file" }) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
 }
 
@@ -947,6 +1016,8 @@ fn traceLineRaw(allocator: std.mem.Allocator, name: []const u8, args_json: []con
         .{ .tool = "web_search", .verb = "search", .key = "query" },
         .{ .tool = "fetch_url", .verb = "fetch", .key = "url" },
         .{ .tool = "read_file", .verb = "read", .key = "path" },
+        .{ .tool = "write_file", .verb = "write", .key = "path" },
+        .{ .tool = "edit_file", .verb = "edit", .key = "path" },
         .{ .tool = "list_dir", .verb = "list", .key = "path" },
         .{ .tool = "view_image", .verb = "view", .key = "path_or_url" },
     }) |l| if (std.mem.eql(u8, name, l.tool)) {
@@ -972,7 +1043,7 @@ pub fn run(ctx: Context, name: []const u8, args_json: []const u8) !Output {
     const parsed = std.json.parseFromSlice(std.json.Value, a, args_json, .{}) catch null;
     defer if (parsed) |p| p.deinit();
     const args = if (parsed) |p| p.value else std.json.Value{ .null = {} };
-    const known = for ([_][]const u8{ "web_search", "fetch_url", "read_file", "list_dir", "search_files", "view_image" }) |n| {
+    const known = for ([_][]const u8{ "web_search", "fetch_url", "read_file", "list_dir", "search_files", "view_image", "write_file", "edit_file" }) |n| {
         if (std.mem.eql(u8, n, name)) break true;
     } else false;
     if (!known) return textOut(a, "error: unknown tool {s}", .{name});
@@ -989,6 +1060,18 @@ pub fn run(ctx: Context, name: []const u8, args_json: []const u8) !Output {
     if (std.mem.eql(u8, name, "read_file")) {
         const path = stringArg(args, "path") orelse return textOut(a, "error: read_file needs a \"path\" string", .{});
         return readFile(ctx, path);
+    }
+    if (isWriteTool(name)) {
+        if (!ctx.writable) return textOut(a, "{s}", .{refuse_write_off});
+        if (std.mem.eql(u8, name, "write_file")) {
+            const path = stringArg(args, "path") orelse return textOut(a, "error: write_file needs a \"path\" string", .{});
+            const content = stringArg(args, "content") orelse return textOut(a, "error: write_file needs a \"content\" string", .{});
+            return writeFileTool(ctx, path, content);
+        }
+        const path = stringArg(args, "path") orelse return textOut(a, "error: edit_file needs a \"path\" string", .{});
+        const old_string = stringArg(args, "old_string") orelse return textOut(a, "error: edit_file needs an \"old_string\" string", .{});
+        const new_string = stringArg(args, "new_string") orelse return textOut(a, "error: edit_file needs a \"new_string\" string", .{});
+        return editFileTool(ctx, path, old_string, new_string, boolArg(args, "replace_all"));
     }
     if (std.mem.eql(u8, name, "list_dir")) return listDir(ctx, stringArg(args, "path") orelse ".");
     if (std.mem.eql(u8, name, "search_files")) {
@@ -1220,6 +1303,136 @@ fn searchFiles(ctx: Context, pattern: []const u8, path: []const u8) !Output {
         return textOut(a, "no matches for \"{s}\" in {s}", .{ pattern, path });
     }
     return .{ .text = try out.toOwnedSlice(a) };
+}
+
+// ── Writing ─────────────────────────────────────────────────────────────
+
+/// Non-overlapping matches of `needle` in `hay`.
+fn countMatches(hay: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, i, needle)) |at| {
+        n += 1;
+        i = at + needle.len;
+    }
+    return n;
+}
+
+/// `hay` with every match of `needle` (or just the first) replaced by `with`.
+fn replaceMatches(allocator: std.mem.Allocator, hay: []const u8, needle: []const u8, with: []const u8, all: bool) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const want: usize = if (all) std.math.maxInt(usize) else 1;
+    var i: usize = 0;
+    var done: usize = 0;
+    while (done < want) : (done += 1) {
+        const at = std.mem.indexOfPos(u8, hay, i, needle) orelse break;
+        try out.appendSlice(allocator, hay[i..at]);
+        try out.appendSlice(allocator, with);
+        i = at + needle.len;
+    }
+    try out.appendSlice(allocator, hay[i..]);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Writes `bytes` over `real_target`, a real path already confined to the tools' folder, through a
+/// temp file and one rename, so a write that fails partway leaves the original whole. A replaced
+/// file keeps its permissions. null on success, else the message for the model.
+fn replaceFileBytes(allocator: std.mem.Allocator, io: std.Io, real_target: []const u8, bytes: []const u8) !?[]u8 {
+    const parent = std.fs.path.dirname(real_target) orelse
+        return try std.fmt.allocPrint(allocator, "error: {s} has no parent folder to write in", .{real_target});
+    const base = std.fs.path.basename(real_target);
+    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch |err|
+        return try std.fmt.allocPrint(allocator, "error: cannot open the folder of {s} ({t})", .{ base, err });
+    defer dir.close(io);
+    const old = dir.statFile(io, base, .{}) catch null;
+    var staged = dir.createFileAtomic(io, base, .{ .replace = true }) catch |err|
+        return try std.fmt.allocPrint(allocator, "error: cannot create {s} ({t})", .{ base, err });
+    defer staged.deinit(io);
+    if (old) |st| staged.file.setPermissions(io, .fromMode(st.permissions.toMode() & 0o7777)) catch {};
+    var wbuf: [8192]u8 = undefined;
+    var fw = staged.file.writer(io, &wbuf);
+    fw.interface.writeAll(bytes) catch {};
+    fw.interface.flush() catch {};
+    if (fw.err) |err| return try std.fmt.allocPrint(allocator, "error: writing {s} failed ({t}); the original is unchanged", .{ base, err });
+    staged.replace(io) catch |err|
+        return try std.fmt.allocPrint(allocator, "error: could not put {s} in place ({t}); the original is unchanged", .{ base, err });
+    return null;
+}
+
+/// Why the file already at `real` cannot be replaced by a text write: null when nothing is there
+/// or what is there is text, else the message for the model.
+fn blockedTextOverwrite(ctx: Context, path: []const u8, real: []const u8) !?[]u8 {
+    const a = ctx.allocator;
+    var file = std.Io.Dir.openFileAbsolute(ctx.io, real, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return try std.fmt.allocPrint(a, "error: cannot open {s} ({t})", .{ path, err }),
+    };
+    defer file.close(ctx.io);
+    const st = file.stat(ctx.io) catch |err| return try std.fmt.allocPrint(a, "error: cannot stat {s} ({t})", .{ path, err });
+    if (st.kind == .directory) return try std.fmt.allocPrint(a, "error: {s} is a folder; give a file name inside it", .{path});
+    const sniff: usize = @intCast(@min(st.size, 8192));
+    if (sniff == 0) return null;
+    const buf = try a.alloc(u8, sniff);
+    defer a.free(buf);
+    var rbuf: [4096]u8 = undefined;
+    var fr = file.reader(ctx.io, &rbuf);
+    const n = fr.interface.readSliceShort(buf) catch |err|
+        return try std.fmt.allocPrint(a, "error: reading {s} failed ({t})", .{ path, err });
+    if (looksBinary(buf[0..n])) return try std.fmt.allocPrint(a, "refused: {s} is not a text file; write to another name", .{path});
+    return null;
+}
+
+fn writeFileTool(ctx: Context, path: []const u8, content: []const u8) !Output {
+    const a = ctx.allocator;
+    if (content.len > max_write_bytes)
+        return textOut(a, "error: write_file content is {d} bytes, more than the {d} bytes a file tool can hold", .{ content.len, max_write_bytes });
+    const real = switch (try confineWriteTarget(a, ctx.io, ctx.root, path)) {
+        .refused => |msg| return textOut(a, "{s}", .{msg}),
+        .ok => |p| p,
+    };
+    defer a.free(real);
+    if (try blockedTextOverwrite(ctx, path, real)) |msg| return .{ .text = msg };
+    if (try replaceFileBytes(a, ctx.io, real, content)) |msg| return .{ .text = msg };
+    return textOut(a, "wrote {d} bytes to {s}", .{ content.len, path });
+}
+
+fn editFileTool(ctx: Context, path: []const u8, old_string: []const u8, new_string: []const u8, replace_all: bool) !Output {
+    const a = ctx.allocator;
+    if (old_string.len == 0) return textOut(a, "error: edit_file needs a non-empty old_string", .{});
+    const real = switch (try confinePath(a, ctx.io, ctx.root, path)) {
+        .ok => |p| p,
+        .refused => |msg| return if (std.mem.eql(u8, msg, refuse_missing))
+            textOut(a, "error: {s} has no such file to edit; use write_file to create one", .{path})
+        else
+            textOut(a, "{s}", .{msg}),
+    };
+    defer a.free(real);
+    var file = std.Io.Dir.openFileAbsolute(ctx.io, real, .{}) catch |err|
+        return textOut(a, "error: cannot open {s} ({t})", .{ path, err });
+    defer file.close(ctx.io);
+    const st = file.stat(ctx.io) catch |err| return textOut(a, "error: cannot stat {s} ({t})", .{ path, err });
+    if (st.kind == .directory) return textOut(a, "error: {s} is a folder; edit_file needs a text file", .{path});
+    var rbuf: [4096]u8 = undefined;
+    var fr = file.reader(ctx.io, &rbuf);
+    // Read to the end rather than to the size just stat'ed: a rewrite of a partial read would drop
+    // whatever the file had grown by.
+    const data = fr.interface.allocRemaining(a, .limited(max_write_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => return textOut(a, "error: {s} is over {d} bytes, too large to edit safely; the read tools would only see part of it", .{ path, max_write_bytes }),
+        else => return textOut(a, "error: reading {s} failed ({t})", .{ path, err }),
+    };
+    defer a.free(data);
+    if (looksBinary(data)) return textOut(a, "refused: {s} is not a text file", .{path});
+    const matches = countMatches(data, old_string);
+    if (matches == 0) return textOut(a, "error: no match for old_string in {s}; read the file and copy the exact text", .{path});
+    if (matches > 1 and !replace_all)
+        return textOut(a, "refused: old_string has {d} matches in {s}; give a longer old_string or set replace_all to true", .{ matches, path });
+    const edited = try replaceMatches(a, data, old_string, new_string, replace_all);
+    defer a.free(edited);
+    if (edited.len > max_write_bytes)
+        return textOut(a, "error: the edited file would be {d} bytes, more than the {d} bytes a file tool can hold", .{ edited.len, max_write_bytes });
+    if (try replaceFileBytes(a, ctx.io, real, edited)) |msg| return .{ .text = msg };
+    return textOut(a, "edited {s}: {d} replacement{s}, {d} bytes", .{ path, matches, if (matches == 1) @as([]const u8, "") else "s", edited.len });
 }
 
 /// The data-URL media type of an image the server can decode, by magic bytes.
@@ -1533,6 +1746,11 @@ fn runForTest(ctx: Context, name: []const u8, args: []const u8) ![]u8 {
     return out.text;
 }
 
+fn entryExists(dir: std.Io.Dir, io: std.Io, sub: []const u8) bool {
+    dir.access(io, sub, .{ .read = true }) catch return false;
+    return true;
+}
+
 test "repl tools: file tools read, list and grep inside the folder only" {
     const allocator = testing.allocator;
     const io = testing.io;
@@ -1669,6 +1887,197 @@ test "repl tools: /cd resolves a folder by real path and refuses anything else" 
             },
         }
     }
+}
+
+/// A folder with one subfolder, text files, a binary file, a hidden file, a secret-named
+/// file, and two symlinks that leave the folder.
+fn writeFixture(tmp: *testing.TmpDir, allocator: std.mem.Allocator) ![:0]u8 {
+    const io = testing.io;
+    try tmp.dir.createDirPath(io, "proj/sub");
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/notes.txt", .data = "alpha\nbeta\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/twice.txt", .data = "x\nx\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/bin.dat", .data = "a\x00b\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/.hidden.txt", .data = "keep\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/server.key", .data = "keep\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/outside.txt", .data = "keep\n" });
+    try tmp.dir.symLink(io, "../elsewhere/outside.txt", "proj/link.txt", .{});
+    try tmp.dir.symLink(io, "../elsewhere", "proj/dirlink", .{});
+    return tmp.dir.realPathFileAlloc(io, "proj", allocator);
+}
+
+test "repl tools: write_file and edit_file change files inside the folder only" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try writeFixture(&tmp, allocator);
+    defer allocator.free(root);
+    const big = try allocator.alloc(u8, max_write_bytes + 1);
+    defer allocator.free(big);
+    @memset(big, 'a');
+    const big_write = try std.fmt.allocPrint(allocator, "{{\"path\":\"big.txt\",\"content\":\"{s}\"}}", .{big});
+    defer allocator.free(big_write);
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/huge.txt", .data = big });
+    const abs_inside = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}/abs.md\",\"content\":\"abs\\n\"}}", .{root});
+    defer allocator.free(abs_inside);
+    const abs_outside = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}/../elsewhere/evil.txt\",\"content\":\"evil\\n\"}}", .{root});
+    defer allocator.free(abs_outside);
+
+    var ctx: Context = .{ .allocator = allocator, .io = io, .root = root, .vision = false, .writable = true };
+    const Case = struct { name: []const u8, args: []const u8, prefix: []const u8 = "", has: []const []const u8 = &.{}, lacks: []const []const u8 = &.{} };
+    for ([_]Case{
+        .{ .name = "write_file", .args = "{\"path\":\"todo.md\",\"content\":\"buy fish\\n\"}", .prefix = "wrote 9 bytes to todo.md" },
+        .{ .name = "read_file", .args = "{\"path\":\"todo.md\"}", .prefix = "buy fish\n" },
+        .{ .name = "write_file", .args = "{\"path\":\"notes.txt\",\"content\":\"alpha\\ngamma\\n\"}", .prefix = "wrote 12 bytes to notes.txt" },
+        .{ .name = "write_file", .args = "{\"path\":\"sub/nested.md\",\"content\":\"n\\n\"}", .prefix = "wrote 2 bytes to sub/nested.md" },
+        .{ .name = "write_file", .args = abs_inside, .prefix = "wrote 4 bytes to" },
+        .{ .name = "write_file", .args = "{\"path\":\"../elsewhere/evil.txt\",\"content\":\"evil\\n\"}", .prefix = "refused:", .has = &.{"/cd <folder>"} },
+        .{ .name = "write_file", .args = abs_outside, .prefix = "refused:" },
+        .{ .name = "write_file", .args = "{\"path\":\".secret.md\",\"content\":\"x\\n\"}", .prefix = "refused:", .has = &.{"hidden"} },
+        .{ .name = "write_file", .args = "{\"path\":\"server.key\",\"content\":\"x\\n\"}", .prefix = "refused:", .has = &.{"secrets"} },
+        .{ .name = "write_file", .args = "{\"path\":\"link.txt\",\"content\":\"x\\n\"}", .prefix = "refused:" },
+        .{ .name = "write_file", .args = "{\"path\":\"dirlink/esc.txt\",\"content\":\"x\\n\"}", .prefix = "refused:" },
+        .{ .name = "write_file", .args = "{\"path\":\"sub\",\"content\":\"x\\n\"}", .prefix = "error:", .has = &.{"is a folder"} },
+        .{ .name = "write_file", .args = "{\"path\":\"nodir/f.md\",\"content\":\"x\\n\"}", .prefix = "refused:", .has = &.{"does not exist"} },
+        .{ .name = "write_file", .args = "{\"path\":\"bin.dat\",\"content\":\"x\\n\"}", .prefix = "refused:", .has = &.{"not a text file"} },
+        .{ .name = "write_file", .args = "{\"path\":\"notes.txt\"}", .prefix = "error: write_file needs" },
+        .{ .name = "write_file", .args = "{\"path\":\"p.md\"}", .prefix = "error: write_file needs" },
+        .{ .name = "write_file", .args = big_write, .prefix = "error:", .has = &.{"bytes"} },
+        .{ .name = "edit_file", .args = "{\"path\":\"notes.txt\",\"old_string\":\"gamma\",\"new_string\":\"omega\"}", .prefix = "edited notes.txt: 1 replacement, 12 bytes" },
+        .{ .name = "edit_file", .args = "{\"path\":\"twice.txt\",\"old_string\":\"x\",\"new_string\":\"y\"}", .prefix = "refused:", .has = &.{ "2 matches", "replace_all" } },
+        .{ .name = "edit_file", .args = "{\"path\":\"twice.txt\",\"old_string\":\"x\",\"new_string\":\"y\",\"replace_all\":true}", .prefix = "edited twice.txt: 2 replacements, 4 bytes" },
+        .{ .name = "edit_file", .args = "{\"path\":\"missing.md\",\"old_string\":\"a\",\"new_string\":\"b\"}", .prefix = "error:", .has = &.{"no such file"} },
+        .{ .name = "edit_file", .args = "{\"path\":\"notes.txt\",\"old_string\":\"zulu\",\"new_string\":\"b\"}", .prefix = "error:", .has = &.{"no match"} },
+        .{ .name = "edit_file", .args = "{\"path\":\"notes.txt\",\"old_string\":\"\",\"new_string\":\"b\"}", .prefix = "error:" },
+        .{ .name = "edit_file", .args = "{\"path\":\"../elsewhere/outside.txt\",\"old_string\":\"keep\",\"new_string\":\"gone\"}", .prefix = "refused:" },
+        .{ .name = "edit_file", .args = "{\"path\":\"huge.txt\",\"old_string\":\"aaa\",\"new_string\":\"b\"}", .prefix = "error:", .has = &.{"too large"} },
+        .{ .name = "edit_file", .args = "{\"path\":\"notes.txt\",\"old_string\":\"alpha\"}", .prefix = "error: edit_file needs" },
+    }) |c| {
+        const text = try runForTest(ctx, c.name, c.args);
+        defer allocator.free(text);
+        try expectStartsWith(c.prefix, text);
+        for (c.has) |h| try expectContains(h, text, true);
+        for (c.lacks) |h| try expectContains(h, text, false);
+    }
+
+    const Kept = struct { path: []const u8, want: []const u8 };
+    for ([_]Kept{
+        .{ .path = "proj/todo.md", .want = "buy fish\n" },
+        .{ .path = "proj/notes.txt", .want = "alpha\nomega\n" },
+        .{ .path = "proj/twice.txt", .want = "y\ny\n" },
+        .{ .path = "proj/sub/nested.md", .want = "n\n" },
+        .{ .path = "elsewhere/outside.txt", .want = "keep\n" },
+        .{ .path = "proj/.hidden.txt", .want = "keep\n" },
+        .{ .path = "proj/server.key", .want = "keep\n" },
+    }) |k| {
+        const got = try tmp.dir.readFileAlloc(io, k.path, allocator, .limited(4096));
+        defer allocator.free(got);
+        try testing.expectEqualStrings(k.want, got);
+    }
+    // Every write went through a temp file; none of them may be left behind.
+    var proj = try tmp.dir.openDir(io, "proj", .{ .iterate = true });
+    defer proj.close(io);
+    var entries: usize = 0;
+    var it = proj.iterate();
+    while (try it.next(io)) |_| entries += 1;
+    try testing.expectEqual(@as(usize, 11), entries);
+
+    ctx.writable = false;
+    for ([_][]const u8{ "write_file", "edit_file" }) |name| {
+        const args = if (std.mem.eql(u8, name, "write_file"))
+            "{\"path\":\"late.md\",\"content\":\"x\\n\"}"
+        else
+            "{\"path\":\"notes.txt\",\"old_string\":\"omega\",\"new_string\":\"x\"}";
+        const text = try runForTest(ctx, name, args);
+        defer allocator.free(text);
+        try expectStartsWith("refused:", text);
+        try expectContains("/edit on", text, true);
+        try testing.expect(!entryExists(tmp.dir, io, "proj/late.md"));
+    }
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, definitionsJson(false, false), "write_file"));
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, definitionsJson(true, false), "write_file"));
+    try testing.expect(std.mem.indexOf(u8, definitionsJson(false, true), "edit_file") != null);
+    try testing.expect(std.mem.indexOf(u8, definitionsJson(true, true), "view_image") != null);
+    try testing.expectEqualStrings("web_search, fetch_url, read_file, list_dir, search_files", toolNames(false, false));
+    try testing.expect(std.mem.endsWith(u8, toolNames(true, true), "view_image, write_file, edit_file"));
+}
+
+test "repl tools: confineNewPath answers for a name that does not exist yet" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try writeFixture(&tmp, allocator);
+    defer allocator.free(root);
+    const real_root = try std.mem.concat(allocator, u8, &.{ root, "/sub/next.md" });
+    defer allocator.free(real_root);
+    const abs_new = try std.mem.concat(allocator, u8, &.{ root, "/abs.md" });
+    defer allocator.free(abs_new);
+    const abs_up = try std.mem.concat(allocator, u8, &.{ root, "/../elsewhere/away.md" });
+    defer allocator.free(abs_up);
+
+    const Case = struct { path: []const u8, want: ?[]u8 };
+    for ([_]Case{
+        .{ .path = "new.md", .want = try std.mem.concat(allocator, u8, &.{ root, "/new.md" }) },
+        .{ .path = "sub/next.md", .want = try allocator.dupe(u8, real_root) },
+        .{ .path = "notes.txt", .want = try std.mem.concat(allocator, u8, &.{ root, "/notes.txt" }) },
+        .{ .path = abs_new, .want = try allocator.dupe(u8, abs_new) },
+        .{ .path = "", .want = null },
+        .{ .path = "sub/", .want = null },
+        .{ .path = "sub/.", .want = null },
+        .{ .path = ".dot.md", .want = null },
+        .{ .path = "sub.env/x.md", .want = null },
+        .{ .path = "dirlink/through.md", .want = null },
+        .{ .path = "elsewhere/away.md", .want = null },
+        .{ .path = abs_up, .want = null },
+    }) |c| {
+        defer if (c.want) |w| allocator.free(w);
+        switch (try confineNewPath(allocator, io, root, c.path)) {
+            .ok => |got| {
+                defer allocator.free(got);
+                testing.expectEqualStrings(c.want orelse "(refused)", got) catch |err| {
+                    std.debug.print("confineNewPath {s} -> {s}\n", .{ c.path, got });
+                    return err;
+                };
+            },
+            .refused => |msg| {
+                testing.expect(c.want == null and msg.len > 0) catch |err| {
+                    std.debug.print("confineNewPath {s} refused: {s}\n", .{ c.path, msg });
+                    return err;
+                };
+            },
+        }
+    }
+}
+
+test "repl tools: a replaced file keeps its permissions" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try writeFixture(&tmp, allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/run.sh", .data = "echo hi\n" });
+    try tmp.dir.setFilePermissions(io, "proj/run.sh", .fromMode(0o751), .{});
+    const ctx: Context = .{ .allocator = allocator, .io = io, .root = root, .vision = false, .writable = true };
+
+    for ([_][2][]const u8{
+        .{ "edit_file", "{\"path\":\"run.sh\",\"old_string\":\"hi\",\"new_string\":\"yo\"}" },
+        .{ "write_file", "{\"path\":\"run.sh\",\"content\":\"echo ok\\n\"}" },
+    }) |c| {
+        const text = try runForTest(ctx, c[0], c[1]);
+        defer allocator.free(text);
+        try testing.expect(!std.mem.startsWith(u8, text, "error") and !std.mem.startsWith(u8, text, "refused"));
+        const st = try tmp.dir.statFile(io, "proj/run.sh", .{});
+        try testing.expectEqual(@as(std.posix.mode_t, 0o751), st.permissions.toMode() & 0o7777);
+    }
+}
+
+test "repl tools: the write tools count as file tools for the fetch approval" {
+    try testing.expect(isWriteTool("write_file") and isWriteTool("edit_file"));
+    try testing.expect(!isWriteTool("read_file"));
+    try testing.expect(isFileTool("write_file") and isFileTool("edit_file"));
 }
 
 test "repl tools: after /cd the file tools are confined to the new folder, just as strictly" {
@@ -1833,10 +2242,16 @@ test "repl tools: web tools refuse local, private and non-http targets before co
     try expectStartsWith("refused:", img);
 }
 
-test "repl tools: the tool list offers view_image only to a vision model, and each call traces one line" {
+test "repl tools: the tool list offers view_image only to a vision model, the write tools only when editing is on, and each call traces one line" {
     const allocator = testing.allocator;
-    for ([_]bool{ false, true }) |vision| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, definitionsJson(vision), .{});
+    const Pack = struct { vision: bool, writable: bool, want: []const u8 };
+    for ([_]Pack{
+        .{ .vision = false, .writable = false, .want = "web_search fetch_url read_file list_dir search_files " },
+        .{ .vision = true, .writable = false, .want = "web_search fetch_url read_file list_dir search_files view_image " },
+        .{ .vision = false, .writable = true, .want = "web_search fetch_url read_file list_dir search_files write_file edit_file " },
+        .{ .vision = true, .writable = true, .want = "web_search fetch_url read_file list_dir search_files view_image write_file edit_file " },
+    }) |p| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, definitionsJson(p.vision, p.writable), .{});
         defer parsed.deinit();
         var names = std.ArrayList(u8).empty;
         defer names.deinit(allocator);
@@ -1845,16 +2260,15 @@ test "repl tools: the tool list offers view_image only to a vision model, and ea
             try names.appendSlice(allocator, t.object.get("function").?.object.get("name").?.string);
             try names.append(allocator, ' ');
         }
-        try testing.expectEqualStrings(if (vision)
-            "web_search fetch_url read_file list_dir search_files view_image "
-        else
-            "web_search fetch_url read_file list_dir search_files ", names.items);
+        try testing.expectEqualStrings(p.want, names.items);
     }
     const Case = struct { name: []const u8, args: []const u8, line: []const u8 };
     for ([_]Case{
         .{ .name = "web_search", .args = "{\"query\":\"zig latest release\"}", .line = "search: zig latest release" },
         .{ .name = "fetch_url", .args = "{\"url\":\"https://ziglang.org/download/\"}", .line = "fetch: https://ziglang.org/download/" },
         .{ .name = "read_file", .args = "{\"path\":\"README.md\"}", .line = "read: README.md" },
+        .{ .name = "write_file", .args = "{\"path\":\"n.md\",\"content\":\"x\"}", .line = "write: n.md" },
+        .{ .name = "edit_file", .args = "{\"path\":\"sub/n.md\",\"old_string\":\"x\"}", .line = "edit: sub/n.md" },
         .{ .name = "list_dir", .args = "{}", .line = "list: ." },
         .{ .name = "search_files", .args = "{\"pattern\":\"TODO\",\"path\":\"src\"}", .line = "grep: TODO in src" },
         .{ .name = "view_image", .args = "{\"path_or_url\":\"shot.png\"}", .line = "view: shot.png" },
