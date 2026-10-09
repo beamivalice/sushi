@@ -61,6 +61,10 @@ A GDN trunk's `KVCache.step` is 0 forever (it advances on layer 0, a linear laye
 slot's `moe_seq_offset`; the pad-waste cap reads `KVCache.kvLenForBatching`. Batched N=2 acquits near-ties
 (≤ 0.15 nats).
 
+- The recurrent state is stored bf16 between tokens (the math runs in f32). `SUSHI_GDN_STATE_F32=1` stores it f32
+  (`ModelConfig.gdnStateDtype`, one `[gdn] recurrent state f32` line): a Qwen checkpoint grows 58.8 → 115.5 MB, billed
+  by `ssmCheckpointBytes`, and a restored bf16 state is widened before its next step.
+
 ## Byte stability
 
 - INT4 long-greedy divergence is legit (the AR/verify INT4 kernel float-noise tail).

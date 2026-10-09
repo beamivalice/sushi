@@ -237,6 +237,8 @@ pub const ModelConfig = struct {
     linear_key_head_dim: u32 = 128,
     linear_value_head_dim: u32 = 128,
     linear_conv_kernel_dim: u32 = 4,
+    /// Store the recurrent state in f32 between tokens (`SUSHI_GDN_STATE_F32=1`); bf16 by default.
+    gdn_state_f32: bool = false,
 
     // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
     // GatedDeltaNet recurrence:
@@ -763,11 +765,16 @@ pub const ModelConfig = struct {
         const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
         if (linear_layers == 0) return 0;
         const state: u64 = @as(u64, self.linear_num_value_heads) *
-            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * @as(u64, if (self.isGlm5()) 4 else 2);
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * @as(u64, if (self.isGlm5() or self.gdn_state_f32) 4 else 2);
         const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
             @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
         const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
         return linear_layers * (state + conv * conv_dim * 2);
+    }
+
+    /// The GatedDeltaNet state's storage dtype; the recurrence computes in f32 either way.
+    pub fn gdnStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
+        return if (self.gdn_state_f32) .float32 else .bfloat16;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1140,6 +1147,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
+    config.gdn_state_f32 = @import("transformer.zig").diagEnvOn("SUSHI_GDN_STATE_F32");
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (std.c.getenv("SUSHI_NGRAM_BF16_DIR")) |raw| {
@@ -5720,6 +5728,16 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
         try t.expectEqual(c.rate_n, meta.expert_quant_rate.?.n);
         try t.expectEqual(@as(u32, 48), meta.num_hidden_layers);
     }
+}
+
+test "an f32 GDN state stores f32 and bills its checkpoint at four bytes per state element" {
+    var c = ModelConfig{ .num_hidden_layers = 48, .full_attention_interval = 4, .linear_num_key_heads = 16, .linear_num_value_heads = 48 };
+    const conv: u64 = 3 * (2 * 16 * 128 + 48 * 128) * 2;
+    try testing.expectEqual(@as(mlx.mlx_dtype, .bfloat16), c.gdnStateDtype());
+    try testing.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 2 + conv)), c.ssmCheckpointBytes());
+    c.gdn_state_f32 = true;
+    try testing.expectEqual(@as(mlx.mlx_dtype, .float32), c.gdnStateDtype());
+    try testing.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 4 + conv)), c.ssmCheckpointBytes());
 }
 
 test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assumptions" {

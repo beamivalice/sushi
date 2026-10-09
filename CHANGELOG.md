@@ -21,6 +21,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **File tools**: the chat page and `sushi run` can let the model add and edit files (`write_file`, `edit_file`) in the folder you choose for the chat; the Edit chip (shown while Tools is on) or `/edit on|off` switches it per conversation, off unless the server was launched with `--edit on`, and every write stays inside that folder.
 - **Tool calls**: `tool_choice: "none"` on chat completions now stops the model from writing a tool call as plain text after earlier calls in the conversation; the chat page and `sushi run` send it on their final, tool-less round, which no longer shows raw `<tool_call>` markup.
 - **Completions**: `/v1/completions` reads `prompt` given as token ids (`[1,2,3]`, `[[1,2,3]]`), refuses a batch of prompts and `echo: true` with a named 400 instead of a misleading "prompt is required" or a silent drop.
+- **Qwen3.8-Flash-Next**: `SUSHI_GDN_STATE_F32=1` keeps the recurrent state in f32 between tokens, for measuring what
+  the default bf16 state costs.
 
 ---
 
