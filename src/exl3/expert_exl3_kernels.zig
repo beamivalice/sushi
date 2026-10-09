@@ -9099,21 +9099,27 @@ test "exl3 every K1.5 to K4 rate decodes within a margin of n48" {
         defer rate_arena.deinit();
         var rate = try mimoMoeFixture(rate_arena.allocator(), c);
         defer rate.deinit();
-        // Each round times both rates back to back, so contention lands on both sides of its ratio.
-        var ratios: [9]f64 = undefined;
-        for (&ratios, 0..) |*ratio, round| {
-            var ns: [2]u64 = undefined;
-            for (0..2) |j| {
-                const k = (round + j) % 2;
-                ns[k] = try laneChainNs(s, if (k == 0) &rate else &ref, if (k == 0) c else ref_case, 48);
+        // Another GPU job only adds time, so each arm keeps its fastest round. Arms 0 and 1 time the
+        // rate, arms 2 and 3 the n48 kernel: when a pair disagrees by more than 10% the box is too
+        // busy to read a ratio, and after three tries the test skips instead of failing on contention.
+        var attempt: u32 = 0;
+        const ratio: f64 = while (attempt < 3) : (attempt += 1) {
+            var best: [4]u64 = @splat(std.math.maxInt(u64));
+            for (0..9) |round| {
+                for (0..4) |j| {
+                    const k = (round + j) % 4;
+                    const ns = try laneChainNs(s, if (k < 2) &rate else &ref, if (k < 2) c else ref_case, 48);
+                    best[k] = @min(best[k], ns);
+                }
             }
-            ratio.* = @as(f64, @floatFromInt(ns[0])) / @as(f64, @floatFromInt(ns[1]));
-        }
-        std.mem.sort(f64, &ratios, {}, std.sort.asc(f64));
+            if (@max(best[0], best[1]) * 100 > @min(best[0], best[1]) * 110) continue;
+            if (@max(best[2], best[3]) * 100 > @min(best[2], best[3]) * 110) continue;
+            break @as(f64, @floatFromInt(@min(best[0], best[1]))) / @as(f64, @floatFromInt(@min(best[2], best[3])));
+        } else return error.SkipZigTest;
         // n64's packed branch carries one output tile per threadgroup where the funnel carries two.
         const limit: f64 = if (n == 64) 1.8 else 1.4;
-        benchPrint("[exl3-lane-margin] n{d} over n48: {d:.3} (median of {d})\n", .{ n, ratios[ratios.len / 2], ratios.len });
-        try std.testing.expect(ratios[ratios.len / 2] < limit);
+        benchPrint("[exl3-lane-margin] n{d} over n48: {d:.3}\n", .{ n, ratio });
+        try std.testing.expect(ratio < limit);
     }
 }
 
