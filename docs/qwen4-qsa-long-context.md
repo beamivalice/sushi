@@ -4,9 +4,9 @@ How Qwen3.8-Flash-Next attends past 2048 tokens: the QSA indexer, block selectio
 width, the indexer history, and the long-context admission and load-time bills. Every mechanism here is gated by ONE
 predicate, `ModelConfig.longCtxGated()`. Read this before touching any `qsa*` function in `src/transformer.zig`.
 
-Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4exp.md),
+Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md),
 [engine-kv-cache](engine-kv-cache.md), [engine-memory-admission](engine-memory-admission.md),
-[engine-mtp](engine-mtp.md), [perf-baselines](perf-baselines.md#qsa).
+[engine-mtp](engine-mtp.md), [perf-baselines](qwen4-perf.md#qsa).
 
 ## Attention arms by query width
 
@@ -76,7 +76,7 @@ separate M-RoPE guard.
 - The pooled block keys are ONE kernel (`sushi_qsa_pool_rope`, from mlx-serve #556): block mean, key norm and
   partial RoPE, bit-identical to the MLX chain. It serves text turns, bf16, 128-wide keys and ratios up to 8; M-RoPE
   turns and other shapes keep the chain. No env lever; `SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS=1` is its A/B
-  ([perf-baselines](perf-baselines.md#qsa-pool-rope)).
+  ([perf-baselines](qwen4-perf.md#qsa-pool-rope)).
 
 ## Indexer history
 

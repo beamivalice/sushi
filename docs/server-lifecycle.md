@@ -161,10 +161,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   A STREAMED load and the other GDN trunks keep the padded batch, capped by PADDING WASTE (`batchedKvKeepCount`,
   `MAX_PAD_WASTE` 1.5 < 2.0); the grouped MTP verify keeps both cap functions (`groupKeepCount` lifts the cap for a group
   billed <= 4096 rows whose longest true context is >= 131072,
-  [engine-qsa-long-context](engine-qsa-long-context.md#small-sparse-groups-at-long-context)).
+  [qwen4-qsa-long-context](qwen4-qsa-long-context.md#small-sparse-groups-at-long-context)).
   Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
-  ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)); resident GLM does the same through `verifyGroups`, and a
-  drafting GLM slot joins as a plain row when its model has company ([arch-glm5-next](arch-glm5-next.md#concurrency)).
+  ([mimo2-arch](mimo2-arch.md#batched-decode)); resident GLM does the same through `verifyGroups`, and a
+  drafting GLM slot joins as a plain row when its model has company ([glm5-arch](glm5-arch.md#concurrency)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
 - `--prefill-decode-share S` (flag > `SUSHI_PREFILL_DECODE_SHARE` > 0) targets the fraction of wall time given
@@ -200,7 +200,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Sleep inhibition follows the inference-thread wait.
 - **The first GPU submission after about a second of idle waits 0.6-1.0 s before any work runs** (M5 Max, MiMo
   2.3bpw, ~90 GB resident, measured on e2d5be76; even a one-element op pays it, and a tick every 2 s does not prevent
-  it; [perf-baselines](perf-baselines.md#mimo-ttft-idle)). For `--gpu-warm-secs` (default 60, 0 = off) after its
+  it; [perf-baselines](mimo2-perf.md#mimo-ttft-idle)). For `--gpu-warm-secs` (default 60, 0 = off) after its
   last prefill or decode tick, the parked inference thread runs one synced element-op every 500 ms (`gpuWarmTick`),
   never while work is queued; an unload closes the window. Output is unchanged.
 - `Slot.deinit` runs on conn threads: it stores marks, the inference thread frees.
@@ -239,7 +239,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   naming the media's tokens, an encode that does not fit a 400 (`towerFitFault`), a failed encode a 500
   (`MediaFault`); never a text-only answer.
 - Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen_vision.zig` / `src/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
-  image/video tower, M-RoPE positions over every block; MiMo-ViT images, [arch-mimo-v2](arch-mimo-v2.md#vision));
+  image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
   `stb_image` + libwebp decode image input.
 
 ## Config reading

@@ -2,8 +2,8 @@
 
 The native GLM path: checkpoint geometry, what `sushi serve`/`run` load and bill, DFlash2 speculation, recorded speed
 and quality, and the lessons the bring-up paid for. Per-kernel contracts and the alternatives that lost are in
-[engine-glm5-kernels](engine-glm5-kernels.md); the clamped EXL3 expert chain is in
-[engine-exl3-experts](engine-exl3-experts.md#glm).
+[glm5-kernels](glm5-kernels.md); the clamped EXL3 expert chain is in
+[engine-exl3-experts](glm5-clamped-experts.md#glm).
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](engine-memory-admission.md),
 [quality-kld](quality-kld.md), [engine-expert-streaming](engine-expert-streaming.md).
@@ -13,7 +13,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
 - Concurrent requests batch as plain rows, up to four ([concurrency](#concurrency)). MTP is off: the checkpoint's MTP
   layer is not integrated.
 - Prefix reuse, RAM, SSD and SSD-only: KDA checkpoints on the prefill chunk grid and at the prompt end, MLA rows below them, the
-  assistant window beside them ([engine-prefix-cache](engine-prefix-cache.md#glm)). The RAM tier defaults to 1 GiB,
+  assistant window beside them ([engine-prefix-cache](glm5-prefix-cache.md#glm)). The RAM tier defaults to 1 GiB,
   which admission evicts for a long prefill; long reuse belongs on `--prefix-cache-disk` or SSD-only.
 - Cache: kv8 compressed MLA latent plus FP32 KDA state, the engine default; it passed its KLD gate
   ([quality-kld](quality-kld.md)). `--kv-quant 16` (or `kv_quant: 16` per request or in model-settings) keeps the
@@ -24,7 +24,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
   `--no-vision` drops its weights and buffers.
 - DFlash2 speculation when an assistant is found ([below](#dflash2)), for greedy and sampled requests.
 - M1–M4 GPUs (no NAX) run the same model with the arms in
-  [engine-glm5-kernels](engine-glm5-kernels.md#without-nax); `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses them.
+  [glm5-kernels](glm5-kernels.md#without-nax); `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses them.
 
 ## Checkpoint geometry
 
@@ -102,14 +102,14 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **Tree**: two draft nodes plus the root, up to four children per node; the verifier runs all rows layerwise.
   KDA replays only the accepted path from a prework tape; IndexPool builds branch-local pools from the committed prefix
   plus each node's ancestry (pooling flattened tree rows would pool siblings together), held beside the reserved
-  pooled buffer and never written into it ([kernels](engine-glm5-kernels.md#dflash2-verification)); MLA reads the
+  pooled buffer and never written into it ([kernels](glm5-kernels.md#dflash2-verification)); MLA reads the
   committed prefix plus the ancestry tail. Commit publishes target state and assistant context together; a commit that fails after
   taking over the request's MLA buffers leaves the request failed.
 - **Draft execution**: the fixed two-node tree keeps all eight noise rows as attention keys and values, but the
   final layer computes only the anchor and two required output rows. Two-tap BF16 convolutions preserve the original
   multiply/add rounding in one kernel, and sliding layers share a block mask. On M5 Max, the A4 g64 assistant's
   eight-row FFN projections reuse weights across the full block with MLX's original reduction order.
-  [Paired measurements](perf-baselines.md#glm-draft-ten-percent) show about 12% lower draft time; depth and acceptance
+  [Paired measurements](glm5-perf.md#glm-draft-ten-percent) show about 12% lower draft time; depth and acceptance
   are unchanged.
 - **Decisions**: greedy follows the target argmax; sampled requests draw only the visited target path with the
   request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included). Both
@@ -165,7 +165,7 @@ inside 1.46% drift) because verification per round grew 20.6%.
   (≤ 2051 rows) plus one chunk's quantizer output, 3.1 MiB. Without NAX the packed tiles (the FP32 composite) keep
   their 256 MiB and the A6, MLA, index and cluster terms drop. With the prefix cache on, a
   prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit
-  ([prefix cache](engine-prefix-cache.md#glm)).
+  ([prefix cache](glm5-prefix-cache.md#glm)).
 - Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with
   the engine's 93% margin: GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +
   vision + A4 at its measured 104.35 GB active advertises 1,048,576 at a 2048 bill (1,144,691 tokens by the bill).
@@ -212,9 +212,9 @@ A pack is scored with `sushi kld compare --model <pack> --fixture <teacher>` aga
 NAX-path teacher: KLD 0.0742, top-1 90.3%, code 0.0429 / prose 0.1055. Earlier packs against the
 first teacher, four prompts × 512 (2026-10-04, TF32 off): Sushi-2.3bpw 0.0930, the A8 experiment 0.0915, Sushi-2.45bpw
 0.0913 mean KLD (code ~0.045, prose ~0.139); Sushi-2.5bpw (K2.5 experts, A6 trunk) 0.0721. Not yet the 16x512 release
-reading; tables and settings in [quality-kld](quality-kld.md#glm-53-flash-native-bf16-teacher-4x512-2026-10-04).
+reading; tables and settings in [quality-kld](glm5-kld.md#glm-53-flash-native-bf16-teacher-4x512-2026-10-04).
 The M1–M4 path rehearsed on the M5 scores the first prompt at 0.0457 against the stock path's 0.0446, top-1 equal
-([perf-baselines](perf-baselines.md#glm-nonnax)).
+([perf-baselines](glm5-perf.md#glm-nonnax)).
 
 The native teacher also captures block boundaries (`SUSHI_HIDDEN_OUT`, all four HC streams, 16,384 BF16 values per
 token per boundary, 46 boundaries) and, for many short windows, runs layer-major: a batch of windows reads each
@@ -224,7 +224,7 @@ layer's experts once, with byte-identical output ([quality-kld](quality-kld.md#l
 
 - A fast path gates on what its kernel needs, never on the served pack's value: W12-only expert gates sent the W14
   Sushi-2.4bpw through the generic chain at +30% verify per round with no error. Diff engagement lines when a pack
-  changes ([measurement](perf-baselines.md#glm-w14-lanes)).
+  changes ([measurement](glm5-perf.md#glm-w14-lanes)).
 - mHC expansion contracts the residual streams first, then adds the separately rounded FP32 branch product; the
   reverse order changes BF16 results.
 - SiLU rounds its sigmoid to BF16 before the multiply; an FP32 HC mix through generic matmul may pick TF32, so the

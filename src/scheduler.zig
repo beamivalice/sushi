@@ -7529,7 +7529,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
     try runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
     // A DFlash2 GLM slot in company decodes as a plain row of the grouped tick (a row for another
-    // request beats a draft row, arch-glm5-next#concurrency); alone it drafts.
+    // request beats a draft row, glm5-arch#concurrency); alone it drafts.
     for (glm_buf[0..glm_n]) |slot| {
         if (glmRowsInCompany(slot, glm_buf[0..glm_n], batchable_buf[0..batchable_n]) and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = slot;
@@ -8272,7 +8272,7 @@ fn slotMimoMtpCrowdable(slot: *const Slot) bool {
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null, slot.enable_pld, gen.pld_enabled) == .mtp;
 }
 
-/// Step costs of a grouped GLM forward in ms (rows ubench, arch-glm5-next#concurrency): fixed, per
+/// Step costs of a grouped GLM forward in ms (rows ubench, glm5-arch#concurrency): fixed, per
 /// row, and one assistant draft.
 pub const GlmRowCost = struct { fixed: f32 = 25, row: f32 = 14.5, draft: f32 = 5 };
 

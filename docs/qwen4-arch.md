@@ -6,7 +6,7 @@ touching `forwardQwen4With`, `src/qwen4_exp.zig` or `src/hc_prefill.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-expert-streaming](engine-expert-streaming.md), [engine-mtp](engine-mtp.md),
-[engine-qsa-long-context](engine-qsa-long-context.md), [perf-baselines](perf-baselines.md),
+[qwen4-qsa-long-context](qwen4-qsa-long-context.md), [perf-baselines](perf-baselines.md),
 [quality-kld](quality-kld.md).
 
 ## The model
@@ -77,7 +77,7 @@ hidden 2560, expert intermediate 640.
   both ways, on DISJOINT sets so neither arm warms the other's pages, before the warm thread faults the table in, and
   takes the pool only when it wins by 20%; SSD and page-cache state determine the choice on each load.
 - `SUSHI_NGRAM_WARM` preads the whole table, and the residency cap (`ngramCacheLimit` = half of RAM) declines any
-  table that cannot be held, bf16 or 4-bit (a 32 GB Mac reads the 4-bit table by row). Calibration and residency measurements: [perf-baselines](perf-baselines.md#ngram-arm).
+  table that cannot be held, bf16 or 4-bit (a 32 GB Mac reads the 4-bit table by row). Calibration and residency measurements: [perf-baselines](qwen4-perf.md#ngram-arm).
 - A table under the cap is a page-cache claim from `startWarm` to `close` (`page_cache_claim`), billed as GPU memory
   by the hot cache's unnamed budget ([engine-prefix-cache](engine-prefix-cache.md#budget)): wired KV evicts it.
 - The n-gram hash's eos is the TEXT config's (`ngram_eos`).

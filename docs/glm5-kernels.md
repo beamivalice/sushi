@@ -3,7 +3,7 @@
 What the native `glm5_next` forward runs in prefill, decode and DFlash2 verification, the arithmetic contract of each
 path, and the alternatives that lost. Every path here is always on for its eligible shape; anything else falls back to
 the staged MLX chain. Read this before touching `src/glm5_*.zig`. Architecture, bills and numbers:
-[arch-glm5-next](arch-glm5-next.md); routed experts: [engine-exl3-experts](engine-exl3-experts.md#glm).
+[glm5-arch](glm5-arch.md); routed experts: [engine-exl3-experts](glm5-clamped-experts.md#glm).
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-kernels.md),
 [engine-mlx-gotchas](engine-mlx-gotchas.md).
@@ -125,17 +125,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   power-of-two coefficients across output tiles. HC expansion emits both the rounded residual and its FP32
   normalized view for the next collapse. The default NAX three-row path uses two-layer asynchronous groups;
   explicit schedules and other widths are unchanged. Together these save
-  [3.5–3.9% versus the dev2 baseline](perf-baselines.md#glm-three-prepared-input), below the additional 5% target.
+  [3.5–3.9% versus the dev2 baseline](glm5-perf.md#glm-three-prepared-input), below the additional 5% target.
 
 - **Three-row MLA value and normalization**: on the NAX path, the A6 value bank reuses its weights across all
   three rows, and HC collapse emits the normalized branch input directly. The latter preserves the intermediate
   BF16 value and native RMS reduction order. Together with expert reuse/tiling, measured verification is
-  [5.25–5.98% lower verification time](perf-baselines.md#glm-three-value-norm) than `f40fa548`; draft depth is unchanged.
+  [5.25–5.98% lower verification time](glm5-perf.md#glm-three-value-norm) than `f40fa548`; draft depth is unchanged.
 - **Shared-expert rows serve every admitted n** (`glm_group2.servesRate`) and every pack window, never one pack's
   rate or window. The three-row, 24-slot lane path reuses each expert's decoded weights across up to three matching
   routes and computes two output tiles per threadgroup. Other widths retain two-member reuse and one output tile. Mixed gate/up and down
   rates are exact, and the engagement test runs `apply` at each rate. Together these changes save
-  [4.0–4.7% of full verification time](perf-baselines.md#glm-three-output-tiles) at the measured prefixes.
+  [4.0–4.7% of full verification time](glm5-perf.md#glm-three-output-tiles) at the measured prefixes.
 - **Groups**: `verifyGroups` runs several requests' trees (≤ 16 rows) in one layer loop. KDA `project`/`finish` and
   MLA `mlaProject`/`mlaFinish` take every row; `recur` and `mlaAttend` take one request's rows and state. Each group
   equals its solo `verify` bit for bit; `SUSHI_GLM_ROWS_UBENCH=N` (`_CTX`, `_TEXT`) times grouped against serial rows.
@@ -161,7 +161,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order. The A6
   three/four-row specialization uses complete row tiles and two outputs per SIMD subgroup, reducing per-thread
   accumulators. Combined with batched FP32 attention, verification takes about 11% less time on M5 Max with
-  Sushi-2.5bpw/A4 g64 ([measurement](perf-baselines.md#glm-verify-final)). Retained BF16 KDA projections run as column
+  Sushi-2.5bpw/A4 g64 ([measurement](glm5-perf.md#glm-verify-final)). Retained BF16 KDA projections run as column
   GEMVs with rows in the batch grid (exact; stock multi-row `Linear` is not); the router batches up to 16 rows.
   Sampled rounds use the same batched rows: their logits equal per-row serial projections bit for bit (215 real 8K
   rounds, every tape and capture too); per-row projections cost 64.2 vs 54.2 ms of verify per round and sampled 8K
@@ -171,7 +171,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   32K; assistant rounding changes, target exact); the next context is cropped to 2047 rows before accepted captures
   append (50 MiB bound at any length; commit 4.27 → 0.73 ms at 32K; exact). Once cropped, the 2047-row context is
   below the block-tail gate, so serving drafts append the block to the cache and attend its view.
-- **Assistant pipeline** (all exact; [measurement](perf-baselines.md#glm-round-levers)): every layer but the last is
+- **Assistant pipeline** (all exact; [measurement](glm5-perf.md#glm-round-levers)): every layer but the last is
   submitted as soon as it is built; gate, up and the BF16 SiLU product run as one A4 g64 kernel at 8 and 3 rows (each
   projection keeps qmv_wide's per-vector order); the conv finish and its residual add are one kernel; the sliding mask
   is built once per (rows, context rows, anchor offset); the lattice's top-16 is two dispatches (per-stretch top-16,
@@ -193,7 +193,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   gate. Off NAX the packed sparse tiles send the same gathered bank through FP32 GEMMs and a precise softmax, as
   native decode does on every GPU (`[glm-attn] FP32 composite sparse|native ... engaged`), held per element to an FP64 oracle no worse than
   the scalar arm plus a store flip and 2^-11 of max|V|. At 16K: 0.628 vs 1.845 ms per 8-row tile, 0.505 vs 1.045 ms
-  per decode row against the scalar latent attention, the same error ([perf-baselines](perf-baselines.md#glm-nonnax)).
+  per decode row against the scalar latent attention, the same error ([perf-baselines](glm5-perf.md#glm-nonnax)).
 - Packed tiles take eight rows (67 MB, inside the 128 MiB tile bill). B3 and B4 run each branch through a B1 GEMM:
   MLX picks GEMM tiles and split-K by batch size, so a batched B3 differed from B1 in the last bit. B1/B3/B4 bill
   32 MiB per pending layer.

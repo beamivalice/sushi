@@ -78,7 +78,7 @@ in-process. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
 - d1408a57 (after v1.1.1) adds the branch-free NAX prefill GEMM body: each expert GEMM runs in x0.73-0.75 of its time,
-  output bytes unchanged ([perf-baselines](perf-baselines.md#mimo-prefill-nax-body)).
+  output bytes unchanged ([perf-baselines](mimo2-perf.md#mimo-prefill-nax-body)).
 
 ## Handing a new engine to mlx-serve
 

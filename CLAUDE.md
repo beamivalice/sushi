@@ -23,19 +23,29 @@ stays off. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of dd
 ## Docs index
 
 This file holds rules and the map. Knowledge, measurements and lessons live in `docs/<category>-<topic>.md`; read the
-doc for the area before changing it, and update it in the same landing.
+doc for the area before changing it, and update it in the same landing. A doc about ONE served architecture takes
+that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`); `engine-`, `server-` and the rest are shared.
 
 | doc | what it holds |
 |---|---|
-| [docs/arch-qwen4exp.md](docs/arch-qwen4exp.md) | Flash-Next trunk, hyper-connections, n-gram PLE table, oracle and ties, packs on this box |
-| [docs/arch-glm5-next.md](docs/arch-glm5-next.md) | GLM geometry, serving, DFlash2, bills, speed, KLD, lessons |
-| [docs/engine-glm5-kernels.md](docs/engine-glm5-kernels.md) | GLM kernels, exactness rules, drift screen, ruled-out list |
-| [docs/arch-mimo-v2.md](docs/arch-mimo-v2.md) | MiMo checkpoint, FP8 trunk, rank-local QKV, routing/sinks, sliding ring, bills, product policy |
+| [docs/qwen4-arch.md](docs/qwen4-arch.md) | Flash-Next trunk, hyper-connections, n-gram PLE table, oracle and ties, packs on this box |
+| [docs/qwen4-perf.md](docs/qwen4-perf.md) | Flash-Next recorded tok/s: decode and MTP ladders, GDN/QSA/HC kernel A/Bs, M1/M2 Max boxes |
+| [docs/qwen4-kld.md](docs/qwen4-kld.md) | Flash-Next KLD of every served pack, the KV-width reading |
+| [docs/qwen4-qsa-long-context.md](docs/qwen4-qsa-long-context.md) | QSA arms per query width, indexer and its history, long-context admission and bills |
+| [docs/mimo2-arch.md](docs/mimo2-arch.md) | MiMo checkpoint, FP8 trunk, rank-local QKV, routing/sinks, sliding ring, bills, product policy |
+| [docs/mimo2-perf.md](docs/mimo2-perf.md) | MiMo recorded tok/s: context ladders, verify rows, prefill, attention kernels, TTFT |
+| [docs/mimo2-kld.md](docs/mimo2-kld.md) | MiMo KLD of the served packs |
+| [docs/mimo2-mtp.md](docs/mimo2-mtp.md) | MiMo's three MTP heads, chain and acceptance |
+| [docs/glm5-arch.md](docs/glm5-arch.md) | GLM geometry, serving, DFlash2, bills, speed, KLD, lessons |
+| [docs/glm5-kernels.md](docs/glm5-kernels.md) | GLM kernels, exactness rules, drift screen, ruled-out list |
+| [docs/glm5-perf.md](docs/glm5-perf.md) | GLM recorded tok/s: DFlash2 round levers, three/four-row verify, prefill chunk, long-context profile |
+| [docs/glm5-kld.md](docs/glm5-kld.md) | GLM KLD against the native BF16 teacher |
+| [docs/glm5-prefix-cache.md](docs/glm5-prefix-cache.md) | GLM cache keys, latent and KDA state, restore, spec state |
+| [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | mlx-serve's pin of `sushi_exl3`, the API it calls, handoff |
 | [docs/engine-expert-streaming.md](docs/engine-expert-streaming.md) | SSD budget ledger, per-layer LRU, slab I/O, imatrix capture, discovery |
 | [docs/engine-mtp.md](docs/engine-mtp.md) | native MTP head, verify invariant, draft re-scoring, round-cost table, head KV/norms |
-| [docs/engine-qsa-long-context.md](docs/engine-qsa-long-context.md) | QSA arms per query width, indexer and its history, long-context admission and bills |
 | [docs/engine-kv-cache.md](docs/engine-kv-cache.md) | kv8 default, kv-quant contract, growth, GDN step, byte-stability settings |
 | [docs/engine-prefix-cache.md](docs/engine-prefix-cache.md) | hot cache, hybrid restore, trimming, SSD tier, SSD-first, checkouts, spec state |
 | [docs/engine-kernels.md](docs/engine-kernels.md) | decode/MoE/prefill/verify kernels, NAX/MPP pitfalls, how to prove and time a kernel |
@@ -45,9 +55,9 @@ doc for the area before changing it, and update it in the same landing.
 | [docs/server-tool-calling.md](docs/server-tool-calling.md) | templates, tool-call parse chain and invariants, think tags, loop stops |
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, ownership, media |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, `__metadata__` stamp, window, g-scale in `suh`, loader rules |
-| [docs/perf-baselines.md](docs/perf-baselines.md) | roofline, recorded tok/s tables with binaries and settings, ruled-out levers |
+| [docs/perf-baselines.md](docs/perf-baselines.md) | method, roofline, shared EXL3 kernel timings, release ladders; per-arch numbers are in the three `*-perf` docs |
 | [docs/bench/v1.2.1/summary.md](docs/bench/v1.2.1/summary.md) | version-pinned release context ladder and individual model benchmark reports |
-| [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, KLD of every served pack |
+| [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, lossy expert pick; per-arch results in the `*-kld` docs |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
 
@@ -89,18 +99,18 @@ Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx
 | `scheduler.zig` / `generate.zig` | slots, inference thread, batching, admission; generation, sampling, MTP orchestration | server-lifecycle |
 | `model.zig` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, per-model settings, discovery, registry | server-lifecycle |
 | `transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch, quant resolution, custom kernels | arch-*, engine-* |
-| `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, attention, GDN, MTP, verify rows / hyper-connections + PLE / QSA | arch-qwen4exp, engine-mtp |
-| `mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | arch-mimo-v2 |
-| `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | arch-qwen4exp |
+| `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, attention, GDN, MTP, verify rows / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
+| `mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | mimo2-arch |
+| `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | qwen4-arch |
 | `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
-| `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk kept as stored + its GEMV, rank-local QKV, stored-affine trunk, shard-stamp check | arch-mimo-v2 |
+| `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk kept as stored + its GEMV, rank-local QKV, stored-affine trunk, shard-stamp check | mimo2-arch |
 | `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3 decoders and kernels | engine-exl3-experts |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, round-cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier | engine-prefix-cache |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
-| `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT (shared preprocessing, Qwen3-VL tower + M-RoPE, MiMo-ViT, GLM tower) | server-lifecycle, arch-mimo-v2 |
+| `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT (shared preprocessing, Qwen3-VL tower + M-RoPE, MiMo-ViT, GLM tower) | server-lifecycle, mimo2-arch |
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |

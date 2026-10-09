@@ -1,7 +1,7 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
 # test_glm_prefix_reuse.sh — GLM-5.3-Flash prefix reuse: KDA checkpoints on the prefill chunk grid
-# and at the prompt end, MLA rows below them (docs/engine-prefix-cache.md#glm). Pins, greedy, one
+# and at the prompt end, MLA rows below them (docs/glm5-prefix-cache.md#glm). Pins, greedy, one
 # hot entry:
 #
 #  1. An identical re-issue restores at the prompt-end checkpoint and answers byte for byte as its

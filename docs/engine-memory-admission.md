@@ -5,9 +5,9 @@ prefill chunk width, the admission line for a long prompt, and why under-billing
 any `*Bytes` bill, `Scheduler.init`, the preflight, or the admission path.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-kv-cache.md),
-[engine-qsa-long-context](engine-qsa-long-context.md#admission-and-load-time-bills),
+[qwen4-qsa-long-context](qwen4-qsa-long-context.md#admission-and-load-time-bills),
 [engine-prefix-cache](engine-prefix-cache.md#budget), [engine-expert-streaming](engine-expert-streaming.md#budget),
-[arch-mimo-v2](arch-mimo-v2.md#bills-the-bill-follows-the-storage-in-the-same-commit).
+[mimo2-arch](mimo2-arch.md#bills-the-bill-follows-the-storage-in-the-same-commit).
 
 ## Metal OOM
 
@@ -55,10 +55,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
   from the capture schedule the generator runs), one assistant window and the RAM tier's row copy (the SSD writer's
   1 GiB permit is the shared headroom term below, for every arch), and keeps fewer checkpoints where they do not fit, never refusing for them
-  ([engine-prefix-cache](engine-prefix-cache.md#glm)).
+  ([engine-prefix-cache](glm5-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
-- Load-time bills run INSIDE `Scheduler.init` ([engine-qsa-long-context](engine-qsa-long-context.md)).
+- Load-time bills run INSIDE `Scheduler.init` ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)).
 - **The kernel unwires a freed Metal buffer asynchronously** (~0.5 s for 50 GB): an unload and an eviction-before-load
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
@@ -120,7 +120,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
   as much context as 512: the `max_safe_context` bill picks it, not a quarter of free memory
-  ([arch-glm5-next](arch-glm5-next.md#memory)).
+  ([glm5-arch](glm5-arch.md#memory)).
 - RAM retention is off by default and the SSD tier on, so every model bills as SSD-first: a ringed arch with a disk tier
   bills its restore's coexistence (`oldBuffersInEvalWindow`) ([engine-prefix-cache](engine-prefix-cache.md#defaults)). Context sizing reserves nothing
   for an idle cache (`ctxSizingCacheReserve` is 0 with RAM off). A model whose tier did not come up bills as without one
@@ -227,7 +227,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what
   the GPU has left it is a named 400. The tower evaluates per block, so the peak is one block's f32 score sheet
-  (heads x N^2) and rows; table in [arch-qwen4exp](arch-qwen4exp.md#vision-tower).
+  (heads x N^2) and rows; table in [qwen4-arch](qwen4-arch.md#vision-tower).
 - **A queued vision encode is billed again on the inference thread** (`runVisionEncode`, `vision_encode_available`),
   right before the tower runs: a prefill's cache growth or an earlier encode's resident output may have taken the
   headroom since the connection thread's check, and the refusal is that same named 400.

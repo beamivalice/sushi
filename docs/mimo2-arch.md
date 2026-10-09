@@ -33,7 +33,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `visual.`, `audio_encoder.`, `speech_embeddings.` and `model.mtp.`; the tower loads beside it
   (`mimo_source.loadVisionWeightsInto`) unless `--no-vision`; audio and video are not wired (their pad ids are
   zeroed so they never join the splice). The three MTP heads load separately under `--mtp`
-  (`mimo_source.loadMtpWeights`, `mimo_mtp.zig`; [engine-mtp](engine-mtp.md#mimo)); the DFlash drafter is not loaded.
+  (`mimo_source.loadMtpWeights`, `mimo_mtp.zig`; [engine-mtp](mimo2-mtp.md#mimo)); the DFlash drafter is not loaded.
 
 ## Source checkpoint and packs
 
@@ -137,14 +137,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   Landed 2026-09-23 (668278c): 39-layer band attention 39.5 -> 20.3 ms at chunk 512, 603 -> 95.5 at 2048, 2439 -> 181
   at 4096; 16x512 KLD -0.2%, inside the rounding-flip floor.
 - **Global-layer attention is what grows a long prompt's TTFT**: ~26% of it at 64k, ~43% at 128k and ~62% at 256k at
-  chunk 2048; the band calls are ~1% ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)).
+  chunk 2048; the band calls are ~1% ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)).
 - **A global-layer forward under 16 rows runs row by row** (`MimoAttnArm.prefill_rows`, the verify rows' arm): the
   fused kernel declines there, and the composed arm would rebuild the whole packed cache dense beside a
   [heads, rows, keys] score sheet, unbilled. A warm restore's short tail (a follow-up of a few tokens) is the case;
   each row is its serial decode tick bit for bit.
 - **On M5 both layer kinds prefill on the matrix units** (`sushi_attn_pd_nax`, same carries, bill and slices;
   `SUSHI_ATTN_PD_NAX=0` = the SIMD kernel): global attention ~3x faster per layer
-  ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](perf-baselines.md#mimo-attn-kernels)).
+  ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](mimo2-perf.md#mimo-attn-kernels)).
 - **A packed-cache global-layer DECODE reads in place** (`mimoGlobalDecodeArm`): with matrix units (M5) the matmul2d
   `sushi_qkv_mpp` (`qkvMppDecodeServes`, from `QKV_MPP_DECODE_MIN_TK` = 4096 keys); without them (M4) the QSA split-K
   body over the whole causal range (`qkvAttnSplitKKernel`, from `QKV_SPLITK_DECODE_MIN_TK` = 4096 keys; 512 keys per
@@ -160,7 +160,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   matmul2d is ~1.2-1.4x faster than split-K at 16k-512k (cross-run). Live 64k split-K decode not yet measured.
 - **`sushi_qkv_mpp` is latency-bound, not bandwidth-bound**: 4 simdgroups with register-prefetched words
   (bit-identical to the 8-simdgroup kernel) cut global-layer attention ~30% at 256k keys. Split-K never beats it on M5
-  at 8k keys or more ([perf-baselines](perf-baselines.md#mimo-attn-kernels)).
+  at 8k keys or more ([perf-baselines](mimo2-perf.md#mimo-attn-kernels)).
 - Before the sliding fusion landed, the composed band+sink sheet was the biggest chunk-dependent bill term (0.17 GB
   at chunk 512, 2.28 GB at 2048). That term is now zero wherever the fused arm serves. Global-layer decode no longer
   rebuilds on M4-class GPUs (split-K, above).
@@ -174,7 +174,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   lane one 4-column group per 128-column tile, and the wide arm (>=17) dequantizes the weights to bf16; the serving
   tile (9-128 on NAX) sums the wide arm's bf16 weights in its own order. Past four
   rows the direct arm runs two stored rows per simdgroup (8 per group), which moves no row's sum and beat the staged
-  arm by 23-36% at 8 rows on every FP8 trunk shape ([perf-baselines](perf-baselines.md#mimo-verify-8)).
+  arm by 23-36% at 8 rows on every FP8 trunk shape ([perf-baselines](mimo2-perf.md#mimo-verify-8)).
 - Every residual add runs in one kernel with the norm that reads its sum (`fusedAddRmsNormUngated`): the
   post-attention norm (`fusedAddRmsNormRouted` also emits the f32 router input), the next layer's input norm and the
   final norm. The router is widened to f32 once at load (source-trunk packs), not per forward.
@@ -207,7 +207,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   (`row_cap`). Nothing pads: rows never share a key tensor. Groups of three or four eligible MTP slots take
   plain batched ticks and retain each row's hidden state so solo rounds can resume; smaller groups keep solo MTP.
   `SUSHI_MTP_BATCHED=0` disables this MTP crowd policy.
-- Measured against interleaved MTP streams: [perf-baselines](perf-baselines.md#mimo-batched-decode).
+- Measured against interleaved MTP streams: [perf-baselines](mimo2-perf.md#mimo-batched-decode).
 
 ## Prompt lookup decoding
 
@@ -281,7 +281,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   to 2048 whose admission bill fits live memory, which is 2048 at every context to 256k on a 128 GB Mac. An
   explicit `--prefill-chunk` caps the ladder and may raise the default as far as the 4096 ceiling
   (`boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
-  ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)), but their bytes differ, so the output of a
+  ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)), but their bytes differ, so the output of a
   prompt longer than 2048 tokens depends on the width memory allowed. The ungated load-time pin subtracts the
   hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback
   (`SUSHI_PREFILL_CHUNK_PER_REQUEST=0`), and the load line says so.
@@ -303,4 +303,4 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - `tests/dump_mimo_v2_fixtures.py` supplies the independent HF oracle; `MIMO_V2_SOURCE` tests the downloaded Flash
   config/template. Native-byte preservation, forward parity, and live serving are separate gates; a header audit
   proves neither numerical parity nor generation. Test commands: [tests/CLAUDE.md](../tests/CLAUDE.md).
-- Quality: KLD through EOS on the 16x512 teacher, recorded in [quality-kld](quality-kld.md#mimo).
+- Quality: KLD through EOS on the 16x512 teacher, recorded in [quality-kld](mimo2-kld.md#mimo).

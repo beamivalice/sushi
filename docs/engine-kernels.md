@@ -5,7 +5,7 @@ each engages, how a kernel is proven correct, and the Metal/NAX pitfalls that co
 changing any `mlx_fast_metal_kernel` source or an eligibility predicate.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
-[engine-mlx-gotchas](engine-mlx-gotchas.md), [engine-qsa-long-context](engine-qsa-long-context.md),
+[engine-mlx-gotchas](engine-mlx-gotchas.md), [qwen4-qsa-long-context](qwen4-qsa-long-context.md),
 [engine-kv-cache](engine-kv-cache.md), [perf-baselines](perf-baselines.md).
 
 ## Decode kernels
@@ -17,14 +17,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - GDN decode = three fused dispatches (`SUSHI_GDN_DECODE_FUSED=0`; S 1..9 bit-identity is SAMPLING). At B=1,
   decode (S=1) and capturing verify (S 2..8) run two: `gdn_decode.step` (prework + recurrence, mlx-serve #517)
   then the norm-gate, bit-identical to the chain, ~0.4 ms per forward
-  ([perf-baselines](perf-baselines.md#gdn-decode-recur)); either chain switch off keeps the chain. A/B seam:
+  ([perf-baselines](qwen4-perf.md#gdn-decode-recur)); either chain switch off keeps the chain. A/B seam:
   `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
 - Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
   an unsupported threadgroup limit falls back to the existing recurrence and epilogue (an M1 declines S 3..8 and
   folds S=2), so the parity test skips a declined width above two. Parity includes every
   captured state with bf16 carry rounding. Wider captures keep the existing path after the S=5 regression
-  in [the width sweep](perf-baselines.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
+  in [the width sweep](qwen4-perf.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
   `gated_delta_step_seq` carries the stored bf16 state to the next token, so serial decode and rollback agree; a
   kernel that carries f32 (upstream's verbatim verify kernel) differs from verify row 1 on.
@@ -33,21 +33,21 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - The qwen4 fused HC read groups verify rows (`HC_ROW_GROUP` 8 per D/U dispatch group), so each weight word is read
   once per group. Configs are cached per (row count, inject, pending write): MTP alternates widths every round, and
   the first read, reads after a flush and the mixer differ in the other two. The row count stays a template argument:
-  as a scalar input it cost 1-4% per verify forward ([perf-baselines](perf-baselines.md#hc-row-group)).
+  as a scalar input it cost 1-4% per verify forward ([perf-baselines](qwen4-perf.md#hc-row-group)).
 - A GEMV that beats MLX's qmv in a chained in-graph ubench can still lose inside the forward: a vectorized affine-8
   reader 10-57% faster in-graph was 2-4% slower per decode forward on an M2 Max
-  ([perf-baselines](perf-baselines.md#m2max-decode)). Judge a decode kernel by the decode meter. The affine-8 verify
+  ([perf-baselines](qwen4-perf.md#m2max-decode)). Judge a decode kernel by the decode meter. The affine-8 verify
   rows kernel takes two output rows per simdgroup: four rows and four simdgroups won an isolated microbench and lost
-  in the forward ([perf-baselines](perf-baselines.md#mimo-verify-2p3)).
+  in the forward ([perf-baselines](mimo2-perf.md#mimo-verify-2p3)).
 - A dependent-kernel cut that REDISTRIBUTES a reduction into every threadgroup loses; a routing-independent chain
   the GPU already OVERLAPS is not a dispatch to fuse. Meter: `SUSHI_DECODE_FWD_UBENCH`.
 - A matmul2d decode tile of 16 query rows is latency-bound: its barriers and small matmuls cost more than its
   reads. `sushi_qkv_mpp` runs 4 simdgroups, not 8, and holds packed words in registers one phase ahead.
   Tried with no gain: more splits, 64-key pages, split K/V tiles, vector tile stores, transposed QK, a fused merge.
-  Numbers: [perf-baselines](perf-baselines.md#mimo-attn-kernels).
+  Numbers: [perf-baselines](mimo2-perf.md#mimo-attn-kernels).
 - Decode on this box is dispatch-gap bound: ~860 kernels per Flash-Next token, kernel time ~9.8 of ~18 ms, ~7 us
   per boundary. `MLX_MAX_OPS_PER_BUFFER` and `MLX_METAL_FAST_SYNCH` gave nothing; decode wins come from fewer,
-  denser kernels ([perf-baselines](perf-baselines.md#exl3)).
+  denser kernels ([perf-baselines](qwen4-perf.md#exl3)).
 - At one decode row the shared-expert gate's dot runs on the router kernel's idle simdgroups in MLX's own
   `dot_product` order (bit-equal to the matmul; declines at 32 or fewer experts, K % 8 != 0 or K > 16384).
 
@@ -87,9 +87,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
     against an f32 reference; a failed probe declines by name. `SUSHI_ATTN_PD_NAX=0` = SIMD.
 - At 128k keys its time is ~69% matmul issue, ~18% load instructions (Q reloaded each key block, K/V fragments per
   simdgroup) and ~12% softmax; K/V memory traffic is ~1% (`SUSHI_ATTN_PD_UBENCH_ABL=1`,
-  [perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)).
+  [perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)).
 - Each fragment row is ONE 8-byte vector load (`SushiNax::load2`); element-wise reads cost ~5% of the kernel
-  ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn) has the ruled-out load layouts).
+  ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn) has the ruled-out load layouts).
 - Contract: every q/k/v row the engine hands it starts 8-byte aligned (views slice only the token axis). A misaligned
   row reads correctly on M5 (unit test), but a misaligned vector load is undefined in MSL.
 - Its PV feeds P as ONE f16 term (P is in [0, 1]; f16 keeps 11 bits): 16x512 KLD -0.19%, inside the rounding-flip
@@ -98,7 +98,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   matmul is truncated (~1e-3).
 - Its ceiling is the matrix units' issue rate for 16x32x16 ops (~55 TFLOPS issued on the M5 Max, the rate MLX's hd-128
   NAX sdpa also reaches), so a P that costs a second PV pass costs ~20% of the kernel. The f16 P pays only
-  together with the lockstep walk and the branch-free loads ([perf-baselines](perf-baselines.md#mimo-attn-kernels)).
+  together with the lockstep walk and the branch-free loads ([perf-baselines](mimo2-perf.md#mimo-attn-kernels)).
 - The SIMD kernel stages K^T with consecutive lanes on consecutive KEY rows: lanes spread over head-dim chunks
   stride 8*LDK halves, one bank. Bit-identical output.
 - hd 256 stays off the NAX attn_pd arm: the same kernel at 256/256 (O in 128 registers per lane) ran 3.2x slower
@@ -110,10 +110,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   32 stored rows; each step a simdgroup writes the dequant route's own `bf16(code x block scale)` into a 16x32
   threadgroup tile and runs 16x32x16 matmul2d against up to 8 sixteen-row tiles of x (wider inputs split rows over
   grid z). Same operands as the dequant route, f32 sums in another order: KLD-gated, never byte-identical
-  ([quality-kld](quality-kld.md#mimo)). Past ~128 rows it is issue-bound (~22 TFLOPS against MLX GEMM's 58) and
+  ([quality-kld](mimo2-kld.md#mimo)). Past ~128 rows it is issue-bound (~22 TFLOPS against MLX GEMM's 58) and
   the dequant + MLX GEMM route serves. `kld capture` keeps that route at every width (`fp8_block.reference_route`),
   so teacher fixtures reproduce; GLM's raw-FP8 trunk keeps `fp8_block.linear`.
-  [perf-baselines](perf-baselines.md#mimo-fp8-tile) has the audit.
+  [perf-baselines](mimo2-perf.md#mimo-fp8-tile) has the audit.
 - Qwen4 HC + GDN prefill fusions take the chunk WIDTH as a scalar INPUT (`SUSHI_HC_PREFILL=0` /
   `SUSHI_GDN_PREFILL_FUSED=0`).
 - GDN prefill (S >= 64) takes one of three recurrences (`GdnRoute`): stock, blocked-seq, or oMLX's software-pipelined
@@ -190,7 +190,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   ~170 us per call to the dev arms. An ablation that skips a tile's only reader lets the compiler drop the tile's
   stores and their loads.
 - Attribute DECODE by `QWEN4_STANDIN` ablations under the decode meter, never by shader samples: the profiler
-  under-samples short kernels and mis-shares the rest ([perf-baselines](perf-baselines.md#m2max-decode)).
+  under-samples short kernels and mis-shares the rest ([perf-baselines](qwen4-perf.md#m2max-decode)).
 - A Metal System Trace: `xcrun xctrace record --template 'Metal System Trace' --instrument 'Metal GPU Counters'
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
 - Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;

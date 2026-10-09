@@ -5,8 +5,8 @@ the zero-copy slab I/O and the correctness bars. Read this before touching `src/
 `src/expert_io.zig` or `src/glm5_stream.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
-[engine-memory-admission](engine-memory-admission.md), [arch-qwen4exp](arch-qwen4exp.md),
-[arch-mimo-v2](arch-mimo-v2.md), [arch-glm5-next](arch-glm5-next.md), [server-lifecycle](server-lifecycle.md#settings).
+[engine-memory-admission](engine-memory-admission.md), [qwen4-arch](qwen4-arch.md),
+[mimo2-arch](mimo2-arch.md), [glm5-arch](glm5-arch.md), [server-lifecycle](server-lifecycle.md#settings).
 
 ## Code map
 
@@ -196,7 +196,7 @@ Imatrix capture rides the streamed bf16 forward (`SUSHI_IMATRIX_OUT=<abs>.safete
 per-layer per-expert sum(x²) and routed counts accumulate ON the GPU keyed by GLOBAL expert ids (slab slots are
 remapped), in the collector's contract the converter reads; the flush runs on the INFERENCE thread (loop exit or
 `/v1/unload-model`), never on `Scheduler.deinit`'s caller thread. MiMo's o_proj and lm_head inputs ride the same
-file as per-channel mean squares under their source weight names ([arch-mimo-v2](arch-mimo-v2.md)). The drivers that feed it a corpus live in the private
+file as per-channel mean squares under their source weight names ([mimo2-arch](mimo2-arch.md)). The drivers that feed it a corpus live in the private
 converter repo. Routed counts reconcile to
 tokens x top-k exactly on every layer; the two load-time warmup forwards add a few tokens.
 

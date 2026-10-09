@@ -7,7 +7,7 @@ packs live in the private repo.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-baselines.md),
 [pack-format](pack-format.md#quality-bar), [engine-exl3-experts](engine-exl3-experts.md#parity-bars),
-[arch-mimo-v2](arch-mimo-v2.md).
+[mimo2-arch](mimo2-arch.md).
 
 ## The tool
 
@@ -175,7 +175,7 @@ binary (built at cf23043d, the landed change's pick code; strict NLL 0.2609, cac
 | 0.2 | 0.00958 | 97.2% | 0.2725 | 92.9% | 7.7% |
 
 Decode at a 4k prompt (llmprobe 0.6.12, `--no-mtp`, one boot each): 5.8 tok/s exact, 10.5 at 0.2
-([perf-baselines](perf-baselines.md#mimo-stream-pick)).
+([perf-baselines](mimo2-perf.md#mimo-stream-pick)).
 
 ## Cross-engine check
 
@@ -186,158 +186,13 @@ that shares no code with ours.
 
 ## Flash-Next (16x512, first EOS, 7186 positions, kv8)
 
-| pack | KLD | top-1 | cosine loss | all positions |
-|---|---|---|---|---|
-| mlx-serve mixed-4-8bit (affine 4-bit gs64 / 8-bit; the control) | 0.0818 | 91.39% | 2.63% | 0.0752 |
-| Sushi-3bpw, first release (MCG K3 w15, bf16 table; binary 7ed9795) | 0.1012 | 90.26% | 3.14% | 0.0931 |
-| Sushi-4bpw, first release (MCG K4 w15, bf16 table; binary 30a27ba) | 0.0632 | 92.99% | 2.25% | 0.0588 |
-| Sushi-3bpw, published 2026-09-29 (MCG K3 w14, 4-bit g32 table; binary 942134d) | 0.1036 | 90.31% | 3.11% | 0.0941 |
-| Sushi-4bpw, published 2026-09-29 (MCG K4 w15, bf16 table; binary 942134d) | 0.0592 | 92.89% | 2.18% | 0.0554 |
+Moved to [qwen4-kld](qwen4-kld.md).
 
-The control row ran on binaries a05d15f / 28d7fab (the KLD tool is unchanged between them). Sushi-4bpw reads below it.
-
-Comparison packs, all on binary b64c5a0e (weights in GPU memory, n-gram table excluded; Sushi-3bpw 0.10123 and
-Sushi-4bpw 0.06319 reproduce on it): affine q3 = routed experts 3-bit g64, dense 8-bit, bf16 n-gram table; oQe =
-oMLX packs as published, restacked for sushi with their 4/5-bit n-gram table unchanged (oQ4e ships the table divided
-by a `weight_scale` tensor, folded into its scales by the restack); mlx-serve packs as published, both sharing one 4-bit
-n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi packs once shipped the vision tower twice,
-0.84 GiB, and no longer do).
-
-| pack | GiB | KLD | top-1 |
-|---|---|---|---|
-| oMLX oQ5e (GBP-DE) | 83.97 | 0.0625 | 92.40% |
-| mlx-serve iQ-MLX 4.7bpw (2026-10-02 build; see below) | 70.13 | 0.0676 | 92.26% |
-| mlx-serve mixed-4-8bit (ddalcu; the control above) | 70.13 | 0.0818 | 91.39% |
-| oMLX oQ4e (Jundot) | 69.21 | 0.1370 | 88.87% |
-| affine q3 | 54.94 | 0.1444 | 88.05% |
-| Vontra 4-bit g32 (TensorFold), as published | 75.60 | 0.2074 | 85.01% |
-| mlx-serve iQ-MLX 3.3bpw (ddalcu; imatrix-weighted affine) | 50.60 | 0.1987 | 86.28% |
-| Sushi-3bpw first release with mixed-4-8bit's 4-bit g32 n-gram table (as first published) | 49.33 | 0.1047 | 90.34% |
-| Sushi-4bpw first release with the same 4-bit g32 table | 63.68 | 0.0666 | 92.35% |
-| Sushi-3bpw published 2026-09-29 with the bf16 table (binary 942134d) | 49.33 | 0.1006 | 90.80% |
-| Sushi-4bpw published 2026-09-29 with the 4-bit g32 table (binary 942134d) | 63.68 | 0.0654 | 92.72% |
-| Sushi-2.6bpw (binary ad5e6be8, 2026-09-27; Sushi-3bpw's 0.10123 and 0.1047 reproduce on it bit for bit) | 43.95 | 0.1303 | 89.33% |
-| Sushi-2.6bpw with the 4-bit g32 table (the published Sushi-2.6bpw) | 43.95 | 0.1355 | 89.08% |
-| Sushi-2bpw with the 4-bit g32 table (the published Sushi-2bpw; bf16 KV, see below) | 34.97 | 0.2080 | 85.94% |
-
-iQ-MLX 4.7bpw, measured 2026-10-02: ReleaseFast at `3e700850` plus existing working-tree edits,
-binary SHA-256 `f5f5a56ef11396d066cd6577121147fdb93fe3fa0eb6a4854ef3c8ec67ac6a07`
-(mtime 2026-10-02 01:28:37 +0700). Flash-Next `mlx-serve-bf16-16x512-raw`, kv8,
-`--tokens 512 --top-k 10 --ctx-size 8192 --no-mtp`, shipped 4-bit g32 n-gram table.
-First-EOS KLD **0.067597376**, top-1 **92.2627%**, NLL **0.396296626**, 7186 positions;
-all-position KLD **0.062826856**, top-1 **93.0298%**, 8192 positions. Weight shards total 70.13 GiB,
-excluding the n-gram table. `taskpolicy -a`, GPU lock `kld-iq47-codex`. This row uses a newer binary than
-the historical comparison rows; differences under ~1% are within the measured rounding-flip floor.
-
-Release 1.0.4 check: `ad4a3ce0` plus the context-bill change, ReleaseFast binary SHA-256
-`2aeee2e678521727e66994d75260c25cd4cffd0d05ecb797c73210a2b0ea9704` (mtime 2026-09-26 15:26:43 +0700),
-Sushi-3bpw, the Flash-Next 16x512 raw teacher, kv8, `--tokens 512 --top-k 10 --ctx-size 8192`, no MTP:
-first-EOS KLD **0.10469852**, top-1 **90.3423%** (7186 positions); all-position KLD 0.09614411, top-1 91.1743%.
-This reproduces the published 0.1047 baseline (-0.0014% relative, inside the 1% floor), without an old-binary rerun.
-M5 Max 128 GB, `taskpolicy -a`, GPU lock `release-v1.0.4-kld-sushi3bpw`; conversion suspended, no timing claim.
-
-Sushi-2.6bpw rows: `ad5e6be8`, ReleaseFast binary SHA-256
-`e85c49f28330474a581954e9eb439294097e83838d42f71c65ab5338113bda4a` (mtime 2026-09-27 14:19:09 +0700),
-`mlx-serve-bf16-16x512-raw`, kv8, `--tokens 512 --top-k 10 --ctx-size 8192`, no MTP, 7186 positions to first EOS;
-all-position KLD 0.1183 (bf16 table) and 0.1229 (4-bit table). Same-binary controls: Sushi-3bpw scores 0.101234497
-with the bf16 table and 0.104698517 with the 4-bit table, the b64c5a0e figures to nine digits. M5 Max 128 GB,
-`taskpolicy -a`, GPU lock `k26-kld` per run, 2026-09-27.
-
-Sushi-2bpw row: sushi v1.0.4 ReleaseFast, binary SHA-256
-`1c2c952090f2642c5119061fc94a552a131b30ca698779bd9593d1c60f9db934` (mtime 2026-09-26 19:51:49 +0700),
-`mlx-serve-bf16-16x512-raw`, `--kv-quant off` (bf16 KV, unlike every other row), no MTP, 7186 positions to first EOS:
-KLD 0.208021, top-1 85.94%, NLL 0.539001; all positions 0.189374 / 87.30% / 0.484980. M5 Max 128 GB, 2026-09-28.
-
-Rows published 2026-09-29: binary built from `942134d`, ReleaseFast SHA-256
-`baffa6de2624f403be75821caefc924cf4ca3fc087a0c11ce232acf60cdfd8cb` (mtime 2026-09-28 21:01:15 +0700),
-`mlx-serve-bf16-16x512-raw`, kv8, `--tokens 512 --top-k 10 --ctx-size 8192`, no MTP, 7186 positions to first EOS.
-M5 Max 128 GB, `taskpolicy -a`, GPU lock per run, 2026-09-29.
-
-
-<a id="kv-width"></a>
-### KV cache width (the one setting that is not the pack)
-
-The tables above rank packs at kv8. The cache width is a separate dial, and the first measurement of it:
-
-| Sushi-3bpw, 16x512 raw | mean KLD | top-1 | NLL |
-|---|---|---|---|
-| `--kv-quant 8` (the default) | 0.104699 | 90.34% | 0.431483 |
-| `--kv-quant 4` | 0.114179 | 89.65% | 0.437941 |
-| delta | **+0.009480 (+9.05%)** | **-0.70 pp** | +1.50% |
-
-kv4 is 9% of KLD, nine times the ROUNDING-FLIP floor, so it is a real cost and not an accumulation artefact. It
-spends 49% of the gap between this pack and the affine 4/8 control. It nearly halves the cache's bytes per token,
-which is the only reason to take it.
-
-Binary `db249826` (Zig sources identical to `e8e2a3cb`), M5 Max 128 GB, the Flash-Next 16x512 raw teacher,
-`--tokens 512 --top-k 10 --ctx-size 8192`, no `--mtp`, 7186 positions to first EOS. Both arms ran on the same binary,
-so the delta stands on that; the absolute kv8 figure reads 0.1047 where the table above records 0.1012, a +3.5% gap
-against a different binary and flag set, which is why the delta is quoted rather than either absolute.
-
-Sushi-2.6bpw (4-bit n-gram table, binary `ad5e6be8`, same settings): `--kv-quant 4` scores 0.145841 / top-1 88.84% /
-NLL 0.465802 against kv8's 0.135508 / 89.08% / 0.454090, +7.63% KLD and -0.24 pp.
-
-<a id="mimo"></a>
 ## MiMo (16x512, first EOS, student kv8)
 
-| pack | KLD | top-1 | positions | binary |
-|---|---|---|---|---|
-| MiMo-V2.6-Flash-Sushi-2.3bpw | 0.0860 | 91.95% | 8067 | 83dc9b6c (v1.1.0 gate) |
-
-Against the 2026-09-30 MOPD teacher. Readings against an earlier teacher capture generate different continuations and
-are not comparable.
-
-The FP8-native teacher against the bf16-rounded teacher: 0.0034 nats.
-
-The FP8 trunk's matrix-unit tile ([engine-kernels](engine-kernels.md#prefill-kernels)) serves 9-128 rows, so it never
-touches these 295-363-token prompt forwards. Forced onto every prompt forward as a stress arm (binary `01319267`, same
-settings, same binary as the off arm): KLD 0.086674 / top-1 91.78% (7404) / NLL 0.360444 against 0.086035 / 91.95%
-(7418) / 0.357721 off, +0.74% KLD, inside the rounding-flip floor (the same bf16 operands summed in another order).
-
+Moved to [mimo2-kld](mimo2-kld.md).
 
 ## GLM-5.3-Flash: native BF16 teacher, 4x512 (2026-10-04)
 
-GLM's release reading is this 4x512 screen, with the two code prompts (2x512) reported apart: a 16x512 BF16 teacher
-would stream the BF16 experts and is too slow to capture. Shipped Sushi-2.4bpw (K2.25/K2.5 W14 experts, A6 g128 trunk)
-against the NAX-path teacher: KLD 0.0742 / top-1 90.3%; code 0.0429, prose 0.1055. The same
-screen on Sushi-2.5bpw (kv8, FP32 decode attention, first teacher): KLD 0.0716 / top-1 90.3%; code 0.0324 / 95.8%,
-prose 0.1107 / 84.9%.
-
-Teacher (every row of the table below was scored against the reference-arm capture, whose `identity.json` has no `nax_arms`): the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
-standard4 --tokens 512 --no-template --kv-quant off --ssd-budget-gb 100` (streamed BF16 experts, dense prefill in
-chunks of at most 512, synchronous layers, BF16 MLA cache, FP32 KDA state). Native prompt lengths 242/261/190/183; no
-EOS in the 2,048 rows, so first-EOS and all-positions readings are the same. Students carry MCG EXL3
-experts at W12 (K2.25 unless the row says K2.5; the shipped row is W14), BF16 MLA and FP32 KDA state, one resident target, MTP and DFlash2 off.
-
-| Pack | Trunk | KLD | Top-1 | NLL | Code / prose KLD | Peak active | Commit, settings |
-|---|---|---:|---:|---:|---:|---:|---|
-| Sushi-2.3bpw | A6 g128 | 0.092950 | 88.96% | 0.4323 | 0.0468 / 0.1391 | 94.08 GB | `3ed533d7`+WIP, TF32 on, fast target kernels |
-| A8 experiment (not shipped) | A8 g128 | 0.091519 | 88.87% | 0.4318 | 0.0441 / 0.1389 | 96.30 GB | same binary |
-| Sushi-2.45bpw | raw FP8 block-128 | 0.091266 | 88.62% | 0.4304 | 0.0439 / 0.1386 | 102.51 GB | `56017748`, TF32 off, `sushi kld compare` |
-| Sushi-2.5bpw (K2.5) | A6 g128 | 0.072071 | 89.94% | 0.4075 | 0.0314 / 0.1127 | 103.59 GB | `00668fcb`, `sushi kld compare` defaults; 2.3bpw reproduces its row bit for bit there |
-
-Against the NAX-path teacher (`glm5_model.enterTeacher()`, binary `177c526f`, TF32 off; decode attention is the only
-arm that changes this capture), students at BF16 latent, same 4x512 prompts:
-
-| Pack | Experts | Trunk | KLD | Top-1 | NLL | Code / prose KLD | Peak active | Commit, settings |
-|---|---|---|---:|---:|---:|---:|---:|---|
-| Sushi-2.3bpw | K2.25 L3-45, W14 | A6 g128 | 0.078609 | 89.94% | 0.4147 | 0.0460 / 0.1112 | 94.07 GB | `177c526f`, `sushi kld compare --kv-quant 16` |
-| **Sushi-2.4bpw (shipped)** | K2.25 L3-36 + MTP, K2.5 L37-44, W14 | A6 g128 | 0.074213 | 90.33% | 0.4160 | 0.0429 / 0.1055 | 95.88 GB | same |
-| Sushi-2.5bpw | K2.5 L3-45, W14 | A6 g128 | 0.057151 | 91.06% | 0.3920 | 0.0316 / 0.0827 | 103.58 GB | same |
-
-The rows above were scored against the first teacher, so they do not rank against this one.
-
-K2.5 experts cut KLD 22.5% from K2.25 on the same A6 trunk (byte-identical trunk tensors). The three trunks sit within 2% of each other under two numerical profiles; this four-prompt screen does not rank them
-and is not the 16x512 release reading. Code scores about 3x lower than prose on every pack.
-
-GLM kv8 latent (`--kv-quant 8`, Sushi-2.5bpw, binary `694e36a3`, `taskpolicy -a`, GPU lock):
-- Same 4x512 teacher: KLD 0.071762 / top-1 89.70% against the BF16 latent's 0.072071 / 89.94% (-0.43%, inside the
-  noise floor); peak active unchanged at 103.59 GB.
-- Long context, against the pack's own BF16-latent reference (2 prompts of 59k and 66k tokens x 2048 teacher-forced
-  tokens): KLD to first EOS 0.00715, top-1 96.8% over 496 positions; per-256-position means stay at 0.0006-0.0094 on
-  the prose prompt. Past EOS the code prompt's continuation degenerates and its KLD climbs to 0.18, outside the
-  scored window.
-- Greedy free-run at those prompts diverges early (token 16 and 118) at near ties; the answers reword the same facts.
-- FP32 composite B1/B3 decode attention against the fused NAX SDPA, one binary (`cc56be2b` diag arms): KLD 0.071569 /
-  top-1 90.33% against 0.071762 / 89.70% (−0.27%, inside the noise floor); with MLX's TF32 GEMMs 0.071602 / 89.84%.
+Moved to [glm5-kld](glm5-kld.md).
 

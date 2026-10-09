@@ -6,7 +6,7 @@ converter change that changes any line here is a format change.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
 [engine-exl3-experts](engine-exl3-experts.md), [quality-kld](quality-kld.md),
-[arch-qwen4exp](arch-qwen4exp.md), [arch-mimo-v2](arch-mimo-v2.md).
+[qwen4-arch](qwen4-arch.md), [mimo2-arch](mimo2-arch.md).
 
 Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
 (`expert_quant` parse), `src/exl3/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),

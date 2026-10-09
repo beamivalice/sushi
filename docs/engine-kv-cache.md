@@ -5,7 +5,7 @@ output. Read this before touching `KVCache` in `src/transformer.zig`, `src/kv_qu
 reads cached keys.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engine-prefix-cache.md),
-[engine-qsa-long-context](engine-qsa-long-context.md), [arch-mimo-v2](arch-mimo-v2.md) (sliding-window ring),
+[qwen4-qsa-long-context](qwen4-qsa-long-context.md), [mimo2-arch](mimo2-arch.md) (sliding-window ring),
 [engine-memory-admission](engine-memory-admission.md), [engine-kernels](engine-kernels.md).
 
 ## Defaults and flags
@@ -18,7 +18,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   `model-settings.json` `kv_quant`, which beats the default. A per-model setting of `kv_quant: off` still wins over
   the default.
 - GLM (`glm5_next`) takes the kv8 default too, through its own MLA latent backend (`glm5_latent.zig`,
-  [arch-glm5-next](arch-glm5-next.md#scope)); kv4 is refused.
+  [glm5-arch](glm5-arch.md#scope)); kv4 is refused.
 - `--kv-attn-mode auto|dense|fused` picks the packed-read arm (`auto` from an 8K PROMPT, fixed at admission); MiMo's
   global-layer decode ignores it and picks per step from the cache's length. `--decode-attn-quant` (default ON,
   LOSSY) requants dense attention at decode AND verify.
@@ -34,8 +34,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   `kv_quant` through `parseKvQuantOverride` and logs the override it applied.
 - Packed reads are kernel-or-DENSE per WIDTH (`kvAttnFusedEligible` t_q==1, `kvAttnVerifyEligible` t_q 2..8; verify
   kernel OFF on G17, `SUSHI_KV_ATTN_VERIFY=1|0`; floor 2048). Guard: `tests/test_kv_quant_fused_equivalence.sh`.
-- Arch-specific packed readers: QSA on qwen4_exp ([engine-qsa-long-context](engine-qsa-long-context.md)); the
-  matmul2d decode kernel and the fused prefill on MiMo's global layers ([arch-mimo-v2](arch-mimo-v2.md#attention-kernels)).
+- Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
+  matmul2d decode kernel and the fused prefill on MiMo's global layers ([mimo2-arch](mimo2-arch.md#attention-kernels)).
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width
   on QSA).
 
