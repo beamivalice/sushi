@@ -10,6 +10,8 @@
 //!   * minItems / maxItems
 //!   * minimum / maximum / exclusiveMinimum / exclusiveMaximum
 //!   * pattern (regex; see regex.zig)
+//!   * $ref to a local JSON pointer (`#`, `#/$defs/Name`, `#/definitions/Name`),
+//!     recursive refs included; any other ref stays `any`
 //!
 //! Strict OpenAI mode: when `additionalProperties` is unspecified, defaults to `false`.
 //!
@@ -102,12 +104,68 @@ pub fn parse(gpa: std.mem.Allocator, value: std.json.Value) ParseError!Schema {
     };
     errdefer schema.arena.deinit();
 
-    const arena = schema.arena.allocator();
-    schema.root = try parseNode(arena, value, 0);
+    var ctx: Ctx = .{ .arena = schema.arena.allocator(), .root = value };
+    // The root is the `#` ref, so a recursive ref back to it lands on this node.
+    schema.root = try parseRef(&ctx, "#", 0);
     return schema;
 }
 
-fn parseNode(arena: std.mem.Allocator, value: std.json.Value, depth: usize) ParseError!*const Node {
+const Ctx = struct {
+    arena: std.mem.Allocator,
+    root: std.json.Value,
+    refs: std.StringHashMapUnmanaged(*Node) = .empty,
+};
+
+/// The slot is memoised before its target parses, so a recursive ref points back at it;
+/// the grammar only follows a child when it descends into it.
+fn parseRef(ctx: *Ctx, ref: []const u8, depth: usize) ParseError!*const Node {
+    if (ctx.refs.get(ref)) |slot| return slot;
+    var target = resolvePointer(ctx.root, ref) orelse return anyLeaf(ctx.arena);
+    var hops: u8 = 0;
+    while (target == .object) : (hops += 1) {
+        const next = target.object.get("$ref") orelse break;
+        if (next != .string) break;
+        if (hops == 16) return anyLeaf(ctx.arena); // a ref chain that never reaches a schema
+        target = resolvePointer(ctx.root, next.string) orelse return anyLeaf(ctx.arena);
+    }
+    const slot = try ctx.arena.create(Node);
+    try ctx.refs.put(ctx.arena, ref, slot);
+    slot.* = (try parseNode(ctx, target, depth)).*;
+    return slot;
+}
+
+/// A local JSON pointer into the root's objects; anything else is unresolved.
+fn resolvePointer(root: std.json.Value, ref: []const u8) ?std.json.Value {
+    if (ref.len == 0 or ref[0] != '#') return null;
+    var node = root;
+    var it = std.mem.tokenizeScalar(u8, ref[1..], '/');
+    while (it.next()) |escaped| {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        var i: usize = 0;
+        while (i < escaped.len) : (i += 1) {
+            if (len == buf.len) return null;
+            buf[len] = escaped[i];
+            if (escaped[i] == '~' and i + 1 < escaped.len and (escaped[i + 1] == '0' or escaped[i + 1] == '1')) {
+                buf[len] = if (escaped[i + 1] == '1') '/' else '~';
+                i += 1;
+            }
+            len += 1;
+        }
+        if (node != .object) return null;
+        node = node.object.get(buf[0..len]) orelse return null;
+    }
+    return node;
+}
+
+fn anyLeaf(arena: std.mem.Allocator) ParseError!*const Node {
+    const node = try arena.create(Node);
+    node.* = .{ .kind = .any };
+    return node;
+}
+
+fn parseNode(ctx: *Ctx, value: std.json.Value, depth: usize) ParseError!*const Node {
+    const arena = ctx.arena;
     if (depth > max_schema_depth) return error.InvalidSchema;
     if (value != .object) {
         // Boolean schema: `true` (any), `false` (none — we don't model "none").
@@ -120,9 +178,13 @@ fn parseNode(arena: std.mem.Allocator, value: std.json.Value, depth: usize) Pars
     }
     const obj = value.object;
 
+    if (obj.get("$ref")) |r| {
+        if (r == .string) return parseRef(ctx, r.string, depth);
+    }
+
     // anyOf / oneOf — branching schemas. Both compile to a Kind.any_of node.
-    if (obj.get("anyOf")) |v| return try parseAnyOf(arena, v, depth);
-    if (obj.get("oneOf")) |v| return try parseAnyOf(arena, v, depth);
+    if (obj.get("anyOf")) |v| return try parseAnyOf(ctx, v, depth);
+    if (obj.get("oneOf")) |v| return try parseAnyOf(ctx, v, depth);
 
     // enum / const — one or more allowed literal values.
     if (obj.get("const")) |v| {
@@ -156,29 +218,31 @@ fn parseNode(arena: std.mem.Allocator, value: std.json.Value, depth: usize) Pars
         for (type_val.array.items, 0..) |t, i| {
             if (t != .string) return error.InvalidSchema;
             // Synthesize a single-type schema by cloning `obj` minus the `type` array.
-            options[i] = try parseSingleType(arena, obj, t.string, depth);
+            options[i] = try parseSingleType(ctx, obj, t.string, depth);
         }
         const node = try arena.create(Node);
         node.* = .{ .kind = .any_of, .any_of_options = options };
         return node;
     }
     if (type_val != .string) return error.InvalidSchema;
-    return try parseSingleType(arena, obj, type_val.string, depth);
+    return try parseSingleType(ctx, obj, type_val.string, depth);
 }
 
-fn parseAnyOf(arena: std.mem.Allocator, v: std.json.Value, depth: usize) ParseError!*const Node {
+fn parseAnyOf(ctx: *Ctx, v: std.json.Value, depth: usize) ParseError!*const Node {
+    const arena = ctx.arena;
     if (v != .array) return error.InvalidSchema;
     if (v.array.items.len == 0) return error.InvalidSchema;
     var options = try arena.alloc(*const Node, v.array.items.len);
     for (v.array.items, 0..) |item, i| {
-        options[i] = try parseNode(arena, item, depth + 1);
+        options[i] = try parseNode(ctx, item, depth + 1);
     }
     const node = try arena.create(Node);
     node.* = .{ .kind = .any_of, .any_of_options = options };
     return node;
 }
 
-fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const u8, depth: usize) ParseError!*const Node {
+fn parseSingleType(ctx: *Ctx, obj: std.json.ObjectMap, t: []const u8, depth: usize) ParseError!*const Node {
+    const arena = ctx.arena;
     const node = try arena.create(Node);
 
     if (std.mem.eql(u8, t, "null")) {
@@ -218,7 +282,7 @@ fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const
         if (obj.get("items")) |iv| {
             // Tuple form (`items: [a, b]`) is not in our subset.
             if (iv == .array) return error.UnsupportedConstruct;
-            items_node = try parseNode(arena, iv, depth + 1);
+            items_node = try parseNode(ctx, iv, depth + 1);
         }
         node.* = .{
             .kind = .array,
@@ -236,7 +300,7 @@ fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const
             else additional = true;
         }
         const props = if (obj.get("properties")) |pv|
-            try parseProperties(arena, pv, obj.get("required"), depth)
+            try parseProperties(ctx, pv, obj.get("required"), depth)
         else
             &[_]Property{};
         node.* = .{
@@ -252,11 +316,12 @@ fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const
 }
 
 fn parseProperties(
-    arena: std.mem.Allocator,
+    ctx: *Ctx,
     properties: std.json.Value,
     required: ?std.json.Value,
     depth: usize,
 ) ParseError![]Property {
+    const arena = ctx.arena;
     if (properties != .object) return error.InvalidSchema;
     const map = properties.object;
 
@@ -275,7 +340,7 @@ fn parseProperties(
     var it = map.iterator();
     while (it.next()) |entry| : (i += 1) {
         const name_owned = try arena.dupe(u8, entry.key_ptr.*);
-        const child = try parseNode(arena, entry.value_ptr.*, depth + 1);
+        const child = try parseNode(ctx, entry.value_ptr.*, depth + 1);
         props[i] = .{
             .name = name_owned,
             .schema = child,
@@ -583,4 +648,38 @@ test "schema nesting beyond the depth limit is refused, ordinary depth parses" {
     for (0..16) |_| try ok.append(a, '}');
     var s = try parseStr(a, ok.items);
     s.deinit();
+}
+
+test "$ref resolves through $defs and definitions; a recursive ref points back at its target" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{
+        \\  "a":{"$ref":"#/$defs/A"},"b":{"$ref":"#/definitions/B"},"self":{"$ref":"#"},
+        \\  "remote":{"$ref":"https://example.com/x.json"}},
+        \\ "$defs":{"A":{"type":"string"}},"definitions":{"B":{"type":"integer"}}}
+    );
+    defer s.deinit();
+    const props = s.root.obj_properties; // sorted: a, b, remote, self
+    try testing.expectEqual(Kind.string, props[0].schema.kind);
+    try testing.expectEqual(Kind.integer, props[1].schema.kind);
+    try testing.expectEqual(Kind.any, props[2].schema.kind);
+    try testing.expectEqual(s.root, props[3].schema);
+}
+
+test "a $ref chain that never reaches a schema relaxes to any" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{"loop":{"$ref":"#/$defs/A"}},"$defs":{"A":{"$ref":"#/$defs/A"}}}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.any, s.root.obj_properties[0].schema.kind);
+}
+
+test "a JSON pointer keeps an unknown ~ escape and decodes ~0 and ~1" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{"a":{"$ref":"#/$defs/a~1b"},"c":{"$ref":"#/$defs/t~0"},"d":{"$ref":"#/$defs/x~2"}},
+        \\ "$defs":{"a/b":{"type":"string"},"t~":{"type":"integer"},"x~2":{"type":"boolean"}}}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.string, s.root.obj_properties[0].schema.kind);
+    try testing.expectEqual(Kind.integer, s.root.obj_properties[1].schema.kind);
+    try testing.expectEqual(Kind.boolean, s.root.obj_properties[2].schema.kind);
 }
