@@ -297,17 +297,23 @@ fn writeOpencodeReasoning(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
     if (n > 0) try out.append(allocator, '}');
 }
 
-/// An opencode launch needs `--standalone`: 2.x otherwise talks to a background service that
-/// never sees OPENCODE_CONFIG_CONTENT. Flags bind to the subcommand, so it goes after one.
+/// OpenCode 2 needs --standalone to receive this process's inline config.
+/// OpenCode 1 has no such flag. Probe CLI support instead of assuming a version.
 fn appendOpencodeInvocation(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: []const []const u8) !void {
-    try out.appendSlice(allocator, "opencode");
+    try out.appendSlice(allocator,
+        \\sushi_opencode_flags=()
+        \\if opencode --help 2>&1 | grep -q -- '--standalone'; then
+        \\  sushi_opencode_flags=(--standalone)
+        \\fi
+        \\opencode
+    );
     if (extras.len > 0 and extras[0].len > 0 and extras[0][0] != '-') {
         try out.append(allocator, ' ');
         try appendQuoted(out, allocator, extras[0]);
-        try out.appendSlice(allocator, " --standalone");
+        try out.appendSlice(allocator, " \"${sushi_opencode_flags[@]}\"");
         return appendExtras(out, allocator, extras[1..]);
     }
-    try out.appendSlice(allocator, " --standalone");
+    try out.appendSlice(allocator, " \"${sushi_opencode_flags[@]}\"");
     try appendExtras(out, allocator, extras);
 }
 
@@ -1371,20 +1377,20 @@ test "opencode config: a row without efforts is not declared a reasoning model, 
     parsed.deinit();
 }
 
-test "opencode script: --standalone follows the subcommand, the model rides the config" {
+test "opencode script: optional --standalone follows the subcommand, the model rides the config" {
     // opencode 2.x connects to a background service that never sees this env, refuses --model on its
     // default command, and refuses a flag placed before a subcommand.
     const b = budgetForContext(1048576);
     const tui = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{});
     defer t.allocator.free(tui);
-    try t.expect(std.mem.indexOf(u8, tui, "\nopencode --standalone\n") != null);
+    try t.expect(std.mem.indexOf(u8, tui, "\nopencode \"${sushi_opencode_flags[@]}\"\n") != null);
     try t.expect(std.mem.indexOf(u8, tui, "--model") == null);
     const run = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{ "run", "read it's" });
     defer t.allocator.free(run);
-    try t.expect(std.mem.indexOf(u8, run, "\nopencode 'run' --standalone 'read it'\\''s'\n") != null);
+    try t.expect(std.mem.indexOf(u8, run, "\nopencode 'run' \"${sushi_opencode_flags[@]}\" 'read it'\\''s'\n") != null);
     const flag = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{"--continue"});
     defer t.allocator.free(flag);
-    try t.expect(std.mem.indexOf(u8, flag, "\nopencode --standalone '--continue'\n") != null);
+    try t.expect(std.mem.indexOf(u8, flag, "\nopencode \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
 }
 
 test "grok names" {

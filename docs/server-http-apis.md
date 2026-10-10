@@ -292,7 +292,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.
 - opencode 2.x talks to a background service that never sees `OPENCODE_CONFIG_CONTENT` and refuses `--model` on its
-  default command: the launcher passes `--standalone` (after a subcommand, flags bind to it), carries the model as
+  default command: the launcher passes `--standalone` only when CLI help advertises it (after a subcommand), carries the model as
   `model`, and marks a row with efforts `reasoning` + `interleaved: reasoning_content` + one `variants` entry per graded
   word (GLM: low/high/max; on/off make none, and a default effort option would send words GLM refuses).
 - opencode sends no `max_tokens`, and GLM reserves a request's whole window without one (1M rows): serve GLM with
