@@ -43,6 +43,10 @@ pub const Options = struct {
     mtp_explicit: bool = false,
     /// `SUSHI_HIDDEN_OUT`: capture appends each prompt forward's block boundaries here.
     hidden_out: []const u8 = "",
+    /// `SUSHI_IMATRIX_OUT`: a native GLM capture also accumulates the experts' imatrix and writes it here.
+    imatrix_out: []const u8 = "",
+    /// Layer-major: the imatrix covers only the first N windows (0 = all); later windows still run for the boundaries.
+    imatrix_windows: u32 = 0,
     /// Native GLM teacher capture: windows run in batches, layer by layer (resumable).
     layer_major: bool = false,
     /// Windows per layer-major batch; 0 = chosen from the budget.
@@ -82,6 +86,7 @@ const ValueFlag = enum {
     expert_pick_tolerance,
     wired_margin_gib,
     batch_windows,
+    imatrix_windows,
     pause_file,
 };
 
@@ -103,6 +108,7 @@ fn valueFlag(name: []const u8) ?ValueFlag {
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
         .{ "--wired-margin-gib", .wired_margin_gib },
         .{ "--batch-windows", .batch_windows },
+        .{ "--imatrix-windows", .imatrix_windows },
         .{ "--pause-file", .pause_file },
     };
     for (table) |row| if (std.mem.eql(u8, name, row[0])) return row[1];
@@ -160,6 +166,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
                 .batch_windows => o.batch_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
+                .imatrix_windows => o.imatrix_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .pause_file => o.pause_file = v,
             }
         } else {
@@ -167,7 +174,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
         }
     }
     if (o.tokens == 0) return error.BadFlagValue;
-    if (!o.layer_major and (o.batch_windows != 0 or o.pause_file.len != 0)) return error.LayerMajorFlagWithoutLayerMajor;
+    if (!o.layer_major and (o.batch_windows != 0 or o.imatrix_windows != 0 or o.pause_file.len != 0)) return error.LayerMajorFlagWithoutLayerMajor;
     if (o.model_dir.len == 0) return error.MissingModel;
     switch (o.command) {
         .capture => {
@@ -212,6 +219,7 @@ pub const USAGE =
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher, --tokens 1: batches of windows run layer by layer,
     \\                        each layer's experts read once per batch; resumable by rerunning
+    \\  --imatrix-windows <n> layer-major: SUSHI_IMATRIX_OUT counts only the first n windows (0 = all)
     \\  --batch-windows <n>   windows per layer-major batch (default: from the budget, at most 32)
     \\  --pause-file <path>   layer-major: idle after the current batch while <path> exists (<path>.ack)
     \\
@@ -1525,6 +1533,9 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (opts.command == .capture) if (hidden_capture.envPath()) |dir| {
         opts.hidden_out = dir;
         log.info("[kld] {s}: appending every prompt forward's block boundaries to {s}\n", .{ hidden_capture.ENV_VAR, dir });
+    };
+    if (opts.command == .capture) if (@import("imatrix.zig").envPath()) |path| {
+        opts.imatrix_out = path;
     };
     if (try @import("glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;

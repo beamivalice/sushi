@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "git_sha", git_sha);
 
     const mod = b.createModule(.{
-        .root_source_file = b.path(if (b.option(bool, "glm-ffn-replay", "Build offline GLM frozen-prefix extractor") orelse false) "src/glm5_ffn_replay.zig" else "src/main.zig"),
+        .root_source_file = b.path(if (b.option(bool, "glm-ffn-replay", "Build offline GLM frozen-prefix extractor") orelse false) "src/glm5_ffn_replay.zig" else if (b.option(bool, "glm-trunk-cov", "Build offline GLM trunk input-covariance extractor") orelse false) "src/glm5_trunk_cov.zig" else "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libcpp = true,

@@ -200,6 +200,13 @@ file as per-channel mean squares under their source weight names ([mimo2-arch](m
 converter repo. Routed counts reconcile to
 tokens x top-k exactly on every layer; the two load-time warmup forwards add a few tokens.
 
+- **GLM**: the native BF16 teacher capture (`sushi kld capture --layer-major`, also window-major) accumulates the same file
+  from `Stream.apply`: the MLP input and the clamped SwiGLU activation rows, keyed by the router's global expert ids,
+  under the source names `model.language_model.layers.{L}.mlp.experts.*`. `--imatrix-windows N` counts only the first N
+  windows (a batch never straddles the cut), so held-out windows can ride the same pass for the tune's boundaries.
+  A layer-major run resumes with its sums: each committed batch leaves `imatrix-<windows>.safetensors` (raw
+  accumulators) in `<out>.partial`, and a resume without the matching file is refused (`GlmLayerMajorImatrixStateMissing`).
+  Only BF16 experts are observed; any other layout is refused (`GlmImatrixNeedsBf16Experts`).
 - **Hidden capture** (`SUSHI_HIDDEN_OUT=<abs dir>`): `sushi kld capture` (no prefix cache, no warmup) appends every
   prompt token's residual at each block boundary (`boundary-XX.bin`, raw bf16 [tokens, hidden]; 00 = layer 0's input,
   b = layer b-1's output), then its ids (`tokens.bin`, u32); `forwardMoeWith` and the native GLM teacher (all four

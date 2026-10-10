@@ -51,6 +51,9 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
 - Measured (binary `65a5904b`, 16 real 500-token tune windows, W=8, `--ssd-budget-gb 100`, `taskpolicy -a`, GPU lock):
   33.1 tok/s against 4.2 window-major (608.8 GB read per batch in ~48 s, ~9 s compute per window); byte-identical
   to window-major on 14 windows (131 files).
+- `SUSHI_IMATRIX_OUT=<abs>.safetensors` rides the same pass and writes the experts' imatrix
+  ([engine-expert-streaming](engine-expert-streaming.md#imatrix)); with `SUSHI_HIDDEN_OUT` one pass yields the tune's
+  boundaries and the converter's calibration.
 - A window carries only its HC residual between layers (32 KiB per token at 4096 hidden): a layer's KDA state,
   MLA latent and pooled index are dropped once the window has run that layer. Decode would need every layer's state per
   window, so `--tokens` above 1 is refused (`GlmLayerMajorNeedsOneRow`).

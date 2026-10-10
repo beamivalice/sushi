@@ -3,6 +3,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const stream = @import("expert_stream.zig");
+const imatrix_capture = @import("imatrix.zig");
 const exl3 = @import("sushi_exl3");
 const fp8_block = @import("fp8_block.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -206,6 +207,8 @@ pub const Stream = struct {
     request_owner: ?*const anyopaque = null,
     pinned: ?Pinned = null,
     pinned_applies: u64 = 0,
+    /// Armed by an imatrix capture: BF16 experts only, every routed row is observed under its global expert id.
+    imatrix: ?*imatrix_capture.Collector = null,
 
     const Pinned = struct { layer: u16, prepared: stream.Prepared };
 
@@ -268,8 +271,11 @@ pub const Stream = struct {
             self.pinned_applies += 1;
         } else for (local, prepared.remapped) |*v, remap| v.* = remap;
         const remapped = try scope.own(mlx.mlx_array_new_data(local.ptr, ish.ptr, @intCast(ish.len), .uint32));
-        const out = switch (self.engine.store.layout()) {
-            .bf16_individual => try bf16Routed(&scope, x, prepared.gate, prepared.up, prepared.down, remapped, scores, cfg.glm_swiglu_limit),
+        const layout = self.engine.store.layout();
+        if (self.imatrix != null and layout != .bf16_individual) return error.GlmImatrixNeedsBf16Experts;
+        const tap: ?Tap = if (self.imatrix) |col| .{ .collector = col, .layer = layer, .ids = try scope.reshape(try scope.cast(raw_ids, .int32), &.{ shape[1], ish[2] }) } else null;
+        const out = switch (layout) {
+            .bf16_individual => try bf16RoutedTapped(&scope, x, prepared.gate, prepared.up, prepared.down, remapped, scores, cfg.glm_swiglu_limit, tap),
             .exl3_k4 => try @import("glm5_forward.zig").routedExl3(&scope, x, exl3Bank(&prepared.quant_raw), remapped, scores, cfg),
             .fp8_individual => try fp8Routed(&scope, self.engine.allocator, x, &prepared.quant_raw, local, ish, scores, cfg.glm_swiglu_limit),
             else => return error.GlmStreamLayoutUnsupported,
@@ -333,7 +339,14 @@ pub fn fp8Routed(ops: *Ops, a: std.mem.Allocator, x: Arr, bank: *const [stream.q
 }
 
 /// Banks are [experts,input,output] views. Scores remain FP32 until the final cast.
+/// An imatrix capture's view of one routed layer: `ids` is the router's [rows, top_k] GLOBAL expert ids, never slab slots.
+const Tap = struct { collector: *imatrix_capture.Collector, layer: u16, ids: Arr };
+
 pub fn bf16Routed(ops: *Ops, x: Arr, gate: Arr, up: Arr, down: Arr, ids: Arr, scores: Arr, limit: f32) !Arr {
+    return bf16RoutedTapped(ops, x, gate, up, down, ids, scores, limit, null);
+}
+
+fn bf16RoutedTapped(ops: *Ops, x: Arr, gate: Arr, up: Arr, down: Arr, ids: Arr, scores: Arr, limit: f32, tap: ?Tap) !Arr {
     if (!mlx.streamIsGpu(ops.s)) return error.GlmStreamRequiresGpu;
     const xs = mlx.getShape(x);
     const ish = mlx.getShape(ids);
@@ -344,6 +357,12 @@ pub fn bf16Routed(ops: *Ops, x: Arr, gate: Arr, up: Arr, down: Arr, ids: Arr, sc
     const hi = try ops.scalar(limit, .bfloat16);
     const lo = try ops.scalar(-limit, .bfloat16);
     const activation = try ops.binary(.mul, try ops.silu(try ops.binary(.min, g, hi)), try ops.binary(.max, try ops.binary(.min, u, hi), lo));
+    if (tap) |t| {
+        const rows = xs[1] * ish[2];
+        try t.collector.observeGateUp(t.layer, try ops.reshape(x, &.{ xs[1], xs[2] }), t.ids);
+        const inter = mlx.getShape(activation);
+        try t.collector.observeDown(t.layer, try ops.reshape(activation, &.{ rows, inter[inter.len - 1] }), try ops.reshape(t.ids, &.{ rows, 1 }));
+    }
     const y = try gather(ops, activation, down, ids);
     const y4 = try ops.reshape(y, &.{ xs[0], xs[1], ish[2], xs[2] });
     const weights = try ops.reshape(scores, &.{ xs[0], xs[1], ish[2], 1 });
@@ -416,6 +435,67 @@ test "GLM stream GPU BF16 routed output matches resident through eviction union 
     try t.expectError(error.GlmStreamRequestBudgetExceeded, store.admit(15, 2));
     try t.expectError(error.GlmStreamRequestBudgetExceeded, store.admit(0, 4));
     try store.admit(13, 3);
+}
+
+test "GLM stream imatrix tap keys the MLP input and the SwiGLU activation on the router's global expert ids" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const fixture = @import("glm_stream_fixture.zig");
+    try fixture.write(t.allocator, tmp.dir, .none);
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(t.io, &path);
+    const geometry = stream.Geometry{ .layers = 4, .experts = 4, .hidden = 32, .intermediate = 16, .first_moe_layer = 3 };
+    var engine = try stream.Engine.initWithOptions(t.allocator, path[0..n], geometry, 2 * 3072, s, .{ .layout = .bf16_individual, .bounce_size = 4096, .io_workers = 1 });
+    defer engine.deinit();
+    const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 4, 4, .glm5_next);
+    defer col.deinit();
+    var store = Stream{ .engine = &engine, .max_tokens = 16, .max_chunk = 3, .imatrix = col };
+    const cfg = model.ModelConfig{ .glm_swiglu_limit = 10 };
+    const route_ids = [6]u32{ 3, 1, 3, 3, 0, 1 };
+    var values: [96]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 5)) / 4;
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const x = try ops.cast(try ops.own(mlx.mlx_array_new_data(&values, &.{ 1, 3, 32 }, 3, .float32)), .bfloat16);
+    const ids = try ops.own(mlx.mlx_array_new_data(&route_ids, &.{ 1, 3, 2 }, 3, .uint32));
+    const scores = try ops.own(mlx.mlx_array_new_data(&[_]f32{ 0.25, 0.75, 0.4, 0.6, 0.7, 0.3 }, &.{ 1, 3, 2 }, 3, .float32));
+    _ = try store.apply(3, &ops, x, ids, scores, &cfg);
+
+    // Every fixture weight of one expert and projection is a single constant, so each output channel of gate
+    // and up is that constant times the row's sum, and the activation is the same on all 16 channels.
+    const weight = struct {
+        fn of(e: usize, pi: usize) f32 {
+            return @bitCast(@as(u32, fixture.value(e, pi)) << 16);
+        }
+    }.of;
+    var want_gu: [4 * 32]f64 = @splat(0);
+    var want_down: [4 * 16]f64 = @splat(0);
+    var want_rows: [4]f64 = @splat(0);
+    for (0..3) |row| {
+        var sum: f64 = 0;
+        for (0..32) |c| sum += values[row * 32 + c];
+        for (0..2) |slot| {
+            const e = route_ids[row * 2 + slot];
+            want_rows[e] += 1;
+            for (0..32) |c| want_gu[e * 32 + c] += @as(f64, values[row * 32 + c]) * values[row * 32 + c];
+            const g = @min(weight(e, 0) * sum, 10);
+            const u = std.math.clamp(@min(weight(e, 1) * sum, 10), -10, 10);
+            const act = g / (1 + @exp(-g)) * u;
+            for (0..16) |c| want_down[e * 16 + c] += act * act;
+        }
+    }
+    const layer = &col.layers[3];
+    try mlx.check(mlx.mlx_array_eval(layer.gu));
+    try mlx.check(mlx.mlx_array_eval(layer.down));
+    try mlx.check(mlx.mlx_array_eval(layer.rows));
+    for (want_gu, mlx.mlx_array_data_float32(layer.gu).?[0..want_gu.len]) |want, got| try t.expectApproxEqRel(want, got, 1e-5);
+    for (want_rows, mlx.mlx_array_data_float32(layer.rows).?[0..4]) |want, got| try t.expectEqual(want, got);
+    for (want_down, mlx.mlx_array_data_float32(layer.down).?[0..want_down.len]) |want, got| try t.expectApproxEqAbs(want, got, 0.03 * @max(1, want));
+    try t.expectEqual(@as(u64, 3), layer.tokens);
+    try t.expect(col.layers[0].gu.ctx == null);
 }
 
 /// The fixture's FP8 bank resident: `[experts, out, in]` codes and `[experts, out/128, in/128]` scales.

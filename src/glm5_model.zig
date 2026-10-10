@@ -235,9 +235,13 @@ pub fn storedAffineBits(w: Arr, scales: Arr, biases: Arr) !c_int {
     const width = @as(u64, @intCast(groups)) * 128;
     if (packed_bits % width != 0) return error.InvalidGlmAffine;
     const bits = packed_bits / width;
-    if (bits != 6 and bits != 8) return error.InvalidGlmAffine;
+    if (bits != 5 and bits != 6 and bits != 8) return error.InvalidGlmAffine;
     return @intCast(bits);
 }
+
+/// A calibration replay sets this to see every trunk projection's input; serving leaves it null.
+pub const LinearTap = struct { ctx: *anyopaque, observe: *const fn (ctx: *anyopaque, w: Arr, x: Arr) anyerror!void };
+pub var linear_tap: ?LinearTap = null;
 
 pub const Linear = struct {
     w: Arr,
@@ -276,6 +280,7 @@ pub const Linear = struct {
     }
 
     pub fn apply(self: Linear, ops: *Ops, x: Arr) !Arr {
+        if (linear_tap) |t| try t.observe(t.ctx, self.w, x);
         if (self.isFp8()) return ops.own(try fp8_block.linear(ops.s, x, self.w, self.scales));
         if (self.scales.ctx != null) {
             if (try @import("glm5_a6_dense_once.zig").tryPrefill(ops, x, self.w, self.scales, self.biases)) |result| return result;
@@ -1079,6 +1084,41 @@ test "GLM model A6 stored projection transpose and embedding rows preserve geome
     try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(try ops.zeros(&.{ 4, 25 }, .uint32), linear.scales, linear.biases));
     try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(try ops.zeros(&.{ 4, 16 }, .uint32), linear.scales, linear.biases));
     try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(linear.w, linear.scales, try ops.zeros(&.{ 4, 2 }, .bfloat16)));
+}
+
+test "GLM model A5 stored projection dequantizes to its codes and applies through the generic quantized matmul" {
+    const a = std.testing.allocator;
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    var codes: [4 * 20]u32 = @splat(0);
+    var values: [4 * 128]f32 = undefined;
+    for (&values, 0..) |*v, i| {
+        const code: u32 = @intCast((i + i / 128) % 32);
+        const shift: u5 = @intCast((i * 5) % 32);
+        codes[i * 5 / 32] |= code << shift;
+        if (shift > 27) codes[i * 5 / 32 + 1] |= code >> @as(u5, @intCast(32 - @as(u32, shift)));
+        v.* = @as(f32, @floatFromInt(code)) * 0.125 - 1;
+    }
+    const scales: [4]u16 = @splat(0x3e00);
+    const biases: [4]u16 = @splat(0xbf80);
+    try weights.map.put(try a.dupe(u8, "p.weight"), mlx.mlx_array_new_data(&codes, &[_]c_int{ 4, 20 }, 2, .uint32));
+    try weights.map.put(try a.dupe(u8, "p.scales"), mlx.mlx_array_new_data(&scales, &[_]c_int{ 4, 1 }, 2, .bfloat16));
+    try weights.map.put(try a.dupe(u8, "p.biases"), mlx.mlx_array_new_data(&biases, &[_]c_int{ 4, 1 }, 2, .bfloat16));
+    const linear = try Linear.load(&weights, "p", 128);
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    try std.testing.expectEqual(@as(c_int, 5), try storedAffineBits(linear.w, linear.scales, linear.biases));
+    const dense = try ops.cast(try ops.dequant(linear.w, linear.scales, linear.biases), .float32);
+    try mlx.check(mlx.mlx_array_eval(dense));
+    try std.testing.expectEqualSlices(f32, &values, mlx.mlx_array_data_float32(dense).?[0..values.len]);
+    const y = try ops.cast(try linear.apply(&ops, try ops.ones(&.{ 1, 2, 128 }, .bfloat16)), .float32);
+    try mlx.check(mlx.mlx_array_eval(y));
+    for (0..4) |row| {
+        var want: f32 = 0;
+        for (values[row * 128 ..][0..128]) |v| want += v;
+        try std.testing.expectApproxEqAbs(want, mlx.mlx_array_data_float32(y).?[row], 0.5);
+    }
+    try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(try ops.zeros(&.{ 4, 28 }, .uint32), linear.scales, linear.biases));
 }
 
 test "GLM FP8 projection follows MiMo source arithmetic at decode and prefill widths" {

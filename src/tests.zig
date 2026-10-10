@@ -71,6 +71,7 @@ test {
     _ = @import("mimo_source.zig");
     _ = @import("glm5_next.zig");
     _ = @import("glm5_model.zig");
+    _ = @import("glm5_trunk_cov.zig");
     _ = @import("glm5_hc_prefill.zig");
     _ = @import("glm5_hc_collapse_simd32.zig");
     _ = @import("glm5_hc_expand_norm.zig");

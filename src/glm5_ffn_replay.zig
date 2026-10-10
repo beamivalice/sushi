@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     if (iterator.next() != null or windows == 0 or length == 0 or length > 512) return error.InvalidReplayArguments;
     var cfg = try model.parseConfig(io, a, pack);
     defer cfg.deinit(a);
-    if (!cfg.isGlm5() or cfg.hc_count != 4) return error.InvalidGlmConfig;
+    if (!cfg.isGlm5() or cfg.hc_count != 4 or index < cfg.first_k_dense_replace) return error.InvalidGlmConfig;
     const stream = mlx.gpuStream();
     if (cfg.expert_layout == .bf16_individual) base.enterTeacher();
     var weights = try native.loadWeightsBounded(io, a, pack, stream, true, 8 << 30);

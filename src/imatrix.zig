@@ -39,11 +39,12 @@ pub const ENV_VAR = "SUSHI_IMATRIX_OUT";
 pub const Arch = enum {
     qwen4_exp,
     mimo_v2,
+    glm5_next,
 
     /// The SOURCE checkpoint's decoder-layer prefix.
     pub fn layerPrefix(self: Arch) []const u8 {
         return switch (self) {
-            .qwen4_exp => "model.language_model.layers.",
+            .qwen4_exp, .glm5_next => "model.language_model.layers.",
             .mimo_v2 => "model.layers.",
         };
     }
@@ -51,6 +52,7 @@ pub const Arch = enum {
     pub fn fromModelType(model_type: []const u8) ?Arch {
         if (std.mem.eql(u8, model_type, "qwen4_exp")) return .qwen4_exp;
         if (std.mem.eql(u8, model_type, "mimo_v2")) return .mimo_v2;
+        if (std.mem.eql(u8, model_type, "glm5_next")) return .glm5_next;
         return null;
     }
 };
@@ -326,6 +328,62 @@ pub const Collector = struct {
         try mlx.check(mlx.mlx_reshape(&flat, scaled, &[_]c_int{shape[0] * shape[1]}, 1, self.s));
         try mlx.check(mlx.mlx_array_eval(flat));
         return flat;
+    }
+
+    /// The raw accumulators of every expert layer (no normalization), so a capture that resumes continues the sums.
+    /// `path` must end in `.safetensors`: MLX appends the suffix otherwise.
+    pub fn saveState(self: *Collector, path: []const u8) !void {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const tokens = try self.allocator.alloc(u32, self.layers.len);
+        defer self.allocator.free(tokens);
+        var key_buf: [64]u8 = undefined;
+        for (self.layers, tokens, 0..) |*slot, *t, li| {
+            t.* = @intCast(slot.tokens);
+            if (slot.tokens == 0) continue;
+            inline for (.{ .{ "gu", &slot.gu }, .{ "down", &slot.down }, .{ "rows", &slot.rows } }) |entry| {
+                try mlx.check(mlx.mlx_array_eval(entry[1].*));
+                try mlx.check(mlx.mlx_map_string_to_array_insert(map, try std.fmt.bufPrintSentinel(&key_buf, "{s}.{d}", .{ entry[0], li }, 0), entry[1].*));
+            }
+        }
+        const count = mlx.mlx_array_new_data(tokens.ptr, &[_]c_int{@intCast(tokens.len)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(count);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(map, "tokens", count));
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const path_z = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{path}, 0);
+        defer self.allocator.free(path_z);
+        try mlx.check(mlx.mlx_save_safetensors(path_z.ptr, map, meta));
+    }
+
+    /// Replaces every accumulator with the ones `saveState` wrote; a file for other geometry is refused.
+    pub fn loadState(self: *Collector, path: []const u8) !void {
+        var loaded = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(loaded);
+        var meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const path_z = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{path}, 0);
+        defer self.allocator.free(path_z);
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        try mlx.check(mlx.mlx_load_safetensors(&loaded, &meta, path_z.ptr, cpu));
+        var count = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(count);
+        try mlx.check(mlx.mlx_map_string_to_array_get(&count, loaded, "tokens"));
+        try mlx.check(mlx.mlx_array_eval(count));
+        const tokens = mlx.mlx_array_data_uint32(count) orelse return error.ImatrixStateCorrupt;
+        if (mlx.mlx_array_size(count) != self.layers.len) return error.ImatrixStateGeometry;
+        var key_buf: [64]u8 = undefined;
+        for (self.layers, 0..) |*slot, li| {
+            slot.deinit();
+            slot.tokens = tokens[li];
+            if (slot.tokens == 0) continue;
+            inline for (.{ .{ "gu", &slot.gu, @as(c_int, 1) }, .{ "down", &slot.down, @as(c_int, 1) }, .{ "rows", &slot.rows, @as(c_int, 1) } }) |entry| {
+                try mlx.check(mlx.mlx_map_string_to_array_get(entry[1], loaded, try std.fmt.bufPrintSentinel(&key_buf, "{s}.{d}", .{ entry[0], li }, 0)));
+                try mlx.check(mlx.mlx_array_eval(entry[1].*));
+                if (mlx.getShape(entry[1].*)[0] != self.experts) return error.ImatrixStateGeometry;
+            }
+        }
     }
 
     /// Write the safetensors file. Returns its byte count.

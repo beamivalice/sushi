@@ -7,6 +7,7 @@ const native = @import("glm5_diagnostic.zig");
 const forward = @import("glm5_forward.zig");
 const streaming = @import("glm5_stream.zig");
 const hidden_capture = @import("hidden_capture.zig");
+const imatrix_capture = @import("imatrix.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Arr = mlx.mlx_array;
 pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
@@ -25,6 +26,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
         return error.NativeGlmTeacherRequiresLosslessStreaming;
     // A layer-major window ends with its prefill: no layer's cache outlives that layer.
     if (opts.layer_major and opts.tokens != 1) return error.GlmLayerMajorNeedsOneRow;
+    if (opts.imatrix_windows != 0 and !opts.layer_major) return error.ImatrixWindowsNeedLayerMajor;
     return true;
 }
 pub fn tryRun(a: std.mem.Allocator, io: std.Io, opts: kld.Options, out: *kld.Out) !bool {
@@ -458,6 +460,51 @@ const Ledger = struct {
         if (check.changed.load(.acquire)) return error.GlmLayerMajorWindowChanged;
     }
 
+
+    // The imatrix sums of the first `n` committed windows are `imatrix-<n>.safetensors`. A batch writes its file before its
+    // log lines, and the earlier file goes only after those lines are durable, so one file always matches the log.
+    fn imatrixStatePath(self: *Ledger, buf: []u8, n: usize, tmp: bool) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/imatrix-{d}{s}.safetensors", .{ self.staging, n, if (tmp) ".tmp" else "" });
+    }
+
+    fn saveImatrix(self: *Ledger, io: std.Io, c: *imatrix_capture.Collector, n: usize) !void {
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var final_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = try self.imatrixStatePath(&tmp_buf, n, true);
+        const final = try self.imatrixStatePath(&final_buf, n, false);
+        try c.saveState(tmp);
+        try fsyncPath(tmp);
+        const cwd = std.Io.Dir.cwd();
+        try cwd.rename(tmp, cwd, final, io);
+    }
+
+    fn restoreImatrix(self: *Ledger, io: std.Io, c: *imatrix_capture.Collector, n: usize) !void {
+        self.dropImatrixStatesExcept(io, n);
+        if (n == 0) return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try self.imatrixStatePath(&buf, n, false);
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.GlmLayerMajorImatrixStateMissing;
+    try c.loadState(path);
+    }
+
+    fn dropImatrixStatesExcept(self: *Ledger, io: std.Io, keep: usize) void {
+        const cwd = std.Io.Dir.cwd();
+        var dir = cwd.openDir(io, self.staging, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+        var keep_buf: [64]u8 = undefined;
+        const keep_name = std.fmt.bufPrint(&keep_buf, "imatrix-{d}.safetensors", .{keep}) catch return;
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (std.mem.startsWith(u8, entry.name, "imatrix-") and !std.mem.eql(u8, entry.name, keep_name)) dir.deleteFile(io, entry.name) catch {};
+        }
+    }
+
+
+    /// How many of the first `windows` windows the imatrix counts.
+    fn covered(b: Batch, windows: usize) usize {
+        return if (b.imatrix_windows == 0) windows else @min(windows, b.imatrix_windows);
+    }
+
     const Batch = struct {
         io: std.Io,
         s: mlx.mlx_stream,
@@ -467,6 +514,9 @@ const Ledger = struct {
         chunk: usize,
         batch: u32,
         hidden: ?*hidden_capture.Writer,
+        imatrix: ?*imatrix_capture.Collector,
+        /// The imatrix covers the first this-many windows (0 = all).
+        imatrix_windows: usize,
         row: []f32,
         limit: usize,
         pause_file: []const u8,
@@ -486,6 +536,7 @@ const Ledger = struct {
             try records.append(a, .{ .id = id, .dir = try a.dupe(u8, r.dir), .prompt_tokens = r.tokens, .generated_tokens = 1, .strict_nll_mean = nll, .strict_perplexity = @exp(nll) });
         }
         if (b.hidden) |w| try w.truncateTo(self.committed_tokens);
+        if (b.imatrix) |c| try self.restoreImatrix(b.io, c, covered(b, self.records.len));
         var next = self.records.len;
         var offset = self.committed_tokens;
         const run_clock = @import("expert_stream.zig").Clock.init();
@@ -500,7 +551,10 @@ const Ledger = struct {
         };
         while (next < b.prompts.len) {
             try waitWhilePaused(a, b.io, b.pause_file, next, b.out);
-            const end = @min(b.prompts.len, next + b.batch);
+            const counted = b.imatrix != null and (b.imatrix_windows == 0 or next < b.imatrix_windows);
+            // A batch never straddles the imatrix cutoff: its windows are all counted or none is.
+            const end = @min(if (counted and b.imatrix_windows != 0) b.imatrix_windows else b.prompts.len, next + b.batch);
+            b.net.expert_stream.?.imatrix = if (counted) b.imatrix else null;
             var sink = try BatchSink.init(a, b, self.staging, next, end, logits_dtype);
             defer sink.deinit();
             const stats = try @import("glm5_layer_major.zig").prefill(a, b.net, b.inputs[next..end], b.chunk, sink.sink());
@@ -508,6 +562,7 @@ const Ledger = struct {
                 for (b.inputs[next..end]) |ids| try w.appendTokens(ids);
                 try w.sync();
             }
+            if (counted) try self.saveImatrix(b.io, b.imatrix.?, end);
             var tokens: u64 = 0;
             for (sink.results, next..) |*res, i| {
                 const record = res.record orelse return error.NativeGlmTeacherRowCountMismatch;
@@ -537,6 +592,7 @@ const Ledger = struct {
                 tokens += b.inputs[i].len;
             }
             if (std.c.fsync(self.log_fd) != 0) return error.GlmLayerMajorSyncFailed;
+            if (b.imatrix != null) self.dropImatrixStatesExcept(b.io, covered(b, end));
             for (sink.results) |*res| {
                 try records.append(a, res.record.?);
                 res.record = null;
@@ -712,6 +768,9 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
     defer engine.deinit();
     var net = try forward.Model.loadStreamed(a, cfg.*, &weights, s, .{ .engine = &engine, .max_tokens = max_tokens, .max_chunk = chunk });
     defer net.deinit();
+    const imatrix: ?*imatrix_capture.Collector = if (opts.imatrix_out.len == 0) null else try imatrix_capture.Collector.init(a, s, opts.imatrix_out, cfg.num_hidden_layers, @intCast(cfg.num_experts), .glm5_next);
+    defer if (imatrix) |c| c.deinit();
+    net.expert_stream.?.imatrix = imatrix;
     const loaded_active = try activeBound(limit, reserve + budget.carried);
     const hidden = if (opts.hidden_out.len > 0) try hidden_capture.Writer.open(a, io, opts.hidden_out, cfg.num_hidden_layers, kld.hiddenCaptureWidth(cfg)) else null;
     defer if (hidden) |w| w.close();
@@ -725,9 +784,11 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
     var logits_dtype: ?mlx.mlx_dtype = null;
     var final_offset: usize = 0;
     if (ledger) |*l| {
-        try l.capture(.{ .io = io, .s = s, .net = &net, .prompts = prompts.items, .inputs = inputs, .chunk = chunk, .batch = batch, .hidden = hidden, .row = row, .limit = limit, .pause_file = opts.pause_file, .out = out }, &records, &logits_dtype);
+        try l.capture(.{ .io = io, .s = s, .net = &net, .prompts = prompts.items, .inputs = inputs, .chunk = chunk, .batch = batch, .hidden = hidden, .imatrix = imatrix, .imatrix_windows = opts.imatrix_windows, .row = row, .limit = limit, .pause_file = opts.pause_file, .out = out }, &records, &logits_dtype);
         final_offset = inputs[inputs.len - 1].len;
     } else try windowMajor(a, io, s, &net, staging, prompts.items, inputs, chunk, opts.tokens, hidden, row, limit, &records, &logits_dtype, &final_offset);
+    if (imatrix) |c| _ = try c.flush();
+    if (ledger) |*l| l.dropImatrixStatesExcept(io, std.math.maxInt(usize));
     const elapsed = @as(f64, @floatFromInt(started.untilNow(io, .awake).nanoseconds)) / 1e9;
     try kld.writeBaseline(a, io, staging, .{ .label = opts.label, .model = opts.model_dir, .run = opts.label, .kv_cache_format = "bf16", .inference_profile = "greedy-native-glm-streamed", .prompt_set = opts.prompts, .ssd_budget_gb = opts.ssd_budget_bytes >> 30, .tokens_per_prompt = opts.tokens, .top_k = opts.top_k, .elapsed_secs = elapsed }, records.items);
     var peak: usize = 0;
@@ -988,6 +1049,9 @@ test "GLM layer-major capture CPU flags: one row per window, native teacher only
     try t.expectEqual(@as(u32, 4), opts.batch_windows);
     try t.expectEqualStrings("/pause", opts.pause_file);
     try t.expectError(error.LayerMajorFlagWithoutLayerMajor, kld.parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--batch-windows", "4" }));
+    const cut = try kld.parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p.jsonl", "--out", "/o", "--tokens", "1", "--no-template", "--layer-major", "--imatrix-windows", "12" });
+    try t.expectEqual(@as(u32, 12), cut.imatrix_windows);
+    try t.expectError(error.LayerMajorFlagWithoutLayerMajor, kld.parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--imatrix-windows", "12" }));
     const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .bf16_individual };
     var teacher = kld.Options{ .command = .capture, .no_template = true, .tokens = 1, .ssd_budget_bytes = 100 << 30, .layer_major = true, .hidden_out = "/h" };
     try t.expect(try accepts(&cfg, teacher));
@@ -1118,6 +1182,132 @@ test "GLM layer-major capture writes window-major's fixture and boundaries byte 
     try std.testing.expectEqual(@as(usize, 3), committed);
     try tiny.capture(a, try tiny.opts("resumed", 2));
     try tiny.expectSame("window-major", "resumed");
+}
+
+/// An imatrix file's F32 entries by name (safetensors: u64 header length, JSON header, data).
+fn imatrixEntry(a: std.mem.Allocator, bytes: []const u8, name: []const u8) ![]f32 {
+    const header_len: usize = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes[8 .. 8 + header_len], .{});
+    defer parsed.deinit();
+    const entry = (parsed.value.object.get(name) orelse return error.ImatrixEntryMissing).object;
+    try std.testing.expectEqualStrings("F32", entry.get("dtype").?.string);
+    const range = entry.get("data_offsets").?.array.items;
+    const data = bytes[8 + header_len + @as(usize, @intCast(range[0].integer)) ..][0 .. @as(usize, @intCast(range[1].integer - range[0].integer))];
+    const out = try a.alloc(f32, data.len / 4);
+    for (out, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, data[i * 4 ..][0..4], .little));
+    return out;
+}
+
+/// Every MoE layer's rows sum to tokens x top_k, and `got` matches `want` entry by entry.
+fn expectImatrixMatches(tiny: *TinyCapture, cfg: *const model.ModelConfig, tokens: f32, want_name: []const u8, got_name: []const u8) !void {
+    const arena = tiny.arena.allocator();
+    const want_bytes = try tiny.read(want_name);
+    const got_bytes = try tiny.read(got_name);
+    for (cfg.first_k_dense_replace..cfg.num_hidden_layers) |layer| {
+        for ([_][]const u8{ "gate_up_proj.rows", "gate_up_proj", "down_proj" }) |leaf| {
+            const key = try std.fmt.allocPrint(arena, "model.language_model.layers.{d}.mlp.experts.{s}", .{ layer, leaf });
+            const want = try imatrixEntry(arena, want_bytes, key);
+            const got = try imatrixEntry(arena, got_bytes, key);
+            try std.testing.expectEqual(want.len, got.len);
+            if (std.mem.endsWith(u8, leaf, ".rows")) {
+                var total: f32 = 0;
+                for (got) |v| total += v;
+                try std.testing.expectEqual(tokens * @as(f32, @floatFromInt(cfg.num_experts_per_tok)), total);
+            }
+            for (want, got) |w, g| try std.testing.expectApproxEqRel(w, g, 1e-4);
+        }
+    }
+}
+
+test "GLM capture writes an imatrix whose counts reconcile, that batches leave alone and that moves no forward byte" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    const arena = tiny.arena.allocator();
+    var cfg = try model.parseConfig(std.testing.io, a, tiny.model);
+    defer cfg.deinit(a);
+    const names = [_][]const u8{ "plain", "wm", "b2", "b3" };
+    const batches = [_]u32{ 2, 0, 2, 3 };
+    for (names, batches) |name, batch| {
+        var o = try tiny.opts(name, batch);
+        if (!std.mem.eql(u8, name, "plain")) o.imatrix_out = try std.fmt.allocPrint(arena, "{s}/{s}.imatrix.safetensors", .{ tiny.root, name });
+        try tiny.capture(a, o);
+    }
+    try tiny.expectSame("plain", "wm");
+    try tiny.expectSame("plain", "b2");
+    try expectImatrixMatches(&tiny, &cfg, 67, "wm.imatrix.safetensors", "wm.imatrix.safetensors");
+    try expectImatrixMatches(&tiny, &cfg, 67, "wm.imatrix.safetensors", "b2.imatrix.safetensors");
+    try expectImatrixMatches(&tiny, &cfg, 67, "wm.imatrix.safetensors", "b3.imatrix.safetensors");
+}
+
+test "GLM layer-major resume carries the imatrix across an interruption and a new batch size" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    const arena = tiny.arena.allocator();
+    var cfg = try model.parseConfig(std.testing.io, a, tiny.model);
+    defer cfg.deinit(a);
+    var whole = try tiny.opts("whole", 3);
+    whole.imatrix_out = try std.fmt.allocPrint(arena, "{s}/whole.imatrix.safetensors", .{tiny.root});
+    try tiny.capture(a, whole);
+    try std.testing.expectError(error.FileNotFound, tiny.tmp.dir.access(std.testing.io, "whole/imatrix-7.safetensors", .{}));
+    var broken = try tiny.opts("resumed", 3);
+    broken.imatrix_out = try std.fmt.allocPrint(arena, "{s}/resumed.imatrix.safetensors", .{tiny.root});
+    interrupt_boundaries_for_test = 3 * 6 + 8;
+    try std.testing.expectError(error.TestInterrupted, tiny.capture(a, broken));
+    interrupt_boundaries_for_test = null;
+    var again = try tiny.opts("resumed", 2);
+    again.imatrix_out = broken.imatrix_out;
+    try tiny.capture(a, again);
+    try expectImatrixMatches(&tiny, &cfg, 67, "whole.imatrix.safetensors", "resumed.imatrix.safetensors");
+}
+
+test "GLM layer-major imatrix covers only the first N windows, across batches and a resume" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    const arena = tiny.arena.allocator();
+    var cfg = try model.parseConfig(std.testing.io, a, tiny.model);
+    defer cfg.deinit(a);
+    // Windows 0..3 hold 9 + 13 + 5 + 12 = 39 tokens; the batch of three must stop at the cutoff.
+    var all = try tiny.opts("all-wm", 0);
+    all.imatrix_out = try std.fmt.allocPrint(arena, "{s}/all-wm.imatrix.safetensors", .{tiny.root});
+    all.imatrix_windows = 4;
+    try std.testing.expectError(error.ImatrixWindowsNeedLayerMajor, tiny.capture(a, all));
+    var cut = try tiny.opts("cut", 3);
+    cut.imatrix_out = try std.fmt.allocPrint(arena, "{s}/cut.imatrix.safetensors", .{tiny.root});
+    cut.imatrix_windows = 4;
+    try tiny.capture(a, cut);
+    const plain = try tiny.opts("plain", 3);
+    try tiny.capture(a, plain);
+    try tiny.expectSame("plain", "cut");
+    try expectImatrixMatches(&tiny, &cfg, 39, "cut.imatrix.safetensors", "cut.imatrix.safetensors");
+    var broken = try tiny.opts("resumed", 3);
+    broken.imatrix_out = try std.fmt.allocPrint(arena, "{s}/resumed.imatrix.safetensors", .{tiny.root});
+    broken.imatrix_windows = 4;
+    interrupt_boundaries_for_test = 5 * 6 + 8;
+    try std.testing.expectError(error.TestInterrupted, tiny.capture(a, broken));
+    interrupt_boundaries_for_test = null;
+    broken.batch_windows = 2;
+    try tiny.capture(a, broken);
+    try expectImatrixMatches(&tiny, &cfg, 39, "cut.imatrix.safetensors", "resumed.imatrix.safetensors");
+}
+
+test "GLM layer-major resume refuses an imatrix capture whose committed sums are gone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    var o = try tiny.opts("run", 3);
+    o.imatrix_out = try std.fmt.allocPrint(tiny.arena.allocator(), "{s}/run.imatrix.safetensors", .{tiny.root});
+    interrupt_boundaries_for_test = 3 * 6 + 8;
+    try std.testing.expectError(error.TestInterrupted, tiny.capture(a, o));
+    interrupt_boundaries_for_test = null;
+    try tiny.tmp.dir.deleteFile(std.testing.io, "run.partial/imatrix-3.safetensors");
+    try std.testing.expectError(error.GlmLayerMajorImatrixStateMissing, tiny.capture(a, o));
 }
 
 test "GLM capture identity records whether the NAX arms were on and what each dispatched" {

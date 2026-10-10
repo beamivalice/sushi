@@ -339,7 +339,8 @@ pub const FfnPrefixReplay = struct {
     shared: ?base.DenseMlp,
 
     pub fn load(cfg: model.ModelConfig, weights: *const model.Weights, index: usize, stream: mlx.mlx_stream) !FfnPrefixReplay {
-        if (!cfg.isGlm5() or index < cfg.first_k_dense_replace or index >= cfg.num_hidden_layers) return error.InvalidGlmLayer;
+        if (!cfg.isGlm5() or index >= cfg.num_hidden_layers) return error.InvalidGlmLayer;
+        const dense = index < cfg.first_k_dense_replace;
         var buf: [256]u8 = undefined;
         const prefix = try std.fmt.bufPrint(&buf, "{s}.layers.{d}", .{ cfg.weight_prefix, index });
         const hc_attn = try base.Hc.load(weights, prefix, "hc_attn", cfg.hidden_size);
@@ -361,9 +362,12 @@ pub const FfnPrefixReplay = struct {
             .kda => |*kda| kda.deinit(),
             .mla => |*mla| mla.deinit(),
         };
-        const router = try tensor(weights, prefix, "mlp.gate.weight");
-        const correction = try tensor(weights, prefix, "mlp.gate.e_score_correction_bias");
-        const shared = if (cfg.shared_expert_intermediate_size > 0)
+        // A dense layer's whole MLP rides as `shared`; it has no router.
+        const router = if (dense) Arr{ .ctx = null } else try tensor(weights, prefix, "mlp.gate.weight");
+        const correction = if (dense) Arr{ .ctx = null } else try tensor(weights, prefix, "mlp.gate.e_score_correction_bias");
+        const shared = if (dense)
+            try base.DenseMlp.load(weights, try std.fmt.bufPrint(&name_buf, "{s}.mlp", .{prefix}), cfg.hidden_size, cfg.intermediate_size)
+        else if (cfg.shared_expert_intermediate_size > 0)
             try base.DenseMlp.load(weights, try std.fmt.bufPrint(&name_buf, "{s}.mlp.shared_experts", .{prefix}), cfg.hidden_size, cfg.shared_expert_intermediate_size)
         else
             null;
