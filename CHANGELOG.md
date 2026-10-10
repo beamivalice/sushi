@@ -20,6 +20,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Tool calls**: a `<function=name` whose closing `>` the model dropped is recovered with its parameters instead of the call being lost as plain text.
 - **File tools**: the chat page and `sushi run` can let the model add and edit files (`write_file`, `edit_file`) in the folder you choose for the chat; the Edit chip (shown while Tools is on) or `/edit on|off` switches it per conversation, off unless the server was launched with `--edit on`, and every write stays inside that folder.
 - **Tool calls**: `tool_choice: "none"` on chat completions now stops the model from writing a tool call as plain text after earlier calls in the conversation; the chat page and `sushi run` send it on their final, tool-less round, which no longer shows raw `<tool_call>` markup.
+- **Anthropic API**: with tools in the request, `/v1/messages` streams thinking as the model writes it instead of in one piece when the thought ends.
+- **Anthropic API**: `usage.input_tokens` no longer includes the cached tokens reported in `cache_read_input_tokens`, so Claude Code stops counting the context twice and compacting at half its real size.
+- **Anthropic API**: a thought that starts after visible text gets its own content block index instead of the still-open text block's, and carries only its own text instead of repeating the answer that streamed before it.
+- **Reasoning**: a `<think>` or `</think>` the model writes inside a backtick code span, while explaining the format, stays text instead of splitting the thought or the answer, on every endpoint.
 - **Completions**: `/v1/completions` reads `prompt` given as token ids (`[1,2,3]`, `[[1,2,3]]`), refuses a batch of prompts and `echo: true` with a named 400 instead of a misleading "prompt is required" or a silent drop.
 
 ---

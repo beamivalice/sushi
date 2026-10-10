@@ -11401,6 +11401,9 @@ fn handleStreamingGeneration(
     // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
+    // The buffer keeps whole text (the tool gate scans it), so a split reads only what the client has
+    // NOT received: a thought the model opens after visible text is its own bytes, not that text again.
+    var text_delivered: usize = 0;
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
     // think block is open and unclosed (47.99 us/token at 113 KB).
@@ -11549,6 +11552,7 @@ fn handleStreamingGeneration(
             // text_buf already updated above
 
             const buf = text_buf.items;
+            const undelivered = buf[text_delivered..];
             const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
@@ -11597,7 +11601,7 @@ fn handleStreamingGeneration(
                     },
                     .split_think => {
                         // Complete thinking block — split into reasoning + content
-                        const split = chat_mod.splitThinkBlock(buf, true, opens_think);
+                        const split = chat_mod.splitThinkBlock(undelivered, true, opens_think);
                         // The thought's tokens never reach the client, so their
                         // entries must not ride the content chunk below — the
                         // reasoning emitters above deliberately do not drain.
@@ -11605,10 +11609,11 @@ fn handleStreamingGeneration(
                         // after it: everything buffered so far was reasoning,
                         // and leaving it pending hands it to the NEXT chunk
                         // (measured: 42 entries on a 1-char delta).
-                        if (split.content.len > 0) lps.skipToContent(buf, split.content, stop_gate.carry_len) else lps.dropPending();
+                        if (split.content.len > 0) lps.skipToContent(undelivered, split.content, stop_gate.carry_len) else lps.dropPending();
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
+                        text_delivered = 0;
                         think_scan.reset();
                         think_closed = true;
                         // Past the cap the tail is exactly what the budget
@@ -11649,6 +11654,7 @@ fn handleStreamingGeneration(
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
                         token_texts.clearRetainingCapacity();
+                        text_delivered = text_buf.items.len;
                     },
                 }
             }
@@ -16594,22 +16600,27 @@ fn handleAnthropicNonStreaming(
     else
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
+    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens);
+    defer allocator.free(usage);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{s}{s}}}
     , .{
         nextCompletionId(&completion_id_counter, nowMs(stream.io)),
         content.items,
         model_name,
         stop_reason,
         stop_seq_json,
-        prompt_token_count,
-        result.completion_tokens,
-        result.cached_tokens,
+        usage,
         timings_field,
     });
     defer allocator.free(response);
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+/// Anthropic counts cache reads apart from `input_tokens`: a client adds the two to size its context.
+fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, output_tokens: u32, cached_tokens: u32) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_input_tokens\":{d}}}", .{ prompt_tokens -| cached_tokens, output_tokens, cached_tokens });
 }
 
 fn handleAnthropicStreaming(
@@ -16768,9 +16779,13 @@ fn handleAnthropicStreaming(
     var skipped_think_open = false;
     var think_tokens: i32 = 0;
     var budget_exhausted = false;
+    var reasoning_streamed: usize = 0; // bytes of the held thought already sent (tools path)
 
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
+    // The buffer keeps whole text (the tool gate scans it), so a split reads only what the client has
+    // NOT received: a thought the model opens after visible text is its own bytes, not that text again.
+    var text_delivered: usize = 0;
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
     // think block is open and unclosed (47.99 us/token at 113 KB).
@@ -16858,6 +16873,7 @@ fn handleAnthropicStreaming(
             // think gate was unified for).
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
+            const undelivered = buf[text_delivered..];
             const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
@@ -16869,25 +16885,34 @@ fn handleAnthropicStreaming(
                 // recorded model family by the corpus streaming-gate test.
                 switch (chat_mod.streamThinkGateScan(buf, enable_thinking, think_closed, prompt_opened_think, &think_scan)) {
                     .hold_thinking => {
-                        // Incomplete thinking — keep buffering until closed
+                        // Safe to stream: the tool gate just returned false, so these bytes
+                        // are reasoning. Each iteration is one token, so the budget counts them.
+                        if (!budget_exhausted) if (heldThoughtSoFar(buf, opens_think, think_closed)) |settled| {
+                            if (chat_mod.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
+                                try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, fresh);
+                                reasoning_streamed = settled.len;
+                                think_tokens += 1;
+                                if (reasoning_budget >= 0 and think_tokens >= reasoning_budget) {
+                                    budget_exhausted = true;
+                                    log.info("  reasoning budget exhausted ({d}/{d} tokens, streamed)\n", .{ think_tokens, reasoning_budget });
+                                }
+                            }
+                        };
                     },
                     .split_think => {
                         // Complete think block — split once: thinking block
                         // first, then the visible remainder as text. Reasoning
                         // ships regardless of the request's thinking flag.
-                        const split = chat_mod.splitThinkBlock(buf, true, opens_think);
-                        if (split.reasoning_content) |rc| {
+                        const split = chat_mod.splitThinkBlock(undelivered, true, opens_think);
+                        if (!budget_exhausted) if (split.reasoning_content) |rc| {
                             const capped = try reasoningWithinBudget(allocator, tok, rc, reasoning_budget);
                             defer if (capped.owned) allocator.free(capped.text);
-                            const sd = try std.fmt.allocPrint(allocator,
-                                \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                            , .{block_index});
-                            defer allocator.free(sd);
-                            try sendAnthropicEvent(stream, "content_block_start", sd);
-                            try emitAnthropicThinkingDelta(allocator, stream, block_index, capped.text);
-                            try closeAnthropicThinkingBlock(allocator, stream, block_index);
-                            block_index += 1;
-                        }
+                            if (chat_mod.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
+                                try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, rest);
+                            }
+                        };
+                        if (thinking_block_open) try closeAnthropicBlock(allocator, stream, &block_index, &text_block_open, &thinking_block_open);
+                        reasoning_streamed = 0;
                         if (split.content.len > 0) {
                             if (!text_block_open) {
                                 const sd = try std.fmt.allocPrint(allocator,
@@ -16903,6 +16928,7 @@ fn handleAnthropicStreaming(
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
+                        text_delivered = 0;
                         think_scan.reset();
                         think_closed = true;
                     },
@@ -16927,6 +16953,7 @@ fn handleAnthropicStreaming(
                             try emitAnthropicTextDelta(allocator, stream, block_index, vis);
                         }
                         token_texts.clearRetainingCapacity();
+                        text_delivered = text_buf.items.len;
                     },
                 }
             }
@@ -17206,10 +17233,6 @@ fn handleAnthropicStreaming(
     if (!client_gone and !budget_exhausted and think_tail.len > 0) {
         try emitAnthropicThinkingOpening(allocator, stream, block_index, &thinking_block_open, think_tail);
     }
-    if (!client_gone and thinking_block_open) {
-        try closeAnthropicThinkingBlock(allocator, stream, block_index);
-        block_index += 1;
-    }
 
     // Post-generation: snapshot stats from whichever source was active.
     ts.finalize();
@@ -17240,39 +17263,20 @@ fn handleAnthropicStreaming(
                 allocator.free(tool_calls);
             }
 
-            // Close any open text block FIRST, at its own index. The old
-            // order emitted the thinking block's start while the text block
-            // still held this index, then stopped the text block at a
-            // never-started index — Claude Code aborted the turn with
-            // "API Error: Content block not found".
-            if (text_block_open) {
-                const sd = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
-                defer allocator.free(sd);
-                try sendAnthropicEvent(stream, "content_block_stop", sd);
-                block_index += 1;
-                text_block_open = false;
-            }
-
             // Emit thinking from buffered text if present — delivery does not
             // key on the request's thinking flag. Once the in-loop split
             // already emitted it, the remaining buffer has no template-opened
             // semantics — passing `opens_think` unguarded would misfile the
             // visible tail as reasoning.
-            {
-                const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
-                if (think_split.reasoning_content) |reasoning| {
-                    const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
-                    defer if (capped.owned) allocator.free(capped.text);
-                    const sd = try std.fmt.allocPrint(allocator,
-                        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                    , .{block_index});
-                    defer allocator.free(sd);
-                    try sendAnthropicEvent(stream, "content_block_start", sd);
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, capped.text);
-                    try closeAnthropicThinkingBlock(allocator, stream, block_index);
-                    block_index += 1;
+            const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
+            if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
+                const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
+                defer if (capped.owned) allocator.free(capped.text);
+                if (chat_mod.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
+                    try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, rest);
                 }
-            }
+            };
+            try closeAnthropicBlock(allocator, stream, &block_index, &text_block_open, &thinking_block_open);
 
             for (tool_calls, 0..) |tc, i| {
                 const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), i });
@@ -17317,18 +17321,14 @@ fn handleAnthropicStreaming(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
-                if (think_split.reasoning_content) |reasoning| {
+                if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
-                    const sd = try std.fmt.allocPrint(allocator,
-                        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                    , .{block_index});
-                    defer allocator.free(sd);
-                    try sendAnthropicEvent(stream, "content_block_start", sd);
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, capped.text);
-                    try closeAnthropicThinkingBlock(allocator, stream, block_index);
-                    block_index += 1;
-                }
+                    if (chat_mod.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
+                        try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, rest);
+                    }
+                };
+                if (thinking_block_open) try closeAnthropicBlock(allocator, stream, &block_index, &text_block_open, &thinking_block_open);
                 if (think_split.content.len > 0) {
                     content_started = true;
                     if (!text_block_open) {
@@ -17352,15 +17352,10 @@ fn handleAnthropicStreaming(
     defer if (echo_stop_seq) allocator.free(stop_seq_json);
 
     if (!client_gone) {
-        // Close text block if open
-        if (text_block_open) {
-            const sd = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
-            defer allocator.free(sd);
-            try sendAnthropicEvent(stream, "content_block_stop", sd);
-        }
+        try closeAnthropicBlock(allocator, stream, &block_index, &text_block_open, &thinking_block_open);
 
         // Ensure at least one content block
-        if (!text_block_open and block_index == 0) {
+        if (block_index == 0) {
             const sd = try std.fmt.allocPrint(allocator,
                 \\{{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}
             , .{});
@@ -17370,14 +17365,14 @@ fn handleAnthropicStreaming(
             try sendAnthropicEvent(stream, "content_block_stop", sd2);
         }
 
-        // message_delta. Scheduler accounts for any prompt-cache hits in `ts.prompt_tokens`.
-        // cache_read_input_tokens rides here (not message_start) because the
-        // prefix-cache hit count is only known after prefill; clients merge
-        // message_delta usage into the final message per Anthropic semantics.
+        // The prefix-cache hit count is only known after prefill, so message_delta
+        // restates input_tokens; clients take its usage over message_start's.
         {
+            const usage = try formatAnthropicUsage(allocator, prompt_token_count, ts.completion_tokens, ts.cached_tokens);
+            defer allocator.free(usage);
             const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-            , .{ stop_reason, stop_seq_json, ts.completion_tokens, ts.cached_tokens });
+                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{s}}}
+            , .{ stop_reason, stop_seq_json, usage });
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -17441,6 +17436,36 @@ fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: *Conn, inde
     const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{index});
     defer allocator.free(stop);
     try sendAnthropicEvent(stream, "content_block_stop", stop);
+}
+
+/// End the open content block, so the next block starts at its own index.
+fn closeAnthropicBlock(allocator: std.mem.Allocator, stream: *Conn, index: *u32, text_open: *bool, thinking_open: *bool) !void {
+    if (thinking_open.*) {
+        try closeAnthropicThinkingBlock(allocator, stream, index.*);
+    } else if (text_open.*) {
+        const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{index.*});
+        defer allocator.free(stop);
+        try sendAnthropicEvent(stream, "content_block_stop", stop);
+    } else return;
+    text_open.* = false;
+    thinking_open.* = false;
+    index.* += 1;
+}
+
+/// A thought may follow visible text: the text block ends before the thinking block opens.
+fn emitAnthropicThinkingAfterText(allocator: std.mem.Allocator, stream: *Conn, index: *u32, text_open: *bool, thinking_open: *bool, thinking: []const u8) !void {
+    if (text_open.*) try closeAnthropicBlock(allocator, stream, index, text_open, thinking_open);
+    try emitAnthropicThinkingOpening(allocator, stream, index.*, thinking_open, thinking);
+}
+
+/// The settled reasoning of a thought still open on the tools path, or null when it must wait for
+/// its close: only a thought that starts the buffer (prompt-opened, or its opener first) splits to
+/// the same prefix while open as once closed, so its deltas add up to the closed thought.
+fn heldThoughtSoFar(buf: []const u8, opens_think: bool, think_closed: bool) ?[]const u8 {
+    const prompt_opened = opens_think and !think_closed;
+    if (!prompt_opened and chat_mod.thinkOpenTagLenAt(buf) == null) return null;
+    const reasoning = chat_mod.splitThinkBlock(buf, true, prompt_opened).reasoning_content orelse return null;
+    return chat_mod.settledReasoning(reasoning);
 }
 
 // ─── /v1/responses (OpenAI Responses API) ────────────────────────────────
@@ -27038,4 +27063,59 @@ test "seedRequestBuf drops bytes past the allocation" {
     try std.testing.expectEqual(@as(usize, 4), seedRequestBuf(buf, "abcdefgh"));
     try std.testing.expectEqualStrings("abcd", buf);
     try std.testing.expectEqual(@as(usize, 2), seedRequestBuf(buf, "xy"));
+}
+
+const AnthropicEventLog = struct {
+    allocator: std.mem.Allocator,
+    out: std.ArrayList(u8) = .empty,
+
+    fn record(impl: *anyopaque, data: []const u8) anyerror!void {
+        const self: *AnthropicEventLog = @ptrCast(@alignCast(impl));
+        try self.out.appendSlice(self.allocator, data);
+        try self.out.append(self.allocator, '\n');
+    }
+};
+
+test "anthropic stream: a thought after visible text ends the text block and takes the next index" {
+    const a = std.testing.allocator;
+    var events = AnthropicEventLog{ .allocator = a };
+    defer events.out.deinit(a);
+    var bridge: WsBridge = .{ .impl = &events, .sendTextFn = &AnthropicEventLog.record };
+    var conn: Conn = undefined;
+    conn.ws_mode = &bridge;
+
+    var index: u32 = 1;
+    var text_open = true;
+    var thinking_open = false;
+    try emitAnthropicThinkingAfterText(a, &conn, &index, &text_open, &thinking_open, "plan");
+    try emitAnthropicThinkingAfterText(a, &conn, &index, &text_open, &thinking_open, " A");
+    try closeAnthropicBlock(a, &conn, &index, &text_open, &thinking_open);
+    try std.testing.expectEqual(@as(u32, 3), index);
+    try std.testing.expect(!text_open and !thinking_open);
+    try std.testing.expectEqualStrings(
+        \\{"type":"content_block_stop","index":1}
+        \\{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}
+        \\{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"plan"}}
+        \\{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":" A"}}
+        \\{"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"sushi-local"}}
+        \\{"type":"content_block_stop","index":2}
+        \\
+    , events.out.items);
+}
+
+test "anthropic stream: a held thought streams only while its start cannot move" {
+    try std.testing.expectEqualStrings("The user asks", heldThoughtSoFar("The user asks\n</thi", true, false).?);
+    try std.testing.expectEqualStrings("plan", heldThoughtSoFar("<think>plan", false, true).?);
+    try std.testing.expect(heldThoughtSoFar("Done. <think>plan", true, true) == null);
+    try std.testing.expect(heldThoughtSoFar("Done. <th", true, true) == null);
+}
+
+test "formatAnthropicUsage: input_tokens leaves out the cache read a client adds back" {
+    const a = std.testing.allocator;
+    const warm = try formatAnthropicUsage(a, 3017, 1, 2986);
+    defer a.free(warm);
+    try std.testing.expectEqualStrings("{\"input_tokens\":31,\"output_tokens\":1,\"cache_read_input_tokens\":2986}", warm);
+    const cold = try formatAnthropicUsage(a, 3017, 1, 0);
+    defer a.free(cold);
+    try std.testing.expectEqualStrings("{\"input_tokens\":3017,\"output_tokens\":1,\"cache_read_input_tokens\":0}", cold);
 }
