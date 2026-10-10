@@ -3066,7 +3066,7 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
 /// Streams the thought in `raw` one byte at a time the way each chat stream path
 /// does and returns (tools path, no-tools path) deltas joined.
 fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![2][]u8 {
-    const close_at = std.mem.indexOf(u8, raw, "</think>").?;
+    const close_at = chat.indexOfThinkCloseTag(raw, 0).?.pos;
     const through_close = raw[0 .. close_at + "</think>".len];
 
     // Tools path: the open block's split, settled, then the closed split's rest.
@@ -3094,8 +3094,8 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     var shipped = false;
     for (raw[body_from .. close_at + "</think>".len]) |byte| {
         try pending.append(allocator, byte);
-        if (std.mem.indexOf(u8, pending.items, "</think>")) |pos| {
-            try plain.appendSlice(allocator, chat.closedThoughtDelta(pending.items[0..pos], shipped));
+        if (chat.indexOfThinkCloseTag(pending.items, 0)) |close| {
+            try plain.appendSlice(allocator, chat.closedThoughtDelta(pending.items[0..close.pos], shipped));
             break;
         }
         const flush = chat.openThoughtFlush(pending.items, shipped);
@@ -3130,11 +3130,15 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
         "First paragraph.\n\nSecond paragraph.\n\n</think>\n\n<tool_call>",
         "Trailing spaces  \n </think>x",
         "Multi-byte end: \u{00e9}\n</think>",
+        // The thought quotes tags in code spans; only the real close ends it.
+        "The user wants `<think>plan A</think>Done` parsed.\n</think>\n\nOPEN plan A CLOSE",
+        "Say ``</think>`` and `<think>` aloud, then `</think>`.\n\n</think>A",
+        "Code:\n```\nfoo\n```</think>\n\nB",
     };
     for (edges) |raw| try cases.append(allocator, .{ .raw = raw, .opened = true });
     try testing.expect(cases.items.len > edges.len);
     for (cases.items) |c| {
-        const want = chat.splitThinkBlock(c.raw[0 .. std.mem.indexOf(u8, c.raw, "</think>").? + "</think>".len], true, c.opened).reasoning_content orelse "";
+        const want = chat.splitThinkBlock(c.raw[0 .. chat.indexOfThinkCloseTag(c.raw, 0).?.pos + "</think>".len], true, c.opened).reasoning_content orelse "";
         const got = try streamThought(allocator, c.raw, c.opened);
         defer for (got) |g| allocator.free(g);
         errdefer std.debug.print("\nraw: {s}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, want, got[0], got[1] });

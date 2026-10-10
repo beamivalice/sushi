@@ -66,13 +66,17 @@ curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"
 TOOLS='[{"name":"get_weather","description":"Get current weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]'
 
 # Validate an SSE capture: block lifecycle + no think tags in text deltas.
-# Prints "OK <n_text> <n_thinking> <n_tool_use>" or "ERR <reason>".
+# Prints "OK <n_text> <n_thinking> <n_tool_use> <n_thinking_after_text>" or "ERR <reason>".
 validate() {
     python3 - "$1" <<'EOF'
 import json, sys
 
 open_blocks = {}   # index -> type
+block_type = {}    # index -> type, as opened
+block_text = {}    # index -> text delivered in that block
 counts = {"text": 0, "thinking": 0, "tool_use": 0}
+saw_text = False
+thought_after_text = 0
 err = None
 saw_message_stop = False
 
@@ -92,12 +96,19 @@ for line in open(sys.argv[1]):
         if idx in open_blocks:
             err = err or f"start index {idx} while already open as {open_blocks[idx]}"
         open_blocks[idx] = btype
+        block_type[idx] = btype
         counts[btype] = counts.get(btype, 0) + 1
+        if btype == "thinking" and saw_text:
+            thought_after_text += 1
+        if btype == "text":
+            saw_text = True
     elif t == "content_block_delta":
         idx = ev["index"]
         if idx not in open_blocks:
             err = err or f"delta for unopened index {idx}"
         d = ev.get("delta", {})
+        body = d.get("text") or d.get("thinking") or ""
+        block_text[idx] = block_text.get(idx, "") + body
         if d.get("type") == "text_delta":
             txt = d.get("text", "")
             if "</think>" in txt or "<think>" in txt:
@@ -115,10 +126,19 @@ for line in open(sys.argv[1]):
 
 if not saw_message_stop:
     err = err or "no message_stop event"
+# A thought the model opens after visible text carries ITS bytes: the split once ran over the whole
+# buffer, so the answer rode out as reasoning a second time (a quoted tag inside a thought is fine).
+lead = ""
+for idx in sorted(block_type):
+    if block_type[idx] == "text":
+        if not lead:
+            lead = block_text.get(idx, "").strip()
+    elif block_type[idx] == "thinking" and len(lead) >= 2 and block_text.get(idx, "").startswith(lead):
+        err = err or f"thinking block {idx} repeats the text delivered before it: {block_text[idx][:60]!r}"
 if err:
     print(f"ERR {err}")
 else:
-    print(f"OK {counts['text']} {counts['thinking']} {counts['tool_use']}")
+    print(f"OK {counts['text']} {counts['thinking']} {counts['tool_use']} {thought_after_text}")
 EOF
 }
 
@@ -160,6 +180,40 @@ N_TOOL2=$(echo "$V2" | awk '{print $4}')
 check "tool_use block emitted" "$([ "${N_TOOL2:-0}" -ge 1 ] 2>/dev/null && echo 1 || echo 0)"
 grep -q '"stop_reason":"tool_use"' /tmp/msgs_stream_tt_2.sse
 check "stop_reason is tool_use" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+
+echo "3. a thought that starts after visible text, thinking off"
+READ_TOOLS='[{"name":"Read","description":"Read a file","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}]'
+# The model writes `Done`, then a literal think block, then the answer, so the thought opens while
+# the text block is still open. What the model writes is its choice: the protocol is asserted always,
+# and a run that wrote no thought after text is reported, not failed.
+BODY3=$(cat <<EOF
+{"model":"m","max_tokens":200,"stream":true,"temperature":0,
+ "thinking":{"type":"disabled"},
+ "tools":$READ_TOOLS,
+ "messages":[{"role":"user","content":"Reply with the word Done, then a new line containing exactly <think>plan</think> and then a new line with the answer to 2+2. Do not use tools."}]}
+EOF
+)
+run_stream "$BODY3" /tmp/msgs_stream_tt_3.sse
+V3=$(validate /tmp/msgs_stream_tt_3.sse)
+echo "    -> $V3"
+check "protocol-valid block lifecycle, each block owns its index" "$([ "${V3%% *}" = "OK" ] && echo 1 || echo 0)"
+[ "${V3%% *}" != "OK" ] || [ "$(echo "$V3" | awk '{print $5}')" -ge 1 ] || echo "    note: the model wrote no thought after text; this run did not exercise the shape"
+
+echo "4. a thought that quotes its own tags in code spans stays one thought"
+# Qwen writes the tags into its reasoning as it explains them. Inside a code span a tag is text, so
+# the thought ends only at the real close and no thought opens after the answer's text.
+BODY4=$(cat <<EOF
+{"model":"m","max_tokens":1500,"stream":true,"temperature":0,
+ "thinking":{"type":"enabled","budget_tokens":2000},
+ "tools":$TOOLS,
+ "messages":[{"role":"user","content":"A parser reads Qwen output where reasoning sits between <think> and </think>. For the raw string \`<think>plan A</think>Done\`, what are the reasoning and the content? Reason it through, quoting the exact tags as you go. In your final answer never write the tags, call them OPEN and CLOSE. Do not use tools."}]}
+EOF
+)
+run_stream "$BODY4" /tmp/msgs_stream_tt_4.sse
+V4=$(validate /tmp/msgs_stream_tt_4.sse)
+echo "    -> $V4"
+check "protocol-valid block lifecycle" "$([ "${V4%% *}" = "OK" ] && echo 1 || echo 0)"
+check "one thought, never reopened after text" "$([ "$(echo "$V4" | awk '{print $3 " " $5}')" = "1 0" ] && echo 1 || echo 0)"
 
 echo ""
 echo "===== $PASS passed, $FAIL failed ====="

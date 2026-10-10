@@ -129,6 +129,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   open its OWN block (`modelThinkOpener`).
 - **Streaming + tools + thinking**: buffer until pattern resolution; reasoning streams INCREMENTALLY on the tools
   path (`.hold_thinking` + `unstreamedReasoning`, never a resend); the think gate scans with a CURSOR (`ThinkScan`).
+  `/v1/messages` streams a held thought only while its start cannot move (`heldThoughtSoFar`: prompt-opened or opener
+  first); a thought reopened after visible text arrives whole at its close.
+- **The tools-path buffer keeps whole text; a split reads only the undelivered tail** (`text_delivered`, both
+  stream paths): the tool gate needs the turn from its start, so the buffer is never cleared on a text flush. A
+  thought the model opens after visible text then split over the WHOLE buffer and shipped that text again as
+  reasoning (the block read `Done\n<think>plan` after `Done` had streamed). The end-of-stream path already had this
+  shape, since it rebuilds from the pending tokens only.
 - Thinking-off is enforced in the PROMPT; generated reasoning is ALWAYS delivered (every site splits via
   `splitThinkBlock(text, true, …)`).
 - **A thought is decided at its first byte when no opener can start it** (`chat.thinkOpenerPossible`: every opener
@@ -137,6 +144,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
   a close tag still arriving wait (`chat.settledReasoning` on the tools path, `chat.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
+- **A think tag inside an inline code span is text** (`openCodeSpanStart`, read by `indexOfThinkCloseTag` and
+  `indexOfThinkOpenTag`, the ONE scan every surface and `normalizeEmbeddedThinkBlocks` use): a model explaining
+  its format writes `` `<think>x</think>` `` into a thought or an answer. The verdict reads only the bytes BEFORE the
+  tag, so a stream never revises it; `openThoughtFlush` therefore keeps an open span in the buffer. A span ends with
+  its line and three backticks are a fence. Tags quoted any other way (plain or double quotes) are still structure.
 - **A thought the length limit cuts ends on what its split delivers** (`chat.cutThoughtDelta`): a lone opener is
   structure, and a thinking block or reasoning item opens at its first delta, so an empty thought streams none.
 
