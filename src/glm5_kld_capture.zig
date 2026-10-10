@@ -11,6 +11,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Arr = mlx.mlx_array;
 pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (!cfg.isGlm5() or opts.command != .capture) return false;
+    // GLM's recurrent state is KDA and always f32; the Qwen GDN arm's flag has
+    // nothing to switch here, so name it rather than take it and do nothing.
+    if (opts.qwen_gdn_fp32) return error.GlmTeacherHasNoQwenGdnState;
     // The FP8 release is a block quantization of the BF16 one, never a teacher.
     if (cfg.expert_layout == .fp8_individual) return error.NativeGlmTeacherRequiresLosslessStreaming;
     // A pack captures its own served path (a student reference, not the teacher) at a BF16 latent.
@@ -39,6 +42,14 @@ test "GLM native KLD capture takes the lossless teacher before the generic loade
     const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .bf16_individual };
     const opts = kld.Options{ .command = .capture, .no_template = true, .tokens = 512, .ssd_budget_bytes = 100 << 30 };
     if (!(try accepts(&cfg, opts))) return error.MissingNativeGlmCapture;
+}
+
+test "GLM native KLD capture refuses --qwen-gdn: its KDA state is f32 already" {
+    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .bf16_individual };
+    var opts = kld.Options{ .command = .capture, .no_template = true, .tokens = 512, .ssd_budget_bytes = 100 << 30, .qwen_gdn_fp32 = true };
+    try std.testing.expectError(error.GlmTeacherHasNoQwenGdnState, accepts(&cfg, opts));
+    opts.qwen_gdn_fp32 = false;
+    try std.testing.expect(try accepts(&cfg, opts));
 }
 
 const HeaderAudit = struct { trunk_bytes: u64 = 0, trunk_bf16: usize = 0, trunk_f32: usize = 0, expert_bf16: usize = 0, shard_stat_sha256: [64]u8 = @splat(0) };

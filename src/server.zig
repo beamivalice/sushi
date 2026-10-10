@@ -2226,6 +2226,7 @@ pub fn serve(
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
     if (mtpHeadKvLine(config, transformer_mod.Transformer.mtp_head_kv_quant_flag)) |line| log.info("{s}\n", .{line});
+    if (qwenGdnLine(config, model_mod.qwen_gdn_fp32)) |line| log.info("{s}\n", .{line});
     if (generate_mod.max_mtp_ctx != 0) {
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
@@ -6385,6 +6386,15 @@ pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const 
     if (!flag) return null;
     if (config.isMimo()) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
     return "MTP head KV: following --kv-quant (--mtp-head-kv-quant)";
+}
+
+/// What `--qwen-gdn fp32` does on this arch, for the boot log; null when unset.
+/// GLM and MiMo have no GatedDeltaNet arm, so the flag is refused there.
+pub fn qwenGdnLine(config: *const model_mod.ModelConfig, fp32: bool) ?[]const u8 {
+    if (!fp32) return null;
+    if (config.isGlm5()) return "GDN state: --qwen-gdn fp32 does not apply to GLM (its KDA state is f32 already)";
+    if (config.isMimo()) return "GDN state: --qwen-gdn fp32 does not apply to mimo_v2 (no GatedDeltaNet layers)";
+    return "GDN state: f32 between tokens (--qwen-gdn fp32; bf16 is the default)";
 }
 
 /// Per-token bytes of the qwen4 MTP head's own KV at the scheme it was LOADED with,
@@ -24616,6 +24626,19 @@ test "mtpHeadKvLine: --mtp-head-kv-quant is reported per arch" {
     try t.expectEqualStrings("MTP head KV: following --kv-quant (--mtp-head-kv-quant)", mtpHeadKvLine(&qwen4, true).?);
     // MiMo's heads keep their own dense window (`mimo_mtp.RowCache`); the flag never reaches them.
     try t.expectEqualStrings("MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)", mtpHeadKvLine(&mimo, true).?);
+}
+
+test "qwenGdnLine: --qwen-gdn fp32 is reported per arch, and refused where there is no GDN arm" {
+    const t = std.testing;
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
+    try t.expect(qwenGdnLine(&qwen4, false) == null);
+    try t.expect(qwenGdnLine(&glm, false) == null);
+    try t.expectEqualStrings("GDN state: f32 between tokens (--qwen-gdn fp32; bf16 is the default)", qwenGdnLine(&qwen4, true).?);
+    // GLM's recurrent state is KDA, not GDN: the flag names a layer it does not have.
+    try t.expectEqualStrings("GDN state: --qwen-gdn fp32 does not apply to GLM (its KDA state is f32 already)", qwenGdnLine(&glm, true).?);
+    try t.expectEqualStrings("GDN state: --qwen-gdn fp32 does not apply to mimo_v2 (no GatedDeltaNet layers)", qwenGdnLine(&mimo, true).?);
 }
 
 test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_quant override" {

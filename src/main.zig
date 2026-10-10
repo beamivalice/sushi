@@ -250,6 +250,13 @@ fn printUsage(io: std.Io) void {
         \\                        more than 16384 tokens only build head history
         \\                        for the last <n> (default: 0 = full history;
         \\                        windowing costs acceptance on stock Qwen heads).
+        \\  --qwen-gdn <fp32|bf16>
+        \\                      Qwen only: store its GatedDeltaNet recurrent
+        \\                      state in fp32 between tokens (default bf16). A
+        \\                      KLD teacher rounds its state to bf16 like every
+        \\                      student, so its KLD cannot price that rounding;
+        \\                      capture the teacher under fp32 to measure it.
+        \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8 or 4 — affine group quant; default 8 on
         \\                          every model (GLM refuses 4). 16 (or `off`)
@@ -968,6 +975,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
             idle_evict_secs = if (n > 0) n else null;
+        } else if (std.mem.eql(u8, args[i], "--qwen-gdn") and i + 1 < args.len) {
+            i += 1;
+            model_mod.qwen_gdn_fp32 = model_mod.parseQwenGdn(args[i]) orelse {
+                log.err("--qwen-gdn: expected fp32 or bf16; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             kv_quant_explicit = true;
