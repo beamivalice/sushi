@@ -294,7 +294,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - opencode 2.x talks to a background service that never sees `OPENCODE_CONFIG_CONTENT` and refuses `--model` on its
   default command: the launcher passes `--standalone` (after a subcommand, flags bind to it), carries the model as
   `model`, and marks a row with efforts `reasoning` + `interleaved: reasoning_content` + one `variants` entry per graded
-  word (GLM: low/high/max; on/off make none, and a default effort option would send words GLM refuses).
+  word (GLM: low/high/max; on/off make none).
+- OpenCode `--think WORD` validates the selected model's advertised efforts and sets only its `options.reasoningEffort`; omission preserves existing defaults.
+- OpenCode `--persist` backs up and merges the global JSON/JSONC config under `XDG_CONFIG_HOME` or `~/.config`, preserves unrelated settings, and normalizes comments into the backup; invalid or ambiguous files are refused.
 - opencode sends no `max_tokens`, and GLM reserves a request's whole window without one (1M rows): serve GLM with
   `--max-tokens N` for opencode (live: a 12k-token agent prompt hit `GlmReserveMemoryLimit` with 16 GB free). grok
   sends its configured `max_completion_tokens`.
