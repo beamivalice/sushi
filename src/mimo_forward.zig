@@ -890,7 +890,9 @@ pub fn mimoDecodePrep(
         prep.k.deinit();
         prep.v.deinit();
     }
-    const view = try ctx.cache.appendQuantized(layer, prep.k, prep.v, self.s, max_kv);
+    // MiMo-only: the gate above guarantees scheme == .affine, so the
+    // tbq dequant arms inside never read these dtypes.
+    const view = try ctx.cache.appendQuantized(layer, prep.k, prep.v, self.s, max_kv, .bfloat16, .bfloat16);
     _ = mlx.mlx_array_free(q_out.*);
     q_out.* = prep.q;
     return view;

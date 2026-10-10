@@ -7168,14 +7168,15 @@ pub const KVCache = struct {
         //    K-derived packed width writes a 16-u32 chunk into a 24-u32 window
         //    (an mlx slice_update mismatch we cannot catch). Identical on every
         //    symmetric arch — the same generalization `updateDense` carries.
-        return self.appendQuantized(layer, new_kq, new_vq, s, max_seq);
+        return self.appendQuantized(layer, new_kq, new_vq, s, max_seq, mlx.mlx_array_dtype(new_k), mlx.mlx_array_dtype(new_v));
     }
 
     /// `update` for rows the caller already quantized with this cache's scheme.
-    pub fn appendQuantized(self: *KVCache, layer: u32, new_kq: kv_quant.QuantizedKV, new_vq: kv_quant.QuantizedKV, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+    pub fn appendQuantized(self: *KVCache, layer: u32, new_kq: kv_quant.QuantizedKV, new_vq: kv_quant.QuantizedKV, s: mlx.mlx_stream, max_seq: u32, dense_k_dtype: mlx.mlx_dtype, dense_v_dtype: mlx.mlx_dtype) !DenseKVView {
+        const cfg = self.config;
         const entry = &self.entries[layer];
-        const group_size: u32 = self.config.group_size;
-        const bits: u8 = self.config.bits;
+        const group_size: u32 = cfg.group_size;
+        const bits: u8 = cfg.bits;
         const compacted = try self.writeAffineChunk(layer, new_kq, new_vq, s, max_seq);
         var trip = [6]mlx.mlx_array{ entry.key_view, entry.key_scales_view, entry.key_biases_view, entry.value_view, entry.value_scales_view, entry.value_biases_view };
         if (compacted) trip = try handOffRingViews(entry, s, 6);
@@ -7190,9 +7191,9 @@ pub const KVCache = struct {
         //    actually reads `.k`/`.v`. (Engagement bug class: the decode
         //    forward calls update(), not denseView() — omitting the triples
         //    here made `kv_attn_mode: "fused"` a silent no-op.)
-        const dense_k = if (cfg.scheme == .tbq) try kv_quant.dequantizeTBQ(s, trip[0], trip[1], bits, mlx.mlx_array_dtype(new_k)) else try kv_quant.dequantizeAffine(s, trip[0], trip[1], trip[2], group_size, bits);
+        const dense_k = if (cfg.scheme == .tbq) try kv_quant.dequantizeTBQ(s, trip[0], trip[1], bits, dense_k_dtype) else try kv_quant.dequantizeAffine(s, trip[0], trip[1], trip[2], group_size, bits);
         errdefer _ = mlx.mlx_array_free(dense_k);
-        const dense_v = if (cfg.scheme == .tbq) try kv_quant.dequantizeTBQ(s, trip[3], trip[4], bits, mlx.mlx_array_dtype(new_v)) else try kv_quant.dequantizeAffine(s, trip[3], trip[4], trip[5], group_size, bits);
+        const dense_v = if (cfg.scheme == .tbq) try kv_quant.dequantizeTBQ(s, trip[3], trip[4], bits, dense_v_dtype) else try kv_quant.dequantizeAffine(s, trip[3], trip[4], trip[5], group_size, bits);
         return .{
             .k = dense_k,
             .v = dense_v,
