@@ -62,6 +62,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 
 ## Streaming
 
+- Chat usage reports `completion_tokens_details.reasoning_tokens` by tokenizing concatenated delivered reasoning; streaming includes it only with `stream_options.include_usage`.
+
 - **A stream and a non-stream answer are the SAME BYTES**; leading whitespace is the one thing a stream may withhold
   (`streamContentLead`). A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
   carries the pre-markup text (`visibleToolPreamble`); a non-stream disconnect reports `client_disconnect`, never
