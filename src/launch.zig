@@ -1,8 +1,8 @@
 //! `sushi launch <agent>` — configure and launch a third-party coding
 //! agent against the local server, ollama-style (issue #188).
 //!
-//! Configs go to dedicated dirs (`~/.sushi/<agent>/`, NEVER a user's real
-//! agent config); the tests here and `tests/test_launch_cmd.sh` pin them.
+//! Configs normally use dedicated dirs or inline settings. OpenCode --persist
+//! explicitly merges into the user config after backing up the original.
 //!
 //! Flow: probe the server; if it's down, print how to start one. Then read
 //! `/v1/models`, derive each model's budget from its ADVERTISED context
@@ -263,6 +263,21 @@ fn writeOmpThinking(allocator: std.mem.Allocator, out: *std.ArrayList(u8), accep
 /// listing efforts is a reasoning model: its graded words become the `variants` opencode sends
 /// as `reasoning_effort`, and its `reasoning_content` is carried back.
 pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, entries: []const Entry) ![]u8 {
+    return opencodeJsonWithEffort(allocator, base_url, model, entries, null);
+}
+
+/// An explicit launch preference applies only to the selected model.
+/// With no preference, retain the server/client default behavior.
+pub fn opencodeJsonWithEffort(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, entries: []const Entry, requested_effort: ?[]const u8) ![]u8 {
+    if (requested_effort) |effort| {
+        var supported = false;
+        for (entries) |e| {
+            if (!std.mem.eql(u8, e.id, model)) continue;
+            if (e.efforts) |words| supported = listed(words, effort);
+            break;
+        }
+        if (!supported) return error.UnsupportedReasoningEffort;
+    }
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.print(allocator, "{{\"$schema\": \"https://opencode.ai/config.json\", \"model\": \"sushi/{f}\", ", .{esc(model)});
@@ -280,6 +295,11 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, model: [
             compactionReserve(e.budget.context),
         });
         if (e.efforts) |words| try writeOpencodeReasoning(allocator, &out, words);
+        if (std.mem.eql(u8, e.id, model)) {
+            if (requested_effort) |effort| {
+                try out.print(allocator, ", \"options\": {{\"reasoningEffort\": \"{f}\"}}", .{esc(effort)});
+            }
+        }
         try out.append(allocator, '}');
     }
     try out.appendSlice(allocator, "}}}}");
@@ -297,17 +317,23 @@ fn writeOpencodeReasoning(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
     if (n > 0) try out.append(allocator, '}');
 }
 
-/// An opencode launch needs `--standalone`: 2.x otherwise talks to a background service that
-/// never sees OPENCODE_CONFIG_CONTENT. Flags bind to the subcommand, so it goes after one.
+/// OpenCode 2 needs --standalone to receive this process's inline config.
+/// OpenCode 1 has no such flag. Probe CLI support instead of assuming a version.
 fn appendOpencodeInvocation(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: []const []const u8) !void {
-    try out.appendSlice(allocator, "opencode");
+    try out.appendSlice(allocator,
+        \\sushi_opencode_flags=()
+        \\if opencode --help 2>&1 | grep -q -- '--standalone'; then
+        \\  sushi_opencode_flags=(--standalone)
+        \\fi
+        \\opencode
+    );
     if (extras.len > 0 and extras[0].len > 0 and extras[0][0] != '-') {
         try out.append(allocator, ' ');
         try appendQuoted(out, allocator, extras[0]);
-        try out.appendSlice(allocator, " --standalone");
+        try out.appendSlice(allocator, " \"${sushi_opencode_flags[@]}\"");
         return appendExtras(out, allocator, extras[1..]);
     }
-    try out.appendSlice(allocator, " --standalone");
+    try out.appendSlice(allocator, " \"${sushi_opencode_flags[@]}\"");
     try appendExtras(out, allocator, extras);
 }
 
@@ -845,6 +871,8 @@ const LaunchArgs = struct {
     url: ?[]const u8 = null,
     port: u16 = 12345,
     print_only: bool = false,
+    think: ?[]const u8 = null,
+    persist: bool = false,
     extras: []const []const u8 = &.{},
 };
 
@@ -870,6 +898,12 @@ fn parseLaunchArgs(args: []const []const u8) !LaunchArgs {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.port = std.fmt.parseInt(u16, args[i], 10) catch return error.Usage;
+        } else if (std.mem.eql(u8, arg, "--think")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.think = args[i];
+        } else if (std.mem.eql(u8, arg, "--persist")) {
+            out.persist = true;
         } else if (std.mem.eql(u8, arg, "--print")) {
             out.print_only = true;
         } else if (std.mem.eql(u8, arg, "--no-start")) {
@@ -880,6 +914,7 @@ fn parseLaunchArgs(args: []const []const u8) !LaunchArgs {
             return error.Usage;
         }
     }
+    if ((out.think != null or out.persist) and out.kind != .opencode) return error.Usage;
     return out;
 }
 
@@ -893,6 +928,9 @@ fn printLaunchUsage() void {
         \\  --model <id>   Serve this model (default: the server's default model)
         \\  --url <base>   Server base URL (default: http://127.0.0.1:<port>)
         \\  --port <n>     Server port for the default URL (default: 12345)
+        \\  --think <word> OpenCode only: explicitly request a server-advertised
+        \\                 reasoning effort (including off when supported)
+        \\  --persist      OpenCode only: back up and merge into the user config
         \\  --print        Write the config files and print the launch script
         \\                 instead of running the agent
         \\
@@ -970,10 +1008,35 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
 
     const oc_config: ?[]u8 = if (parsed.kind == .opencode)
-        try opencodeJson(allocator, base_url, chosen.id, models.entries)
+        opencodeJsonWithEffort(allocator, base_url, chosen.id, models.entries, parsed.think) catch |err| {
+            if (err != error.UnsupportedReasoningEffort) return err;
+            log.err("reasoning effort '{s}' is not supported by {s}; accepted:", .{ parsed.think orelse "", chosen.id });
+            if (chosen.efforts) |words| {
+                for (words) |word| log.err(" {s}", .{word});
+            }
+            log.err("\n", .{});
+            std.process.exit(1);
+        }
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
+
+    if (parsed.persist) {
+        const config_root = if (std.c.getenv("XDG_CONFIG_HOME")) |v| std.mem.span(v) else null;
+        if (config_root) |root| {
+            if (!std.fs.path.isAbsolute(root)) return error.InvalidConfigDirectory;
+        }
+        const dir_path = if (config_root) |root|
+            try std.fmt.allocPrint(allocator, "{s}/opencode", .{root})
+        else
+            try std.fmt.allocPrint(allocator, "{s}/.config/opencode", .{homeDir()});
+        defer allocator.free(dir_path);
+        @import("opencode_persist.zig").save(allocator, io, dir_path, oc_config.?, models.entries) catch |err| {
+            log.err("could not persist OpenCode config: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        log.info("saved OpenCode settings in {s} (original backed up when changed)\n", .{dir_path});
+    }
 
     const script = try scriptFor(allocator, parsed.kind, base_url, chosen.id, chosen.budget, oc_config, parsed.extras);
     defer allocator.free(script);
@@ -1371,20 +1434,20 @@ test "opencode config: a row without efforts is not declared a reasoning model, 
     parsed.deinit();
 }
 
-test "opencode script: --standalone follows the subcommand, the model rides the config" {
+test "opencode script: optional --standalone follows the subcommand, the model rides the config" {
     // opencode 2.x connects to a background service that never sees this env, refuses --model on its
     // default command, and refuses a flag placed before a subcommand.
     const b = budgetForContext(1048576);
     const tui = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{});
     defer t.allocator.free(tui);
-    try t.expect(std.mem.indexOf(u8, tui, "\nopencode --standalone\n") != null);
+    try t.expect(std.mem.indexOf(u8, tui, "\nopencode \"${sushi_opencode_flags[@]}\"\n") != null);
     try t.expect(std.mem.indexOf(u8, tui, "--model") == null);
     const run = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{ "run", "read it's" });
     defer t.allocator.free(run);
-    try t.expect(std.mem.indexOf(u8, run, "\nopencode 'run' --standalone 'read it'\\''s'\n") != null);
+    try t.expect(std.mem.indexOf(u8, run, "\nopencode 'run' \"${sushi_opencode_flags[@]}\" 'read it'\\''s'\n") != null);
     const flag = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{"--continue"});
     defer t.allocator.free(flag);
-    try t.expect(std.mem.indexOf(u8, flag, "\nopencode --standalone '--continue'\n") != null);
+    try t.expect(std.mem.indexOf(u8, flag, "\nopencode \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
 }
 
 test "grok names" {
@@ -1528,4 +1591,39 @@ test "config writers escape ids and urls so hostile ones stay data" {
     defer t.allocator.free(hermes);
     try t.expect(std.mem.indexOf(u8, hermes, "  default: \"a\\\"b\\\\c'd\"\n") != null);
     try t.expect(std.mem.indexOf(u8, hermes, "      \"a\\\"b\\\\c'd\":\n") != null);
+}
+
+test "opencode --think applies only to selected model and uses SDK spelling" {
+    const entries = [_]Entry{
+        .{ .id = "qwen", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &qwen4_efforts },
+        .{ .id = "glm", .budget = FALLBACK_BUDGET, .vision = false, .loaded = false, .efforts = &glm5_efforts },
+    };
+    for ([_][]const u8{ "off", "low", "medium", "xhigh" }) |effort| {
+        const text = try opencodeJsonWithEffort(t.allocator, "http://localhost:12345", "qwen", &entries, effort);
+        defer t.allocator.free(text);
+        const json = try std.json.parseFromSlice(std.json.Value, t.allocator, text, .{});
+        defer json.deinit();
+        const models = json.value.object.get("provider").?.object.get("sushi").?.object.get("models").?.object;
+        const options = models.get("qwen").?.object.get("options").?.object;
+        try t.expectEqualStrings(effort, options.get("reasoningEffort").?.string);
+        try t.expect(options.get("reasoning_effort") == null);
+        try t.expect(models.get("glm").?.object.get("options") == null);
+    }
+    try t.expectError(error.UnsupportedReasoningEffort, opencodeJsonWithEffort(t.allocator, "http://localhost:12345", "qwen", &entries, "high"));
+}
+
+test "opencode --think rejects unadvertised or absent reasoning support" {
+    const plain = [_]Entry{.{ .id = "plain", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    try t.expectError(error.UnsupportedReasoningEffort, opencodeJsonWithEffort(t.allocator, "http://localhost:12345", "plain", &plain, "xhigh"));
+    const parsed = try parseLaunchArgs(&.{ "opencode", "--think", "xhigh", "--", "run", "hello" });
+    try t.expectEqualStrings("xhigh", parsed.think.?);
+    try t.expectEqualStrings("run", parsed.extras[0]);
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "opencode", "--think" }));
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "pi", "--think", "xhigh" }));
+}
+
+test "opencode persist flag is explicit and agent scoped" {
+    try t.expect((try parseLaunchArgs(&.{ "opencode", "--persist", "--think", "xhigh" })).persist);
+    try t.expect(!(try parseLaunchArgs(&.{"opencode"})).persist);
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "pi", "--persist" }));
 }

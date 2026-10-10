@@ -7,6 +7,7 @@ const generate_mod = @import("generate.zig");
 const mtp_mod = @import("mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
+const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
 const rp_mod = @import("reasoning_protocol.zig");
@@ -14,8 +15,10 @@ const token_mask = @import("token_mask.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const fp8_block = @import("fp8_block.zig");
 const model_mod = @import("model.zig");
+const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
-const vision_common = @import("vision_common.zig");
+const muse_vision = @import("muse_vision.zig");
+const lfm2_vision = @import("lfm2_vision.zig");
 const mimo_vision = @import("mimo_vision.zig");
 const glm5_vision = @import("glm5_vision.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
@@ -36,6 +39,7 @@ const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
+const ane_mod = @import("ane.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const update_mod = @import("update.zig");
 
@@ -631,6 +635,14 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// penalty; `--mtp` (`default_force_mtp`) overrides that for operators who
 /// measured otherwise — the 35B-A3B sidecar holds ~73% per-draft.
 ///
+/// `dsv4_stages`: DeepSeek-V4 DSpark — the checkpoint's OWN draft stages,
+/// designed for exactly this MoE trunk. `dsv4_stages` is true only when the
+/// stages were LOADED (opt-in `--dspark` + memory fit-gate, so `n_mtp > 0`);
+/// then requests default ON outright (the qwen MoE-verify caution is about
+/// a bolted-on sidecar, not a native design). Like qwen MTP it is never
+/// subject to the n-gram prompt gate; explicit `enable_mtp:false` opts out
+/// per request.
+///
 /// `native_measured`: same exemption, for an arch whose head ships inside the
 /// checkpoint AND has been measured no-worse-than-serial across the context
 /// ladder (`Transformer.nativeMoeMtpHeadMeasured`, which carries the bar). It
@@ -678,27 +690,39 @@ pub fn mtpChoiceFor(config: *const model_mod.ModelConfig) model_settings.MtpChoi
 ///
 /// `served`: `model.served_model_types` default ON with a head loaded (owner policy: MTP is always
 /// on for the served packs). The expert-streaming path keeps the `force` rule.
-pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, native_measured: bool, served: bool) bool {
+pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool, served: bool) bool {
+    if (dsv4_stages) return true;
     if (!mtp_loaded) return false;
     return !is_moe or force or native_measured or served;
 }
 
-fn defaultEnableMtpForStreaming(mtp_loaded: bool, is_moe: bool, force: bool, native_measured: bool, served: bool, expert_streaming: bool) bool {
+fn defaultEnableMtpForStreaming(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool, served: bool, expert_streaming: bool) bool {
     if (expert_streaming) return mtp_loaded and force;
-    return defaultEnableMtp(mtp_loaded, is_moe, force, native_measured, served);
+    return defaultEnableMtp(mtp_loaded, is_moe, force, dsv4_stages, native_measured, served);
 }
 
 /// Does this model's MTP head carry the measured native-MoE exemption above?
-/// A NAMED per-arch capability read once here, so the call sites can never disagree.
+/// Mirrors `dsv4DraftStages` — a NAMED per-arch capability read once here, so
+/// the four call sites can never disagree (the list-of-one class).
 fn nativeMeasuredMoeHead(lm: *LoadedModel) bool {
     const x = lm.transformer orelse return false;
     return x.nativeMoeMtpHeadMeasured();
 }
 
-/// Can this model run an MTP-flagged request speculatively? Every per-surface
-/// `enable_mtp` conjunct must use THIS, not a bare `lm.mtp != null`.
+/// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
+fn dsv4DraftStages(lm: *LoadedModel) bool {
+    const x = lm.transformer orelse return false;
+    const d = x.dsv4 orelse return false;
+    return d.n_mtp > 0;
+}
+
+/// Can this model run an MTP-flagged request speculatively? Either a qwen
+/// sidecar/in-checkpoint head (lm.mtp) or dsv4's native DSpark stages. Every
+/// per-surface `enable_mtp` conjunct must use THIS, not `lm.mtp != null` —
+/// the bare conjunct silently killed the flag for dsv4 at submit while the
+/// default/dispatch layers were correct (the per-surface wiring class).
 fn mtpCapable(lm: *LoadedModel) bool {
-    return lm.mtp != null;
+    return lm.mtp != null or dsv4DraftStages(lm);
 }
 
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
@@ -922,10 +946,6 @@ fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const u8,
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
 }
 
-/// `--edit on|off`: whether a new chat on the page starts with its write tools on. Each chat's
-/// Edit chip then switches them for itself.
-pub var g_web_edit: bool = false;
-
 /// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
 fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, body: []const u8) !void {
     const origin = findHeaderValueCI(headers, "origin") orelse "";
@@ -956,22 +976,18 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const 
         if (browse.bool) return sendWebToolFolders(allocator, stream, root);
     }
     const vision = if (parsed.value.object.get("vision")) |v| v == .bool and v.bool else false;
-    if (parsed.value.object.get("write")) |w| {
-        if (w != .bool) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Write must be a boolean", 400);
-    }
-    const writable = if (parsed.value.object.get("write")) |w| w.bool else false;
     const name = parsed.value.object.get("name");
     if (name == null) {
-        const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision, writable), .{});
+        const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision), .{});
         defer defs.deinit();
-        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root, .edit_default = g_web_edit }, .{});
+        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root }, .{});
         defer allocator.free(json);
         return sendResponse(stream, "200 OK", "application/json", json);
     }
     const args = parsed.value.object.get("arguments");
     if (name.? != .string or args == null or args.? != .string)
         return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Tool name and arguments must be strings", 400);
-    const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision, .writable = writable }, name.?.string, args.?.string);
+    const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision }, name.?.string, args.?.string);
     defer result.deinit(allocator);
     const json = try std.json.Stringify.valueAlloc(allocator, result, .{});
     defer allocator.free(json);
@@ -1432,15 +1448,6 @@ fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const T
 }
 
 const TOOL_CHOICE_UNDECLARED = "tool_choice names a function that is not in tools";
-
-/// The decode-time half of tool_choice "none": the template's call opener, banned when it is one
-/// token, so a model that sees earlier calls in the history cannot write one as plain text.
-fn noneCallBan(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig) ?@import("logit_bias.zig").Bias {
-    const opener = (chat_mod.callOpener(allocator, chat_config) catch null) orelse return null;
-    defer allocator.free(opener);
-    const id = atomicTokenId(allocator, tok, opener) orelse return null;
-    return .{ .id = id, .delta = -100 };
-}
 
 /// Arm the decode-time half of a forced tool_choice (required or named), or
 /// null when the choice forces nothing or the call cannot be committed: no
@@ -2024,6 +2031,8 @@ pub fn serve(
     defer configured_kv_quant = null;
     configured_mtp = model_settings.launchFlag(bool, load_params.mtp_enabled, load_params.mtp_explicit);
     defer configured_mtp = null;
+    scheduler_mod.load_context_bytes = &loadContextBytes;
+    defer scheduler_mod.load_context_bytes = null;
     scheduler_mod.load_serving_bill = &loadServingBill;
     defer scheduler_mod.load_serving_bill = null;
 
@@ -2188,13 +2197,13 @@ pub fn serve(
         log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, model_settings.sourceLabel(ctx.source, "--ctx-size") });
     } else {
         const memory_ctx = computeMemoryContext(config);
-        const memory_allows = safeAutoContext(memory_ctx);
+        const memory_allows = safeAutoContextAt(memory_ctx, autoContextPct(config));
         const rope_ctx = config.contextCap();
         if (rope_ctx > 0 and pinned >= rope_ctx) {
             // The checkpoint's own maximum binds; memory had room to spare.
             log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
         } else {
-            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, auto_ctx_safety_pct, memory_ctx });
+            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, autoContextPct(config), memory_ctx });
         }
     }
 
@@ -2217,6 +2226,8 @@ pub fn serve(
     log.info("[pld] {s} ({s}); draft_len={d}, key_len={d}; default for new requests\n", .{ if (pld.on) "on" else "off", pld.source, server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (scheduler.dflash != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
+    } else if (scheduler.drafter != null and scheduler.dflash == null) {
+        log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
     if (config.isGlm5()) {
         log.info("MTP: off (GLM native serving has no integrated MTP head)\n", .{});
@@ -2843,7 +2854,14 @@ fn handleConnection(
 /// second model to load beside this one, or another app to take RAM — and the
 /// Metal OOM it would eventually hit is uncatchable (see the auto-context
 /// gotcha). Reserve headroom instead.
-const auto_ctx_safety_pct: u32 = 93;
+const auto_ctx_safety_pct: u32 = 85;
+/// GLM's admission bills every request exactly and refuses past it, so its advertised context keeps a thinner
+/// margin: the smallest at which Sushi-2.5bpw at release defaults advertises 1,048,576 at 2048-row chunks.
+const glm_auto_ctx_safety_pct: u32 = 93;
+
+fn autoContextPct(config: *const model_mod.ModelConfig) u32 {
+    return if (config.isGlm5()) glm_auto_ctx_safety_pct else auto_ctx_safety_pct;
+}
 
 /// PURE: apply the safety margin and round down to a 1024 boundary so the
 /// number reads sanely in logs and client configs. Never returns 0.
@@ -2851,10 +2869,14 @@ const auto_ctx_safety_pct: u32 = 93;
 /// Takes the MEMORY-derived ceiling only. The model's own `max_position_embeddings`
 /// is applied afterwards, un-margined: when the checkpoint's max is the binding
 /// constraint there is nothing to reserve memory headroom against, and shaving
-/// the margin off a 131,072-token model that comfortably fits in RAM just throws
+/// 15% off a 131,072-token model that comfortably fits in RAM just throws
 /// context away.
 fn safeAutoContext(raw: u32) u32 {
-    const scaled: u64 = (@as(u64, raw) * auto_ctx_safety_pct) / 100;
+    return safeAutoContextAt(raw, auto_ctx_safety_pct);
+}
+
+fn safeAutoContextAt(raw: u32, pct: u32) u32 {
+    const scaled: u64 = (@as(u64, raw) * pct) / 100;
     const rounded: u64 = (scaled / 1024) * 1024;
     if (rounded == 0) return @intCast(@max(scaled, 1));
     return @intCast(rounded);
@@ -2866,16 +2888,16 @@ fn safeAutoContext(raw: u32) u32 {
 /// a YaRN-scaled checkpoint — the same derivation vLLM applies to
 /// `max_model_len`, because a position past the scaled window aliases back
 /// inside the ramp rather than reading as a longer distance.
-/// The context the server advertises, from the largest context memory alone allows (93%
+/// The context the server advertises, from the largest context memory alone allows (85%
 /// margin on the memory number, checkpoint cap afterwards). Shared by the load-time session
 /// bill and the boot-time sizer so the two cannot spell the relation two ways.
-fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
-    const with_headroom = safeAutoContext(memory_ctx);
+fn autoContextFrom(memory_ctx: u32, ctx_cap: u32, pct: u32) u32 {
+    const with_headroom = safeAutoContextAt(memory_ctx, pct);
     return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
 }
 
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    return autoContextFrom(computeMemoryContext(config), config.contextCap());
+    return autoContextFrom(computeMemoryContext(config), config.contextCap(), autoContextPct(config));
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -2978,7 +3000,7 @@ fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system
 
 /// How far under the enforced wired limit a plan may reach: past the limit Metal returns
 /// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
-pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 1 << 30;
+pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 4 << 30;
 
 /// PURE: the floor an explicitly raised `iogpu.wired_limit_mb` puts under the ceiling; 0 when
 /// the sysctl is absent or at the macOS default (75% of RAM), which leaves the ceiling as is.
@@ -2995,7 +3017,7 @@ pub fn wiredLimitFloor(wired_limit: u64, total_ram: u64, margin: u64) u64 {
 
 pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
     const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidWiredMargin;
-    if (n < 1 or n > 32) return error.InvalidWiredMargin;
+    if (n < 2 or n > 32) return error.InvalidWiredMargin;
     return @as(u64, n) << 30;
 }
 
@@ -3179,14 +3201,21 @@ pub fn staticGpuMemoryCeiling() u64 {
 /// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
 /// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
 fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
+    // The ANE's int8 copies are wired host buffers: invisible to MLX's own
+    // accounting, but genuinely gone from free RAM. Left to leak in through
+    // the noisy free-RAM term they made auto-context swing across boots of the
+    // SAME build (measured 5,120 / 10,240 / 55,296 tokens, 27B iQ on a 32 GB
+    // M1 Pro). Add them back and subtract the known figure once. Zero — and so
+    // exactly the old expression — whenever no offload is resident.
+    const ane_bytes = ane_mod.live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        metrics.getAvailableMemBytes(),
+        metrics.getAvailableMemBytes() +| ane_bytes,
         wiredCeilingFloorFor(config),
-    );
+    ) -| ane_bytes;
 }
 
 pub fn expertStreamingLoadFits(ceiling: u64, active_mem: u64, resident_bytes: u64, cache_bytes: u64, bounce_bytes: u64, fill_peak_bytes: u64, serving_bytes: u64) bool {
@@ -3478,6 +3507,32 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
+/// The ANE admission gate's headroom for THIS model at THIS chunk: the KV
+/// cache for a context worth serving, the hot prefix cache, the prefill
+/// chunk's transient envelope, and the non-model baseline. Every term is one
+/// the auto-context sizer also reserves — the gate must not admit an offload
+/// into memory the sizer has already spoken for.
+///
+/// Both model terms already exist as estimators — this is the "a gate that
+/// runs BEFORE the estimator that knows better is the estimator" rule applied
+/// to `ane.gateAllows`, which carried a flat 12 GB instead. That constant was
+/// calibrated for the 27B at chunk 8192 and was wrong in BOTH directions once
+/// `resolvePrefillChunk` sized the chunk down: measured on that geometry, the
+/// envelope is 12.66 GB at chunk 8192 but 2.13 GB at chunk 1024.
+///
+/// The KV term is a RESERVE, not a prediction: see `ane.MIN_CONTEXT_TOKENS`.
+pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
+    const kv_bits: u64 = defaultKvBits(config);
+    const ctx: u64 = if (config.max_position_embeddings > 0)
+        @min(ane_mod.MIN_CONTEXT_TOKENS, config.max_position_embeddings)
+    else
+        ane_mod.MIN_CONTEXT_TOKENS;
+    return ane_mod.GATE_BASELINE_BYTES +|
+        (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx) +|
+        resolvedPrefixCacheMem() +|
+        prefillTransientReserve(config, kv_bits, chunk);
+}
+
 var ctx_bar_cached: ?bool = null;
 
 /// `SUSHI_PREFILL_CHUNK_CTX_BAR=0` restores the share-only rung cap.
@@ -3583,7 +3638,7 @@ fn glmPrefillChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: 
 }
 
 fn glmAdvertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
-    return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap());
+    return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap(), autoContextPct(config));
 }
 
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
@@ -3618,6 +3673,15 @@ pub fn billedPrefillChunk(
 pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     if (manualContext(config) == 0) return 0;
     return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| slotRingBytes(config, kv_bits);
+}
+
+/// The explicit-context cache bill for the load preflight, or the flat-headroom fallback.
+pub fn loadContextBytes(config: *const model_mod.ModelConfig) ?u64 {
+    // Measured on resident Flash-Next and MiMo EXL3; any other arch or layout needs its own envelope.
+    const measured = std.mem.eql(u8, config.model_type, "qwen4_exp") or config.isMimo();
+    if (!measured or config.expert_layout != .exl3_k4 or config.expert_streaming) return null;
+    if (manualContext(config) == 0) return null;
+    return sizerCtxKvBytes(config, defaultKvBits(config));
 }
 
 /// The full-context admission bill at the width a requested launch can run.
@@ -3793,6 +3857,64 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     try std.testing.expectEqual(@as(?scheduler_mod.LoadServingBill, null), loadServingBill(&cfg, budget));
 }
 
+test "loadContextBytes reuses the sizer with launch and model settings precedence" {
+    const guard = qsaScoreFusedOffGuard();
+    defer guard.deinit();
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    const saved_kv = configured_kv_quant;
+    defer configured_kv_quant = saved_kv;
+    var cfg = qwen4RequestTestConfig();
+    cfg.expert_layout = .exl3_k4;
+    server_config.max_context_size = 0;
+    configured_kv_quant = null;
+    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
+
+    cfg.ctx_override = 1248;
+    cfg.kv_quant_override = transformer_mod.KVQuantConfig.affine(4);
+    try std.testing.expectEqual(@as(?u64, sizerCtxKvBytes(&cfg, 4)), loadContextBytes(&cfg));
+    server_config.max_context_size = 4096;
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    try std.testing.expectEqual(@as(?u64, sizerCtxKvBytes(&cfg, 8)), loadContextBytes(&cfg));
+    try std.testing.expectEqual(
+        @as(?u64, sessionBytesPerToken(&cfg, 8) * 4096 + slotRingBytes(&cfg, 8)),
+        loadContextBytes(&cfg),
+    );
+
+    cfg.expert_streaming = true;
+    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
+    cfg.expert_streaming = false;
+    cfg.expert_layout = .bf16_fused;
+    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
+    cfg.expert_layout = .exl3_k4;
+    cfg.model_type = "mimo_v2";
+    try std.testing.expectEqual(@as(?u64, sizerCtxKvBytes(&cfg, 8)), loadContextBytes(&cfg));
+    cfg.expert_streaming = true;
+    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
+    cfg.expert_streaming = false;
+    cfg.model_type = "qwen3_moe";
+    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
+}
+
+test "loadContextBytes honors --no-mtp before the scheduler is published" {
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    const saved_mtp = configured_mtp;
+    defer configured_mtp = saved_mtp;
+    var cfg = qwen4RequestTestConfig();
+    cfg.expert_layout = .exl3_k4;
+    server_config.max_context_size = 1248;
+    cfg.mtp_override = false;
+    configured_mtp = null;
+    const without_head = loadContextBytes(&cfg);
+    cfg.mtp_override = true;
+    configured_mtp = false;
+    try std.testing.expectEqual(without_head, loadContextBytes(&cfg));
+    configured_mtp = true;
+    cfg.mtp_override = false;
+    try std.testing.expect(loadContextBytes(&cfg).? > without_head.?);
+}
+
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
 /// Must run BEFORE the auto-context sizer: the sizer bills this chunk's
 /// transient reserve, and `checkAttentionMemory` and
@@ -3954,6 +4076,7 @@ pub fn resolvedContextForLoad(
     transient_reserve: u64,
     per_tok: u64,
     ctx_cap: u32,
+    margin_pct: u32,
 ) u32 {
     if (explicit_ctx > 0) return explicit_ctx;
     if (pinned_ctx > 0) return pinned_ctx;
@@ -3963,7 +4086,7 @@ pub fn resolvedContextForLoad(
         cache_reserve +| transient_reserve,
         per_tok,
         0,
-    ), ctx_cap);
+    ), ctx_cap, margin_pct);
 }
 
 /// The SSD-first call site. Takes the static ceiling (the budget is a property of the machine),
@@ -3979,6 +4102,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
+        autoContextPct(config),
     );
 }
 
@@ -4030,7 +4154,7 @@ fn ssdFirstBudgetForLoad(
 /// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
 /// deliberately has no server.zig import): the weights are resident there, so
 /// `mlx_get_active_memory` is honest. Logs one line when the clamp bites, and publishes the
-/// answer so the auto-context sizer stops reserving a budget the cache never got.
+/// answer so the auto-context sizer and the ANE gate stop reserving a budget the cache never got.
 /// The hot-cache reserve the context is sized against at load time on the RAM-first arm: a
 /// constant (the server's own `--prefix-cache-mem` default), never the ask. Reading the ask
 /// let a 60GB ask collapse the advertised context to 870 tokens; context is the primary
@@ -4057,6 +4181,7 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
+        autoContextPct(config),
     );
 }
 
@@ -4154,6 +4279,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
             ctx_kv,
             prefillTransientReserve(config, kv_bits, chunk),
         );
+        // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
         publishResolvedPrefixCacheMem(clamped);
         if (revise.quiet) return clamped;
         if (ask != requested) logOneSessionAsk(ask, ctx_tokens, one);
@@ -4724,6 +4850,7 @@ test "an unloaded qwen4 stub is text-only only when the checkpoint must stream" 
         .tokenizer = null,
         .chat_config = null,
         .vision_encoder = null,
+        .drafter = null,
         .drafter_path = "",
         .drafter_block_size = 0,
         .prefix_cache = null,
@@ -4788,6 +4915,7 @@ test "a quantized pack loaded resident advertises no streaming, the same pack st
         .tokenizer = null,
         .chat_config = &chat_cfg,
         .vision_encoder = null,
+        .drafter = null,
         .drafter_path = "",
         .drafter_block_size = 0,
         .prefix_cache = null,
@@ -5145,16 +5273,16 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
     const cap: u32 = cfg.contextCap();
 
     // The sizing reserve is a constant, so the answer cannot move with the ask.
-    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
-    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, auto_ctx_safety_pct);
+    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expectEqual(ctx_default, ctx_big_ask);
     try t.expect(ctx_default > 900_000); // a real context, not the floor
 
     // The defect, both spellings: sizing against the granted budget...
-    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
+    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expect(vs_granted <= 1024);
     // ...and against the raw ask, which saturates usable to zero.
-    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
+    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expect(vs_raw_ask <= 1024);
     try t.expect(ctx_default > vs_granted * 500);
 }
@@ -5245,6 +5373,7 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     const advertised = autoContextFrom(
         safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
         cfg.contextCap(),
+        auto_ctx_safety_pct,
     );
     try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
 }
@@ -5333,6 +5462,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const advertised = autoContextFrom(
         safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0),
         cfg.contextCap(),
+        auto_ctx_safety_pct,
     );
     const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
     try t.expectEqual(advertised, billed);
@@ -5340,7 +5470,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     // Shown on a tighter box where the checkpoint cap does not bind.
     const tight: u64 = active + 24_000 * MiB;
     const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
-    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
+    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap(), auto_ctx_safety_pct);
     try t.expect(old_billed > billed_t);
     try t.expect(billed > 500_000);
     try t.expect(billed_t > 300_000);
@@ -5469,7 +5599,7 @@ test "an explicit --ctx-size boot never consults the session reserve" {
     for ([_]u64{ 0, CTX_SIZING_CACHE_RESERVE, 99_000 * MiB }) |reserve| {
         try t.expectEqual(
             @as(u32, 262_144),
-            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap()),
+            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap(), auto_ctx_safety_pct),
         );
     }
 
@@ -5482,8 +5612,8 @@ test "an explicit --ctx-size keeps the load-time context byte-identical" {
     const t = std.testing;
     const MiB: u64 = 1 << 20;
     const per_tok: u64 = 20_736;
-    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144));
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576));
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144, auto_ctx_safety_pct));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576, auto_ctx_safety_pct));
 }
 
 test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
@@ -6233,6 +6363,30 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
 
+/// deepseek_v4 sibling of `prefillMemoryNeeded`: bills what `extendState`
+/// ACTUALLY allocates (third bite of the bills-what-the-arch-reads class,
+/// live 2026-08-01: the generic estimator billed 4069 MB for a 7514-token pi
+/// prompt against 3610 MB available and 400'd it; the honest bill is ~2.3 GB).
+/// Two generic terms are wrong for this arch: `chunk` is the generic MoE
+/// prefill cap (4096) but dsv4 sub-chunks internally at `prefillSub()` (512),
+/// shrinking the per-chunk MLP envelope 8x; and the fp16 score-scratch term
+/// misses dsv4's real attention transient, the [C, tk, latent] f32 gathered-K
+/// set — the very allocation PREFILL_SUB exists to bound. State term: raw kv
+/// latents are [n, latent] f32 per layer, and the compressed arms add about
+/// half the raw again (ratio-4 slots at 2x width + ratio-128 + indexer), so
+/// 3/2 x raw covers the lot; kv-quant never applies to this module-owned
+/// state, so the bill is unconditionally f32.
+pub fn dsv4PrefillMemoryNeeded(seq: u64, layers: u64, latent: u64, hidden: u64, ffn: u64, sub_chunk: u64, attn_keys: u64) u64 {
+    const fwd: u64 = @min(sub_chunk, @max(seq, 1));
+    const kv_bytes: u64 = layers * seq * latent * 4 * 3 / 2;
+    const gather: u64 = fwd * @min(attn_keys, seq) * latent * 4;
+    const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
+    // Same chunk-independent runtime floor the generic estimator bills: it is
+    // a property of the MLX runtime and the KV cache's growth, not of the arch
+    // (the 2026-08-01 live case still admits — 2984 MB against 3610 free).
+    return (kv_bytes + gather + 3 * mlp + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4;
+}
+
 /// Per-TOKEN bytes of prefill working set that live OUTSIDE the MLP envelope,
 /// because the arch runs streams the envelope does not model. MEASURED as the
 /// slope of peak-above-steady-state against the prefill chunk (M4 Max,
@@ -6783,11 +6937,15 @@ pub fn prefillNeededAtChunk(
         )) *| 5 / 4 +|
             (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
     }
+    // deepseek_v4 gets its own estimator: it sub-chunks prefill internally and its state is module-owned f32.
+    const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
     const heads: u64 = config.num_attention_heads;
+    const layers: u64 = config.num_hidden_layers;
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
+    if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
@@ -7582,9 +7740,11 @@ fn renderModelEntry(
 
         const has_chat = readyHasChat(config.is_encoder_only, chat_config.chat_template.len);
         const has_vision = entry.vision_encoder != null;
+        const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
         var caps = try readyCapsJson(allocator, .{
             .has_chat = has_chat,
             .has_vision = has_vision,
+            .has_audio = has_audio,
             .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
         });
@@ -7595,12 +7755,13 @@ fn renderModelEntry(
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
         if (has_vision and config.video_token_id != 0) try mods.appendSlice(allocator, ",\"video\"");
+        if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
         const efforts_part = try reasoningEffortsJson(allocator, config);
         defer allocator.free(efforts_part);
-        const drafter_loaded = entry.dflash != null;
+        const drafter_loaded = entry.drafter != null or entry.dflash != null;
         const mtp_loaded = entry.mtp != null;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
@@ -8016,7 +8177,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
-    const drafter_loaded = lm.dflash != null;
+    const drafter_loaded = lm.drafter != null or lm.dflash != null;
     const drafter_path_json = if (drafter_loaded)
         try jsonEscape(allocator, lm.drafter_path)
     else
@@ -8158,8 +8319,8 @@ fn renderPropsBody(
     cache_mem: usize,
     /// KV of the hot prefix caches + live slots.
     kv_cache_mem: u64,
-    /// Leading-comma JSON fragments spliced before the root close (the
-    /// qwen4 n-gram warm object, ...). Concatenated by the handler.
+    /// Leading-comma JSON fragments spliced before the root close (the ANE
+    /// object, the qwen4 n-gram warm object). Concatenated by the handler.
     extra_json: []const u8,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
@@ -8285,7 +8446,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
         .mtp_loaded = mtpCapable(lm),
-        .mtp_default_on = defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head),
+        .mtp_default_on = defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head),
         .mtp_choice = mtpChoiceFor(config),
         .mtp_acceptance = acceptance.value,
         .mtp_acceptance_source = model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
@@ -8293,7 +8454,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
-        .drafter = if (lm.dflash != null) "dflash" else "none",
+        .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = pld.on, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
         .pld_source = pld.source,
         .max_concurrent = max_concurrent,
@@ -8341,6 +8502,33 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
     });
 }
 
+/// The /props "ane" object (A8): mode, coverage, geometry and the int8
+/// bill of the resident ANE prefill engine, so "what is the Neural Engine
+/// holding" is answerable without log-grepping. Pure — the handler feeds
+/// it the engine's fields; returns a leading-comma fragment spliced before
+/// the props root close (empty when there is no engine).
+/// One ANE unit's dispatch evidence. Under dual this is the ONLY in-process
+/// proof that both dies were addressed — a silently ignored affinity hint
+/// looks identical from here, so the counters pair with the out-of-process
+/// `macpow --dump | grep ANE0_` check, never replace it.
+const AneUnitStat = struct { instance: i64, evals: u64, eval_failures: u64 };
+
+fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, units: []const AneUnitStat) ![]u8 {
+    var evals: u64 = 0;
+    var eval_failures: u64 = 0;
+    for (units) |u| {
+        evals += u.evals;
+        eval_failures += u.eval_failures;
+    }
+    var rows_buf: [512]u8 = undefined;
+    var used: usize = 0;
+    for (units, 0..) |u, i| {
+        const row = try std.fmt.bufPrint(rows_buf[used..], "{s}{{\"instance\":{d},\"evals\":{d},\"eval_failures\":{d}}}", .{ if (i == 0) "" else ",", u.instance, u.evals, u.eval_failures });
+        used += row.len;
+    }
+    return std.fmt.allocPrint(allocator, ",\"ane\":{{\"mode\":\"{s}\",\"units\":{d},\"mlp_layers\":{d},\"gdn_layers\":{d},\"rows\":{d},\"chunk_rows\":{d},\"share\":{d:.2},\"int8_bytes\":{d},\"evals\":{d},\"eval_failures\":{d},\"unit_evals\":[{s}]}}", .{ mode_name, units.len, mlp_layers, gdn_layers, rows, chunk_rows, share, int8_bytes, evals, eval_failures, rows_buf[0..used] });
+}
+
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
     const config = lm.config.?;
     const ctx_len = getEffectiveContextLength(config);
@@ -8364,6 +8552,23 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // "Free RAM" line stays in lockstep with what gates a load.
     const available_mem = metrics.getAvailableMemBytes();
 
+    // ANE prefill engine state (A8) — absent when the offload is off.
+    const ane_json = blk: {
+        if (lm.transformer) |x| {
+            if (x.ane_prefill) |eng| {
+                var stats: [ane_mod.MAX_UNITS]AneUnitStat = undefined;
+                for (eng.units, 0..) |*u, i| stats[i] = .{
+                    .instance = u.instance,
+                    .evals = u.evals_ok.load(.monotonic),
+                    .eval_failures = u.evals_failed.load(.monotonic),
+                };
+                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
+            }
+        }
+        break :blk try allocator.dupe(u8, "");
+    };
+    defer allocator.free(ane_json);
+
     // qwen4 n-gram table warm (F8) — the two module-level atomics are zero
     // whenever no table is warming, so the object is absent off qwen4_exp.
     const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
@@ -8376,7 +8581,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(update_json);
     const fallbacks_json = try templateFallbacksPropsJson(allocator, chat_mod.template_fallbacks.load(.monotonic));
     defer allocator.free(fallbacks_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ngram_json, batching_json, settings_json, update_json, fallbacks_json });
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, update_json, fallbacks_json });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -8595,7 +8800,18 @@ fn handleEmbeddings(
             return;
         }
         const raw_ids = try tok.encode(allocator, text);
-        const ids = if (config.effectivePooling() == .last_token) blk: {
+        // Bidirectional embedding models (EmbeddingGemma) declare
+        // add_bos_token + add_eos_token; the SentencePiece encode path adds
+        // neither, so wrap here. BERT's [CLS]/[SEP] come from WordPiece itself.
+        const ids = if (config.use_bidirectional_attention) blk: {
+            defer allocator.free(raw_ids);
+            break :blk try wrapEncoderIds(
+                allocator,
+                raw_ids,
+                config.bos_token_id,
+                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+            );
+        } else if (config.effectivePooling() == .last_token) blk: {
             // Last-token pooling models pool an APPENDED terminator: the
             // Qwen3-Embedding tokenizer's TemplateProcessing post-processor
             // adds <|endoftext|> (the config's eos_token_id) to every encode,
@@ -9113,49 +9329,6 @@ fn hashTextValue(v: std.json.Value) ?u64 {
     return if (n == 0) null else h.final();
 }
 
-const CompletionPrompt = union(enum) {
-    text: []const u8,
-    /// Caller frees.
-    ids: []u32,
-    invalid: []const u8,
-    missing,
-};
-
-/// `/v1/completions` `prompt`: a string or token ids (OpenAI's `int[]`, what lm-eval sends),
-/// either also as a one-item list. A real batch is a named 400, like `n`.
-fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab_size: u32) !CompletionPrompt {
-    const val = v orelse return .missing;
-    switch (val) {
-        .null => return .missing,
-        .string => |s| return .{ .text = s },
-        .array => |arr| {
-            if (arr.items.len == 0) return .{ .invalid = "'prompt' is empty" };
-            if (arr.items[0] == .string or arr.items[0] == .array) {
-                if (arr.items.len > 1) return .{ .invalid = "batched prompts are not supported: send one prompt per request" };
-                return parseCompletionPrompt(allocator, arr.items[0], vocab_size);
-            }
-            const ids = try allocator.alloc(u32, arr.items.len);
-            for (arr.items, ids) |item, *id| {
-                if (item != .integer or item.integer < 0 or item.integer >= vocab_size) {
-                    allocator.free(ids);
-                    return .{ .invalid = "'prompt' token ids must be integers inside the model's vocabulary" };
-                }
-                id.* = @intCast(item.integer);
-            }
-            return .{ .ids = ids };
-        },
-        else => return .{ .invalid = "'prompt' must be a string or a list of token ids" },
-    }
-}
-
-/// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty sum it
-/// reads as perplexity 1; refused by name instead.
-fn echoRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    const v = root.get("echo") orelse return null;
-    if (v != .bool or !v.bool) return null;
-    return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
-}
-
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
     switch (v) {
@@ -9225,6 +9398,7 @@ fn handleChatCompletions(
 
     var wire = WireMessages.init(allocator);
     defer wire.deinit();
+    wire.media.accepts_audio = config.audio_token_id != 0;
     try readOpenAiMessages(&wire, messages_val.array.items, visionPreprocFromConfig(config));
     const messages = &wire.messages;
     if (wire.media.refusal()) |fault| {
@@ -9417,7 +9591,7 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         return;
     };
-    var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking());
+    var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
     if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
@@ -9472,12 +9646,12 @@ fn handleChatCompletions(
     // requests default to ON unless the target is MoE (where verify-forward
     // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
     // overrides either way.
-    const lm_default_enable_drafter: bool = lm.dflash != null;
+    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
         lm_default_enable_drafter;
-    if (enable_drafter and lm.dflash == null) {
+    if (enable_drafter and lm.drafter == null and lm.dflash == null) {
         enable_drafter = false; // no drafter loaded; quietly fall through
     }
     if (enable_drafter and logprobs_n > 0) {
@@ -9502,8 +9676,8 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
         enable_mtp = false;
@@ -9707,15 +9881,12 @@ fn handleChatCompletions(
     // A decode-time bound owns the budget; the surfaces then deliver the
     // whole (closed) thought instead of trimming it.
     sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
-    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
+    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(if (config.unpadded_vocab_size > 0) config.unpadded_vocab_size else config.vocab_size, tok.definedVocabSize())) catch |err| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
         return;
     } else &.{};
     defer allocator.free(request_bias);
-    const none_ban = if (tool_choice == .none and lm.transformer != null) noneCallBan(allocator, tok, chat_config) else null;
-    const biases = if (none_ban) |ban| try std.mem.concat(allocator, @import("logit_bias.zig").Bias, &.{ request_bias, &.{ban} }) else request_bias;
-    defer if (none_ban != null) allocator.free(biases);
-    sampling.think_penalty.biases = biases;
+    sampling.think_penalty.biases = request_bias;
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
@@ -9787,22 +9958,16 @@ fn handleCompletions(
         else => 0,
     } else 0;
 
-    if (echoRejectReason(root)) |reason| {
-        log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-        return;
-    }
+    // Extract prompt (required)
+    const prompt_text = if (root.get("prompt")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
 
-    const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), @min(config.vocab_size, tok.definedVocabSize()));
-    defer if (prompt == .ids) allocator.free(prompt.ids);
-    switch (prompt) {
-        .missing, .invalid => {
-            const reason = if (prompt == .invalid) prompt.invalid else "'prompt' is a required field";
-            log.warn("POST /v1/completions -> 400 ({s})\n", .{reason});
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-            return;
-        },
-        .text, .ids => {},
+    if (prompt_text == null) {
+        log.warn("POST /v1/completions -> 400 (missing prompt)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'prompt' is a required field", 400);
+        return;
     }
 
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
@@ -9870,8 +10035,8 @@ fn handleCompletions(
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
-        lm.dflash != null;
-    if (enable_drafter and lm.dflash == null) enable_drafter = false;
+        (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
+    if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
@@ -9882,24 +10047,17 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
+    const preview_len = @min(prompt_text.?.len, 80);
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
-    switch (prompt) {
-        .text => |s| log.info("  > \"{s}{s}\"\n", .{ s[0..@min(s.len, 80)], if (s.len > 80) "..." else "" }),
-        .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
-        else => unreachable,
-    }
+    log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
 
-    // Tokenize prompt directly (no chat template); token ids are taken as sent.
-    const prompt_ids = switch (prompt) {
-        .text => |s| try tok.encode(allocator, s),
-        .ids => |ids| try allocator.dupe(u32, ids),
-        else => unreachable,
-    };
+    // Tokenize prompt directly (no chat template).
+    const prompt_ids = try tok.encode(allocator, prompt_text.?);
     defer allocator.free(prompt_ids);
     if (prompt_ids.len == 0) {
         log.warn("POST /v1/completions -> 400 (prompt tokenizes to zero tokens)\n", .{});
@@ -9960,7 +10118,7 @@ fn handleCompletions(
         .seed = seed,
     };
     sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, true, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
-    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
+    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(if (config.unpadded_vocab_size > 0) config.unpadded_vocab_size else config.vocab_size, tok.definedVocabSize())) catch |err| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
         return;
     } else &.{};
@@ -10005,7 +10163,7 @@ fn handleNonStreamingCompletion(
     // Spec dispatch: `requestSpecModes` (DFlash > MTP > drafter > PLD).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -10095,7 +10253,7 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -10117,6 +10275,7 @@ fn handleStreamingCompletion(
         .timeout_ns = getTimeoutNs(),
         .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
+        .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .allow_batch_mtp = allow_batch_mtp,
@@ -10429,7 +10588,8 @@ fn nonStreamingViaScheduler(
         .max_tokens = max_tokens,
         .timeout_ns = timeout_ns,
         .enable_pld = enable_pld,
-        .enable_drafter = enable_drafter and (lm.dflash != null),
+        .enable_drafter = enable_drafter and (lm.drafter != null or lm.dflash != null),
+        .drafter = if (enable_drafter) lm.drafter else null,
         .dflash = if (enable_drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .allow_batch_mtp = allow_batch_mtp,
@@ -10657,7 +10817,7 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -10797,7 +10957,9 @@ fn handleNonStreamingGeneration(
                 try allocator.alloc(u8, 0);
             defer allocator.free(tc_timings_field);
 
-            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+            const tc_details = try formatReasoningDetails(allocator, tok, deliveredReasoning(budget_truncated_reasoning, tc_think_split.reasoning_content) orelse "");
+            defer allocator.free(tc_details);
+            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, tc_details);
             defer allocator.free(tc_usage_obj);
 
             const response = try std.fmt.allocPrint(allocator,
@@ -10857,27 +11019,16 @@ fn handleNonStreamingGeneration(
     // key on the request's thinking flag.
     var reasoning_json: []const u8 = "";
     var reasoning_allocated = false;
-    var usage_details_json: []const u8 = "";
-    var usage_details_allocated = false;
-    {
-        // Use budget-truncated reasoning if available, otherwise use full reasoning
-        const reasoning_text = deliveredReasoning(budget_truncated_reasoning, think_split.reasoning_content);
-        if (reasoning_text) |reasoning| {
-            const escaped_reasoning = try jsonEscape(allocator, reasoning);
-            reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
-            allocator.free(escaped_reasoning);
-            reasoning_allocated = true;
-            // usage.completion_tokens_details.reasoning_tokens (OpenAI/LM Studio
-            // parity) so clients can budget visible content separately.
-            if (tok.encode(allocator, reasoning)) |rids| {
-                defer allocator.free(rids);
-                usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{rids.len});
-                usage_details_allocated = true;
-            } else |_| {}
-        }
+    const reasoning_text = deliveredReasoning(budget_truncated_reasoning, think_split.reasoning_content);
+    const usage_details_json = try formatReasoningDetails(allocator, tok, reasoning_text orelse "");
+    defer allocator.free(usage_details_json);
+    if (reasoning_text) |reasoning| {
+        const escaped_reasoning = try jsonEscape(allocator, reasoning);
+        defer allocator.free(escaped_reasoning);
+        reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
+        reasoning_allocated = true;
     }
     defer if (reasoning_allocated) allocator.free(reasoning_json);
-    defer if (usage_details_allocated) allocator.free(usage_details_json);
 
     const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
@@ -11135,11 +11286,11 @@ const StreamingTokenStream = struct {
                 return first_tok;
             },
             .drafter => {
-                // Mirror the PLD branch — `nextDflash` returns the same
+                // Mirror the PLD branch — `nextDrafter` returns the same
                 // `{tokens, accepted_tokens}` shape (full accept yields
                 // `block_size` tokens, partial accept yields `1+j`). Walk the
                 // batch, stop at the first EOS, push the rest into pending.
-                const r = (try gen.nextDflash(allocator)) orelse return null;
+                const r = (try gen.nextDrafter(allocator)) orelse return null;
                 defer allocator.free(r.tokens);
                 if (r.tokens.len == 0) {
                     self.finished = true;
@@ -11208,13 +11359,14 @@ pub fn requestSpecModes(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
+    gemma_drafter_loaded: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) RequestSpec {
     const spec_ok = logprobs_n == 0 and !has_constraint;
-    const sidecar = spec_ok and enable_drafter and dflash_loaded;
+    const sidecar = spec_ok and enable_drafter and (gemma_drafter_loaded or dflash_loaded);
     const use_dflash = sidecar and dflash_loaded;
     const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
     const use_drafter = use_dflash or (!use_mtp and sidecar);
@@ -11229,12 +11381,13 @@ fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
+    gemma_drafter_loaded: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
-    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
+    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, gemma_drafter_loaded, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
     if (r.use_mtp) return .mtp;
     if (r.use_drafter) return .drafter;
     if (r.use_pld) return .pld;
@@ -11243,25 +11396,25 @@ fn pickStreamMode(
 
 test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head; the gemma drafter does not" {
     // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
-    var r = requestSpecModes(true, true, true, true, true, false, 0);
+    var r = requestSpecModes(true, true, true, false, true, true, false, 0);
     try std.testing.expect(r.use_drafter and !r.use_mtp and !r.use_pld);
-    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, true, false, 0));
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, true, true, false, 0));
     // gemma drafter + mtp -> MTP keeps its rank.
-    r = requestSpecModes(true, true, true, false, true, false, 0);
+    r = requestSpecModes(true, true, true, true, false, true, false, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, false, true, false, 0));
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, false, true, false, 0));
     // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
-    r = requestSpecModes(true, false, true, true, true, false, 0);
+    r = requestSpecModes(true, false, true, false, true, true, false, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
     // logprobs / grammar disable every spec mode, dflash included.
-    r = requestSpecModes(true, true, true, true, true, false, 3);
+    r = requestSpecModes(true, true, true, false, true, true, false, 3);
     try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
-    r = requestSpecModes(true, true, true, true, true, true, 0);
+    r = requestSpecModes(true, true, true, false, true, true, true, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
     // No sidecar loaded -> MTP; nothing loaded -> PLD.
-    r = requestSpecModes(true, true, true, false, true, false, 0);
+    r = requestSpecModes(true, true, true, false, false, true, false, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
-    r = requestSpecModes(true, true, true, false, false, false, 0);
+    r = requestSpecModes(true, true, true, false, false, false, false, 0);
     try std.testing.expect(r.use_pld and !r.use_mtp and !r.use_drafter);
 }
 
@@ -11329,7 +11482,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -11358,6 +11511,7 @@ fn handleStreamingGeneration(
         .timeout_ns = getTimeoutNs(),
         .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
+        .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .allow_batch_mtp = allow_batch_mtp,
@@ -11462,6 +11616,10 @@ fn handleStreamingGeneration(
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
+    // Collect the exact deltas delivered to the client, including tool paths and
+    // capped tails. Tokenize once at the end: SSE chunk boundaries are not tokens.
+    var delivered_reasoning = std.ArrayList(u8).empty;
+    defer delivered_reasoning.deinit(allocator);
     var reasoning_tokens_sent: usize = 0; // reasoning deltas actually emitted (the budget is counted in these)
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
@@ -11531,6 +11689,7 @@ fn handleStreamingGeneration(
         if (delivery) |*d| {
             defer allocator.free(token_text);
             try d.feed(allocator, token_text);
+            if (include_usage) try delivered_reasoning.appendSlice(allocator, d.reasoning.items);
             try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
             try beatStreamKeepalive(stream, .sse_comment);
             continue;
@@ -11584,6 +11743,7 @@ fn handleStreamingGeneration(
                             if (so_far.reasoning_content) |rc| {
                                 const settled = chat_mod.settledReasoning(rc);
                                 if (chat_mod.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
+                                    if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                     reasoning_streamed = settled.len;
                                     reasoning_tokens_sent += 1;
@@ -11618,6 +11778,7 @@ fn handleStreamingGeneration(
                         if (!budget_exhausted) {
                             if (split.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                    if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                 }
                             }
@@ -11827,6 +11988,7 @@ fn handleStreamingGeneration(
                 const last = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 thought_shipped = false;
                 if (last.len > 0 and !budget_exhausted) {
+                    if (include_usage) try delivered_reasoning.appendSlice(allocator, last);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = last }, null, null, null, .{});
                 }
                 const after = m.pos + m.len;
@@ -11881,6 +12043,7 @@ fn handleStreamingGeneration(
                 const safe_len = flush.skip + flush.ship;
                 if (safe_len > 0) {
                     if (flush.ship > 0 and !budget_exhausted) {
+                        if (include_usage) try delivered_reasoning.appendSlice(allocator, think_buf.items[flush.skip..safe_len]);
                         try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[flush.skip..safe_len] }, null, null, null, .{});
                     }
                     if (flush.ship > 0) thought_shipped = true;
@@ -11949,6 +12112,7 @@ fn handleStreamingGeneration(
         if (delivery) |*d| {
             d.clearOutput();
             try d.finish(allocator);
+            if (include_usage) try delivered_reasoning.appendSlice(allocator, d.reasoning.items);
             try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
         }
     }
@@ -11965,6 +12129,7 @@ fn handleStreamingGeneration(
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
             const tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
             if (!budget_exhausted and tail.len > 0) {
+                if (include_usage) try delivered_reasoning.appendSlice(allocator, tail);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = tail }, null, null, null, .{});
             }
         } else {
@@ -12019,6 +12184,7 @@ fn handleStreamingGeneration(
                     // Apply reasoning budget truncation if set
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
+                    if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{});
                 }
             }
@@ -12060,6 +12226,7 @@ fn handleStreamingGeneration(
                     // Apply reasoning budget truncation if set
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
+                    if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{});
                 }
                 if (think_split.content.len > 0) {
@@ -12091,7 +12258,9 @@ fn handleStreamingGeneration(
         // the ending twice (PR #147's doubled truncation banner). Pending
         // logprobs all drained on the final chunk above.
         if (include_usage) {
-            const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
+            const details = try formatReasoningDetails(allocator, tok, delivered_reasoning.items);
+            defer allocator.free(details);
+            const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, details);
             defer allocator.free(usage_json);
             const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
@@ -12535,6 +12704,10 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     _ = mlx.mlx_get_cache_memory(&mlx_cache);
     ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
+    // ANE prefill offload totals — published by the engines themselves
+    // (ane.publishLive / deinit), so this is a lock-free read.
+    ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
+    ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
     // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.
     ctx.metrics.ngram_warm_bytes.set(qwen4_mod.live_warm_bytes.load(.monotonic));
 
@@ -13512,6 +13685,19 @@ fn cachedFormatChat(
     return ids;
 }
 
+/// Use the same tokenizer and delivered-text convention for both chat modes.
+/// This is a subset of completion_tokens, not an extra charge added to total_tokens.
+fn formatReasoningDetails(allocator: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, text: []const u8) ![]u8 {
+    if (text.len == 0) return reasoningDetailsJson(allocator, 0);
+    const ids = try tok.encode(allocator, text);
+    defer allocator.free(ids);
+    return reasoningDetailsJson(allocator, ids.len);
+}
+
+fn reasoningDetailsJson(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{count});
+}
+
 /// The chat-completions `usage` object, shared by the non-stream, tool-call
 /// and streaming-final-chunk emitters so the shape never drifts per path.
 /// `prompt_tokens_details.cached_tokens` is ALWAYS present (0 when cold) —
@@ -14435,7 +14621,7 @@ pub fn largestImageEncodeBytes(config: *const model_mod.ModelConfig) u64 {
     const patches: u64 = if (vp.mode == .glm5)
         @as(u64, vp.max_tokens) * merge * merge
     else
-        vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / @max(@as(u64, vp.patch) * vp.patch, 1);
+        qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / @max(@as(u64, vp.patch) * vp.patch, 1);
     const largest = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
     return visionEncodeBill(config, &largest, &.{}, @intCast(patches / (merge * merge))).bytes;
 }
@@ -14767,6 +14953,24 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.lfm2_vision) {
+        // NaFlex: no temporal axis and no merge-block patch order — the
+        // projector unshuffles AFTER the tower, so the grid stays plain
+        // row-major and `merge` only sizes the token count.
+        return .{
+            .mode = .lfm2,
+            .patch = config.vision_patch_size,
+            .tps = 1,
+            .merge = config.lv_downsample,
+            .min_tokens = config.lv_min_image_tokens,
+            .max_tokens = config.lv_max_image_tokens,
+            .tile_size = if (config.lv_split_images) config.lv_tile_size else 0,
+            .min_tiles = config.lv_min_tiles,
+            .max_tiles = config.lv_max_tiles,
+            .use_thumbnail = config.lv_use_thumbnail,
+            .pixels_tolerance = config.lv_pixels_tolerance,
+        };
+    }
     if (config.mimo_vision) return .{
         .mode = .mimo,
         .patch = config.qv_patch,
@@ -14784,14 +14988,15 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
         .max_tokens = config.glmv_max_image_tokens,
         .max_video_tokens = config.glmv_max_video_tokens,
     };
-    if (!config.qwen_vision) return .{};
+    if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
-        .mode = .qwen,
+        .mode = if (config.muse_vision) .muse else .qwen,
         .patch = config.qv_patch,
         .tps = config.qv_temporal_patch,
         .merge = config.qv_merge,
         .min_pixels = config.qv_min_pixels,
         .max_pixels = config.qv_max_pixels,
+        .max_tokens = config.mv_max_image_tokens,
     };
 }
 
@@ -14800,7 +15005,7 @@ var vision_pixel_clamp_logged: bool = false;
 fn logVisionPixelClamp(declared: u32) void {
     if (vision_pixel_clamp_logged) return;
     vision_pixel_clamp_logged = true;
-    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ vision_common.ENGINE_MAX_PIXELS, declared });
+    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ qwen_vision.ENGINE_MAX_PIXELS, declared });
 }
 
 test "visionPreprocFromConfig threads each tower's processor bounds" {
@@ -14819,6 +15024,17 @@ test "visionPreprocFromConfig threads each tower's processor bounds" {
     try std.testing.expectEqual(@as(u32, 65536), qwen.min_pixels);
     try std.testing.expectEqual(@as(u32, 16777216), qwen.max_pixels);
 
+    // muse caps on MERGED tokens instead of pixels, and must not be routed
+    // through the Qwen resize (different algorithm, different patch order).
+    const muse = visionPreprocFromConfig(&.{
+        .muse_vision = true,
+        .qv_patch = 14,
+        .qv_temporal_patch = 2,
+        .qv_merge = 2,
+        .mv_max_image_tokens = 4096,
+    });
+    try std.testing.expectEqual(.muse, muse.mode);
+    try std.testing.expectEqual(@as(u32, 4096), muse.max_tokens);
     try std.testing.expectEqual(.gemma, visionPreprocFromConfig(&.{}).mode);
 
     const mimo = visionPreprocFromConfig(&.{
@@ -14868,7 +15084,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .mimo }, .{ .mode = .qwen } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen } }) |vp| {
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -15100,17 +15316,175 @@ pub fn appendImageUrlContent(
     vp: chat_mod.VisionPreproc,
 ) bool {
     const before = list.items.len;
+    if (vp.mode == .lfm2 and vp.tile_size > 0 and std.mem.startsWith(u8, url, "data:image/") and
+        !std.mem.startsWith(u8, url, "data:image/x-mlx-pixels"))
+    {
+        appendLfm2Tiles(allocator, list, url, vp);
+        return list.items.len > before;
+    }
     if (parseImageUrlContent(allocator, url, vp)) |img| {
         list.append(allocator, img) catch allocator.free(img.pixels);
     }
     return list.items.len > before;
 }
 
-/// The resample filter belongs to the arch's reference processor; every served
-/// patch-grid tower resizes bicubic.
-fn resampleFilterFor(vp: chat_mod.VisionPreproc) vision_common.Filter {
-    _ = vp;
-    return .bicubic;
+/// `Lfm2VlImageProcessor.resize_and_split`: a source inside the budget is one
+/// resized image; past it, the WHOLE image is resized onto a `cols`x`rows`
+/// canvas of `tile_size` tiles, cut into tiles, and a thumbnail of the whole
+/// image is appended after them. The canvas is resampled ONCE and read tile by
+/// tile — re-resizing per tile would resample each region on its own and is not
+/// what `split_to_tiles` does.
+fn appendLfm2Tiles(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.ImageData),
+    url: []const u8,
+    vp: chat_mod.VisionPreproc,
+) void {
+    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return;
+    const b64 = url[sep + 8 ..];
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return;
+    const raw = allocator.alloc(u8, decoded_size) catch return;
+    defer allocator.free(raw);
+    std.base64.standard.Decoder.decode(raw, b64) catch return;
+
+    const src = decodeRgbOwned(allocator, raw) orelse return;
+    defer src.deinit(allocator);
+
+    const split = vp.max_tiles > 1 and
+        lfm2_vision.isImageTooLarge(src.h, src.w, vp.patch, vp.merge, vp.max_tokens, vp.pixels_tolerance);
+    // Doubles as the whole-image geometry when the source stays one tile.
+    const thumb = lfm2_vision.smartResize(src.h, src.w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens);
+    const thumb_tokens = (thumb.h / vp.patch / vp.merge) * (thumb.w / vp.patch / vp.merge);
+
+    if (!split) {
+        const chw = lfm2Canvas(allocator, src, thumb.h, thumb.w, vp) orelse return;
+        defer allocator.free(chw);
+        const img = lfm2Region(allocator, chw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w) orelse return;
+        list.append(allocator, img) catch {
+            allocator.free(img.pixels);
+            return;
+        };
+        log.info("  Decoded {d}x{d} image → lfm2 grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
+            src.w, src.h, thumb.h / vp.patch, thumb.w / vp.patch, thumb_tokens, thumb.w, thumb.h,
+        });
+        return;
+    }
+
+    const grid = lfm2_vision.gridLayout(src.h, src.w, vp.min_tiles, vp.max_tiles, vp.tile_size);
+    const canvas_h = vp.tile_size * grid.rows;
+    const canvas_w = vp.tile_size * grid.cols;
+    const per_tile = (vp.tile_size / vp.patch / vp.merge) * (vp.tile_size / vp.patch / vp.merge);
+    const n_tiles: u16 = @intCast(grid.rows * grid.cols);
+    const before = list.items.len;
+
+    // A partial tile set would be spliced against a token layout that assumes
+    // all of them, so any failure drops the whole image rather than some of it.
+    var ok = true;
+    {
+        const chw = lfm2Canvas(allocator, src, canvas_h, canvas_w, vp) orelse return;
+        defer allocator.free(chw);
+        outer: for (0..grid.rows) |row| {
+            for (0..grid.cols) |col| {
+                var img = lfm2Region(
+                    allocator,
+                    chw,
+                    canvas_h,
+                    canvas_w,
+                    vp,
+                    @intCast(row * vp.tile_size),
+                    @intCast(col * vp.tile_size),
+                    vp.tile_size,
+                    vp.tile_size,
+                ) orelse {
+                    ok = false;
+                    break :outer;
+                };
+                img.tile_rows = @intCast(grid.rows);
+                img.tile_cols = @intCast(grid.cols);
+                img.tile_index = @intCast(row * grid.cols + col);
+                list.append(allocator, img) catch {
+                    allocator.free(img.pixels);
+                    ok = false;
+                    break :outer;
+                };
+            }
+        }
+    }
+    if (!ok) {
+        for (list.items[before..]) |prior| allocator.free(prior.pixels);
+        list.shrinkRetainingCapacity(before);
+        return;
+    }
+
+    var thumb_note: []const u8 = "";
+    if (vp.use_thumbnail and n_tiles != 1) {
+        if (lfm2Canvas(allocator, src, thumb.h, thumb.w, vp)) |tchw| {
+            defer allocator.free(tchw);
+            if (lfm2Region(allocator, tchw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w)) |t| {
+                var img = t;
+                img.tile_rows = @intCast(grid.rows);
+                img.tile_cols = @intCast(grid.cols);
+                img.tile_index = n_tiles;
+                list.append(allocator, img) catch allocator.free(img.pixels);
+                thumb_note = " + thumbnail";
+            }
+        }
+    }
+    log.info("  Decoded {d}x{d} image → lfm2 {d}x{d} tiles{s} on a {d}x{d} canvas ({d} tokens)\n", .{
+        src.w,      src.h,
+        grid.rows,  grid.cols,
+        thumb_note, canvas_w,
+        canvas_h,   @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
+    });
+}
+
+/// Resize `src` onto a `canvas_h` x `canvas_w` normalized CHW buffer, owned by
+/// the caller. One resample serves every tile cut from it.
+/// The resample filter belongs to the ARCH's reference processor, not to the
+/// resampler it shares: muse smart-resizes with Lanczos, LFM2-VL with PIL
+/// BILINEAR (`Lfm2VlImageProcessor` uses it at all three sites — tile canvas,
+/// thumbnail, single view), Qwen with bicubic. Reusing a neighbouring tower's
+/// filter is silent: the geometry and token counts still match, the pixels do
+/// not (measured 2026-08-14: bicubic loses 3 of 144 ScreenSpot-v2 items on
+/// LFM2.5-VL and never wins one).
+fn resampleFilterFor(vp: chat_mod.VisionPreproc) qwen_vision.Filter {
+    return switch (vp.mode) {
+        .muse => .lanczos,
+        .lfm2 => .bilinear,
+        else => .bicubic,
+    };
+}
+
+fn lfm2Canvas(allocator: std.mem.Allocator, src: DecodedRgb, canvas_h: u32, canvas_w: u32, vp: chat_mod.VisionPreproc) ?[]f32 {
+    const chw = allocator.alloc(f32, 3 * @as(usize, canvas_h) * canvas_w) catch return null;
+    qwen_vision.resizeRgbNormalizedChw(allocator, chw, src.rgb, src.h, src.w, canvas_h, canvas_w, resampleFilterFor(vp)) catch {
+        allocator.free(chw);
+        return null;
+    };
+    return chw;
+}
+
+/// Emit the patch region at (`y0`, `x0`) of a prepared canvas as one `ImageData`.
+fn lfm2Region(
+    allocator: std.mem.Allocator,
+    chw: []const f32,
+    canvas_h: u32,
+    canvas_w: u32,
+    vp: chat_mod.VisionPreproc,
+    y0: u32,
+    x0: u32,
+    region_h: u32,
+    region_w: u32,
+) ?chat_mod.ImageData {
+    const C: u32 = 3;
+    const gh = region_h / vp.patch;
+    const gw = region_w / vp.patch;
+    const n: usize = @as(usize, gh) * gw;
+    const feat: usize = @as(usize, C) * vp.patch * vp.patch;
+    const bytes = allocator.alloc(u8, n * feat * 4) catch return null;
+    const out = @as([*]f32, @ptrCast(@alignCast(bytes.ptr)))[0 .. n * feat];
+    lfm2_vision.buildPixelValuesRegion(out, chw, C, canvas_h, canvas_w, vp.patch, y0, x0, region_h, region_w);
+    return .{ .pixels = bytes, .width = region_w, .height = region_h, .grid_h = gh, .grid_w = gw };
 }
 
 /// A decoded source image as packed RGB8, owned by `allocator`. One owner and
@@ -15157,13 +15531,15 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
 }
 
 /// The pixel size a patch-grid tower's processor resizes an `src_h` x `src_w` image to.
-fn imageResize(vp: chat_mod.VisionPreproc, factor: u32, src_h: u32, src_w: u32) vision_common.Resized {
-    const bounds = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+fn imageResize(vp: chat_mod.VisionPreproc, factor: u32, src_h: u32, src_w: u32) qwen_vision.Resized {
+    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
     if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
     return switch (vp.mode) {
+        .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
+        .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
         .mimo => mimo_vision.smartResize(src_h, src_w, factor, bounds.min, bounds.max),
         .glm5 => glm5_vision.smartResize(vp.tps, src_h, src_w, vp.tps, factor, vp.min_tokens, vp.max_tokens),
-        else => vision_common.smartResizeImage(src_h, src_w, factor, bounds.min, bounds.max),
+        else => qwen_vision.smartResizeImage(src_h, src_w, factor, bounds.min, bounds.max),
     };
 }
 
@@ -15201,7 +15577,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             mimo_vision.resizeNormalizedChw(chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
         } else if (vp.mode == .glm5) {
             glm5_vision.resizeNormalizedChw(allocator, chw, px[0..source_len], src_h, src_w, rh, rw, vp.tps, vp.tps, factor, vp.min_tokens) catch return null;
-        } else vision_common.resizeRgbNormalizedChw(
+        } else qwen_vision.resizeRgbNormalizedChw(
             allocator,
             chw,
             px[0..source_len],
@@ -15215,7 +15591,9 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
         switch (vp.mode) {
-            else => vision_common.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge),
+            .muse => muse_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps),
+            .lfm2 => lfm2_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch),
+            else => qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge),
         }
         log.info("  Decoded {d}x{d} image → {s} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, @tagName(vp.mode), gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
         return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
@@ -15285,7 +15663,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         };
     }
 
-    const bounds = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
     const min_pixels = bounds.min;
     const max_pixels = bounds.max;
     if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
@@ -15294,7 +15672,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
     const rs = if (vp.mode == .glm5)
         glm5_vision.smartResize(@intCast(frame_urls.len), first.h, first.w, vp.tps, factor, vp.min_tokens, vp.max_video_tokens)
     else
-        vision_common.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
+        qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
     const rh = rs.h;
     const rw = rs.w;
     const C: u32 = 3;
@@ -15315,7 +15693,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         const resize = if (vp.mode == .glm5)
             glm5_vision.resizeNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, @intCast(frame_urls.len), vp.tps, factor, vp.min_tokens)
         else
-            vision_common.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp));
+            qwen_vision.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp));
         resize catch {
             allocator.free(chw);
             return null;
@@ -15341,7 +15719,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
             group_frames[k] = frames_chw.items[idx];
         }
         const out_slice = pv_f32[g * n_per_group * feat ..][0 .. n_per_group * feat];
-        vision_common.buildPixelValuesVideo(out_slice, group_frames[0..vp.tps], C, rh, rw, vp.patch, vp.merge);
+        qwen_vision.buildPixelValuesVideo(out_slice, group_frames[0..vp.tps], C, rh, rw, vp.patch, vp.merge);
     }
 
     log.info("  Decoded {d} frames → {s} video grid_t={d} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
@@ -16050,7 +16428,7 @@ fn handleAnthropicMessages(
     // than paying for it and discarding it); a PRESENT object decides
     // explicitly, exactly as before.
     var enable_thinking = if (root.get("thinking") == null)
-        config.defaultEnableThinking()
+        config.defaultEnableThinking(root.get("tools") != null)
     else
         false;
     var reasoning_budget: i32 = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
@@ -16112,12 +16490,12 @@ fn handleAnthropicMessages(
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter: bool = lm.dflash != null;
+    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
         lm_default_enable_drafter;
-    if (enable_drafter and lm.dflash == null) enable_drafter = false;
+    if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
@@ -16127,8 +16505,8 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
     // chat-completions' `response_format`: a schema instruction in the system
@@ -16403,7 +16781,7 @@ fn handleAnthropicNonStreaming(
 
     // Speculative decoding dispatch — same `requestSpecModes` as
     // chat-completions (DFlash > MTP > drafter > PLD).
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -16660,7 +17038,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -16685,6 +17063,7 @@ fn handleAnthropicStreaming(
         .timeout_ns = getTimeoutNs(),
         .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
+        .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
         .allow_batch_mtp = allow_batch_mtp,
@@ -17845,7 +18224,7 @@ fn handleResponsesInner(
     const active_has_tools = has_tools and !final_answer_mode;
     const active_tools_json: ?[]const u8 = if (active_has_tools) tools_json else null;
     const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice_instruction else null;
-    enable_thinking = responsesEnableThinking(root, enable_thinking, config.defaultEnableThinking());
+    enable_thinking = responsesEnableThinking(root, enable_thinking, config.defaultEnableThinking(active_has_tools));
     if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
@@ -17986,8 +18365,8 @@ fn handleResponsesInner(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
-    if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
+    if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Check if attention computation would exceed GPU memory.
@@ -18154,12 +18533,12 @@ fn handleResponsesInner(
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter_resp: bool = lm.dflash != null;
+    const lm_default_enable_drafter_resp: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
         lm_default_enable_drafter_resp;
-    if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
+    if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
     if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
@@ -18185,7 +18564,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -18212,7 +18591,8 @@ fn handleResponsesInner(
             .timeout_ns = getTimeoutNs(),
             .enable_pld = stream_mode == .pld,
             .enable_drafter = stream_mode == .drafter,
-                .dflash = if (stream_mode == .drafter) lm.dflash else null,
+            .drafter = if (stream_mode == .drafter) lm.drafter else null,
+            .dflash = if (stream_mode == .drafter) lm.dflash else null,
             .drafter_block_size = lm.drafter_block_size,
             .allow_batch_mtp = allow_batch_mtp,
             .enable_mtp = stream_mode == .mtp,
@@ -18516,7 +18896,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         const use_pld = spec.use_pld;
@@ -20076,8 +20456,8 @@ test "safeAutoContext leaves headroom below the memory ceiling and rounds to 102
     // The raw ceiling is the largest context that FITS. Running at exactly that
     // leaves nothing for the prefix cache to grow into, a second model, or
     // another app — so admit only `auto_ctx_safety_pct` of it.
-    try testing.expectEqual(@as(u32, 88064), safeAutoContext(94729)); // 93% = 88098 -> 1024-floor
-    try testing.expectEqual(@as(u32, 29696), safeAutoContext(32768)); // 93% = 30474 -> 1024-floor
+    try testing.expectEqual(@as(u32, 79872), safeAutoContext(94729)); // 85% = 80519 -> 1024-floor
+    try testing.expectEqual(@as(u32, 27648), safeAutoContext(32768)); // 85% = 27852 -> 1024-floor
     // Never rounds down to zero on a tiny ceiling.
     try testing.expect(safeAutoContext(1000) > 0);
     try testing.expect(safeAutoContext(1) > 0);
@@ -20098,7 +20478,7 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
 
     // A tiny model whose `max_position_embeddings` is far below anything memory
     // could constrain: it must get its FULL declared context, un-margined.
-    // (Regression: applying the margin AFTER the model-max clamp shaved context off a
+    // (Regression: applying 85% AFTER the model-max clamp shaved 15% off a
     // 131,072-token checkpoint that fits in RAM with room to spare.)
     var small = model_mod.ModelConfig{};
     small.max_position_embeddings = 4096;
@@ -20115,23 +20495,7 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     unbounded.max_position_embeddings = 0;
     try testing.expect(autoContextFor(&unbounded) > 0);
     const memory_ctx = memoryContextAt(&unbounded, 96 << 30, 40 << 30);
-    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap()));
-}
-
-test "every served model advertises 93% of the memory ceiling, capped at its own maximum" {
-    const t = testing;
-    var qwen = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
-    defer qwen.deinit(t.allocator);
-    var mimo = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/mimo_v2.json"));
-    defer mimo.deinit(t.allocator);
-    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
-    defer glm.deinit(t.allocator);
-    for ([_]*const model_mod.ModelConfig{ &qwen, &mimo, &glm }) |cfg| {
-        try t.expectEqual(@as(u32, 1_048_576), cfg.contextCap());
-        try t.expectEqual(@as(u32, 88064), autoContextFrom(94729, cfg.contextCap()));
-        try t.expectEqual(cfg.contextCap(), autoContextFrom(4_000_000, cfg.contextCap()));
-        try t.expectEqual(@as(u32, 974_848), autoContextFrom(1_048_576, cfg.contextCap()));
-    }
+    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap(), auto_ctx_safety_pct));
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
@@ -20268,8 +20632,8 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     defer wired_limit_mb_override = saved;
     wired_limit_mb_override = 120_000;
 
-    try t.expectEqual(@as(u64, 1 << 30), WIRED_LIMIT_MARGIN_BYTES);
-    try t.expectEqual(@as(u64, 118_976), wiredLimitFloor(120_000 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES) / mb);
+    try t.expectEqual(@as(u64, 4 << 30), WIRED_LIMIT_MARGIN_BYTES);
+    try t.expectEqual(@as(u64, 115_904), wiredLimitFloor(120_000 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES) / mb);
     // The macOS default (75% of RAM) and anything under it declares nothing; and however
     // absurd the sysctl, never plan within the margin of physical RAM.
     try t.expectEqual(@as(u64, 0), wiredLimitFloor(98_304 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES));
@@ -20310,18 +20674,17 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     try t.expectEqual(@as(u64, 11_388), needed / mb);
     try t.expect(needed > gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
     const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
-    try t.expectEqual(@as(u64, 31_254), (lifted -| footprint) / mb);
+    try t.expectEqual(@as(u64, 28_182), (lifted -| footprint) / mb);
     try t.expect(needed <= lifted -| footprint);
 }
 
-test "parseWiredMarginGib accepts 1..32 and names a bad value" {
+test "parseWiredMarginGib accepts 2..32 and names a bad value" {
     const t = std.testing;
-    try t.expectEqual(@as(u64, 1) << 30, try parseWiredMarginGib("1"));
     try t.expectEqual(@as(u64, 8) << 30, try parseWiredMarginGib("8"));
     try t.expectEqual(@as(u64, 6) << 30, try parseWiredMarginGib("6"));
     try t.expectEqual(@as(u64, 2) << 30, try parseWiredMarginGib("2"));
     try t.expectEqual(@as(u64, 32) << 30, try parseWiredMarginGib("32"));
-    try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("0"));
+    try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("1"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("33"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("nope"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib(""));
@@ -20501,6 +20864,43 @@ test "auto-context on a 16 GB profile: activations are a chunk reserve, not a pe
     // back rather than being invisible.
     const narrow = safeContextForBudget(ceiling, weights, prefillTransientReserve(&cfg, 4, 256), per_tok, 262144);
     try t.expect(narrow > got);
+}
+
+test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+    cfg.num_hidden_layers = 64;
+    cfg.full_attention_interval = 4;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_num_value_heads = 48;
+    cfg.max_position_embeddings = 262144;
+
+    const wide = aneGateHeadroom(&cfg, 8192);
+    const narrow = aneGateHeadroom(&cfg, 1024);
+    const gib = 1024 * 1024 * 1024;
+
+    // Dominated by the chunk envelope, which is the whole point: the flat
+    // 12 GB it replaces refused a measured +38% prefill at chunk 1024 while
+    // under-reserving at chunk 8192.
+    try t.expect(wide > 8 * gib);
+    try t.expect(narrow < wide * 3 / 4);
+
+    // The KV reserve is exactly MIN_CONTEXT_TOKENS worth — the guarantee that
+    // an admitted offload leaves a usable context behind.
+    try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
+        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits(&cfg)) * ane_mod.MIN_CONTEXT_TOKENS +
+        resolvedPrefixCacheMem() +
+        prefillTransientReserve(&cfg, defaultKvBits(&cfg), 1024));
+
+    // A model that cannot reach the reserve context only reserves its own max.
+    cfg.max_position_embeddings = 8192;
+    try t.expect(aneGateHeadroom(&cfg, 1024) < narrow);
 }
 
 test "auto-context never sizes past the ceiling as weights grow" {
@@ -20995,8 +21395,57 @@ test "renderPropsBody omits chat_template" {
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
+    // No ANE engine => no ane object, and the body is still valid JSON.
+    try testing.expect(std.mem.indexOf(u8, body, "\"ane\"") == null);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     parsed.deinit();
+}
+
+test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill and eval counts" {
+    const one = [_]AneUnitStat{.{ .instance = 0, .evals = 112, .eval_failures = 0 }};
+    const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &one);
+    defer testing.allocator.free(frag);
+    try testing.expectEqualStrings(",\"ane\":{\"mode\":\"channel\",\"units\":1,\"mlp_layers\":64,\"gdn_layers\":48,\"rows\":8192,\"chunk_rows\":8192,\"share\":0.45,\"int8_bytes\":9469231104,\"evals\":112,\"eval_failures\":0,\"unit_evals\":[{\"instance\":0,\"evals\":112,\"eval_failures\":0}]}", frag);
+    // Spliced into a props body it stays valid JSON with the object present.
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3_5_moe";
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const ane = parsed.value.object.get("ane") orelse return error.MissingAne;
+    try testing.expectEqualStrings("channel", ane.object.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 48), ane.object.get("gdn_layers").?.integer);
+    // The M3 Ultra tester could not verify DISPATCH from /props (the
+    // engagement lines live only in the log) — evals is the probe a bench
+    // harness reads: zero with a green boot = built-but-never-dispatched.
+    try testing.expectEqual(@as(i64, 112), ane.object.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 0), ane.object.get("eval_failures").?.integer);
+
+    // Dual: `evals` is the TOTAL, and `unit_evals` names each die. A
+    // silently ignored affinity hint is invisible in-process — both units
+    // report evals and both land on one ANE — so this row is what a tester
+    // cross-checks against `macpow --dump | grep ANE0_`, which must show
+    // BOTH counters moving.
+    const two = [_]AneUnitStat{
+        .{ .instance = 1, .evals = 112, .eval_failures = 0 },
+        .{ .instance = 2, .evals = 112, .eval_failures = 3 },
+    };
+    const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
+    defer testing.allocator.free(dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, dual);
+    defer testing.allocator.free(dual_body);
+    var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
+    defer dual_parsed.deinit();
+    const dane = dual_parsed.value.object.get("ane").?.object;
+    try testing.expectEqual(@as(i64, 2), dane.get("units").?.integer);
+    try testing.expectEqual(@as(i64, 224), dane.get("evals").?.integer);
+    try testing.expectEqual(@as(i64, 3), dane.get("eval_failures").?.integer);
+    const rows_json = dane.get("unit_evals").?.array;
+    try testing.expectEqual(@as(usize, 2), rows_json.items.len);
+    try testing.expectEqual(@as(i64, 1), rows_json.items[0].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 2), rows_json.items[1].object.get("instance").?.integer);
+    try testing.expectEqual(@as(i64, 112), rows_json.items[1].object.get("evals").?.integer);
 }
 
 test "queryModel: GET /props?model=<id> routes to that model, percent-decoded" {
@@ -21132,6 +21581,19 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
     try testing.expectEqual(@as(i64, 17_179_869_184), w.get("bytes").?.integer);
     try testing.expectEqual(@as(i64, 54_975_581_388), w.get("total").?.integer);
 
+    // Both fragments splice at the same slot, so an ANE boot on a qwen4 pack
+    // must still parse.
+    const one = [_]AneUnitStat{.{ .instance = 0, .evals = 1, .eval_failures = 0 }};
+    const ane = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 1, &one);
+    defer testing.allocator.free(ane);
+    const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ ane, frag });
+    defer testing.allocator.free(both);
+    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, both);
+    defer testing.allocator.free(body2);
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, body2, .{});
+    defer parsed2.deinit();
+    try testing.expect(parsed2.value.object.get("ane") != null);
+    try testing.expect(parsed2.value.object.get("ngram_warm") != null);
 }
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
@@ -21642,49 +22104,6 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
 }
 
-test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 400" {
-    const allocator = std.testing.allocator;
-    const Want = union(enum) { text: []const u8, ids: []const u32, invalid, missing };
-    const cases = [_]struct { body: []const u8, want: Want }{
-        .{ .body = "{\"prompt\":\"hi\"}", .want = .{ .text = "hi" } },
-        .{ .body = "{\"prompt\":[\"hi\"]}", .want = .{ .text = "hi" } },
-        .{ .body = "{\"prompt\":[1,2,3]}", .want = .{ .ids = &.{ 1, 2, 3 } } },
-        .{ .body = "{\"prompt\":[[5,6]]}", .want = .{ .ids = &.{ 5, 6 } } },
-        .{ .body = "{\"prompt\":[[1],[2]]}", .want = .invalid },
-        .{ .body = "{\"prompt\":[\"a\",\"b\"]}", .want = .invalid },
-        .{ .body = "{\"prompt\":[]}", .want = .invalid },
-        .{ .body = "{\"prompt\":[1,-2]}", .want = .invalid },
-        .{ .body = "{\"prompt\":[1,100]}", .want = .invalid },
-        .{ .body = "{\"prompt\":7}", .want = .invalid },
-        .{ .body = "{}", .want = .missing },
-    };
-    for (cases) |case| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
-        defer parsed.deinit();
-        const got = try parseCompletionPrompt(allocator, parsed.value.object.get("prompt"), 100);
-        defer if (got == .ids) allocator.free(got.ids);
-        switch (case.want) {
-            .text => |t| try std.testing.expectEqualStrings(t, got.text),
-            .ids => |ids| try std.testing.expectEqualSlices(u32, ids, got.ids),
-            .invalid => try std.testing.expect(got == .invalid),
-            .missing => try std.testing.expect(got == .missing),
-        }
-    }
-}
-
-test "echoRejectReason: echo is refused by name, never silently dropped" {
-    const allocator = std.testing.allocator;
-    for ([_]struct { body: []const u8, rejected: bool }{
-        .{ .body = "{}", .rejected = false },
-        .{ .body = "{\"echo\":false}", .rejected = false },
-        .{ .body = "{\"echo\":true}", .rejected = true },
-    }) |case| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(case.rejected, echoRejectReason(parsed.value.object) != null);
-    }
-}
-
 test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { body: []const u8, rejected: bool }{
@@ -21945,7 +22364,8 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
             .tokenizer = null,
             .chat_config = &chat_cfg,
             .vision_encoder = null,
-                .drafter_path = "",
+            .drafter = null,
+            .drafter_path = "",
             .drafter_block_size = 0,
             .prefix_cache = null,
             .refcount = std.atomic.Value(u32).init(0),
@@ -22716,6 +23136,46 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     );
 }
 
+test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, not the generic MoE chunk" {
+    const t = std.testing;
+    // Live 2026-08-01 (pi + stochastic DSpark, stages resident): a 7514-token
+    // prompt was 400-rejected — the generic estimator billed 4069 MB against
+    // 3610 MB available. Its chunk term is the generic MoE prefill cap (4096)
+    // but dsv4 sub-chunks internally at 512 (deepseek_v4.prefillSub — the
+    // MLP transient envelope is 8x smaller), and its score term is fp16
+    // attention scratch while dsv4's real transient is the [C, tk, latent]
+    // f32 gathered-K set (the very allocation PREFILL_SUB exists to bound).
+    // The honest bill for the same request is ~2.3 GB — admitted with room.
+    const available: u64 = 3610 * 1024 * 1024;
+    const generic = prefillMemoryNeeded(7514, 64, 1, 88064, 512, 512, 4096, 12288, 16, 4096, 641, 0, 0, .{});
+    try t.expectEqual(@as(u64, 4069 + 640), generic / (1024 * 1024));
+    try t.expect(generic > available);
+    const honest = dsv4PrefillMemoryNeeded(7514, 43, 512, 4096, 12288, 512, 641);
+    try t.expectEqual(@as(u64, 2344 + 640), honest / (1024 * 1024));
+    try t.expect(honest < available);
+    // Not under-billing: the full 25% margin survives over the real state +
+    // transient floor (raw + compressed latents in f32, the gathered-K set).
+    const floor: u64 = 43 * 7514 * 512 * 4 * 3 / 2 + 512 * 641 * 512 * 4;
+    try t.expect(honest > floor * 5 / 4);
+    // A prompt shorter than the sub-chunk bills its own width, not the cap
+    // (the hy_v3 31-token-prompt class).
+    try t.expect(dsv4PrefillMemoryNeeded(31, 43, 512, 4096, 12288, 512, 641) < 704 * 1024 * 1024);
+    // The bill stays honest at the far end: a full 40960-token window costs
+    // real state (~5 GB of latents) — the fix must not flatten the curve.
+    try t.expect(dsv4PrefillMemoryNeeded(40960, 43, 512, 4096, 12288, 512, 641) > 6 * 1024 * 1024 * 1024);
+}
+
+test "checkAttentionMemory routes deepseek_v4 through its own estimator with the REAL sub-chunk" {
+    // The estimator existing proves nothing if the call site keeps handing
+    // dsv4 to the generic bill (the attn_keys scan-test class). Needles are
+    // split with `++` so this test's own source never matches them.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const call = "dsv4PrefillMemoryNeeded(seq, layers, " ++
+        "kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))";
+    try t.expect(std.mem.indexOf(u8, src, call) != null);
+}
+
 test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     // RAM restore uses refcount-sharing. The resident entry is already inside
     // `active_mem`, and prefillMemoryNeeded bills the destination KV growth.
@@ -23003,36 +23463,40 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
     const t = std.testing;
     // No sidecar loaded → never on, whatever the operator asked for.
-    try t.expect(!defaultEnableMtp(false, false, false, false, false));
-    try t.expect(!defaultEnableMtp(false, true, true, false, false));
+    try t.expect(!defaultEnableMtp(false, false, false, false, false, false));
+    try t.expect(!defaultEnableMtp(false, true, true, false, false, false));
     // Dense target with a sidecar → on by default (unchanged behavior).
-    try t.expect(defaultEnableMtp(true, false, false, false, false));
-    try t.expect(defaultEnableMtp(true, false, true, false, false));
+    try t.expect(defaultEnableMtp(true, false, false, false, false, false));
+    try t.expect(defaultEnableMtp(true, false, true, false, false, false));
     // MoE target → OFF by default (the verify-forward routing caution) ...
-    try t.expect(!defaultEnableMtp(true, true, false, false, false));
+    try t.expect(!defaultEnableMtp(true, true, false, false, false, false));
     // ... but ON when the operator passed --mtp. Without this, a MoE MTP
     // checkpoint is unreachable from any client that doesn't send
     // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
-    try t.expect(defaultEnableMtp(true, true, true, false, false));
+    try t.expect(defaultEnableMtp(true, true, true, false, false, false));
+    // DSpark: dsv4's own stages default ON outright — MoE-ness and --mtp
+    // never gate the checkpoint's native draft design.
+    try t.expect(defaultEnableMtp(false, true, false, true, false, false));
+    try t.expect(defaultEnableMtp(false, false, false, true, false, false));
     // A MEASURED native MoE head defaults ON despite is_moe — the
     // caution above is about a bolted-on sidecar paying expert routing it was
     // never designed around, and this arch was measured no-worse-than-serial
     // at every context rung on two prompt shapes.
-    try t.expect(defaultEnableMtp(true, true, false, true, false));
+    try t.expect(defaultEnableMtp(true, true, false, false, true, false));
     // The claim is about the HEAD, so it still needs one loaded.
-    try t.expect(!defaultEnableMtp(false, true, false, true, false));
-    try t.expect(!defaultEnableMtpForStreaming(true, false, false, true, false, true));
-    try t.expect(defaultEnableMtpForStreaming(true, true, true, false, false, true));
+    try t.expect(!defaultEnableMtp(false, true, false, false, true, false));
+    try t.expect(!defaultEnableMtpForStreaming(true, false, false, false, true, false, true));
+    try t.expect(defaultEnableMtpForStreaming(true, true, true, false, false, false, true));
 }
 
 test "defaultEnableMtp: a served MoE pack with its head loaded defaults ON; streaming keeps --mtp" {
     const t = std.testing;
-    try t.expect(defaultEnableMtp(true, true, false, false, true));
-    try t.expect(!defaultEnableMtp(false, true, false, false, true)); // still needs a head
-    try t.expect(!defaultEnableMtp(true, true, false, false, false)); // an inherited MoE arch keeps the caution
-    try t.expect(!defaultEnableMtpForStreaming(true, true, false, false, true, true));
-    try t.expect(defaultEnableMtpForStreaming(true, true, true, false, true, true));
-    try t.expect(defaultEnableMtpForStreaming(true, true, false, false, true, false));
+    try t.expect(defaultEnableMtp(true, true, false, false, false, true));
+    try t.expect(!defaultEnableMtp(false, true, false, false, false, true)); // still needs a head
+    try t.expect(!defaultEnableMtp(true, true, false, false, false, false)); // an inherited MoE arch keeps the caution
+    try t.expect(!defaultEnableMtpForStreaming(true, true, false, false, false, true, true));
+    try t.expect(defaultEnableMtpForStreaming(true, true, true, false, false, true, true));
+    try t.expect(defaultEnableMtpForStreaming(true, true, false, false, false, true, false));
     try t.expect(model_mod.isServedArch("qwen4_exp") and model_mod.isServedArch("mimo_v2"));
 }
 
@@ -23272,6 +23736,7 @@ test "POST /v1/completions with a prompt that tokenizes to nothing answers 400 b
     lm.config = &cfg;
     lm.tokenizer = &tok;
     lm.transformer = null;
+    lm.drafter = null;
     lm.dflash = null;
     lm.mtp = null;
 
@@ -24202,7 +24667,7 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
 
     // Auto boot, nothing pinned: the session is what the machine can serve. `cache_reserve = 0`
     // is a test isolation.
-    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
+    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expect(auto > 100_000);
     try t.expect(auto <= cap);
 
@@ -24223,9 +24688,9 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
     try t.expect(fixed -| real_kv < (bogus -| placeholder_kv) / 2);
 
     // An explicit --ctx-size wins outright, and a pinned context is used as-is.
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap));
-    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap));
-    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
+    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
+    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
 }
 
 test "the advertised context does not move with the cache ask" {
@@ -24253,8 +24718,8 @@ test "the advertised context does not move with the cache ask" {
     try t.expect(vs_resolved <= 1024);
 
     // The pair agrees at the advertised number: both sides go through `autoContextFrom`.
-    const advertised = autoContextFrom(memory_ctx, cfg.contextCap());
-    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
+    const advertised = autoContextFrom(memory_ctx, cfg.contextCap(), auto_ctx_safety_pct);
+    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap(), auto_ctx_safety_pct);
     try t.expectEqual(advertised, clamp_ctx);
 }
 
@@ -25523,6 +25988,7 @@ fn testQuantizationModelRow(k: ?u8, expected: []const u8, loaded: bool) !void {
         .tokenizer = null,
         .chat_config = null,
         .vision_encoder = null,
+        .drafter = null,
         .drafter_path = "",
         .drafter_block_size = 0,
         .prefix_cache = null,
@@ -25732,28 +26198,6 @@ test "tool_choice auto and none arm no forced call" {
     defer a.free(ids);
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .auto, null) == null);
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .none, null) == null);
-}
-
-test "tool_choice none bans each family's one-token call opener, and nothing else" {
-    const a = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(a);
-    defer arena_state.deinit();
-    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>" });
-    defer deinitTestTokenizer(&tok);
-    var split = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
-    defer deinitTestTokenizer(&split);
-    for ([_][]const u8{
-        @embedFile("fixtures/qwen38_chat_template.jinja"),
-        @embedFile("fixtures/mimo_v26_chat_template.jinja"),
-        @embedFile("fixtures/glm53_chat_template.jinja"),
-    }) |tpl| {
-        var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
-        const ban = noneCallBan(a, &tok, &config) orelse return error.OpenerNotBanned;
-        try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, ban.id);
-        try std.testing.expectEqual(@as(f32, -100), ban.delta);
-        // An opener the tokenizer splits would ban its first piece, a plain `<`, everywhere.
-        try std.testing.expect(noneCallBan(a, &split, &config) == null);
-    }
 }
 
 /// Render one turn as the surface builds it: Responses input (with `instructions`)
@@ -26100,9 +26544,7 @@ test "web tools: list, confined execution, and browser origin guard" {
     }
     listen_host = "127.0.0.1";
     listen_port = 12345;
-    const Case = struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8, lacks: []const u8 = "" };
-    const write_call = "{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside.md\\\",\\\"content\\\":\\\"x\\\"}\",\"write\":true}";
-    const cases = [_]Case{
+    const cases = [_]struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8 }{
         .{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = "web_search" },
         .{ .origin = "http://evil.test", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
         .{ .origin = "null", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
@@ -26112,31 +26554,14 @@ test "web tools: list, confined execution, and browser origin guard" {
         .{ .origin = "http://localhost:12345", .body = "{\"directory\":\"/sushi-folder-does-not-exist\"}", .status = "400 Bad Request", .contains = "no such folder" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside\\\"}\"}", .status = "200 OK", .contains = "refused" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"exec\",\"arguments\":\"{}\"}", .status = "200 OK", .contains = "unknown tool" },
-        // The chat's own write flag is the switch: with it the call reaches the confinement check,
-        // which is what keeps the test from writing anything; without it the call is refused.
-        .{ .origin = "http://localhost:12345", .body = write_call, .status = "200 OK", .contains = "outside the folder" },
-        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"edit_file\",\"arguments\":\"{\\\"path\\\":\\\"/etc/hosts\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"b\\\"}\",\"write\":true}", .status = "200 OK", .contains = "outside the folder" },
-        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"x.md\\\",\\\"content\\\":\\\"x\\\"}\"}", .status = "200 OK", .contains = "writing files is off" },
-        .{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = "\"edit_default\":false", .lacks = "write_file" },
-        .{ .origin = "http://localhost:12345", .body = "{\"write\":true,\"vision\":true}", .status = "200 OK", .contains = "edit_file" },
-        .{ .origin = "http://localhost:12345", .body = "{\"write\":\"yes\"}", .status = "400 Bad Request", .contains = "boolean" },
-        .{ .origin = "http://evil.test", .body = write_call, .status = "403 Forbidden", .contains = "Origin" },
     };
-    const old_edit = g_web_edit;
-    defer g_web_edit = old_edit;
-    for ([_]bool{ false, true }) |edit_default| {
-        g_web_edit = edit_default;
-        // --edit on only changes what a new chat starts with; it never writes on its own.
-        const extra = [_]Case{.{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = if (edit_default) "\"edit_default\":true" else "\"edit_default\":false", .lacks = "write_file" }};
-        for (if (edit_default) &extra else &cases) |c| {
-            const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ c.origin, c.body.len, c.body });
-            defer t.allocator.free(req);
-            const response = try serveOneForTest(req);
-            defer t.allocator.free(response);
-            try t.expect(std.mem.indexOf(u8, response, c.status) != null);
-            try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
-            if (c.lacks.len > 0) try t.expect(std.mem.indexOf(u8, responseBody(response), c.lacks) == null);
-        }
+    for (cases) |c| {
+        const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ c.origin, c.body.len, c.body });
+        defer t.allocator.free(req);
+        const response = try serveOneForTest(req);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.indexOf(u8, response, c.status) != null);
+        try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
     }
 }
 
@@ -26231,6 +26656,9 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk(&other));
+    // A model whose hot cache never loads asks for none.
+    const dsv4 = model_mod.ModelConfig{ .model_type = "deepseek_v4" };
+    try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk(&dsv4));
     // GLM's context is sized with no cache reserve (its admission evicts); its unnamed ask is
     // its 1 GiB tier and a named one stands.
     const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
@@ -26655,10 +27083,10 @@ test "GLM billed checkpoint peak equals the checkpoints its prefill captures, wh
     const per_cp = cfg.ssmCheckpointBytes();
     const Case = struct { seq: u64, matched: u64 };
     const cases = [_]Case{
-        .{ .seq = 16, .matched = 0 },       .{ .seq = 31, .matched = 0 },          .{ .seq = 40, .matched = 0 },
-        .{ .seq = 2049, .matched = 0 },     .{ .seq = 5000, .matched = 0 },        .{ .seq = 18432, .matched = 0 },
-        .{ .seq = 70000, .matched = 0 },    .{ .seq = 65536, .matched = 61440 },   .{ .seq = 18432, .matched = 16384 },
-        .{ .seq = 9000, .matched = 8188 },  .{ .seq = 9100, .matched = 8188 },
+        .{ .seq = 16, .matched = 0 },      .{ .seq = 31, .matched = 0 },        .{ .seq = 40, .matched = 0 },
+        .{ .seq = 2049, .matched = 0 },    .{ .seq = 5000, .matched = 0 },      .{ .seq = 18432, .matched = 0 },
+        .{ .seq = 70000, .matched = 0 },   .{ .seq = 65536, .matched = 61440 }, .{ .seq = 18432, .matched = 16384 },
+        .{ .seq = 9000, .matched = 8188 }, .{ .seq = 9100, .matched = 8188 },
     };
     for ([_]u32{ 256, 2048, 8192, 65536 }) |stride| {
         ssm_checkpoint_stride = stride;
@@ -27038,4 +27466,43 @@ test "seedRequestBuf drops bytes past the allocation" {
     try std.testing.expectEqual(@as(usize, 4), seedRequestBuf(buf, "abcdefgh"));
     try std.testing.expectEqualStrings("abcd", buf);
     try std.testing.expectEqual(@as(usize, 2), seedRequestBuf(buf, "xy"));
+}
+
+test "opencode formatChatUsage reasoning details preserves totals and reports zero" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 7 }) |count| {
+        const details = try reasoningDetailsJson(a, count);
+        defer a.free(details);
+        const raw = try formatChatUsage(a, 10, 20, 4, details);
+        defer a.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(count)), parsed.value.object.get("completion_tokens_details").?.object.get("reasoning_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 30), parsed.value.object.get("total_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 4), parsed.value.object.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+    }
+}
+
+test "opencode formatChatUsage reasoning tokenization ignores SSE boundaries" {
+    const a = std.testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    try tok.vocab.put("a", 1);
+    try tok.vocab.put("b", 2);
+    try tok.vocab.put("ab", 3);
+    try tok.merge_ranks.put(.{ .left = "a", .right = "b" }, 0);
+    var delivered = std.ArrayList(u8).empty;
+    defer delivered.deinit(a);
+    try delivered.appendSlice(a, "a");
+    try delivered.appendSlice(a, "b");
+    const details = try formatReasoningDetails(a, &tok, delivered.items);
+    defer a.free(details);
+    try std.testing.expectEqualStrings(",\"completion_tokens_details\":{\"reasoning_tokens\":1}", details);
+    const empty = try formatReasoningDetails(a, &tok, "");
+    defer a.free(empty);
+    try std.testing.expectEqualStrings(",\"completion_tokens_details\":{\"reasoning_tokens\":0}", empty);
 }
