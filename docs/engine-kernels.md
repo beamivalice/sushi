@@ -29,7 +29,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `gated_delta_step_seq` carries the stored bf16 state to the next token, so serial decode and rollback agree; a
   kernel that carries f32 (upstream's verbatim verify kernel) differs from verify row 1 on.
 - The GDN prework and norm-gate serve bf16 activations only; the chain's recurrence outputs take the stored state's
-  width, so an f32 state (`SUSHI_GDN_STATE_F32=1`) runs the chain while `gdn_decode` declines it.
+  width, so an f32 state (`--qwen-gdn fp32`) runs the chain while `gdn_decode` declines it.
 - The qwen4 fused HC read groups verify rows (`HC_ROW_GROUP` 8 per D/U dispatch group), so each weight word is read
   once per group. Configs are cached per (row count, inject, pending write): MTP alternates widths every round, and
   the first read, reads after a flush and the mixer differ in the other two. The row count stays a template argument:

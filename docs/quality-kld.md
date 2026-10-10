@@ -19,7 +19,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
   QKV and made every pack score the same.
 - Teacher captures run the KV cache dense (`--kv-quant off`); students are scored at kv8 unless the row says so.
 - A Qwen teacher's GDN state is bf16 like every student's, so KLD cannot see that rounding; a teacher captured under
-  `SUSHI_GDN_STATE_F32=1` measures it.
+  `kld capture --qwen-gdn fp32` measures it. GLM is not that case: its recurrent state is KDA, f32 by construction, and
+  a native GLM capture refuses the flag.
 - `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4 and GLM (`[tokens, 4, hidden]`), including boundary zero. GLM teacher and served-pack capture retain every native HC stream. The served path appends each chunk's native boundaries and commits token IDs only after every boundary has the complete prompt.
 - Spool mode (`SUSHI_HIDDEN_SPOOL_BYTES=<budget>`, `SUSHI_HIDDEN_OUT` = spool root, `SUSHI_HIDDEN_SPOOL_FIRST=<n>`) writes each prompt as an atomic window `w-<n>/` and waits while complete windows hold the budget: a consumer deletes the windows it has used. The live Qwen tune reads it; the chunked GLM path is refused.
 - A `--prompts` jsonl line may carry `prompt_ids` (token ids, used as given, no template) instead of `prompt`.
