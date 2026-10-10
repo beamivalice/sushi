@@ -24,6 +24,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_settings = @import("model_settings.zig");
+const log = @import("log.zig");
 
 /// KV-cache storage scheme.
 ///   * `off`      — dense bf16.
@@ -326,10 +327,248 @@ pub fn tbqCentroids(bits: u8) []const f32 {
     return if (bits == 4) &tbq_tables.centroids4 else &tbq_tables.centroids3;
 }
 
+// ── Fused write-side encoder ──
+//
+// The composed `quantizeTBQInner` chains ~25 host-bound lazy MLX ops per K/V
+// block-group (astype, reshape, norm, sign flips, the 128×128 matmul, one
+// greater_equal+add per midpoint, pack, astype, the biases copy). Per decode
+// step that is ~24 dispatches of near-zero work each, and on decode-bound
+// rounds they dominate. The kernel below reproduces the SAME formula in one
+// dispatch: block norm → tvec → s1 → FWHT (butterfly stages 1..16 in
+// registers via shuffles, 32/64 through threadgroup memory) → [1/√128 when
+// normalized] → s2 → midpoint codebook search → 64 (tbq4) or 48 (tbq3)
+// packed bytes + the fp16 norms. Like `rotate_forward` in the fork, the
+// butterfly accumulates in a different order than the matmul, so a v value
+// within ~1 ULP of a midpoint can bucket one code away; RMSE is preserved,
+// bit-exactness with the composed path is NOT (pinned by the fused-vs-composed
+// tests). One threadgroup per 128-element block, 128 threads.
+const TBQ_ENCODE_KERNEL_SOURCE =
+    \\constexpr int NMID = (1 << BITS) - 1;
+    \\
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint g = threadgroup_position_in_grid.x;
+    \\const int blk = int(g) % BLK;
+    \\const long row = long(g) / BLK;
+    \\
+    \\threadgroup float red[4];
+    \\threadgroup float red2[4];
+    \\threadgroup float fw[128];
+    \\threadgroup uint idxg[128];
+    \\
+    \\const float xv = float(x[row * long(BLK) * 128 + long(blk) * 128 + tid]);
+    \\
+    \\// Block L2 norm.
+    \\float n2 = simd_sum(xv * xv);
+    \\if (thread_index_in_simdgroup == 0) red[thread_position_in_threadgroup.x / 32] = n2;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const float norm = sqrt(red[0] + red[1] + red[2] + red[3]);
+    \\
+    \\// tvec, faithful to the composed where/max arms (tbq4 zeroes the block;
+    \\// tbq3 clamps the norm itself).
+    \\float tv;
+    \\if (NORMALIZED == 1) {
+    \\  tv = (norm > 1e-10f) ? xv / fmax(norm, 1e-38f) : 0.0f;
+    \\} else {
+    \\  tv = xv / fmax(norm, 1e-10f);
+    \\}
+    \\
+    \\// Forward rotation: s1 → FWHT → [isv when normalized] → s2.
+    \\tv *= s1[tid];
+    \\for (int h = 1; h <= 16; h <<= 1) {
+    \\  const float p = simd_shuffle_xor(tv, uint(h));
+    \\  tv = (tid & uint(h)) != 0 ? p - tv : tv + p;
+    \\}
+    \\fw[tid] = tv;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\{
+    \\  const float p = fw[tid ^ 32];
+    \\  tv = (tid & 32) != 0 ? p - tv : tv + p;
+    \\}
+    \\fw[tid] = tv;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\{
+    \\  const float p = fw[tid ^ 64];
+    \\  tv = (tid & 64) != 0 ? p - tv : tv + p;
+    \\}
+    \\if (NORMALIZED == 1) tv *= 0.08838834764831845f;
+    \\tv *= s2[tid];
+    \\
+    \\// Codebook index: idx = #{ j : v >= mid[j] } over the ascending
+    \\// midpoints — the same counting rule as the composed greater_equal chain.
+    \\int idx = 0;
+    \\for (int j = 0; j < NMID; ++j) idx += (tv >= mid[j]) ? 1 : 0;
+    \\idxg[tid] = uint(idx);
+    \\
+    \\// Scale d = norm / ‖recon(unit)‖, the where/clamp arms per scheme.
+    \\float rc2 = simd_sum(cen[idx] * cen[idx]);
+    \\if (thread_index_in_simdgroup == 0) red2[thread_position_in_threadgroup.x / 32] = rc2;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const float rn = sqrt(red2[0] + red2[1] + red2[2] + red2[3]);
+    \\float dval;
+    \\if (NORMALIZED == 1) {
+    \\  dval = (rn > 1e-10f) ? norm / fmax(rn, 1e-10f) : norm;
+    \\} else {
+    \\  dval = fmax(norm, 1e-10f) / fmax(rn, 1e-10f);
+    \\}
+    \\
+    \\// Pack: tbq4 two nibbles per byte; tbq3 eight 3-bit codes per 24-bit
+    \\// fixed-point group (no carry), stored little-endian as 3 bytes.
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (BITS == 4) {
+    \\  if (tid < 64) {
+    \\    const uint byte0 = idxg[2 * tid] | (idxg[2 * tid + 1] << 4);
+    \\    q[row * long(BLK) * 64 + long(blk) * 64 + tid] = uchar(byte0);
+    \\  }
+    \\} else {
+    \\  if (tid < 48) {
+    \\    const int grp = int(tid) / 3;
+    \\    const int part = int(tid) % 3;
+    \\    uint w = 0;
+    \\    for (int j = 0; j < 8; ++j) w += idxg[grp * 8 + j] << (3 * j);
+    \\    q[row * long(BLK) * 48 + long(blk) * 48 + tid] = uchar((w >> (8 * part)) & 0xFFu);
+    \\  }
+    \\}
+    \\if (tid == 0) {
+    \\  dn[g] = half(dval);
+    \\  db[g] = half(dval);
+    \\}
+;
+
+var tbq_enc_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var tbq_enc_fused_env: ?bool = null;
+/// Test/scheduler hook: false forces the composed chain, null/true keeps the
+/// fused kernel. Same shape as `kv_attn_fused_override` for the decode reads.
+pub var tbq_encode_fused_override: ?bool = null;
+
+fn tbqEncodeFusedEnabled() bool {
+    if (tbq_encode_fused_override) |v| return v;
+    if (tbq_enc_fused_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_TBQ_ENCODE_FUSED");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    tbq_enc_fused_env = enabled;
+    return enabled;
+}
+
+fn getTbqEncodeKernel() !mlx.mlx_fast_metal_kernel {
+    if (tbq_enc_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "s1", "s2", "mid", "cen" };
+    const output_names = [_][*:0]const u8{ "q", "dn", "db" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("sushi_tbq_encode", in_vec, out_vec, TBQ_ENCODE_KERNEL_SOURCE, "", true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    tbq_enc_kernel = kernel;
+    return kernel;
+}
+
+/// The four codebook tables as device arrays, uploaded once per bits variant
+/// and kept for the module's lifetime — the handles own the device buffers
+/// after eval, and a second eval of the same array is a no-op.
+const TbqEncTablesDev = struct { s1: mlx.mlx_array, s2: mlx.mlx_array, mid: mlx.mlx_array, cen: mlx.mlx_array };
+var tbq_enc_dev: [2]?TbqEncTablesDev = .{ null, null };
+
+fn tbqEncDevTables(t: TBQTables) !TbqEncTablesDev {
+    const slot: usize = if (t.bits == 4) 0 else 1;
+    if (tbq_enc_dev[slot]) |d| return d;
+    const sh_sign = [_]c_int{128};
+    const sh_cen = [_]c_int{@intCast(t.centroids.len)};
+    const sh_mid = [_]c_int{@intCast(t.midpoints.len)};
+    const s1 = tbqHost(t.signs1.ptr, &sh_sign, .float32);
+    const s2 = tbqHost(t.signs2.ptr, &sh_sign, .float32);
+    const mid = tbqHost(t.midpoints.ptr, &sh_mid, .float32);
+    const cen = tbqHost(t.centroids.ptr, &sh_cen, .float32);
+    for ([_]mlx.mlx_array{ s1, s2, mid, cen }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    const dev = TbqEncTablesDev{ .s1 = s1, .s2 = s2, .mid = mid, .cen = cen };
+    tbq_enc_dev[slot] = dev;
+    return dev;
+}
+
+const TbqEncCfgKey = struct { bits: u8, dt: mlx.mlx_dtype, b: c_int, h: c_int, t: c_int, blk: c_int };
+var tbq_enc_cfg: [2]?mlx.mlx_fast_metal_kernel_config = .{ null, null };
+var tbq_enc_cfg_key: [2]TbqEncCfgKey = @splat(std.mem.zeroes(TbqEncCfgKey));
+var tbq_enc_engaged: [2]bool = @splat(false);
+
+/// Fused TBQ quantize: one kernel dispatch for the whole
+/// `[B, H, T, D]` → (packed q, fp16 norms + copy) transform. Null when the
+/// shape/dtype is out of the kernel's domain (the caller then runs the
+/// composed chain); an unmaterialized or CPU-stream input also defers.
+fn quantizeTBQFused(s: mlx.mlx_stream, dense_x: mlx.mlx_array, t: TBQTables) !?QuantizedKV {
+    if (!mlx.streamIsGpu(s)) return null;
+    const shape = mlx.getShape(dense_x);
+    if (shape.len != 4) return null;
+    const B = shape[0];
+    const Hh = shape[1];
+    const T = shape[2];
+    const D = shape[3];
+    if (B <= 0 or Hh <= 0 or T <= 0 or D <= 0 or @mod(D, 128) != 0) return null;
+    const xd = mlx.mlx_array_dtype(dense_x);
+    if (xd != .float32 and xd != .float16 and xd != .bfloat16) return null;
+    const blk: c_int = @divExact(D, 128);
+    const packed_dim: c_int = blk * if (t.bits == 4) @as(c_int, 64) else 48;
+
+    const kernel = try getTbqEncodeKernel();
+    const key = TbqEncCfgKey{ .bits = t.bits, .dt = xd, .b = B, .h = Hh, .t = T, .blk = blk };
+    const slot: usize = if (t.bits == 4) 0 else 1;
+    if (tbq_enc_cfg[slot] == null or !std.meta.eql(tbq_enc_cfg_key[slot], key)) {
+        if (tbq_enc_cfg[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const sh_q = [_]c_int{ B, Hh, T, packed_dim };
+        const sh_d = [_]c_int{ B, Hh, T, blk };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &sh_q, 4, .uint8));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &sh_d, 4, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &sh_d, 4, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 128 * B * Hh * T * blk, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(t.bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BLK", blk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NORMALIZED", @intFromBool(t.normalized)));
+        tbq_enc_cfg[slot] = config;
+        tbq_enc_cfg_key[slot] = key;
+    }
+    const dev = try tbqEncDevTables(t);
+    // The kernel indexes `x` as a flat row-major [B, H, T, BLK, 128]; MLX
+    // materializes reshape outputs row-major, and `ensure_row_contiguous`
+    // backstops a sliced input like the composed chain's astype does.
+    const sh5 = [_]c_int{ B, Hh, T, blk, 128 };
+    var xr = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(xr);
+    try mlx.check(mlx.mlx_reshape(&xr, dense_x, &sh5, 5, s));
+    const inputs_arr = [_]mlx.mlx_array{ xr, dev.s1, dev.s2, dev.mid, dev.cen };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, tbq_enc_cfg[slot].?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 3) return error.MetalKernelBadOutputCount;
+    var out: QuantizedKV = .{
+        .q = mlx.mlx_array_new(),
+        .scales = mlx.mlx_array_new(),
+        .biases = mlx.mlx_array_new(),
+    };
+    errdefer out.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&out.q, outputs_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&out.scales, outputs_vec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&out.biases, outputs_vec, 2));
+    if (!tbq_enc_engaged[slot]) {
+        tbq_enc_engaged[slot] = true;
+        log.info("[tbq] fused encode kernel engaged: bits={d} D={d} B={d} H={d} T={d}\n", .{ t.bits, D, B, Hh, T });
+    }
+    return out;
+}
 /// Rotated-codebook quantize `[B, H, T, D]` (D a multiple of 128).
 pub fn quantizeTBQ(s: mlx.mlx_stream, dense_x: mlx.mlx_array, bits: u8) !QuantizedKV {
     if (bits != 3 and bits != 4) return error.UnsupportedKvBits;
-    return quantizeTBQInner(s, dense_x, TBQTables.forBits(bits));
+    const t = TBQTables.forBits(bits);
+    if (tbqEncodeFusedEnabled()) {
+        if (quantizeTBQFused(s, dense_x, t)) |maybe| {
+            if (maybe) |fused| return fused;
+        } else |_| {}
+    }
+    return quantizeTBQInner(s, dense_x, t);
 }
 
 /// Rotated-codebook dequantize a `(q, d)` pair to `out_dtype`, in the
@@ -2033,4 +2272,101 @@ test "GLM latent stores BF16 or kv8 and names kv4 unsupported" {
     try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.affine(8).glmLatentBits());
     try std.testing.expectEqual(@as(?u8, null), KVQuantConfig.affine(4).glmLatentBits());
     try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.fromJsonValue(.{ .integer = 8 }).?.glmLatentBits());
+}
+
+test "tbq fused encode: matches the composed chain within codebook tolerance (tbq4, tbq3)" {
+    const s = mlx.gpuStream();
+    // BLK=2 geometry (head_dim 256, the qwen4 live shape): the kernel's
+    // block index must decompose g into (row, blk) exactly like the
+    // composed [..., BLK, 128] reshape chain.
+    const src = try buildGaussianBf16(s, 96, 256);
+    defer _ = mlx.mlx_array_free(src);
+    for ([_]u8{ 4, 3 }) |bits| {
+        tbq_encode_fused_override = false;
+        var lazy = try quantizeTBQ(s, src, bits);
+        defer lazy.deinit();
+        tbq_encode_fused_override = true;
+        var fused = try quantizeTBQ(s, src, bits);
+        defer fused.deinit();
+        // Anti-vacuity: prove this call really ran the fused kernel —
+        // otherwise the tolerance checks below would compare lazy against
+        // lazy and pass on a silent fallback.
+        try testing.expect(tbq_enc_engaged[if (bits == 4) @as(usize, 0) else 1]);
+
+        try testing.expectEqualSlices(c_int, mlx.getShape(lazy.q), mlx.getShape(fused.q));
+        try testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(fused.q));
+        try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(fused.scales));
+        // biases is the second array the kernel writes: same buffer values,
+        // distinct handles — the 6-slot contract must survive fusion.
+        try testing.expectEqual(mlx.mlx_array_size(fused.scales), mlx.mlx_array_size(fused.biases));
+
+        const lb = try flatBytes(lazy.q);
+        const fb = try flatBytes(fused.q);
+        var diff: usize = 0;
+        for (lb, fb) |a, b| diff += @intFromBool(a != b);
+        // Butterfly-vs-matmul ULP ties straddling a midpoint are the ONLY
+        // expected divergence (see the section header); codebook search sits
+        // mid-cell for ordinary data, so ties are rare.
+        try testing.expect(diff * 200 <= lb.len); // ≤ 0.5% of packed bytes
+
+        const lz = try dequantizeTBQ(s, lazy.q, lazy.scales, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(lz);
+        const fz = try dequantizeTBQ(s, fused.q, fused.scales, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(fz);
+        const lfl = try readF32Flat(s, lz, testing.allocator);
+        defer testing.allocator.free(lfl);
+        const ffl = try readF32Flat(s, fz, testing.allocator);
+        defer testing.allocator.free(ffl);
+        var max_err: f32 = 0;
+        for (lfl, ffl) |a, b| {
+            try testing.expect(!std.math.isNan(b));
+            if (@abs(a - b) > max_err) max_err = @abs(a - b);
+        }
+        // One code away costs a centroid gap × the block scale (unit-norm
+        // fixture ⇒ gaps ≤ ~0.06 for tbq4, ~0.24 for tbq3); with both the
+        // flip AND a ≤0.2%-off norm, 0.5 is generous but adversarial.
+        try testing.expect(max_err < 0.5);
+    }
+}
+
+test "tbq fused encode: deterministic and self-stable through quant→dequant→quant (tbq4, tbq3)" {
+    const s = mlx.gpuStream();
+    const src = try buildGaussianBf16(s, 16, 256);
+    defer _ = mlx.mlx_array_free(src);
+    for ([_]u8{ 4, 3 }) |bits| {
+        tbq_encode_fused_override = true;
+        defer tbq_encode_fused_override = null;
+        var q1 = try quantizeTBQ(s, src, bits);
+        defer q1.deinit();
+        var q2 = try quantizeTBQ(s, src, bits);
+        defer q2.deinit();
+        try testing.expectEqualSlices(u8, try flatBytes(q1.q), try flatBytes(q2.q));
+        // The fused kernel on an already-quantized block reproduces its own
+        // bytes: the fixed-point pack/unpack round-trip is exact (mirrors
+        // the composed-path pin at "fixed-point pack/unpack").
+        const dq = try dequantizeTBQ(s, q1.q, q1.scales, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(dq);
+        var q3 = try quantizeTBQ(s, dq, bits);
+        defer q3.deinit();
+        try testing.expectEqualSlices(u8, try flatBytes(q1.q), try flatBytes(q3.q));
+    }
+}
+
+test "tbq fused encode: all-zero block keeps idx 8 / scale 0 (tbq4)" {
+    const s = mlx.gpuStream();
+    tbq_encode_fused_override = true;
+    defer tbq_encode_fused_override = null;
+    const shape = [_]c_int{ 1, 1, 4, 256 };
+    const zeros = std.mem.zeroes([1024]f32);
+    const f32_arr = mlx.mlx_array_new_data(&zeros, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f32_arr);
+    var src = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(src);
+    try mlx.check(mlx.mlx_astype(&src, f32_arr, .bfloat16, s));
+
+    var qkv = try quantizeTBQ(s, src, 4);
+    defer qkv.deinit();
+    for (try flatBytes(qkv.q)) |b| try testing.expectEqual(@as(u8, 0x88), b);
+    for (try flatBytes(qkv.scales)) |b| try testing.expectEqual(@as(u8, 0), b);
+    for (try flatBytes(qkv.biases)) |b| try testing.expectEqual(@as(u8, 0), b);
 }
