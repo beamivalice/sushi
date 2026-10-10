@@ -10797,7 +10797,9 @@ fn handleNonStreamingGeneration(
                 try allocator.alloc(u8, 0);
             defer allocator.free(tc_timings_field);
 
-            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+            const tc_details = try formatReasoningDetails(allocator, tok, deliveredReasoning(budget_truncated_reasoning, tc_think_split.reasoning_content) orelse "");
+            defer allocator.free(tc_details);
+            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, tc_details);
             defer allocator.free(tc_usage_obj);
 
             const response = try std.fmt.allocPrint(allocator,
@@ -10857,27 +10859,16 @@ fn handleNonStreamingGeneration(
     // key on the request's thinking flag.
     var reasoning_json: []const u8 = "";
     var reasoning_allocated = false;
-    var usage_details_json: []const u8 = "";
-    var usage_details_allocated = false;
-    {
-        // Use budget-truncated reasoning if available, otherwise use full reasoning
-        const reasoning_text = deliveredReasoning(budget_truncated_reasoning, think_split.reasoning_content);
-        if (reasoning_text) |reasoning| {
-            const escaped_reasoning = try jsonEscape(allocator, reasoning);
-            reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
-            allocator.free(escaped_reasoning);
-            reasoning_allocated = true;
-            // usage.completion_tokens_details.reasoning_tokens (OpenAI/LM Studio
-            // parity) so clients can budget visible content separately.
-            if (tok.encode(allocator, reasoning)) |rids| {
-                defer allocator.free(rids);
-                usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{rids.len});
-                usage_details_allocated = true;
-            } else |_| {}
-        }
+    const reasoning_text = deliveredReasoning(budget_truncated_reasoning, think_split.reasoning_content);
+    const usage_details_json = try formatReasoningDetails(allocator, tok, reasoning_text orelse "");
+    defer allocator.free(usage_details_json);
+    if (reasoning_text) |reasoning| {
+        const escaped_reasoning = try jsonEscape(allocator, reasoning);
+        defer allocator.free(escaped_reasoning);
+        reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
+        reasoning_allocated = true;
     }
     defer if (reasoning_allocated) allocator.free(reasoning_json);
-    defer if (usage_details_allocated) allocator.free(usage_details_json);
 
     const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
@@ -11462,6 +11453,9 @@ fn handleStreamingGeneration(
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
+    // Tokenize concatenated delivered text; SSE boundaries are not token boundaries.
+    var delivered_reasoning = std.ArrayList(u8).empty;
+    defer delivered_reasoning.deinit(allocator);
     var reasoning_tokens_sent: usize = 0; // reasoning deltas actually emitted (the budget is counted in these)
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
@@ -11531,6 +11525,7 @@ fn handleStreamingGeneration(
         if (delivery) |*d| {
             defer allocator.free(token_text);
             try d.feed(allocator, token_text);
+            if (include_usage) try delivered_reasoning.appendSlice(allocator, d.reasoning.items);
             try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
             try beatStreamKeepalive(stream, .sse_comment);
             continue;
@@ -11584,6 +11579,7 @@ fn handleStreamingGeneration(
                             if (so_far.reasoning_content) |rc| {
                                 const settled = chat_mod.settledReasoning(rc);
                                 if (chat_mod.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
+                                    if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                     reasoning_streamed = settled.len;
                                     reasoning_tokens_sent += 1;
@@ -11618,6 +11614,7 @@ fn handleStreamingGeneration(
                         if (!budget_exhausted) {
                             if (split.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                    if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                 }
                             }
@@ -11827,6 +11824,7 @@ fn handleStreamingGeneration(
                 const last = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 thought_shipped = false;
                 if (last.len > 0 and !budget_exhausted) {
+                    if (include_usage) try delivered_reasoning.appendSlice(allocator, last);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = last }, null, null, null, .{});
                 }
                 const after = m.pos + m.len;
@@ -11881,6 +11879,7 @@ fn handleStreamingGeneration(
                 const safe_len = flush.skip + flush.ship;
                 if (safe_len > 0) {
                     if (flush.ship > 0 and !budget_exhausted) {
+                        if (include_usage) try delivered_reasoning.appendSlice(allocator, think_buf.items[flush.skip..safe_len]);
                         try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[flush.skip..safe_len] }, null, null, null, .{});
                     }
                     if (flush.ship > 0) thought_shipped = true;
@@ -11949,6 +11948,7 @@ fn handleStreamingGeneration(
         if (delivery) |*d| {
             d.clearOutput();
             try d.finish(allocator);
+            if (include_usage) try delivered_reasoning.appendSlice(allocator, d.reasoning.items);
             try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
         }
     }
@@ -11965,6 +11965,7 @@ fn handleStreamingGeneration(
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
             const tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
             if (!budget_exhausted and tail.len > 0) {
+                if (include_usage) try delivered_reasoning.appendSlice(allocator, tail);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = tail }, null, null, null, .{});
             }
         } else {
@@ -12019,6 +12020,7 @@ fn handleStreamingGeneration(
                     // Apply reasoning budget truncation if set
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
+                    if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{});
                 }
             }
@@ -12060,6 +12062,7 @@ fn handleStreamingGeneration(
                     // Apply reasoning budget truncation if set
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
+                    if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{});
                 }
                 if (think_split.content.len > 0) {
@@ -12091,7 +12094,9 @@ fn handleStreamingGeneration(
         // the ending twice (PR #147's doubled truncation banner). Pending
         // logprobs all drained on the final chunk above.
         if (include_usage) {
-            const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
+            const details = try formatReasoningDetails(allocator, tok, delivered_reasoning.items);
+            defer allocator.free(details);
+            const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, details);
             defer allocator.free(usage_json);
             const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
@@ -13510,6 +13515,18 @@ fn cachedFormatChat(
         };
     };
     return ids;
+}
+
+/// Delivered reasoning is a subset of completion_tokens, not an additional charge.
+fn formatReasoningDetails(allocator: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, text: []const u8) ![]u8 {
+    if (text.len == 0) return reasoningDetailsJson(allocator, 0);
+    const ids = try tok.encode(allocator, text);
+    defer allocator.free(ids);
+    return reasoningDetailsJson(allocator, ids.len);
+}
+
+fn reasoningDetailsJson(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{count});
 }
 
 /// The chat-completions `usage` object, shared by the non-stream, tool-call
@@ -27038,4 +27055,43 @@ test "seedRequestBuf drops bytes past the allocation" {
     try std.testing.expectEqual(@as(usize, 4), seedRequestBuf(buf, "abcdefgh"));
     try std.testing.expectEqualStrings("abcd", buf);
     try std.testing.expectEqual(@as(usize, 2), seedRequestBuf(buf, "xy"));
+}
+
+test "reasoning usage preserves totals and reports zero" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 7 }) |count| {
+        const details = try reasoningDetailsJson(a, count);
+        defer a.free(details);
+        const raw = try formatChatUsage(a, 10, 20, 4, details);
+        defer a.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(count)), parsed.value.object.get("completion_tokens_details").?.object.get("reasoning_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 30), parsed.value.object.get("total_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 4), parsed.value.object.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+    }
+}
+
+test "reasoning usage tokenization ignores SSE boundaries" {
+    const a = std.testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    try tok.vocab.put("a", 1);
+    try tok.vocab.put("b", 2);
+    try tok.vocab.put("ab", 3);
+    try tok.merge_ranks.put(.{ .left = "a", .right = "b" }, 0);
+    var delivered = std.ArrayList(u8).empty;
+    defer delivered.deinit(a);
+    try delivered.appendSlice(a, "a");
+    try delivered.appendSlice(a, "b");
+    const details = try formatReasoningDetails(a, &tok, delivered.items);
+    defer a.free(details);
+    try std.testing.expectEqualStrings(",\"completion_tokens_details\":{\"reasoning_tokens\":1}", details);
+    const empty = try formatReasoningDetails(a, &tok, "");
+    defer a.free(empty);
+    try std.testing.expectEqualStrings(",\"completion_tokens_details\":{\"reasoning_tokens\":0}", empty);
 }
