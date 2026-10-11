@@ -731,14 +731,19 @@ pub fn noteQsaArmForSlots(slots: []const *ForwardCtx, arm: QsaArm) void {
 }
 
 pub fn qsaAlignedSparseAttn(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, blocks: mlx.mlx_array, ratio: c_int, scale: f32, budget: c_int) !?mlx.mlx_array {
-    // TBQ declines the whole aligned arm (same reasoning as qsaSparseAttn):
-    // its gather bodies would read the lazy dense views and materialize the
-    // full-cache dequant per call. Decode/verify widths instead take the
-    // packed-row subset gathers in qsaDecodeGatherAttn/qsaVerifyGatherAttn.
-    if (view.tbq_triple) return null;
     const width = mlx.getShape(q)[2];
     const length = mlx.getShape(view.k)[2];
     const cut = std.math.clamp(budget + ratio - 1 - (length - width), 0, width);
+    // TBQ takes only the fused-free passthrough into the split-K arm (which
+    // reads the packed rows directly): with `cut > 0` the per-row prefix
+    // SDPA below would evaluate the lazy whole-cache dequant on every fused
+    // step, so those widths still decline to the packed-row subset gathers
+    // in qsaDecodeGatherAttn/qsaVerifyGatherAttn, exactly as before the TBQ
+    // split-K arm existed.
+    if (view.tbq_triple) {
+        if (budget <= 0 or cut == 0) return qsaSparseAttn(s, q, view, blocks, ratio, scale);
+        return null;
+    }
     if (budget <= 0 or cut == 0) return qsaSparseAttn(s, q, view, blocks, ratio, scale);
     if (width >= FUSED256_MIN_Q_LEN) return null;
     var parts: [FUSED256_MIN_Q_LEN]mlx.mlx_array = @splat(.{});
@@ -819,7 +824,7 @@ pub fn qsaBatchedGatherAttn(
         ));
         var gathered: ?mlx.mlx_array = null;
         const qsa_ok = blk.ctx != null and slot_mask.ctx == null and !standin_sdpa;
-        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) {
+        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple or kv_view.tbq_triple, seq_len)) {
             gathered = try qsaAlignedSparseAttn(s, q_slot, kv_view, blk, ratio, attn_scale, budget);
         }
         if (gathered == null and qsa_ok and seq_len == 1) {

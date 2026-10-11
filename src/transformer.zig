@@ -2253,7 +2253,7 @@ pub const AttnPdArm = enum { simd, nax };
 var attn_pd_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 
 fn getAttnPdKernel(arm: AttnPdArm) !mlx.mlx_fast_metal_kernel {
-    const slot = &attn_pd_kernels[@intFromEnum(arm)];
+    const slot = &attn_pd_kernels[@backingInt(arm)];
     if (slot.*) |kk| return kk;
     const kernel = try newAttnPdKernel(
         if (arm == .nax) "sushi_attn_pd_nax" else "sushi_attn_pd",
@@ -2605,7 +2605,7 @@ fn attnPdKernelName(arm: AttnPdArm) []const u8 {
 }
 
 fn logAttnPdEngaged(arm: AttnPdArm, qk_dim: c_int, v_dim: c_int, q_len: c_int, kv_len: c_int, dispatches: u32) void {
-    const slot = &attn_pd_engaged_logged[@intFromEnum(arm)][if (qk_dim == 256) 0 else 1];
+    const slot = &attn_pd_engaged_logged[@backingInt(arm)][if (qk_dim == 256) 0 else 1];
     if (slot.*) return;
     slot.* = true;
     log.info("[attn-pd] engaged: {s} qk={d} v={d} qL={d} kL={d} dispatches={d}\n", .{ attnPdKernelName(arm), qk_dim, v_dim, q_len, kv_len, dispatches });
@@ -3356,7 +3356,6 @@ const QSA_TBQ_HEADER =
     \\}
     \\
 ;
-
 
 /// [stock, nax]
 var qsa_gather_packed_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
@@ -4720,6 +4719,234 @@ const QSA_ATTN_Q_SOURCE =
     \\}
 ;
 
+/// sushi_attn_qsa256_qsplit's TBQ twin (Chunk 6): same split-K row body, same
+/// online softmax, same partials — only the dequant of the staged rows
+/// differs. K/V ride the packed TBQ code streams (u8) with fp16 block norms,
+/// staged through `sushi_qsa_tbq8` as the rotated-domain value
+/// `cl[code] * d[element/128]` — exactly what the prefill tbq kernel and the
+/// fused take stage. The wrapper M1-rotates `q` before the split pass and
+/// M2-folds the MERGED output (softmax is linear, so one fold after the merge
+/// equals rotating every split's accumulator; per-split folds would only
+/// multiply the matmul cost). No `kbi`/`vbi` args: TBQ has no biases, the
+/// codebook `cl` rides the 8th input. BITS is 4 or 3, GS is 128 by contract.
+const QSA_ATTN_Q_TBQ_SOURCE =
+    \\constexpr int KC = DK / 8;
+    \\constexpr int VC = DV / 8;
+    \\constexpr int LDK = BK + 8;
+    \\constexpr int LDV = DV + 8;
+    \\constexpr int NT = 32 * NSG;
+    \\constexpr int KT = BK / 8;
+    \\constexpr int KV_ELEMS = (DK * LDK > BK * LDV) ? DK * LDK : BK * LDV;
+    \\// Per-length split counts ride the grid, never a template.
+    \\const int NSPLIT = int(threadgroups_per_grid.z);
+    \\
+    \\const int qL = q_shape[2];
+    \\const int kL = kq_shape[2];
+    \\const int Hq = q_shape[1];
+    \\const int Hk = kq_shape[1];
+    \\const int gqa = Hq / Hk;
+    \\const int KB = blocks_shape[2];
+    \\
+    \\const int s = int(threadgroup_position_in_grid.x);
+    \\const int hk = int(threadgroup_position_in_grid.y);
+    \\// The caller pins batch to 1 (qs[0] != 1 declines), so the grid's z is
+    \\// free to carry the split index instead of the batch index.
+    \\const int bb = 0;
+    \\const int jsp = int(threadgroup_position_in_grid.z);
+    \\const ushort lane = ushort(thread_index_in_simdgroup);
+    \\const ushort warp = ushort(simdgroup_index_in_threadgroup);
+    \\const int tix = int(thread_index_in_threadgroup);
+    \\
+    \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
+    \\// Query s sits at absolute key position p (bottom-right aligned). Its
+    \\// visible keys: `count` complete blocks, then the tail [tail_start, p].
+    \\// SPARSE=0 has no block list: its whole causal range [0, p] is the tail.
+    \\const int p = (kL - qL) + s;
+    \\const int complete = (p + 1) / RATIO;
+    \\const int count = SPARSE ? metal::min(complete, KB) : 0;
+    \\const int sel_len = count * RATIO;
+    \\const int tail_start = SPARSE ? complete * RATIO : 0;
+    \\const int L = sel_len + (p + 1 - tail_start);
+    \\// Split-K. This threadgroup owns virtual keys [t_lo, t_hi) of the row's
+    \\// own range [0, L). The virtual index already concatenates the row's
+    \\// selected blocks and THEN its ragged tail, so a contiguous virtual
+    \\// range is exactly a contiguous block range — plus, for the last
+    \\// non-empty split, the tail. Boundaries are BK-aligned so every tile
+    \\// but a split's last is full. A split starting past L is EMPTY and
+    \\// writes the merge's identity.
+    \\const int tiles = (L + BK - 1) / BK;
+    \\// BALANCED=0 (default, MEASURED): ceil(tiles/NSPLIT) per split, so the
+    \\// last splits can be short or empty — at the swept shape 129 tiles over
+    \\// 16 splits is 14 full, 1 partial, 1 empty. BALANCED=1 spreads the
+    \\// remainder one tile per split instead. Strictly better load balance on
+    \\// paper; NOT the default because the sweep that chose NSPLIT=16 ran on
+    \\// the ceil distribution, and changing how work is divided invalidates
+    \\// it. Same outputs either way — the split boundaries move, the merge is
+    \\// exact over whatever they are.
+    \\int t_lo, t_hi;
+    \\if (BALANCED) {
+    \\  const int base_t = tiles / NSPLIT;
+    \\  const int rem_t = tiles % NSPLIT;
+    \\  const int start_t = jsp * base_t + metal::min(jsp, rem_t);
+    \\  const int cnt_t = base_t + ((jsp < rem_t) ? 1 : 0);
+    \\  t_lo = start_t * BK;
+    \\  t_hi = metal::min(L, (start_t + cnt_t) * BK);
+    \\} else {
+    \\  const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
+    \\  t_lo = jsp * tiles_per * BK;
+    \\  t_hi = metal::min(L, t_lo + tiles_per * BK);
+    \\}
+    \\
+    \\const long block_base = (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
+    \\const long kq_base  = (long)bb * kq_strides[0]  + (long)hk * kq_strides[1];
+    \\const long ksc_base = (long)bb * ksc_strides[0] + (long)hk * ksc_strides[1];
+    \\const long vq_base  = (long)bb * vq_strides[0]  + (long)hk * vq_strides[1];
+    \\const long vsc_base = (long)bb * vsc_strides[0] + (long)hk * vsc_strides[1];
+    \\
+    \\threadgroup T KVs[KV_ELEMS];
+    \\threadgroup T* Ks = KVs;
+    \\threadgroup T* Vs = KVs;
+    \\
+    \\const short2 sc = sushi_coord(lane);
+    \\const short sn = sc.x;
+    \\const short sm = sc.y;
+    \\const short tm = 8 * short(warp);
+    \\const int Ks_off = sm * LDK + sn;
+    \\const int Vs_off = sm * LDV + sn;
+    \\const int row = tm + sm;
+    \\const bool row_ok = row < gqa;
+    \\
+    \\float2 Qfrag[KC];
+    \\if (row_ok) {
+    \\  const device T* Qrow = q + bb * q_strides[0] + (long)(hk * gqa + row) * q_strides[1] + (long)s * q_strides[2];
+    \\  for (int dd = 0; dd < KC; ++dd) {
+    \\    const vec<T, 2> pr = *((const device vec<T, 2>*)(Qrow + dd * 8 + sn));
+    \\    Qfrag[dd] = float2(float(pr.x), float(pr.y));
+    \\  }
+    \\} else {
+    \\  for (int dd = 0; dd < KC; ++dd) Qfrag[dd] = float2(0.0f);
+    \\}
+    \\float2 Ofrag[VC];
+    \\for (int i = 0; i < VC; ++i) Ofrag[i] = float2(0.0f);
+    \\float max_score = -3.0e38f;
+    \\float sum_score = 0.0f;
+    \\
+    \\for (int t0 = t_lo; t0 < t_hi; t0 += BK) {
+    \\  const int rows_k = metal::min(BK, t_hi - t0);
+    \\
+    \\  // K tile: dequantize the rotated-domain value straight into the SAME
+    \\  // transposed staging the affine split pass fills, so the fragment
+    \\  // math below is untouched. The 8 dims of one chunk share a TBQ block
+    \\  // (GS is 128, a multiple of 8), so `sushi_qsa_tbq8` resolves the
+    \\  // block norm for the chunk internally.
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * KC; i += NT) {
+    \\    const int r = i / KC;
+    \\    const int c8 = i % KC;
+    \\    const int cb = c8 * 8;
+    \\    T ev[8];
+    \\    if (r < rows_k) {
+    \\      const int vi = t0 + r;
+    \\      const int bi = vi / RATIO;
+    \\      const int pos = vi < sel_len ? blocks[block_base + bi] * RATIO + (vi - bi * RATIO) : tail_start + vi - sel_len;
+    \\      const uint4 w = sushi_qsa_tbq8<T, BITS, GS>(kq + kq_base + (long)pos * kq_strides[2], ksc + ksc_base + (long)pos * ksc_strides[2], cl, c8);
+    \\      const thread T* e = (thread T*)&w;
+    \\      for (int j = 0; j < 8; ++j) ev[j] = e[j];
+    \\    } else {
+    \\      for (int j = 0; j < 8; ++j) ev[j] = T(0.0f);
+    \\    }
+    \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = ev[j];
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  float2 Sfrag[KT];
+    \\  for (int i = 0; i < KT; ++i) Sfrag[i] = float2(0.0f);
+    \\  for (int dd = 0; dd < KC; ++dd) {
+    \\    const float2 qf = Qfrag[dd];
+    \\    const int kbase = Ks_off + dd * 8 * LDK;
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      const float2 kf = float2(float(Ks[kbase + kt * 8]), float(Ks[kbase + kt * 8 + 1]));
+    \\      sushi_mma(Sfrag[kt], qf, kf);
+    \\    }
+    \\  }
+    \\  for (int kt = 0; kt < KT; ++kt) Sfrag[kt] *= scale_log2e;
+    \\  if (rows_k < BK) {
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      if (kt * 8 + sn >= rows_k) Sfrag[kt].x = -INFINITY;
+    \\      if (kt * 8 + sn + 1 >= rows_k) Sfrag[kt].y = -INFINITY;
+    \\    }
+    \\  }
+    \\
+    \\  // V tile: dequantize the rotated-domain value into the row-major
+    \\  // staging. The output accumulates rotated; the wrapper folds it by
+    \\  // M2 once after the merge.
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * VC; i += NT) {
+    \\    const int r = i / VC;
+    \\    const int c8 = i % VC;
+    \\    const int cb = c8 * 8;
+    \\    T ev[8];
+    \\    if (r < rows_k) {
+    \\      const int vi = t0 + r;
+    \\      const int bi = vi / RATIO;
+    \\      const int pos = vi < sel_len ? blocks[block_base + bi] * RATIO + (vi - bi * RATIO) : tail_start + vi - sel_len;
+    \\      const uint4 w = sushi_qsa_tbq8<T, BITS, GS>(vq + vq_base + (long)pos * vq_strides[2], vsc + vsc_base + (long)pos * vsc_strides[2], cl, c8);
+    \\      const thread T* e = (thread T*)&w;
+    \\      for (int j = 0; j < 8; ++j) ev[j] = e[j];
+    \\    } else {
+    \\      for (int j = 0; j < 8; ++j) ev[j] = T(0.0f);
+    \\    }
+    \\    for (int j = 0; j < 8; ++j) Vs[r * LDV + cb + j] = ev[j];
+    \\  }
+    \\
+    \\  float new_max = max_score;
+    \\  for (int kt = 0; kt < KT; ++kt) new_max = metal::max(new_max, sushi_row_max(Sfrag[kt]));
+    \\  float rowsum = 0.0f;
+    \\  for (int kt = 0; kt < KT; ++kt) {
+    \\    Sfrag[kt] = metal::exp2(Sfrag[kt] - new_max);
+    \\    rowsum += sushi_row_sum(Sfrag[kt]);
+    \\  }
+    \\  const float factor = metal::exp2(max_score - new_max);
+    \\  max_score = new_max;
+    \\  sum_score = sum_score * factor + rowsum;
+    \\  for (int i = 0; i < VC; ++i) Ofrag[i] *= factor;
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int id = 0; id < VC; ++id) {
+    \\    const int vbase = Vs_off + id * 8;
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      const float2 vf = float2(float(Vs[vbase + kt * 8 * LDV]), float(Vs[vbase + kt * 8 * LDV + 1]));
+    \\      sushi_mma(Ofrag[id], Sfrag[kt], vf);
+    \\    }
+    \\  }
+    \\}
+    \\
+    \\// Partials for the merge pass, UNNORMALIZED and still rotated-domain:
+    \\// the running max and sum belong to this split alone, and only the
+    \\// merge knows the row's global max. `sushi_row_max`/`sushi_row_sum`
+    \\// reduce across the four lanes holding a row, so every lane of the row
+    \\// carries the same m/l and exactly one of them (sn == 0) writes the pair.
+    \\//
+    \\// An empty split writes l = 0, which is the merge's skip flag: a
+    \\// NON-empty split always has l >= 1, because its own maximum element
+    \\// contributes exp2(max - max) = 1. So l == 0 identifies emptiness
+    \\// exactly, and the merge never evaluates (-inf) - (-inf).
+    \\if (row_ok) {
+    \\  const int hq = hk * gqa + row;
+    \\  const long pidx = ((long)hq * (long)qL + (long)s) * NSPLIT + jsp;
+    \\  device float* Aptr = pacc + pidx * DV + sn;
+    \\  for (int id = 0; id < VC; ++id) {
+    \\    Aptr[id * 8] = Ofrag[id].x;
+    \\    Aptr[id * 8 + 1] = Ofrag[id].y;
+    \\  }
+    \\  if (sn == 0) {
+    \\    const bool empty = (t_lo >= t_hi);
+    \\    pml[pidx * 2] = empty ? -INFINITY : max_score;
+    \\    pml[pidx * 2 + 1] = empty ? 0.0f : sum_score;
+    \\  }
+    \\}
+;
+
 /// sushi_attn_qsa256_qmerge: the split-K reduction, one threadgroup per (q head, query row).
 /// Standard flash-decoding merge in the log2 domain; `l_j == 0` marks an empty split and is
 /// skipped. NSPLIT, qL and DV ride `pacc_shape`, so the config depends on nothing per token.
@@ -4866,6 +5093,34 @@ fn getQsaAttnQKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+var qsa_attn_q_tbq_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+/// Loader for the TBQ twin of the split kernel: 8 inputs — the packed code
+/// streams, their fp16 block norms and the f32 codebook, no bias triples —
+/// and `QSA_TBQ_HEADER` ahead of the shared mma/coord header, which is what
+/// makes `sushi_qsa_tbq8` visible to the body.
+fn getQsaAttnQSplitTbqKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_attn_q_tbq_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "q", "scl", "blocks", "kq", "ksc", "vq", "vsc", "cl" };
+    const output_names = [_][*:0]const u8{ "pacc", "pml" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "sushi_attn_qsa256_qsplit_tbq",
+        in_vec,
+        out_vec,
+        QSA_ATTN_Q_TBQ_SOURCE,
+        QSA_TBQ_HEADER ++ ATTN_QSA256_KERNEL_HEADER,
+        false, // packed triples are cache VIEWS — a contiguous copy erases the win
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_attn_q_tbq_kernel_cached = kernel;
+    return kernel;
+}
+
 pub var qsa_attn_kernel_override: ?bool = null;
 var qsa_attn_kernel_env: ?bool = null;
 
@@ -4949,11 +5204,20 @@ const QsaAttnCfgKey = struct {
     bk: c_int,
     ratio: c_int,
     dtype: mlx.mlx_dtype,
+    /// TBQ arm discriminator: tbq4 and affine4 share (bits, gs=128 cannot,
+    /// but the flag also separates the key from any future 4-bit affine
+    /// view), and the default keeps every existing affine key value.
+    is_tbq: bool = false,
 };
 var qsa_attn_cfgs = QsaCfgCache(QsaAttnCfgKey, 2){};
 pub fn qsaAttnCfgBuilds() usize {
     return qsa_attn_cfgs.builds;
 }
+
+/// The TBQ split-K branch dispatches from this function — a nonzero `seen`
+/// proves a served tick ran the packed split pass, where the affine engage
+/// one-shot (bucketed) cannot.
+var qsa_attn_tbq_engaged_bits: OneShotBits = .{};
 var qsa_attn_engaged_bits: OneShotBits = .{};
 
 /// One split-K pass plus its merge. `arrays` = the packed K and V triples, or dense K and V
@@ -5028,6 +5292,94 @@ fn splitKAttnDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, blocks: mlx.mlx_array
     return out;
 }
 
+/// TBQ twin of `splitKAttnDispatch` (Chunk 6): same split-K grid, same f32
+/// partials, SAME merge kernel — only the split pass reads the packed TBQ
+/// inputs (code streams + fp16 norms + codebook) instead of an affine triple.
+/// `q` must already be M1-rotated by the caller; the merged output is still
+/// rotated-domain and gets the M2 fold there.
+fn splitKAttnDispatchTbq(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    blocks: mlx.mlx_array,
+    kq: mlx.mlx_array,
+    kn: mlx.mlx_array,
+    vq: mlx.mlx_array,
+    vn: mlx.mlx_array,
+    cl: mlx.mlx_array,
+    attn_scale: f32,
+    key: QsaAttnCfgKey,
+) !?mlx.mlx_array {
+    const kernel = getQsaAttnQSplitTbqKernel() catch return null;
+    const merge_kernel = getQsaAttnMergeKernel() catch return null;
+    const qs = mlx.getShape(q);
+    const seq_len = qs[2];
+    const scl_data = [_]f32{attn_scale};
+    const one = [_]c_int{1};
+    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(scl);
+
+    const cfgs: [2]mlx.mlx_fast_metal_kernel_config = qsa_attn_cfgs.get(key) orelse blk: {
+        // Split pass: one threadgroup per (row, kv head, split). The tbq
+        // source references no QUANT macro, so no template arg for it.
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const acc_shape = [_]c_int{ qs[1], seq_len, key.nsplit, key.dv };
+        const ml_shape = [_]c_int{ qs[1], seq_len, key.nsplit, 2 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &acc_shape, 4, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 4, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, seq_len * 32, key.h_kv * key.nsg, key.nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, key.nsg, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", key.dtype));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", key.nsg));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", key.bk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", key.ratio));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(key.bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(key.gs)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BALANCED", @intFromBool(key.balanced)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", qs[3]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", key.dv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SPARSE", @intFromBool(key.sparse)));
+
+        // Merge pass: identical to the affine dispatch — the merge never
+        // looks at cache values, only the partials.
+        const mconfig = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(mconfig);
+        const o_shape = [_]c_int{ qs[0], qs[1], seq_len, key.dv };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(mconfig, &o_shape, 4, key.dtype));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(mconfig, key.dv, seq_len, qs[1]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(mconfig, key.dv, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(mconfig, "T", key.dtype));
+
+        qsa_attn_cfgs.put(key, .{ config, mconfig });
+        break :blk .{ config, mconfig };
+    };
+
+    const inputs_arr = [_]mlx.mlx_array{ q, scl, blocks, kq, kn, vq, vn, cl };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var parts_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&parts_vec, kernel, inputs_vec, cfgs[0], s));
+    if (mlx.mlx_vector_array_size(parts_vec) != 2) return error.MetalKernelBadOutputCount;
+    var pacc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pacc);
+    var pml = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pml);
+    try mlx.check(mlx.mlx_vector_array_get(&pacc, parts_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&pml, parts_vec, 1));
+
+    const merge_in = [_]mlx.mlx_array{ pacc, pml };
+    const merge_vec = mlx.mlx_vector_array_new_data(&merge_in, merge_in.len);
+    defer _ = mlx.mlx_vector_array_free(merge_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, merge_kernel, merge_vec, cfgs[1], s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    return out;
+}
+
 /// Every position uses the same row body for dense and quantized caches.
 pub fn qsaSparseAttn(
     s: mlx.mlx_stream,
@@ -5042,7 +5394,10 @@ pub fn qsaSparseAttn(
     if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
     const qs = mlx.getShape(q_rope);
     const seq_len = qs[2];
-    if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) return null;
+    // The tbq arm joins at the same width band as affine split-K: the S>=16
+    // prefill tick keeps the whole-cache prefill kernel, whose packed rows
+    // ride the same code paths as this one's staging.
+    if (!qsaSparseAttnServes(kv_view.has_quant_triple or kv_view.tbq_triple, seq_len)) return null;
     if (qs[0] != 1 or qs[3] != 256) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;
@@ -5052,10 +5407,97 @@ pub fn qsaSparseAttn(
     _ = bs[2];
     if (ratio <= 0) return null;
 
-    // A TBQ view's packed buffers are not affine triples, and the dense-row
-    // body below would evaluate the whole-cache lazy dequant on every call;
-    // the widths this kernel serves go to the subset-dequant gather arms.
-    if (kv_view.tbq_triple) return null;
+    // TBQ split-K arm (Chunk 6): the packed rows are 4/3-bit codes in the
+    // ROTATED domain with fp16 block norms, staged through `sushi_qsa_tbq8`
+    // exactly like the prefill tbq kernel and the fused take. M1 rides the
+    // queries once per tick (a per-head 128x128 f32 matmul); M2 folds the
+    // MERGED output once — softmax linearity makes one fold equal per-split
+    // folds at 1/NSPLIT of the matmul cost. Geometry checks mirror
+    // `gatherQsa256Impl`'s tbq arm and `qsaTbqTakeRotated`'s view reads.
+    if (kv_view.tbq_triple) {
+        const bits: u8 = kv_view.bits;
+        if (bits != 3 and bits != 4) return null;
+        if (kv_view.group_size != 128) return null;
+        const kq = kv_view.k_triple_q;
+        const kn = kv_view.k_triple_scales;
+        const vq = kv_view.v_triple_q;
+        const vn = kv_view.v_triple_scales;
+        for ([_]mlx.mlx_array{ kq, kn, vq, vn }) |array| {
+            if (array.ctx == null or mlx.mlx_array_ndim(array) != 4) return null;
+        }
+        if (mlx.mlx_array_strides(kq)[3] != 1 or mlx.mlx_array_strides(kn)[3] != 1 or
+            mlx.mlx_array_strides(vq)[3] != 1 or mlx.mlx_array_strides(vn)[3] != 1) return null;
+        const kqs = mlx.getShape(kq);
+        const vqs = mlx.getShape(vq);
+        const h_kv: c_int = kqs[1];
+        const kv: c_int = kqs[2];
+        // tbq4 packs two codes per byte, tbq3 three codes per three bytes.
+        const p_exp: c_int = if (bits == 4) 128 else 96;
+        if (kqs[0] != 1 or vqs[0] != 1 or vqs[1] != h_kv or vqs[2] != kv or
+            kqs[3] != p_exp or vqs[3] != p_exp) return null;
+        if (h_kv <= 0 or kv < seq_len or @rem(qs[1], h_kv) != 0) return null;
+        const gqa: c_int = @divExact(qs[1], h_kv);
+        if (gqa > 64) return null;
+        if (mlx.mlx_array_dtype(kq) != .uint8 or mlx.mlx_array_dtype(vq) != .uint8 or
+            mlx.mlx_array_dtype(kn) != .float16 or mlx.mlx_array_dtype(vn) != .float16) return null;
+        const kns = mlx.getShape(kn);
+        const vns = mlx.getShape(vn);
+        if (kns[0] != 1 or kns[1] != h_kv or kns[2] != kv or kns[3] != 2 or
+            vns[0] != 1 or vns[1] != h_kv or vns[2] != kv or vns[3] != 2) return null;
+        if (mlx.mlx_array_strides(q_rope)[3] != 1 or mlx.mlx_array_strides(blocks)[2] != 1) return null;
+        const q_rot = try tbqRotateQueries(s, q_rope, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(q_rot);
+        // The codebook is module-static: the array wraps its bytes and the
+        // lazy graph's captured pointer outlives the handle (same rule as
+        // the prefill arm at :4332).
+        const cent = kv_quant.tbqCentroids(bits);
+        const cent_shape = [_]c_int{@intCast(cent.len)};
+        const cl = mlx.mlx_array_new_data(cent.ptr, &cent_shape, 1, .float32);
+        defer _ = mlx.mlx_array_free(cl);
+        const key = QsaAttnCfgKey{
+            .q_shape = ShapeKey.from(qs),
+            .h_kv = h_kv,
+            .dv = 256,
+            .bits = bits,
+            .gs = 128,
+            // Key material only: the tbq source references no QUANT macro.
+            .quant = true,
+            .sparse = true,
+            .nsg = @divTrunc(gqa + 7, 8),
+            .nsplit = qsaAttnNSplit(),
+            .bk = qsaAttnBk(),
+            .balanced = qsaAttnBalanced(),
+            .ratio = ratio,
+            .dtype = .bfloat16,
+            .is_tbq = true,
+        };
+        const merged = (try splitKAttnDispatchTbq(s, q_rot, blocks, kq, kn, vq, vn, cl, attn_scale, key)) orelse return null;
+        defer _ = mlx.mlx_array_free(merged);
+        // Fold M2 out of the rotated domain — the prefill wrapper's reshape
+        // dance: ROWS = Hq*S vectors of DV = 256, two 128-blocks each.
+        const orows = [_]c_int{ qs[0] * qs[1] * seq_len, 256 };
+        var flat = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, merged, &orows, 2, s));
+        const o_true = try tbqRotateOutput(s, flat, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(o_true);
+        var final = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(final);
+        const f_shape = [_]c_int{ qs[0], qs[1], seq_len, 256 };
+        try mlx.check(mlx.mlx_reshape(&final, o_true, &f_shape, 4, s));
+        // Per-call engagement meter for this branch's tests: the one-shot
+        // log below is bucketed across the process's lifetime; this bit
+        // proves the packed split pass served THIS tick.
+        _ = qsa_attn_tbq_engaged_bits.take(qsaWidthBucket(seq_len));
+        if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len))) {
+            log.info(
+                "[qsa-attn] engaged (S={d} kv={d} quant=tbq{d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — SUSHI_QSA_ATTN_KERNEL=0 restores the union gather\n",
+                .{ seq_len, kv, bits, kv_view.group_size, gqa, key.bk, key.nsplit, seq_len * h_kv * key.nsplit },
+            );
+        }
+        return final;
+    }
+
     const quant = kv_view.has_quant_triple;
     const bits: u8 = if (quant) kv_view.bits else 8;
     const gs: u32 = if (quant) kv_view.group_size else 64;
@@ -5667,6 +6109,7 @@ pub const KvPrefixView = struct {
         };
     }
 };
+
 
 
 
@@ -6734,12 +7177,12 @@ fn attnPdDispatch(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SINK", if (has_sinks) 1 else 0));
 
         const inputs_arr = [_]mlx.mlx_array{
-            q,                                if (packed_kv != null) k_slice else k,
+            q,                                     if (packed_kv != null) k_slice else k,
             if (packed_kv != null) v_slice else v, scl,
-            win,                              kr,
-            phase,                            if (has_carry) m_prev else dummy,
-            if (has_carry) l_prev else dummy, if (has_carry) o_prev else dummy,
-            if (mask) |m| m else dummy_b,     if (mask != null) skip else dummy_b,
+            win,                                   kr,
+            phase,                                 if (has_carry) m_prev else dummy,
+            if (has_carry) l_prev else dummy,      if (has_carry) o_prev else dummy,
+            if (mask) |m| m else dummy_b,          if (mask != null) skip else dummy_b,
             if (has_sinks) sinks_f32 else dummy,
         };
         const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
@@ -19082,6 +19525,7 @@ pub const Transformer = struct {
 
 
 
+
     /// SUSHI_DIFFUSION_TRACE=1 debugging aid: print the first 8 values
     /// of position 0 of a hidden state.
     var trace_tail_once: bool = true;
@@ -19313,6 +19757,7 @@ pub const Transformer = struct {
         _ = mlx.mlx_array_free(q.*);
         q.* = out;
     }
+
 
 
 
@@ -42119,8 +42564,8 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
         built += 1;
     }
     const n_var = 1 + built;
-    const served_kernel = attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] orelse return error.NaxKernelNotBuilt;
-    defer attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+    const served_kernel = attn_pd_kernels[@backingInt(AttnPdArm.nax)] orelse return error.NaxKernelNotBuilt;
+    defer attn_pd_kernels[@backingInt(AttnPdArm.nax)] = served_kernel;
     var var_kls_buf: [8]c_int = undefined;
     const var_kls = var_kls_buf[0..try attnPdUbenchList("SUSHI_ATTN_PD_UBENCH_ABL_KL", "131072", &var_kls_buf)];
     std.debug.print("[attn-pd-ub] kernel variants, dense chain (ms):\n[attn-pd-ub]    qL       kL   served  TFLOPS", .{});
@@ -42139,7 +42584,7 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
             const vb = try testRandUniformBf16(rnd, &[_]c_int{ 1, 8, ql + 127, 128 }, -1.0, 1.0, s);
             defer _ = mlx.mlx_array_free(vb);
             const bv = DenseKVView{ .k = kb, .v = vb, .owned = false };
-            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+            attn_pd_kernels[@backingInt(AttnPdArm.nax)] = served_kernel;
             const ref = (try fusedSdpaPrefillKv(s, q, &bv, scale, 128, sinks)) orelse return error.FusedDeclined;
             defer _ = mlx.mlx_array_free(ref);
             try mlx.check(mlx.mlx_array_eval(ref));
@@ -42147,13 +42592,13 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
             const ref_bits = (mlx.mlx_array_data_bfloat16(ref) orelse return error.Unreadable)[0..n];
             std.debug.print("[attn-pd-ub] band qL {d} identical:", .{@as(u32, @intCast(ql))});
             for (0..n_alt) |i| {
-                    attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = kernels[n_abl + i];
+                attn_pd_kernels[@backingInt(AttnPdArm.nax)] = kernels[n_abl + i];
                 const got = (try fusedSdpaPrefillKv(s, q, &bv, scale, 128, sinks)) orelse return error.FusedDeclined;
                 defer _ = mlx.mlx_array_free(got);
                 try mlx.check(mlx.mlx_array_eval(got));
                 std.debug.print(" alt{d} {}", .{ i, std.mem.eql(u16, ref_bits, (mlx.mlx_array_data_bfloat16(got) orelse return error.Unreadable)[0..n]) });
             }
-            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+            attn_pd_kernels[@backingInt(AttnPdArm.nax)] = served_kernel;
             std.debug.print("\n", .{});
         }
         for (var_kls) |vkl| {
@@ -42161,14 +42606,14 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
             defer view.deinit();
             var same: [4]bool = @splat(true);
             {
-            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+                attn_pd_kernels[@backingInt(AttnPdArm.nax)] = served_kernel;
                 const ref = (try fusedSdpaPrefillKv(s, q, &view.view, scale, 0, .{ .ctx = null })) orelse return error.FusedDeclined;
                 defer _ = mlx.mlx_array_free(ref);
                 try mlx.check(mlx.mlx_array_eval(ref));
                 const n = mlx.mlx_array_size(ref);
                 const ref_bits = (mlx.mlx_array_data_bfloat16(ref) orelse return error.Unreadable)[0..n];
                 for (0..n_alt) |i| {
-                    attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = kernels[n_abl + i];
+                    attn_pd_kernels[@backingInt(AttnPdArm.nax)] = kernels[n_abl + i];
                     const got = (try fusedSdpaPrefillKv(s, q, &view.view, scale, 0, .{ .ctx = null })) orelse return error.FusedDeclined;
                     defer _ = mlx.mlx_array_free(got);
                     try mlx.check(mlx.mlx_array_eval(got));
@@ -42178,13 +42623,13 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
             var t: [abls.len + alt_paths_buf.len + 1][reps_max]f64 = undefined;
             for (0..reps + 1) |r| {
                 for (0..n_var) |a| {
-                    attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = if (a == 0) served_kernel else kernels[a - 1];
+                    attn_pd_kernels[@backingInt(AttnPdArm.nax)] = if (a == 0) served_kernel else kernels[a - 1];
                     const t0 = std.Io.Timestamp.now(io, .boot);
                     try Run.global(s, .dense, null, q, &view.view, scale);
                     if (r > 0) t[a][r - 1] = @as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e6;
                 }
             }
-            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+            attn_pd_kernels[@backingInt(AttnPdArm.nax)] = served_kernel;
             const m0 = median(t[0][0..reps]);
             std.debug.print("[attn-pd-ub] {d:>5} {d:>8} {d:>8.2} {d:>7.1}", .{ @as(u32, @intCast(ql)), @as(u32, @intCast(vkl)), m0, causalFlops(ql, vkl) / m0 / 1e9 });
             for (1..n_abl + 1) |a| std.debug.print(" {d:>9.2}", .{median(t[a][0..reps])});
@@ -44395,8 +44840,14 @@ test "qsa verify gather tbq: subset SDPA matches masked full SDPA (tbq4, tbq3, l
         defer view.deinit();
         try std.testing.expect(!view.has_quant_triple);
         try std.testing.expect(view.tbq_triple);
-        // The aligned fused arm declines before touching the lazy dense views.
-        try std.testing.expect((try qsaAlignedSparseAttn(s, q, &view, blocks, ratio, scale, 512)) == null);
+        // The aligned fused arm's split-K passthrough now SERVES tbq at hd
+        // 256; on a kill-switched kernel it declines without touching the
+        // lazy dense views, leaving the packed-row gather arm below in place.
+        {
+            qsa_attn_kernel_override = false;
+            defer qsa_attn_kernel_override = null;
+            try std.testing.expect((try qsaAlignedSparseAttn(s, q, &view, blocks, ratio, scale, 512)) == null);
+        }
         const got = (try qsaVerifyGatherAttn(s, q, &view, blocks, ratio, scale)) orelse return error.VerifyGatherDeclined;
         defer _ = mlx.mlx_array_free(got);
         const ref = try attn256Reference(q, view.k, view.v, scale, "array", mask, s);
@@ -44407,6 +44858,148 @@ test "qsa verify gather tbq: subset SDPA matches masked full SDPA (tbq4, tbq3, l
         try std.testing.expect(diff < 0.01);
         try std.testing.expect(cos > 0.9999);
     }
+}
+
+test "qsa split-K tbq: rotated-domain arm matches fused-take gather and dense SDPA (tbq4, tbq3)" {
+    // Measured: vs dense SDPA max diff 0.000488 / cos 0.9999915 (tbq4/tbq3,
+    // S=8 and S=1); vs the fused-take gather arms max diff 0.000488 /
+    // cos 0.9999948, with the S=1 decode arm near-bitwise identical
+    // (0.000015 / 1.0000000). The INT_MAX-padded + ragged kv=4094 cases
+    // match the dense mask arm to 0.000122.
+    // Chunk 6: the TBQ view has its own split-K arm — M1 rides the queries,
+    // the split pass stages packed rows through `sushi_qsa_tbq8` in the
+    // rotated domain, and one M2 fold after the merge returns the true
+    // output. Baseline 1 is the fused-take gather this arm replaces at
+    // verify/decode widths (its staged rows are the same rotated values);
+    // baseline 2 is the dense-mask SDPA over the whole-cache dequant. Bars
+    // are the take-parity bars: only tiling/split order may differ.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    qsa_attn_kernel_override = true;
+    qsa_verify_gather_override = true;
+    qsa_decode_gather_override = true;
+    qsa_verify_gather_min_kv_override = 1024;
+    tbq_take_override = true; // pin the fused take for the gather baselines
+    defer {
+        qsa_attn_kernel_override = null;
+        qsa_verify_gather_override = null;
+        qsa_decode_gather_override = null;
+        qsa_verify_gather_min_kv_override = null;
+        tbq_take_override = null;
+    }
+    var prng = std.Random.DefaultPrng.init(0x51C7_BB1E);
+    const rnd = prng.random();
+    const cases = [_]struct { q_len: c_int, kv: c_int, kb: c_int, bits: u8 }{
+        .{ .q_len = 8, .kv = 4096, .kb = 64, .bits = 4 },
+        .{ .q_len = 1, .kv = 4096, .kb = 64, .bits = 4 },
+        .{ .q_len = 8, .kv = 4096, .kb = 64, .bits = 3 },
+        .{ .q_len = 1, .kv = 4096, .kb = 64, .bits = 3 },
+        // Ragged final superblock AND every row INT_MAX-padded: at kv=4094
+        // complete = 1023 < kb, so the fixture pads every row. The gather
+        // arms' no-win gates (gathered rows >= kv) decline that regime, so
+        // the ground truth here is the dense-mask SDPA: the split kernel
+        // reads the row's own `min(complete, KB)` blocks and never touches
+        // the pads.
+        .{ .q_len = 8, .kv = 4094, .kb = 1025, .bits = 4 },
+        .{ .q_len = 1, .kv = 4094, .kb = 1025, .bits = 4 },
+    };
+    for (cases) |c| {
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, c.q_len, 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, c.kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(k_dense);
+        const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, c.kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(v_dense);
+        var fx = try QsaBlockFixture.build(rnd, c.q_len, c.kv, c.kb, ratio);
+        defer fx.deinit();
+        var cache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.tbq(c.bits));
+        defer cache.deinit();
+        var view = try cache.update(0, k_dense, v_dense, s, 250000);
+        defer view.deinit();
+        try std.testing.expect(view.tbq_triple);
+        try std.testing.expect(!view.has_quant_triple);
+
+        qsa_attn_tbq_engaged_bits.reset();
+        tbq_take_engaged_bits.reset();
+        const got = (try qsaSparseAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.SplitKDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        // Anti-vacuity: the packed split pass served this tick, and the
+        // fused take never ran — the split kernel staged the rows itself.
+        try std.testing.expect(qsa_attn_tbq_engaged_bits.seen != 0);
+        try std.testing.expect(tbq_take_engaged_bits.seen == 0);
+
+        const ref = try attn256Reference(q, view.k, view.v, scale, "array", fx.mask, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const rd = try attn256MaxDiff(got, ref, s);
+        const rc = try attn256Cosine(got, ref, s);
+        errdefer std.debug.print("[qsa-splitk] S={d} kv={d} kb={d} tbq{d}: vs-dense max diff {d:.6} cos {d:.7}\n", .{ c.q_len, c.kv, c.kb, c.bits, rd, rc });
+        try std.testing.expect(rd < 0.01);
+        try std.testing.expect(rc > 0.9999);
+
+        if (c.kv == 4096) {
+            const base = if (c.q_len == 1)
+                (try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.GatherBaselineDeclined
+            else
+                (try qsaVerifyGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.GatherBaselineDeclined;
+            defer _ = mlx.mlx_array_free(base);
+            const gd = try attn256MaxDiff(got, base, s);
+            const gc = try attn256Cosine(got, base, s);
+            errdefer std.debug.print("[qsa-splitk] S={d} kv={d} kb={d} tbq{d}: vs-take max diff {d:.6} cos {d:.7}\n", .{ c.q_len, c.kv, c.kb, c.bits, gd, gc });
+            try std.testing.expect(gd < 0.01);
+            try std.testing.expect(gc > 0.9999);
+        }
+    }
+}
+
+test "qsa split-K tbq: kill switch falls back to the gather arms" {
+    // SUSHI_QSA_ATTN_KERNEL=0 (same seam as the affine arm): the split-K
+    // entry declines a tbq view outright, and the aligned passthrough
+    // declines before it can touch the lazy dense views — the verify-width
+    // tick keeps landing on the fused-take gather exactly as before this
+    // arm existed.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    var prng = std.Random.DefaultPrng.init(0xDEAD_1C71);
+    const rnd = prng.random();
+    const kv: c_int = 512;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 8, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(v_dense);
+    var fx = try QsaBlockFixture.build(rnd, 8, kv, 16, ratio);
+    defer fx.deinit();
+    var cache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.tbq(4));
+    defer cache.deinit();
+    var view = try cache.update(0, k_dense, v_dense, s, 0);
+    defer view.deinit();
+    try std.testing.expect(view.tbq_triple);
+    qsa_attn_tbq_engaged_bits.reset();
+    {
+        qsa_attn_kernel_override = false;
+        defer qsa_attn_kernel_override = null;
+        try std.testing.expect((try qsaSparseAttn(s, q, &view, fx.blocks, ratio, scale)) == null);
+        try std.testing.expect((try qsaAlignedSparseAttn(s, q, &view, fx.blocks, ratio, scale, 512)) == null);
+        try std.testing.expect(qsa_attn_tbq_engaged_bits.seen == 0);
+    }
+    // With the kernel back on, the same call serves and the take meter
+    // stays dark: the fallback is not what ran.
+    qsa_attn_kernel_override = true;
+    defer qsa_attn_kernel_override = null;
+    qsa_verify_gather_override = true;
+    qsa_decode_gather_override = true;
+    defer qsa_verify_gather_override = null;
+    defer qsa_decode_gather_override = null;
+    tbq_take_engaged_bits.reset();
+    const got = (try qsaSparseAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.SplitKDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expect(qsa_attn_tbq_engaged_bits.seen != 0);
+    try std.testing.expect(tbq_take_engaged_bits.seen == 0);
 }
 
 test "qsa prefill gather tbq: packed gather matches whole-cache dense SDPA (tbq4, tbq3)" {
@@ -45470,6 +46063,7 @@ fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const Qs
         _ = mlx.mlx_clear_cache();
     }
 }
+
 
 test "splitMaskedSdpa256: verify-width array-mask rows split through the vector kernel match one dispatch" {
     const s = mlx.gpuStream();
@@ -49168,8 +49762,8 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
 
     // Slots 0 and 1 run together, 2 joins, 0 leaves as 3 joins, 2 is cancelled, 0 comes back.
     const active = [_][]const usize{
-        &.{ 0, 1 },    &.{ 0, 1 },    &.{ 0, 1, 2 }, &.{ 0, 1, 2 }, &.{ 1, 2, 3 },
-        &.{ 1, 2, 3 }, &.{ 1, 3 },    &.{ 0, 1, 3 }, &.{ 0, 1, 3 }, &.{ 0, 1, 2, 3 },
+        &.{ 0, 1 },    &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 1, 2 }, &.{ 1, 2, 3 },
+        &.{ 1, 2, 3 }, &.{ 1, 3 }, &.{ 0, 1, 3 }, &.{ 0, 1, 3 }, &.{ 0, 1, 2, 3 },
     };
     var mismatched: usize = 0;
     for (active, 0..) |set, tick| {
@@ -57430,7 +58024,7 @@ fn mimoExpectClose(label: []const u8, actual: []const f32, expected: []const f32
             if (@abs(x - y) > @abs(actual[peak] - expected[peak])) peak = i;
         }
         std.debug.print("{s}: max absolute error {d} exceeds {d}; index {d}, actual {d}, expected {d}; first-row error {d}\n", .{
-            label, err, limit, peak, actual[peak], expected[peak],
+            label,                                                                                         err, limit, peak, actual[peak], expected[peak],
             try mimoFixtureMaxAbs(actual[0..@min(384, actual.len)], expected[0..@min(384, expected.len)]),
         });
         return error.TestExpectedEqual;
@@ -57978,7 +58572,6 @@ test "upstream bugfix: KVCache affine quant keeps its dtype through growth" {
     }
 }
 
-
 test "gdn verify fold: output and every rollback state remain bit-identical" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
@@ -57995,7 +58588,6 @@ test "gdn verify fold: output and every rollback state remain bit-identical" {
         }
     }
 }
-
 
 test "gdn verify fold: unsupported threadgroup declines without poisoning later work" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -58015,7 +58607,6 @@ test "gdn verify fold: unsupported threadgroup declines without poisoning later 
     try testing.expect(!mlx.errorPending());
 }
 
-
 test "gdn verify fold: default serves two rows and timing overrides stay within the kernel envelope" {
     const saved = gdn_verify_fold_override;
     defer gdn_verify_fold_override = saved;
@@ -58026,7 +58617,6 @@ test "gdn verify fold: default serves two rows and timing overrides stay within 
     gdn_verify_fold_override = false;
     try testing.expect(!gdnVerifyFoldFor(2));
 }
-
 
 const Qwen4LadderHostFixture = struct {
     bytes: []align(std.heap.page_size_min) u8,
@@ -58043,9 +58633,7 @@ const Qwen4LadderHostFixture = struct {
             const v = (prng.random().float(f32) - 0.5) * 2;
             std.mem.writeInt(u16, self.bytes[i * 2 ..][0..2], @truncate(@as(u32, @bitCast(v)) >> 16), .little);
         }
-        self.st = .{ .hash = hash, .table = .{ .map = self.bytes, .rows = hash.total_rows,
-            .dim = dim, .bits = 16, .group_size = 0, .w_off = 0, .s_off = 0, .b_off = 0,
-            .wcols = dim, .scols = 0 } };
+        self.st = .{ .hash = hash, .table = .{ .map = self.bytes, .rows = hash.total_rows, .dim = dim, .bits = 16, .group_size = 0, .w_off = 0, .s_off = 0, .b_off = 0, .wcols = dim, .scols = 0 } };
         self.xfm_bytes = @splat(0);
         self.cache_bytes = @splat(0);
         const x = self.xfm();
@@ -58079,7 +58667,6 @@ fn expectLadderPleHistoryEqual(want: *const SSMCacheEntry, got: *const SSMCacheE
     try testing.expectEqual(want.spec_ple_len, got.spec_ple_len);
     try testing.expectEqualSlices(u32, want.spec_ple_tokens[0..want.spec_ple_len], got.spec_ple_tokens[0..got.spec_ple_len]);
 }
-
 
 const Qwen4LadderRig = struct {
     fx: Qwen4LadderHostFixture,
@@ -58585,7 +59172,9 @@ pub const StreamGdnUndo = struct {
 
     pub fn init(entry: *const SSMCacheEntry) !StreamGdnUndo {
         const conv = if (entry.conv_state.ctx != null) try standinRef(entry.conv_state) else entry.conv_state;
-        errdefer if (conv.ctx != null) { _ = mlx.mlx_array_free(conv); };
+        errdefer if (conv.ctx != null) {
+            _ = mlx.mlx_array_free(conv);
+        };
         const state = if (entry.ssm_state.ctx != null) try standinRef(entry.ssm_state) else entry.ssm_state;
         return .{ .conv = conv, .state = state, .initialized = entry.initialized };
     }
@@ -58643,10 +59232,22 @@ const StreamDeferredRig = struct {
         try self.fx.init();
         const x = self.fx.xfm();
         x.config = .{
-            .model_type = "qwen4_exp", .hidden_size = 64, .hc_count = 4, .num_hidden_layers = 4, .vocab_size = 16,
-            .num_experts = 4, .num_experts_per_tok = 2, .moe_intermediate_size = 64, .hidden_act = .silu,
-            .linear_num_key_heads = 1, .linear_num_value_heads = 1, .linear_key_head_dim = 32, .linear_value_head_dim = 32,
-            .linear_conv_kernel_dim = 4, .quant_group_size = 32, .quant_bits = 4,
+            .model_type = "qwen4_exp",
+            .hidden_size = 64,
+            .hc_count = 4,
+            .num_hidden_layers = 4,
+            .vocab_size = 16,
+            .num_experts = 4,
+            .num_experts_per_tok = 2,
+            .moe_intermediate_size = 64,
+            .hidden_act = .silu,
+            .linear_num_key_heads = 1,
+            .linear_num_value_heads = 1,
+            .linear_key_head_dim = 32,
+            .linear_value_head_dim = 32,
+            .linear_conv_kernel_dim = 4,
+            .quant_group_size = 32,
+            .quant_bits = 4,
         };
         var prng = std.Random.DefaultPrng.init(183);
         const r = prng.random();
@@ -58658,9 +59259,15 @@ const StreamDeferredRig = struct {
         try mlx.check(mlx.mlx_ones(&x.ones_hidden.?, &[_]c_int{64}, 1, .bfloat16, x.s));
         const hc_weights = HcWeights{
             .norm_w = try self.weight(r, &.{ 4, 64 }),
-            .down_w = try self.weight(r, &.{ 256, 8 }), .down_s = none, .down_b = none,
-            .up_w = try self.weight(r, &.{ 8, 256 }), .up_s = none, .up_b = none,
-            .inject_w = try self.weight(r, &.{ 256, 4 }), .inject_s = none, .inject_b = none,
+            .down_w = try self.weight(r, &.{ 256, 8 }),
+            .down_s = none,
+            .down_b = none,
+            .up_w = try self.weight(r, &.{ 8, 256 }),
+            .up_s = none,
+            .up_b = none,
+            .inject_w = try self.weight(r, &.{ 256, 4 }),
+            .inject_s = none,
+            .inject_b = none,
         };
         x.qwen4_mixer = hc_weights;
         var mw: MoeMlpWeights = std.mem.zeroes(MoeMlpWeights);
@@ -58679,20 +59286,35 @@ const StreamDeferredRig = struct {
             self.count += 1;
         }
         const la = LinearAttnWeights{
-            .qkv_w = try self.weight(r, &.{ 64, 96 }), .qkv_s = none, .qkv_b = none,
-            .z_w = try self.weight(r, &.{ 64, 32 }), .z_s = none, .z_b = none,
-            .a_w = try self.weight(r, &.{ 64, 1 }), .a_s = none, .a_b = none,
-            .b_w = try self.weight(r, &.{ 64, 1 }), .b_s = none, .b_b = none,
-            .out_w = try self.weight(r, &.{ 32, 64 }), .out_s = none, .out_b = none,
+            .qkv_w = try self.weight(r, &.{ 64, 96 }),
+            .qkv_s = none,
+            .qkv_b = none,
+            .z_w = try self.weight(r, &.{ 64, 32 }),
+            .z_s = none,
+            .z_b = none,
+            .a_w = try self.weight(r, &.{ 64, 1 }),
+            .a_s = none,
+            .a_b = none,
+            .b_w = try self.weight(r, &.{ 64, 1 }),
+            .b_s = none,
+            .b_b = none,
+            .out_w = try self.weight(r, &.{ 32, 64 }),
+            .out_s = none,
+            .out_b = none,
             .conv1d_w = try self.weight(r, &.{ 96, 4, 1 }),
             .norm_w = try self.weight(r, &.{32}),
-            .A_log = try self.weight(r, &.{1}), .dt_bias = try self.weight(r, &.{1}),
+            .A_log = try self.weight(r, &.{1}),
+            .dt_bias = try self.weight(r, &.{1}),
             .combined_proj = false,
         };
         for (&self.layers) |*layer| layer.* = .{
-            .input_norm = none, .post_attn_norm = none, .is_linear = true,
-            .attn = .{ .linear = la }, .mlp = .{ .moe = mw },
-            .hc_attn = hc_weights, .hc_mlp = hc_weights,
+            .input_norm = none,
+            .post_attn_norm = none,
+            .is_linear = true,
+            .attn = .{ .linear = la },
+            .mlp = .{ .moe = mw },
+            .hc_attn = hc_weights,
+            .hc_mlp = hc_weights,
         };
         x.moe_layers = &self.layers;
     }
@@ -58701,7 +59323,9 @@ const StreamDeferredRig = struct {
         const x = self.fx.xfm();
         for (self.arrays[0..self.count]) |a| _ = mlx.mlx_array_free(a);
         inline for (.{ "gdn_q_scale", "gdn_k_scale", "gdn_eps", "gdn_ones_w", "ones_hidden" }) |name|
-            if (@field(x, name)) |a| { _ = mlx.mlx_array_free(a); };
+            if (@field(x, name)) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
         _ = mlx.mlx_array_free(x.one);
         self.fx.deinit();
     }
@@ -58950,9 +59574,9 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
         var equal = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(equal);
         try mlx.check(mlx.mlx_array_equal(&equal, actual, expected, true, xfm.s));
-            var same = false;
+        var same = false;
         try mlx.check(mlx.mlx_array_item_bool(&same, equal));
-            try testing.expect(same);
+        try testing.expect(same);
         try testing.expectEqual(request.offset, xfm.cache.step);
     }
     try xfm.resetCache();

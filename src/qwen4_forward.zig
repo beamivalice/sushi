@@ -2443,7 +2443,7 @@ pub fn gatedFullAttnProjected(
         const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         var gathered: ?mlx.mlx_array = null;
         const qsa_ok = ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa;
-        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) {
+        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple or kv_view.tbq_triple, seq_len)) {
             // One fused dispatch per layer: each row indexes its own selection + tail.
             gathered = try qsaAlignedSparseAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale, @intCast(self.config.indexer_budget));
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 1;
