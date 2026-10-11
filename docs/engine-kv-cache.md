@@ -59,6 +59,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   schemes — TBQ takes the 16384-row QUANT floor, not the 32768 dense one;
   billing it as dense pinned interleaved MTP ticks at 16k-32k rows to the
   whole-cache rebuild and refused a 67k prompt on a live tbq4 server.
+- TBQ split-K arm (Chunk 6): `qsaSparseAttn` serves tbq views at every width
+  `qsaSparseAttnServes` admits through `sushi_attn_qsa256_qsplit_tbq` — the split
+  pass stages packed rows through `sushi_qsa_tbq8` (no per-tick dense subset at
+  all), M1 folds into the queries once per tick, M2 folds the merged output once
+  (softmax linearity makes one post-merge fold equal NSPLIT per-split folds), the
+  affine merge kernel is reused byte-identical. It replaced the gather arms as the
+  FIRST choice after a tbq4 server run decoded 8-12 t/s vs kv8's 42: the split-K
+  decline (`if (kv_view.tbq_triple) return null`) had left only per-tick
+  materialization — ~+4.5 GB active_bytes and 53 ms/tok serial. Measured per
+  layer-tick at kv=36864: split-K 0.253 (S=8) / 0.350 (S=1) vs fused-take
+  0.876/1.029 and affine8 0.955/1.214. `SUSHI_QSA_ATTN_KERNEL=0` restores the
+  gather arms; `qsaAlignedSparseAttn` still passes tbq only when the fused prefix
+  budget is free (cut>0 declines, so the per-row prefix SDPA never evaluates the
+  lazy whole-cache dequant). Engage line: `[qsa-attn] engaged (S=… quant=tbq4/gs128 …)`.
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
   matmul2d decode kernel and the fused prefill on MiMo's global layers ([mimo2-arch](mimo2-arch.md#attention-kernels)).
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width

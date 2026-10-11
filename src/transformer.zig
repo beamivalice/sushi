@@ -4775,27 +4775,11 @@ const QSA_ATTN_Q_TBQ_SOURCE =
     \\// but a split's last is full. A split starting past L is EMPTY and
     \\// writes the merge's identity.
     \\const int tiles = (L + BK - 1) / BK;
-    \\// BALANCED=0 (default, MEASURED): ceil(tiles/NSPLIT) per split, so the
-    \\// last splits can be short or empty — at the swept shape 129 tiles over
-    \\// 16 splits is 14 full, 1 partial, 1 empty. BALANCED=1 spreads the
-    \\// remainder one tile per split instead. Strictly better load balance on
-    \\// paper; NOT the default because the sweep that chose NSPLIT=16 ran on
-    \\// the ceil distribution, and changing how work is divided invalidates
-    \\// it. Same outputs either way — the split boundaries move, the merge is
-    \\// exact over whatever they are.
-    \\int t_lo, t_hi;
-    \\if (BALANCED) {
-    \\  const int base_t = tiles / NSPLIT;
-    \\  const int rem_t = tiles % NSPLIT;
-    \\  const int start_t = jsp * base_t + metal::min(jsp, rem_t);
-    \\  const int cnt_t = base_t + ((jsp < rem_t) ? 1 : 0);
-    \\  t_lo = start_t * BK;
-    \\  t_hi = metal::min(L, (start_t + cnt_t) * BK);
-    \\} else {
-    \\  const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
-    \\  t_lo = jsp * tiles_per * BK;
-    \\  t_hi = metal::min(L, t_lo + tiles_per * BK);
-    \\}
+    \\// ceil(tiles/NSPLIT) per split, so the last splits can be short or empty; the
+    \\// merge is exact over whatever the boundaries are.
+    \\const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
+    \\const int t_lo = jsp * tiles_per * BK;
+    \\const int t_hi = metal::min(L, t_lo + tiles_per * BK);
     \\
     \\const long block_base = (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
     \\const long kq_base  = (long)bb * kq_strides[0]  + (long)hk * kq_strides[1];
@@ -5335,7 +5319,6 @@ fn splitKAttnDispatchTbq(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", key.ratio));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(key.bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(key.gs)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BALANCED", @intFromBool(key.balanced)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", qs[3]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", key.dv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SPARSE", @intFromBool(key.sparse)));
@@ -5466,7 +5449,6 @@ pub fn qsaSparseAttn(
             .nsg = @divTrunc(gqa + 7, 8),
             .nsplit = qsaAttnNSplit(),
             .bk = qsaAttnBk(),
-            .balanced = qsaAttnBalanced(),
             .ratio = ratio,
             .dtype = .bfloat16,
             .is_tbq = true,
