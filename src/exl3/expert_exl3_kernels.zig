@@ -1420,7 +1420,7 @@ fn buildWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c_int
 }
 
 fn gemmWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c_int, aligned: bool) !WindowTable {
-    return if (aligned) buildWindowTable(s, eids, n, win) else buildStrideTable(s, n, win);
+    return if (aligned) buildWindowTable(s, eids, n, win) else buildStrideTable(n, win);
 }
 
 fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c_int) !WindowTable {
@@ -1467,25 +1467,16 @@ fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c
             off += live;
         }
     }
-    const starts_raw = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(starts_raw);
-    const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(nlives_raw);
-    var starts = mlx.mlx_array_new();
+    const starts = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     errdefer _ = mlx.mlx_array_free(starts);
-    var nlives = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(nlives);
-    try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
-    try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(starts));
-    try mlx.check(mlx.mlx_array_eval(nlives));
+    const nlives = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     if (exl3UbenchOn()) {
         benchPrint("[exl3-ubench] win_table_host nwin={d} n={d} win={d} eval=eids\n", .{ nwin_u, n, win });
     }
     return .{ .starts = starts, .nlives = nlives, .nwin = @intCast(nwin_u) };
 }
 
-fn buildStrideTable(s: mlx.mlx_stream, n: c_int, win: c_int) !WindowTable {
+fn buildStrideTable(n: c_int, win: c_int) !WindowTable {
     const w: u32 = @intCast(win);
     const nn: u32 = @intCast(n);
     const nwin_u = (nn + w - 1) / w;
@@ -1499,18 +1490,9 @@ fn buildStrideTable(s: mlx.mlx_stream, n: c_int, win: c_int) !WindowTable {
         sh[i] = st;
         lh[i] = @min(w, nn - st);
     }
-    const starts_raw = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(starts_raw);
-    const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(nlives_raw);
-    var starts = mlx.mlx_array_new();
+    const starts = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     errdefer _ = mlx.mlx_array_free(starts);
-    var nlives = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(nlives);
-    try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
-    try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(starts));
-    try mlx.check(mlx.mlx_array_eval(nlives));
+    const nlives = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     if (exl3UbenchOn()) {
         benchPrint("[exl3-ubench] win_table_stride nwin={d} n={d} win={d}\n", .{ nwin_u, n, win });
     }
