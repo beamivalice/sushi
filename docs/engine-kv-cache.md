@@ -14,7 +14,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   `[kv-cache] <kv8|kv4|off> (<default|--kv-quant|model-settings.json>)`
   (scheduler adds `; ctx N (source)`); `/props` reports `settings.kv_cache`, `/v1/models` `meta.kv_cache`.
   `kld capture|compare` teachers stay dense; the qwen4 MTP head KV is dense unless `--mtp-head-kv-quant`.
-- `--kv-quant 8|4|16` (16 = dense BF16, also spelled `off`/`0`; `src/kv_quant.zig`, `configuredKvQuantFor(config)`); an explicit flag beats
+- `--kv-quant 8|4|16|tbq4|tbq3` (16 = dense BF16, also spelled `off`/`0`; `tbq4`/`tbq3` = rotated fixed-codebook
+  storage, `src/kv_quant.zig`, `configuredKvQuantFor(config)`); an explicit flag beats
   `model-settings.json` `kv_quant`, which beats the default. A per-model setting of `kv_quant: off` still wins over
   the default.
 - GLM (`glm5_next`) takes the kv8 default too, through its own MLA latent backend (`glm5_latent.zig`,
@@ -38,6 +39,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   the merged output inverse-rotated by M2 = M1ᵀ — so decode/verify never rebuild the whole cache; the dense
   fallback stays a whole-cache dequant and the affine path is bit-identical.
   Guard: `tests/test_kv_quant_fused_equivalence.sh`.
+- TBQ writes quantize in ONE dispatch: the fused Metal encoder `sushi_tbq_encode` (`kv_quant.quantizeTBQ`; one
+  threadgroup per 128-block runs norm → s1 → FWHT (register shuffles for stages 1..16, threadgroup scratch for
+  32/64) → [1/√128] → s2 → midpoint search → 64 B (tbq4) or 48 B (tbq3) fixed-point pack + the fp16 norms and
+  their biases copy). The ~25-op composed chain remains the fallback and any `SUSHI_TBQ_ENCODE_FUSED=0` restore.
+  The butterfly accumulates in a different order than the composed 128×128 matmul, so a value within ~1 ULP of a
+  midpoint can bucket one code away: RMSE is preserved, bit-exactness with the composed path is NOT (pinned by
+  the fused-vs-composed tolerance tests in `src/kv_quant.zig`).
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
   matmul2d decode kernel and the fused prefill on MiMo's global layers ([mimo2-arch](mimo2-arch.md#attention-kernels)).
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width
