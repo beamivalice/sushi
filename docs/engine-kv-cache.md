@@ -55,6 +55,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   subset reads now cost *less* than 8-bit. Geometry/dtype mismatch declines
   silently to the composed chain; force it with `SUSHI_TBQ_TAKE_FUSED=0`.
   Engage line: `[qsa-take] fused engaged: bits=…`.
+  Routing note: the verify floor (`qsaVerifyGatherServes`) bills `isQuant`
+  schemes — TBQ takes the 16384-row QUANT floor, not the 32768 dense one;
+  billing it as dense pinned interleaved MTP ticks at 16k-32k rows to the
+  whole-cache rebuild and refused a 67k prompt on a live tbq4 server.
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
   matmul2d decode kernel and the fused prefill on MiMo's global layers ([mimo2-arch](mimo2-arch.md#attention-kernels)).
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width
