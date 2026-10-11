@@ -19028,6 +19028,7 @@ pub const Transformer = struct {
 
 
 
+
     // ── Multi-head Latent Attention (bailing_hybrid full-attention layers) ──
     //
     // The DeepSeek-V3 shape, in its NAIVE (un-absorbed) form: the compressed
@@ -44184,6 +44185,73 @@ test "qsa prefill gather tbq: packed gather matches whole-cache dense SDPA (tbq4
         try std.testing.expect(diff < 0.01);
         try std.testing.expect(cos > 0.9999);
     }
+}
+
+test "qsa prefill gather tbq: engages on the server-shaped grown cache" {
+    // The live server declined this arm for hours: the forward's prefill
+    // call site gated `gatherQsa256Packed` on `has_quant_triple`, which a
+    // tbq view never sets, so every 2048-token chunk ran the dense gather
+    // over a whole-cache dequant instead. The direct-call unit tests above
+    // never touched that gate. This test rebuilds the failing shape - five
+    // 2048-row updates growing the cache to >=10240 capacity, one 2048-row
+    // forward - and pins that the TBQ kernel engages there AND stays
+    // numerically exact after the growth path copied the triples (a wrong
+    // grow layout would engage and be wrong, so the mask-arm reference is
+    // not optional).
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_gather_override = true;
+    qsa_attn_kernel_override = true;
+    qsa_nax_override = false;
+    defer qsa_gather_override = null;
+    defer qsa_attn_kernel_override = null;
+    defer qsa_nax_override = null;
+    var prng = std.Random.DefaultPrng.init(0x51B1_1);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.tbq(4));
+    defer cache.deinit();
+    const k0 = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 2048, 256 }, s);
+    defer _ = mlx.mlx_array_free(k0);
+    const v0 = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 2048, 256 }, s);
+    defer _ = mlx.mlx_array_free(v0);
+    var view = try cache.update(0, k0, v0, s, 250000);
+    defer view.deinit();
+    for (1..5) |_| {
+        const kc = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 2048, 256 }, s);
+        defer _ = mlx.mlx_array_free(kc);
+        const vc = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 2048, 256 }, s);
+        defer _ = mlx.mlx_array_free(vc);
+        view.deinit();
+        view = try cache.update(0, kc, vc, s, 250000);
+    }
+    try std.testing.expect(view.tbq_triple);
+    const cap = mlx.getShape(view.k_triple_q)[2];
+    try std.testing.expect(cap >= 10240);
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 2048, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const blocks_host = try qsaVerifyBlocksHost(ta, rnd, 2048, cap, 512, ratio);
+    defer ta.free(blocks_host);
+    const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, 2048, 512 }, 3, .int32);
+    defer _ = mlx.mlx_array_free(blocks);
+    qsa_gather_tbq_engaged_bits.reset();
+    qsa_gather_packed_engaged_bits.reset();
+    const got = (try gatherQsa256Packed(s, q, &view, scale, blocks, ratio)) orelse return error.PrefillGatherDeclinedAtServerShape;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expect(qsa_gather_tbq_engaged_bits.seen != 0);
+    try std.testing.expect(qsa_gather_packed_engaged_bits.seen == 0);
+    try std.testing.expect(!qsa_gather_used_nax);
+    const mask = try qsaMaskFromBlocks(s, blocks, cap, ratio);
+    defer _ = mlx.mlx_array_free(mask);
+    const ref = try attn256Reference(q, view.k, view.v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const diff = try attn256MaxDiff(got, ref, s);
+    const cos = try attn256Cosine(got, ref, s);
+    errdefer std.debug.print("[qsa-prefill-gather] grown cap={d} S=2048 tbq4: max diff {d:.6} cos {d:.7}\n", .{ cap, diff, cos });
+    try std.testing.expect(diff < 0.01);
+    try std.testing.expect(cos > 0.9999);
 }
 
 test "qsa prefill gather tbq: tbq4 and affine4 never share a gather config" {

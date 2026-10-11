@@ -2469,7 +2469,18 @@ pub fn gatedFullAttnProjected(
                 try mlx.check(mlx.mlx_array_eval(q_rope));
                 clk = ProfClock.init();
             }
-            if (kv_view.has_quant_triple and qsaPackedGatherServes(seq_len, mlx.getShape(full_k)[2], mlx.getShape(ctx.qsa_blocks)[2], ratio))
+            // TBQ first and unbounded: `qsaPackedGatherServes` exists to cap the
+            // DENSE gather's staged re-reads against a whole-cache rebuild, and a
+            // tbq kernel never materializes one. `tbq_triple` and `has_quant_triple`
+            // are mutually exclusive, so at most one of these calls runs per width;
+            // a null (declined geometry, kill switch) still falls to the dense
+            // gather below unchanged. This call site gated only on
+            // `has_quant_triple`, so tbq prefills ran the whole-cache dequant gather
+            // even with the packed kernel built (pinned by the server-shaped engage
+            // test in src/transformer.zig's tbq suite).
+            if (kv_view.tbq_triple)
+                gathered = try gatherQsa256Packed(self.s, q_rope, &kv_view, attn_scale, ctx.qsa_blocks, ratio);
+            if (gathered == null and kv_view.has_quant_triple and qsaPackedGatherServes(seq_len, mlx.getShape(full_k)[2], mlx.getShape(ctx.qsa_blocks)[2], ratio))
                 gathered = try gatherQsa256Packed(self.s, q_rope, &kv_view, attn_scale, ctx.qsa_blocks, ratio);
             if (gathered == null) gathered = try gatherQsa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_blocks, ratio);
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 8;
