@@ -46,6 +46,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   The butterfly accumulates in a different order than the composed 128×128 matmul, so a value within ~1 ULP of a
   midpoint can bucket one code away: RMSE is preserved, bit-exactness with the composed path is NOT (pinned by
   the fused-vs-composed tolerance tests in `src/kv_quant.zig`).
+- TBQ subset reads (QSA decode/verify gathers) stage rows in ONE dispatch:
+  `sushi_tbq_take` gathers them through the arm's own index array and emits
+  **rotated-domain** values — the query is rotated once around the SDPA
+  (per-128-block orthogonal; the row-indexed additive mask rides unchanged)
+  and the raw output folds back once. Measured on a grown cache at 67k rows:
+  0.52 ms/layer/step vs 1.34 composed (−61%) and 0.72 kv8 affine — TBQ
+  subset reads now cost *less* than 8-bit. Geometry/dtype mismatch declines
+  silently to the composed chain; force it with `SUSHI_TBQ_TAKE_FUSED=0`.
+  Engage line: `[qsa-take] fused engaged: bits=…`.
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
   matmul2d decode kernel and the fused prefill on MiMo's global layers ([mimo2-arch](mimo2-arch.md#attention-kernels)).
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width
