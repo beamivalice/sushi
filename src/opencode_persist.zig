@@ -112,7 +112,8 @@ pub fn merged(a: std.mem.Allocator, existing: []const u8, generated: []const u8,
     return std.json.Stringify.valueAlloc(a, old.value, .{ .whitespace = .indent_2 });
 }
 
-pub fn save(a: std.mem.Allocator, io: std.Io, directory: []const u8, generated: []const u8, entries: anytype) !void {
+/// Returns an allocator-owned backup path after replacement, or null without a backup.
+pub fn save(a: std.mem.Allocator, io: std.Io, directory: []const u8, generated: []const u8, entries: anytype) !?[]u8 {
     try std.Io.Dir.cwd().createDirPath(io, directory);
     var dir = try std.Io.Dir.openDirAbsolute(io, directory, .{});
     defer dir.close(io);
@@ -138,8 +139,10 @@ pub fn save(a: std.mem.Allocator, io: std.Io, directory: []const u8, generated: 
     const original = jsonc orelse json;
     const result = try merged(a, original orelse "{}", generated, entries);
     defer a.free(result);
+    var backup_path: ?[]u8 = null;
+    errdefer if (backup_path) |path| a.free(path);
     if (original) |raw| {
-        if (std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), result)) return;
+        if (std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), result)) return null;
         var index: usize = 0;
         while (true) : (index += 1) {
             const backup_name = try std.fmt.allocPrint(a, "{s}.sushi-backup-{d}", .{ name, index });
@@ -151,6 +154,7 @@ pub fn save(a: std.mem.Allocator, io: std.Io, directory: []const u8, generated: 
             defer backup.close(io);
             try backup.writeStreamingAll(io, raw);
             try backup.sync(io);
+            backup_path = try std.fs.path.join(a, &.{ directory, backup_name });
             break;
         }
     }
@@ -171,6 +175,33 @@ pub fn save(a: std.mem.Allocator, io: std.Io, directory: []const u8, generated: 
     if ((original == null) != (current == null)) return error.ConfigChanged;
     if (original) |raw| if (!std.mem.eql(u8, raw, current.?)) return error.ConfigChanged;
     try dir.rename(tmp_name, dir, name, io);
+    return backup_path;
+}
+
+test "opencode persistence returns backup paths only for replaced configs" {
+    const t = std.testing;
+    const a = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(t.io, &buf);
+    const directory = buf[0..n];
+    const entries = [_]struct { id: []const u8, loaded: bool }{};
+    const generated = "{\"provider\":{\"sushi\":{\"models\":{}}}}";
+    try t.expectEqual(@as(?[]u8, null), try save(a, t.io, directory, generated, &entries));
+    const raw = "{\"plugin\":[\"keep\"]}";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "opencode.json", .data = raw });
+    const reported = try save(a, t.io, directory, generated, &entries);
+    defer if (reported) |path| a.free(path);
+    try t.expect(reported != null);
+    const backup_path = reported.?;
+    const expected = try std.fs.path.join(a, &.{ directory, "opencode.json.sushi-backup-0" });
+    defer a.free(expected);
+    try t.expectEqualStrings(expected, backup_path);
+    const backup = try std.Io.Dir.cwd().readFileAlloc(t.io, backup_path, a, .limited(4096));
+    defer a.free(backup);
+    try t.expectEqualStrings(raw, backup);
+    try t.expectEqual(@as(?[]u8, null), try save(a, t.io, directory, generated, &entries));
 }
 
 test "opencode persistence JSONC merge preserves unrelated settings and omitted effort" {

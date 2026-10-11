@@ -49,12 +49,27 @@ def main():
                 line = next(line for line in result.stdout.splitlines() if line.startswith("export OPENCODE_CONFIG_CONTENT="))
                 return json.loads(shlex.split(line)[1].split("=", 1)[1])
 
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            (checkpoint / "config.json").write_text('{"model_type":"qwen4_exp"}')
+            run = [str(Path(options.bin).resolve()), "run", str(checkpoint)]
+            for args in [("--think",), ("--think", "--help"), ("--think", "hello", "--help")]:
+                result = subprocess.run(run + list(args), env=env, capture_output=True, text=True, timeout=30)
+                assert result.returncode != 0 and "--think requires" in result.stderr, result.stderr
+            for effort in ["off", "low", "medium", "xhigh"]:
+                result = subprocess.run(run + ["--think", effort, "--help"], env=env,
+                                        capture_output=True, text=True, timeout=30)
+                assert result.returncode == 0 and "Usage: sushi" in result.stdout, result.stderr
+            backup_notice = "backed up the previous OpenCode config to "
+
             for effort in ["off", "low", "medium", "xhigh"]:
                 models = config(launch("--think", effort))["provider"]["sushi"]["models"]
                 assert models["qwen"]["options"] == {"reasoningEffort": effort}
                 assert "options" not in models["glm"]
             assert "options" not in config(launch())["provider"]["sushi"]["models"]["qwen"]
             assert launch("--think", "high").returncode != 0
+            for args in [("--think",), ("--think", "--persist")]:
+                assert launch(*args).returncode != 0
             assert not (root / "opencode").exists()
             directory = root / "opencode"
             directory.mkdir()
@@ -76,23 +91,30 @@ def main():
             assert models["glm"]["limit"]["output"] <= 32768
             backups = list(directory.glob("*.sushi-backup-*"))
             assert len(backups) == 1 and backups[0].read_text() == original
+            assert [line for line in result.stderr.splitlines() if line.startswith(backup_notice)] == [
+                backup_notice + str(backups[0])], result.stderr
+            assert backup_notice not in result.stdout
             assert path.stat().st_mode & 0o777 == 0o600
             before = path.read_bytes()
-            assert launch("--persist").returncode == 0
+            result = launch("--persist")
+            assert result.returncode == 0 and backup_notice not in result.stderr, result.stderr
             assert path.read_bytes() == before and len(list(directory.glob("*.sushi-backup-*"))) == 1
             assert launch("--persist", "--think", "high").returncode != 0
             assert path.read_bytes() == before
             path.write_text("{ broken")
-            assert launch("--persist").returncode != 0 and path.read_text() == "{ broken"
+            result = launch("--persist")
+            assert result.returncode != 0 and path.read_text() == "{ broken"
+            assert backup_notice not in result.stderr
             path.write_text(original)
             other = directory / "opencode.json"
             other.write_text("{}")
             assert launch("--persist").returncode != 0 and path.read_text() == original
             other.unlink()
             path.unlink()
-            assert launch("--persist", "--think", "low").returncode == 0
+            result = launch("--persist", "--think", "low")
+            assert result.returncode == 0 and backup_notice not in result.stderr, result.stderr
             assert json.loads(other.read_text())["provider"]["sushi"]["models"]["qwen"]["options"]["reasoningEffort"] == "low"
-        print("PASS: effort validation, opt-in save, merge, backup, idempotence, invalid and ambiguous configs")
+        print("PASS: run/launch effort validation, opt-in save, merge, backup path on stderr, idempotence, invalid and ambiguous configs")
     finally:
         server.shutdown()
         server.server_close()

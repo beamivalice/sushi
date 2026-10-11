@@ -764,10 +764,10 @@ pub fn unquotePath(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
 
 pub const ThinkFlag = struct { think: Think, consumed: bool };
 
-/// `--think [effort]`: the next argument is taken only when it is an effort word.
-pub fn parseThinkFlag(next: ?[]const u8) ThinkFlag {
+/// `--think <effort>` requires an explicit effort word.
+pub fn parseThinkFlag(next: ?[]const u8) error{Usage}!ThinkFlag {
     if (next) |w| if (model.parseEffort(w)) |e| return .{ .think = .{ .effort = e }, .consumed = true };
-    return .{ .think = .on, .consumed = false };
+    return error.Usage;
 }
 
 pub const ThinkCommand = union(enum) { show, set: Think, refuse: []const u8 };
@@ -1820,12 +1820,12 @@ test "cli: buildReplChatBody and parseReplLine speak /v1/chat/completions SSE" {
     try testing.expect(parseReplLine(allocator, ": keepalive") == null);
 }
 
-test "cli: --think takes the next argument only when it is an effort word" {
-    try testing.expectEqual(ThinkFlag{ .think = .on, .consumed = false }, parseThinkFlag(null));
-    try testing.expectEqual(ThinkFlag{ .think = .on, .consumed = false }, parseThinkFlag("--port"));
-    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .xhigh }, .consumed = true }, parseThinkFlag("xhigh"));
-    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .off }, .consumed = true }, parseThinkFlag("off"));
-    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .off }, .consumed = true }, parseThinkFlag("none"));
+test "cli: --think requires an effort word" {
+    for ([_]?[]const u8{ null, "", "--port", "hello", "invalid" }) |word|
+        try testing.expectError(error.Usage, parseThinkFlag(word));
+    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .xhigh }, .consumed = true }, try parseThinkFlag("xhigh"));
+    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .off }, .consumed = true }, try parseThinkFlag("off"));
+    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .off }, .consumed = true }, try parseThinkFlag("none"));
 }
 
 test "cli: /think shows, sets an accepted word, and refuses the rest" {
@@ -2505,8 +2505,8 @@ test "cli: one-shot and REPL omission keep the model default" {
 
 
 test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only their own words" {
-    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .on }, .consumed = true }, parseThinkFlag("on"));
-    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .minimal }, .consumed = true }, parseThinkFlag("minimal"));
+    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .on }, .consumed = true }, try parseThinkFlag("on"));
+    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .minimal }, .consumed = true }, try parseThinkFlag("minimal"));
     const mimo = [_]model.Effort{ .off, .on };
     for ([_][]const u8{ "/think on", "/think minimal", "/think low", "/think medium", "/think high", "/think xhigh", "/think max" }) |line| {
         try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .on } }), parseThinkCommand(line, &mimo));

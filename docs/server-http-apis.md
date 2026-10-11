@@ -26,7 +26,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
   none runs at (`model.defaultReasoningEffort`: `--think`, else GLM high, else off/on per `defaultEnableThinking`,
   where a thinking Qwen silence renders low).
-- `--think X` is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
+- CLI `--think X` requires an explicit effort word and is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
   any X but off is on) or, lacking it, keeps its own default. It never fails a load.
 - A thinking request that names NO effort gets no server budget (decided): Qwen3.8 renders it as low
   (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
@@ -296,7 +296,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   `model`, and marks a row with efforts `reasoning` + `interleaved: reasoning_content` + one `variants` entry per graded
   word (GLM: low/high/max; on/off make none).
 - OpenCode `--think WORD` validates the selected model's advertised efforts and sets only its `options.reasoningEffort`; omission preserves existing defaults.
-- OpenCode `--persist` backs up and merges the global JSON/JSONC config under `XDG_CONFIG_HOME` or `~/.config`, preserves unrelated settings, and normalizes comments into the backup; invalid or ambiguous files are refused.
+- OpenCode `--persist` backs up and merges the global JSON/JSONC config under `XDG_CONFIG_HOME` or `~/.config`, preserves unrelated settings, and normalizes comments into the backup; successful replacements print the backup's full path to stderr; invalid or ambiguous files are refused.
 - opencode sends no `max_tokens`, and GLM reserves a request's whole window without one (1M rows): serve GLM with
   `--max-tokens N` for opencode (live: a 12k-token agent prompt hit `GlmReserveMemoryLimit` with 16 GB free). grok
   sends its configured `max_completion_tokens`.

@@ -621,11 +621,10 @@ pub fn main(init: std.process.Init) !void {
             serve_mode = true;
             serve_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--think")) {
-            const f = cli_mod.parseThinkFlag(if (i + 1 < args.len) args[i + 1] else null);
-            if (!f.consumed) {
+            const f = cli_mod.parseThinkFlag(if (i + 1 < args.len) args[i + 1] else null) catch {
                 log.err("--think requires a model-supported value: GLM low|high|max, Qwen off|low|medium|xhigh, MiMo off or any level (on)\n", .{});
                 std.process.exit(1);
-            }
+            };
             run_opts.think = f.think;
             if (f.consumed) i += 1;
         } else if (std.mem.eql(u8, args[i], "--tool") and i + 1 < args.len) {

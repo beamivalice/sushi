@@ -1025,11 +1025,15 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         else
             try std.fmt.allocPrint(allocator, "{s}/.config/opencode", .{homeDir()});
         defer allocator.free(dir_path);
-        @import("opencode_persist.zig").save(allocator, io, dir_path, oc_config.?, models.entries) catch |err| {
+        const backup_path = @import("opencode_persist.zig").save(allocator, io, dir_path, oc_config.?, models.entries) catch |err| {
             log.err("could not persist OpenCode config: {s}\n", .{@errorName(err)});
             return err;
         };
-        log.info("saved OpenCode settings in {s} (original backed up when changed)\n", .{dir_path});
+        if (backup_path) |path| {
+            defer allocator.free(path);
+            log.info("backed up the previous OpenCode config to {s}\n", .{path});
+        }
+        log.info("saved OpenCode settings in {s}\n", .{dir_path});
     }
 
     const script = try scriptFor(allocator, parsed.kind, base_url, chosen.id, chosen.budget, oc_config, parsed.extras);
