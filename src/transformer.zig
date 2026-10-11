@@ -3323,6 +3323,40 @@ const QSA_PACKED_HEADER =
     \\}
     \\
 ;
+/// TBQ twin of `sushi_qsa_unpack8`: the packed row is bytes, not nibble-in-
+/// u32 words — tbq4 pairs two codes per byte (four consecutive bytes per
+/// 8-element chunk, low nibble first), tbq3 packs eight codes per 24-bit
+/// little-endian fixed-point group (three bytes). The value is the
+/// rotated-domain codebook entry times the fp16 block norm, `cl[code] *
+/// d[e/128]`; there is no bias, and the row carries DK/128 norms addressed
+/// by element index (GS is 128 by contract, so an 8-chunk never straddles a
+/// block boundary).
+const QSA_TBQ_HEADER =
+    \\template <typename T, int BITS, int GS>
+    \\inline uint4 sushi_qsa_tbq8(const device uint8_t* wq, const device half* sc, const device float* cl, int c8) {
+    \\  constexpr int CB = GS / 2;   // bytes per 128-block at 4 bits (64)
+    \\  constexpr int BB = GS * 3 / 8; // bytes per 128-block at 3 bits (48)
+    \\  constexpr int W4 = BITS == 4 ? 4 : 3; // bytes holding one 8-element chunk
+    \\  const int e0 = c8 * 8;
+    \\  const int gb = e0 / GS;
+    \\  const int le = e0 % GS;
+    \\  const long bb0 = (BITS == 4 ? (long)(gb * CB) : (long)(gb * BB)) + (long)((le / 8) * W4);
+    \\  const float d = float(sc[gb]);
+    \\  uint32_t w = 0;
+    \\  for (int j = 0; j < W4; ++j) w |= uint32_t(wq[bb0 + j]) << (8u * uint(j));
+    \\  const uint sh0 = BITS == 4 ? 0u : 3u * uint(le % 8);
+    \\  const uint MASKB = (1u << BITS) - 1u;
+    \\  uint4 out = uint4(0);
+    \\  thread T* e = (thread T*)&out;
+    \\  for (int l = 0; l < 8; ++l) {
+    \\    const uint code = BITS == 4 ? ((w >> (4u * uint(l))) & MASKB) : ((w >> (sh0 + 3u * uint(l))) & MASKB);
+    \\    e[l] = T(cl[code] * d);
+    \\  }
+    \\  return out;
+    \\}
+    \\
+;
+
 
 /// [stock, nax]
 var qsa_gather_packed_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
@@ -3346,6 +3380,183 @@ fn getQsaGatherPackedKernel(nax: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+/// sushi_attn_qsa256_packed's TBQ twin: same tiles, same online softmax,
+/// same gather-by-block walk — only the dequant of the staged rows differs.
+/// The K/V rows are the TBQ packed code streams (u8) with fp16 block norms,
+/// staged as the ROTATED-domain value `cl[code] * d[element/128]`; `q`
+/// arrives pre-rotated by M1 and the wrapper inverse-rotates the merged
+/// output by M2 (the identity pinned by kv_quant's rotation tests, the same
+/// one the Chunk-2 fused decode/verify kernels run on). BITS is 4 or 3, GS
+/// is 128 by the TBQ contract; there are no biases.
+const QSA_ATTN_TBQ_KERNEL_SOURCE =
+    \\constexpr int BD = 256;
+    \\constexpr int LDK = BK + 8;
+    \\constexpr int LDV = BD + 8;
+    \\constexpr int NT = 32 * NSG;
+    \\constexpr int KT = BK / 8;
+    \\
+    \\const int qL = q_shape[2];
+    \\const int kL = k_shape[2];
+    \\const int Hq = q_shape[1];
+    \\const int Hk = k_shape[1];
+    \\const int gqa = Hq / Hk;
+    \\const int KB = blocks_shape[2];
+    \\
+    \\const int s = int(threadgroup_position_in_grid.x);
+    \\const int hk = int(threadgroup_position_in_grid.y);
+    \\const int bb = int(threadgroup_position_in_grid.z);
+    \\const ushort lane = ushort(thread_index_in_simdgroup);
+    \\const ushort warp = ushort(simdgroup_index_in_threadgroup);
+    \\const int tix = int(thread_index_in_threadgroup);
+    \\
+    \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
+    \\// Query s sits at absolute key position p (bottom-right aligned). Its
+    \\// visible keys: `count` complete blocks, then the tail [tail_start, p].
+    \\const int p = (kL - qL) + s;
+    \\const int complete = (p + 1) / RATIO;
+    \\const int count = metal::min(complete, KB);
+    \\const int sel_len = count * RATIO;
+    \\const int tail_start = complete * RATIO;
+    \\const int L = sel_len + (p + 1 - tail_start);
+    \\
+    \\const device int* blk = blocks + (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
+    \\const device uint8_t* Kp = k + bb * k_strides[0] + hk * k_strides[1];
+    \\const device uint8_t* Vp = v + bb * v_strides[0] + hk * v_strides[1];
+    \\const device half* Kscp = ksc + bb * ksc_strides[0] + hk * ksc_strides[1];
+    \\const device half* Vscp = vsc + bb * vsc_strides[0] + hk * vsc_strides[1];
+    \\
+    \\threadgroup T KVs[LDK * BD];
+    \\threadgroup T* Ks = KVs;
+    \\threadgroup T* Vs = KVs;
+    \\
+    \\const short2 sc = sushi_coord(lane);
+    \\const short sn = sc.x;
+    \\const short sm = sc.y;
+    \\const short tm = 8 * short(warp);
+    \\const int Ks_off = sm * LDK + sn;
+    \\const int Vs_off = sm * LDV + sn;
+    \\const int row = tm + sm;
+    \\const bool row_ok = row < gqa;
+    \\
+    \\float2 Qfrag[BD / 8];
+    \\if (row_ok) {
+    \\  const device T* Qrow = q + bb * q_strides[0] + (long)(hk * gqa + row) * q_strides[1] + (long)s * q_strides[2];
+    \\  for (int dd = 0; dd < BD / 8; ++dd) {
+    \\    const vec<T, 2> pr = *((const device vec<T, 2>*)(Qrow + dd * 8 + sn));
+    \\    Qfrag[dd] = float2(float(pr.x), float(pr.y));
+    \\  }
+    \\} else {
+    \\  for (int dd = 0; dd < BD / 8; ++dd) Qfrag[dd] = float2(0.0f);
+    \\}
+    \\float2 Ofrag[BD / 8];
+    \\for (int i = 0; i < BD / 8; ++i) Ofrag[i] = float2(0.0f);
+    \\float max_score = -3.0e38f;
+    \\float sum_score = 0.0f;
+    \\
+    \\for (int t0 = 0; t0 < L; t0 += BK) {
+    \\  const int rows_k = metal::min(BK, L - t0);
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = sushi_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = sushi_qsa_tbq8<T, BITS, GS>(Kp + (long)pos * k_strides[2], Kscp + (long)pos * ksc_strides[2], cl, c8);
+    \\    }
+    \\    thread T* e = (thread T*)&w;
+    \\    const int cb = c8 * 8;
+    \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  float2 Sfrag[KT];
+    \\  for (int i = 0; i < KT; ++i) Sfrag[i] = float2(0.0f);
+    \\  for (int dd = 0; dd < BD / 8; ++dd) {
+    \\    const float2 qf = Qfrag[dd];
+    \\    const int kbase = Ks_off + dd * 8 * LDK;
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      const float2 kf = float2(float(Ks[kbase + kt * 8]), float(Ks[kbase + kt * 8 + 1]));
+    \\      sushi_mma(Sfrag[kt], qf, kf);
+    \\    }
+    \\  }
+    \\  for (int kt = 0; kt < KT; ++kt) Sfrag[kt] *= scale_log2e;
+    \\  if (rows_k < BK) {
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      if (kt * 8 + sn >= rows_k) Sfrag[kt].x = -INFINITY;
+    \\      if (kt * 8 + sn + 1 >= rows_k) Sfrag[kt].y = -INFINITY;
+    \\    }
+    \\  }
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = sushi_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = sushi_qsa_tbq8<T, BITS, GS>(Vp + (long)pos * v_strides[2], Vscp + (long)pos * vsc_strides[2], cl, c8);
+    \\    }
+    \\    *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;
+    \\  }
+    \\
+    \\  float new_max = max_score;
+    \\  for (int kt = 0; kt < KT; ++kt) new_max = metal::max(new_max, sushi_row_max(Sfrag[kt]));
+    \\  float rowsum = 0.0f;
+    \\  for (int kt = 0; kt < KT; ++kt) {
+    \\    Sfrag[kt] = metal::exp2(Sfrag[kt] - new_max);
+    \\    rowsum += sushi_row_sum(Sfrag[kt]);
+    \\  }
+    \\  const float factor = metal::exp2(max_score - new_max);
+    \\  max_score = new_max;
+    \\  sum_score = sum_score * factor + rowsum;
+    \\  for (int i = 0; i < BD / 8; ++i) Ofrag[i] *= factor;
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int id = 0; id < BD / 8; ++id) {
+    \\    const int vbase = Vs_off + id * 8;
+    \\    for (int kt = 0; kt < KT; ++kt) {
+    \\      const float2 vf = float2(float(Vs[vbase + kt * 8 * LDV]), float(Vs[vbase + kt * 8 * LDV + 1]));
+    \\      sushi_mma(Ofrag[id], Sfrag[kt], vf);
+    \\    }
+    \\  }
+    \\}
+    \\
+    \\if (row_ok) {
+    \\  const float inv = 1.0f / sum_score;
+    \\  device T* Optr = out + (((long)bb * Hq + (hk * gqa + row)) * (long)qL + (long)s) * BD + sn;
+    \\  for (int id = 0; id < BD / 8; ++id) {
+    \\    Optr[id * 8] = T(Ofrag[id].x * inv);
+    \\    Optr[id * 8 + 1] = T(Ofrag[id].y * inv);
+    \\  }
+    \\}
+;
+
+var qsa_gather_tbq_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQsaGatherTbqKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_gather_tbq_kernel_cached) |kernel| return kernel;
+    const names = [_][*:0]const u8{ "q", "k", "v", "scl", "blocks", "ksc", "vsc", "cl" };
+    const outputs = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&outputs, outputs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "sushi_attn_qsa256_tbq",
+        in_vec,
+        out_vec,
+        QSA_ATTN_TBQ_KERNEL_SOURCE,
+        QSA_TBQ_HEADER ++ ATTN_QSA256_KERNEL_HEADER,
+        false, // packed triples are cache VIEWS — a contiguous copy erases the win
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_gather_tbq_kernel_cached = kernel;
+    return kernel;
+}
+
 const QsaGatherCfgKey = struct {
     q_shape: ShapeKey,
     h_kv: c_int,
@@ -3357,9 +3568,14 @@ const QsaGatherCfgKey = struct {
     /// 0 = dense bf16 K/V.
     packed_bits: u8 = 0,
     packed_gs: u32 = 0,
+    /// tbq4 and affine-4 share a (packed_bits, packed_gs) key; the schemes
+    /// are discriminated by the view's flag, never by `bits` (the collision
+    /// rule from the Chunk-2 TBQ config comment).
+    is_tbq: bool = false,
 };
 var qsa_gather_cfgs = QsaCfgCache(QsaGatherCfgKey, 1){};
 var qsa_gather_packed_engaged_bits: OneShotBits = .{};
+var qsa_gather_tbq_engaged_bits: OneShotBits = .{};
 
 /// Block-gathered QSA attention (qwen4_exp prefill): `blocks` is the
 /// [B, S, KB] int32 selection, each row ascending with INT_MAX past its
@@ -3378,10 +3594,12 @@ pub fn gatherQsa256(
     return gatherQsa256Impl(s, q, .{ .k = k, .v = v, .owned = false }, scale, blocks, ratio);
 }
 
-/// `gatherQsa256` straight off a PACKED cache (`view.has_quant_triple`): the kernel stages only
-/// the rows each query gathers, so no layer attends a dense rebuild of the whole cache.
+/// `gatherQsa256` straight off a PACKED cache — AFFINE (`view.has_quant_triple`)
+/// or TBQ (`view.tbq_triple`, see `gatherQsa256Impl`'s tbq arm): the kernel
+/// stages only the rows each query gathers, so no layer attends a dense
+/// rebuild of the whole cache.
 pub fn gatherQsa256Packed(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, scale: f32, blocks: mlx.mlx_array, ratio: c_int) !?mlx.mlx_array {
-    if (!view.has_quant_triple or !qsaAttnKernelEnabled()) return null;
+    if (!(view.has_quant_triple or view.tbq_triple) or !qsaAttnKernelEnabled()) return null;
     return gatherQsa256Impl(s, q, view.*, scale, blocks, ratio);
 }
 
@@ -3396,8 +3614,11 @@ fn gatherQsa256Impl(
     if (!qsaGatherEnabled()) return null;
     if (!mlx.streamIsGpu(s)) return null;
     const is_packed = view.has_quant_triple;
-    const k = if (is_packed) view.k_triple_q else view.k;
-    const v = if (is_packed) view.v_triple_q else view.v;
+    const is_tbq = view.tbq_triple;
+    // The two triple flavours never coexist; a view claiming both is a bug.
+    if (is_packed and is_tbq) return null;
+    const k = if (is_packed or is_tbq) view.k_triple_q else view.k;
+    const v = if (is_packed or is_tbq) view.v_triple_q else view.v;
     if (blocks.ctx == null or mlx.mlx_array_ndim(blocks) != 3 or mlx.mlx_array_dtype(blocks) != .int32) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
@@ -3405,7 +3626,29 @@ fn gatherQsa256Impl(
     const vs = mlx.getShape(v);
     const bs = mlx.getShape(blocks);
     const vpw: c_int = if (is_packed) @divExact(32, @as(c_int, view.bits)) else 1;
-    if (is_packed) {
+    if (is_tbq) {
+        // The TBQ triple: packed code bytes + fp16 block norms in the
+        // rotated domain, group fixed at 128 (the Chunk-2 contract). The
+        // kernel reads `cl[16]` (tbq4) / `cl[8]` (tbq3) codebook entries, so
+        // anything unexpected here declines rather than mis-walking the
+        // affine nibbles.
+        if (view.bits != 4 and view.bits != 3) return null;
+        if (view.group_size != 128) return null;
+        if (qs[0] != 1 or qs[3] != 256) return null; // tbqRotateQueries is [1,Hq,S,D]
+        // Bytes per packed row: tbq4 pairs codes, tbq3 packs eight codes per
+        // 24-bit group — the affine `32/bits` word formula breaks at 3.
+        const dk: c_int = if (view.bits == 4) ks[3] * 2 else @divTrunc(ks[3] * 8, 3);
+        const dv: c_int = if (view.bits == 4) vs[3] * 2 else @divTrunc(vs[3] * 8, 3);
+        if (dk != 256 or dv != 256) return null;
+        if (mlx.mlx_array_dtype(k) != .uint8 or mlx.mlx_array_dtype(v) != .uint8) return null;
+        if (mlx.mlx_array_strides(k)[3] != 1 or mlx.mlx_array_strides(v)[3] != 1) return null;
+        for ([_]mlx.mlx_array{ view.k_triple_scales, view.v_triple_scales }) |a| {
+            if (a.ctx == null or mlx.mlx_array_ndim(a) != 4 or mlx.mlx_array_dtype(a) != .float16) return null;
+            const sh = mlx.getShape(a);
+            // [B, H, T, DK/128]; DK is pinned to 256 above, so the norm count is 2.
+            if (sh[0] != ks[0] or sh[1] != ks[1] or sh[2] != ks[2] or sh[3] != 2 or mlx.mlx_array_strides(a)[3] != 1) return null;
+        }
+    } else if (is_packed) {
         if (view.bits != 4 and view.bits != 8) return null;
         if (view.group_size == 0 or 256 % view.group_size != 0 or view.group_size % 8 != 0) return null;
         const g: c_int = @intCast(256 / view.group_size);
@@ -3417,7 +3660,7 @@ fn gatherQsa256Impl(
         if (mlx.mlx_array_dtype(k) != .uint32 or mlx.mlx_array_dtype(v) != .uint32) return null;
         if (mlx.mlx_array_strides(k)[3] != 1 or mlx.mlx_array_strides(v)[3] != 1) return null;
     } else if (mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16 or !attn256Base16Aligned(k) or !attn256Base16Aligned(v)) return null;
-    if (qs[3] != 256 or ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
+    if (!is_tbq and (qs[3] != 256 or ks[3] * vpw != 256 or vs[3] * vpw != 256)) return null;
     if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
     const gqa: c_int = @divTrunc(qs[1], ks[1]);
     if (gqa > 64) return null;
@@ -3426,7 +3669,7 @@ fn gatherQsa256Impl(
     if (ratio <= 0) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16) return null;
 
-    qsaNaxArm();
+    if (!is_tbq) qsaNaxArm(); // the NAX probe is for the affine/dense arms
     const qst = mlx.mlx_array_strides(q);
     const kst = mlx.mlx_array_strides(k);
     const vst = mlx.mlx_array_strides(v);
@@ -3435,9 +3678,12 @@ fn gatherQsa256Impl(
         qst[1] % 8 == 0 and qst[2] % 8 == 0 and
         kst[1] % 8 == 0 and kst[2] % 8 == 0 and
         vst[1] % 8 == 0 and vst[2] % 8 == 0;
-    const nax_geometry = is_packed or (nax_aligned and ratio == 4 and qs[0] == 1 and qs[1] == 24 and ks[1] == 2 and bs[2] == 512);
+    const nax_geometry = !is_tbq and (is_packed or (nax_aligned and ratio == 4 and qs[0] == 1 and qs[1] == 24 and ks[1] == 2 and bs[2] == 512));
     var use_nax = nax_geometry and qsaNaxEnabled() and qsaNaxEligible(.bfloat16, .bfloat16, .bfloat16, qs[3], gqa, qs[2]);
     const kernel = blk: {
+        // tbq4's nibbles are not affine codes: a tbq view must NEVER reach
+        // the affine packed kernel, and there is no NAX variant here.
+        if (is_tbq) break :blk getQsaGatherTbqKernel() catch return null;
         if (use_nax) {
             break :blk (if (is_packed) getQsaGatherPackedKernel(true) else getQsaNaxKernel()) catch {
                 qsa_nax_probe_state.store(1, .release);
@@ -3452,6 +3698,26 @@ fn gatherQsa256Impl(
     const scl_data = [_]f32{scale};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
     defer _ = mlx.mlx_array_free(scl);
+
+    // The TBQ kernel attends in the rotated domain: queries @ M1 per 128
+    // block, and the codebook (`cl[16]` at tbq4, `cl[8]` at tbq3) as f32.
+    // `cl` wraps the module-static kv_quant centroid table (Chunk-2's
+    // lifetime rule — never a function-local buffer behind a lazy graph);
+    // `q_rot` is a lazy array, fine for a fast-kernel apply.
+    var q_rot: mlx.mlx_array = .{ .ctx = null };
+    defer if (q_rot.ctx != null) {
+        _ = mlx.mlx_array_free(q_rot);
+    };
+    var cl: mlx.mlx_array = .{ .ctx = null };
+    defer if (cl.ctx != null) {
+        _ = mlx.mlx_array_free(cl);
+    };
+    if (is_tbq) {
+        q_rot = try tbqRotateQueries(s, q, view.bits, .bfloat16);
+        const cent = kv_quant.tbqCentroids(view.bits);
+        const cent_shape = [_]c_int{@intCast(cent.len)};
+        cl = mlx.mlx_array_new_data(cent.ptr, &cent_shape, 1, .float32);
+    }
     const nsg: c_int = @divTrunc(gqa + 7, 8);
     const bk: c_int = QSA_GATHER_BK;
     const key = QsaGatherCfgKey{
@@ -3462,8 +3728,9 @@ fn gatherQsa256Impl(
         .ratio = ratio,
         .nax = use_nax,
         .dtype = .bfloat16,
-        .packed_bits = if (is_packed) view.bits else 0,
-        .packed_gs = if (is_packed) view.group_size else 0,
+        .packed_bits = if (is_packed or is_tbq) view.bits else 0,
+        .packed_gs = if (is_packed or is_tbq) view.group_size else 0,
+        .is_tbq = is_tbq,
     };
     const cfgs: [1]mlx.mlx_fast_metal_kernel_config = qsa_gather_cfgs.get(key) orelse blk: {
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -3476,7 +3743,7 @@ fn gatherQsa256Impl(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", nsg));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", bk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio));
-        if (is_packed) {
+        if (is_packed or is_tbq) {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(view.bits)));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(view.group_size)));
         }
@@ -3486,7 +3753,8 @@ fn gatherQsa256Impl(
 
     const dense_in = [_]mlx.mlx_array{ q, k, v, scl, blocks };
     const packed_in = [_]mlx.mlx_array{ q, k, v, scl, blocks, view.k_triple_scales, view.k_triple_biases, view.v_triple_scales, view.v_triple_biases };
-    const inputs: []const mlx.mlx_array = if (is_packed) &packed_in else &dense_in;
+    const tbq_in = [_]mlx.mlx_array{ q_rot, k, v, scl, blocks, view.k_triple_scales, view.v_triple_scales, cl };
+    const inputs: []const mlx.mlx_array = if (is_tbq) &tbq_in else if (is_packed) &packed_in else &dense_in;
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -3495,6 +3763,27 @@ fn gatherQsa256Impl(
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    if (is_tbq) {
+        if (qsa_gather_tbq_engaged_bits.take(0)) {
+            log.info("[qsa-gather] engaged: sushi_attn_qsa256_tbq S={d} kv={d} blocks={d} kv{d}/gs{d} (SUSHI_QSA_ATTN_KERNEL=0 restores the gather over a dense rebuild)\n", .{ qs[2], ks[2], bs[2], view.bits, view.group_size });
+        }
+        // The staged rows are rotated-domain values and Q was pre-rotated by
+        // M1; softmax is linear, so the merged output @ M2 per 128-block is
+        // the true attention output (the identity pinned by kv_quant's
+        // rotation tests). The rotate wants [ROWS, 256].
+        var orows = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(orows);
+        const r_shape = [_]c_int{ qs[0] * qs[1] * qs[2], 256 };
+        try mlx.check(mlx.mlx_reshape(&orows, out, &r_shape, 2, s));
+        _ = mlx.mlx_array_free(out);
+        const o_true = try tbqRotateOutput(s, orows, view.bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(o_true);
+        var final = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(final);
+        const f_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+        try mlx.check(mlx.mlx_reshape(&final, o_true, &f_shape, 4, s));
+        return final;
+    }
     if (is_packed) {
         if (qsa_gather_packed_engaged_bits.take(@intFromBool(use_nax))) {
             log.info("[qsa-gather] engaged: {s} S={d} kv={d} blocks={d} kv{d}/gs{d}\n", .{ if (use_nax) "sushi_qsa_nax_packed" else "sushi_attn_qsa256_packed", qs[2], ks[2], bs[2], view.bits, view.group_size });
@@ -43828,6 +44117,208 @@ test "qsa verify gather tbq: subset SDPA matches masked full SDPA (tbq4, tbq3, l
         try std.testing.expect(diff < 0.01);
         try std.testing.expect(cos > 0.9999);
     }
+}
+
+test "qsa prefill gather tbq: packed gather matches whole-cache dense SDPA (tbq4, tbq3)" {
+    // The prefill arm (S >= FUSED256_MIN_Q_LEN) against the mask arm it
+    // replaces — which dequantizes the ENTIRE cache before attending. The
+    // kernel stages only gathered rows in the rotated domain; the wrapper
+    // inverse-rotates the merged output, so both must agree to the same bar
+    // the decode/verify tbq gathers pinned (0.01): kernel tiling order is
+    // the only difference. `qsaVerifyBlocksHost` rows stop at
+    // min(complete, kb) — the INT_MAX pads past the count must never be
+    // read, and with kv < 4*kb every row carries them.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_gather_override = true;
+    qsa_attn_kernel_override = true;
+    qsa_nax_override = false;
+    defer qsa_gather_override = null;
+    defer qsa_attn_kernel_override = null;
+    defer qsa_nax_override = null;
+    var prng = std.Random.DefaultPrng.init(0x7B90_11);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, bits: u8 }{
+        .{ .s = 32, .kv = 300, .kb = 80, .bits = 4 },
+        .{ .s = 16, .kv = 300, .kb = 80, .bits = 3 },
+    };
+    for (cases) |c| {
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, c.s, 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, c.kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(k_dense);
+        const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, c.kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(v_dense);
+        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, c.s, c.kv, c.kb, ratio);
+        defer ta.free(blocks_host);
+        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, c.s, c.kb }, 3, .int32);
+        defer _ = mlx.mlx_array_free(blocks);
+        const mask = try qsaMaskFromBlocks(s, blocks, c.kv, ratio);
+        defer _ = mlx.mlx_array_free(mask);
+
+        var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.tbq(c.bits));
+        defer cache.deinit();
+        var view = try cache.update(0, k_dense, v_dense, s, 0);
+        defer view.deinit();
+        try std.testing.expect(view.tbq_triple);
+        try std.testing.expect(!view.has_quant_triple);
+        qsa_gather_tbq_engaged_bits.reset();
+        qsa_gather_packed_engaged_bits.reset();
+        const got = (try gatherQsa256Packed(s, q, &view, scale, blocks, ratio)) orelse return error.PrefillGatherDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        // Anti-vacuity: the TBQ kernel itself ran — and not the affine one.
+        try std.testing.expect(qsa_gather_tbq_engaged_bits.seen != 0);
+        try std.testing.expect(qsa_gather_packed_engaged_bits.seen == 0);
+        try std.testing.expect(!qsa_gather_used_nax);
+        const ref = try attn256Reference(q, view.k, view.v, scale, "array", mask, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const diff = try attn256MaxDiff(got, ref, s);
+        const cos = try attn256Cosine(got, ref, s);
+        errdefer std.debug.print("[qsa-prefill-gather] S={d} kv={d} tbq{d}: max diff {d:.6} cos {d:.7}\n", .{ c.s, c.kv, c.bits, diff, cos });
+        // Measured: S=32 tbq4 0.000244, S=16 tbq3 0.000244 (cos 0.999992
+        // both) — tiling-order noise only, same bar as the decode/verify
+        // tbq gathers.
+        try std.testing.expect(diff < 0.01);
+        try std.testing.expect(cos > 0.9999);
+    }
+}
+
+test "qsa prefill gather tbq: tbq4 and affine4 never share a gather config" {
+    // tbq4 and affine4 report the same (packed_bits, packed_gs) — only the
+    // view's `is_tbq` flag (never `bits`) discriminates them (the collision
+    // rule from the Chunk-2 TBQ config comment). Same q/blocks geometry,
+    // same source k/v: each scheme must engage ONLY its own kernel's meter
+    // and match ONLY its own cache's dense rebuild — and a tbq call issued
+    // right after an affine one (which would evict a colliding key from the
+    // config cache) must still be exact.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_gather_override = true;
+    qsa_attn_kernel_override = true;
+    qsa_nax_override = false;
+    defer qsa_gather_override = null;
+    defer qsa_attn_kernel_override = null;
+    defer qsa_nax_override = null;
+    var prng = std.Random.DefaultPrng.init(0xD15C_0001);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    const S: c_int = 16;
+    const kv: c_int = 300;
+    const kb: c_int = 64;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, S, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(v_dense);
+    const blocks_host = try qsaVerifyBlocksHost(ta, rnd, S, kv, kb, ratio);
+    defer ta.free(blocks_host);
+    const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, S, kb }, 3, .int32);
+    defer _ = mlx.mlx_array_free(blocks);
+    const mask = try qsaMaskFromBlocks(s, blocks, kv, ratio);
+    defer _ = mlx.mlx_array_free(mask);
+
+    var tbq_cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.tbq(4));
+    defer tbq_cache.deinit();
+    var tbq_view = try tbq_cache.update(0, k_dense, v_dense, s, 0);
+    defer tbq_view.deinit();
+    // gs 128 (not the constructor's 64): with it, the affine arm's packed_*
+    // key fields equal the tbq4 ones — the exact colliding pair.
+    var aff_cache = try KVCache.initWithConfig(ta, 1, .{ .scheme = .affine, .bits = 4, .group_size = 128 });
+    defer aff_cache.deinit();
+    var aff_view = try aff_cache.update(0, k_dense, v_dense, s, 0);
+    defer aff_view.deinit();
+    try std.testing.expect(aff_view.has_quant_triple);
+    try std.testing.expect(!aff_view.tbq_triple);
+
+    qsa_gather_tbq_engaged_bits.reset();
+    qsa_gather_packed_engaged_bits.reset();
+    const got_t = (try gatherQsa256Packed(s, q, &tbq_view, scale, blocks, ratio)) orelse return error.PrefillGatherDeclined;
+    defer _ = mlx.mlx_array_free(got_t);
+    try std.testing.expect(qsa_gather_tbq_engaged_bits.seen != 0);
+    try std.testing.expect(qsa_gather_packed_engaged_bits.seen == 0);
+
+    qsa_gather_tbq_engaged_bits.reset();
+    qsa_gather_packed_engaged_bits.reset();
+    const got_a = (try gatherQsa256Packed(s, q, &aff_view, scale, blocks, ratio)) orelse return error.PrefillGatherDeclined;
+    defer _ = mlx.mlx_array_free(got_a);
+    try std.testing.expect(qsa_gather_packed_engaged_bits.seen != 0);
+    try std.testing.expect(qsa_gather_tbq_engaged_bits.seen == 0);
+
+    // Each output matches its own cache's dense rebuild; the two caches hold
+    // different code streams for the same tokens, so the schemes disagree.
+    const ref_t = try attn256Reference(q, tbq_view.k, tbq_view.v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref_t);
+    const ref_a = try attn256Reference(q, aff_view.k, aff_view.v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref_a);
+    const d_t = try attn256MaxDiff(got_t, ref_t, s);
+    const d_a = try attn256MaxDiff(got_a, ref_a, s);
+    const d_x = try attn256MaxDiff(got_t, got_a, s);
+    errdefer std.debug.print("[qsa-prefill-discriminate] tbq {d:.6} affine {d:.6} cross {d:.6}\n", .{ d_t, d_a, d_x });
+    // Measured (tbq kernel vs its own dequant 0.000366, affine packed vs
+    // its own dequant 0.000488): both arms are tight on their OWN cache;
+    // the cross diff (0.009583) is the two schemes' quantization noise on
+    // the same tokens — the schemes are numerically distinct, so a kernel
+    // mix-up could not pass the per-scheme bars.
+    try std.testing.expect(d_t < 0.01);
+    try std.testing.expect(d_a < 0.01);
+    try std.testing.expect(d_x > 0.005);
+
+    // Interleaving pin: the tbq key must survive the affine call beside it —
+    // re-run tbq now (same shapes; a colliding key would hand it the affine
+    // arm's config) and it must still be exact.
+    const got_t2 = (try gatherQsa256Packed(s, q, &tbq_view, scale, blocks, ratio)) orelse return error.PrefillGatherDeclined;
+    defer _ = mlx.mlx_array_free(got_t2);
+    const d_t2 = try attn256MaxDiff(got_t2, ref_t, s);
+    try std.testing.expect(d_t2 < 0.01);
+}
+
+test "qsa prefill gather tbq: the kill switch declines and the mask arm stands" {
+    // `SUSHI_QSA_ATTN_KERNEL=0` (the override var here) must turn the tbq
+    // packed gather into a null decline — the batched caller then expands to
+    // the mask arm, which attends the lazy dense dequant of the whole cache.
+    // No GPU evaluation needed for the decline itself, but the arm must
+    // re-engage with the switch restored to prove the decline is the gate,
+    // not a geometry rejection.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5EA1_0003);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    const S: c_int = 16;
+    const kv: c_int = 100;
+    const kb: c_int = 16;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, S, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(v_dense);
+    const blocks_host = try qsaVerifyBlocksHost(ta, rnd, S, kv, kb, ratio);
+    defer ta.free(blocks_host);
+    const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, S, kb }, 3, .int32);
+    defer _ = mlx.mlx_array_free(blocks);
+    var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.tbq(4));
+    defer cache.deinit();
+    var view = try cache.update(0, k_dense, v_dense, s, 0);
+    defer view.deinit();
+    qsa_attn_kernel_override = false;
+    defer qsa_attn_kernel_override = null;
+    try std.testing.expect((try gatherQsa256Packed(s, q, &view, scale, blocks, ratio)) == null);
+    qsa_attn_kernel_override = true;
+    qsa_gather_tbq_engaged_bits.reset();
+    const got = (try gatherQsa256Packed(s, q, &view, scale, blocks, ratio)) orelse return error.PrefillGatherReDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expect(qsa_gather_tbq_engaged_bits.seen != 0);
 }
 
 // ── Fused sparse attention at verify widths (sushi_attn_qsa256_q) ──

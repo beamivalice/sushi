@@ -829,6 +829,15 @@ pub fn qsaBatchedGatherAttn(
         if (gathered == null and qsa_ok and seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) {
             gathered = try qsaVerifyGatherAttn(s, q_slot, kv_view, blk, ratio, attn_scale);
         }
+        if (gathered == null and qsa_ok and seq_len >= FUSED256_MIN_Q_LEN and kv_view.tbq_triple) {
+            // TBQ prefill: dequantize only the gathered rows in the rotated
+            // domain. `qsaPackedGatherServes` bounds the DENSE gather's
+            // staged re-reads against a whole-cache rebuild — the tbq kernel
+            // never materializes one, so the bound must not gate it. A null
+            // here falls through to the mask arm (which reads the lazy dense
+            // dequant of the whole cache) unchanged.
+            gathered = try gatherQsa256Packed(s, q_slot, kv_view, attn_scale, blk, ratio);
+        }
         if (gathered == null and qsa_ok and seq_len >= FUSED256_MIN_Q_LEN and kv_view.has_quant_triple) {
             gathered = if (qsaPackedGatherServes(seq_len, mlx.getShape(kv_view.k)[2], mlx.getShape(blk)[2], ratio))
                 try gatherQsa256Packed(s, q_slot, kv_view, attn_scale, blk, ratio)
