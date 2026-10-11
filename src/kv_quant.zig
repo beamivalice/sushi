@@ -92,6 +92,11 @@ pub const KVQuantConfig = struct {
         return switch (self.scheme) {
             .off => 0,
             .affine => if (self.bits == 8 and self.group_size == 64) 8 else null,
+            // GLM's MLA latent stores dense (0) or kv8 only. Every caller
+            // (server admission, scheduler, the forward gate) refuses a null
+            // with GlmKvQuantUnsupported before a latent buffer exists, so
+            // tbq declines here rather than falling into kv8 semantics.
+            .tbq => null,
         };
     }
 
