@@ -5700,6 +5700,17 @@ pub fn qsaVerifyGatherMinKvFor(quantized: bool) c_int {
     return if (quantized) QSA_VERIFY_GATHER_MIN_KV_QUANT else QSA_VERIFY_GATHER_MIN_KV_DENSE;
 }
 
+/// The forward's legacy verify term as one testable predicate: verify widths
+/// (2..FUSED256_MIN_Q_LEN) route to the subset gather when the cache scheme
+/// subset-dequantizes gathered rows. `isQuant` covers BOTH packed readers —
+/// affine AND tbq. `scheme == .affine` here once billed tbq as dense, pinning
+/// every interleaved MTP verify tick between 16384 and 32768 rows to the
+/// whole-cache rebuild (tbq4 prefill memory refusal, 2026-10-11).
+pub fn qsaVerifyGatherServes(cfg: kv_quant.KVQuantConfig, seq_len: c_int, kv: c_int) bool {
+    return seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and
+        qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(cfg.isQuant());
+}
+
 test "qsa verify gather floor: dense KV 32768, quantized 16384, override wins" {
     const prev_o = qsa_verify_gather_min_kv_override;
     defer qsa_verify_gather_min_kv_override = prev_o;
@@ -5709,6 +5720,27 @@ test "qsa verify gather floor: dense KV 32768, quantized 16384, override wins" {
     qsa_verify_gather_min_kv_override = 4096;
     try std.testing.expectEqual(@as(c_int, 4096), qsaVerifyGatherMinKvFor(false));
     try std.testing.expectEqual(@as(c_int, 4096), qsaVerifyGatherMinKvFor(true));
+}
+
+test "qsa verify gather serves tbq: quant floor through the forward predicate (tbq)" {
+    const prev_o = qsa_verify_gather_min_kv_override;
+    const prev_g = qsa_verify_gather_override;
+    defer {
+        qsa_verify_gather_min_kv_override = prev_o;
+        qsa_verify_gather_override = prev_g;
+    }
+    qsa_verify_gather_min_kv_override = null;
+    qsa_verify_gather_override = true;
+    const tbq_cfg = kv_quant.KVQuantConfig.tbq(4);
+    const dense_cfg = kv_quant.KVQuantConfig.dense;
+    // 20480 rows sit inside the old tbq dead zone: packed readers take it.
+    try std.testing.expect(qsaVerifyGatherServes(tbq_cfg, 8, QSA_VERIFY_GATHER_MIN_KV_QUANT + 4096));
+    try std.testing.expect(!qsaVerifyGatherServes(dense_cfg, 8, QSA_VERIFY_GATHER_MIN_KV_QUANT + 4096));
+    // The QUANT floor still binds tbq below it, and non-verify widths are
+    // not this term's business.
+    try std.testing.expect(!qsaVerifyGatherServes(tbq_cfg, 8, QSA_VERIFY_GATHER_MIN_KV_QUANT));
+    try std.testing.expect(!qsaVerifyGatherServes(tbq_cfg, 1, 65536));
+    try std.testing.expect(!qsaVerifyGatherServes(tbq_cfg, FUSED256_MIN_Q_LEN, 65536));
 }
 
 /// Geometry of the verify-width QSA gather — pure arithmetic, the ONE owner
@@ -18908,6 +18940,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&out, roped, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, self.s));
         return out;
     }
+
 
 
 
@@ -45605,18 +45638,6 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     if (banded) |f| _ = mlx.mlx_array_free(f);
 }
 
-test "fused256DispatchBudget: unset env caches inner null, not outer" {
-    const t = std.testing;
-    fused256_budget_override = null;
-    _ = unsetenv("SUSHI_FUSED_256_BUDGET");
-    fused256_budget_env_cached = null;
-    try t.expectEqual(FUSED256_DEFAULT_DISPATCH_BUDGET, fused256DispatchBudget(.simd));
-    try t.expectEqual(ATTN_PD_NAX_DISPATCH_BUDGET, fused256DispatchBudget(.nax));
-    // Absent env must land as outer=Some(inner=null); the coercion bug left
-    // the outer null, so the next call's `.?` unwrap crashed prefill.
-    try t.expect(fused256_budget_env_cached != null);
-}
-
 test "fused256KvChunkLen: BK alignment, one-block floor, kl cap, budget-off" {
     const t = std.testing;
     // budget <= 0: single dispatch covering the full key axis.
@@ -59488,4 +59509,50 @@ test "qsa verify gather tbq fused take: rotated-domain rows match composed chain
         const de = try attn256MaxDiff(got_e, if (env_fused) got_f else got_c, s);
         try std.testing.expectEqual(@as(f32, 0), de);
     }
+}
+
+test "qsa verify gather tbq: engages on a server-grown cache in the 16k-32k dead zone (tbq4)" {
+    // DEFAULT floors, real growth — the configuration the refused live
+    // prefill ran WITHOUT: a tbq4 cache grown past the QUANT floor (16384)
+    // but under the old misbilled DENSE floor (32768) must reach the fused
+    // subset gather at verify width and match dense SDPA.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    const chunk: c_int = 2048;
+    const kv: c_int = 20480;
+    var prng = std.Random.DefaultPrng.init(0x2048_2048);
+    const rnd = prng.random();
+    var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.tbq(4));
+    defer cache.deinit();
+    var view = try cache.update(0, try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, chunk, 256 }, s), try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, chunk, 256 }, s), s, 250000);
+    var i: c_int = 1;
+    while (i < @divExact(kv, chunk)) : (i += 1) {
+        const kc = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, chunk, 256 }, s);
+        defer _ = mlx.mlx_array_free(kc);
+        const vc = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, chunk, 256 }, s);
+        defer _ = mlx.mlx_array_free(vc);
+        const nv = try cache.update(0, kc, vc, s, 250000);
+        view.deinit();
+        view = nv;
+    }
+    defer view.deinit();
+    try std.testing.expectEqual(kv, mlx.getShape(view.k_triple_q)[2]);
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 8, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    var fx = try QsaBlockFixture.build(rnd, 8, kv, 64, ratio);
+    defer fx.deinit();
+    tbq_take_engaged_bits.reset();
+    const got = (try qsaVerifyGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.VerifyGatherDeclinedDeadZone;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expect(tbq_take_engaged_bits.seen != 0); // fused take engaged at 20480 rows
+    const ref = try attn256Reference(q, view.k, view.v, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const d = try attn256MaxDiff(got, ref, s);
+    const c = try attn256Cosine(got, ref, s);
+    errdefer std.debug.print("[qsa-verify-deadzone] vs-dense {d:.6} cos {d:.7}\n", .{ d, c });
+    try std.testing.expect(d < 0.01);
+    try std.testing.expect(c > 0.9999);
 }

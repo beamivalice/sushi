@@ -52,8 +52,7 @@ const qsaSelectSplitEnabled = trf.qsaSelectSplitEnabled;
 const qsaSparseAttn = trf.qsaSparseAttn;
 const qsaSparseAttnServes = trf.qsaSparseAttnServes;
 const qsaVerifyGatherAttn = trf.qsaVerifyGatherAttn;
-const qsaVerifyGatherEnabled = trf.qsaVerifyGatherEnabled;
-const qsaVerifyGatherMinKvFor = trf.qsaVerifyGatherMinKvFor;
+const qsaVerifyGatherServes = trf.qsaVerifyGatherServes;
 const qsaWidthBucket = trf.qsaWidthBucket;
 const qwen4Standin = qwen4_forward.qwen4Standin;
 const sliceAttentionSeq = trf.sliceAttentionSeq;
@@ -1354,7 +1353,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     const gather_floor = if (nax_geometry) qsaPrefillGatherMinKv() else qsaGatherMinKv();
     const legacy_blocks = kv > gather_floor and
         (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
-            (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(quantized)));
+            (qsaVerifyGatherServes(ctx.cache.config, seq_len, kv)));
     const want_blocks = batch == 1 and qsaGatherEnabled() and (row_sparse or legacy_blocks);
     if (want_blocks) {
         // Prefill: sorted per-row block indices for the gather kernel;
@@ -1363,7 +1362,6 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
         const prof = diagEnvOnCached(&qwen4_forward.qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
         var clk: ProfClock = undefined;
         if (prof) {
-            if (k32.ctx != null) try mlx.check(mlx.mlx_array_eval(k32));
             clk = ProfClock.init();
         }
         // Free before assign: a `defer` registered below a fallible call leaked a handle per tick.

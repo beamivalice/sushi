@@ -2336,7 +2336,10 @@ pub fn batchKvLenOfWith(cache: *const KVCache, cfg: ?*const model_mod.ModelConfi
     if (!c.longCtxGated()) return @intCast(cache.step);
     const raw: u32 = @intCast(cache.kvLenForBatching());
     const gather_on = transformer_mod.qsaBatchedGatherOn(seq_len);
-    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len, cache.config.scheme == .affine));
+    // TBQ counts as packed here too: `qsaBatchedGatherFloor` bills the verify
+    // floor for widths >= 2, and the verify gather subset-dequantizes tbq
+    // views (same predicate as the forward's `packed_readers`).
+    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len, cache.config.isQuant()));
     return c.batchedEffectiveKvLen(raw, gather_on, min_kv);
 }
 
