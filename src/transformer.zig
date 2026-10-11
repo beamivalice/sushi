@@ -3557,6 +3557,186 @@ fn getQsaGatherTbqKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+// ── Phase 2 Chunk-5: fused rotated-domain subset-dequant ──────────────
+//
+// The decode/verify gather arms used to compose 4x takeContig + 2x
+// dequantizeTBQ per step: ~40 dispatches per layer-step, the dequantize
+// itself a ~20-op chain including the full 128-point inverse-rotation
+// matmul per row. `sushi_tbq_take` collapses that to ONE dispatch: it
+// walks the packed rows through `idx` directly in byte space and stages
+// the rotated-domain bf16 value `cl[code] * d[e/128]` — exactly what the
+// Chunk-4 prefill kernel stages inline, so the rotated-domain SDPA trick
+// (rotate q once by M1, fold the output once by M2, per-128-block)
+// applies at the call sites. The additive validity mask indexes gathered
+// ROWS, so it is basis-agnostic and rides unchanged.
+const TBQ_TAKE_KERNEL_SOURCE =
+    \\const int R = idx_shape[0];
+    \\const int HKV = kq_shape[1];
+    \\const int G = kq_shape[2];
+    \\
+    \\const uint gw = thread_position_in_grid.x;
+    \\if (gw >= (uint)(R * HKV) * 32u) {
+    \\  return;
+    \\}
+    \\const uint c8 = gw & 31u;
+    \\const uint rh = gw >> 5u;
+    \\const uint h = rh % (uint)HKV;
+    \\const uint r = rh / (uint)HKV;
+    \\const uint tok = idx[r];
+    \\if (tok >= (uint)G) {
+    \\  return;
+    \\}
+    \\
+    \\const long rowk = (long)h * kq_strides[1] + (long)tok * kq_strides[2];
+    \\const long rown = (long)h * kn_strides[1] + (long)tok * kn_strides[2];
+    \\const long rowvq = (long)h * vq_strides[1] + (long)tok * vq_strides[2];
+    \\const long rowvn = (long)h * vn_strides[1] + (long)tok * vn_strides[2];
+    \\
+    \\const uint4 kw = sushi_qsa_tbq8<T, BITS, GS>(kq + rowk, kn + rown, cl, (int)c8);
+    \\const uint4 vw = sushi_qsa_tbq8<T, BITS, GS>(vq + rowvq, vn + rowvn, cl, (int)c8);
+    \\
+    \\const long ob = ((long)h * (long)R + (long)r) * 256 + (long)c8 * 8;
+    \\*((device uint4*)(gk + ob)) = kw;
+    \\*((device uint4*)(gv + ob)) = vw;
+;
+
+var tbq_take_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getTbqTakeKernel() !mlx.mlx_fast_metal_kernel {
+    if (tbq_take_kernel_cached) |kernel| return kernel;
+    const names = [_][*:0]const u8{ "kq", "kn", "vq", "vn", "idx", "cl" };
+    const outputs = [_][*:0]const u8{ "gk", "gv" };
+    const in_vec = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&outputs, outputs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "sushi_tbq_take",
+        in_vec,
+        out_vec,
+        TBQ_TAKE_KERNEL_SOURCE,
+        QSA_TBQ_HEADER,
+        false, // packed triples are cache VIEWS — a contiguous copy erases the win
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    tbq_take_kernel_cached = kernel;
+    return kernel;
+}
+
+pub var tbq_take_override: ?bool = null; // test seam
+var tbq_take_env: ?bool = null;
+fn tbqTakeFusedEnabled() bool {
+    if (tbq_take_override) |v| return v;
+    if (tbq_take_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_TBQ_TAKE_FUSED");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    tbq_take_env = enabled;
+    return enabled;
+}
+
+const TbqTakeCfgKey = struct {
+    bits: u8,
+    h_kv: c_int,
+    gathered_len: c_int,
+    kv: c_int,
+    gs: u32,
+};
+var tbq_take_cfgs = QsaCfgCache(TbqTakeCfgKey, 1){};
+var tbq_take_engaged_bits: OneShotBits = .{};
+
+const TbqRotRows = struct { k: mlx.mlx_array, v: mlx.mlx_array };
+
+/// Gather `idx_u32`'s packed TBQ rows in ONE dispatch as rotated-domain
+/// bf16 [1, h_kv, gathered_len, 256]: the staged value per element is
+/// `cl[code] * d[e/128]` — the same thing Chunk-4's prefill kernel stages
+/// inline, so the caller runs the rotated-domain dance the gatherQsa256Impl
+/// tbq arm performs: rotate the queries once with `tbqRotateQueries`, run
+/// the usual SDPA (the additive mask indexes gathered ROWS, so it is
+/// basis-agnostic), and fold the output back through `tbqRotateOutput`.
+/// null = declined (kill switch, geometry, dtype, kernel compile): the
+/// caller falls back to the composed takeContig+dequantizeTBQ chain
+/// byte-for-byte.
+fn qsaTbqTakeRotated(
+    s: mlx.mlx_stream,
+    view: DenseKVView,
+    idx_u32: mlx.mlx_array,
+    bits: u8,
+    h_kv: c_int,
+    kv: c_int,
+    head_dim: c_int,
+    gathered_len: c_int,
+) ?TbqRotRows {
+    if (!tbqTakeFusedEnabled()) return null;
+    if ((bits != 3 and bits != 4) or head_dim != 256 or gathered_len <= 0 or kv <= 0) return null;
+    if (!view.tbq_triple) return null;
+    const kq = view.k_triple_q;
+    const kn = view.k_triple_scales;
+    const vq = view.v_triple_q;
+    const vn = view.v_triple_scales;
+    if (kq.ctx == null or kn.ctx == null or vq.ctx == null or vn.ctx == null) return null;
+    if (mlx.mlx_array_dtype(kq) != .uint8 or mlx.mlx_array_dtype(kn) != .float16) return null;
+    if (mlx.mlx_array_dtype(vq) != .uint8 or mlx.mlx_array_dtype(vn) != .float16) return null;
+    if (mlx.mlx_array_dtype(idx_u32) != .uint32 or mlx.mlx_array_ndim(idx_u32) != 1) return null;
+    // Same packed geometry the composed tbq branch validates before takeContig.
+    const p_exp: c_int = if (bits == 4) @divExact(head_dim, 2) else @divExact(head_dim * 3, 8);
+    const blk_exp: c_int = @divExact(head_dim, 128);
+    const kqs = mlx.getShape(kq);
+    const kns = mlx.getShape(kn);
+    const vqs = mlx.getShape(vq);
+    const vns = mlx.getShape(vn);
+    if (kqs.len != 4 or kns.len != 4 or vqs.len != 4 or vns.len != 4 or
+        kqs[0] != 1 or kns[0] != 1 or vqs[0] != 1 or vns[0] != 1 or
+        kqs[1] != h_kv or kns[1] != h_kv or vqs[1] != h_kv or vns[1] != h_kv or
+        kqs[2] != kv or kns[2] != kv or vqs[2] != kv or vns[2] != kv or
+        kqs[3] != p_exp or vqs[3] != p_exp or
+        kns[3] != blk_exp or vns[3] != blk_exp) return null;
+    const gs: u32 = view.group_size;
+    if (gs != 128) return null; // sushi_qsa_tbq8 is written for the TBQ block size
+    const kernel = getTbqTakeKernel() catch return null;
+    // `cl` wraps the module-static kv_quant centroid table (the prefill
+    // arm's lifetime rule at gatherQsa256Impl — never a function-local
+    // buffer behind a lazy graph); free ONLY the handle after apply.
+    const cent = kv_quant.tbqCentroids(bits);
+    const cent_shape = [_]c_int{@intCast(cent.len)};
+    const cl = mlx.mlx_array_new_data(cent.ptr, &cent_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(cl);
+    const key = TbqTakeCfgKey{ .bits = bits, .h_kv = h_kv, .gathered_len = gathered_len, .kv = kv, .gs = gs };
+    const cfgs: [1]mlx.mlx_fast_metal_kernel_config = tbq_take_cfgs.get(key) orelse blk: {
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const o_shape = [_]c_int{ 1, h_kv, gathered_len, 256 };
+        if (mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16) != 0) return null;
+        if (mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16) != 0) return null;
+        const total: c_int = gathered_len * h_kv * 32;
+        if (mlx.mlx_fast_metal_kernel_config_set_grid(config, (total + 255) & ~@as(c_int, 255), 1, 1) != 0) return null;
+        if (mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1) != 0) return null;
+        if (mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16) != 0) return null;
+        if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)) != 0) return null;
+        if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(gs)) != 0) return null;
+        tbq_take_cfgs.put(key, .{config});
+        break :blk .{config};
+    };
+    const ins = [_]mlx.mlx_array{ kq, kn, vq, vn, idx_u32, cl };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    if (mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfgs[0], s) != 0) return null;
+    if (mlx.mlx_vector_array_size(outputs_vec) != 2) return null;
+    var rows = TbqRotRows{ .k = mlx.mlx_array_new(), .v = mlx.mlx_array_new() };
+    errdefer {
+        _ = mlx.mlx_array_free(rows.k);
+        _ = mlx.mlx_array_free(rows.v);
+    }
+    if (mlx.mlx_vector_array_get(&rows.k, outputs_vec, 0) != 0) return null;
+    if (mlx.mlx_vector_array_get(&rows.v, outputs_vec, 1) != 0) return null;
+    if (tbq_take_engaged_bits.take(@intCast(bits))) {
+        log.info("[qsa-take] fused engaged: bits={d} rows={d} kv={d} heads={d} (SUSHI_TBQ_TAKE_FUSED=0 restores the composed chain)\n", .{ bits, gathered_len, kv, h_kv });
+    }
+    return rows;
+}
+
 const QsaGatherCfgKey = struct {
     q_shape: ShapeKey,
     h_kv: c_int,
@@ -5335,6 +5515,7 @@ pub fn qsaDecodeGatherAttn(
     defer _ = mlx.mlx_array_free(gk);
     var gv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gv);
+    var rotated_rows = false;
     if (kv_view.tbq_triple and (kv_view.bits == 3 or kv_view.bits == 4)) {
         // Packed rows + fp16 block norms; dequantize ONLY the gathered
         // subset. TBQ norms ride `*_triple_scales`; the biases copy is never
@@ -5357,21 +5538,34 @@ pub fn qsaDecodeGatherAttn(
             kqs[2] != kv or kns[2] != kv or vqs[2] != kv or vns[2] != kv or
             kqs[3] != p_exp or vqs[3] != p_exp or
             kns[3] != blk_exp or vns[3] != blk_exp) return dq.no(.quant_layout);
-        // Contiguous copies: dequantize misreads the strided take views.
-        const gkq = try takeContig(s, kq, idx_u32, 2);
-        defer _ = mlx.mlx_array_free(gkq);
-        const gkn = try takeContig(s, kn, idx_u32, 2);
-        defer _ = mlx.mlx_array_free(gkn);
-        const gvq = try takeContig(s, vq, idx_u32, 2);
-        defer _ = mlx.mlx_array_free(gvq);
-        const gvn = try takeContig(s, vn, idx_u32, 2);
-        defer _ = mlx.mlx_array_free(gvn);
-        const gkdt = try kv_quant.dequantizeTBQ(s, gkq, gkn, kv_view.bits, .bfloat16);
-        defer _ = mlx.mlx_array_free(gkdt);
-        const gvdt = try kv_quant.dequantizeTBQ(s, gvq, gvn, kv_view.bits, .bfloat16);
-        defer _ = mlx.mlx_array_free(gvdt);
-        try mlx.check(mlx.mlx_array_set(&gk, gkdt));
-        try mlx.check(mlx.mlx_array_set(&gv, gvdt));
+        // Chunk-5 fused path: ONE dispatch gathers the packed rows through
+        // `idx` and stages them in the rotated domain (q gets M1-rotated and
+        // the output M2-folded around the SDPA below). A decline (kill switch
+        // or geometry) leaves `rotated_rows` false and the composed chain
+        // runs byte-for-byte unchanged.
+        if (qsaTbqTakeRotated(s, kv_view.*, idx_u32, kv_view.bits, h_kv, kv, head_dim, gathered_len)) |rows| {
+            try mlx.check(mlx.mlx_array_set(&gk, rows.k));
+            try mlx.check(mlx.mlx_array_set(&gv, rows.v));
+            _ = mlx.mlx_array_free(rows.k);
+            _ = mlx.mlx_array_free(rows.v);
+            rotated_rows = true;
+        } else {
+            // Contiguous copies: dequantize misreads the strided take views.
+            const gkq = try takeContig(s, kq, idx_u32, 2);
+            defer _ = mlx.mlx_array_free(gkq);
+            const gkn = try takeContig(s, kn, idx_u32, 2);
+            defer _ = mlx.mlx_array_free(gkn);
+            const gvq = try takeContig(s, vq, idx_u32, 2);
+            defer _ = mlx.mlx_array_free(gvq);
+            const gvn = try takeContig(s, vn, idx_u32, 2);
+            defer _ = mlx.mlx_array_free(gvn);
+            const gkdt = try kv_quant.dequantizeTBQ(s, gkq, gkn, kv_view.bits, .bfloat16);
+            defer _ = mlx.mlx_array_free(gkdt);
+            const gvdt = try kv_quant.dequantizeTBQ(s, gvq, gvn, kv_view.bits, .bfloat16);
+            defer _ = mlx.mlx_array_free(gvdt);
+            try mlx.check(mlx.mlx_array_set(&gk, gkdt));
+            try mlx.check(mlx.mlx_array_set(&gv, gvdt));
+        }
     } else if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
@@ -5415,7 +5609,30 @@ pub fn qsaDecodeGatherAttn(
 
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
+    if (rotated_rows) {
+        // Rotated-domain SDPA (Chunk-5): q @ M1 once, gathered rows already
+        // in the rotated domain, fold the raw output back by @ M2 — the exact
+        // dance of gatherQsa256Impl's tbq arm. add4 indexes gathered ROWS,
+        // so the mask rides unchanged.
+        const bits = kv_view.bits;
+        const q_rot = try tbqRotateQueries(s, q_rope, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(q_rot);
+        var r_out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(r_out);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&r_out, q_rot, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
+        const os = mlx.getShape(r_out);
+        var orows = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(orows);
+        const r_shape = [_]c_int{ os[0] * os[1] * os[2], os[3] };
+        try mlx.check(mlx.mlx_reshape(&orows, r_out, &r_shape, 2, s));
+        _ = mlx.mlx_array_free(r_out);
+        const o_true = try tbqRotateOutput(s, orows, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(o_true);
+        const f_shape = [_]c_int{ os[0], os[1], os[2], os[3] };
+        try mlx.check(mlx.mlx_reshape(&out, o_true, &f_shape, 4, s));
+    } else {
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
+    }
     if (qsa_engaged_bits.take(qsaEngagedBit(.decode_gather, qs[2]))) {
         log.info("[qsa-decode-gather] engaged (S={d} kv={d} rows={d})\n", .{ qs[2], kv, gathered_len });
     }
@@ -5938,6 +6155,7 @@ pub fn qsaVerifyGatherAttn(
     defer _ = mlx.mlx_array_free(gk);
     var gv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gv);
+    var rotated_rows = false;
     if (kv_view.tbq_triple and (kv_view.bits == 3 or kv_view.bits == 4)) {
         // Packed rows + fp16 block norms; dequantize ONLY the union subset.
         // TBQ norms ride `*_triple_scales`; biases are never read.
@@ -5959,21 +6177,33 @@ pub fn qsaVerifyGatherAttn(
             kqs[2] != kv or kns[2] != kv or vqs[2] != kv or vns[2] != kv or
             kqs[3] != p_exp or vqs[3] != p_exp or
             kns[3] != blk_exp or vns[3] != blk_exp) return dq.no(.quant_layout);
-        // Contiguous copies: dequantize misreads the strided take views.
-        const gkq = try takeContig(s, kq, tok_u32, 2);
-        defer _ = mlx.mlx_array_free(gkq);
-        const gkn = try takeContig(s, kn, tok_u32, 2);
-        defer _ = mlx.mlx_array_free(gkn);
-        const gvq = try takeContig(s, vq, tok_u32, 2);
-        defer _ = mlx.mlx_array_free(gvq);
-        const gvn = try takeContig(s, vn, tok_u32, 2);
-        defer _ = mlx.mlx_array_free(gvn);
-        const gkdt = try kv_quant.dequantizeTBQ(s, gkq, gkn, kv_view.bits, .bfloat16);
-        defer _ = mlx.mlx_array_free(gkdt);
-        const gvdt = try kv_quant.dequantizeTBQ(s, gvq, gvn, kv_view.bits, .bfloat16);
-        defer _ = mlx.mlx_array_free(gvdt);
-        try mlx.check(mlx.mlx_array_set(&gk, gkdt));
-        try mlx.check(mlx.mlx_array_set(&gv, gvdt));
+        // Chunk-5 fused path: ONE dispatch gathers the union subset through
+        // `tok_u32` and stages it in the rotated domain (q M1-rotated and the
+        // output M2-folded around the SDPA below). A decline leaves
+        // `rotated_rows` false and the composed chain runs unchanged.
+        if (qsaTbqTakeRotated(s, kv_view.*, tok_u32, kv_view.bits, h_kv, kv, head_dim, geom.rows)) |rows| {
+            try mlx.check(mlx.mlx_array_set(&gk, rows.k));
+            try mlx.check(mlx.mlx_array_set(&gv, rows.v));
+            _ = mlx.mlx_array_free(rows.k);
+            _ = mlx.mlx_array_free(rows.v);
+            rotated_rows = true;
+        } else {
+            // Contiguous copies: dequantize misreads the strided take views.
+            const gkq = try takeContig(s, kq, tok_u32, 2);
+            defer _ = mlx.mlx_array_free(gkq);
+            const gkn = try takeContig(s, kn, tok_u32, 2);
+            defer _ = mlx.mlx_array_free(gkn);
+            const gvq = try takeContig(s, vq, tok_u32, 2);
+            defer _ = mlx.mlx_array_free(gvq);
+            const gvn = try takeContig(s, vn, tok_u32, 2);
+            defer _ = mlx.mlx_array_free(gvn);
+            const gkdt = try kv_quant.dequantizeTBQ(s, gkq, gkn, kv_view.bits, .bfloat16);
+            defer _ = mlx.mlx_array_free(gkdt);
+            const gvdt = try kv_quant.dequantizeTBQ(s, gvq, gvn, kv_view.bits, .bfloat16);
+            defer _ = mlx.mlx_array_free(gvdt);
+            try mlx.check(mlx.mlx_array_set(&gk, gkdt));
+            try mlx.check(mlx.mlx_array_set(&gv, gvdt));
+        }
     } else if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
@@ -6018,7 +6248,33 @@ pub fn qsaVerifyGatherAttn(
     // split the dense mask arm uses, now over [R] instead of [kv].
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    if (try splitMaskedSdpa256(s, q_rope, gk, gv, attn_scale, add4)) |split_out| {
+    if (rotated_rows) {
+        // Rotated-domain SDPA (Chunk-5): same row-group split / fast arm as
+        // the composed path, just fed the M1-rotated query; the merged output
+        // folds back by @ M2 (the gatherQsa256Impl tbq arm dance). add4 is
+        // indexed by gathered ROWS, so the mask rides unchanged.
+        const bits = kv_view.bits;
+        const q_rot = try tbqRotateQueries(s, q_rope, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(q_rot);
+        var r_out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(r_out);
+        if (try splitMaskedSdpa256(s, q_rot, gk, gv, attn_scale, add4)) |split_out| {
+            _ = mlx.mlx_array_free(r_out);
+            r_out = split_out;
+        } else {
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&r_out, q_rot, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
+        }
+        const os = mlx.getShape(r_out);
+        var orows = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(orows);
+        const r_shape = [_]c_int{ os[0] * os[1] * os[2], os[3] };
+        try mlx.check(mlx.mlx_reshape(&orows, r_out, &r_shape, 2, s));
+        _ = mlx.mlx_array_free(r_out);
+        const o_true = try tbqRotateOutput(s, orows, bits, .bfloat16);
+        defer _ = mlx.mlx_array_free(o_true);
+        const f_shape = [_]c_int{ os[0], os[1], os[2], os[3] };
+        try mlx.check(mlx.mlx_reshape(&out, o_true, &f_shape, 4, s));
+    } else if (try splitMaskedSdpa256(s, q_rope, gk, gv, attn_scale, add4)) |split_out| {
         _ = mlx.mlx_array_free(out);
         out = split_out;
     } else {
@@ -59077,5 +59333,159 @@ test "GLM vision native serving splices media before HC expansion and preserves 
         try testing.expect(same);
         try testing.expectEqualSlices(c_int, &.{ 1, 1, 128 }, mlx.getShape(capture_out[0]));
         try testing.expectEqual(request.offset, ctx.cache.step);
+    }
+}
+
+test "qsa decode gather tbq fused take: rotated-domain rows match composed chain and dense SDPA (tbq4, tbq3)" {
+    // Chunk-5: one fused `sushi_tbq_take` dispatch replaces the decode arm's
+    // 4x takeContig + 2x dequantizeTBQ chain. The staged rows are ROTATED
+    // domain (q M1-rotated once, raw SDPA output M2-folded), so fused output
+    // agrees with the composed chain and the masked full-SDPA reference to
+    // bf16 rounding, not bitwise — the composed dequant rounds at a
+    // different point than the rotated staging does (same bar as the prefill
+    // tbq kernel). Capacity grows far past the written rows (max_seq =
+    // 250000) so both paths read STRIDED take views, the layout the composed
+    // chain's contiguous-copy workaround exists for.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    qsa_decode_gather_override = true;
+    defer qsa_decode_gather_override = null;
+    const env_fused = tbqTakeFusedEnabled();
+    var prng = std.Random.DefaultPrng.init(0x5A17_CE5A);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    const kv: c_int = 4096;
+    for ([_]u8{ 4, 3 }) |bits| {
+        var cache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.tbq(bits));
+        defer cache.deinit();
+        const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(k_dense);
+        const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(v_dense);
+        var view = try cache.update(0, k_dense, v_dense, s, 250000);
+        defer view.deinit();
+        try std.testing.expect(view.tbq_triple);
+        try std.testing.expectEqual(kv, mlx.getShape(view.k_triple_q)[2]);
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        var fx = try QsaBlockFixture.build(rnd, 1, kv, 512, ratio);
+        defer fx.deinit();
+        // Fused rotated-domain take, pinned ON regardless of env (the kill
+        // switch is covered by the third phase + the env-filter run).
+        tbq_take_override = true;
+        defer tbq_take_override = null;
+        tbq_take_engaged_bits.reset();
+        const got_f = (try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.DecodeGatherDeclinedFused;
+        defer _ = mlx.mlx_array_free(got_f);
+        try std.testing.expect(tbq_take_engaged_bits.seen != 0); // anti-vacuity
+        // Composed chain: take pinned OFF; the fused meter must stay dark.
+        tbq_take_override = false;
+        tbq_take_engaged_bits.reset();
+        const got_c = (try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.DecodeGatherDeclinedComposed;
+        defer _ = mlx.mlx_array_free(got_c);
+        try std.testing.expect(tbq_take_engaged_bits.seen == 0);
+        // Re-pin against the masked full-SDPA dense reference (same bar as
+        // the composed tbq gather test it upgrades: 0.01 / 0.9999).
+        const ref = try attn256Reference(q, view.k, view.v, scale, "array", fx.mask, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const fc = try attn256MaxDiff(got_f, got_c, s);
+        const fr = try attn256MaxDiff(got_f, ref, s);
+        const cr = try attn256MaxDiff(got_c, ref, s);
+        const fcos = try attn256Cosine(got_f, ref, s);
+        errdefer std.debug.print("[qsa-take] decode tbq{d}: fused-vs-composed {d:.6} fused-vs-dense {d:.6} composed-vs-dense {d:.6} cos {d:.7}\n", .{ bits, fc, fr, cr, fcos });
+        try std.testing.expect(fc < 0.01);
+        try std.testing.expect(fr < 0.01);
+        try std.testing.expect(cr < 0.01);
+        try std.testing.expect(fcos > 0.9999);
+        // The env default must reproduce exactly one of the two pinned
+        // paths (fused meter flips with the switch).
+        tbq_take_override = null;
+        tbq_take_engaged_bits.reset();
+        const got_e = (try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.DecodeGatherDeclinedEnv;
+        defer _ = mlx.mlx_array_free(got_e);
+        try std.testing.expect((tbq_take_engaged_bits.seen != 0) == env_fused);
+        const de = try attn256MaxDiff(got_e, if (env_fused) got_f else got_c, s);
+        try std.testing.expectEqual(@as(f32, 0), de); // same graph, same path
+    }
+    // Affine caches keep the fused tbq meter dark (meters stay separated).
+    var acache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
+    defer acache.deinit();
+    const ak = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(ak);
+    const av = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(av);
+    var aview = try acache.update(0, ak, av, s, 250000);
+    defer aview.deinit();
+    const aq = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
+    defer _ = mlx.mlx_array_free(aq);
+    var afx = try QsaBlockFixture.build(rnd, 1, kv, 512, ratio);
+    defer afx.deinit();
+    tbq_take_engaged_bits.reset();
+    const agot = (try qsaDecodeGatherAttn(s, aq, &aview, afx.blocks, ratio, scale)) orelse return error.DecodeGatherDeclinedAffine;
+    defer _ = mlx.mlx_array_free(agot);
+    try std.testing.expect(tbq_take_engaged_bits.seen == 0);
+}
+
+test "qsa verify gather tbq fused take: rotated-domain rows match composed chain and dense SDPA (S=8, tbq4, tbq3)" {
+    // The verify width of Chunk-5's fused take: rows = the union of the S
+    // selections + tails, gathered through the same single dispatch on
+    // strided (grown-capacity) views. Same bars as the composed verify test.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    qsa_verify_gather_override = true;
+    qsa_verify_gather_min_kv_override = 1024;
+    defer qsa_verify_gather_override = null;
+    defer qsa_verify_gather_min_kv_override = null;
+    const env_fused = tbqTakeFusedEnabled();
+    var prng = std.Random.DefaultPrng.init(0x5A17_3118);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    const kv: c_int = 4096;
+    const S: c_int = 8;
+    for ([_]u8{ 4, 3 }) |bits| {
+        var cache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.tbq(bits));
+        defer cache.deinit();
+        const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(k_dense);
+        const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(v_dense);
+        var view = try cache.update(0, k_dense, v_dense, s, 250000);
+        defer view.deinit();
+        try std.testing.expect(view.tbq_triple);
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, S, 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        var fx = try QsaBlockFixture.build(rnd, S, kv, 64, ratio); // union stays < kv (the arm's no-win gate)
+        defer fx.deinit();
+        tbq_take_override = true;
+        defer tbq_take_override = null;
+        tbq_take_engaged_bits.reset();
+        const got_f = (try qsaVerifyGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.VerifyGatherDeclinedFused;
+        defer _ = mlx.mlx_array_free(got_f);
+        try std.testing.expect(tbq_take_engaged_bits.seen != 0); // anti-vacuity
+        tbq_take_override = false;
+        tbq_take_engaged_bits.reset();
+        const got_c = (try qsaVerifyGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.VerifyGatherDeclinedComposed;
+        defer _ = mlx.mlx_array_free(got_c);
+        try std.testing.expect(tbq_take_engaged_bits.seen == 0);
+        const ref = try attn256Reference(q, view.k, view.v, scale, "array", fx.mask, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const fc = try attn256MaxDiff(got_f, got_c, s);
+        const fr = try attn256MaxDiff(got_f, ref, s);
+        const cr = try attn256MaxDiff(got_c, ref, s);
+        const fcos = try attn256Cosine(got_f, ref, s);
+        errdefer std.debug.print("[qsa-take] verify S=8 tbq{d}: fused-vs-composed {d:.6} fused-vs-dense {d:.6} composed-vs-dense {d:.6} cos {d:.7}\n", .{ bits, fc, fr, cr, fcos });
+        try std.testing.expect(fc < 0.01);
+        try std.testing.expect(fr < 0.01);
+        try std.testing.expect(cr < 0.01);
+        try std.testing.expect(fcos > 0.9999);
+        tbq_take_override = null;
+        tbq_take_engaged_bits.reset();
+        const got_e = (try qsaVerifyGatherAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.VerifyGatherDeclinedEnv;
+        defer _ = mlx.mlx_array_free(got_e);
+        try std.testing.expect((tbq_take_engaged_bits.seen != 0) == env_fused);
+        const de = try attn256MaxDiff(got_e, if (env_fused) got_f else got_c, s);
+        try std.testing.expectEqual(@as(f32, 0), de);
     }
 }
