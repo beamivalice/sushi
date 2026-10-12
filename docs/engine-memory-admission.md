@@ -114,8 +114,9 @@ admission bill at 1248 tokens, which replaces warmup and net once it is larger):
 Flash-Next's extra slack is the vision tower: it is billed at load for the first image and not resident until then.
 MiMo at 1248 tokens bills a request's prefill scratch (1.79) above its warmup. The streamed warmup is its cache, fill
 union and bounce buffers. Every bill is above its peak; the 1 GiB net is what separates them where nothing else does.
-The net does not stack on a context bill: no request allocates during the warmup, and the 64 GB recipe (2.6bpw, kv8,
-250000) has about 2 GiB of slack under its ceiling for both terms.
+The net does not stack on a context bill: no request allocates during the warmup. On the 64 GB recipe (2.6bpw, kv8,
+250000, 59,000 MB wired) the f32 GDN state leaves the load 4.0 GiB of slack and a cold 250k request 0.77 GiB at the
+4096 width admission picks (3adb8002, bill arithmetic); 0.8 GiB more drops that request to the 2048 width.
 Previous bills for the same boots: 46.20, 91.65, 91.91 and 7.27 GiB (the streamed one was 12 GiB under its peak).
 
 Other expert layouts of these archs bill the same terms; their warmup is not measured on this box.
