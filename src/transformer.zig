@@ -3951,7 +3951,7 @@ fn gatherQsa256Impl(
         // the true attention output (the identity pinned by kv_quant's
         // rotation tests). The rotate wants [ROWS, 256].
         var orows = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(orows);
+        defer _ = mlx.mlx_array_free(orows); // errdefer leaked one pinned kernel-output buffer per tbq prefill call
         const r_shape = [_]c_int{ qs[0] * qs[1] * qs[2], 256 };
         try mlx.check(mlx.mlx_reshape(&orows, out, &r_shape, 2, s));
         _ = mlx.mlx_array_free(out);
@@ -5459,7 +5459,7 @@ pub fn qsaSparseAttn(
         // dance: ROWS = Hq*S vectors of DV = 256, two 128-blocks each.
         const orows = [_]c_int{ qs[0] * qs[1] * seq_len, 256 };
         var flat = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(flat);
+        defer _ = mlx.mlx_array_free(flat); // errdefer leaked one pinned split-K merged buffer per tbq tick
         try mlx.check(mlx.mlx_reshape(&flat, merged, &orows, 2, s));
         const o_true = try tbqRotateOutput(s, flat, bits, .bfloat16);
         defer _ = mlx.mlx_array_free(o_true);
@@ -45116,6 +45116,112 @@ test "qsa prefill gather tbq: engages on the server-shaped grown cache" {
     errdefer std.debug.print("[qsa-prefill-gather] grown cap={d} S=2048 tbq4: max diff {d:.6} cos {d:.7}\n", .{ cap, diff, cos });
     try std.testing.expect(diff < 0.01);
     try std.testing.expect(cos > 0.9999);
+}
+
+test "tbq write and arm paths release every pinned device buffer (floor)" {
+    // Regression guard for the tbq4 server ratchet (live A run 2026-10-12:
+    // 44 -> 58 GB active, never reclaimable, then a 64k-row METAL OOM).
+    // Three handles owned with `errdefer` only leaked one pinned device
+    // buffer per SUCCESSFUL call: `xr` in the fused TBQ encoder (pins the
+    // quantize input), `orows` in the packed-gather tbq route (pins the
+    // kernel output), and `flat` in the split-K tbq branch (pins the
+    // merged buffer). Each loop frees every handle it takes via iteration
+    // `defer`s and evals its outputs so the buffers are materialized
+    // before the release check; at the floor the process must sit within
+    // 256KB of baseline. Pre-fix this retains ~6MB (3MB + 2.3MB + 0.6MB),
+    // so any re-introduction of the pattern trips it.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    const scale: f32 = 1.0 / 16.0;
+    var prng = std.Random.DefaultPrng.init(0x5A5A_01);
+    const rnd = prng.random();
+    const act = struct {
+        fn get() usize {
+            var a: usize = 0;
+            _ = mlx.mlx_get_active_memory(&a);
+            return a;
+        }
+    }.get;
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    const base = act();
+
+    // 1) Fused encoder: fresh [1,2,512,256] bf16 input per call. The
+    //    byte-parity tests in kv_quant pin the fused-vs-composed choice;
+    //    here the fused override is forced on.
+    kv_quant.tbq_encode_fused_override = true;
+    defer kv_quant.tbq_encode_fused_override = null;
+    for (0..6) |_| {
+        const src = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 512, 256 }, s);
+        defer _ = mlx.mlx_array_free(src);
+        var qkv = try kv_quant.quantizeTBQ(s, src, 4);
+        defer qkv.deinit();
+        try mlx.check(mlx.mlx_array_eval(qkv.q));
+        try mlx.check(mlx.mlx_array_eval(qkv.scales));
+        try mlx.check(mlx.mlx_array_eval(qkv.biases));
+    }
+
+    // 2) Packed-gather tbq route: S=32 over kv=300, same envelope the
+    //    prefill-gather parity test uses, six times.
+    qsa_gather_override = true;
+    qsa_attn_kernel_override = true;
+    qsa_nax_override = false;
+    defer {
+        qsa_gather_override = null;
+        qsa_attn_kernel_override = null;
+        qsa_nax_override = null;
+    }
+    for (0..6) |_| {
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 32, 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const kd = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 300, 256 }, s);
+        defer _ = mlx.mlx_array_free(kd);
+        const vd = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 300, 256 }, s);
+        defer _ = mlx.mlx_array_free(vd);
+        var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.tbq(4));
+        defer cache.deinit();
+        var view = try cache.update(0, kd, vd, s, 0);
+        defer view.deinit();
+        const bh = try qsaVerifyBlocksHost(ta, rnd, 32, 300, 80, ratio);
+        defer ta.free(bh);
+        const blocks = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{ 1, 32, 80 }, 3, .int32);
+        defer _ = mlx.mlx_array_free(blocks);
+        qsa_gather_tbq_engaged_bits.reset();
+        const got = (try gatherQsa256Packed(s, q, &view, scale, blocks, ratio)) orelse return error.PrefillGatherDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expect(qsa_gather_tbq_engaged_bits.seen != 0);
+        try mlx.check(mlx.mlx_array_eval(got));
+    }
+
+    // 3) Split-K tbq branch: S=8 over kv=4096 (the verified arm envelope),
+    //    six ticks.
+    for (0..6) |_| {
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 8, 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const kd = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 4096, 256 }, s);
+        defer _ = mlx.mlx_array_free(kd);
+        const vd = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, 4096, 256 }, s);
+        defer _ = mlx.mlx_array_free(vd);
+        var fx = try QsaBlockFixture.build(rnd, 8, 4096, 64, ratio);
+        defer fx.deinit();
+        var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.tbq(4));
+        defer cache.deinit();
+        var view = try cache.update(0, kd, vd, s, 250000);
+        defer view.deinit();
+        qsa_attn_tbq_engaged_bits.reset();
+        const got = (try qsaSparseAttn(s, q, &view, fx.blocks, ratio, scale)) orelse return error.SplitKDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expect(qsa_attn_tbq_engaged_bits.seen != 0);
+        try mlx.check(mlx.mlx_array_eval(got));
+    }
+
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    const fin = act();
+    const kept: usize = if (fin > base) fin - base else 0;
+    try std.testing.expect(kept < 256 * 1024);
 }
 
 test "qsa prefill gather tbq: tbq4 and affine4 never share a gather config" {

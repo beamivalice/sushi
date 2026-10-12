@@ -540,7 +540,7 @@ fn quantizeTBQFused(s: mlx.mlx_stream, dense_x: mlx.mlx_array, t: TBQTables) !?Q
     // backstops a sliced input like the composed chain's astype does.
     const sh5 = [_]c_int{ B, Hh, T, blk, 128 };
     var xr = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(xr);
+    defer _ = mlx.mlx_array_free(xr); // errdefer leaked one pinned input buffer per fused quantize call
     try mlx.check(mlx.mlx_reshape(&xr, dense_x, &sh5, 5, s));
     const inputs_arr = [_]mlx.mlx_array{ xr, dev.s1, dev.s2, dev.mid, dev.cen };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
