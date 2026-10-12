@@ -179,11 +179,13 @@ The 48 GB recipe is the same check at a 43,000 MB ceiling (probe at `eab60060`, 
 |---|---:|---:|---:|---:|---:|---:|
 | Sushi-2bpw, kv8 | 131072 | 5905 | 512 | 6163 | 40.7 | 141072 |
 
-The README memory table's "needed" row is the weights plus this full-context bill at the 512 rung plus a 1 GiB hot
-cache. At `eab60060` the bill is the same for every Flash-Next pack and for `--max-tokens` 32000 or 64000: 5905 /
-8825 / 14025 / 24425 MiB at 128k / 256k / 512k / 1M tokens (KV 2080 / 4160 / 8320 / 16640 of it).
-Its max-context column is the largest multiple of 8192 tokens whose weights + 512-rung bill + 1 GiB hot cache + 256
-MiB spare fits each wired limit, capped at 1M (same probe, kv8 and kv4).
+The README memory table is the billed resident weights (trunk, vision tower, MTP head and its rerank copy; GLM with its
+assistant) plus this full-context bill at the 512 rung (`--max-tokens 0`, `--ctx-size` the context); the prompt cache is
+not counted. The bill is the same for every Flash-Next pack: 5905 / 8825 / 14025 / 24425 MiB at 128k / 256k / 512k /
+1M tokens at `--qwen-gdn 16` (KV 2080 / 4160 / 8320 / 16640 of it; the probe at `eab60060`, reproduced at 4b919abb),
+and 1080 MiB more at each size at the f32 default. Its max-context column is the largest multiple of 8192 tokens whose
+weights + 512-rung bill + 256 MiB spare fits each wired limit, capped at 1M (kv8 and kv4); the 48 and 64 GB rows run at
+`--qwen-gdn 16`, the 96 and 128 GB rows at the f32 default.
 
 The ladder widens the chunk until the bill nearly fills what is available, so the spare in a row is small by
 construction; "largest admitted" (2000-token steps) is where even the 512 rung stops fitting. The ceiling assumes

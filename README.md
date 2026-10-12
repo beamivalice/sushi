@@ -40,24 +40,29 @@ Update with `brew upgrade sushi`.
 
 GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on with `--mtp-head-kv-quant`; GLM
 with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
+The Qwen columns are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 1 GiB off each Qwen cell.
 
 | context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
 |---|---:|---:|---:|---:|---:|---:|
-| weights only | 35.0 | 44.0 | 63.7 | 83.6 | 78.6 | 90.0 |
-| 128k | 40.7 | 49.7 | 69.4 | 87.3 | 81.8 | 93.2 |
-| 256k | 43.6 | 52.6 | 72.3 | 89.2 | 82.9 | 94.3 |
-| 512k | 48.7 | 57.6 | 77.4 | 92.9 | 85.1 | 96.5 |
-| 1M | 58.8 | 67.8 | 87.5 | 100.4 | 89.6 | 101.0 |
+| weights only | 35.2 | 44.2 | 63.9 | 89.7 | 78.3 | 89.8 |
+| 128k | 42.1 | 51.0 | 70.8 | 93.7 | 82.6 | 94.1 |
+| 256k | 44.9 | 53.9 | 73.6 | 95.8 | 83.8 | 95.2 |
+| 512k | 50.0 | 59.0 | 78.7 | 99.9 | 86.0 | 97.5 |
+| 1M | 60.1 | 69.1 | 88.9 | 108.2 | 90.5 | 102.0 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
-the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no 4-bit KV):
+the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no
+4-bit KV):
 
 | Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
 |---|---|---|---|---|---|---|---|
-| 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — | — | — |
-| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | — | — | — | — |
-| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | — | 512k / — | — |
+| 48 GB † | 43,000 MB (42.0 GiB) | 160k / 240k | — | — | — | — | — |
+| 64 GB † | 59,000 MB (57.6 GiB) | 936k / 1M | 480k / 768k | — | — | — | — |
+| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 960k / 1M | — | 696k / — | — |
 | 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — |
+
+† At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
+less: 112k / 168k at 48 GB, and 880k / 1M and 432k / 680k at 64 GB.
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
