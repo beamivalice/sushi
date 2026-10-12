@@ -44,6 +44,11 @@ fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_arra
 /// GLM's gate is upper-clamped and its up branch is symmetrically clamped,
 /// before SwiGLU and the down projection. Packed expert rates remain 2–4 bpw.
 pub fn moeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, limit: c_int) !mlx.mlx_array {
+    return moeClampedWithShared(s, x, bank, inds, scores, dec, limit, null);
+}
+
+/// A decode row may fold an already computed shared expert (same dtype and size as the output) into the finish reduce.
+pub fn moeClampedWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, limit: c_int, shared: ?mlx.mlx_array) !mlx.mlx_array {
     if (limit <= 0 or limit > 128) return error.InvalidExl3Clamp;
     const sh = mlx.getShape(x);
     const ix = mlx.getShape(inds);
@@ -63,7 +68,7 @@ pub fn moeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx
     try validateClampedProjection(bank.gate, gs[0], sh[2], width);
     try validateClampedProjection(bank.up, gs[0], sh[2], width);
     try validateClampedProjection(bank.down, gs[0], width, sh[2]);
-    return moeOutputClamped(s, x, bank, inds, scores, dec, false, mlx.mlx_array_dtype(x), null, limit);
+    return moeOutputClamped(s, x, bank, inds, scores, dec, false, mlx.mlx_array_dtype(x), shared, limit);
 }
 
 pub fn validateClampedProjection(p: Proj, experts: c_int, input: c_int, output: c_int) !void {
@@ -107,7 +112,7 @@ fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.m
     const u = bank.up;
     const d = bank.down;
     const y = if (limit > 0)
-        try kernels.moeSwigluClamped(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, limit, xd)
+        try kernels.moeSwigluClampedWithShared(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, limit, xd, shared)
     else if (rows <= kernels.DECODE_ROWS_MAX or verify_rows)
         if (mlx.getShape(g.trellis)[3] == mlx.getShape(u.trellis)[3])
             try kernels.moeSwigluFusedWithShared(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, xd, shared)

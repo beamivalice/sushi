@@ -125,8 +125,8 @@ const HEADER5: [:0]const u8 =
     \\ }
     \\}
 ;
-pub const Kernel = enum { qkv, hoist, tiles };
-var logged: [3][9]bool = @splat(@splat(false));
+pub const Kernel = enum { qkv, hoist, tiles, shared, kda_project };
+var logged: [5][9]bool = @splat(@splat(false));
 /// One line per kernel and stored width names the affine paths a pack reaches.
 pub fn logEngaged(comptime kernel: Kernel, bits: c_int) void {
     const seen = &logged[@intFromEnum(kernel)][@intCast(bits)];
@@ -136,6 +136,8 @@ pub fn logEngaged(comptime kernel: Kernel, bits: c_int) void {
         .qkv => "[glm] copy-free QKV",
         .hoist => "[glm-dflash] coefficient hoist rows",
         .tiles => "[glm-dflash] affine row tiles",
+        .shared => "[glm] shared-expert gate/up/activation fusion",
+        .kda_project => "[glm] KDA q/k/v/f_a/g_a/beta projection",
     };
     @import("log.zig").info("{s} engaged (A{d}g128)\n", .{ label, bits });
 }
@@ -208,6 +210,34 @@ fn configuration(width: c_int, dims: [3]c_int, rank: usize) !Config {
     return .{ .value = cfg, .cached = false };
 }
 
+pub const BankShape = struct { bits: c_int, rows: c_int };
+
+/// A loaded, row-major affine g128 bank whose qmv_fast order these kernels reproduce for an input of `width`.
+pub fn checkBank(width: c_int, bank: Bank) !?BankShape {
+    if (bank.weight.ctx == null or bank.scales.ctx == null or bank.biases.ctx == null) return null;
+    const w = mlx.getShape(bank.weight);
+    if (w.len != 2 or w[0] <= 0 or @rem(w[0], 8) != 0 or mlx.mlx_array_dtype(bank.weight) != .uint32 or
+        !(try materialized(bank.weight)) or !rowMajor(bank.weight)) return null;
+    const bits: c_int = if (w[1] == @divExact(width, 4)) 8 else if (w[1] == @divExact(width, 16) * 3) 6 else if (@rem(width, 512) == 0 and w[1] == @divExact(width, 32) * 5) 5 else return null;
+    const grid = [_]c_int{ w[0], @divExact(width, 128) };
+    // Lazy views can acquire different strides at evaluation; only loaded grids qualify.
+    for ([_]Arr{ bank.scales, bank.biases }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16 or !std.mem.eql(c_int, &grid, mlx.getShape(a)) or
+        !(try materialized(a)) or !rowMajor(a))
+    {
+        return null;
+    };
+    return .{ .bits = bits, .rows = w[0] };
+}
+
+/// The qmv_fast helpers (`glm_qmv_rows`) for a stored width.
+pub fn header(bits: c_int) [:0]const u8 {
+    return switch (bits) {
+        6 => HEADER6,
+        5 => HEADER5,
+        else => HEADER,
+    };
+}
+
 pub fn qkv(s: mlx.mlx_stream, x: Arr, banks: [3]Bank) !?[3]Arr {
     if (!mlx.streamIsGpu(s) or x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const sh = mlx.getShape(x);
@@ -217,21 +247,10 @@ pub fn qkv(s: mlx.mlx_stream, x: Arr, banks: [3]Bank) !?[3]Arr {
     var bits: c_int = 0;
     var dims: [3]c_int = undefined;
     for (banks, &dims) |bank, *n| {
-        if (bank.weight.ctx == null or bank.scales.ctx == null or bank.biases.ctx == null) return null;
-        const w = mlx.getShape(bank.weight);
-        if (w.len != 2 or w[0] <= 0 or @rem(w[0], 8) != 0 or mlx.mlx_array_dtype(bank.weight) != .uint32 or
-            !(try materialized(bank.weight)) or !rowMajor(bank.weight)) return null;
-        const packed_bits: c_int = if (w[1] == @divExact(width, 4)) 8 else if (w[1] == @divExact(width, 16) * 3) 6 else if (@rem(width, 512) == 0 and w[1] == @divExact(width, 32) * 5) 5 else return null;
-        if (bits != 0 and bits != packed_bits) return null;
-        bits = packed_bits;
-        const grid = [_]c_int{ w[0], @divExact(width, 128) };
-        // Lazy views can acquire different strides at evaluation; only loaded grids qualify.
-        for ([_]Arr{ bank.scales, bank.biases }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16 or !std.mem.eql(c_int, &grid, mlx.getShape(a)) or
-            !(try materialized(a)) or !rowMajor(a))
-        {
-            return null;
-        };
-        n.* = w[0];
+        const found = (try checkBank(width, bank)) orelse return null;
+        if (bits != 0 and bits != found.bits) return null;
+        bits = found.bits;
+        n.* = found.rows;
     }
     var total: i64 = 0;
     for (dims) |n| {

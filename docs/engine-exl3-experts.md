@@ -128,6 +128,9 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   decode tick's. Two members only: four spill their accumulators. Not on Flash-Next, whose rows share too few experts.
 - **A decode GEMV slot is bound by its own FMA and input path**, not the weight decode or DRAM, so deduplicating
   shared experts recovers only 4-7% of the expert kernels at 3-4 rows.
+- **GLM's one-row decode GEMVs are latency-bound, not ALU-bound**: two tiles per group and two k-tiles per iteration
+  took the chain from 179 to 141 µs per layer ([glm5-clamped-experts](glm5-clamped-experts.md#glm)); judge a decode
+  GEMV change on the whole chain meter (`SUSHI_GLM_T1_UBENCH=1`, test binary), not on an instruction count.
 - Dead for the decode GEMVs (microbenched): 4 or 8 tiles per threadgroup, software prefetch, 2 simdgroups, a
   threadgroup LUT decode, a 24-bit multiply split, half2 input reads, bitfield extracts.
 - Dead for the prefill GEMM on the NAX body (MiMo and Flash-Next, outputs bit-identical, all slower): 64-row windows

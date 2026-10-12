@@ -79,6 +79,8 @@ test {
     _ = @import("glm5_kda_prework.zig");
     _ = @import("glm5_router.zig");
     _ = @import("glm5_activation.zig");
+    _ = @import("glm5_shared.zig");
+    _ = @import("glm5_kda_project.zig");
     _ = @import("glm5_dflash_tree.zig");
     _ = @import("glm5_dflash_topk.zig");
     _ = @import("glm5_dflash.zig");

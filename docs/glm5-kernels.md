@@ -72,16 +72,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   The shared NAX gate bounds row subgroups per threadgroup: 8 (256 threads) without NAX, 16 (512) with it.
 - **Index scores, NAX window** (9–16 query rows, 3584–8192 completed pools): Q `[T·32,128]` × pooled-key tiles of at
   most 2048 pools, scalar epilogue kept (BF16 dot, BF16 ReLU·weight, sequential FP32 32-head sum, BF16 total, −inf
-  for future pools). 0/7/6 of 16K/65K/131K scores differ, every 512-pool set kept. The tiles stay lazy until the packed
-  tile pair settles (36 MiB per pending layer): a host settle per tile cost 95 vs 21 ms per MLA layer at 32K.
+  for future pools). 0/7/6 of 16K/65K/131K scores differ, every 512-pool set kept. The tiles stay lazy until their packed
+  tile settles (36 MiB per pending layer: two 32-row selections): a host settle per tile cost 95 vs 21 ms per MLA layer at 32K.
 - **Selection**: a prefill tile ranks its top 512 pools in one dispatch per row (radix-16 search for the 512th key,
   every larger key plus the lowest-pool ties at it, each candidate's rank), equal to ArgPartition's stable order
-  (higher score first, ties by pool, NaN last). Decode and verify rows keep ArgPartition.
+  (higher score first, ties by pool, NaN last). Decode and verify rows keep ArgPartition. A 32-row tile scores, ranks
+  and expands its 32 rows in one pass, bit-equal to the two 16-row halves it used to join.
 - **Meter**: `SUSHI_GLM_LONGCTX_UBENCH=1` (`_CTX`, `_REPS`) runs one MLA layer on a synthetic kv8 state: a decode row
   and a 2048-row chunk split into scores, selection and whole attention, plus decode and chunk append costs.
 - **Sparse attention**: per real query, gather its 512 pools plus raw tail (2051 latent rows) into one BF16 bank used
   as K and V, native SDPA at scale 1/16 for at most 16 queries per graph (16K: 0.69 vs 5.22 ms scalar). Two such graphs
-  stay in flight (−18.6% at 8K, −6.9% at 16K), and exactly 32 rows join two unchanged T16 selections into one B32 call
+  stay in flight (−18.6% at 8K, −6.9% at 16K) and the older settles only after its successor is queued, so the GPU
+  never waits for the host to build the next graph (exact against serial tiles). Exactly 32 rows make one B32 call
   (whole attention −15.4%, 16K model prefill −4.9% vs 1.95% drift, exact against B16) at any history: the 2 MiB
   score plane no longer narrows tiles past 64K, and the selection planes are billed per history token (64 B).
   Invalid and future slots are zeroed before load, all-invalid outputs after; MLX's automatic input copy is off for
@@ -89,12 +91,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - **KDA**: FA/GA/beta read the same normalized input, so at exactly 2048 rows they run as one prepared BF16
   `[320,4096]` NAX GEMM with compact outputs (exact, −6.9%; 85 MiB resident, built at load on a NAX GPU). A6 QKV and
   output banks are dequantized to temporary BF16 and multiplied by dense NAX at exactly 2048 rows (exact, −7.4%/−5.3%;
-  512 MiB at async2). Prework is one dispatch: conv4, BF16 SiLU, Q/K L2, FP32 decay, BF16 beta (−74%). The recurrence
+  512 MiB at async2). The MLA q_a/q_b/kv_a and indexer wq_b projections take the same path (exact, −4% to −11% per
+  call; an MLA layer's 140 MiB sits inside the KDA layer's four banks). The shared expert and dense MLP stay on qmm
+  ([measured](glm5-perf.md#glm-a6-trunk-dense)). Prework is one dispatch: conv4, BF16 SiLU, Q/K L2, FP32 decay, BF16 beta (−74%). The recurrence
   carries four value rows per SIMD group sharing K/decay/Q loads, one `simd_sum` per member, FP32 state (−22% at 512,
   −34% at 2048 tokens). The output epilogue fuses FP32 RMS, norm weight and sigmoid gate. The conv history keeps raw
   BF16 bits (integer copies of the last three QKV rows: a float round trip flushes subnormals and signed zeros).
+  From 128 rows the prework reads the three projections in place, with no concatenated copy (exact, −0.4 ms of a
+  14.7 ms T2048 layer). `SUSHI_GLM_KDA_PREFILL_UBENCH=1` times each stage of one synthetic T2048 layer.
 - **HC**: at 128+ BF16 rows one kernel fuses widening, RMS (MLX's 1024-logical-thread reduction on 128 threads) and
   the 24-output projection with shared accumulators (exact, −51% at 512 rows).
+  The RMS mix serves two rows per threadgroup (each weight load feeds both, each row keeps its own lane order and
+  reduction); the row count rides a buffer input so one compiled kernel serves every chunk length.
+- **Schedule**: prefill queues every layer asynchronously and the host waits only on the layer `interval − 1` back,
+  so the GPU always has the next graph queued; the evaluation and memory bills per pending layer are unchanged.
 
 ## Decode (one evaluation per token, submitted every four layers)
 
@@ -110,12 +120,25 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   Measured inside noise: decode 28.24 → 28.18 ms/token (−0.2%; Sushi-2.4bpw, ctx 1024, arms alternated in one boot,
   16 rounds x 48 tokens, implementation plus a throwaway arm switch, `taskpolicy -a`, GPU lock, quiet window, battery
   at 97%). Landed by owner decision, not for speed.
+- One-token KDA projections: q/k/v (copy-free A5/A6/A8 banks) and the dense BF16 f_a, g_a and beta GEMVs run in one dispatch
+  (`glm5_kda_project.zig`) and write the body's joined `[q|k|v|beta]` row directly, so neither concat runs. The dense rows
+  reproduce MLX `gemv_bfloat16_bm1_bn8_sm1_sn32_tm4_tn4` (K >= 16 rows): eight 128-column K slices per 1024, shuffle-down
+  16..1 per slice, slices added in order. Bit-exact; declines unserved banks and the covariance tap.
+- One-token shared expert: gate, up and the clamped BF16 SwiGLU in one dispatch over resident A5/A6/A8 banks
+  (`glm5_shared.zig`, one simdgroup per projection, activation arithmetic of `glm5_activation.zig`); the down stays the stock
+  qmv. The BF16 add rides the routed finish reduce (after the routed sum's own rounding), and that reduce lists `shared`
+  as its FIRST input: MLX encodes inputs in order, so the shared chain runs before the routed one. Shared last measured
+  +0.55 to +0.7 ms/token slower than the separate add; the dispatch count is the same either way.
 - Router: FP32 GEMV with sigmoid and correction, then stable top-8 and unbiased normalization (two dispatches; BF16
   weights widened locally). Dense/shared activation: one dispatch over the exhaustive BF16 sigmoid table (128 KiB).
 - Attention: B1 per decode row and B3/B4 for verification branches, from one gather source (`[B,2051,512]` bank,
   Q `[B,1,64,512]`), through FP32 GEMMs and a precise softmax on every GPU. A NAX GPU multiplies with MLX's
   block-masked GEMM, which never takes the TF32 path, so the bits do not depend on `MLX_ENABLE_TF32`. Its fixed
   32×32×16 tiles let B3/B4 run together with every B1 bit preserved. Ordinary GEMM still runs each branch separately.
+  A request's serial row (one row, no overlay, NAX) takes `runRow`, B1's bytes in fewer dispatches: the gather writes
+  the FP32 bank, the scaled FP32 query and, past the dense window, expands the 512 pools itself; the current row
+  comes from the cache (not a dequantized tail copy); the block masks are built once; no all-invalid zeroing.
+  `SUSHI_GLM_DECODE_UBENCH=1` (`_CTX`) splits one row into a dependent 16-layer chain per stage.
   Multi-row gathers write FP32 directly after the BF16/kv8 read, retaining its rounding boundary and the 32 MiB
   scratch cap. Every cell sits within one BF16 ulp of an FP64 oracle;
   the fused D512 NAX SDPA it replaced missed that on ~70% of cells (rel L2 1.2e-2 against 1.6e-3). Gate (`cc56be2b`
@@ -126,6 +149,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   ran alone while 255 threads waited (exact; −27.6% component, 8K model −2.65% vs 1.99% drift). T1/T2/T4 in one process on Sushi-2.5bpw kv8 at 1K (`SUSHI_GLM_ROWS_UBENCH`, 24 rounds,
   arms interleaved, `taskpolicy -a`, lock, AC): serial token 30.87 → 28.98 ms (−6.1%), grouped T2 40.92 → 38.98 (−4.7%),
   T4 66.41 → 64.19 (−3.3%); T3 unchanged (51.50 vs 51.41, the control). Bit-exact against the reference kernel at every width.
+- Serial decode carries each HC expansion's FP32 normalized output into the next collapse, as three-row verification
+  does (`serialHcEligible`: hidden 4096, NAX arms, SIMD32 collapse); bit-exact, one-shot `[glm] serial decode HC
+  collapse from the expansion engaged`.
 
 ## DFlash2 verification
 
@@ -261,6 +287,14 @@ Prefill attention and index:
   262144. At short context the first radix selector measured +1.6%, 2/11.
 - Two-tile cadence inside the NAX index scorer (−16.3% component, −0.45% model at 16K): superseded by keeping every
   tile lazy until the tile pair settles.
+- Selecting the next tile inside the current tile's evaluation (overlap with its SDPA): −19% at 6K, +9% to +60% at
+  10K-32K, erratic per context, no model gain.
+- Eight-code vectorized kv8 gather (one scale/bias, one 16-byte store): exact, no faster (the gather runs at ~365 GB/s).
+- Ring depth 3 or 12 for the in-flight tiles: no gain over 2 (12 slower); larger SDPA batches than 32: per-row cost flat.
+- Serial decode row, 8 K ctx per MLA layer (~110 µs net: select 37, QK GEMM 34, PV GEMM 56): tree scorer over 4/8/16
+  pools per threadgroup (same time: ALU-bound at 32K+ pools), the radix selector for one row (−3 µs at 8K, +20 µs at
+  128K), and simdgroup-matrix QK/PV kernels with MLX's exact accumulation (bit-equal, but 0 to −5 µs: they match MLX's
+  32x32 tiles, loads of the shared operand dominate).
 - Tree scorer variants: FMA partials (matched on random data, no faster), keys or queries held as FP32 register
   arrays (spills, 5–7× slower), the partial terms as a loop over the head width with per-lane head ternaries (6×
   slower than four statements and a clamped head).
@@ -275,6 +309,9 @@ Prefill KDA and trunk:
 - Staged (threadgroup) recurrence schedules: +7.8% to +65%; threadgroup height 8/16: −3–4%, superseded by R4.
 - R8 value rows: −1.6% (8/11), about 2.4 ms per T2048 prompt.
 - Temporal 128-token KDA tiles: +11.8%, 0/11.
+- Recurrence threadgroup height 1/2/8/16 at R4 and R2 value rows: no gain over height 4 (R2 slower); simd_sum is ~18%
+  of the recurrence, which is ALU-bound. A vector-load post epilogue: no gain. One N=24576 QKV GEMM runs 6.8 vs 7.3 ms
+  but needs all three dequantizations first (+0.7 ms exposed), so it loses to the three overlapped GEMMs.
 - A6 dense expansion at T1536–2047: −7.9% component, +3.1% on the equal-memory model gate.
 - Request-lifetime BF16 copies of all 136 A6 banks (8.5 GiB): +0.36%, 4/11.
 - Affine QMM tile swizzle (≤1%), tile aspect (wide +16–21%; tall WM2/WN2 wrote zeros from row 16), A6 word unpack and
@@ -295,6 +332,8 @@ Decode and verify:
 - Per-node packed NAX decode attention: +23–60%, 0/6 in all nine cases. Shared-factor split-8 merge: +2–5%.
 - Short-row NAX index scorer (M128/K128/C2048): +14%, 0/11. Four-subgroup scalar scorer: 0.83% slower paired.
   Shared-prefix three-query scoring: +18%, 1/22.
+- Router logits with all eight loads per 1024 columns issued first (exact): -0.017 +- 0.010 ms/token, noise; removed.
+  Routing before the shared chain in the tape (finish reduce input order): -0.007 +- 0.026, noise.
 - Fused T3 KDA core (prework + leaf recurrence + post): −0.7%, 6/11; removed. Canonical chain/fork recurrence:
   chain 6/11, fork slower. Keeping all three T3 endpoints: −1.5% (6/11) for +272 MiB.
 - Retained KDA projections: native NAX batch +5.7%; FA+GA N256 column join +3.7% (N320 changes the GEMV kernel).

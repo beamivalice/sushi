@@ -248,6 +248,15 @@ const Moe = struct {
     }
     fn apply(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !Arr {
         const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
+        // The shared expert is built first: the finish reduce lists it first, so MLX encodes its chain ahead of the routed one.
+        if (self.shared) |shared| if (self.streamed == null and isDecodeRow(x)) {
+            const mid = try shared.apply(ops, x, cfg.glm_swiglu_limit);
+            if (mlx.mlx_array_dtype(mid) == .bfloat16 and std.mem.eql(c_int, mlx.getShape(mid), mlx.getShape(x))) {
+                const dec = exl3.format.Decode{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window };
+                return ops.own(try exl3.moeClampedWithShared(ops.s, x, self.bank, routing.indices, routing.scores, dec, @intFromFloat(cfg.glm_swiglu_limit), mid));
+            }
+            return ops.binary(.add, try routedExl3(ops, x, self.bank, routing.indices, routing.scores, cfg), mid);
+        };
         const routed = if (self.streamed) |store|
             try store.apply(self.layer_index, ops, x, routing.indices, routing.scores, cfg)
         else
@@ -256,6 +265,11 @@ const Moe = struct {
         return routed;
     }
 };
+
+fn isDecodeRow(x: Arr) bool {
+    const sh = mlx.getShape(x);
+    return sh.len == 3 and sh[0] == 1 and sh[1] == 1 and mlx.mlx_array_dtype(x) == .bfloat16;
+}
 
 /// The resident bank and a streamed slab bank run this one dispatch; slab ids are slot ids.
 pub fn routedExl3(ops: *Ops, x: Arr, bank: exl3.Bank, ids: Arr, scores: Arr, cfg: *const model.ModelConfig) !Arr {
@@ -478,6 +492,11 @@ pub const Request = struct {
 };
 
 var schedule_test_syncs: usize = 0;
+var serial_hc_logged = false;
+var serial_hc_layers: usize = 0;
+pub fn serialHcLayerCount() usize {
+    return serial_hc_layers;
+}
 var schedule_test_asyncs: usize = 0;
 
 fn appendLayerState(evals: mlx.mlx_vector_array, state: *const LayerState) !void {
@@ -641,10 +660,24 @@ pub const Model = struct {
         var h = try self.embedStreams(ids, embedded);
         defer _ = mlx.mlx_array_free(h);
         if (request.boundaries) |sink| try sink.append(sink.ctx, 0, h);
+        var queued: [8]Arr = undefined;
+        for (&queued) |*q| q.* = mlx.mlx_array_new();
+        defer for (queued) |q| {
+            _ = mlx.mlx_array_free(q);
+        };
+        const carry_norm = ish[1] == 1 and self.serialHcEligible();
+        var h_norm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h_norm);
+        var have_norm = false;
         for (self.layers, request.layers, 0..) |*layer, *state, layer_index| {
             var ops = Ops{ .s = self.s };
             defer ops.deinit();
-            const next = try self.layerBody(&ops, layer, state, h, request.dense_prefill);
+            const next = if (carry_norm) blk: {
+                const step = try self.serialLayer(&ops, layer, state, h, if (have_norm) h_norm else null, layer_index + 1 < self.layers.len);
+                have_norm = step.norm != null;
+                if (step.norm) |n| try mlx.check(mlx.mlx_array_set(&h_norm, n));
+                break :blk step.next;
+            } else try self.layerBody(&ops, layer, state, h, request.dense_prefill);
             if (request.capture) |capture| {
                 for (capture.ids, 0..) |id, i| {
                     if (id == layer_index) try mlx.check(mlx.mlx_array_set(&capture.out[i], try ops.reduce(next, 2, true, false)));
@@ -653,15 +686,16 @@ pub const Model = struct {
             if (staged_prefill) {
                 const evals = mlx.mlx_vector_array_new_value(next);
                 defer _ = mlx.mlx_vector_array_free(evals);
+                try appendCaptures(evals, request.capture, layer_index, layer_index + 1);
+                try appendLayerState(evals, state);
+                try mlx.check(mlx.mlx_async_eval(evals));
+                if (@import("builtin").is_test) schedule_test_asyncs += 1;
+                try mlx.check(mlx.mlx_array_set(&queued[layer_index % queued.len], next));
+                // At most `interval` layers are pending, and the next one is built while the newest still runs.
                 const interval: usize = request.prefill_sync_layers;
-                const first = layer_index - layer_index % interval;
-                try appendCaptures(evals, request.capture, first, layer_index + 1);
-                for (request.layers[first .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
-                if ((layer_index + 1) % interval != 0) {
-                    try mlx.check(mlx.mlx_async_eval(evals));
-                    if (@import("builtin").is_test) schedule_test_asyncs += 1;
-                } else {
-                    try mlx.check(mlx.mlx_eval(evals));
+                if (layer_index + 1 >= interval) {
+                    const waited = &queued[(layer_index + 1 - interval) % queued.len];
+                    try mlx.check(mlx.mlx_array_eval(waited.*));
                     if (@import("builtin").is_test) schedule_test_syncs += 1;
                 }
             } else if (!staged_decode or (layer_index + 1) % 4 == 0) {
@@ -723,6 +757,40 @@ pub const Model = struct {
             .moe => |moe| try moe.apply(ops, prefix.input, &self.cfg),
         };
         return ops.own(try primitive.hcExpand(prefix.residual, y, prefix.post, prefix.comb, self.s));
+    }
+
+    fn serialHcEligible(self: *const Model) bool {
+        return self.cfg.hidden_size == 4096 and base.naxArms() and @import("glm5_hc_collapse_simd32.zig").enabled();
+    }
+
+    /// One decode row with the verifier's HC chain: each expansion also emits the next collapse's FP32
+    /// normalized input and each collapse applies its sublayer RMS, the same bytes as `layerBody`.
+    fn serialLayer(self: *const Model, ops: *Ops, layer: *const Layer, state: *LayerState, h: Arr, h_norm: ?Arr, carry: bool) !struct { next: Arr, norm: ?Arr } {
+        const expand_norm = @import("glm5_hc_expand_norm.zig");
+        const cfg = &self.cfg;
+        const pre = if (h_norm) |n| try layer.hc_attn.collapseFromNormalized(ops, h, cfg, layer.norm_attn, n) else try layer.hc_attn.collapse(ops, h, cfg);
+        defer pre.deinit();
+        const x = if (h_norm != null) pre.mixed else try ops.rms(pre.mixed, layer.norm_attn, cfg.rms_norm_eps);
+        const a = switch (layer.attn) {
+            .kda => |kda| try kda.apply(ops, x, cfg, &state.recurrent),
+            .mla => |*mla| try mla.applyMode(ops, x, cfg, &state.attention, false),
+        };
+        const joined = (try expand_norm.apply(self.s, h, a, pre.post, pre.comb, cfg.rms_norm_eps)) orelse return error.InvalidGlmHc;
+        defer joined.deinit();
+        const ff = try layer.hc_ffn.collapseFromNormalized(ops, joined.expanded, cfg, layer.norm_ffn, joined.normalized);
+        defer ff.deinit();
+        const y = switch (layer.ffn) {
+            .dense => |dense| try dense.apply(ops, ff.mixed, cfg.glm_swiglu_limit),
+            .moe => |moe| try moe.apply(ops, ff.mixed, cfg),
+        };
+        if (!carry) return .{ .next = try ops.own(try primitive.hcExpand(joined.expanded, y, ff.post, ff.comb, self.s)), .norm = null };
+        const out = (try expand_norm.apply(self.s, joined.expanded, y, ff.post, ff.comb, cfg.rms_norm_eps)) orelse return error.InvalidGlmHc;
+        serial_hc_layers += 1;
+        if (!serial_hc_logged and !@import("builtin").is_test) {
+            serial_hc_logged = true;
+            @import("log.zig").info("[glm] serial decode HC collapse from the expansion engaged\n", .{});
+        }
+        return .{ .next = try ops.own(out.expanded), .norm = try ops.own(out.normalized) };
     }
 
     fn layerBody(self: *const Model, ops: *Ops, layer: *const Layer, state: *LayerState, h: Arr, dense_prefill: bool) !Arr {
@@ -1203,8 +1271,8 @@ test "GLM two-layer prefill schedule preserves every nonzero cache bit" {
         schedule_test_syncs = 0;
         const got = try net.forwardLast(&pipelined, ids, true);
         defer _ = mlx.mlx_array_free(got);
-        try std.testing.expectEqual(@as(usize, 2), schedule_test_asyncs);
-        try std.testing.expectEqual(@as(usize, 3), schedule_test_syncs);
+        try std.testing.expectEqual(@as(usize, 4), schedule_test_asyncs);
+        try std.testing.expectEqual(@as(usize, 4), schedule_test_syncs);
         try expectArrayBits(expected, got);
         try expectRequestBits(&baseline, &pipelined);
     }
@@ -1427,8 +1495,9 @@ test "GLM bounded prefill schedules preserve cache bits and reject invalid inter
             const got = try net.forwardLast(&pipelined, ids, true);
             defer _ = mlx.mlx_array_free(got);
             if (width > 1) {
-                try std.testing.expectEqual(@as(usize, 4 - 4 / interval), schedule_test_asyncs);
-                try std.testing.expectEqual(@as(usize, 1 + 4 / interval), schedule_test_syncs);
+                // Every layer is queued before the host waits, on the layer `interval - 1` back, so the GPU never drains.
+                try std.testing.expectEqual(@as(usize, 4), schedule_test_asyncs);
+                try std.testing.expectEqual(@as(usize, 1 + (4 + 1 -| interval)), schedule_test_syncs);
             }
             try expectArrayBits(expected, got);
             try expectRequestBits(&baseline, &pipelined);

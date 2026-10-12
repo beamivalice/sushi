@@ -54,6 +54,52 @@ const RMS_SOURCE: [:0]const u8 =
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if(tid==0)for(uint o=0;o<uint(COLS);++o)out[row*24u+first+o]=(partial[o*4u]+partial[o*4u+1u])+(partial[o*4u+2u]+partial[o*4u+3u]);
 ;
+// RMS_SOURCE for R rows per threadgroup: each weight load feeds R rows, and every row keeps its own
+// lane order, simd_sum and partial combine, so its bytes are RMS_SOURCE's. The bit cast keeps the
+// normalized input a rounded FP32 product, as RMS_SOURCE's volatile does, without spilling.
+const RMS_ROWS_SOURCE: [:0]const u8 =
+    \\const uint row0=threadgroup_position_in_grid.y*uint(R);
+    \\const uint rows=nrows[0];
+    \\const uint tid=thread_position_in_threadgroup.x;
+    \\const uint lane=thread_index_in_simdgroup,sg=simdgroup_index_in_threadgroup;
+    \\threadgroup float sums[32*R];
+    \\threadgroup float inverse[R];
+    \\threadgroup float partial[4*24*R];
+    \\for(uint q=0;q<uint(R);++q) {
+    \\  const uint row=min(row0+q,rows-1u);
+    \\  for(uint virtual_group=0;virtual_group<8;++virtual_group) {
+    \\    const uint logical=virtual_group*128u+tid;
+    \\    float acc=0.0f;
+    \\    for(uint r=0;r<16384u;r+=4096u) {
+    \\      for(uint i=0;i<4u;++i) {float xi=float(x[row*16384u+r+logical*4u+i]);acc+=xi*xi;}
+    \\    }
+    \\    acc=simd_sum(acc);
+    \\    if(lane==0) sums[q*32u+virtual_group*4u+sg]=acc;
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if(sg==0) for(uint q=0;q<uint(R);++q) {float acc=simd_sum(sums[q*32u+lane]);if(lane==0) inverse[q]=metal::precise::rsqrt(acc/16384.0f+float(eps));}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float values[R][24];
+    \\for(uint q=0;q<uint(R);++q) for(uint o=0;o<24u;++o)values[q][o]=0.0f;
+    \\for(uint d=tid;d<16384u;d+=128u) {
+    \\ float v[R];
+    \\ for(uint q=0;q<uint(R);++q) v[q]=as_type<float>(as_type<uint>(float(x[min(row0+q,rows-1u)*16384u+d])*inverse[q]));
+    \\ for(uint o=0;o<24u;++o) {
+    \\  const float wo=float(w[o*16384u+d]);
+    \\  for(uint q=0;q<uint(R);++q) values[q][o]+=v[q]*wo;
+    \\ }
+    \\}
+    \\for(uint q=0;q<uint(R);++q) for(uint o=0;o<24u;++o) {
+    \\ const float total=simd_sum(values[q][o]);
+    \\ if(lane==0)partial[(q*24u+o)*4u+sg]=total;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if(tid<uint(R) && row0+tid<rows) for(uint o=0;o<24u;++o) {
+    \\ const uint p=(tid*24u+o)*4u;
+    \\ out[(row0+tid)*24u+o]=(partial[p]+partial[p+1u])+(partial[p+2u]+partial[p+3u]);
+    \\}
+;
 const REFERENCE: [:0]const u8 =
     \\const uint group=threadgroup_position_in_grid.x;
     \\const uint row=group/24u,output=group%24u,tid=thread_position_in_threadgroup.x;
@@ -76,7 +122,48 @@ pub fn resetDispatchCount() void {
     calls = 0;
 }
 
-var kernels: [3]?mlx.mlx_fast_metal_kernel = @splat(null);
+var kernels: [4]?mlx.mlx_fast_metal_kernel = @splat(null);
+/// Rows per threadgroup of the 24-output RMS mix; three or more rows spill the accumulators.
+const rms_rows: c_int = 2;
+var rows_calls: usize = 0;
+pub fn rowsDispatchCount() usize {
+    return rows_calls;
+}
+fn rowsKernel() !mlx.mlx_fast_metal_kernel {
+    if (kernels[3]) |k| return k;
+    const iv = mlx.mlx_vector_string_new_data(&.{ "x", "w", "eps", "nrows" }, 4);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&.{"out"}, 1);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_hc_rms_rows", iv, ov, RMS_ROWS_SOURCE, "", true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    kernels[3] = k;
+    return k;
+}
+fn runRows(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32) !Arr {
+    const rows = mlx.getShape(x)[1];
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, 24 }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", rms_rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128, @divTrunc(rows + rms_rows - 1, rms_rows), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    const eps = mlx.mlx_array_new_float(epsilon);
+    defer _ = mlx.mlx_array_free(eps);
+    const count: u32 = @intCast(rows);
+    const nrows = mlx.mlx_array_new_data(&count, &.{1}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(nrows);
+    const iv = mlx.mlx_vector_array_new_data(&.{ x, w, eps, nrows }, 4);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try rowsKernel(), iv, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+    rows_calls += 1;
+    return out;
+}
 fn kernel(index: usize) !mlx.mlx_fast_metal_kernel {
     if (kernels[index]) |k| return k;
     const iv = if (index == 2) mlx.mlx_vector_string_new_data(&.{ "x", "w", "eps" }, 3) else mlx.mlx_vector_string_new_data(&.{ "x", "w" }, 2);
@@ -131,7 +218,7 @@ pub fn experimentalRmsMix(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32, cols:
     const sh = mlx.getShape(x);
     if (sh.len != 4 or sh[0] != 1 or sh[1] < 128 or sh[1] > 65535 or sh[2] != 4 or sh[3] != 4096 or
         !std.mem.eql(c_int, &.{ 24, 16384 }, mlx.getShape(w)) or (cols != 8 and cols != 24)) return null;
-    const out = try runMode(s, x, w, cols, epsilon);
+    const out = if (cols == 24) try runRows(s, x, w, epsilon) else try runMode(s, x, w, cols, epsilon);
     calls += 1;
     return out;
 }
@@ -239,7 +326,8 @@ test "GLM HC multi-output RMS preserves staged bits and rejects small rows" {
     var wb = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wb);
     try mlx.check(mlx.mlx_astype(&wb, wf, .bfloat16, s));
-    for ([_]c_int{ 128, 512 }) |rows| {
+    // 129 and 2047 leave a partial multi-row group; 2048 is the served chunk.
+    for ([_]c_int{ 128, 129, 512, 2047, 2048 }) |rows| {
         const bits = try a.alloc(u16, @as(usize, @intCast(rows)) * 16384);
         defer a.free(bits);
         for ([_]f32{ 0, 0.0001, 1, 128 }) |magnitude| {
@@ -253,8 +341,10 @@ test "GLM HC multi-output RMS preserves staged bits and rejects small rows" {
                 const expected = try staged(s, x, w, eps);
                 defer _ = mlx.mlx_array_free(expected);
                 for ([_]c_int{ 8, 24 }) |cols| {
+                    const before = rowsDispatchCount();
                     const actual = (try experimentalRmsMix(s, x, w, eps, cols)).?;
                     defer _ = mlx.mlx_array_free(actual);
+                    try std.testing.expectEqual(before + @intFromBool(cols == 24), rowsDispatchCount());
                     try expectBits(expected, actual);
                 }
             };

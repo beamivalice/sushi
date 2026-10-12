@@ -356,8 +356,10 @@ pub fn sigmoidFloatMode(s: mlx.mlx_stream) !?bool {
 /// outputs `a_low`/`gate_low` ([1, 1, 128]); stands in for `Inputs.a`/`gate`.
 pub const SecondStage = struct { a_low: Arr, gate_low: Arr, fb: Arr, gb: Arr };
 pub const Inputs = struct {
-    qkv: Arr,
-    beta: Arr,
+    qkv: Arr = .{ .ctx = null },
+    beta: Arr = .{ .ctx = null },
+    /// `[q|k|v|beta]` already joined; replaces `qkv` and `beta`.
+    joined: Arr = .{ .ctx = null },
     a: Arr = .{ .ctx = null },
     gate: Arr = .{ .ctx = null },
     second_stage: ?SecondStage = null,
@@ -408,10 +410,15 @@ fn configuration(heads: c_int, mode: Modes) !Config {
 
 pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
     if (!mlx.streamIsGpu(s) or in.heads < 1 or in.heads > 1024 or !std.math.isFinite(in.norm_eps) or in.norm_eps <= 0 or !std.math.isFinite(in.lower) or in.lower != -5) return null;
-    for ([_]Arr{ in.qkv, in.beta, in.conv_weight, in.exp_a, in.dt_bias, in.norm, in.conv_state, in.state }) |value| if (value.ctx == null) return null;
+    for ([_]Arr{ in.conv_weight, in.exp_a, in.dt_bias, in.norm, in.conv_state, in.state }) |value| if (value.ctx == null) return null;
     const d = in.heads * 128;
-    if (!std.mem.eql(c_int, &.{ 1, 1, d * 3 }, mlx.getShape(in.qkv)) or mlx.mlx_array_dtype(in.qkv) != .bfloat16 or
-        !std.mem.eql(c_int, &.{ 1, 1, in.heads }, mlx.getShape(in.beta)) or mlx.mlx_array_dtype(in.beta) != .bfloat16) return null;
+    if (in.joined.ctx != null) {
+        if (!std.mem.eql(c_int, &.{ 1, 1, d * 3 + in.heads }, mlx.getShape(in.joined)) or mlx.mlx_array_dtype(in.joined) != .bfloat16) return null;
+    } else {
+        if (in.qkv.ctx == null or in.beta.ctx == null or
+            !std.mem.eql(c_int, &.{ 1, 1, d * 3 }, mlx.getShape(in.qkv)) or mlx.mlx_array_dtype(in.qkv) != .bfloat16 or
+            !std.mem.eql(c_int, &.{ 1, 1, in.heads }, mlx.getShape(in.beta)) or mlx.mlx_array_dtype(in.beta) != .bfloat16) return null;
+    }
     if (in.second_stage) |st| {
         for ([_]Arr{ st.a_low, st.gate_low, st.fb, st.gb }) |value| if (value.ctx == null or mlx.mlx_array_dtype(value) != .bfloat16) return null;
         if (!std.mem.eql(c_int, &.{ 1, 1, 128 }, mlx.getShape(st.a_low)) or !std.mem.eql(c_int, &.{ 1, 1, 128 }, mlx.getShape(st.gate_low)) or
@@ -430,9 +437,13 @@ pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
     const mode = (try modes(s)) orelse return null;
     var projection = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(projection);
-    const parts = mlx.mlx_vector_array_new_data(&[_]Arr{ in.qkv, in.beta }, 2);
-    defer _ = mlx.mlx_vector_array_free(parts);
-    try mlx.check(mlx.mlx_concatenate_axis(&projection, parts, -1, s));
+    if (in.joined.ctx != null) {
+        try mlx.check(mlx.mlx_array_set(&projection, in.joined));
+    } else {
+        const parts = mlx.mlx_vector_array_new_data(&[_]Arr{ in.qkv, in.beta }, 2);
+        defer _ = mlx.mlx_vector_array_free(parts);
+        try mlx.check(mlx.mlx_concatenate_axis(&projection, parts, -1, s));
+    }
     const constants = [_]f32{ 1 / @sqrt(@as(f32, 128)), 1e-6, in.norm_eps, in.lower, 1.0 / 128.0 };
     const consts = mlx.mlx_array_new_data(&constants, &[_]c_int{5}, 1, .float32);
     defer _ = mlx.mlx_array_free(consts);

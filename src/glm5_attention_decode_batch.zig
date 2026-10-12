@@ -177,6 +177,132 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
     if (batch == 1) b1_calls += 1 else if (batch == 3) b3_calls += 1;
     return result;
 }
+// One serial row reads its whole history, current row included, from the cache. The FP32 bank is written
+// directly (SUSHI_LATENT is BF16, so widening is exact), the query is widened and scaled beside it, and a
+// sparse row expands its 512 pools to tokens here exactly as `sushi_glm_expand_pools` does.
+const row_gather_source: [:0]const u8 =
+    \\const uint i=thread_position_in_grid.x;
+    \\if(i<32768u) qs[i]=float(q[i])*float(qscale);
+    \\if(i>=2051u*128u) return;
+    \\const uint slot=i/128u,d=(i%128u)*4u;
+    \\const uint last=uint(offset);
+    \\int id;
+    \\if(POOLED==1) {
+    \\ if(slot<2048u) {
+    \\  const uint p=selected[slot>>2];
+    \\  id=(p+1u)*4u<=last+1u?int(p*4u+(slot&3u)):-1;
+    \\ } else {
+    \\  const uint rem=(last+1u)%4u;
+    \\  id=slot-2048u<rem?int(last+1u-rem+slot-2048u):-1;
+    \\ }
+    \\} else id=int(selected[slot]);
+    \\const bool valid=id>=0 && uint(id)<=last;
+    \\if(d==0u) mask[slot]=valid;
+    \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=valid?float(SUSHI_LATENT(cache,uint(id),d+j,512u)):0.0f;
+;
+var row_gather_kernels: [2][2]?mlx.mlx_fast_metal_kernel = @splat(.{ null, null });
+var row_gather_configs: [2]?mlx.mlx_fast_metal_kernel_config = .{ null, null };
+var row_calls: usize = 0;
+var block_masks: [2]Arr = .{ .{ .ctx = null }, .{ .ctx = null } };
+/// The block-masked GEMM wants an all-true block mask per shape; built and settled once.
+fn blockMask(slot: usize, s: mlx.mlx_stream) !Arr {
+    if (block_masks[slot].ctx == null) {
+        var mask = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(mask);
+        const shapes = [2][3]c_int{ .{ 1, 2, 65 }, .{ 1, 2, 16 } };
+        try mlx.check(mlx.mlx_ones(&mask, &shapes[slot], 3, .bool_, s));
+        try mlx.check(mlx.mlx_array_eval(mask));
+        block_masks[slot] = mask;
+    }
+    return block_masks[slot];
+}
+pub fn rowCalls() usize {
+    return row_calls;
+}
+/// What a serial row attends to: its `decodeSelected` tokens, or the 512 pools they expand from.
+pub const RowSelection = union(enum) { ids: Arr, pools: Arr };
+/// Whether `runRow` takes this row: the fused arithmetic matches B1's block-masked GEMMs only on a NAX GPU.
+pub fn rowSupported(q: Arr, cache: Latent, offset: usize, s: mlx.mlx_stream) bool {
+    if (!mlx.streamIsGpu(s) or !@import("glm5_model.zig").naxArms() or q.ctx == null or cache.data.ctx == null) return false;
+    if (!cache.rowMajor() or cache.dtype() != .bfloat16 or mlx.mlx_array_dtype(q) != .bfloat16) return false;
+    const qs = mlx.getShape(q);
+    const strides = mlx.mlx_array_strides(q);
+    return qs.len == 3 and qs[0] == 1 and qs[1] == 64 and qs[2] == 512 and strides[1] == 512 and strides[2] == 1 and
+        cache.width() == 512 and offset < @as(usize, @intCast(cache.rows()));
+}
+/// `run` for one serial row (offset = the cache's last row) with the same arithmetic and bytes as B1: the
+/// FP32 bank is gathered once instead of widened from a BF16 bank, the tail row comes from the cache itself
+/// (SUSHI_LATENT equals MLX's dequantizer) and the block masks are built once. The selection must come
+/// from `decodeSelected`, whose first slot is never invalid, so `run`'s all-invalid zeroing is a no-op here.
+pub fn runRow(ops: *Ops, q: Arr, cache: Latent, offset: usize, selection: RowSelection, scale: f32) !?Arr {
+    if (!rowSupported(q, cache, offset, ops.s) or !std.math.isFinite(scale) or scale <= 0) return null;
+    const pooled = selection == .pools;
+    const selected = switch (selection) {
+        .ids => |a| a,
+        .pools => |a| a,
+    };
+    const ss = mlx.getShape(selected);
+    if (selected.ctx == null or ss.len != 2 or ss[0] != 1) return null;
+    if (pooled) {
+        if (ss[1] != 512 or mlx.mlx_array_dtype(selected) != .uint32) return null;
+    } else if (ss[1] != 2051 or mlx.mlx_array_dtype(selected) != .int32) return null;
+    const off: u32 = @intCast(offset);
+    const oa = try ops.own(mlx.mlx_array_new_data(&off, &.{}, 0, .uint32));
+    const qa = try ops.own(mlx.mlx_array_new_data(&scale, &.{}, 0, .float32));
+    const ids = try ops.contiguous(selected);
+    const mode = @intFromBool(pooled);
+    const cfg = row_gather_configs[mode] orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ 1, 2051, 512 }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ 1, 2051 }, 2, .bool_));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ 1, 64, 512 }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 2051 * 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "POOLED", mode));
+        row_gather_configs[mode] = c;
+        break :blk c;
+    };
+    const quantized = cache.quantized();
+    const kernel = &row_gather_kernels[mode][@intFromBool(quantized)];
+    if (kernel.* == null) {
+        const names: []const [*:0]const u8 = if (quantized)
+            &.{ "cache", "cache_scales", "cache_biases", "selected", "offset", "q", "qscale" }
+        else
+            &.{ "cache", "selected", "offset", "q", "qscale" };
+        const inputs = mlx.mlx_vector_string_new_data(names.ptr, names.len);
+        defer _ = mlx.mlx_vector_string_free(inputs);
+        const outputs = mlx.mlx_vector_string_new_data(&.{ "kv", "mask", "qs" }, 3);
+        defer _ = mlx.mlx_vector_string_free(outputs);
+        const k = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_decode_row_gather8" else "sushi_glm_decode_row_gather", inputs, outputs, row_gather_source, latent_store.header(quantized), false, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        kernel.* = k;
+    }
+    const inputs = if (quantized)
+        mlx.mlx_vector_array_new_data(&.{ cache.data, cache.scales, cache.biases, ids, oa, q, qa }, 7)
+    else
+        mlx.mlx_vector_array_new_data(&.{ cache.data, ids, oa, q, qa }, 5);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel.*.?, inputs, cfg, ops.s));
+    const bank = try ops.slot();
+    const mask = try ops.slot();
+    const queries = try ops.slot();
+    try mlx.check(mlx.mlx_vector_array_get(bank, outputs, 0));
+    try mlx.check(mlx.mlx_vector_array_get(mask, outputs, 1));
+    try mlx.check(mlx.mlx_vector_array_get(queries, outputs, 2));
+    const scores = try ops.slot();
+    try mlx.check(mlx.mlx_block_masked_mm(scores, queries.*, try ops.transpose(bank.*, &.{ 0, 2, 1 }), 32, try blockMask(0, ops.s), .{ .ctx = null }, .{ .ctx = null }, ops.s));
+    const masked = try ops.slot();
+    try mlx.check(mlx.mlx_where(masked, try ops.reshape(mask.*, &.{ 1, 1, 2051 }), scores.*, try ops.scalar(-std.math.inf(f32), .float32), ops.s));
+    const mixed = try ops.slot();
+    try mlx.check(mlx.mlx_block_masked_mm(mixed, try ops.softmax(masked.*, -1), bank.*, 32, try blockMask(1, ops.s), .{ .ctx = null }, .{ .ctx = null }, ops.s));
+    b1_calls += 1;
+    row_calls += 1;
+    return try ops.reshape(try ops.cast(mixed.*, .bfloat16), &.{ 1, 64, 512 });
+}
+
 test "GLM decode batch geometry ancestry and conservative scratch" {
     const branches = [_]Branch{
         .{ .offset = 16381, .length = 16382, .path = .{ 0, 0, 0, 0 } },

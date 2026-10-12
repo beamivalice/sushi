@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3-Flash is faster with the same output**: decode without DFlash2 runs about 9% faster and prompt processing
+  about 5% faster, token for token identical to before.
 - **`--qwen-gdn fp32` no longer restores a bf16 state from the SSD prefix cache** (nor the reverse): the two widths now
   keep separate cache namespaces.
 - **Qwen3.8-Flash-Next forgets at its true rate**: the linear-attention decay gate is now computed in f32, which a

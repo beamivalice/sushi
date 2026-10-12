@@ -3,12 +3,12 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
-pub const dot_limit: usize = 2 * 1024 * 1024;
+pub const dot_limit: usize = 4 * 1024 * 1024;
 pub const tile_pools: usize = 2048;
-pub const max_rows: usize = 16;
-/// Tiles stay lazy until the packed tile pair settles: four 16-row selections at 8192 pools, each
-/// holding every dot plane (8 MiB), the tile outputs and the joined scores (512 KiB each).
-pub const transient_bytes: usize = 4 * (8 * 1024 * 1024 + 2 * 512 * 1024);
+pub const max_rows: usize = 32;
+/// Tiles stay lazy until their packed tile settles: two 32-row selections at 8192 pools, each
+/// holding every dot plane (16 MiB), the tile outputs and the joined scores (1 MiB each).
+pub const transient_bytes: usize = 2 * (16 * 1024 * 1024 + 2 * 1024 * 1024);
 var calls: usize = 0;
 pub fn enabled() bool {
     return !@import("glm5_model.zig").reference_numerics and @import("glm5_model.zig").naxArms();
@@ -119,17 +119,17 @@ pub fn scores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: m
     return out;
 }
 test "GLM IndexPool NAX dot plane remains within original bound" {
-    try std.testing.expectEqual(dot_limit, try dotBytes(16, 2048));
-    try std.testing.expectEqual(@as(usize, 524288), try outputBytes(16, 8192));
-    try std.testing.expect(geometry(&.{ 16, 32, 128 }, &.{ 8192, 128 }, &.{ 16, 32 }, 32752, 8192));
-    try std.testing.expect(!geometry(&.{ 17, 32, 128 }, &.{ 8192, 128 }, &.{ 17, 32 }, 32751, 8192));
+    try std.testing.expectEqual(dot_limit, try dotBytes(32, 2048));
+    try std.testing.expectEqual(@as(usize, 1048576), try outputBytes(32, 8192));
+    try std.testing.expect(geometry(&.{ 32, 32, 128 }, &.{ 8192, 128 }, &.{ 32, 32 }, 32736, 8192));
+    try std.testing.expect(!geometry(&.{ 33, 32, 128 }, &.{ 8192, 128 }, &.{ 33, 32 }, 32735, 8192));
 }
 test "GLM IndexPool NAX reserves transient copies per pending layer" {
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
-    // Two packed tiles in flight hold four 16-row selections, each with every tile's dot plane,
+    // Two packed tiles in flight hold two 32-row selections, each with every tile's dot plane,
     // its epilogue output and the joined scores.
     const selection = try dotBytes(max_rows, 8192) + 2 * try outputBytes(max_rows, 8192);
-    try std.testing.expectEqual(4 * selection, transient_bytes);
+    try std.testing.expectEqual(2 * selection, transient_bytes);
     try std.testing.expectEqual(transient_bytes * 2, try transientBudget(2048, 2));
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
     try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));

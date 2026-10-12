@@ -22,6 +22,12 @@ admitted rate and is always on for eligible shapes ([glm5-arch](glm5-arch.md)).
   banks at any window; component −17% at 1 row, −29% at 16). The middle is prepared separately in lane order and the down reads it
   by `half4` (`downLanePrepare` + `downLaneCoop`: every admitted n, MCG at any window, BF16 out; −10–15% against the fused
   middle/down, which now serves only what the lane path declines).
+- **One-row decode GEMVs carry two output tiles per threadgroup and two k-tiles per simdgroup iteration**
+  (`ONE_ROW_COOP_SOURCE`, gate/up and down at rows == 1, every admitted n, MCG at any window): four tile reads are in
+  flight and one input quad feeds both tiles; each cell keeps its tile order sg, sg+4, ... and the epilogue its
+  r-then-simdgroup sum, so the bytes are the lane kernels'. Chain meter, n36 / n40: 178.6 / 179.9 → 140.5 / 144.8
+  µs per layer (gate/up 108.8 → 82.7, down 59.5 → 47.0). It serves rows 1 only (the lane kernels keep rows 2–16) and
+  needs input tiles % 8 and output tiles % 2.
 - **Verification rows share weight reads** (`src/exl3/glm_group2.zig`, 3–4 BF16 rows, 4096/2048, top-8, clamp 10,
   MCG at any window, every admitted n, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
   feeds two independent FP32 accumulator sets, and a serial 4 KiB member reduction keeps the r-then-simdgroup order.
@@ -40,6 +46,9 @@ admitted rate and is always on for eligible shapes ([glm5-arch](glm5-arch.md)).
 
 Ruled out for GLM experts (each exact unless noted; "component" = an isolated replay on real banks):
 
+- One-row decode GEMV shapes (chain meter, n36): 4 output tiles per group 247.6, 4 k-tiles per iteration with 2 tiles
+  166.5, 4 tiles with 4 k-tiles 295.3 (spills), 1 tile with 4 k-tiles 147.0, next-iteration prefetch of the tile reads
+  141.3 against 141.4, one-tile epilogue buffer 141.2 against 142.1: the 2 x 2 shape (140.5) stays.
 - Window height 16 or one 16-row accumulator: 7–19% slower per GEMM; WIN32 keeps decode reuse and two-tile scheduling.
 - 64/32-thread output groups: group 64 only 0.7–1.8% faster, group 32 flat or slower; 128 kept.
 - n36 SIMD word sharing (load 36 words once, shuffle): 83–86% slower; fewer source reads are not fewer transactions.

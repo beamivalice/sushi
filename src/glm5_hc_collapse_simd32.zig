@@ -103,7 +103,7 @@ fn run(x: Arr, mixes: Arr, scale: Arr, base: Arr, iters: c_int, epsilon: f32, s:
     if (!geometry(mlx.getShape(x), mlx.getShape(mixes), mlx.getShape(scale), mlx.getShape(base), iters, epsilon) or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     for ([_]Arr{ mixes, scale, base }) |a| if (mlx.mlx_array_dtype(a) != .float32) return null;
     if (norm) |n| {
-        if (!enabled() or !@import("glm5_model.zig").naxArms() or mlx.getShape(x)[1] != 3 or n.weight.ctx == null or
+        if (!enabled() or !@import("glm5_model.zig").naxArms() or (mlx.getShape(x)[1] != 1 and mlx.getShape(x)[1] != 3) or n.weight.ctx == null or
             mlx.mlx_array_dtype(n.weight) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(n.weight), &.{4096}) or
             !std.math.isFinite(n.epsilon) or n.epsilon <= 0) return null;
     }
@@ -181,7 +181,7 @@ fn check(ops: *Ops, x: Arr, mix: Arr, scale: Arr, base: Arr, expected_calls: usi
     try exact(ops, reference.mixed, new.mixed);
     try exact(ops, reference.post, new.post);
     try exact(ops, reference.comb, new.comb);
-    if (mlx.mlx_array_dtype(x) == .bfloat16 and mlx.getShape(x)[1] == 3 and @import("glm5_model.zig").naxArms()) {
+    if (mlx.mlx_array_dtype(x) == .bfloat16 and (mlx.getShape(x)[1] == 1 or mlx.getShape(x)[1] == 3) and @import("glm5_model.zig").naxArms()) {
         const weight = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{4096}, 997, ops.s));
         for ([_]f32{ 1e-6, 1e-5 }) |eps| {
             const normalized = (try collapseNormalized(x, mix, scale, base, 20, 1e-6, ops.s, .{ .weight = weight, .epsilon = eps })) orelse return error.TestExpectedHcNorm;

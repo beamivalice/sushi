@@ -5,6 +5,8 @@ const unary = @import("glm5_kda_fused.zig");
 const Arr = mlx.mlx_array;
 pub const Inputs = struct {
     qkv: Arr,
+    /// The q, k and v projections as separate `[1, rows, width]` arrays, read in place of `qkv`.
+    parts: ?[3]Arr = null,
     a: Arr,
     beta: Arr,
     conv_weight: Arr,
@@ -209,16 +211,39 @@ fn getTreeKernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
+// The joined kernel with each part's rows addressed at `width` instead of `channels`.
+const PARTS_SOURCE: [:0]const u8 = blk: {
+    @setEvalBranchQuota(100000);
+    const edits = [_][2][]const u8{
+        .{ "const uint channel=part*width+head*128u+tid;", "const uint channel=part*width+head*128u+tid,inner=head*128u+tid;\n const device T* src=part==0u?qkv0:(part==1u?qkv1:qkv2);" },
+        .{ "qkv[(pos-3u)*channels+channel]", "src[(pos-3u)*width+inner]" },
+        .{ "((const device ushort*)qkv)[(pos-3u)*channels+channel]", "((const device ushort*)src)[(pos-3u)*width+inner]" },
+    };
+    var text: []const u8 = SOURCE;
+    for (edits) |edit| {
+        const at = std.mem.indexOf(u8, text, edit[0]).?;
+        text = text[0..at] ++ edit[1] ++ text[at + edit[0].len ..];
+    }
+    break :blk text ++ "";
+};
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
-fn getKernel() !mlx.mlx_fast_metal_kernel {
-    if (kernel) |k| return k;
-    const iv = mlx.mlx_vector_string_new_data(&.{ "qkv", "a", "beta", "conv_w", "exp_a", "dt_bias", "previous", "length", "constants" }, 9);
+var parts_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var parts_count: usize = 0;
+pub fn partsDispatchCount() usize {
+    return parts_count;
+}
+fn getKernel(split: bool) !mlx.mlx_fast_metal_kernel {
+    if (if (split) parts_kernel else kernel) |k| return k;
+    const iv = if (split)
+        mlx.mlx_vector_string_new_data(&.{ "qkv0", "qkv1", "qkv2", "a", "beta", "conv_w", "exp_a", "dt_bias", "previous", "length", "constants" }, 11)
+    else
+        mlx.mlx_vector_string_new_data(&.{ "qkv", "a", "beta", "conv_w", "exp_a", "dt_bias", "previous", "length", "constants" }, 9);
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&.{ "q_out", "k_out", "v_out", "decay_out", "beta_out", "conv_out" }, 6);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_kda_prework", iv, ov, SOURCE, HEADER, true, false);
+    const k = mlx.mlx_fast_metal_kernel_new(if (split) "sushi_glm_kda_prework_parts" else "sushi_glm_kda_prework", iv, ov, if (split) PARTS_SOURCE else SOURCE, HEADER, true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
-    kernel = k;
+    if (split) parts_kernel = k else kernel = k;
     return k;
 }
 fn geometryFits(rows: c_int, heads: c_int) bool {
@@ -236,11 +261,16 @@ fn geometryFits(rows: c_int, heads: c_int) bool {
 pub fn apply(s: mlx.mlx_stream, in: Inputs) !?Result {
     if (@import("builtin").is_test and force_reference_for_tests) return null;
     if (!mlx.streamIsGpu(s) or in.heads < 1 or in.heads > @divTrunc(std.math.maxInt(c_int), 384) or in.lower != -5) return null;
-    for ([_]Arr{ in.qkv, in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias }) |a| if (a.ctx == null) return null;
-    const shape = mlx.getShape(in.qkv);
+    const split = in.parts != null;
+    const joined = [1]Arr{in.qkv};
+    const sources: []const Arr = if (in.parts) |*p| p else &joined;
+    for (sources) |a| if (a.ctx == null) return null;
+    for ([_]Arr{ in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias }) |a| if (a.ctx == null) return null;
+    const shape = mlx.getShape(sources[0]);
     const width = in.heads * 128;
-    if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] != 3 * width or
-        @as(i64, shape[1]) * shape[2] > std.math.maxInt(c_int) or mlx.mlx_array_dtype(in.qkv) != .bfloat16) return null;
+    if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] != (if (split) width else 3 * width) or
+        @as(i64, shape[1]) * 3 * width > std.math.maxInt(c_int)) return null;
+    for (sources) |a| if (mlx.mlx_array_dtype(a) != .bfloat16 or !std.mem.eql(c_int, shape, mlx.getShape(a))) return null;
     const rows = shape[1];
     if (!geometryFits(rows, in.heads)) return null;
     for ([_]Arr{ in.a, in.beta, in.conv_weight }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16) return null;
@@ -266,11 +296,15 @@ pub fn apply(s: mlx.mlx_stream, in: Inputs) !?Result {
     // constants[3] is added to a copied tail row, and -0.0 keeps the sign of a zero as `materializedOwnedCopy` does.
     const constants = mlx.mlx_array_new_data(&[_]f32{ 1 / @sqrt(@as(f32, 128)), 1e-6, in.lower, -0.0 }, &[_]c_int{4}, 1, .float32);
     defer _ = mlx.mlx_array_free(constants);
-    const iv = mlx.mlx_vector_array_new_data(&.{ in.qkv, in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias, in.conv_state orelse in.qkv, length, constants }, 9);
+    const rest = [_]Arr{ in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias, in.conv_state orelse sources[0], length, constants };
+    var args: [3 + rest.len]Arr = undefined;
+    @memcpy(args[0..sources.len], sources);
+    @memcpy(args[sources.len..][0..rest.len], &rest);
+    const iv = mlx.mlx_vector_array_new_data(&args, sources.len + rest.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try getKernel(), iv, cfg, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try getKernel(split), iv, cfg, s));
     var arrays: [6]Arr = undefined;
     var made: usize = 0;
     errdefer for (arrays[0..made]) |a| {
@@ -282,6 +316,7 @@ pub fn apply(s: mlx.mlx_stream, in: Inputs) !?Result {
         try mlx.check(mlx.mlx_vector_array_get(a, ov, i));
     }
     count += 1;
+    parts_count += @intFromBool(split);
     return .{ .q = arrays[0], .k = arrays[1], .v = arrays[2], .decay = arrays[3], .beta = arrays[4], .conv = arrays[5] };
 }
 
@@ -378,6 +413,70 @@ test "GLM KDA prework exact raw outputs and compact tails across token boundarie
             }
         }
     }
+}
+
+test "GLM KDA prework reads the q/k/v projections in place with the joined kernel's bits" {
+    const Ops = @import("glm5_model.zig").Ops;
+    const s = mlx.gpuStream();
+    for ([_]c_int{ 1, 3, 64 }) |heads| {
+        for ([_]c_int{ 128, 133, 512 }) |rows| {
+            for ([_]bool{ false, true }) |hot| {
+                var ops = Ops{ .s = s };
+                defer ops.deinit();
+                const width = heads * 128;
+                var parts: [3]Arr = undefined;
+                for (&parts, 0..) |*part, i| part.* = try randomArray(&ops, &.{ 1, rows, width }, .bfloat16, 3 + i, 3);
+                var in = Inputs{
+                    .qkv = try ops.concat(&parts, -1),
+                    .a = try randomArray(&ops, &.{ 1, rows, width }, .bfloat16, 15, 12),
+                    .beta = try randomArray(&ops, &.{ 1, rows, heads }, .bfloat16, 33, 8),
+                    .conv_weight = try randomArray(&ops, &.{ 3 * width, 4, 1 }, .bfloat16, 45, 0.5),
+                    .exp_a = try ops.unary(.exp, try randomArray(&ops, &.{heads}, .float32, 55, 1)),
+                    .dt_bias = try randomArray(&ops, &.{width}, .float32, 67, 2),
+                    .conv_state = if (hot) try randomArray(&ops, &.{ 1, 3, 3 * width }, .bfloat16, 89, 2) else null,
+                    .heads = heads,
+                };
+                const want = (try apply(s, in)) orelse return error.TestExpectedPrework;
+                defer want.deinit();
+                const before = parts_count;
+                in.qkv = .{ .ctx = null };
+                in.parts = parts;
+                const got = (try apply(s, in)) orelse return error.TestExpectedPrework;
+                defer got.deinit();
+                try std.testing.expectEqual(before + 1, parts_count);
+                for (want.arrays(), got.arrays(), 0..) |expected, actual, field| expectBits(expected, actual) catch |err| {
+                    std.debug.print("parts mismatch H={d} rows={d} hot={} field={d}\n", .{ heads, rows, hot, field });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+test "GLM KDA prework refuses malformed projection parts before dispatch" {
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const part = try ops.zeros(&.{ 1, 2, 128 }, .bfloat16);
+    const valid = Inputs{
+        .qkv = .{ .ctx = null },
+        .parts = .{ part, part, part },
+        .a = try ops.zeros(&.{ 1, 2, 128 }, .bfloat16),
+        .beta = try ops.zeros(&.{ 1, 2, 1 }, .bfloat16),
+        .conv_weight = try ops.zeros(&.{ 384, 4, 1 }, .bfloat16),
+        .exp_a = try ops.ones(&.{1}, .float32),
+        .dt_bias = try ops.zeros(&.{128}, .float32),
+        .heads = 1,
+    };
+    const before = parts_count;
+    var bad = valid;
+    bad.parts = .{ part, part, try ops.zeros(&.{ 1, 2, 256 }, .bfloat16) };
+    try std.testing.expect((try apply(ops.s, bad)) == null);
+    bad.parts = .{ part, part, try ops.zeros(&.{ 1, 2, 128 }, .float32) };
+    try std.testing.expect((try apply(ops.s, bad)) == null);
+    bad.parts = .{ part, .{ .ctx = null }, part };
+    try std.testing.expect((try apply(ops.s, bad)) == null);
+    try std.testing.expectEqual(before, parts_count);
 }
 
 test "GLM KDA prework refuses unsupported inputs before dispatch" {

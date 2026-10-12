@@ -554,15 +554,22 @@ fn rankTop(scope: *Scope, scores: Arr, key_bits: u8) !Arr {
     return kernelOutput(scope, ov, 0);
 }
 
+/// The top pools of each row, [rows, min(pools, 512)], best first for ranked rows.
+fn selectPools(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
+    const rows = mlx.getShape(index_q)[0];
+    const pools: c_int = @intCast(state.processed / 4);
+    const scores = try indexScores(scope, state, index_q, weights, offset);
+    return if (rows > 1 and pools >= pool_budget)
+        try rankTop(scope, scores, if (mlx.mlx_array_dtype(index_q) == .bfloat16) 16 else 32)
+    else
+        try partitionTop(scope, scores, rows);
+}
+
 fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
     const rows = mlx.getShape(index_q)[0];
     const pools: c_int = @intCast(state.processed / 4);
     const off = try scope.own(mlx.mlx_array_new_int(@intCast(offset)));
-    const scores = try indexScores(scope, state, index_q, weights, offset);
-    const selected = if (rows > 1 and pools >= pool_budget)
-        try rankTop(scope, scores, if (mlx.mlx_array_dtype(index_q) == .bfloat16) 16 else 32)
-    else
-        try partitionTop(scope, scores, rows);
+    const selected = try selectPools(scope, state, index_q, weights, offset);
     const ec = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(ec);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(ec, &.{ rows, selected_width }, 2, .int32));
@@ -578,11 +585,26 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
 
 fn selectPackedChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
     const rows = mlx.getShape(index_q)[0];
-    if (rows <= packed_nax.max_rows) return selectChunk(scope, state, index_q, weights, offset);
-    if (rows != 32) return error.InvalidGlmAttentionShape;
+    if (rows > packed_nax.max_rows and rows != packed_nax.wide_rows) return error.InvalidGlmAttentionShape;
+    return selectChunk(scope, state, index_q, weights, offset);
+}
+
+/// The 16-row selector geometry a 32-row tile used to join.
+fn selectPackedHalves(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
     const first = try selectChunk(scope, state, try scope.cut(index_q, 0, 16), try scope.cut(weights, 0, 16), offset);
     const second = try selectChunk(scope, state, try scope.cut(index_q, 16, 32), try scope.cut(weights, 16, 32), offset + 16);
     return scope.join(first, second);
+}
+
+/// `decodeSelected` before the token expansion: the 512 pools of a serial row past the dense window,
+/// null inside it (every token is selected there).
+fn decodePools(state: *const State, index_q: Arr, weights: Arr, offset: usize, s: mlx.mlx_stream) !?Arr {
+    if (offset + 1 <= pool_size * (pool_budget + 1) - 1) return null;
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    var node = state.*;
+    node.processed = offset + 1;
+    return try scope.result(try selectPools(&scope, &node, index_q, weights, offset));
 }
 
 /// The same per-node rule is used for serial decode and verifier ancestry.
@@ -704,40 +726,46 @@ test "GLM packed32 scheduling keeps every remainder in original selector geometr
     try std.testing.expectEqual(@as(usize, 5), packedTileRows(5, 16));
 }
 
-fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32, max_rows: usize, s: mlx.mlx_stream) !Arr {
+/// Settles `tile` and keeps its output; the graph it built is released only now.
+fn settleTile(tile: *PackedTile, parts: mlx.mlx_vector_array, s: mlx.mlx_stream) !void {
+    if (!tile.pending) return;
+    try mlx.check(mlx.mlx_array_eval(tile.out));
+    tile.pending = false;
+    try mlx.check(mlx.mlx_vector_array_append_value(parts, tile.out));
+    tile.deinit();
+    tile.* = .{ .scope = .{ .s = s }, .ops = .{ .s = s } };
+}
+
+// Two tiles stay in flight: the older settles only after its successor is queued, so the GPU never
+// waits for the host to build the next graph.
+fn attendPackedTiles(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32, max_rows: usize, s: mlx.mlx_stream) !Arr {
     const rows: usize = @intCast(mlx.getShape(q)[0]);
     const parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
+    var tiles = [_]PackedTile{
+        .{ .scope = .{ .s = s }, .ops = .{ .s = s } },
+        .{ .scope = .{ .s = s }, .ops = .{ .s = s } },
+    };
+    defer for (&tiles) |*tile| tile.deinit();
     var start: usize = 0;
-    while (start < rows) {
-        var tiles = [_]PackedTile{
-            .{ .scope = .{ .s = s }, .ops = .{ .s = s } },
-            .{ .scope = .{ .s = s }, .ops = .{ .s = s } },
-        };
-        defer for (&tiles) |*tile| tile.deinit();
-        const outputs = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(outputs);
-        var count: usize = 0;
-        for (&tiles) |*tile| {
-            if (start == rows) break;
-            const end = start + packedTileRows(rows - start, max_rows);
-            const qc = try tile.scope.cut(q, @intCast(start), @intCast(end));
-            const selected = try selectPackedChunk(&tile.scope, state, try tile.scope.cut(iq, @intCast(start), @intCast(end)), try tile.scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
-            tile.out = (try packed_nax.run(&tile.ops, qc, state.latentView(), selected, offset + start, state.processed, scale)) orelse
-                try attentionChunk(&tile.scope, state, qc, selected, offset + start, scale, 1, false, null);
-            const submit = mlx.mlx_vector_array_new_data(&.{tile.out}, 1);
-            defer _ = mlx.mlx_vector_array_free(submit);
-            tile.pending = true;
-            try mlx.check(mlx.mlx_async_eval(submit));
-            try mlx.check(mlx.mlx_vector_array_append_value(outputs, tile.out));
-            count += 1;
-            start = end;
-        }
-        try mlx.check(mlx.mlx_eval(outputs));
-        for (tiles[0..count]) |*tile| {
-            tile.pending = false;
-            try mlx.check(mlx.mlx_vector_array_append_value(parts, tile.out));
-        }
+    var slot: usize = 0;
+    while (start < rows) : (slot ^= 1) {
+        const tile = &tiles[slot];
+        try settleTile(tile, parts, s);
+        const end = start + packedTileRows(rows - start, max_rows);
+        const qc = try tile.scope.cut(q, @intCast(start), @intCast(end));
+        const selected = try selectPackedChunk(&tile.scope, state, try tile.scope.cut(iq, @intCast(start), @intCast(end)), try tile.scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
+        tile.out = (try packed_nax.run(&tile.ops, qc, state.latentView(), selected, offset + start, state.processed, scale)) orelse
+            try attentionChunk(&tile.scope, state, qc, selected, offset + start, scale, 1, false, null);
+        const submit = mlx.mlx_vector_array_new_data(&.{tile.out}, 1);
+        defer _ = mlx.mlx_vector_array_free(submit);
+        tile.pending = true;
+        try mlx.check(mlx.mlx_async_eval(submit));
+        start = end;
+    }
+    for (0..tiles.len) |_| {
+        try settleTile(&tiles[slot], parts, s);
+        slot ^= 1;
     }
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -778,7 +806,7 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
     const score_rows = if (sparse and !headpack) score_scratch_bytes / pool_bytes else std.math.maxInt(usize);
     const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, score_rows), if (headpack) packed_rows else 128));
     if (headpack and (@as(usize, @intCast(sh[0])) > max_rows or (wide_chunk and max_rows == 32)))
-        return attendPackedPairs(state, q, index_q.?, weights.?, offset, scale, max_rows, s);
+        return attendPackedTiles(state, q, index_q.?, weights.?, offset, scale, max_rows, s);
     const parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
     var start: usize = 0;
@@ -815,7 +843,18 @@ fn attendNativeDecode(state: *const State, q: Arr, iq: ?Arr, weights: ?Arr, offs
         for (first..end) |row| {
             const pos = offset + row;
             const query = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
-            const indices = try ops.own(try decodeSelected(state, if (iq) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil, if (weights) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil, pos, s));
+            const row_iq = if (iq) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil;
+            const row_weights = if (weights) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil;
+            if (rows == 1 and view == null and native.rowSupported(query, state.latentView(), pos, s)) {
+                const selection: native.RowSelection = if (try decodePools(state, row_iq, row_weights, pos, s)) |pools|
+                    .{ .pools = try ops.own(pools) }
+                else
+                    .{ .ids = try ops.own(try decodeSelected(state, row_iq, row_weights, pos, s)) };
+                const out = (try native.runRow(&ops, query, state.latentView(), pos, selection, scale)) orelse return error.GlmDecodeNativeUnsupported;
+                try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
+                continue;
+            }
+            const indices = try ops.own(try decodeSelected(state, row_iq, row_weights, pos, s));
             const prefix = if (view) |v| v.storage() else state.latentView();
             const prefix_rows = if (view) |v| v.prefix_rows else pos;
             const tail = if (view) |v| v.tail else try ops.own(try state.latentView().dense(@intCast(pos), @intCast(pos + 1), s));
@@ -1288,13 +1327,94 @@ test "GLM packed prefill keeps 32-row tiles at long history and equals 16-row ti
     const q = try normal(&scope, &.{ rows, 64, 512 }, 42, 0.05);
     const iq = try normal(&scope, &.{ rows, 32, 128 }, 43, 1);
     const w = try normal(&scope, &.{ rows, 32 }, 44, 0.1);
-    const narrow = try scope.own(try attendPackedPairs(&twins[0], q, iq, w, offset, 1.0 / 16.0, packed_nax.max_rows, s));
+    const narrow = try scope.own(try attendPackedTiles(&twins[0], q, iq, w, offset, 1.0 / 16.0, packed_nax.max_rows, s));
     packed_nax.resetDispatchCount();
     const wide = try scope.own(try attend(&twins[0], q, iq, w, offset, 1.0 / 16.0, s));
     try mlx.check(mlx.mlx_array_eval(wide));
     try std.testing.expectEqual(@as(usize, rows / packed_nax.wide_rows), packed_nax.dispatchCount());
     try expectSameBits(narrow, wide);
     try std.testing.expectEqual(@as(usize, 64 * 131072), try selectionScratchBytes(131072));
+}
+
+test "GLM a 32-row selection equals two 16-row selections at tree and NAX index scoring" {
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const n = 32768;
+    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 60, 1), try normal(&scope, &.{ n, 128 }, 61, 1), &.{ 16384, 16384 });
+    defer for (&twins) |*st| st.deinit();
+    const iq = try normal(&scope, &.{ n, 32, 128 }, 62, 1);
+    const w = try normal(&scope, &.{ n, 32 }, 63, 0.1);
+    const nax_calls = @import("glm5_indexpool_nax.zig").dispatchCount();
+    // History 4160 (tree scorer), 14400 (NAX window), 32768 (NAX at its widest).
+    for ([_]usize{ 4160, 14400, n }) |history| {
+        var round = Scope{ .s = s };
+        defer round.deinit();
+        var state = twins[0];
+        state.processed = history;
+        const first = history - 64;
+        const rows: c_int = 32;
+        const cut_q = try round.cut(iq, @intCast(first), @intCast(first + 32));
+        const cut_w = try round.cut(w, @intCast(first), @intCast(first + 32));
+        const whole = try selectPackedChunk(&round, &state, cut_q, cut_w, first);
+        const halves = try selectPackedHalves(&round, &state, cut_q, cut_w, first);
+        try std.testing.expectEqual(rows, mlx.getShape(whole)[0]);
+        try expectSameBits(halves, whole);
+        try expectSameBits(try indexScores(&round, &state, cut_q, cut_w, first), try round.join(
+            try indexScores(&round, &state, try round.cut(cut_q, 0, 16), try round.cut(cut_w, 0, 16), first),
+            try indexScores(&round, &state, try round.cut(cut_q, 16, 32), try round.cut(cut_w, 16, 32), first + 16),
+        ));
+    }
+    try std.testing.expect(@import("glm5_indexpool_nax.zig").dispatchCount() > nax_calls);
+}
+
+/// One tile at a time, each settled before the next is built.
+fn attendPackedSerial(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, max_rows: usize, s: mlx.mlx_stream) !Arr {
+    const rows: usize = @intCast(mlx.getShape(q)[0]);
+    const parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    var start: usize = 0;
+    while (start < rows) {
+        var scope = Scope{ .s = s };
+        defer scope.deinit();
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const end = start + packedTileRows(rows - start, max_rows);
+        const selected = try selectPackedChunk(&scope, state, try scope.cut(iq, @intCast(start), @intCast(end)), try scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
+        const out = (try packed_nax.run(&ops, try scope.cut(q, @intCast(start), @intCast(end)), state.latentView(), selected, offset + start, state.processed, 1.0 / 16.0)) orelse return error.ExpectedPackedNax;
+        try mlx.check(mlx.mlx_array_eval(out));
+        try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
+        start = end;
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, parts, 0, s));
+    return out;
+}
+
+test "GLM in-flight packed tiles equal serial tiles bit for bit at every tile count and remainder" {
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const n = 16384;
+    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 50, 1), try normal(&scope, &.{ n, 128 }, 51, 1), &.{ 8192, 8192 });
+    defer for (&twins) |*st| st.deinit();
+    for ([_]c_int{ 16, 32, 48, 80, 96, 112 }) |rows| for ([_]usize{ packed_nax.max_rows, packed_nax.wide_rows }) |width| {
+        var round = Scope{ .s = s };
+        defer round.deinit();
+        const offset: usize = n - @as(usize, @intCast(rows));
+        const q = try normal(&round, &.{ rows, 64, 512 }, 52, 0.05);
+        const iq = try normal(&round, &.{ rows, 32, 128 }, 53, 1);
+        const w = try normal(&round, &.{ rows, 32 }, 54, 0.1);
+        const serial = try round.own(try attendPackedSerial(&twins[0], q, iq, w, offset, width, s));
+        packed_nax.resetDispatchCount();
+        const tiled = try round.own(try attendPackedTiles(&twins[0], q, iq, w, offset, 1.0 / 16.0, width, s));
+        try mlx.check(mlx.mlx_array_eval(tiled));
+        try std.testing.expect(packed_nax.dispatchCount() >= @as(usize, @intCast(rows)) / width);
+        try expectSameBits(serial, tiled);
+    };
 }
 
 test "GLM packed cadence bills a second tile only beyond one wide tile" {
@@ -1408,6 +1528,44 @@ test "GLM kv8 native decode and packed prefill attention match BF16 over the rou
     }
     try std.testing.expectEqual(@as(usize, 2 * (1 + 3)), native.b1Calls());
     try std.testing.expectEqual(@as(usize, if (@import("glm5_model.zig").naxArms()) 2 * 2 else 2 * (2 + 4)), packed_nax.dispatchCount());
+}
+
+test "GLM serial decode row equals the B1 tail-tape path bit for bit on kv8 and BF16 latents" {
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    const native = @import("glm5_attention_decode_batch.zig");
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const n = 9000;
+    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 70, 1), try normal(&scope, &.{ n, 128 }, 71, 1), &.{ 4000, 1500, 3500 });
+    defer for (&twins) |*st| st.deinit();
+    const calls = native.rowCalls();
+    // 1500 rows sit in the dense window, 2052 is its first sparse row, 9000 selects among 2250 pools.
+    // The small queries scale into FP32 subnormals.
+    for ([_]f32{ 0.05, 1e-37 }) |deviation| for ([_]usize{ 1500, 2052, 5000, n }) |length| for (&twins) |*twin| {
+        var round = Scope{ .s = s };
+        defer round.deinit();
+        var state = twin.*;
+        state.processed = length;
+        const pos = length - 1;
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const q = try normal(&round, &.{ 1, 64, 512 }, 72, deviation);
+        const iq = try normal(&round, &.{ 1, 32, 128 }, 73, 1);
+        const w = try normal(&round, &.{ 1, 32 }, 74, 0.1);
+        const ids = try ops.own(try decodeSelected(&state, iq, w, pos, s));
+        const tail = try ops.own(try state.latentView().dense(@intCast(pos), @intCast(length), s));
+        const want = (try native.run(&ops, q, state.latentView(), pos, tail, &.{.{ .offset = pos, .length = length, .path = .{ 0, 1, 2, 3 } }}, ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+        const got = (try native.runRow(&ops, q, state.latentView(), pos, .{ .ids = ids }, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+        try expectSameBits(want, got);
+        const pools = try decodePools(&state, iq, w, pos, s);
+        try std.testing.expectEqual(length > 2051, pools != null);
+        if (pools) |p| {
+            const from_pools = (try native.runRow(&ops, q, state.latentView(), pos, .{ .pools = try ops.own(p) }, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+            try expectSameBits(want, from_pools);
+        }
+    };
+    try std.testing.expectEqual(calls + 2 * (8 + 6), native.rowCalls());
 }
 
 fn bf16Values(a: Arr, out: []f32) !void {
@@ -1783,5 +1941,108 @@ test "GLM long-context attention components (SUSHI_GLM_LONGCTX_UBENCH=1)" {
         const prefill_w = try normal(&scope, &.{ 2048, 32 }, 33, 0.2);
         for (std.enums.values(UbenchStage), &ms) |stage, *m| m.* = try ubenchMedianMs(io, @min(reps, 3), stage, &state, prefill_q, prefill_iq, prefill_w, total - 2048, s);
         std.debug.print("[glm-attn-ubench] ctx={d} prefill chunk 2048: scores {d:.1} ms, select {d:.1} ms, attend {d:.1} ms\n", .{ n, ms[0], ms[1], ms[2] });
+    }
+}
+
+const DecodeStage = enum { null_chain, scores, select, composite_cast, composite_qk, composite_softmax, composite, full };
+
+fn decodeComposite(ops: *Ops, q: Arr, kv_bank: Arr, mask: Arr, scale: f32, stage: DecodeStage) !Arr {
+    const kv = try ops.cast(kv_bank, .float32);
+    if (stage == .composite_cast) return kv;
+    const queries = try ops.binary(.mul, try ops.cast(q, .float32), try ops.scalar(scale, .float32));
+    const kt = try ops.transpose(kv, &.{ 0, 2, 1 });
+    const blocks = try ops.ones(&.{ 1, 2, 65 }, .bool_);
+    const qk = try ops.slot();
+    try mlx.check(mlx.mlx_block_masked_mm(qk, queries, kt, 32, blocks, .{ .ctx = null }, .{ .ctx = null }, ops.s));
+    const masked = try ops.slot();
+    try mlx.check(mlx.mlx_where(masked, try ops.reshape(mask, &.{ 1, 1, 2051 }), qk.*, try ops.scalar(-std.math.inf(f32), .float32), ops.s));
+    if (stage == .composite_qk) return masked.*;
+    const probs = try ops.softmax(masked.*, -1);
+    if (stage == .composite_softmax) return probs;
+    const blocks2 = try ops.ones(&.{ 1, 2, 16 }, .bool_);
+    const pv = try ops.slot();
+    try mlx.check(mlx.mlx_block_masked_mm(pv, probs, kv, 32, blocks2, .{ .ctx = null }, .{ .ctx = null }, ops.s));
+    return ops.cast(pv.*, .bfloat16);
+}
+
+// DIAGNOSTIC (SUSHI_GLM_DECODE_UBENCH=1, `_CTX`): one serial decode row's MLA attention as a dependent chain of
+// 16 layers (each layer's query and index inputs come from the previous output), cumulative stages; the
+// per-layer figure includes the chain's token plumbing, which `null_chain` measures.
+test "GLM decode row attention stages (SUSHI_GLM_DECODE_UBENCH=1)" {
+    if (!@import("transformer.zig").diagEnvOn("SUSHI_GLM_DECODE_UBENCH")) return error.SkipZigTest;
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const raw = if (std.c.getenv("SUSHI_GLM_DECODE_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "1024,8192,32768,131072";
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |token| {
+        const n = try std.fmt.parseInt(c_int, token, 10);
+        var scope = Scope{ .s = s };
+        defer scope.deinit();
+        var state = State{ .latent_bits = latent_store.kv8_bits };
+        defer state.deinit();
+        const ape = try scope.zeros(&.{ 4, 128 }, .bfloat16);
+        var filled: c_int = 0;
+        while (filled < n) {
+            const rows = @min(n - filled, 16384);
+            var part = Scope{ .s = s };
+            defer part.deinit();
+            const seed: u64 = @intCast(filled);
+            _ = try state.append(try normal(&part, &.{ rows, 512 }, seed + 1, 1), try normal(&part, &.{ rows, 128 }, seed + 2, 1), try normal(&part, &.{ rows, 128 }, seed + 3, 1), ape, s);
+            try state.evaluate();
+            filled += rows;
+        }
+        const pos: usize = @intCast(n - 1);
+        const q0 = try normal(&scope, &.{ 1, 64, 512 }, 21, 0.05);
+        const bank = try normal(&scope, &.{ 1, 2051, 512 }, 22, 1);
+        const mask = try scope.slot();
+        try mlx.check(mlx.mlx_ones(mask, &.{ 1, 2051 }, 2, .bool_, s));
+        try mlx.check(mlx.mlx_array_eval(q0));
+        try mlx.check(mlx.mlx_array_eval(bank));
+        try mlx.check(mlx.mlx_array_eval(mask.*));
+        var line: [8]f64 = undefined;
+        for (std.enums.values(DecodeStage), &line) |stage, *out| {
+            var samples: [9]f64 = undefined;
+            for (&samples, 0..) |*sample, rep| {
+                _ = rep;
+                var opses: [16]Ops = undefined;
+                var scopes: [16]Scope = undefined;
+                for (&opses, &scopes) |*o, *sc| {
+                    o.* = Ops{ .s = s };
+                    sc.* = Scope{ .s = s };
+                }
+                defer for (&opses, &scopes) |*o, *sc| {
+                    o.deinit();
+                    sc.deinit();
+                };
+                var q = q0;
+                const sw = @import("io_util.zig").Stopwatch.init(io);
+                for (&opses, &scopes) |*ops, *sc| {
+                    const flat = try ops.reshape(q, &.{32768});
+                    const iq = try ops.reshape(try ops.slice(flat, 0, 0, 4096), &.{ 1, 32, 128 });
+                    const w = try ops.reshape(try ops.slice(flat, 0, 4096, 4128), &.{ 1, 32 });
+                    var node = state;
+                    node.processed = pos + 1;
+                    const product: Arr = switch (stage) {
+                        .null_chain => q,
+                        .scores => try indexScores(sc, &node, iq, w, pos),
+                        .select => try ops.own(try decodeSelected(&state, iq, w, pos, s)),
+                        .composite_cast, .composite_qk, .composite_softmax => try decodeComposite(ops, q, bank, mask.*, 1.0 / 16.0, stage),
+                        .composite => try packed_nax.compositeWith(ops, q, bank, mask.*, 1.0 / 16.0, .block_masked),
+                        .full => try ops.own(try attend(&state, q, iq, w, pos, 1.0 / 16.0, s)),
+                    };
+                    const first = try ops.cast(try ops.reshape(try ops.slice(try ops.reshape(product, &.{-1}), 0, 0, 1), &.{1}), .float32);
+                    const token_value = try ops.cast(try ops.binary(.mul, first, try ops.scalar(0, .float32)), .bfloat16);
+                    q = try ops.binary(.add, q, token_value);
+                }
+                try mlx.check(mlx.mlx_array_eval(q));
+                sample.* = @as(f64, @floatFromInt(sw.read())) / 1e3 / 16.0;
+            }
+            std.mem.sort(f64, &samples, {}, std.sort.asc(f64));
+            out.* = samples[4];
+        }
+        std.debug.print("[glm-decode-ubench] ctx={d} us/layer:", .{n});
+        for (std.enums.values(DecodeStage), line) |stage, v| std.debug.print(" {s}={d:.0}", .{ @tagName(stage), v });
+        std.debug.print("\n", .{});
     }
 }
