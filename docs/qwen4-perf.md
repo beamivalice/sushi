@@ -575,11 +575,11 @@ quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
   2k rung 76.1-82.5; llmprobe 0.6.12 and 0.6.13) the revert is at parity.
 
 <a id="gdn-f32-cost"></a>
-## f32 GDN gate (default) and `--qwen-gdn fp32`: cost
+## f32 GDN gate and state (default): cost
 
 Quality of the same arms: [qwen4-kld](qwen4-kld.md#gdn-f32-teacher). Arms: **a** = main `60272184` (bf16 gate; mtime 2026-10-12 10:19:17,
 sha256 `3a03a4f5...`), **b** = the f32-gate change, default flags (f32 gate, bf16 state), **c** = `--qwen-gdn fp32` (`794b4bb0`, mtime 12:44:03, sha256
-`f4899eff...`; the kernels are the landed ones).
+`f4899eff...`; the kernels are the landed ones). Arm c is now the default and the flag is removed; a and b no longer run.
 
 Cell: Sushi-2.6bpw, `--kv-quant 8 --mtp`, llmprobe 0.6.15 `--bench-only --rungs 4k,32k --runs 3`, one boot per row in the order a b c c b a,
 M5 Max 128 GB on AC, fans max, quiet window, 3 min idle between boots, `taskpolicy -a`, GPU lock per boot, an empty prefix-cache base per
@@ -601,11 +601,11 @@ Adjacent pairs, change of the first over the second (decode / 4k / 32k decode, 4
 
 - The default change (f32 gate) has no measurable cost: the two pairs disagree in sign on every decode metric.
 - MTP decode swings 10-17% between boots of one arm (b 4k decode 79.7 against 93.0, tokens per step 2.9-4.0): a few percent cannot be resolved.
-- The 4-stream aggregate is the quiet metric: b 95.8 / 96.0, c 93.9 / 94.5, so `--qwen-gdn fp32` costs about 2% there.
+- The 4-stream aggregate is the quiet metric: b 95.8 / 96.0, c 93.9 / 94.5, so the f32 state (arm c, now the default) costs about 2% there.
 - Prefill is within ~5% for c over b, not resolved (-9.1/-6.8 in one pair, +1.0/-0.7 in the other).
 
 Bills (default flags, kv8, `--mtp`, a 6000-token prompt sent twice, an empty SSD base per boot, `794b4bb0`):
-- `--qwen-gdn fp32` adds 54.0 MB per persisted checkpoint: b `persisted 6008/6008 tokens (1 ssm-cp, 67.4 MB)`, resident 147.8 MB; c
+- The f32 state (arm c) adds 54.0 MB per persisted checkpoint: b `persisted 6008/6008 tokens (1 ssm-cp, 67.4 MB)`, resident 147.8 MB; c
   `1 ssm-cp, 121.4 MB`, resident 201.8 MB.
 - The admission bill at that request rises 4549 → 4616 MB (+67 MB).
 - Auto context stays 1,048,576 tokens and the boot `active_bytes` stay 47.51 GB on this 128 GB box.

@@ -223,15 +223,6 @@ fn printUsage(io: std.Io) void {
         \\                        bound is inclusive (<n> itself still drafts)
         \\                        and it outranks `enable_mtp:true` in the
         \\                        request body.
-        \\  --qwen-gdn <fp32|bf16>
-        \\                      Qwen only: store its GatedDeltaNet recurrent
-        \\                      state in fp32 between tokens (default bf16);
-        \\                      the decay gate is fp32 either way. Costs
-        \\                      memory (twice the state per cache checkpoint).
-        \\                      A KLD teacher rounds its state to bf16 like
-        \\                      every student, so its KLD cannot price that
-        \\                      rounding; capture the teacher under fp32.
-        \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8 or 4 — affine group quant; default 8 on
         \\                          every model (GLM refuses 4). 16 (or `off`)
@@ -830,12 +821,6 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             const n = flagInt(u32, "--idle-evict-secs", args[i], 0);
             idle_evict_secs = if (n > 0) n else null;
-        } else if (std.mem.eql(u8, args[i], "--qwen-gdn") and i + 1 < args.len) {
-            i += 1;
-            model_mod.qwen_gdn_fp32 = model_mod.parseQwenGdn(args[i]) orelse {
-                log.err("--qwen-gdn: expected fp32 or bf16; got '{s}'\n", .{args[i]});
-                std.process.exit(1);
-            };
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             kv_quant_explicit = true;

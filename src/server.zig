@@ -2078,7 +2078,6 @@ pub fn serve(
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
     if (mtpHeadKvLine(config, transformer_mod.Transformer.mtp_head_kv_quant_flag)) |line| log.info("{s}\n", .{line});
-    if (qwenGdnLine(config, model_mod.qwen_gdn_fp32)) |line| log.info("{s}\n", .{line});
     if (generate_mod.max_mtp_ctx != 0) {
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
@@ -6197,15 +6196,6 @@ pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const 
     if (!flag) return null;
     if (config.isMimo()) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
     return "MTP head KV: following --kv-quant (--mtp-head-kv-quant)";
-}
-
-/// What `--qwen-gdn fp32` does on this arch, for the boot log; null when unset.
-/// GLM and MiMo have no GatedDeltaNet arm, so the flag is refused there.
-pub fn qwenGdnLine(config: *const model_mod.ModelConfig, fp32: bool) ?[]const u8 {
-    if (!fp32) return null;
-    if (config.isGlm5()) return "GDN state: --qwen-gdn fp32 does not apply to GLM (its KDA state is f32 already)";
-    if (config.isMimo()) return "GDN state: --qwen-gdn fp32 does not apply to mimo_v2 (no GatedDeltaNet layers)";
-    return "GDN state: f32 between tokens (--qwen-gdn fp32; bf16 is the default; the decay gate is f32 either way)";
 }
 
 /// Per-token bytes of the qwen4 MTP head's own KV at the scheme it was LOADED with,
@@ -19907,7 +19897,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
     const shared = WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
-    try t.expectEqual(@as(u64, 11_388), needed / mb);
+    try t.expectEqual(@as(u64, 11_456), needed / mb);
     try t.expect(needed > gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
     const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
     try t.expectEqual(@as(u64, 31_254), (lifted -| footprint) / mb);
@@ -19955,8 +19945,8 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS));
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
     // The bill at the narrowest and a wider width.
-    try t.expectEqual(@as(u64, 4_989), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
-    try t.expectEqual(@as(u64, 6_480), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
+    try t.expectEqual(@as(u64, 5_057), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
+    try t.expectEqual(@as(u64, 6_548), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
     // A buffer the previous turn sized above this prompt but below the reservation is grown to
     // it before the prefill writes, one attention layer per eval: one window of old rows.
@@ -19964,7 +19954,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
     try t.expect(reserved > 450_048);
     try t.expectEqual(450_048 *| kv_per_tok / 12, f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 4_991), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expectEqual(@as(u64, 5_059), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.
@@ -23217,8 +23207,8 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
 
     // 1. SSM checkpoints: 36 GDN layers x (state + conv window), up to --ssm-checkpoint-max.
     const per_cp = cfg.ssmCheckpointBytes();
-    // 36 x (1,572,864 + 61,440) B = 58.83 MB.
-    try t.expect(per_cp > 58_000_000 and per_cp < 60_000_000);
+    // 36 x (3,145,728 + 61,440) B = 115.46 MB: the state is f32.
+    try t.expect(per_cp > 115_000_000 and per_cp < 116_000_000);
     const saved_cp_max = ssm_checkpoint_max;
     ssm_checkpoint_max = 32;
     defer ssm_checkpoint_max = saved_cp_max;
@@ -24183,19 +24173,6 @@ test "mtpHeadKvLine: --mtp-head-kv-quant is reported per arch" {
     try t.expectEqualStrings("MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)", mtpHeadKvLine(&mimo, true).?);
 }
 
-test "qwenGdnLine: --qwen-gdn fp32 is reported per arch, and refused where there is no GDN arm" {
-    const t = std.testing;
-    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
-    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
-    try t.expect(qwenGdnLine(&qwen4, false) == null);
-    try t.expect(qwenGdnLine(&glm, false) == null);
-    try t.expectEqualStrings("GDN state: f32 between tokens (--qwen-gdn fp32; bf16 is the default; the decay gate is f32 either way)", qwenGdnLine(&qwen4, true).?);
-    // GLM's recurrent state is KDA, not GDN: the flag names a layer it does not have.
-    try t.expectEqualStrings("GDN state: --qwen-gdn fp32 does not apply to GLM (its KDA state is f32 already)", qwenGdnLine(&glm, true).?);
-    try t.expectEqualStrings("GDN state: --qwen-gdn fp32 does not apply to mimo_v2 (no GatedDeltaNet layers)", qwenGdnLine(&mimo, true).?);
-}
-
 test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_quant override" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
@@ -24405,13 +24382,13 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
     try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
 
-    // AND THE VERDICT MOVES. 10,774 MB refused against 10,000 MB available;
-    // the honest checkpoint term brings it to 9,722 MB, so the turn is served.
+    // AND THE VERDICT MOVES. 11,854 MB refused against 10,000 MB available;
+    // the honest checkpoint term brings it to 9,789 MB, so the turn is served.
     const available: u64 = 10_000 * mb;
     try t.expect(needed < available);
-    try t.expectEqual(@as(u64, 9_722), needed / mb);
+    try t.expectEqual(@as(u64, 9_789), needed / mb);
     const before = gross - terms.checkpoint_bytes + @as(u64, ssm_checkpoint_max) * per_cp;
-    try t.expectEqual(@as(u64, 10_774), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
+    try t.expectEqual(@as(u64, 11_854), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
 }
 
@@ -24428,11 +24405,11 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
     const kv_bits: u64 = 8;
     // Turn A, width 2048, prompt 364,509, max_gen 421,923.
     try t.expectEqual(
-        @as(u64, 12_189),
+        @as(u64, 13_269),
         prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
     );
     try t.expectEqual(
-        @as(u64, 10_774),
+        @as(u64, 11_854),
         prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
     );
 }

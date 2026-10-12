@@ -22,14 +22,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
   an unsupported threadgroup limit falls back to the existing recurrence and epilogue (an M1 declines S 3..8 and
   folds S=2), so the parity test skips a declined width above two. Parity includes every
-  captured state with bf16 carry rounding. Wider captures keep the existing path after the S=5 regression
+  captured state. Wider captures keep the existing path after the S=5 regression
   in [the width sweep](qwen4-perf.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
-  `gated_delta_step_seq` carries the stored bf16 state to the next token, so serial decode and rollback agree; a
-  kernel that carries f32 (upstream's verbatim verify kernel) differs from verify row 1 on.
+  `gated_delta_step_seq` carries the state at its stored width to the next token, so serial decode and rollback agree;
+  Qwen stores f32 now, so the rule bites on a bf16 state only, where upstream's verbatim verify kernel (it carries f32)
+  differs from verify row 1 on.
 - The GDN prework and norm-gate serve bf16 activations only. The recurrence kernels, the prework (`GT`) and
-  `gdn_decode` (K1, K1S, fold) take the stored state's width (`StT`) and the gate's (`GT`) as template args, so an f32
-  state (`--qwen-gdn fp32`) runs the fused step too; every gate producer rounds `g` once, at
+  `gdn_decode` (K1, K1S, fold) take the stored state's width (`StT`) and the gate's (`GT`) as template args, so the f32
+  state Qwen serves runs the fused step too; every gate producer rounds `g` once, at
   `ModelConfig.gdnGateDtype()` (f32 on every Qwen load: the compiled gate closure, `gdnGateChain`, the prework kernel,
   K1/K1S/fold), and the recurrence reads it as f32 whatever it holds. An f32 gate also adds `a + dt_bias` in f32, as the
   HF reference does. Its precise-exp kernels and MLX's exp differ by ulps of `g`, so f32 gate probes allow 1e-6

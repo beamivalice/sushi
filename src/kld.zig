@@ -35,9 +35,6 @@ pub const Options = struct {
     ctx_size: u32 = 0,
     /// Dense, not the serving default: the teacher adds no quantization of its own.
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
-    /// `--qwen-gdn fp32`: store the teacher's GDN state in f32 so its KLD sees
-    /// the rounding every bf16 student pays.
-    qwen_gdn_fp32: bool = false,
     ssd_budget_bytes: u64 = 0,
     pick_tolerance: f32 = 0,
     wired_margin_bytes: u64 = 0,
@@ -83,7 +80,6 @@ const ValueFlag = enum {
     limit,
     ctx_size,
     kv_quant,
-    qwen_gdn,
     ssd_budget_gb,
     expert_pick_tolerance,
     wired_margin_gib,
@@ -104,7 +100,6 @@ const value_flags = [_]struct { []const u8, ValueFlag }{
         .{ "--limit", .limit },
         .{ "--ctx-size", .ctx_size },
         .{ "--kv-quant", .kv_quant },
-        .{ "--qwen-gdn", .qwen_gdn },
         .{ "--ssd-budget-gb", .ssd_budget_gb },
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
         .{ "--wired-margin-gib", .wired_margin_gib },
@@ -164,7 +159,6 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .limit => o.limit = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
-                .qwen_gdn => o.qwen_gdn_fp32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
@@ -221,14 +215,6 @@ pub const USAGE =
     \\  --json <file>         compare: write the numbers as JSON
     \\  --ctx-size <n>        context length override
     \\  --kv-quant <16|8|4>   KV cache quantization (16 = BF16, also off)
-    \\  --qwen-gdn <fp32|bf16>
-    \\                      Qwen only: store its GatedDeltaNet recurrent state
-    \\                      in fp32 (default bf16; the decay gate is fp32
-    \\                      either way). A bf16 teacher rounds its state like
-    \\                      every student, so KLD cannot price that rounding;
-    \\                      capture the teacher under fp32 to measure it.
-    \\                      GLM's KDA state is f32 already and refuses the
-    \\                      flag; a GLM pack has no GDN arm.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
@@ -901,7 +887,6 @@ pub const Loaded = struct {
 pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Loaded {
     const self = try allocator.create(Loaded);
     errdefer allocator.destroy(self);
-    model_mod.qwen_gdn_fp32 = opts.qwen_gdn_fp32;
     self.* = .{
         .allocator = allocator,
         .io = io,
@@ -2017,7 +2002,7 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectError(error.MissingFlagValue, parseArgs(&.{ "compare", "--model" }));
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--tokens", "zero" }));
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--kv-quant", "3" }));
-    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--qwen-gdn", "f32" }));
+    try testing.expectError(error.UnknownFlag, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--qwen-gdn", "fp32" }));
     try testing.expectError(error.MissingModel, parseArgs(&.{ "capture", "--prompts", "/p", "--out", "/o" }));
     try testing.expectError(error.MissingPrompts, parseArgs(&.{ "capture", "--model", "/m", "--out", "/o" }));
     try testing.expectError(error.MissingOut, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p" }));
@@ -2030,14 +2015,6 @@ test "kld: an unflagged capture keeps a full-width teacher KV, never the serving
     try testing.expectEqual(transformer_mod.KVQuantConfig.dense, capture.kv_quant_config);
     try testing.expect(transformer_mod.KVQuantConfig.engine_default.isQuant());
     try testing.expectEqualStrings("bf16", kvCacheFormat(capture.kv_quant_config));
-    try testing.expect(!capture.qwen_gdn_fp32);
-}
-
-test "kld: --qwen-gdn fp32 stores the teacher's GDN state in f32, bf16 leaves it alone" {
-    const fp32 = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--qwen-gdn", "fp32" });
-    try testing.expect(fp32.qwen_gdn_fp32);
-    const bf16 = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--qwen-gdn", "bf16" });
-    try testing.expect(!bf16.qwen_gdn_fp32);
 }
 
 test "kld: the recorded strict NLL is the teacher's own log-softmax, as the capture wrote it" {

@@ -63,13 +63,14 @@ slot's `moe_seq_offset`; the pad-waste cap reads `KVCache.kvLenForBatching`. Bat
 
 - The decay gate `g` is f32 at every producer (`ModelConfig.gdnGateDtype`, the `GDN gate compiled ... g f32` line): a
   bf16 gate gave a head whose exact g is within 2^-9 of 1 g == 1.0, so it never forgot (206 of 1728 heads in our
-  Flash-Next packs). The gate is never stored. The recurrent state is stored bf16 between tokens (the math runs in f32),
-  which still rounds a per-token decay under 2^-9 away: `--qwen-gdn fp32` stores it f32 (`ModelConfig.gdnStateDtype`,
-  one `[gdn] recurrent state f32` line) and a slow head then forgets at its exact rate. A Qwen checkpoint grows
-  58.8 → 115.5 MB, billed by `ssmCheckpointBytes`, and a restored bf16 state is widened before its next step. GLM's
-  state is KDA, not GDN: f32 by construction, so the flag does not apply and the bill follows the arch, not the flag.
-- Measured against the f32-gate default: the f32 state's KLD gain is inside the noise ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher)),
-  its cost is about 2% of 4-stream aggregate and +54 MB per checkpoint ([qwen4-perf](qwen4-perf.md#gdn-f32-cost)).
+  Flash-Next packs). The gate is never stored. The recurrent state is stored f32 between tokens
+  (`ModelConfig.gdnStateDtype`, one `[gdn] recurrent state f32` line): a bf16 state rounds a per-token decay under 2^-9
+  away, and a slow head forgets at its exact rate in f32. A Qwen checkpoint is 115.5 MB (58.8 MB at bf16), billed by
+  `ssmCheckpointBytes`, and a restored bf16 state is widened before its next step. GLM's state is KDA, not GDN: f32 by
+  construction, and the bill follows the arch.
+- Measured against the bf16 state (an earlier opt-in, now the only arm): the f32 state's KLD gain is inside the noise
+  ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher)), its cost is about 2% of 4-stream aggregate and +54 MB per checkpoint
+  ([qwen4-perf](qwen4-perf.md#gdn-f32-cost)).
 
 ## Byte stability
 

@@ -2,18 +2,6 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
-/// `--qwen-gdn fp32`: the GatedDeltaNet recurrent state is stored in f32 between
-/// tokens instead of bf16. A launch decision, not a per-model one: `parseConfig`
-/// reads it so every load path (serve, run, kld) resolves the same state width.
-pub var qwen_gdn_fp32: bool = false;
-
-/// The `--qwen-gdn` value: fp32 stores the state f32, bf16 leaves it at bf16,
-/// anything else is a usage error the caller reports by name.
-pub fn parseQwenGdn(value: []const u8) ?bool {
-    if (std.mem.eql(u8, value, "fp32")) return true;
-    if (std.mem.eql(u8, value, "bf16")) return false;
-    return null;
-}
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
 const expert_io = @import("expert_io.zig");
@@ -250,8 +238,6 @@ pub const ModelConfig = struct {
     linear_key_head_dim: u32 = 128,
     linear_value_head_dim: u32 = 128,
     linear_conv_kernel_dim: u32 = 4,
-    /// Store the recurrent state in f32 between tokens (`--qwen-gdn fp32`); bf16 by default.
-    gdn_state_f32: bool = false,
 
     // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
     // GatedDeltaNet recurrence:
@@ -778,39 +764,32 @@ pub const ModelConfig = struct {
         const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
         if (linear_layers == 0) return 0;
         const state: u64 = @as(u64, self.linear_num_value_heads) *
-            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * self.recurrentStateBytes();
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * @sizeOf(f32);
         const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
             @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
         const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
         return linear_layers * (state + conv * conv_dim * 2);
     }
 
-    /// The GatedDeltaNet state's storage dtype; the recurrence computes in f32 either way.
-    /// Qwen's arm only: GLM's recurrent state is KDA, f32 by construction, and
-    /// never reaches the GDN chain this speaks for.
-    pub fn gdnStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
-        return if (self.gdn_state_f32) .float32 else .bfloat16;
+    /// The one place that names the GatedDeltaNet state's storage dtype. GLM's recurrent state is KDA,
+    /// f32 by construction, and never reaches the GDN chain this speaks for.
+    pub fn gdnStateDtype(_: *const ModelConfig) mlx.mlx_dtype {
+        return .float32;
     }
 
     /// Names a stored-state layout the weight files do not tell apart, for the SSD cache namespace; null
-    /// is no GDN state. A restored state of the other width would be cast, and one written under a
-    /// bf16 gate continues differently from this engine's.
+    /// is no GDN state. A state written under an older bf16 state or gate continues differently, so it
+    /// is never restored.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
         if (self.linear_num_value_heads == 0 or self.isGlm5()) return null;
-        return if (self.gdnStateDtype() == .float32) "gdn-f32-state-v1" else "gdn-gate-f32-v1";
+        return "gdn-f32-state-v1";
     }
 
-    /// The GatedDeltaNet decay gate's dtype, f32 whatever the state's width: a bf16 gate near one is
+    /// The GatedDeltaNet decay gate's dtype: a bf16 gate near one is
     /// exactly 1.0 and that head never forgets. GLM's gate is KDA's own and never reaches the GDN
     /// producers this speaks for.
     pub fn gdnGateDtype(self: *const ModelConfig) mlx.mlx_dtype {
         return if (self.isGlm5()) .bfloat16 else .float32;
-    }
-
-    /// Bytes one recurrent-state element holds on this arch. GLM's KDA state is
-    /// f32 whatever the GDN flag says; every other linear arch follows `--qwen-gdn`.
-    fn recurrentStateBytes(self: *const ModelConfig) u64 {
-        return if (self.isGlm5() or self.gdnStateDtype() == .float32) 4 else 2;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1183,7 +1162,6 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
-    config.gdn_state_f32 = qwen_gdn_fp32;
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (std.c.getenv("SUSHI_NGRAM_BF16_DIR")) |raw| {
@@ -5746,37 +5724,7 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
     }
 }
 
-test "--qwen-gdn takes fp32 or bf16 and nothing else" {
-    try testing.expectEqual(@as(?bool, true), parseQwenGdn("fp32"));
-    try testing.expectEqual(@as(?bool, false), parseQwenGdn("bf16"));
-    for ([_][]const u8{ "f32", "FP32", "16", "" }) |bad| try testing.expectEqual(@as(?bool, null), parseQwenGdn(bad));
-}
-
-test "--qwen-gdn fp32 is what parseConfig reads, on a loaded config and not a struct literal" {
-    const t = std.testing;
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPath(t.io, &path_buf);
-    const path = path_buf[0..n];
-
-    const saved = qwen_gdn_fp32;
-    defer qwen_gdn_fp32 = saved;
-    qwen_gdn_fp32 = true;
-    var c = try parseConfig(t.io, t.allocator, path);
-    defer c.deinit(t.allocator);
-    try t.expect(c.gdn_state_f32);
-    try t.expectEqual(@as(mlx.mlx_dtype, .float32), c.gdnStateDtype());
-
-    qwen_gdn_fp32 = false;
-    var d = try parseConfig(t.io, t.allocator, path);
-    defer d.deinit(t.allocator);
-    try t.expect(!d.gdn_state_f32);
-    try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), d.gdnStateDtype());
-}
-
-test "the GDN decay gate is f32 by default; --qwen-gdn fp32 widens the state too; GLM keeps its own" {
+test "Qwen serves an f32 GDN state and gate with no flag; GLM keeps its own gate" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -5789,43 +5737,25 @@ test "the GDN decay gate is f32 by default; --qwen-gdn fp32 widens the state too
     var glm_buf: [std.fs.max_path_bytes]u8 = undefined;
     const glm_path = try std.fmt.bufPrint(&glm_buf, "{s}/glm", .{path});
 
-    const saved = qwen_gdn_fp32;
-    defer qwen_gdn_fp32 = saved;
-
-    qwen_gdn_fp32 = false;
-    var plain = try parseConfig(t.io, t.allocator, path);
-    defer plain.deinit(t.allocator);
-    try t.expectEqual(@as(mlx.mlx_dtype, .float32), plain.gdnGateDtype());
-    try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), plain.gdnStateDtype());
-
-    qwen_gdn_fp32 = true;
-    var flag = try parseConfig(t.io, t.allocator, path);
-    defer flag.deinit(t.allocator);
-    try t.expectEqual(@as(mlx.mlx_dtype, .float32), flag.gdnGateDtype());
-    try t.expectEqual(@as(mlx.mlx_dtype, .float32), flag.gdnStateDtype());
+    var qwen = try parseConfig(t.io, t.allocator, path);
+    defer qwen.deinit(t.allocator);
+    try t.expectEqual(@as(mlx.mlx_dtype, .float32), qwen.gdnStateDtype());
+    try t.expectEqual(@as(mlx.mlx_dtype, .float32), qwen.gdnGateDtype());
+    try t.expectEqualStrings("gdn-f32-state-v1", qwen.cacheLayoutNamespace().?);
 
     var glm = try parseConfig(t.io, t.allocator, glm_path);
     defer glm.deinit(t.allocator);
     try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), glm.gdnGateDtype());
+    try t.expectEqual(@as(?[]const u8, null), glm.cacheLayoutNamespace());
 }
 
-test "an f32 GDN state stores f32 and bills its checkpoint at four bytes per state element" {
+test "the GDN state checkpoint is billed at four bytes per state element" {
     const t = std.testing;
     var c = ModelConfig{ .num_hidden_layers = 48, .full_attention_interval = 4, .linear_num_key_heads = 16, .linear_num_value_heads = 48 };
     const conv: u64 = 3 * (2 * 16 * 128 + 48 * 128) * 2;
-    try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), c.gdnStateDtype());
-    try t.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 2 + conv)), c.ssmCheckpointBytes());
-    c.gdn_state_f32 = true;
-    try t.expectEqual(@as(mlx.mlx_dtype, .float32), c.gdnStateDtype());
     try t.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 4 + conv)), c.ssmCheckpointBytes());
-    // GLM's recurrent state is KDA, not GDN: f32 by construction. The bill stays
-    // 4 bytes whatever the Qwen flag says, so it follows the arch rule rather
-    // than gdnStateDtype — which speaks only for the GDN arm GLM never reaches.
+    // GLM's KDA state is f32 by construction and bills the same.
     c.model_type = "glm5_next";
-    try t.expectEqual(@as(mlx.mlx_dtype, .float32), c.gdnStateDtype());
-    try t.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 4 + conv)), c.ssmCheckpointBytes());
-    c.gdn_state_f32 = false;
-    try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), c.gdnStateDtype());
     try t.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 4 + conv)), c.ssmCheckpointBytes());
 }
 
