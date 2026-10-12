@@ -4714,7 +4714,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // so every bill reads the same answer as `--prefix-cache-disk off`.
     var disk_tier: ?kv_disk_cache.DiskTier = null;
     if (cache_applies and params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-        const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+        const fp = kv_disk_cache.modelFingerprintWithLayout(sch.allocator, sch.io, entry.path, params.config.cacheLayoutNamespace()) catch |err| {
             log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };

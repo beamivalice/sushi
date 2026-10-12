@@ -792,6 +792,13 @@ pub const ModelConfig = struct {
         return if (self.gdn_state_f32) .float32 else .bfloat16;
     }
 
+    /// Names a stored-state layout the weight files do not tell apart, for the SSD cache namespace;
+    /// null is the default layout. A restored state of the other width would be cast, not equal.
+    pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (self.linear_num_value_heads > 0 and !self.isGlm5() and self.gdnStateDtype() == .float32) return "gdn-f32-state-v1";
+        return null;
+    }
+
     /// The GatedDeltaNet decay gate's dtype: `--qwen-gdn fp32` widens it with the state, since a bf16
     /// gate near one is exactly 1.0 and that head never forgets. GLM's gate is KDA's own and never
     /// reaches the GDN producers this speaks for.

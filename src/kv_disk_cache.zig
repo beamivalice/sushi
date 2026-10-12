@@ -4278,6 +4278,11 @@ fn fingerprintFile(h: *std.hash.XxHash64, io: std.Io, dir: std.Io.Dir, name: []c
 }
 
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
+    return modelFingerprintWithLayout(allocator, io, model_dir, null);
+}
+
+/// `layout` names a stored-state layout the model files do not tell apart; null keeps the historical fingerprint.
+pub fn modelFingerprintWithLayout(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, layout: ?[]const u8) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
     h.update(model_dir);
@@ -4322,6 +4327,7 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
     for (names.items) |name| fingerprintFile(&h, io, dir, name);
     fingerprintFile(&h, io, dir, "ngram_table.bin");
     if (model.getConfigOverrides()) |raw| h.update(raw);
+    if (layout) |tag| h.update(tag);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
@@ -6685,6 +6691,40 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
 
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, ""));
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
+}
+
+test "modelFingerprint: an f32 GDN state gets its own SSD namespace, the bf16 default keeps today's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" });
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/m", .{base});
+    defer testing.allocator.free(dir);
+
+    var narrow = model.ModelConfig{ .linear_num_value_heads = 48 };
+    var wide = narrow;
+    wide.gdn_state_f32 = true;
+    var glm = wide;
+    glm.model_type = "glm5_next";
+    var mimo = model.ModelConfig{ .model_type = "mimo_v2", .gdn_state_f32 = true };
+
+    const today = try modelFingerprint(testing.allocator, io, dir);
+    defer testing.allocator.free(today);
+    const fp_bf16 = try modelFingerprintWithLayout(testing.allocator, io, dir, narrow.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_bf16);
+    try testing.expectEqualStrings(today, fp_bf16);
+    const fp_f32 = try modelFingerprintWithLayout(testing.allocator, io, dir, wide.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_f32);
+    try testing.expect(!std.mem.eql(u8, today, fp_f32));
+    // The flag does not change what GLM (KDA state, f32 always) or MiMo (no GDN layers) store.
+    for ([_]*model.ModelConfig{ &glm, &mimo }) |c| {
+        const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, c.cacheLayoutNamespace());
+        defer testing.allocator.free(fp);
+        try testing.expectEqualStrings(today, fp);
+    }
 }
 
 test "modelFingerprint: rolls with --config-overrides" {

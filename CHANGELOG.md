@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`--qwen-gdn fp32` no longer restores a bf16 state from the SSD prefix cache** (nor the reverse): the two widths now
+  keep separate cache namespaces; existing bf16 caches stay valid.
 - **`--qwen-gdn fp32` is the full precision fix for Qwen3.8-Flash-Next**: it keeps the decay gate in f32 beside the
   state, so slowly fading heads fade (a bf16 gate rounded them to never forgetting), and the fused decode and verify
   steps now serve the f32 state instead of falling back.
