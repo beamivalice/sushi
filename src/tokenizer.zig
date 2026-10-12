@@ -67,6 +67,57 @@ pub fn reservedOutputIds(
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
 pub const PretokStyle = enum { gpt2, llama3 };
 
+/// Precedes a special's text that the sender wrote as plain text (see `Tokenizer.markLiteralSpecials`).
+/// A Unicode noncharacter, so it cannot be part of a real message.
+pub const literal_mark = "\u{FDD0}";
+
+/// Earliest-occurrence, longest-at-a-position matcher over the special tokens: bucketed by first
+/// byte once per call, so a scan is O(text) however many specials the vocabulary has.
+const SpecialScan = struct {
+    const Cand = struct { bytes: []const u8, id: u32 };
+    cands: []Cand,
+    bucket_start: [257]u32,
+
+    fn init(tok: *const Tokenizer, allocator: std.mem.Allocator) !SpecialScan {
+        const cands = try allocator.alloc(Cand, tok.special_tokens.count());
+        errdefer allocator.free(cands);
+        var i: usize = 0;
+        var sit = tok.special_tokens.iterator();
+        while (sit.next()) |entry| : (i += 1) {
+            cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
+        }
+        std.mem.sort(Cand, cands, {}, struct {
+            fn lessThan(_: void, a: Cand, b: Cand) bool {
+                const ab: u8 = if (a.bytes.len > 0) a.bytes[0] else 0;
+                const bb: u8 = if (b.bytes.len > 0) b.bytes[0] else 0;
+                if (ab != bb) return ab < bb;
+                return a.bytes.len > b.bytes.len;
+            }
+        }.lessThan);
+        // bucket_start[b]..bucket_start[b+1] = candidates whose first byte is b.
+        var bucket_start: [257]u32 = @splat(0);
+        var ci: usize = 0;
+        for (0..256) |b| {
+            bucket_start[b] = @intCast(ci);
+            while (ci < cands.len and cands[ci].bytes.len > 0 and cands[ci].bytes[0] == b) ci += 1;
+        }
+        bucket_start[256] = @intCast(cands.len);
+        return .{ .cands = cands, .bucket_start = bucket_start };
+    }
+
+    fn deinit(self: *SpecialScan, allocator: std.mem.Allocator) void {
+        allocator.free(self.cands);
+    }
+
+    fn matchAt(self: *const SpecialScan, text: []const u8, pos: usize) ?Cand {
+        const b = text[pos];
+        for (self.cands[self.bucket_start[b]..self.bucket_start[@as(usize, b) + 1]]) |c| {
+            if (c.bytes.len <= text.len - pos and std.mem.startsWith(u8, text[pos..], c.bytes)) return c;
+        }
+        return null;
+    }
+};
+
 pub const Tokenizer = struct {
     /// Token string -> id
     vocab: std.StringHashMap(u32),
@@ -198,6 +249,55 @@ pub const Tokenizer = struct {
 
     /// Encode text to token IDs (no BOS/EOS added, except WordPiece adds [CLS]/[SEP]).
     pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        return self.encodeProtected(allocator, text, &.{});
+    }
+
+    /// `encode` for text that went through `markLiteralSpecials`: a special's text right after a
+    /// `literal_mark` is plain text, every other special keeps its id. The mark never reaches a token.
+    pub fn encodeMarked(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        if (std.mem.indexOf(u8, text, literal_mark) == null) return self.encode(allocator, text);
+        var clean = std.ArrayList(u8).empty;
+        defer clean.deinit(allocator);
+        var protect = std.ArrayList(usize).empty;
+        defer protect.deinit(allocator);
+        var i: usize = 0;
+        while (i < text.len) {
+            if (std.mem.startsWith(u8, text[i..], literal_mark)) {
+                try protect.append(allocator, clean.items.len);
+                i += literal_mark.len;
+            } else {
+                try clean.append(allocator, text[i]);
+                i += 1;
+            }
+        }
+        return self.encodeProtected(allocator, clean.items, protect.items);
+    }
+
+    /// `text` with a `literal_mark` before every special-token occurrence, so `encodeMarked` keeps
+    /// it as text. Marks already in `text` are dropped: a mark only ever comes from here.
+    pub fn markLiteralSpecials(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var scan = try SpecialScan.init(self, allocator);
+        defer scan.deinit(allocator);
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        var pos: usize = 0;
+        while (pos < text.len) {
+            if (std.mem.startsWith(u8, text[pos..], literal_mark)) {
+                pos += literal_mark.len;
+            } else if (scan.matchAt(text, pos)) |m| {
+                try out.appendSlice(allocator, literal_mark);
+                try out.appendSlice(allocator, m.bytes);
+                pos += m.bytes.len;
+            } else {
+                try out.append(allocator, text[pos]);
+                pos += 1;
+            }
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// `protect` holds ascending offsets of specials to leave as text.
+    fn encodeProtected(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, protect: []const usize) ![]u32 {
         // Split text around special tokens, encode segments with BPE, insert special token IDs
         var result = std.ArrayList(u32).empty;
         errdefer result.deinit(allocator);
@@ -212,60 +312,20 @@ pub const Tokenizer = struct {
             return result.toOwnedSlice(allocator);
         }
 
-        // Special-token splitter. The old scan re-searched the ENTIRE
-        // remaining text for EVERY special token per segment
-        // (O(specials × text) — ~12 s per 66 KB prompt on gemma-3's
-        // 6415-special vocabulary; gemma-4's 24 specials never noticed).
-        // Instead: bucket the specials by first byte once per call (~µs),
-        // then a single left-to-right pass tries only the candidates whose
-        // first byte matches. Semantics unchanged — earliest occurrence
-        // wins, longest special wins at the same position (buckets are
-        // sorted by descending length, so the first hit is the longest).
-        const n_special = self.special_tokens.count();
-        const Cand = struct { bytes: []const u8, id: u32 };
-        const cands = try allocator.alloc(Cand, n_special);
-        defer allocator.free(cands);
-        {
-            var i: usize = 0;
-            var sit = self.special_tokens.iterator();
-            while (sit.next()) |entry| : (i += 1) {
-                cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
-            }
-        }
-        std.mem.sort(Cand, cands, {}, struct {
-            fn lessThan(_: void, a: Cand, b: Cand) bool {
-                const ab: u8 = if (a.bytes.len > 0) a.bytes[0] else 0;
-                const bb: u8 = if (b.bytes.len > 0) b.bytes[0] else 0;
-                if (ab != bb) return ab < bb;
-                return a.bytes.len > b.bytes.len;
-            }
-        }.lessThan);
-        // bucket_start[b]..bucket_start[b+1] = candidates whose first byte is b.
-        var bucket_start: [257]u32 = @splat(0);
-        {
-            var ci: usize = 0;
-            for (0..256) |b| {
-                bucket_start[b] = @intCast(ci);
-                while (ci < cands.len and cands[ci].bytes.len > 0 and cands[ci].bytes[0] == b) ci += 1;
-            }
-            bucket_start[256] = @intCast(cands.len);
-        }
+        var scan = try SpecialScan.init(self, allocator);
+        defer scan.deinit(allocator);
 
         var pos: usize = 0;
         var seg_start: usize = 0;
+        var next_protect: usize = 0;
         while (pos < text.len) {
-            const b = text[pos];
-            var ci = bucket_start[b];
-            const cend = bucket_start[@as(usize, b) + 1];
-            var matched: ?Cand = null;
-            while (ci < cend) : (ci += 1) {
-                const c = cands[ci];
-                if (c.bytes.len <= text.len - pos and std.mem.startsWith(u8, text[pos..], c.bytes)) {
-                    matched = c;
-                    break;
-                }
-            }
+            const matched = scan.matchAt(text, pos);
+            while (next_protect < protect.len and protect[next_protect] < pos) next_protect += 1;
             if (matched) |m| {
+                if (next_protect < protect.len and protect[next_protect] == pos) {
+                    pos += m.bytes.len;
+                    continue;
+                }
                 if (pos > seg_start) {
                     const ids = try self.encodeSegment(allocator, text[seg_start..pos]);
                     defer allocator.free(ids);
@@ -1649,6 +1709,39 @@ test "encode special-token scan: earliest match, longest tie-break, adjacency" {
         defer allocator.free(ids);
         try testing.expectEqualSlices(u32, &[_]u32{ 1, 92 }, ids);
     }
+}
+
+test "literal marks: a marked special encodes as text, an unmarked one as its id, stray marks are dropped" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer {
+        tok.vocab.deinit();
+        tok.id_to_token.deinit();
+        tok.merge_ranks.deinit();
+        tok.special_tokens.deinit();
+        tok.unicode_to_byte.deinit();
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    for (0..256) |b| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
+        const piece = try arena.allocator().dupe(u8, buf[0..n]);
+        try tok.vocab.put(piece, @intCast(b));
+        try tok.id_to_token.put(@intCast(b), piece);
+        try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
+    }
+    try tok.special_tokens.put("<s>", 300);
+    try tok.special_tokens.put("<s>x", 301);
+
+    const marked = try tok.markLiteralSpecials(allocator, "a<s>x\u{FDD0}b<s>");
+    defer allocator.free(marked);
+    try testing.expectEqualStrings("a" ++ literal_mark ++ "<s>xb" ++ literal_mark ++ "<s>", marked);
+
+    // Marked: 'a' '<' 's' '>' 'x' 'b' '<' 's' '>'. Unmarked text in the same string keeps its id.
+    const ids = try tok.encodeMarked(allocator, "a" ++ literal_mark ++ "<s>xb<s>");
+    defer allocator.free(ids);
+    try testing.expectEqualSlices(u32, &.{ 'a', '<', 's', '>', 'x', 'b', 300 }, ids);
 }
 
 test "WordPiece encode basic" {

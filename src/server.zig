@@ -25276,7 +25276,7 @@ test "MiMo MTP state bill is constant and follows retained storage" {
 
 /// A byte-level tokenizer spelling every byte as its own token, plus `specials`
 /// as atomic ids from 256 up. Strings live in `arena`.
-fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, specials: []const []const u8) !Tokenizer {
+pub fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, specials: []const []const u8) !Tokenizer {
     var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
     for (0..256) |b| {
         var buf: [4]u8 = undefined;
@@ -25294,7 +25294,7 @@ fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, special
     return tok;
 }
 
-fn deinitTestTokenizer(tok: *Tokenizer) void {
+pub fn deinitTestTokenizer(tok: *Tokenizer) void {
     tok.vocab.deinit();
     tok.id_to_token.deinit();
     tok.merge_ranks.deinit();

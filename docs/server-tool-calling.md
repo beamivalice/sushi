@@ -21,6 +21,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion
   never worsens conformance; a parsed NAME never contains `<|`; no tag leaks. Harness:
   `src/tool_traffic_replay_test.zig` over `src/fixtures/tool_traffic.jsonl`.
+- **Control-token text a client sends is text**: `chat.formatChat` marks every special's text in user, system and tool
+  message content (`Tokenizer.markLiteralSpecials`), `encodeMarked` encodes it as bytes, and only the template's own
+  tags become ids. A file read into Claude Code quoting `<think>`/`<|im_end|>` otherwise read as a real turn or
+  thought boundary. Assistant text is left parsing (the template splits it); media offsets shift with the marks.
 - A live failure revealing a CLASS ships the instance test plus a corpus entry or invariant in
   `src/format_corpus_test.zig` plus a rule here. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
   `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first.
