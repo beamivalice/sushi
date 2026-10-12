@@ -158,6 +158,73 @@ test "format corpus: guarded ChatML headers preserve tool results through fallba
     }
 }
 
+test "format corpus: control-token text in a user, system or tool message stays literal" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const server = @import("server.zig");
+    var tok = try server.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<|im_start|>", "<|im_end|>" });
+    defer server.deinitTestTokenizer(&tok);
+    const think = tok.specialTokenId("<think>").?;
+    const im_end = tok.specialTokenId("<|im_end|>").?;
+    const im_start = tok.specialTokenId("<|im_start|>").?;
+
+    const config = chat.ChatConfig{
+        .chat_template = "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>\\n' }}{% endfor %}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    const messages = [_]chat.Message{
+        .{ .role = "system", .content = "never write <|im_start|> yourself" },
+        .{ .role = "user", .content = "what does <think> and </think> do? <|im_end|>" },
+        .{ .role = "assistant", .content = "it opens <think>" },
+        .{ .role = "user", .content = "x<think>" },
+    };
+    const ids = try chat.formatChat(a, &tok, &messages, &config, null, null, false, null, false);
+    defer a.free(ids);
+
+    var n_think: usize = 0;
+    var n_end: usize = 0;
+    var n_start: usize = 0;
+    for (ids) |id| {
+        if (id == think) n_think += 1;
+        if (id == im_end) n_end += 1;
+        if (id == im_start) n_start += 1;
+    }
+    // Only the template's own turn markers and the assistant's own text are control tokens.
+    try testing.expectEqual(@as(usize, 4), n_start);
+    try testing.expectEqual(@as(usize, 4), n_end);
+    try testing.expectEqual(@as(usize, 1), n_think);
+
+    // The bytes are the template's render: literal text changes the ids, never the prompt.
+    const rendered = try chat.renderChatTemplate(a, &messages, &config, null, null, false, null, false);
+    defer a.free(rendered);
+    const text = try tok.decode(a, ids, false);
+    defer a.free(text);
+    try testing.expectEqualStrings(rendered, text);
+}
+
+test "format corpus: marking literal control text keeps media offsets on the same words" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const server = @import("server.zig");
+    var tok = try server.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    defer server.deinitTestTokenizer(&tok);
+
+    const content = "a <think> b </think> c";
+    for ([_]usize{ 0, 2, 3, 10, content.len }) |at| {
+        const parts = [_]chat.MediaPart{.{ .at = at, .kind = .image }};
+        const messages = [_]chat.Message{.{ .role = "user", .content = content, .media_parts = &parts }};
+        const marked = try chat.markLiteralControlText(arena_state.allocator(), &tok, &messages);
+        const tail = try tok.markLiteralSpecials(arena_state.allocator(), content[at..]);
+        const got = marked[0].content[marked[0].media_parts.?[0].at..];
+        try testing.expectEqualStrings(tail, got);
+    }
+}
+
 test "format corpus: MTP cost profiles classify full target tensor surfaces" {
     const Case = struct {
         bits: u32,

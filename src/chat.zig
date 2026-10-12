@@ -378,9 +378,11 @@ pub fn formatChat(
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    var literal_arena = std.heap.ArenaAllocator.init(allocator);
+    defer literal_arena.deinit();
+    const marked = try markLiteralControlText(literal_arena.allocator(), tok, messages);
+    const rendered = try renderChatTemplate(allocator, marked, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
-
 
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
@@ -1422,23 +1424,52 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     return buf.toOwnedSlice(allocator);
 }
 
-/// Encode text that may contain special tokens (like <|im_start|>, <bos>, etc.).
+/// Encode a rendered prompt: its own control tokens (turn markers, think tags) become ids, and
+/// the control-token text a sender put in a message (see `markLiteralControlText`) stays text.
 fn encodeWithSpecialTokens(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
     text: []const u8,
     ids: *std.ArrayList(u32),
 ) !void {
-    // `Tokenizer.encode` already splits around special tokens (earliest
-    // occurrence, longest at a position) with an O(text) first-byte-bucketed
-    // scan. This wrapper used to duplicate that split with its own
-    // O(specials x text) re-search per segment — ~11 s per 66 KB rendered
-    // prompt on gemma-3's 6415-special vocabulary (the tokenizer-side twin
-    // of the same class was fixed in tokenizer.zig; keep both on the shared
-    // fast path so they can't drift apart again).
-    const segment_ids = try tok.encode(allocator, text);
+    const segment_ids = try tok.encodeMarked(allocator, text);
     defer allocator.free(segment_ids);
     try ids.appendSlice(allocator, segment_ids);
+}
+
+/// Message text a client sends is data, so a `<think>` or `<|im_end|>` in a user, system or tool
+/// message must not become a control token the model reads as a real boundary. Assistant text is
+/// left alone: the template parses it (`</think>` split) and it is the model's own earlier output.
+pub fn markLiteralControlText(arena: std.mem.Allocator, tok: *const Tokenizer, messages: []const Message) ![]const Message {
+    var out: ?[]Message = null;
+    for (messages, 0..) |m, i| {
+        if (std.mem.eql(u8, m.role, "assistant")) continue;
+        const text = try tok.markLiteralSpecials(arena, m.content);
+        if (std.mem.eql(u8, text, m.content)) continue;
+        if (out == null) out = try arena.dupe(Message, messages);
+        out.?[i].content = text;
+        if (m.media_parts) |parts| {
+            const shifted = try arena.dupe(MediaPart, parts);
+            for (shifted) |*p| p.at = markedOffset(text, p.at);
+            out.?[i].media_parts = shifted;
+        }
+    }
+    return out orelse messages;
+}
+
+/// Where byte `raw_at` of the unmarked content sits in the marked text, just before any mark there.
+fn markedOffset(marked: []const u8, raw_at: usize) usize {
+    var k: usize = 0;
+    var raw: usize = 0;
+    while (k < marked.len and raw < raw_at) {
+        if (std.mem.startsWith(u8, marked[k..], tokenizer_mod.literal_mark)) {
+            k += tokenizer_mod.literal_mark.len;
+        } else {
+            k += 1;
+            raw += 1;
+        }
+    }
+    return k;
 }
 
 const SpecialEntry = struct {
