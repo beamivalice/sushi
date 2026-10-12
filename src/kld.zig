@@ -201,7 +201,9 @@ pub const USAGE =
     \\  a captured fixture dir (its prompts are reused), a directory of
     \\  *.txt files (one prompt each, sorted by name), or a .jsonl of
     \\  {"id":...,"prompt":...} lines; a line may give "prompt_ids":[...]
-    \\  (token ids, used as given) instead of "prompt".
+    \\  (token ids, used as given) instead of "prompt", and with it
+    \\  "continuation_ids":[...] that capture scores teacher-forced
+    \\  instead of generating a continuation.
     \\
     \\  SUSHI_HIDDEN_OUT=<dir> makes capture append each prompt forward's
     \\  residual at every block boundary to <dir> (boundary-XX.bin, tokens.bin).
@@ -305,6 +307,11 @@ fn rowNll(row: []const f32, chosen: u32) f64 {
     return max + @log(sum) - @as(f64, row[chosen]);
 }
 
+/// The token row `step` is scored against: the forced continuation's, else the greedy one.
+fn pickToken(force: ?[]const u32, step: usize, row: []const f32) u32 {
+    return if (force) |f| f[step] else argmaxOf(row);
+}
+
 fn argmaxOf(row: []const f32) u32 {
     var best: usize = 0;
     var best_v = -std.math.inf(f64);
@@ -317,8 +324,9 @@ fn argmaxOf(row: []const f32) u32 {
     return @intCast(best);
 }
 
-/// `ids` set: the prompt is these token ids as given (no template, no tokenizer).
-pub const Prompt = struct { id: []u8, text: []u8, ids: ?[]u32 = null };
+/// `ids` set: the prompt is these token ids as given (no template, no tokenizer). `force` set (needs `ids`): capture
+/// scores this continuation teacher-forced instead of generating one.
+pub const Prompt = struct { id: []u8, text: []u8, ids: ?[]u32 = null, force: ?[]u32 = null };
 
 pub const PromptList = struct {
     allocator: std.mem.Allocator,
@@ -329,6 +337,7 @@ pub const PromptList = struct {
             self.allocator.free(p.id);
             self.allocator.free(p.text);
             if (p.ids) |ids| self.allocator.free(ids);
+            if (p.force) |f| self.allocator.free(f);
         }
         self.allocator.free(self.items);
         self.items = &.{};
@@ -362,6 +371,7 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
             allocator.free(p.id);
             allocator.free(p.text);
             if (p.ids) |ids| allocator.free(ids);
+            if (p.force) |f| allocator.free(f);
         }
         items.deinit(allocator);
     }
@@ -428,6 +438,9 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
                 };
                 const ids = if (obj.get("prompt_ids")) |v| try tokenIdsField(allocator, v) else null;
                 errdefer if (ids) |i| allocator.free(i);
+                const force = if (obj.get("continuation_ids")) |v| try tokenIdsField(allocator, v) else null;
+                errdefer if (force) |f| allocator.free(f);
+                if (force != null and ids == null) return error.BadPromptJsonl;
                 const text = if (ids != null) try allocator.dupe(u8, "") else blk: {
                     const text_value = obj.get("prompt") orelse return error.BadPromptJsonl;
                     break :blk switch (text_value) {
@@ -442,7 +455,7 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
                     else => try std.fmt.allocPrint(allocator, "prompt-{d:0>2}", .{seq}),
                 } else try std.fmt.allocPrint(allocator, "prompt-{d:0>2}", .{seq});
                 errdefer allocator.free(id);
-                try items.append(allocator, .{ .id = id, .text = text, .ids = ids });
+                try items.append(allocator, .{ .id = id, .text = text, .ids = ids, .force = force });
                 seq += 1;
             }
         },
@@ -1157,13 +1170,14 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         const row = try allocator.alloc(f32, vocab);
         defer allocator.free(row);
 
+        const steps: u32 = if (p.force) |f| @intCast(f.len) else opts.tokens;
         var step: u32 = 0;
-        while (step < opts.tokens) : (step += 1) {
+        while (step < steps) : (step += 1) {
             try readLastRow(&l.xfm, logits, row);
-            const chosen = argmaxOf(row);
+            const chosen = pickToken(p.force, step, row);
             try writer.appendRow(row, chosen);
             try generated.append(allocator, chosen);
-            if (step + 1 == opts.tokens) break;
+            if (step + 1 == steps) break;
             const next = try forwardOne(l, &ctx, chosen);
             _ = mlx.mlx_array_free(logits);
             logits = next;
@@ -2783,4 +2797,30 @@ test "kld: GLM full-stream hidden capture retains chunked boundaries and native 
     const tokens = try tmp.dir.readFileAlloc(io, "hidden/tokens.bin", arena, .limited(1 << 20));
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&ids), tokens);
     try testing.expect(loaded.xfm.glm5_request.?.boundaries == null);
+}
+
+test "a jsonl line may force its continuation, and only after prompt_ids" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTextFile(io, tmp.dir, "ok.jsonl", "{\"id\":\"t\",\"prompt_ids\":[1,2,3],\"continuation_ids\":[4,5]}\n");
+    try writeTextFile(io, tmp.dir, "bad.jsonl", "{\"id\":\"t\",\"prompt\":\"x\",\"continuation_ids\":[4,5]}\n");
+    var path_buf: [512]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const ok_path = try std.fmt.allocPrint(a, "{s}/ok.jsonl", .{root});
+    defer a.free(ok_path);
+    var list = try loadPrompts(a, io, ok_path, 0);
+    defer list.deinit();
+    try testing.expectEqualSlices(u32, &.{ 4, 5 }, list.items[0].force.?);
+    const bad_path = try std.fmt.allocPrint(a, "{s}/bad.jsonl", .{root});
+    defer a.free(bad_path);
+    try testing.expectError(error.BadPromptJsonl, loadPrompts(a, io, bad_path, 0));
+}
+
+test "pickToken scores the forced token and falls back to the argmax" {
+    const row = [_]f32{ 0.1, 2.0, 0.3 };
+    try testing.expectEqual(@as(u32, 1), pickToken(null, 0, &row));
+    try testing.expectEqual(@as(u32, 2), pickToken(&.{ 2, 0 }, 0, &row));
+    try testing.expectEqual(@as(u32, 0), pickToken(&.{ 2, 0 }, 1, &row));
 }

@@ -24,6 +24,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 - `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4 and GLM (`[tokens, 4, hidden]`), including boundary zero. GLM teacher and served-pack capture retain every native HC stream. The served path appends each chunk's native boundaries and commits token IDs only after every boundary has the complete prompt.
 - Spool mode (`SUSHI_HIDDEN_SPOOL_BYTES=<budget>`, `SUSHI_HIDDEN_OUT` = spool root, `SUSHI_HIDDEN_SPOOL_FIRST=<n>`) writes each prompt as an atomic window `w-<n>/` and waits while complete windows hold the budget: a consumer deletes the windows it has used. The live Qwen tune reads it; the chunked GLM path is refused.
 - A `--prompts` jsonl line may carry `prompt_ids` (token ids, used as given, no template) instead of `prompt`.
+- With `prompt_ids` a line may also carry `continuation_ids`: capture feeds and stores exactly those tokens (one full-vocab
+  row each, `--tokens` ignored) instead of the greedy continuation, so `compare` scores real text at any depth and
+  `per_position_kld` of its `--json` bins by context position. The to-first-EOS line of such a fixture is meaningless
+  (the text holds EOS-like tokens): read `mean_kld` or the per-position rows.
 
 Native GLM capture runs the native forward through `sushi kld capture` with individual BF16 expert streaming,
 `--no-template --kv-quant off --ssd-budget-gb <total GiB>`. It audits indexed text headers before loading:
