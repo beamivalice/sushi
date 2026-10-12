@@ -15079,7 +15079,7 @@ pub const Transformer = struct {
 
 
     /// Apply the compiled GDN gate closure if available, else the raw chain.
-    /// Returns owned g (bf16, shape of `a`).
+    /// Returns owned g (`config.gdnGateDtype()`, shape of `a`).
     fn computeGdnGate(self: *const Transformer, A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array) !mlx.mlx_array {
         if (self.compiled_gdn_gate) |compiled| {
             const in_arr = [_]mlx.mlx_array{ A_log, a, dt_bias };
@@ -15094,7 +15094,7 @@ pub const Transformer = struct {
                 return g;
             }
         }
-        return gdnGateChain(A_log, a, dt_bias, self.s);
+        return gdnGateChain(A_log, a, dt_bias, self.config.gdnGateDtype(), self.s);
     }
 
 
@@ -18336,7 +18336,7 @@ pub const Transformer = struct {
         const inv_scale_sq = self.gdn_q_scale.?;
         const inv_sqrt_sc = self.gdn_k_scale.?;
 
-        // A restored state continues in the width this load stores; the fused step serves bf16 only.
+        // A restored state continues in the width this load stores.
         const state_dtype = cfg.gdnStateDtype();
         if (ssm.ssm_state.ctx != null and mlx.mlx_array_dtype(ssm.ssm_state) != state_dtype) {
             var cast = mlx.mlx_array_new();
@@ -18365,6 +18365,7 @@ pub const Transformer = struct {
                 .dt_bias = la.dt_bias,
                 .q_scale = inv_scale_sq,
                 .k_scale = inv_sqrt_sc,
+                .gate_dtype = cfg.gdnGateDtype(),
             };
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
             if (self.spec_capture_ssm and gdnVerifyFoldFor(seq_len)) {
@@ -18473,6 +18474,7 @@ pub const Transformer = struct {
                 .dv = dv,
                 .seq = seq_len,
                 .batch = batch,
+                .gate_dtype = cfg.gdnGateDtype(),
             }) catch null) orelse break :blk;
             // Spec-capture rollback slices the conv INPUT; build the concat
             // the composed path would have stashed (lazy, one launch).
@@ -21074,10 +21076,11 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
 /// owned `inds` (int32, [..., k]) and `norm_scores` (bf16, [..., k]) — caller
 /// must free both.
 /// GatedDeltaNet gating chain: g = exp(-exp(A_log) * softplus(a + dt_bias)),
-/// computed in float32 for stability and returned as bfloat16. Mirrors
-/// mlx-lm's `compute_g` (which is `@mx.compile`d). Pure — serves as both the
-/// compiled-closure body and the uncompiled fallback. Returns owned array.
-pub fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+/// computed in float32 for stability and returned as `gate_dtype` (an f32 gate also adds
+/// a + dt_bias in f32, as the HF reference does). Mirrors mlx-lm's `compute_g` (which is
+/// `@mx.compile`d). Pure — serves as both the compiled-closure body and the uncompiled
+/// fallback. Returns owned array.
+pub fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, gate_dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     var A_log_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(A_log_f32);
     try mlx.check(mlx.mlx_astype(&A_log_f32, A_log, .float32, s));
@@ -21088,10 +21091,20 @@ pub fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_arr
     // softplus(a + dt_bias) = log1p(exp(a + dt_bias))
     var a_plus_dt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(a_plus_dt);
-    try mlx.check(mlx.mlx_add(&a_plus_dt, a, dt_bias, s));
     var a_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(a_f32);
-    try mlx.check(mlx.mlx_astype(&a_f32, a_plus_dt, .float32, s));
+    if (gate_dtype == .float32) {
+        var a_wide = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a_wide);
+        var dt_wide = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_wide);
+        try mlx.check(mlx.mlx_astype(&a_wide, a, .float32, s));
+        try mlx.check(mlx.mlx_astype(&dt_wide, dt_bias, .float32, s));
+        try mlx.check(mlx.mlx_add(&a_f32, a_wide, dt_wide, s));
+    } else {
+        try mlx.check(mlx.mlx_add(&a_plus_dt, a, dt_bias, s));
+        try mlx.check(mlx.mlx_astype(&a_f32, a_plus_dt, .float32, s));
+    }
     var exp_a = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(exp_a);
     try mlx.check(mlx.mlx_exp(&exp_a, a_f32, s));
@@ -21110,7 +21123,7 @@ pub fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_arr
     try mlx.check(mlx.mlx_exp(&g_f32, neg_neg, s));
     var g = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(g);
-    try mlx.check(mlx.mlx_astype(&g, g_f32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&g, g_f32, gate_dtype, s));
     return g;
 }
 
@@ -23016,7 +23029,7 @@ const QK_NORM_ROPE_256_SOURCE =
 // dispatches per GDN layer per step. Six outputs: normed/scaled Q and K,
 // activated V, the next 3-row conv state, g and beta.
 // The gate rides the SAME formulas MLX's compiled gate closure emits
-// (precise exp, utils.h log1p, bf16 add rounding), so it is bit-identical
+// (precise exp, utils.h log1p, GT add rounding), so it is bit-identical
 // to `computeGdnGate`; the in-kernel sigmoid (SiLU half, beta) is MLX's own
 // unary formula (exp-of-abs form) — the challenge swept all 65,280 finite
 // bf16 inputs against it: bit-exact everywhere.
@@ -23101,16 +23114,16 @@ const GDN_PREWORK_SOURCE =
     \\    if (lane == 0) {
     \\        // beta = sigmoid(b) (MLX unary formula); g = exp(-exp(A_log) *
     \\        // softplus(a + dt_bias)) with the compiled chain's own casts:
-    \\        // bf16 add, f32 precise exp / log1p / exp, bf16 store.
+    \\        // GT add, f32 precise exp / log1p / exp, GT store.
     \\        const T bv = b_in[row * uint(BSTRIDE) + uint(BOFF) + head];
     \\        T bsig;
     \\        if constexpr (TAB) bsig = sigtab[as_type<ushort>(bv)];
     \\        else { T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); bsig = bv < T(0) ? by : T(1) - by; }
     \\        beta_out[row * uint(HV) + head] = bsig;
-    \\        const T apd = T(float(a_in[row * uint(ASTRIDE) + uint(AOFF) + head]) + float(dt_bias[head]));
+    \\        const GT apd = GT(float(a_in[row * uint(ASTRIDE) + uint(AOFF) + head]) + float(dt_bias[head]));
     \\        float sp = sushi_log1p(metal::precise::exp(float(apd)));
     \\        float ea = metal::precise::exp(float(A_log[head]));
-    \\        g_out[row * uint(HV) + head] = T(metal::precise::exp(-(ea * sp)));
+    \\        g_out[row * uint(HV) + head] = GT(metal::precise::exp(-(ea * sp)));
     \\    }
     \\}
     \\// Next conv state = rows [S, S+NKEEP) of concat(conv_state, qkv).
@@ -23191,7 +23204,7 @@ fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, batch: c_int, c: c_int, qs: c_int, qo: c_int, bs: c_int, bo: c_int, as: c_int, ao: c_int };
+const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, batch: c_int, c: c_int, qs: c_int, qo: c_int, bs: c_int, bo: c_int, as: c_int, ao: c_int, gate: mlx.mlx_dtype };
 var gdn_prework_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gdn_prework_cfg_key: GdnPreworkCfgKey = std.mem.zeroes(GdnPreworkCfgKey);
 
@@ -23200,7 +23213,7 @@ pub const GdnPrework = struct {
     k: mlx.mlx_array, // [B, S, Hk, 128] normed + scaled
     v: mlx.mlx_array, // [B, S, Hv, 128] silu-activated
     conv_state: mlx.mlx_array, // [B, NKEEP, C] next conv state
-    g: mlx.mlx_array, // [B, S, Hv] forget gate
+    g: mlx.mlx_array, // [B, S, Hv] forget gate in `GdnPreworkArgs.gate_dtype`
     beta: mlx.mlx_array, // [B, S, Hv] sigmoid(b)
 };
 /// Rows (batch*seq) the decode-width GDN fusions serve.
@@ -23239,6 +23252,7 @@ pub const GdnPreworkArgs = struct {
     dv: c_int,
     seq: c_int,
     batch: c_int = 1,
+    gate_dtype: mlx.mlx_dtype = .bfloat16, // `ModelConfig.gdnGateDtype()`
 };
 
 /// One fused dispatch for the GDN prework at S 1..9 x B batched slots
@@ -23249,7 +23263,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     if (!gdnPreworkEnabled()) return null;
     if (!gdnPrefillFusedFor(in.seq, in.batch) and (in.seq < 1 or in.seq > 9 or in.batch < 1 or in.batch * in.seq > GDN_FUSED_MAX_ROWS)) return null;
     if (in.seq < 3 and !gdnDecodeFusedEnabled()) return null;
-    if (in.dk != 128 or in.dv != 128) return null;
+    if (in.dk != 128 or in.dv != 128 or (in.gate_dtype != .bfloat16 and in.gate_dtype != .float32)) return null;
     inline for (.{ in.qkv, in.b, in.a, in.conv_state, in.conv_w, in.dt_bias }) |arr| {
         if (mlx.mlx_array_dtype(arr) != .bfloat16) return null;
     }
@@ -23266,7 +23280,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     if (csh.len != 3 or csh[0] != in.batch or csh[1] != 3 or csh[2] != c_dim) return null;
 
     const nkeep: c_int = 3;
-    const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off };
+    const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off, .gate = in.gate_dtype };
     if (gdn_prework_cfg == null or !std.meta.eql(gdn_prework_cfg_key, key)) {
         if (gdn_prework_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -23278,11 +23292,12 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &q_shape, 4, .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &v_shape, 4, .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &st_shape, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &g_shape, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &g_shape, 3, in.gate_dtype));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &g_shape, 3, .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, in.batch * in.seq, 2 * in.hk + in.hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "GT", in.gate_dtype));
         const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "TAB", @as(c_int, @intFromBool(in.seq >= 17)) }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         gdn_prework_cfg = config;
@@ -35978,7 +35993,7 @@ test "gdnGateChain matches g = exp(-exp(A_log) * softplus(a + dt_bias))" {
     const dt_bias = mlx.mlx_array_new_data(&dt_data, &hv_shape, 1, .float32);
     defer _ = mlx.mlx_array_free(dt_bias);
 
-    const g = try gdnGateChain(A_log, a, dt_bias, s);
+    const g = try gdnGateChain(A_log, a, dt_bias, .bfloat16, s);
     defer _ = mlx.mlx_array_free(g);
 
     var g_f32 = mlx.mlx_array_new();
@@ -45085,7 +45100,7 @@ test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row"
         const ds = try attn256MaxDiff(preb.conv_state, ref_state, s);
         if (ds != 0) std.debug.print("prework B={d} conv_state maxdiff={e}\n", .{ batch, ds });
         try std.testing.expectEqual(@as(f32, 0.0), ds);
-        const g_ref = try gdnGateChain(A_log, a_in, dt_bias, s);
+        const g_ref = try gdnGateChain(A_log, a_in, dt_bias, .bfloat16, s);
         defer _ = mlx.mlx_array_free(g_ref);
         const dg = try attn256MaxDiff(preb.g, g_ref, s);
         if (dg != 0) std.debug.print("prework B={d} g maxdiff={e}\n", .{ batch, dg });
@@ -45288,8 +45303,8 @@ fn gdnChainRecurrence(s: mlx.mlx_stream, pre: *const GdnPrework, state: mlx.mlx_
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ 1, t_len, hv, dv }, 4, .bfloat16));
-    if (capture) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ t_len, 1, hv, dv, dk }, 5, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ 1, hv, dv, dk }, 4, .bfloat16));
+    if (capture) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ t_len, 1, hv, dv, dk }, 5, mlx.mlx_array_dtype(state)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ 1, hv, dv, dk }, 4, mlx.mlx_array_dtype(state)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, hv));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", mlx.mlx_array_dtype(pre.q)));
@@ -45317,7 +45332,9 @@ fn gdnChainRecurrence(s: mlx.mlx_stream, pre: *const GdnPrework, state: mlx.mlx_
     return r;
 }
 
-fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, folded: bool) !void {
+/// `wide`: an f32 state under an f32 gate, the `--qwen-gdn fp32` widths.
+fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, folded: bool, wide: bool) !void {
+    const gate_dt: mlx.mlx_dtype = if (wide) .float32 else .bfloat16;
     var prng = std.Random.DefaultPrng.init(0x6D5E + @as(u64, @intCast(t_len * 131 + hv)));
     const rnd = prng.random();
     const dk: c_int = 128;
@@ -45349,10 +45366,10 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
     defer _ = mlx.mlx_array_free(dt_bias);
     const norm_w = try gdnRecurRand(rnd, &.{dv}, 2.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(norm_w);
-    const ssm_state = try gdnRecurRand(rnd, &.{ 1, hv, dv, dk }, 1.0, .bfloat16, s);
+    const ssm_state = try gdnRecurRand(rnd, &.{ 1, hv, dv, dk }, 1.0, gate_dt, s);
     defer _ = mlx.mlx_array_free(ssm_state);
 
-    const pre = (try gdnPreworkFused(s, .{ .qkv = qkv, .qkv_off = 0, .qkv_stride = c_dim, .b = b_in, .b_off = 0, .b_stride = hv, .a = a_in, .a_off = 0, .a_stride = hv, .A_log = A_log, .dt_bias = dt_bias, .conv_state = conv_state, .conv_w = conv_w, .q_scale = q_scale, .k_scale = k_scale, .hk = hk, .hv = hv, .dk = dk, .dv = dv, .seq = t_len })) orelse return error.FusedDeclined;
+    const pre = (try gdnPreworkFused(s, .{ .gate_dtype = gate_dt, .qkv = qkv, .qkv_off = 0, .qkv_stride = c_dim, .b = b_in, .b_off = 0, .b_stride = hv, .a = a_in, .a_off = 0, .a_stride = hv, .A_log = A_log, .dt_bias = dt_bias, .conv_state = conv_state, .conv_w = conv_w, .q_scale = q_scale, .k_scale = k_scale, .hk = hk, .hv = hv, .dk = dk, .dv = dv, .seq = t_len })) orelse return error.FusedDeclined;
     defer inline for (.{ pre.q, pre.k, pre.v, pre.conv_state, pre.g, pre.beta }) |arr| {
         _ = mlx.mlx_array_free(arr);
     };
@@ -45365,7 +45382,7 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
     defer _ = mlx.mlx_array_free(flat_ref);
 
     const geo = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
-    const in = gdn_decode.Inputs{ .qkv = qkv, .a = a_in, .b = b_in, .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w, .A_log = A_log, .dt_bias = dt_bias, .q_scale = q_scale, .k_scale = k_scale };
+    const in = gdn_decode.Inputs{ .qkv = qkv, .a = a_in, .b = b_in, .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w, .A_log = A_log, .dt_bias = dt_bias, .q_scale = q_scale, .k_scale = k_scale, .gate_dtype = gate_dt };
     const got = (try gdn_decode.step(geo, t_len, in, s)) orelse return error.FusedDeclined;
     defer got.deinit();
     const flat = (try gdnNormGateFused(s, got.y, z, 0, value_dim, norm_w, eps_arr, false, hv, dv, 1, t_len)) orelse return error.FusedDeclined;
@@ -45491,12 +45508,14 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
     defer gdn_decode_fused_override = null;
     for ([_][2]c_int{ .{ 16, 48 }, .{ 2, 8 } }) |heads| {
         var t: c_int = 1;
-        while (t <= gdn_decode.MAX_SEQ) : (t += 1) try gdnRecurParityCase(s, heads[0], heads[1], t, false);
+        while (t <= gdn_decode.MAX_SEQ) : (t += 1) {
+            try gdnRecurParityCase(s, heads[0], heads[1], t, false, false);
+            try gdnRecurParityCase(s, heads[0], heads[1], t, false, true);
+        }
     }
 
-    // The chain serves bf16 only (its prework and norm-gate decline anything else, and its
-    // recurrence stores a bf16 state it cannot convert an f32 one into): f16 activations, an
-    // f32 state or a width past MAX_SEQ keep the chain.
+    // The chain's prework and norm-gate serve bf16 activations only: f16 activations or a width
+    // past MAX_SEQ keep the chain. An f32 state is served, and keeps its width.
     var prng = std.Random.DefaultPrng.init(0xF16);
     const rnd = prng.random();
     const hk: c_int = 2;
@@ -45504,9 +45523,9 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
     const c_dim: c_int = 2 * hk * 128 + hv * 128;
     const scale = bf16Scalar(0.1, s);
     defer _ = mlx.mlx_array_free(scale);
-    for ([_][2]mlx.mlx_dtype{ .{ .float16, .bfloat16 }, .{ .bfloat16, .float32 }, .{ .bfloat16, .bfloat16 } }, 0..) |dts, case| {
+    for ([_][2]mlx.mlx_dtype{ .{ .float16, .bfloat16 }, .{ .bfloat16, .bfloat16 } }, 0..) |dts, case| {
         const dt = dts[0];
-        const t_len: c_int = if (case == 2) gdn_decode.MAX_SEQ + 1 else 1;
+        const t_len: c_int = if (case == 1) gdn_decode.MAX_SEQ + 1 else 1;
         const qkv = try gdnRecurRand(rnd, &.{ 1, t_len, c_dim }, 1.0, dt, s);
         defer _ = mlx.mlx_array_free(qkv);
         const ab = try gdnRecurRand(rnd, &.{ 1, t_len, hv }, 1.0, dt, s);
@@ -45560,6 +45579,12 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
 }
 
 test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and verify widths; rollback to every row is serial decode" {
+    try gdnRecurLayerCase(false);
+    try gdnRecurLayerCase(true);
+}
+
+/// `wide`: an f32 state under an f32 gate, the `--qwen-gdn fp32` widths.
+fn gdnRecurLayerCase(wide: bool) !void {
     const s = mlx.gpuStream();
     gdn_prework_override = true;
     defer gdn_prework_override = null;
@@ -45583,6 +45608,7 @@ test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and 
     xfm.config.linear_conv_kernel_dim = 4;
     xfm.config.rms_norm_eps = 1e-6;
     xfm.config.kda_sigmoid_out_gate = true;
+    xfm.config.gdn_state_f32 = wide;
     var prng = std.Random.DefaultPrng.init(0x6D5E1);
     const rnd = prng.random();
     const la = LinearAttnWeights{
@@ -45611,7 +45637,7 @@ test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and 
     };
     const conv0 = try gdnRecurRand(rnd, &.{ 1, 3, c_dim }, 4.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(conv0);
-    const state0 = try gdnRecurRand(rnd, &.{ 1, hv, 128, 128 }, 1.0, .bfloat16, s);
+    const state0 = try gdnRecurRand(rnd, &.{ 1, hv, 128, 128 }, 1.0, if (wide) .float32 else .bfloat16, s);
     defer _ = mlx.mlx_array_free(state0);
     var chain = SSMCacheEntry{ .conv_state = try gdnRecurRef(conv0), .ssm_state = try gdnRecurRef(state0), .initialized = true };
     var fused = SSMCacheEntry{ .conv_state = try gdnRecurRef(conv0), .ssm_state = try gdnRecurRef(state0), .initialized = true };
@@ -45778,6 +45804,206 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
     try ssmRollbackFromCapture(&live, 0, @intCast(seq), s);
     try qkvExpectBitsEqual(s, live.ssm_state, serial.ssm_state);
     try qkvExpectBitsEqual(s, live.conv_state, serial.conv_state);
+}
+
+const GdnDecayRoute = enum { chain, prework_chain, decode, verify, fold, prefill };
+
+/// Per head: the gate input `a` (dt_bias 0) and A_log. Every exact gate lies in (0.5, 1); the slow ones
+/// sit inside bf16's rounding to 1.0 or to its 2^-8 grid.
+const gdn_decay_a = [8]f32{ -8, -7, -6, -9, -5, -2, 0, -10 };
+const gdn_decay_A_log = [8]f32{ 0, 0, 0, -1, 0, 0, 0, 0 };
+/// Divisible by every width 1..MAX_SEQ.
+const gdn_decay_steps: c_int = 840;
+
+fn gdnDecayGate(head: usize) f64 {
+    const sp = @log(1.0 + @exp(@as(f64, gdn_decay_a[head])));
+    return @exp(-@exp(@as(f64, gdn_decay_A_log[head])) * sp);
+}
+
+fn gdnDecayHost(arr: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const p = mlx.mlx_array_data_float32(f) orelse return error.InvalidDtype;
+    return testing.allocator.dupe(f32, p[0..mlx.mlx_array_size(f)]);
+}
+
+/// `state0` decayed by `steps` exact gates: with q, k and v all zero the recurrence is `state *= g`.
+fn gdnDecayExpectExact(state0: []const f32, got: []const f32, hv: usize, steps: usize, tol: f64) !void {
+    const per_head = state0.len / hv;
+    for (0..hv) |h| {
+        const decay = std.math.pow(f64, gdnDecayGate(h), @floatFromInt(steps));
+        for (0..per_head) |i| {
+            const want = @as(f64, state0[h * per_head + i]) * decay;
+            const have = @as(f64, got[h * per_head + i]);
+            if (@abs(have - want) > tol * @abs(want) + 1e-9) {
+                std.debug.print("head {d} elem {d} steps {d}: got {e} want {e}\n", .{ h, i, steps, have, want });
+                return error.TestExpectedApproxEqRel;
+            }
+        }
+    }
+}
+
+fn gdnDecayEqualBits(a: []const f32, b: []const f32) !void {
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b));
+}
+
+fn gdnDecayClose(a: []const f32, b: []const f32, tol: f64) !void {
+    for (a, b) |x, y| try testing.expect(@abs(@as(f64, x) - @as(f64, y)) <= tol * @abs(@as(f64, x)) + 1e-9);
+}
+
+/// Final state (and, when capturing, the last call's captured rows) after `gdn_decay_steps` tokens in
+/// calls of `per_call`, on the layer path `route` selects. Row j of the last call holds the state after
+/// token j of that call.
+fn gdnDecayRun(xfm: *Transformer, la: *const LinearAttnWeights, route: GdnDecayRoute, per_call: c_int, state0: mlx.mlx_array, conv_dim: c_int, rows: *[]f32) ![]f32 {
+    const s = xfm.s;
+    gdn_prework_override = route != .chain;
+    defer gdn_prework_override = null;
+    gdn_decode_recur_override = route == .decode or route == .verify or route == .fold;
+    defer gdn_decode_recur_override = null;
+    gdn_verify_fold_override = route == .fold;
+    defer gdn_verify_fold_override = null;
+    gdn_decode_recur_engaged = false;
+    gdn_verify_recur_engaged = false;
+    gdn_verify_fold_engaged = false;
+    xfm.spec_capture_ssm = route == .verify or route == .fold;
+    defer xfm.spec_capture_ssm = false;
+
+    var entry = SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        ssmFreeSpecCapture(&entry);
+        _ = mlx.mlx_array_free(entry.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+    }
+    try mlx.check(mlx.mlx_zeros(&entry.conv_state, &[_]c_int{ 1, 3, conv_dim }, 3, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&entry.ssm_state, state0, xfm.config.gdnStateDtype(), s));
+
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1, per_call, 128 }, 3, .bfloat16, s));
+    var call: c_int = 0;
+    while (call < @divExact(gdn_decay_steps, per_call)) : (call += 1) {
+        _ = mlx.mlx_array_free(try xfm.gatedDeltaNetProjected(ones, la, &entry, 0, 1, per_call, route == .prefill, null, false));
+    }
+    switch (route) {
+        .decode => try testing.expect(gdn_decode_recur_engaged),
+        .verify => try testing.expect(gdn_verify_recur_engaged),
+        .fold => try testing.expect(gdn_verify_fold_engaged or gdn_decode.foldDeclined(per_call)),
+        else => {},
+    }
+    rows.* = if (entry.spec_state_seq.ctx != null) try gdnDecayHost(entry.spec_state_seq, s) else &.{};
+    return gdnDecayHost(entry.ssm_state, s);
+}
+
+test "gdn decay: at an f32 state and gate every route forgets at the exact rate, and the routes agree" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    defer inline for (.{ &xfm.gdn_q_scale, &xfm.gdn_k_scale, &xfm.gdn_eps, &xfm.gdn_ones_w }) |p| {
+        if (p.*) |arr| _ = mlx.mlx_array_free(arr);
+    };
+    const hk: c_int = 2;
+    const hv: c_int = 8;
+    const hidden: c_int = 128;
+    const c_dim: c_int = 2 * hk * 128 + hv * 128;
+    xfm.config.linear_num_key_heads = @intCast(hk);
+    xfm.config.linear_num_value_heads = @intCast(hv);
+    xfm.config.linear_key_head_dim = 128;
+    xfm.config.linear_value_head_dim = 128;
+    xfm.config.linear_conv_kernel_dim = 4;
+    xfm.config.rms_norm_eps = 1e-6;
+    xfm.config.gdn_state_f32 = true;
+
+    // Zero q/k/v projections and a ones input make `a` the column sum of a_w: each head's gate input is
+    // exact and the recurrence reduces to state *= g.
+    var a_w_host: [128 * 8]f32 = undefined;
+    for (0..128) |r| for (0..8) |h| {
+        a_w_host[r * 8 + h] = gdn_decay_a[h] / 128.0;
+    };
+    const a_w_f32 = mlx.mlx_array_new_data(&a_w_host, &[_]c_int{ hidden, hv }, 2, .float32);
+    defer _ = mlx.mlx_array_free(a_w_f32);
+    var a_w = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&a_w, a_w_f32, .bfloat16, s));
+    const A_log_f32 = mlx.mlx_array_new_data(&gdn_decay_A_log, &[_]c_int{hv}, 1, .float32);
+    defer _ = mlx.mlx_array_free(A_log_f32);
+    var A_log = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&A_log, A_log_f32, .bfloat16, s));
+    var zeros: [5]mlx.mlx_array = undefined;
+    const zero_shapes = [5][2]c_int{ .{ hidden, c_dim }, .{ hidden, hv * 128 }, .{ hidden, hv }, .{ hv * 128, hidden }, .{ hv, 0 } };
+    for (&zeros, zero_shapes, 0..) |*z, sh, i| {
+        z.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(z, &sh, if (i == 4) 1 else 2, .bfloat16, s));
+    }
+    var ones_norm = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&ones_norm, &[_]c_int{128}, 1, .bfloat16, s));
+    var prng = std.Random.DefaultPrng.init(0xDECA7);
+    const la = LinearAttnWeights{
+        .qkv_w = zeros[0],
+        .qkv_s = .{},
+        .qkv_b = .{},
+        .z_w = zeros[1],
+        .z_s = .{},
+        .z_b = .{},
+        .a_w = a_w,
+        .a_s = .{},
+        .a_b = .{},
+        .b_w = zeros[2],
+        .b_s = .{},
+        .b_b = .{},
+        .conv1d_w = try gdnRecurRand(prng.random(), &.{ c_dim, 4, 1 }, 1.0, .bfloat16, s),
+        .A_log = A_log,
+        .dt_bias = zeros[4],
+        .norm_w = ones_norm,
+        .out_w = zeros[3],
+        .out_s = .{},
+        .out_b = .{},
+    };
+    defer inline for (.{ la.qkv_w, la.z_w, la.a_w, la.b_w, la.conv1d_w, la.A_log, la.dt_bias, la.norm_w, la.out_w }) |arr| {
+        _ = mlx.mlx_array_free(arr);
+    };
+    const state0 = try gdnRecurRand(prng.random(), &.{ 1, hv, 128, 128 }, 1.0, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(state0);
+    const start = try gdnDecayHost(state0, s);
+    defer testing.allocator.free(start);
+
+    const Case = struct { route: GdnDecayRoute, per_call: c_int };
+    const cases = [_]Case{
+        .{ .route = .chain, .per_call = 1 },
+        .{ .route = .prework_chain, .per_call = 1 },
+        .{ .route = .decode, .per_call = 1 },
+        .{ .route = .verify, .per_call = 2 },
+        .{ .route = .verify, .per_call = 3 },
+        .{ .route = .verify, .per_call = 4 },
+        .{ .route = .verify, .per_call = 5 },
+        .{ .route = .verify, .per_call = 6 },
+        .{ .route = .verify, .per_call = 7 },
+        .{ .route = .verify, .per_call = 8 },
+        .{ .route = .fold, .per_call = 2 },
+        .{ .route = .prefill, .per_call = gdn_decay_steps },
+    };
+    var finals: [cases.len][]f32 = undefined;
+    var made: usize = 0;
+    defer for (finals[0..made]) |f| testing.allocator.free(f);
+    for (cases, 0..) |c, i| {
+        var rows: []f32 = &.{};
+        defer if (rows.len > 0) testing.allocator.free(rows);
+        finals[i] = try gdnDecayRun(&xfm, &la, c.route, c.per_call, state0, c_dim, &rows);
+        made += 1;
+        try gdnDecayExpectExact(start, finals[i], hv, @intCast(gdn_decay_steps), 1e-3);
+        // Row j of the last call is the state after that many tokens: the rollback source.
+        var j: usize = 0;
+        while (rows.len > 0 and j + 1 < @as(usize, @intCast(c.per_call))) : (j += 1) {
+            try gdnDecayExpectExact(start, rows[j * start.len ..][0..start.len], hv, @as(usize, @intCast(gdn_decay_steps - c.per_call)) + j + 1, 1e-3);
+        }
+    }
+    // The fused arms share one gate formula and the chain arms MLX's: bit-equal inside a family.
+    for (finals[3..11]) |f| try gdnDecayEqualBits(finals[2], f);
+    try gdnDecayEqualBits(finals[1], finals[2]);
+    try gdnDecayEqualBits(finals[0], finals[11]);
+    // Across families, precise::exp against MLX's exp differ by ulps of g, not a bf16 step.
+    try gdnDecayClose(finals[0], finals[2], 1e-4);
 }
 
 test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 incl. strided q" {
@@ -48850,7 +49076,7 @@ test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity 
             var dt = mlx.mlx_array_new();
             if (mlx.mlx_vector_array_get(&dt, input, 2) != 0) return -1;
             defer _ = mlx.mlx_array_free(dt);
-            const g = gdnGateChain(A_log, a, dt, st.*) catch return -1;
+            const g = gdnGateChain(A_log, a, dt, .bfloat16, st.*) catch return -1;
             const arr = [_]mlx.mlx_array{g};
             res.* = mlx.mlx_vector_array_new_data(&arr, 1);
             _ = mlx.mlx_array_free(g);
@@ -48885,11 +49111,68 @@ test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity 
     var g_compiled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(g_compiled);
     try mlx.check(mlx.mlx_vector_array_get(&g_compiled, out_vec, 0));
-    const g_chain = try gdnGateChain(A_log, a, dt_bias, s);
+    const g_chain = try gdnGateChain(A_log, a, dt_bias, .bfloat16, s);
     defer _ = mlx.mlx_array_free(g_chain);
     const d = try attn256MaxDiff(g_compiled, g_chain, s);
     errdefer std.debug.print("[gate probe] compiled vs chain max |diff| = {e}\n", .{d});
     try std.testing.expectEqual(@as(f32, 0.0), d);
+}
+
+test "gdn gate at f32: compiled closure, graph chain and prework kernel agree to a few ulps and carry the f32 width" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    xfm.config.gdn_state_f32 = true;
+    xfm.compileGdnGate();
+    defer if (xfm.compiled_gdn_gate) |closure| {
+        _ = mlx.mlx_closure_free(closure);
+    };
+    try testing.expect(xfm.compiled_gdn_gate != null);
+    var prng = std.Random.DefaultPrng.init(0x6A7F);
+    const rnd = prng.random();
+    const hk: c_int = 2;
+    const hv: c_int = 48;
+    const c_dim: c_int = 2 * hk * 128 + hv * 128;
+    const q_scale = bf16Scalar(1.0 / 128.0, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const k_scale = bf16Scalar(@sqrt(1.0 / 128.0), s);
+    defer _ = mlx.mlx_array_free(k_scale);
+    const A_log = try attn256RandBf16(rnd, &[_]c_int{hv}, s);
+    defer _ = mlx.mlx_array_free(A_log);
+    const dt_bias = try attn256RandBf16(rnd, &[_]c_int{hv}, s);
+    defer _ = mlx.mlx_array_free(dt_bias);
+    var worst: f64 = 0;
+    for ([_]c_int{ 1, 9, 65, 513 }) |seq| {
+        const qkv = try attn256RandBf16(rnd, &[_]c_int{ 1, seq, c_dim }, s);
+        defer _ = mlx.mlx_array_free(qkv);
+        const conv_state = try attn256RandBf16(rnd, &[_]c_int{ 1, 3, c_dim }, s);
+        defer _ = mlx.mlx_array_free(conv_state);
+        const conv_w = try attn256RandBf16(rnd, &[_]c_int{ c_dim, 4, 1 }, s);
+        defer _ = mlx.mlx_array_free(conv_w);
+        const b_in = try attn256RandBf16Scaled(rnd, &[_]c_int{ 1, seq, hv }, 16.0, s);
+        defer _ = mlx.mlx_array_free(b_in);
+        const a_in = try attn256RandBf16Scaled(rnd, &[_]c_int{ 1, seq, hv }, 16.0, s);
+        defer _ = mlx.mlx_array_free(a_in);
+        const pre = (try gdnPreworkFused(s, .{ .qkv = qkv, .qkv_off = 0, .qkv_stride = c_dim, .b = b_in, .b_off = 0, .b_stride = hv, .a = a_in, .a_off = 0, .a_stride = hv, .A_log = A_log, .dt_bias = dt_bias, .conv_state = conv_state, .conv_w = conv_w, .q_scale = q_scale, .k_scale = k_scale, .hk = hk, .hv = hv, .dk = 128, .dv = 128, .seq = seq, .gate_dtype = .float32 })) orelse return error.FusedDeclined;
+        defer inline for (.{ pre.q, pre.k, pre.v, pre.conv_state, pre.g, pre.beta }) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        const g_closure = try xfm.computeGdnGate(A_log, a_in, dt_bias);
+        defer _ = mlx.mlx_array_free(g_closure);
+        const g_chain = try gdnGateChain(A_log, a_in, dt_bias, .float32, s);
+        defer _ = mlx.mlx_array_free(g_chain);
+        for ([_]mlx.mlx_array{ pre.g, g_closure, g_chain }) |g| try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(g));
+        const want = try gdnDecayHost(g_chain, s);
+        defer testing.allocator.free(want);
+        for ([_]mlx.mlx_array{ pre.g, g_closure }) |g| {
+            const got = try gdnDecayHost(g, s);
+            defer testing.allocator.free(got);
+            for (want, got) |w, x| worst = @max(worst, @abs(@as(f64, w) - @as(f64, x)) / @max(@abs(@as(f64, w)), 1e-30));
+        }
+    }
+    // precise::exp and MLX's exp round differently in the last bits of an f32, never by a bf16 step.
+    try testing.expect(worst <= 1e-6);
 }
 
 test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, PLE tokens) through capture and restore" {
@@ -55809,7 +56092,10 @@ test "gdn verify fold: output and every rollback state remain bit-identical" {
     defer gdn_decode_fused_override = null;
     for ([_][2]c_int{ .{ 2, 8 }, .{ 16, 48 } }) |heads| {
         var t: c_int = 2;
-        while (t <= gdn_decode.MAX_SEQ) : (t += 1) try gdnRecurParityCase(s, heads[0], heads[1], t, true);
+        while (t <= gdn_decode.MAX_SEQ) : (t += 1) {
+            try gdnRecurParityCase(s, heads[0], heads[1], t, true, false);
+            try gdnRecurParityCase(s, heads[0], heads[1], t, true, true);
+        }
     }
 }
 
@@ -55824,11 +56110,11 @@ test "gdn verify fold: unsupported threadgroup declines without poisoning later 
     defer gdn_decode_fused_override = null;
     gdn_decode.fold_nt_override = 2048;
     defer gdn_decode.fold_nt_override = null;
-    try gdnRecurParityCase(s, 2, 8, 2, true);
+    try gdnRecurParityCase(s, 2, 8, 2, true, false);
     try testing.expect(gdn_decode.foldDeclined(2));
     try testing.expect(!mlx.errorPending());
     gdn_decode.fold_nt_override = null;
-    try gdnRecurParityCase(s, 2, 8, 2, true);
+    try gdnRecurParityCase(s, 2, 8, 2, true, false);
     try testing.expect(!mlx.errorPending());
 }
 

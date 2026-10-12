@@ -1,10 +1,11 @@
-//! Fused GatedDeltaNet decode and verify step (B=1, per-head gate, bf16): the
+//! Fused GatedDeltaNet decode and verify step (B=1, per-head gate, bf16 activations): the
 //! prework (conv, silu, q/k norm, gate, beta) and the recurrence in ONE dispatch,
 //! then the norm-gate epilogue, or folds it and rollback history into verify.
 //! Each head runs over SPLIT threadgroups in the unfolded kernel; each
 //! recomputes its head's prework (cheaper than a barrier between kernels) before
-//! its slice of the recurrence rows. Outputs are the bf16 y, state and capture
-//! buffers of `gdnPreworkFused -> gated_delta_step[_seq]`, bit for bit.
+//! its slice of the recurrence rows. Outputs are the bf16 y and the state and capture
+//! buffers (bf16 or f32, as the incoming state) of `gdnPreworkFused -> gated_delta_step[_seq]`,
+//! bit for bit.
 //! Port of mlx-serve `src/gdn_decode.zig` (K1 by David Dalcu; the verify-width
 //! kernel and host plumbing from mlx-serve #517 by Samuel Reed); its Hadamard
 //! norm-gate-rotate kernel is not ported. The verify fold adapts mlx-serve #558.
@@ -69,10 +70,10 @@ const K1_SOURCE =
     \\  const T bv = b_in[hv];
     \\  T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\  gb[1] = float(bsig);
-    \\  const T apd = T(float(a_in[hv]) + float(dt_bias[hv]));
+    \\  const GT apd = GT(float(a_in[hv]) + float(dt_bias[hv]));
     \\  float sp = sushi_log1p(metal::precise::exp(float(apd)));
     \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  gb[0] = float(T(metal::precise::exp(-(ea * sp))));
+    \\  gb[0] = float(GT(metal::precise::exp(-(ea * sp))));
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\float kk[4], qq[4];
@@ -160,9 +161,9 @@ const K1S_HEAD =
     \\    const T bv = b_in[t * HV + hv];
     \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\    gb[t][1] = float(bsig);
-    \\    const T apd = T(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
+    \\    const GT apd = GT(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
     \\    float sp = sushi_log1p(metal::precise::exp(float(apd)));
-    \\    gb[t][0] = float(T(metal::precise::exp(-(ea * sp))));
+    \\    gb[t][0] = float(GT(metal::precise::exp(-(ea * sp))));
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -247,6 +248,7 @@ pub const Inputs = struct {
     dt_bias: mlx.mlx_array, // [Hv]
     q_scale: mlx.mlx_array, // 0-dim bf16
     k_scale: mlx.mlx_array, // 0-dim bf16
+    gate_dtype: mlx.mlx_dtype = .bfloat16, // the decay gate's rounding: bf16 or f32
 };
 
 /// y [1,S,Hv,Dv], the next conv state [1,3,C] and the final state [1,Hv,Dv,Dk];
@@ -266,7 +268,8 @@ pub const Recur = struct {
 
 var k1_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var k1s_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var cfg_key: ?Geometry = null;
+const Widths = struct { g: Geometry, state: mlx.mlx_dtype, gate: mlx.mlx_dtype };
+var cfg_key: ?Widths = null;
 /// Index = token count; 1 is the decode kernel's, 2..MAX_SEQ the verify kernel's.
 var cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 
@@ -281,18 +284,19 @@ fn makeKernel(name: [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]con
     return k;
 }
 
-fn buildConfig(g: Geometry, t_len: c_int) !mlx.mlx_fast_metal_kernel_config {
+fn buildConfig(g: Geometry, t_len: c_int, state: mlx.mlx_dtype, gate: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_config {
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t_len, g.hv, g.dv }, 4, .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, .bfloat16));
-    if (t_len > 1) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, state));
+    if (t_len > 1) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, state));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", state));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gate));
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     if (t_len > 1) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
@@ -303,11 +307,16 @@ fn shapeIs(a: mlx.mlx_array, want: []const c_int) bool {
     return std.mem.eql(c_int, mlx.getShape(a), want);
 }
 
+fn isStateWidth(dt: mlx.mlx_dtype) bool {
+    return dt == .bfloat16 or dt == .float32;
+}
+
 fn inputsFit(g: Geometry, t_len: c_int, in: Inputs) bool {
     if (t_len < 1 or t_len > MAX_SEQ) return false;
     if (g.dk != 128 or g.dv != 128 or g.hk < 1 or @rem(g.hv, g.hk) != 0) return false;
-    for ([_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.dt_bias, in.q_scale, in.k_scale }) |arr|
+    for ([_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.conv_w, in.dt_bias, in.q_scale, in.k_scale }) |arr|
         if (mlx.mlx_array_dtype(arr) != .bfloat16) return false;
+    if (!isStateWidth(mlx.mlx_array_dtype(in.ssm_state)) or !isStateWidth(in.gate_dtype)) return false;
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     if (!shapeIs(in.qkv, &.{ 1, t_len, c }) or !shapeIs(in.a, &.{ 1, t_len, g.hv }) or !shapeIs(in.b, &.{ 1, t_len, g.hv }) or
         !shapeIs(in.conv_state, &.{ 1, 3, c }) or !shapeIs(in.ssm_state, &.{ 1, g.hv, g.dv, g.dk }) or
@@ -319,8 +328,8 @@ fn inputsFit(g: Geometry, t_len: c_int, in: Inputs) bool {
 }
 
 /// Prework + recurrence over `t_len` tokens (1 = decode, 2..MAX_SEQ = verify
-/// with per-step state capture). Null outside the kernels' geometry and outside
-/// bf16, the one width the chain's prework, recurrence and norm-gate all serve.
+/// with per-step state capture). Null outside the kernels' geometry, off bf16 activations (the
+/// chain's prework and norm-gate serve no other) and for a state or gate that is neither bf16 nor f32.
 pub fn step(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?Recur {
     if (!mlx.streamIsGpu(s) or !inputsFit(g, t_len, in)) return null;
 
@@ -335,15 +344,16 @@ pub fn step(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?Recur {
             k1_kernel = try makeKernel("sushi_gdn_decode_recur", &.{ "y", "conv_out", "state_out" }, K1_SOURCE);
             break :blk k1_kernel.?;
         };
-    if (cfg_key == null or !std.meta.eql(cfg_key.?, g)) {
+    const widths = Widths{ .g = g, .state = mlx.mlx_array_dtype(in.ssm_state), .gate = in.gate_dtype };
+    if (cfg_key == null or !std.meta.eql(cfg_key.?, widths)) {
         for (&cfgs) |*slot| if (slot.*) |cf| {
             _ = mlx.mlx_fast_metal_kernel_config_free(cf);
             slot.* = null;
         };
-        cfg_key = g;
+        cfg_key = widths;
     }
     const idx: usize = @intCast(t_len);
-    if (cfgs[idx] == null) cfgs[idx] = try buildConfig(g, t_len);
+    if (cfgs[idx] == null) cfgs[idx] = try buildConfig(g, t_len, widths.state, widths.gate);
 
     const ins = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
     const v = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -382,7 +392,7 @@ pub var fold_nt_override: ?c_int = null;
 var fold_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var fold_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 var fold_ok: [MAX_SEQ + 1]?bool = @splat(null);
-const FoldKey = struct { g: Geometry, swish: bool, nt: c_int };
+const FoldKey = struct { g: Geometry, swish: bool, nt: c_int, state: mlx.mlx_dtype, gate: mlx.mlx_dtype };
 var fold_key: ?FoldKey = null;
 
 pub fn foldDeclined(t_len: c_int) bool {
@@ -394,19 +404,21 @@ fn buildFoldConfig(key: FoldKey, t_len: c_int) !mlx.mlx_fast_metal_kernel_config
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    inline for (.{ &[_]c_int{ 1, t_len, g.hv * g.dv }, &[_]c_int{ 1, 3, c }, &[_]c_int{ 1, g.hv, g.dv, g.dk }, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, &[_]c_int{ 1, 3 + t_len, c } }) |shape|
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape, shape.len, .bfloat16));
+    const out_dtypes = [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, key.state, key.state, .bfloat16 };
+    inline for (.{ &[_]c_int{ 1, t_len, g.hv * g.dv }, &[_]c_int{ 1, 3, c }, &[_]c_int{ 1, g.hv, g.dv, g.dk }, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, &[_]c_int{ 1, 3 + t_len, c } }, 0..) |shape, i|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape, shape.len, out_dtypes[i]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * key.nt, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, key.nt, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", key.state));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", key.gate));
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", key.nt }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len }, .{ "SWISH", @as(c_int, @intFromBool(key.swish)) } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     return cfg;
 }
 
 /// Verify recurrence, norm-gate and rollback convolution history in one dispatch.
-/// The recurrence retains the stored bf16 state between tokens, as serial decode does.
+/// The recurrence retains the stored state between tokens, as serial decode does.
 pub fn stepFold(g: Geometry, t_len: c_int, in: Inputs, z: mlx.mlx_array, norm_w: mlx.mlx_array, eps: mlx.mlx_array, swish: bool, s: mlx.mlx_stream) !?Fold {
     if (!mlx.streamIsGpu(s) or t_len < 2 or !inputsFit(g, t_len, in)) return null;
     if (mlx.mlx_array_dtype(z) != .bfloat16 or mlx.mlx_array_dtype(norm_w) != .bfloat16 or mlx.mlx_array_dtype(eps) != .float32) return null;
@@ -422,7 +434,7 @@ pub fn stepFold(g: Geometry, t_len: c_int, in: Inputs, z: mlx.mlx_array, norm_w:
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         fold_kernel = k;
     }
-    const key = FoldKey{ .g = g, .swish = swish, .nt = fold_nt_override orelse FOLD_NT };
+    const key = FoldKey{ .g = g, .swish = swish, .nt = fold_nt_override orelse FOLD_NT, .state = mlx.mlx_array_dtype(in.ssm_state), .gate = in.gate_dtype };
     if (fold_key == null or !std.meta.eql(fold_key.?, key)) {
         for (&fold_cfgs) |*slot| if (slot.*) |cfg| {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);

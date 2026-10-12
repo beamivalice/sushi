@@ -277,7 +277,8 @@ pub const Qwen4Mtp = struct {
 };
 
 /// Compile the GatedDeltaNet gating chain (astype→exp→add→astype→exp→log1p→
-/// multiply→negative→exp→astype, ~10 dispatches) into one fused kernel.
+/// multiply→negative→exp→astype, ~10 dispatches) into one fused kernel, at the dtype
+/// `config.gdnGateDtype()` holds when the first call traces it.
 /// shapeless=true: pure elementwise chain, same trace for any [B,S,Hv].
 pub fn compileGdnGate(self: *Transformer) void {
     const raw_closure = mlx.mlx_closure_new_func_payload(
@@ -306,7 +307,7 @@ pub fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_
     if (mlx.mlx_vector_array_get(&dt_bias, input, 2) != 0) return -1;
     defer _ = mlx.mlx_array_free(dt_bias);
 
-    const g = gdnGateChain(A_log, a, dt_bias, self.s) catch return -1;
+    const g = gdnGateChain(A_log, a, dt_bias, self.config.gdnGateDtype(), self.s) catch return -1;
     const out_arr = [_]mlx.mlx_array{g};
     res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
     _ = mlx.mlx_array_free(g);

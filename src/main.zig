@@ -224,11 +224,12 @@ fn printUsage(io: std.Io) void {
         \\                        and it outranks `enable_mtp:true` in the
         \\                        request body.
         \\  --qwen-gdn <fp32|bf16>
-        \\                      Qwen only: store its GatedDeltaNet recurrent
-        \\                      state in fp32 between tokens (default bf16). A
-        \\                      KLD teacher rounds its state to bf16 like every
-        \\                      student, so its KLD cannot price that rounding;
-        \\                      capture the teacher under fp32 to measure it.
+        \\                      Qwen only: keep its GatedDeltaNet recurrent
+        \\                      state and decay gate in fp32 (default bf16).
+        \\                      Costs memory (twice the state per cache
+        \\                      checkpoint). A KLD teacher rounds both to bf16
+        \\                      like every student, so its KLD cannot price
+        \\                      that rounding; capture the teacher under fp32.
         \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8 or 4 — affine group quant; default 8 on

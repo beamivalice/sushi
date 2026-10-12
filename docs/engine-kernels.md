@@ -27,8 +27,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
   `gated_delta_step_seq` carries the stored bf16 state to the next token, so serial decode and rollback agree; a
   kernel that carries f32 (upstream's verbatim verify kernel) differs from verify row 1 on.
-- The GDN prework and norm-gate serve bf16 activations only; the chain's recurrence outputs take the stored state's
-  width, so an f32 state (`--qwen-gdn fp32`) runs the chain while `gdn_decode` declines it.
+- The GDN prework and norm-gate serve bf16 activations only. The recurrence kernels, the prework (`GT`) and
+  `gdn_decode` (K1, K1S, fold) take the stored state's width (`StT`) and the gate's (`GT`) as template args, so an f32
+  state and gate (`--qwen-gdn fp32`) run the fused step too; every gate producer rounds `g` once, at
+  `ModelConfig.gdnGateDtype()` (the compiled gate closure, `gdnGateChain`, the prework kernel, K1/K1S/fold), and the
+  recurrence reads it as f32 whatever it holds. An f32 gate also adds `a + dt_bias` in f32, as the HF reference does.
+  Its precise-exp kernels and MLX's exp differ by ulps of `g`, so f32 gate probes allow 1e-6 relative; bf16 stays exact.
 - The qwen4 fused HC read groups verify rows (`HC_ROW_GROUP` 8 per D/U dispatch group), so each weight word is read
   once per group. Configs are cached per (row count, inject, pending write): MTP alternates widths every round, and
   the first read, reads after a flush and the mixer differ in the other two. The row count stays a template argument:

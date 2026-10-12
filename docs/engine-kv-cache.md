@@ -61,9 +61,11 @@ A GDN trunk's `KVCache.step` is 0 forever (it advances on layer 0, a linear laye
 slot's `moe_seq_offset`; the pad-waste cap reads `KVCache.kvLenForBatching`. Batched N=2 acquits near-ties
 (≤ 0.15 nats).
 
-- The recurrent state is stored bf16 between tokens (the math runs in f32). `--qwen-gdn fp32` stores it f32
-  (`ModelConfig.gdnStateDtype`, one `[gdn] recurrent state f32` line): a Qwen checkpoint grows 58.8 → 115.5 MB, billed
-  by `ssmCheckpointBytes`, and a restored bf16 state is widened before its next step. GLM's state is KDA, not GDN: f32 by
+- The recurrent state is stored bf16 between tokens (the math runs in f32), and the decay gate `g` is rounded to bf16
+  by every producer: a head with exact g within 2^-9 of 1 gets g == 1.0 and never forgets (206 of 1728 heads in our
+  Flash-Next packs). `--qwen-gdn fp32` widens both (`ModelConfig.gdnStateDtype`, `gdnGateDtype`, one
+  `[gdn] recurrent state f32` line): a Qwen checkpoint grows 58.8 → 115.5 MB, billed by `ssmCheckpointBytes`, and a
+  restored bf16 state is widened before its next step. The gate is never stored. GLM's state is KDA, not GDN: f32 by
   construction, so the flag does not apply and the bill follows the arch, not the flag.
 
 ## Byte stability

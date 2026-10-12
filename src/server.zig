@@ -6205,7 +6205,7 @@ pub fn qwenGdnLine(config: *const model_mod.ModelConfig, fp32: bool) ?[]const u8
     if (!fp32) return null;
     if (config.isGlm5()) return "GDN state: --qwen-gdn fp32 does not apply to GLM (its KDA state is f32 already)";
     if (config.isMimo()) return "GDN state: --qwen-gdn fp32 does not apply to mimo_v2 (no GatedDeltaNet layers)";
-    return "GDN state: f32 between tokens (--qwen-gdn fp32; bf16 is the default)";
+    return "GDN state and decay gate: f32 (--qwen-gdn fp32; bf16 is the default)";
 }
 
 /// Per-token bytes of the qwen4 MTP head's own KV at the scheme it was LOADED with,
@@ -24190,7 +24190,7 @@ test "qwenGdnLine: --qwen-gdn fp32 is reported per arch, and refused where there
     const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
     try t.expect(qwenGdnLine(&qwen4, false) == null);
     try t.expect(qwenGdnLine(&glm, false) == null);
-    try t.expectEqualStrings("GDN state: f32 between tokens (--qwen-gdn fp32; bf16 is the default)", qwenGdnLine(&qwen4, true).?);
+    try t.expectEqualStrings("GDN state and decay gate: f32 (--qwen-gdn fp32; bf16 is the default)", qwenGdnLine(&qwen4, true).?);
     // GLM's recurrent state is KDA, not GDN: the flag names a layer it does not have.
     try t.expectEqualStrings("GDN state: --qwen-gdn fp32 does not apply to GLM (its KDA state is f32 already)", qwenGdnLine(&glm, true).?);
     try t.expectEqualStrings("GDN state: --qwen-gdn fp32 does not apply to mimo_v2 (no GatedDeltaNet layers)", qwenGdnLine(&mimo, true).?);
