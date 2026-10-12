@@ -35,8 +35,8 @@ pub const Options = struct {
     ctx_size: u32 = 0,
     /// Dense, not the serving default: the teacher adds no quantization of its own.
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
-    /// `--qwen-gdn fp32`: keep the teacher's GDN state and decay gate in f32 so its KLD sees
-    /// the roundings every bf16 student pays.
+    /// `--qwen-gdn fp32`: store the teacher's GDN state in f32 so its KLD sees
+    /// the rounding every bf16 student pays.
     qwen_gdn_fp32: bool = false,
     ssd_budget_bytes: u64 = 0,
     pick_tolerance: f32 = 0,
@@ -222,13 +222,13 @@ pub const USAGE =
     \\  --ctx-size <n>        context length override
     \\  --kv-quant <16|8|4>   KV cache quantization (16 = BF16, also off)
     \\  --qwen-gdn <fp32|bf16>
-    \\                      Qwen only: keep its GatedDeltaNet recurrent state
-    \\                      and decay gate in fp32 (default bf16). A bf16
-    \\                      teacher rounds both like every student, so KLD
-    \\                      cannot price those roundings; capture the teacher
-    \\                      under fp32 to measure them. GLM's KDA state is f32
-    \\                      already and refuses the flag; a GLM pack has no
-    \\                      GDN arm.
+    \\                      Qwen only: store its GatedDeltaNet recurrent state
+    \\                      in fp32 (default bf16; the decay gate is fp32
+    \\                      either way). A bf16 teacher rounds its state like
+    \\                      every student, so KLD cannot price that rounding;
+    \\                      capture the teacher under fp32 to measure it.
+    \\                      GLM's KDA state is f32 already and refuses the
+    \\                      flag; a GLM pack has no GDN arm.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)

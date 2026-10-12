@@ -7,10 +7,11 @@ earlier history is mlx-serve's, in that project's changelog.
 ## Unreleased
 
 - **`--qwen-gdn fp32` no longer restores a bf16 state from the SSD prefix cache** (nor the reverse): the two widths now
-  keep separate cache namespaces; existing bf16 caches stay valid.
-- **`--qwen-gdn fp32` is the full precision fix for Qwen3.8-Flash-Next**: it keeps the decay gate in f32 beside the
-  state, so slowly fading heads fade (a bf16 gate rounded them to never forgetting), and the fused decode and verify
-  steps now serve the f32 state instead of falling back.
+  keep separate cache namespaces.
+- **Qwen3.8-Flash-Next forgets at its true rate**: the linear-attention decay gate is now computed in f32, which a
+  bf16 gate rounded to "never forget" for the slowest heads; `--qwen-gdn fp32` also keeps the state in f32, and the
+  fused decode and verify steps now serve it instead of falling back. The Qwen SSD prefix cache starts empty on the
+  first boot after this change, since older entries hold bf16-gate state.
 - **64 GB Macs boot the recommended context again**: the load check no longer asks for 1 GB more than the requested
   context needs, which could refuse the documented 64 GB launch (`--ctx-size 250000`) in v1.2.2.
 - **GLM keeps its speed in `sushi run`**: DFlash2 now stays on for requests that carry `logit_bias` or

@@ -291,7 +291,7 @@ pub fn compileGdnGate(self: *Transformer) void {
     _ = mlx.mlx_closure_free(raw_closure);
     if (rc == 0 and compiled.ctx != null) {
         self.compiled_gdn_gate = compiled;
-        log.info("GDN gate compiled (kernel fusion enabled)\n", .{});
+        log.info("GDN gate compiled (kernel fusion enabled), g {s}\n", .{@tagName(self.config.gdnGateDtype())});
     }
 }
 

@@ -792,18 +792,19 @@ pub const ModelConfig = struct {
         return if (self.gdn_state_f32) .float32 else .bfloat16;
     }
 
-    /// Names a stored-state layout the weight files do not tell apart, for the SSD cache namespace;
-    /// null is the default layout. A restored state of the other width would be cast, not equal.
+    /// Names a stored-state layout the weight files do not tell apart, for the SSD cache namespace; null
+    /// is no GDN state. A restored state of the other width would be cast, and one written under a
+    /// bf16 gate continues differently from this engine's.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
-        if (self.linear_num_value_heads > 0 and !self.isGlm5() and self.gdnStateDtype() == .float32) return "gdn-f32-state-v1";
-        return null;
+        if (self.linear_num_value_heads == 0 or self.isGlm5()) return null;
+        return if (self.gdnStateDtype() == .float32) "gdn-f32-state-v1" else "gdn-gate-f32-v1";
     }
 
-    /// The GatedDeltaNet decay gate's dtype: `--qwen-gdn fp32` widens it with the state, since a bf16
-    /// gate near one is exactly 1.0 and that head never forgets. GLM's gate is KDA's own and never
-    /// reaches the GDN producers this speaks for.
+    /// The GatedDeltaNet decay gate's dtype, f32 whatever the state's width: a bf16 gate near one is
+    /// exactly 1.0 and that head never forgets. GLM's gate is KDA's own and never reaches the GDN
+    /// producers this speaks for.
     pub fn gdnGateDtype(self: *const ModelConfig) mlx.mlx_dtype {
-        return if (self.gdn_state_f32 and !self.isGlm5()) .float32 else .bfloat16;
+        return if (self.isGlm5()) .bfloat16 else .float32;
     }
 
     /// Bytes one recurrent-state element holds on this arch. GLM's KDA state is
@@ -5775,7 +5776,7 @@ test "--qwen-gdn fp32 is what parseConfig reads, on a loaded config and not a st
     try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), d.gdnStateDtype());
 }
 
-test "--qwen-gdn fp32 widens the GDN decay gate with the state; the default keeps both bf16; GLM keeps its own" {
+test "the GDN decay gate is f32 by default; --qwen-gdn fp32 widens the state too; GLM keeps its own" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -5794,7 +5795,7 @@ test "--qwen-gdn fp32 widens the GDN decay gate with the state; the default keep
     qwen_gdn_fp32 = false;
     var plain = try parseConfig(t.io, t.allocator, path);
     defer plain.deinit(t.allocator);
-    try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), plain.gdnGateDtype());
+    try t.expectEqual(@as(mlx.mlx_dtype, .float32), plain.gdnGateDtype());
     try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), plain.gdnStateDtype());
 
     qwen_gdn_fp32 = true;

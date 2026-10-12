@@ -44615,7 +44615,20 @@ test "qk norm rope fused: bit-identical at the qwen geometry (rd=32, strided pos
     }
 }
 
+/// A gate probe: exact at bf16, a few ulps of g at f32 (precise::exp against MLX's exp).
+fn gdnGateExpectClose(got: mlx.mlx_array, want: mlx.mlx_array, gate_dt: mlx.mlx_dtype, s: mlx.mlx_stream) !void {
+    try testing.expectEqual(gate_dt, mlx.mlx_array_dtype(got));
+    try testing.expectEqual(gate_dt, mlx.mlx_array_dtype(want));
+    const d = try attn256MaxDiff(got, want, s);
+    if (gate_dt == .bfloat16) try testing.expectEqual(@as(f32, 0.0), d) else try testing.expect(d <= 1e-6);
+}
+
 test "gdn packed prework: bit-identical to the composed chain at decode and prefill widths incl. gate/beta + folded layout" {
+    try gdnPreworkCase(.bfloat16);
+    try gdnPreworkCase(.float32);
+}
+
+fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
     const s = mlx.gpuStream();
     gdn_prefill_fused_override = true;
     defer gdn_prefill_fused_override = null;
@@ -44698,6 +44711,7 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
             .dk = dk,
             .dv = dv,
             .seq = seq,
+            .gate_dtype = gate_dt,
         })) orelse return error.FusedDeclined;
         defer _ = mlx.mlx_array_free(pre.q);
         defer _ = mlx.mlx_array_free(pre.k);
@@ -44770,9 +44784,14 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.conv_state, ref_state, s));
 
         // Gate + beta against the graph chain.
-        const g_ref = try xfm.computeGdnGate(A_log, a_in, dt_bias);
+        const g_ref = try gdnGateChain(A_log, a_in, dt_bias, gate_dt, s);
         defer _ = mlx.mlx_array_free(g_ref);
-        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.g, g_ref, s));
+        try gdnGateExpectClose(pre.g, g_ref, gate_dt, s);
+        if (gate_dt == xfm.config.gdnGateDtype()) {
+            const g_compiled = try xfm.computeGdnGate(A_log, a_in, dt_bias);
+            defer _ = mlx.mlx_array_free(g_compiled);
+            try gdnGateExpectClose(pre.g, g_compiled, gate_dt, s);
+        }
         var beta_ref = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(beta_ref);
         try mlx.check(mlx.mlx_sigmoid(&beta_ref, b_in, s));
@@ -44813,6 +44832,7 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
             .dk = dk,
             .dv = dv,
             .seq = seq,
+            .gate_dtype = gate_dt,
         })) orelse return error.FusedDeclined;
         defer _ = mlx.mlx_array_free(pre2.q);
         defer _ = mlx.mlx_array_free(pre2.k);
@@ -44867,7 +44887,7 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
             defer _ = mlx.mlx_array_free(b2);
             const a2 = try cat0(s, a_in, a_b);
             defer _ = mlx.mlx_array_free(a2);
-            var args_b = GdnPreworkArgs{ .qkv = qkv2, .qkv_off = 0, .qkv_stride = c_dim, .b = b2, .b_off = 0, .b_stride = hv, .a = a2, .a_off = 0, .a_stride = hv, .A_log = A_log, .dt_bias = dt_bias, .conv_state = st2, .conv_w = conv_w, .q_scale = q_scale, .k_scale = k_scale, .hk = hk, .hv = hv, .dk = dk, .dv = dv, .seq = seq, .batch = 2 };
+            var args_b = GdnPreworkArgs{ .qkv = qkv2, .qkv_off = 0, .qkv_stride = c_dim, .b = b2, .b_off = 0, .b_stride = hv, .a = a2, .a_off = 0, .a_stride = hv, .A_log = A_log, .dt_bias = dt_bias, .conv_state = st2, .conv_w = conv_w, .q_scale = q_scale, .k_scale = k_scale, .hk = hk, .hv = hv, .dk = dk, .dv = dv, .seq = seq, .batch = 2, .gate_dtype = gate_dt };
             const preb = (try gdnPreworkFused(s, args_b)) orelse return error.FusedDeclined;
             defer inline for (.{ preb.q, preb.k, preb.v, preb.conv_state, preb.g, preb.beta }) |arr| {
                 _ = mlx.mlx_array_free(arr);
@@ -44927,6 +44947,7 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
             .dk = dk,
             .dv = dv,
             .seq = 2,
+            .gate_dtype = gate_dt,
         };
         args.seq = 17;
         gdn_prefill_fused_override = false;
@@ -44951,6 +44972,11 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
 }
 
 test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row" {
+    try gdnPreworkBatchedCase(.bfloat16);
+    try gdnPreworkBatchedCase(.float32);
+}
+
+fn gdnPreworkBatchedCase(gate_dt: mlx.mlx_dtype) !void {
     const s = mlx.gpuStream();
     gdn_prework_override = true;
     defer gdn_prework_override = null;
@@ -45030,6 +45056,7 @@ test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row"
             .dv = dv,
             .seq = seq,
             .batch = batch,
+            .gate_dtype = gate_dt,
         })) orelse return error.FusedDeclined;
         defer inline for (.{ preb.q, preb.k, preb.v, preb.conv_state, preb.g, preb.beta }) |arr| {
             _ = mlx.mlx_array_free(arr);
@@ -45100,11 +45127,9 @@ test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row"
         const ds = try attn256MaxDiff(preb.conv_state, ref_state, s);
         if (ds != 0) std.debug.print("prework B={d} conv_state maxdiff={e}\n", .{ batch, ds });
         try std.testing.expectEqual(@as(f32, 0.0), ds);
-        const g_ref = try gdnGateChain(A_log, a_in, dt_bias, .bfloat16, s);
+        const g_ref = try gdnGateChain(A_log, a_in, dt_bias, gate_dt, s);
         defer _ = mlx.mlx_array_free(g_ref);
-        const dg = try attn256MaxDiff(preb.g, g_ref, s);
-        if (dg != 0) std.debug.print("prework B={d} g maxdiff={e}\n", .{ batch, dg });
-        try std.testing.expectEqual(@as(f32, 0.0), dg);
+        try gdnGateExpectClose(preb.g, g_ref, gate_dt, s);
         var beta_ref = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(beta_ref);
         try mlx.check(mlx.mlx_sigmoid(&beta_ref, b_in, s));
@@ -45133,6 +45158,7 @@ test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row"
             .dv = dv,
             .seq = seq,
             .batch = 1,
+            .gate_dtype = gate_dt,
         };
         const last: c_int = batch - 1;
         const q1 = try row0(s, qkv, last);
@@ -45332,9 +45358,9 @@ fn gdnChainRecurrence(s: mlx.mlx_stream, pre: *const GdnPrework, state: mlx.mlx_
     return r;
 }
 
-/// `wide`: an f32 state under an f32 gate, the `--qwen-gdn fp32` widths.
+/// The served gate is f32; `wide` adds the f32 state of `--qwen-gdn fp32`.
 fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, folded: bool, wide: bool) !void {
-    const gate_dt: mlx.mlx_dtype = if (wide) .float32 else .bfloat16;
+    const gate_dt: mlx.mlx_dtype = .float32;
     var prng = std.Random.DefaultPrng.init(0x6D5E + @as(u64, @intCast(t_len * 131 + hv)));
     const rnd = prng.random();
     const dk: c_int = 128;
@@ -45366,7 +45392,7 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
     defer _ = mlx.mlx_array_free(dt_bias);
     const norm_w = try gdnRecurRand(rnd, &.{dv}, 2.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(norm_w);
-    const ssm_state = try gdnRecurRand(rnd, &.{ 1, hv, dv, dk }, 1.0, gate_dt, s);
+    const ssm_state = try gdnRecurRand(rnd, &.{ 1, hv, dv, dk }, 1.0, if (wide) .float32 else .bfloat16, s);
     defer _ = mlx.mlx_array_free(ssm_state);
 
     const pre = (try gdnPreworkFused(s, .{ .gate_dtype = gate_dt, .qkv = qkv, .qkv_off = 0, .qkv_stride = c_dim, .b = b_in, .b_off = 0, .b_stride = hv, .a = a_in, .a_off = 0, .a_stride = hv, .A_log = A_log, .dt_bias = dt_bias, .conv_state = conv_state, .conv_w = conv_w, .q_scale = q_scale, .k_scale = k_scale, .hk = hk, .hv = hv, .dk = dk, .dv = dv, .seq = t_len })) orelse return error.FusedDeclined;
@@ -45583,7 +45609,7 @@ test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and 
     try gdnRecurLayerCase(true);
 }
 
-/// `wide`: an f32 state under an f32 gate, the `--qwen-gdn fp32` widths.
+/// The served gate is f32; `wide` adds the f32 state of `--qwen-gdn fp32`.
 fn gdnRecurLayerCase(wide: bool) !void {
     const s = mlx.gpuStream();
     gdn_prework_override = true;
@@ -45896,7 +45922,14 @@ fn gdnDecayRun(xfm: *Transformer, la: *const LinearAttnWeights, route: GdnDecayR
     return gdnDecayHost(entry.ssm_state, s);
 }
 
-test "gdn decay: at an f32 state and gate every route forgets at the exact rate, and the routes agree" {
+test "gdn decay: at an f32 state and gate every route forgets at the exact rate; at the default bf16 state the routes agree" {
+    try gdnDecayCase(true);
+    try gdnDecayCase(false);
+}
+
+/// The gate is f32 either way. An f32 state forgets at the exact rate; a bf16 state rounds a slow head's
+/// decay away (its step is under half a bf16 ulp), so only the routes' agreement is asserted there.
+fn gdnDecayCase(state_f32: bool) !void {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -45914,7 +45947,7 @@ test "gdn decay: at an f32 state and gate every route forgets at the exact rate,
     xfm.config.linear_value_head_dim = 128;
     xfm.config.linear_conv_kernel_dim = 4;
     xfm.config.rms_norm_eps = 1e-6;
-    xfm.config.gdn_state_f32 = true;
+    xfm.config.gdn_state_f32 = state_f32;
 
     // Zero q/k/v projections and a ones input make `a` the column sum of a_w: each head's gate input is
     // exact and the recurrence reduces to state *= g.
@@ -45991,19 +46024,20 @@ test "gdn decay: at an f32 state and gate every route forgets at the exact rate,
         defer if (rows.len > 0) testing.allocator.free(rows);
         finals[i] = try gdnDecayRun(&xfm, &la, c.route, c.per_call, state0, c_dim, &rows);
         made += 1;
-        try gdnDecayExpectExact(start, finals[i], hv, @intCast(gdn_decay_steps), 1e-3);
+        if (state_f32) try gdnDecayExpectExact(start, finals[i], hv, @intCast(gdn_decay_steps), 1e-3);
         // Row j of the last call is the state after that many tokens: the rollback source.
         var j: usize = 0;
-        while (rows.len > 0 and j + 1 < @as(usize, @intCast(c.per_call))) : (j += 1) {
+        while (state_f32 and rows.len > 0 and j + 1 < @as(usize, @intCast(c.per_call))) : (j += 1) {
             try gdnDecayExpectExact(start, rows[j * start.len ..][0..start.len], hv, @as(usize, @intCast(gdn_decay_steps - c.per_call)) + j + 1, 1e-3);
         }
     }
     // The fused arms share one gate formula and the chain arms MLX's: bit-equal inside a family.
     for (finals[3..11]) |f| try gdnDecayEqualBits(finals[2], f);
     try gdnDecayEqualBits(finals[1], finals[2]);
-    try gdnDecayEqualBits(finals[0], finals[11]);
+    // A prefill chunk holds its state in f32 across tokens; a bf16 state rounds it every token.
+    if (state_f32) try gdnDecayEqualBits(finals[0], finals[11]);
     // Across families, precise::exp against MLX's exp differ by ulps of g, not a bf16 step.
-    try gdnDecayClose(finals[0], finals[2], 1e-4);
+    if (state_f32) try gdnDecayClose(finals[0], finals[2], 1e-4);
 }
 
 test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 incl. strided q" {
@@ -49123,7 +49157,6 @@ test "gdn gate at f32: compiled closure, graph chain and prework kernel agree to
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
-    xfm.config.gdn_state_f32 = true;
     xfm.compileGdnGate();
     defer if (xfm.compiled_gdn_gate) |closure| {
         _ = mlx.mlx_closure_free(closure);

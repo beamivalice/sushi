@@ -53,7 +53,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
 | `--kv-quant` | `8` → KV scheme 8, 4 or 16 (`off` = BF16); also `kv_quant` in settings and per request (main.zig:972) | user | help, usage, engine-kv-cache; 21 tests | keep |
-| `--qwen-gdn` | `bf16` → keep the GatedDeltaNet state and decay gate in `fp32`, Qwen only (main.zig:966) | user | help, engine-kernels, quality-kld; 0 tests (kld parse test) | keep: the long-context precision tradeoff; add a serve-side test |
+| `--qwen-gdn` | `bf16` → store the GatedDeltaNet state in `fp32`, Qwen only; the decay gate is f32 either way (main.zig:966) | user | help, engine-kernels, quality-kld; 0 tests (kld parse test) | keep: the long-context precision tradeoff (measured against the f32-gate default: raw KLD -0.5% and held-out code -1%, both inside the noise; about -2% on 4-stream aggregate and +54 MB per checkpoint, [qwen4-kld](qwen4-kld.md#gdn-f32-teacher), [qwen4-perf](qwen4-perf.md#gdn-f32-cost)); add a serve-side test |
 | `--mtp-head-kv-quant` | off → Qwen's MTP head KV follows `--kv-quant`; no effect on MiMo (main.zig:762) | machine | help, usage, README, engine-mtp; 0 tests | keep: the long-context memory bills use it |
 
 ## Speculation (MTP, prompt lookup, drafter)
@@ -135,7 +135,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--no-template` | off → feed raw prompt text (kld.zig:143) | dev | help, quality-kld | keep |
 | `kld`: `--ctx-size` | model max → context override (kld.zig:108) | dev | help | keep |
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
-| `kld`: `--qwen-gdn` | `bf16` → fp32 GDN state and gate for a teacher that prices those roundings (kld.zig:110) | dev | help, quality-kld | keep |
+| `kld`: `--qwen-gdn` | `bf16` → fp32 GDN state for a teacher that prices that rounding (kld.zig:110) | dev | help, quality-kld | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |
 | `kld`: `--wired-margin-gib` | `1` → headroom under the wired limit (kld.zig:114) | dev | help | keep |

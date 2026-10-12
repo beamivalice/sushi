@@ -107,3 +107,78 @@ against a different binary and flag set, which is why the delta is quoted rather
 
 Sushi-2.6bpw (4-bit n-gram table, binary `ad5e6be8`, same settings): `--kv-quant 4` scores 0.145841 / top-1 88.84% /
 NLL 0.465802 against kv8's 0.135508 / 89.08% / 0.454090, +7.63% KLD and -0.24 pp.
+
+<a id="gdn-f32-teacher"></a>
+## The f32 GDN teacher (gate and state)
+
+The 16x512 teachers above round the GatedDeltaNet gate and state to bf16 like every student, so their KLD cannot price that
+rounding. This teacher stores both f32. Numbers on it are read only against each other.
+
+- Teacher `qwen38-flash-next-bf16-gdnf32-v1` (under `kld-teacher/`): the BF16 checkpoint streamed (`--ssd-budget-gb 94`),
+  `--kv-quant off`, `--qwen-gdn fp32` (f32 state and f32 gate), `--no-template`, `--ctx-size 20480`, `--top-k 10`, no MTP,
+  `MLX_ENABLE_TF32=0`, binary built at `0a50c13c` (the f32-gate change, mtime 2026-10-12 10:43:43, sha256 `c19e5a35...`).
+- Three views of it, each a normal fixture: `raw` (the 16 wikitext prompts of the Flash-Next 16x512 raw fixture, 512 greedy
+  rows each), `long` (teacher-forced `continuation_ids`, [quality-kld](quality-kld.md#the-tool)) and `code2`.
+- `long` holds chat-A (64-id prefix, 16,384 forced rows of one 16.7K-token chat history), chat and `de.rs` at prefill depths
+  2048 / 8192 / 16384 with 256 forced rows each (one-forward prefill, no chunk boundary). `code2` holds the same three
+  depths of held-out Zig (`gdn_decode.zig` + `qwen4_forward.zig` at `314573ed`) in a second capture with the same settings.
+- Held-out text: 0 13-gram hits against `tune-corpus-v2` (what Sushi-2.6bpw was tuned on); chat and `de.rs` are in other calib
+  corpora, `code2` in none.
+- The raw prompts are the old fixture's text; ids are identical except `wikitext2-test-07-hed-pe` (sushi's tokenizer, 2 of
+  322 ids differ). Every arm scores the sushi ids; the old-teacher compare keeps the old ones.
+- Arm a on the OLD raw teacher reproduces 0.137095 / 89.23% / 0.455440 of [Release 1.2.2 check](#flash-next-16x512-first-eos-7186-positions-kv8) exactly.
+- The new teacher's strict NLL on the raw prompts is 0.2584 against 0.2972 for the old one, and its greedy continuations
+  diverge within 40 tokens on every prompt (the old teacher came from mlx-serve): raw numbers are not comparable across teachers.
+
+Arms (student Sushi-2.6bpw, kv8, no MTP, `--ctx-size` 8192 raw / 20480 long, M5 Max 128 GB, `taskpolicy -a`, GPU lock per compare,
+2026-10-12): **a** = main `60272184` (bf16 gate, bf16 state; mtime 10:19:17, sha256 `3a03a4f5...`), **b** = the f32-gate change, default flags
+(f32 gate, bf16 state), **c** = the same with `--qwen-gdn fp32` (f32 gate and state). Its kernels did not change after
+the binary above.
+
+### Raw 16x512, first-EOS (7539 positions)
+
+| arm | KLD | top-1 | NLL | paired difference of KLD (95% CI) |
+|---|---|---|---|---|
+| a | 0.117092 | 91.06% | 0.380222 | |
+| b | 0.114813 | 91.01% | 0.378234 | b - a -0.002279 [-0.004711, -0.000048] (-1.95%) |
+| c | 0.114252 | 90.79% | 0.376931 | c - b -0.000561 [-0.002512, +0.001482] (-0.49%); c - a -0.002840 [-0.005625, -0.000259] (-2.43%) |
+
+- The f32 gate is a real KLD gain (CI excludes 0, above the 1% rounding floor); the f32 state on top of it is inside the noise.
+- The interval is a block bootstrap over 128-row blocks that never cross a prompt (adjacent rows share state, so rows are not independent).
+
+### Long context (256-row cells, one text each)
+
+KLD per arm and the paired difference against b (95% block-bootstrap CI). Held-out Zig, teacher NLL 0.154 / 0.875 / 0.525:
+
+| `code2` depth | a | b | c | a - b | c - b |
+|---|---|---|---|---|---|
+| 2048 | 0.026049 | 0.025315 | 0.026826 | +0.000734 [-0.005074, +0.007366] | +0.001511 [-0.000955, +0.004361] |
+| 8192 | 0.079187 | 0.064072 | 0.063399 | +0.015115 [+0.000823, +0.033306] | -0.000674 [-0.008429, +0.007366] |
+| 16384 | 0.071620 | 0.057347 | 0.054681 | +0.014273 [-0.005847, +0.042148] | -0.002666 [-0.009996, +0.004110] |
+| all 768 rows | 0.058952 | 0.048912 | 0.048302 | | |
+
+Chat history, B cells (teacher NLL 1.019 / 2.690 / 2.003):
+
+| chat depth | a | b | c | a - b | c - b |
+|---|---|---|---|---|---|
+| 2048 | 0.017923 | 0.018857 | 0.017857 | -0.000934 [-0.003690, +0.001340] | -0.001000 [-0.002891, +0.000310] |
+| 8192 | 0.069275 | 0.068088 | 0.080276 | +0.001187 [-0.012044, +0.016054] | +0.012188 [+0.004023, +0.020366] |
+| 16384 | 0.253566 | 0.214445 | 0.199107 | +0.039121 [+0.018751, +0.062827] | -0.015338 [-0.031926, -0.001425] |
+
+Chat-A (16,384 decode-path rows, teacher NLL 1.619), binned by context position:
+
+| context | rows | a | b | c | a - b | c - b |
+|---|---|---|---|---|---|---|
+| 0-512 | 448 | 0.056277 | 0.054888 | 0.043858 | +0.001389 [-0.013712, +0.017939] | -0.011029 [-0.025070, +0.004600] |
+| 512-2K | 1536 | 0.049720 | 0.047626 | 0.039204 | +0.002094 [-0.004878, +0.008797] | -0.008422 [-0.018136, +0.000034] |
+| 2K-8K | 6144 | 0.056366 | 0.065772 | 0.061676 | -0.009406 [-0.018055, -0.001747] | -0.004096 [-0.014804, +0.005432] |
+| 8K-end | 8256 | 0.095773 | 0.086385 | 0.098596 | +0.009388 [-0.006150, +0.026451] | +0.012211 [-0.000600, +0.027200] |
+
+Memorized control (`serde_json/src/de.rs`, teacher NLL 0.058 / 0.0038 / 0.0014 at depth 2048 / 8192 / 16384): KLD a / b / c is
+0.007142 / 0.008345 / 0.009191, 0.004812 / 0.004522 / 0.005065 and 0.001035 / 0.001249 / 0.001082; every paired CI contains 0.
+
+- On unseen code the f32 gate cuts KLD about 17% at depth (code2 all rows, a to b); the f32 state on top of it adds about 1%, inside the noise.
+- Chat-A and the chat B cells have mixed signs (a is better than b at 2K-8K, c is worse than b at 8192 and 8K-end): one text of
+  highly autocorrelated rows, and the block CI is optimistic. Read no position trend from them.
+- Fixture B prefills in one forward, so it carries no chunk-boundary state rounding and under-measures the state benefit.
+- A memorized text (NLL near 0.001) has no KLD to resolve: keep any long-context text only if the teacher's NLL on it is above ~0.1.

@@ -307,9 +307,10 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
 
 ## SSD-first
 
-- Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed. An f32 GDN state (`--qwen-gdn fp32`) adds the layout tag
-  `gdn-f32-state-v1` (`ModelConfig.cacheLayoutNamespace`), so a bf16-state server and an f32 one never restore each other's
-  checkpoints; the bf16 default hashes exactly what it did before. KV width is not in the namespace: `bestMatch` skips an
+- Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed. A Qwen GDN model adds a layout tag
+  (`ModelConfig.cacheLayoutNamespace`): `gdn-gate-f32-v1` for the default bf16 state, `gdn-f32-state-v1` for
+  `--qwen-gdn fp32`, so the two widths never restore each other's checkpoints and entries written under the old bf16
+  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. KV width is not in the namespace: `bestMatch` skips an
   entry whose manifest quant differs from the live one.
 
 - `prefix_cache.ssdFirstActive` = a disk tier AND (capable arch OR RAM retention disabled), mirrored onto `HotPrefixCache.ssd_first` +

@@ -6693,7 +6693,7 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
 }
 
-test "modelFingerprint: an f32 GDN state gets its own SSD namespace, the bf16 default keeps today's" {
+test "modelFingerprint: the default Qwen GDN layout and an f32 state each get their own SSD namespace" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -6713,13 +6713,15 @@ test "modelFingerprint: an f32 GDN state gets its own SSD namespace, the bf16 de
 
     const today = try modelFingerprint(testing.allocator, io, dir);
     defer testing.allocator.free(today);
-    const fp_bf16 = try modelFingerprintWithLayout(testing.allocator, io, dir, narrow.cacheLayoutNamespace());
-    defer testing.allocator.free(fp_bf16);
-    try testing.expectEqualStrings(today, fp_bf16);
+    // Entries written before the gate became f32 sit under `today`'s value and are never restored.
+    const fp_default = try modelFingerprintWithLayout(testing.allocator, io, dir, narrow.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_default);
+    try testing.expect(!std.mem.eql(u8, today, fp_default));
     const fp_f32 = try modelFingerprintWithLayout(testing.allocator, io, dir, wide.cacheLayoutNamespace());
     defer testing.allocator.free(fp_f32);
     try testing.expect(!std.mem.eql(u8, today, fp_f32));
-    // The flag does not change what GLM (KDA state, f32 always) or MiMo (no GDN layers) store.
+    try testing.expect(!std.mem.eql(u8, fp_default, fp_f32));
+    // GLM (KDA state, f32 always) and MiMo (no GDN layers) keep the historical namespace.
     for ([_]*model.ModelConfig{ &glm, &mimo }) |c| {
         const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, c.cacheLayoutNamespace());
         defer testing.allocator.free(fp);

@@ -573,3 +573,39 @@ quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
 - On 2.6bpw it does not go deep (m_avg 3.2) and tokens per ms are equal.
 - Above 8192 KV both arms run the same planner. Against v1.1.1 on 4bpw in other boots that day (decode 80.8-89.4,
   2k rung 76.1-82.5; llmprobe 0.6.12 and 0.6.13) the revert is at parity.
+
+<a id="gdn-f32-cost"></a>
+## f32 GDN gate (default) and `--qwen-gdn fp32`: cost
+
+Quality of the same arms: [qwen4-kld](qwen4-kld.md#gdn-f32-teacher). Arms: **a** = main `60272184` (bf16 gate; mtime 2026-10-12 10:19:17,
+sha256 `3a03a4f5...`), **b** = the f32-gate change, default flags (f32 gate, bf16 state), **c** = `--qwen-gdn fp32` (`794b4bb0`, mtime 12:44:03, sha256
+`f4899eff...`; the kernels are the landed ones).
+
+Cell: Sushi-2.6bpw, `--kv-quant 8 --mtp`, llmprobe 0.6.15 `--bench-only --rungs 4k,32k --runs 3`, one boot per row in the order a b c c b a,
+M5 Max 128 GB on AC, fans max, quiet window, 3 min idle between boots, `taskpolicy -a`, GPU lock per boot, an empty prefix-cache base per
+boot (`SUSHI_PREFIX_CACHE_DIR`; the SSD tier restores another boot's prefix otherwise), 2026-10-12. Every boot logged `[spec-stats]` (MTP on);
+`[gdn] recurrent state f32` appears in the c boots only.
+
+| boot | decode | 4k decode | 32k decode | 4k prefill | 32k prefill | 4 streams single | 4 streams aggregate | tok/step 4k, 32k | loadDrift |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 a | 87.6 | 96.5 | 84.4 | 2119 | 2115 | 74.3 | 95.5 | 3.2, 4.0 | ok |
+| 2 b | 100.8 | 79.7 | 86.8 | 2330 | 2250 | 64.3 | 95.8 | 2.9, 4.0 | -10.3% |
+| 3 c | 101.2 | 92.1 | 91.0 | 2118 | 2097 | 68.0 | 93.9 | 3.6, 3.8 | -15.5% |
+| 4 c | 99.3 | 86.0 | 80.1 | 2120 | 2065 | 73.2 | 94.5 | 3.1, 3.6 | -13.7% |
+| 5 b | 91.1 | 93.0 | 91.5 | 2099 | 2080 | 66.5 | 96.0 | 3.4, 3.4 | ok |
+| 6 a | 90.9 | 87.9 | 77.9 | 1767 | 1766 | 62.5 | 87.6 | 3.4, 3.0 | ok |
+
+Adjacent pairs, change of the first over the second (decode / 4k / 32k decode, 4k / 32k prefill, 4-stream aggregate):
+- b over a: 2 vs 1: +15.1 / -17.4 / +2.8, +10.0 / +6.4, +0.3%; 5 vs 6: +0.2 / +5.8 / +17.5, +18.8 / +17.8, +9.6%.
+- c over b: 3 vs 2: +0.4 / +15.6 / +4.8, -9.1 / -6.8, -2.0%; 4 vs 5: +9.0 / -7.5 / -12.5, +1.0 / -0.7, -1.6%.
+
+- The default change (f32 gate) has no measurable cost: the two pairs disagree in sign on every decode metric.
+- MTP decode swings 10-17% between boots of one arm (b 4k decode 79.7 against 93.0, tokens per step 2.9-4.0): a few percent cannot be resolved.
+- The 4-stream aggregate is the quiet metric: b 95.8 / 96.0, c 93.9 / 94.5, so `--qwen-gdn fp32` costs about 2% there.
+- Prefill is within ~5% for c over b, not resolved (-9.1/-6.8 in one pair, +1.0/-0.7 in the other).
+
+Bills (default flags, kv8, `--mtp`, a 6000-token prompt sent twice, an empty SSD base per boot, `794b4bb0`):
+- `--qwen-gdn fp32` adds 54.0 MB per persisted checkpoint: b `persisted 6008/6008 tokens (1 ssm-cp, 67.4 MB)`, resident 147.8 MB; c
+  `1 ssm-cp, 121.4 MB`, resident 201.8 MB.
+- The admission bill at that request rises 4549 → 4616 MB (+67 MB).
+- Auto context stays 1,048,576 tokens and the boot `active_bytes` stay 47.51 GB on this 128 GB box.
