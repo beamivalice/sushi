@@ -223,6 +223,12 @@ fn printUsage(io: std.Io) void {
         \\                        bound is inclusive (<n> itself still drafts)
         \\                        and it outranks `enable_mtp:true` in the
         \\                        request body.
+        \\  --qwen-gdn <32|16>  Qwen only: bits of the GatedDeltaNet recurrent state
+        \\                      between tokens (default 32 = f32; the decay gate
+        \\                      is f32 either way). 16 (bf16) halves the state in
+        \\                      every cache checkpoint (about 54 MB each on
+        \\                      Flash-Next) to save memory on smaller machines.
+        \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8 or 4 — affine group quant; default 8 on
         \\                          every model (GLM refuses 4). 16 (or `off`)
@@ -821,6 +827,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             const n = flagInt(u32, "--idle-evict-secs", args[i], 0);
             idle_evict_secs = if (n > 0) n else null;
+        } else if (std.mem.eql(u8, args[i], "--qwen-gdn") and i + 1 < args.len) {
+            i += 1;
+            model_mod.qwen_gdn_f32 = model_mod.parseQwenGdn(args[i]) orelse {
+                log.err("--qwen-gdn: expected 32 or 16; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             kv_quant_explicit = true;

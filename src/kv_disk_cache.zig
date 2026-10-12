@@ -6693,7 +6693,7 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
 }
 
-test "modelFingerprint: the f32 GDN layout gets its own SSD namespace, so an older bf16 state is never restored" {
+test "modelFingerprint: the f32 and the --qwen-gdn 16 GDN layouts each get their own SSD namespace" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -6704,17 +6704,23 @@ test "modelFingerprint: the f32 GDN layout gets its own SSD namespace, so an old
     const dir = try std.fmt.allocPrint(testing.allocator, "{s}/m", .{base});
     defer testing.allocator.free(dir);
 
-    const qwen = model.ModelConfig{ .linear_num_value_heads = 48 };
-    var glm = qwen;
+    const wide = model.ModelConfig{ .linear_num_value_heads = 48 };
+    var narrow = wide;
+    narrow.gdn_state_f32 = false;
+    var glm = wide;
     glm.model_type = "glm5_next";
     const mimo = model.ModelConfig{ .model_type = "mimo_v2" };
 
     const today = try modelFingerprint(testing.allocator, io, dir);
     defer testing.allocator.free(today);
-    // Entries written before the state became f32 sit under `today`'s value and are never restored.
-    const fp_f32 = try modelFingerprintWithLayout(testing.allocator, io, dir, qwen.cacheLayoutNamespace());
+    // Entries written before the gate became f32 sit under `today`'s value and are never restored.
+    const fp_narrow = try modelFingerprintWithLayout(testing.allocator, io, dir, narrow.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_narrow);
+    try testing.expect(!std.mem.eql(u8, today, fp_narrow));
+    const fp_f32 = try modelFingerprintWithLayout(testing.allocator, io, dir, wide.cacheLayoutNamespace());
     defer testing.allocator.free(fp_f32);
     try testing.expect(!std.mem.eql(u8, today, fp_f32));
+    try testing.expect(!std.mem.eql(u8, fp_narrow, fp_f32));
     // GLM (KDA state, f32 always) and MiMo (no GDN layers) keep the historical namespace.
     for ([_]*const model.ModelConfig{ &glm, &mimo }) |c| {
         const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, c.cacheLayoutNamespace());

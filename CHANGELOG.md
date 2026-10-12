@@ -8,10 +8,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **GLM-5.3-Flash is faster with the same output**: decode without DFlash2 runs about 9% faster and prompt processing
   about 5% faster, token for token identical to before.
-- **Qwen3.8-Flash-Next forgets at its true rate**: the linear-attention decay gate and recurrent state are now f32, which
-  a bf16 gate rounded to "never forget" for the slowest heads, so `--qwen-gdn` is removed. A cached checkpoint grows by
-  54 MB and four-stream throughput drops about 2%. The Qwen SSD prefix cache starts empty on the first boot after this
-  change, since older entries hold a bf16 state.
+- **Qwen3.8-Flash-Next forgets at its true rate**: the linear-attention decay gate and recurrent state are now f32,
+  which a bf16 gate rounded to "never forget" for the slowest heads. A cached checkpoint grows by 54 MB and four-stream
+  throughput drops about 2%, so `--qwen-gdn 16` keeps the bf16 state (the gate stays f32) to save memory on smaller
+  Macs, and the 32 GB, 48 GB and 64 GB launch lines use it. The Qwen SSD prefix cache starts empty on the first boot after this
+  change, since older entries hold a bf16 gate.
 - **64 GB Macs boot the recommended context again**: the load check no longer asks for 1 GB more than the requested
   context needs, which could refuse the documented 64 GB launch (`--ctx-size 250000`) in v1.2.2.
 - **GLM keeps its speed in `sushi run`**: DFlash2 now stays on for requests that carry `logit_bias` or

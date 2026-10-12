@@ -70,8 +70,11 @@ Sushi-2bpw streams on a 32 GB Mac with MTP on, at about 20 tok/s decode:
 ```bash
 sudo sysctl iogpu.wired_limit_mb=27000
 sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-gb 18 --ctx-size 66000 \
-  --expert-pick-tolerance 0.3
+  --qwen-gdn 16 --expert-pick-tolerance 0.3
 ```
+
+`--qwen-gdn 16` stores Qwen's recurrent state in bf16 instead of the f32 default, which halves the state in every cache
+checkpoint (about 54 MB each) and is what the 32, 48 and 64 GB recipes run.
 
 `--ssd-budget-gb 18` keeps 18 GiB resident (trunk, KV cache and an expert cache) and reads the remaining experts from
 the SSD. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert

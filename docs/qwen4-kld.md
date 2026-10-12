@@ -115,7 +115,7 @@ The 16x512 teachers above round the GatedDeltaNet gate and state to bf16 like ev
 rounding. This teacher stores both f32. Numbers on it are read only against each other.
 
 - Teacher `qwen38-flash-next-bf16-gdnf32-v1` (under `kld-teacher/`): the BF16 checkpoint streamed (`--ssd-budget-gb 94`),
-  `--kv-quant off`, the f32 state and f32 gate (`--qwen-gdn fp32` then, now the only arm), `--no-template`, `--ctx-size 20480`, `--top-k 10`, no MTP,
+  `--kv-quant off`, the f32 state and f32 gate (the default; `--qwen-gdn fp32` then, `--qwen-gdn 32` now), `--no-template`, `--ctx-size 20480`, `--top-k 10`, no MTP,
   `MLX_ENABLE_TF32=0`, binary built at `0a50c13c` (the f32-gate change, mtime 2026-10-12 10:43:43, sha256 `c19e5a35...`).
 - Three views of it, each a normal fixture: `raw` (the 16 wikitext prompts of the Flash-Next 16x512 raw fixture, 512 greedy
   rows each), `long` (teacher-forced `continuation_ids`, [quality-kld](quality-kld.md#the-tool)) and `code2`.
@@ -132,8 +132,8 @@ rounding. This teacher stores both f32. Numbers on it are read only against each
 
 Arms (student Sushi-2.6bpw, kv8, no MTP, `--ctx-size` 8192 raw / 20480 long, M5 Max 128 GB, `taskpolicy -a`, GPU lock per compare,
 2026-10-12): **a** = main `60272184` (bf16 gate, bf16 state; mtime 10:19:17, sha256 `3a03a4f5...`), **b** = the f32-gate change, default flags
-(f32 gate, bf16 state), **c** = the same with `--qwen-gdn fp32` (f32 gate and state); c is now the default and the flag is
-removed. Its kernels did not change after the binary above.
+(f32 gate, bf16 state), **c** = the same with `--qwen-gdn fp32` (f32 gate and state); c is now the default (`--qwen-gdn 32`) and b is
+`--qwen-gdn 16`. Its kernels did not change after the binary above.
 
 ### Raw 16x512, first-EOS (7539 positions)
 

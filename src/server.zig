@@ -2078,6 +2078,7 @@ pub fn serve(
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
     if (mtpHeadKvLine(config, transformer_mod.Transformer.mtp_head_kv_quant_flag)) |line| log.info("{s}\n", .{line});
+    if (qwenGdnLine(config, model_mod.qwen_gdn_f32)) |line| log.info("{s}\n", .{line});
     if (generate_mod.max_mtp_ctx != 0) {
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
@@ -6196,6 +6197,15 @@ pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const 
     if (!flag) return null;
     if (config.isMimo()) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
     return "MTP head KV: following --kv-quant (--mtp-head-kv-quant)";
+}
+
+/// What `--qwen-gdn 16` does on this arch, for the boot log; null at the f32 default.
+/// GLM and MiMo have no GatedDeltaNet arm, so the flag has no effect there.
+pub fn qwenGdnLine(config: *const model_mod.ModelConfig, f32_state: bool) ?[]const u8 {
+    if (f32_state) return null;
+    if (config.isGlm5()) return "GDN state: --qwen-gdn 16 has no effect on GLM (its KDA state is f32 already)";
+    if (config.isMimo()) return "GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)";
+    return "GDN state: bf16 between tokens (--qwen-gdn 16; f32 is the default; the decay gate is f32 either way)";
 }
 
 /// Per-token bytes of the qwen4 MTP head's own KV at the scheme it was LOADED with,
@@ -24171,6 +24181,46 @@ test "mtpHeadKvLine: --mtp-head-kv-quant is reported per arch" {
     try t.expectEqualStrings("MTP head KV: following --kv-quant (--mtp-head-kv-quant)", mtpHeadKvLine(&qwen4, true).?);
     // MiMo's heads keep their own dense window (`mimo_mtp.RowCache`); the flag never reaches them.
     try t.expectEqualStrings("MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)", mtpHeadKvLine(&mimo, true).?);
+}
+
+test "qwenGdnLine: --qwen-gdn 16 is reported per arch, and has no effect where there is no GDN arm" {
+    const t = std.testing;
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
+    try t.expect(qwenGdnLine(&qwen4, true) == null);
+    try t.expect(qwenGdnLine(&glm, true) == null);
+    try t.expectEqualStrings("GDN state: bf16 between tokens (--qwen-gdn 16; f32 is the default; the decay gate is f32 either way)", qwenGdnLine(&qwen4, false).?);
+    // GLM's recurrent state is KDA, not GDN: the flag names a layer it does not have.
+    try t.expectEqualStrings("GDN state: --qwen-gdn 16 has no effect on GLM (its KDA state is f32 already)", qwenGdnLine(&glm, false).?);
+    try t.expectEqualStrings("GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)", qwenGdnLine(&mimo, false).?);
+}
+
+test "the 64 GB Sushi-2.6bpw recipe's bills at both GDN widths: 250000 context, kv8, MTP, 32000 new tokens" {
+    const t = std.testing;
+    const mb: u64 = 1024 * 1024;
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(t.allocator);
+    cfg.expert_layout = .exl3_k4;
+    const saved_head = transformer_mod.Transformer.mtp_head_kv_quant_flag;
+    defer transformer_mod.Transformer.mtp_head_kv_quant_flag = saved_head;
+    transformer_mod.Transformer.mtp_head_kv_quant_flag = true;
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 250_000;
+    const saved_kv = configured_kv_quant;
+    defer configured_kv_quant = saved_kv;
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const saved_mtp = configured_mtp;
+    defer configured_mtp = saved_mtp;
+    configured_mtp = true;
+    const warm = WarmPrefix{ .mtp_on = true };
+    // The load bill's context term is the narrowest rung; a request runs the 4096 rung in 13,734 MB.
+    try t.expectEqual(@as(u64, 9_633), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 12_946), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    cfg.gdn_state_f32 = false;
+    try t.expectEqual(@as(u64, 8_553), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 11_866), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
 }
 
 test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_quant override" {

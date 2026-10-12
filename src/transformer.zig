@@ -45358,7 +45358,8 @@ fn gdnChainRecurrence(s: mlx.mlx_stream, pre: *const GdnPrework, state: mlx.mlx_
     return r;
 }
 
-fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, folded: bool) !void {
+/// The gate is f32 at either width; `wide` selects the f32 state, else the bf16 state of `--qwen-gdn 16`.
+fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, folded: bool, wide: bool) !void {
     const gate_dt: mlx.mlx_dtype = .float32;
     var prng = std.Random.DefaultPrng.init(0x6D5E + @as(u64, @intCast(t_len * 131 + hv)));
     const rnd = prng.random();
@@ -45391,7 +45392,7 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
     defer _ = mlx.mlx_array_free(dt_bias);
     const norm_w = try gdnRecurRand(rnd, &.{dv}, 2.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(norm_w);
-    const ssm_state = try gdnRecurRand(rnd, &.{ 1, hv, dv, dk }, 1.0, .float32, s);
+    const ssm_state = try gdnRecurRand(rnd, &.{ 1, hv, dv, dk }, 1.0, if (wide) .float32 else .bfloat16, s);
     defer _ = mlx.mlx_array_free(ssm_state);
 
     const pre = (try gdnPreworkFused(s, .{ .gate_dtype = gate_dt, .qkv = qkv, .qkv_off = 0, .qkv_stride = c_dim, .b = b_in, .b_off = 0, .b_stride = hv, .a = a_in, .a_off = 0, .a_stride = hv, .A_log = A_log, .dt_bias = dt_bias, .conv_state = conv_state, .conv_w = conv_w, .q_scale = q_scale, .k_scale = k_scale, .hk = hk, .hv = hv, .dk = dk, .dv = dv, .seq = t_len })) orelse return error.FusedDeclined;
@@ -45534,7 +45535,8 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
     for ([_][2]c_int{ .{ 16, 48 }, .{ 2, 8 } }) |heads| {
         var t: c_int = 1;
         while (t <= gdn_decode.MAX_SEQ) : (t += 1) {
-            try gdnRecurParityCase(s, heads[0], heads[1], t, false);
+            try gdnRecurParityCase(s, heads[0], heads[1], t, false, false);
+            try gdnRecurParityCase(s, heads[0], heads[1], t, false, true);
         }
     }
 
@@ -45603,10 +45605,12 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
 }
 
 test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and verify widths; rollback to every row is serial decode" {
-    try gdnRecurLayerCase();
+    try gdnRecurLayerCase(false);
+    try gdnRecurLayerCase(true);
 }
 
-fn gdnRecurLayerCase() !void {
+/// The gate is f32 at either width; `wide` selects the f32 state, else the bf16 state of `--qwen-gdn 16`.
+fn gdnRecurLayerCase(wide: bool) !void {
     const s = mlx.gpuStream();
     gdn_prework_override = true;
     defer gdn_prework_override = null;
@@ -45630,6 +45634,7 @@ fn gdnRecurLayerCase() !void {
     xfm.config.linear_conv_kernel_dim = 4;
     xfm.config.rms_norm_eps = 1e-6;
     xfm.config.kda_sigmoid_out_gate = true;
+    xfm.config.gdn_state_f32 = wide;
     var prng = std.Random.DefaultPrng.init(0x6D5E1);
     const rnd = prng.random();
     const la = LinearAttnWeights{
@@ -45658,7 +45663,7 @@ fn gdnRecurLayerCase() !void {
     };
     const conv0 = try gdnRecurRand(rnd, &.{ 1, 3, c_dim }, 4.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(conv0);
-    const state0 = try gdnRecurRand(rnd, &.{ 1, hv, 128, 128 }, 1.0, .float32, s);
+    const state0 = try gdnRecurRand(rnd, &.{ 1, hv, 128, 128 }, 1.0, if (wide) .float32 else .bfloat16, s);
     defer _ = mlx.mlx_array_free(state0);
     var chain = SSMCacheEntry{ .conv_state = try gdnRecurRef(conv0), .ssm_state = try gdnRecurRef(state0), .initialized = true };
     var fused = SSMCacheEntry{ .conv_state = try gdnRecurRef(conv0), .ssm_state = try gdnRecurRef(state0), .initialized = true };
@@ -45916,11 +45921,14 @@ fn gdnDecayRun(xfm: *Transformer, la: *const LinearAttnWeights, route: GdnDecayR
     return gdnDecayHost(entry.ssm_state, s);
 }
 
-test "gdn decay: at an f32 state and gate every route forgets at the exact rate" {
-    try gdnDecayCase();
+test "gdn decay: at an f32 state and gate every route forgets at the exact rate; at --qwen-gdn 16 the routes agree" {
+    try gdnDecayCase(true);
+    try gdnDecayCase(false);
 }
 
-fn gdnDecayCase() !void {
+/// The gate is f32 either way. An f32 state forgets at the exact rate; a bf16 state rounds a slow head's
+/// decay away (its step is under half a bf16 ulp), so only the routes' agreement is asserted there.
+fn gdnDecayCase(state_f32: bool) !void {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -45938,6 +45946,7 @@ fn gdnDecayCase() !void {
     xfm.config.linear_value_head_dim = 128;
     xfm.config.linear_conv_kernel_dim = 4;
     xfm.config.rms_norm_eps = 1e-6;
+    xfm.config.gdn_state_f32 = state_f32;
 
     // Zero q/k/v projections and a ones input make `a` the column sum of a_w: each head's gate input is
     // exact and the recurrence reduces to state *= g.
@@ -46014,20 +46023,20 @@ fn gdnDecayCase() !void {
         defer if (rows.len > 0) testing.allocator.free(rows);
         finals[i] = try gdnDecayRun(&xfm, &la, c.route, c.per_call, state0, c_dim, &rows);
         made += 1;
-        try gdnDecayExpectExact(start, finals[i], hv, @intCast(gdn_decay_steps), 1e-3);
+        if (state_f32) try gdnDecayExpectExact(start, finals[i], hv, @intCast(gdn_decay_steps), 1e-3);
         // Row j of the last call is the state after that many tokens: the rollback source.
         var j: usize = 0;
-        while (rows.len > 0 and j + 1 < @as(usize, @intCast(c.per_call))) : (j += 1) {
+        while (state_f32 and rows.len > 0 and j + 1 < @as(usize, @intCast(c.per_call))) : (j += 1) {
             try gdnDecayExpectExact(start, rows[j * start.len ..][0..start.len], hv, @as(usize, @intCast(gdn_decay_steps - c.per_call)) + j + 1, 1e-3);
         }
     }
     // The fused arms share one gate formula and the chain arms MLX's: bit-equal inside a family.
     for (finals[3..11]) |f| try gdnDecayEqualBits(finals[2], f);
     try gdnDecayEqualBits(finals[1], finals[2]);
-    // A prefill chunk holds its state in f32 across tokens.
-    try gdnDecayEqualBits(finals[0], finals[11]);
+    // A prefill chunk holds its state in f32 across tokens; a bf16 state rounds it every token.
+    if (state_f32) try gdnDecayEqualBits(finals[0], finals[11]);
     // Across families, precise::exp against MLX's exp differ by ulps of g, not a bf16 step.
-    try gdnDecayClose(finals[0], finals[2], 1e-4);
+    if (state_f32) try gdnDecayClose(finals[0], finals[2], 1e-4);
 }
 
 test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 incl. strided q" {
@@ -56116,7 +56125,8 @@ test "gdn verify fold: output and every rollback state remain bit-identical" {
     for ([_][2]c_int{ .{ 2, 8 }, .{ 16, 48 } }) |heads| {
         var t: c_int = 2;
         while (t <= gdn_decode.MAX_SEQ) : (t += 1) {
-            try gdnRecurParityCase(s, heads[0], heads[1], t, true);
+            try gdnRecurParityCase(s, heads[0], heads[1], t, true, false);
+            try gdnRecurParityCase(s, heads[0], heads[1], t, true, true);
         }
     }
 }
@@ -56132,11 +56142,11 @@ test "gdn verify fold: unsupported threadgroup declines without poisoning later 
     defer gdn_decode_fused_override = null;
     gdn_decode.fold_nt_override = 2048;
     defer gdn_decode.fold_nt_override = null;
-    try gdnRecurParityCase(s, 2, 8, 2, true);
+    try gdnRecurParityCase(s, 2, 8, 2, true, false);
     try testing.expect(gdn_decode.foldDeclined(2));
     try testing.expect(!mlx.errorPending());
     gdn_decode.fold_nt_override = null;
-    try gdnRecurParityCase(s, 2, 8, 2, true);
+    try gdnRecurParityCase(s, 2, 8, 2, true, false);
     try testing.expect(!mlx.errorPending());
 }
 

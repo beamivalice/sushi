@@ -26,11 +26,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   in [the width sweep](qwen4-perf.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
   `gated_delta_step_seq` carries the state at its stored width to the next token, so serial decode and rollback agree;
-  Qwen stores f32 now, so the rule bites on a bf16 state only, where upstream's verbatim verify kernel (it carries f32)
-  differs from verify row 1 on.
+  Qwen stores f32 by default, so the rule bites at `--qwen-gdn 16` only, where upstream's verbatim verify kernel (it
+  carries f32) differs from verify row 1 on.
 - The GDN prework and norm-gate serve bf16 activations only. The recurrence kernels, the prework (`GT`) and
   `gdn_decode` (K1, K1S, fold) take the stored state's width (`StT`) and the gate's (`GT`) as template args, so the f32
-  state Qwen serves runs the fused step too; every gate producer rounds `g` once, at
+  state (the default; `--qwen-gdn 16` stores bf16) runs the fused step too; every gate producer rounds `g` once, at
   `ModelConfig.gdnGateDtype()` (f32 on every Qwen load: the compiled gate closure, `gdnGateChain`, the prework kernel,
   K1/K1S/fold), and the recurrence reads it as f32 whatever it holds. An f32 gate also adds `a + dt_bias` in f32, as the
   HF reference does. Its precise-exp kernels and MLX's exp differ by ulps of `g`, so f32 gate probes allow 1e-6

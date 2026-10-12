@@ -109,14 +109,15 @@ admission bill at 1248 tokens, which replaces warmup and net once it is larger):
 | MiMo 2.3bpw, auto | 89.65 | 0.25 | 1.00 | 90.90 | 89.88 | 1.02 |
 | MiMo 2.3bpw, `--ctx-size 1248` | 89.65 | 1.79 | — | 91.44 | 89.88 | 1.56 |
 | GLM 2.4bpw, auto or `--ctx-size 1248` | 89.76 | 0.52 | 1.00 | 91.28 | 90.16 | 1.12 |
-| Flash-Next 2bpw streamed, `--ssd-budget-gb 18 --ctx-size 66000` | 5.57 | 13.69 | 1.00 | 20.27 | 19.07 | 1.20 |
+| Flash-Next 2bpw streamed, `--ssd-budget-gb 18 --ctx-size 66000 --qwen-gdn 16` | 5.57 | 13.69 | 1.00 | 20.27 | 19.07 | 1.20 |
 
 Flash-Next's extra slack is the vision tower: it is billed at load for the first image and not resident until then.
 MiMo at 1248 tokens bills a request's prefill scratch (1.79) above its warmup. The streamed warmup is its cache, fill
 union and bounce buffers. Every bill is above its peak; the 1 GiB net is what separates them where nothing else does.
-The net does not stack on a context bill: no request allocates during the warmup. On the 64 GB recipe (2.6bpw, kv8,
-250000, 59,000 MB wired) the f32 GDN state leaves the load 4.0 GiB of slack and a cold 250k request 0.77 GiB at the
-4096 width admission picks (3adb8002, bill arithmetic); 0.8 GiB more drops that request to the 2048 width.
+The net does not stack on a context bill: no request allocates during the warmup. The 64 GB recipe (2.6bpw, kv8, 250000,
+59,000 MB wired) runs `--qwen-gdn 16` and has 5.1 GiB of slack at load and 1.83 GiB for a cold 250k request at the 4096
+width admission picks; the f32 default leaves 4.0 and 0.77 GiB, and 0.8 GiB more drops that request to the 2048 width
+(bill arithmetic on the shipped config fixture, 2927817e against 3adb8002).
 Previous bills for the same boots: 46.20, 91.65, 91.91 and 7.27 GiB (the streamed one was 12 GiB under its peak).
 
 Other expert layouts of these archs bill the same terms; their warmup is not measured on this box.

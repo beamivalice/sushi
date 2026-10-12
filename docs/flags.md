@@ -1,6 +1,6 @@
 # Launch flags
 
-A flag exists for a setting a user picks: a real tradeoff (`--kv-quant 4` for context at some quality cost, `--expert-pick-tolerance` for speed against exactness) or a fit to their own machine (`--mtp-min-depth` / `--mtp-max-depth` per Apple chip, memory and context limits). Operator settings qualify too: ports, API key, paths, logging. A flag that offers no real choice is bloat: a developer A/B switch, a kill switch for an adopted default, a rejected or never-measured experiment, a flag that does nothing, two flags that set the same thing, a flag whose every useful value is the default. A test that needs to force an arm gets a test seam or a temporary env knob ([envvar](envvar.md)), not a flag.
+A flag exists for a setting a user picks: a real tradeoff (`--kv-quant 4` for context at some quality cost, `--expert-pick-tolerance` for speed against exactness) or a fit to their own machine (`--mtp-min-depth` / `--mtp-max-depth` per Apple chip, `--qwen-gdn 16` for memory, memory and context limits). Operator settings qualify too: ports, API key, paths, logging. A flag that offers no real choice is bloat: a developer A/B switch, a kill switch for an adopted default, a rejected or never-measured experiment, a flag that does nothing, two flags that set the same thing, a flag whose every useful value is the default. A test that needs to force an arm gets a test seam or a temporary env knob ([envvar](envvar.md)), not a flag.
 
 Precedence: an explicit flag outranks `model-settings.json`, which outranks the default ([server-lifecycle](server-lifecycle.md#settings)). A flag that mirrors a settings key adds the precedence and nothing else; that is not bloat by itself.
 
@@ -53,6 +53,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
 | `--kv-quant` | `8` → KV scheme 8, 4 or 16 (`off` = BF16); also `kv_quant` in settings and per request (main.zig:972) | user | help, usage, engine-kv-cache; 21 tests | keep |
+| `--qwen-gdn` | `32` → GatedDeltaNet state width in bits, `32` (f32) or `16` (bf16), Qwen only; the decay gate is f32 either way (main.zig:830) | machine | help, usage, engine-kv-cache, quality-kld; 3 tests (parse, config, boot line) | keep: the 32, 48 and 64 GB recipes pass `16` to halve the state per checkpoint (about 54 MB each); against the f32 default the bf16 state (arm b) is about 2% faster on 4-stream aggregate and its KLD is inside the noise ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher), [qwen4-perf](qwen4-perf.md#gdn-f32-cost)) |
 | `--mtp-head-kv-quant` | off → Qwen's MTP head KV follows `--kv-quant`; no effect on MiMo (main.zig:762) | machine | help, usage, README, engine-mtp; 0 tests | keep: the long-context memory bills use it |
 
 ## Speculation (MTP, prompt lookup, drafter)
@@ -134,6 +135,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--no-template` | off → feed raw prompt text (kld.zig:143) | dev | help, quality-kld | keep |
 | `kld`: `--ctx-size` | model max → context override (kld.zig:108) | dev | help | keep |
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
+| `kld`: `--qwen-gdn` | `32` → `16` scores a bf16-state student against the f32 teacher; a GLM capture refuses it (kld.zig:107) | dev | help, quality-kld; 2 tests | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |
 | `kld`: `--wired-margin-gib` | `1` → headroom under the wired limit (kld.zig:114) | dev | help | keep |
@@ -181,7 +183,6 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 | `--expert-cache-gb` (also `kld`) | `--ssd-budget-gb`; the BF16-source streaming test passes it |
 | `--embedding-max-length` | the model's window |
 | `--logit-bias-file` | request `logit_bias`; the `logit_bias_file` key in `model-settings.json` stays (a settings twin, left alone) |
-| `--qwen-gdn` (also `kld`) | nothing: Qwen's GatedDeltaNet state is always f32 beside the f32 gate (owner call 2026-10-13; the f32 arm's cost is in [qwen4-perf](qwen4-perf.md#gdn-f32-cost)) |
 
 ## Owner calls
 

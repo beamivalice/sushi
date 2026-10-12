@@ -76,11 +76,16 @@ sudo sysctl iogpu.wired_limit_mb=43000
 hf download beamster/Qwen3.8-Flash-Next-Sushi-2bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw
 # or: sushi pull qwen3.8-flash-next:2bpw   (lands in ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-2bpw)
 
-# images, 8-bit KV, 128k context
+# images, 8-bit KV, 128k context; --qwen-gdn 16 keeps the GatedDeltaNet state in bf16 (see below)
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 131072 \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
+
+Every 32 GB, 48 GB and 64 GB Qwen recipe passes `--qwen-gdn 16` (the 32 GB one is in the
+[README](../README.md#streaming-on-a-32-gb-mac)): the recurrent state is f32 by default, and bf16 halves it in every
+cache checkpoint (about 54 MB each on Flash-Next), the memory these recipes are sized to. The 96 GB and larger recipes
+keep the f32 default.
 
 **64 GB Mac, Sushi-2.6bpw**
 
@@ -99,12 +104,12 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw --local-dir ~/.sushi/models
 
 # 1. images, 8-bit KV — the default quality
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 250000 \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 250000 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 
 # 2. images, 4-bit KV — 1.8 times the context, at 8% KLD and 0.2 points of next-token agreement
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
-  --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 450000 \
+  --mtp --kv-quant 4 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 450000 \
   --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
 
@@ -119,12 +124,12 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-3bpw --local-dir ~/.sushi/models/Q
 
 # 1. images, 8-bit KV — the default quality
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 128000 \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 128000 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 
 # 2. images, 4-bit KV — twice the context, at 9% KLD and 0.7 points of next-token agreement
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
-  --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 256000 \
+  --mtp --kv-quant 4 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 256000 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
 
