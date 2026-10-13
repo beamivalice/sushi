@@ -118,8 +118,8 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   `glmCheckpointsRelease`, the same answer that arms the hook). The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
   tier's row copy (at most its budget; the SSD tier copies none), the checkpoints and the window, whichever of that
   and the prefill's transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. The writer's
-  1 GiB permit (the previous request's staged flush) is not in this bill: admission takes it off the headroom for every
-  arch (`scheduler.diskWriterHostBytes`, [engine-memory-admission](engine-memory-admission.md)); SSD-only reserves no
+  permit (the previous request's staged flush) is not billed: it is pageable host memory outside the wired limit
+  ([engine-memory-admission](engine-memory-admission.md)); SSD-only reserves no
   idle cache.
   - Only the inference thread's admission pass bills the checkpoints (`WarmPrefix.checkpoints`). The connection
     thread, the context sizer and the cache clamp bill none, so the advertised context is the cache-off one.

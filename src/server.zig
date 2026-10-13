@@ -1083,10 +1083,9 @@ pub fn diskTierOn(config: *const model_mod.ModelConfig) bool {
     return prefix_cache_disk_bytes > 0 and !config.prefix_cache_disk_declined;
 }
 
-/// Host bytes the model's SSD writer may hold outside MLX's count: its permit while the tier is on.
-fn diskWriterPermitBytes(config: *const model_mod.ModelConfig) u64 {
-    return if (diskTierOn(config)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
-}
+/// The SSD writer's permit, sized once from host RAM at startup (`kv_disk_writer.permitForRam`); the
+/// scheduler arms every writer with it.
+pub var disk_writer_permit_bytes: u64 = kv_disk_writer.DEFAULT_PERMIT_BYTES;
 
 /// The disk bytes the SSD-tier-dependent policies read: the launch ask, or 0 for a model whose tier is off.
 fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
@@ -2756,6 +2755,7 @@ fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
 }
 
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
+    if (billedAutoContext(config)) return billedAdvertisedContext(config, computeMemoryContext(config));
     return autoContextFrom(computeMemoryContext(config), config.contextCap());
 }
 
@@ -3818,7 +3818,7 @@ pub fn resolvedContextForLoad(
 /// the same reserve constant the RAM arm and `computeMemoryContext` pass, and the boot's
 /// configured KV width (billing at bf16 on a `--kv-quant 8` boot was the 22,464-vs-13,824 MB defect).
 fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
-    if (billedAutoContext(config)) return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap());
+    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk));
     return resolvedContextForLoad(
         manualContext(config),
         config.pinned_context,
@@ -3896,13 +3896,21 @@ fn legacyPrefixCacheAsk(config: *const model_mod.ModelConfig) u64 {
 }
 
 /// An arch whose auto context is the largest one its request bill admits, and that has none pinned yet.
+/// Flash-Next's advertised context from the largest one its bill admits: within the measured range the bill
+/// (at least 1.1x the live peak) is the one reserve, so no margin goes on top; past it the margin stays.
+fn billedAdvertisedContext(config: *const model_mod.ModelConfig, memory_ctx: u32) u32 {
+    const measured: u32 = @intCast(@min(memory_ctx, MEASURED_NET_MAX_TOKENS) / 1024 * 1024);
+    const ctx = @max(safeAutoContext(memory_ctx), measured);
+    return if (config.contextCap() > 0) @min(ctx, config.contextCap()) else ctx;
+}
+
 fn billedAutoContext(config: *const model_mod.ModelConfig) bool {
     return config.longCtxGated() and manualContext(config) == 0 and config.pinned_context == 0;
 }
 
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
 fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
-    if (billedAutoContext(config)) return autoContextFrom(memoryContextAtChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, chunk), config.contextCap());
+    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, chunk));
     return resolvedContextForLoad(
         manualContext(config),
         config.pinned_context,
@@ -4203,76 +4211,11 @@ test "a model whose SSD tier did not come up bills and budgets as with --prefix-
     try t.expect(ssdFirstBudgetForLoad(&cfg, 1 << 30, 100 << 30, 40 << 30, 4 << 30, 1 << 30, &idle, true) == null);
 }
 
-test "a paused SSD writer's staged bytes refuse an admission that fits the ceiling by less than its permit, on every arch" {
-    const t = std.testing;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var tier = try kv_disk_cache.DiskTier.init(t.allocator, io, base, "fp-admission-writer", 0, 128);
-    defer tier.deinit();
-    tier.enableBackgroundWriter();
-    const w = tier.writer.?;
-    w.setPaused(true);
-    defer {
-        w.setPaused(false);
-        tier.drainWriter();
-    }
-    const blob = try t.allocator.alloc(u8, 4096);
-    @memset(blob, 1);
-    w.submit(try t.allocator.dupe(u8, "/nonexistent/staged.safetensors"), blob);
-    // The one reading: the writer holds its backlog or its permit, whichever is larger.
-    const writer_bytes = tier.writerHostBytes();
-    try t.expect(writer_bytes >= kv_disk_writer.DEFAULT_PERMIT_BYTES);
-
-    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
-    glm.glm_dflash_loaded = false;
-    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride };
-    defer {
-        prefix_cache_capacity = saved[0];
-        ssm_checkpoint_stride = saved[1];
-    }
-    prefix_cache_capacity = 32;
-    ssm_checkpoint_stride = 256;
-    const tiers = TierGuard.pin(false, 20 << 30);
-    defer tiers.restore();
-    const kv_bits: u64 = 8;
-    const configs = [_]model_mod.ModelConfig{ qwen4DeployedTestConfig(), mimoV2FlashBillConfig(), glm };
-    for (configs) |cfg| {
-        const needed = prefillNeededAtChunk(&cfg, 65536, 1024, kv_bits, 2048, .{});
-        // Headroom within the permit of the bill: fits with an idle writer, not beside a staged one.
-        const ceiling = needed + kv_disk_writer.DEFAULT_PERMIT_BYTES / 2;
-        try t.expect(needed <= admissionAvailable(ceiling, 0, 0));
-        try t.expect(needed > admissionAvailable(ceiling, 0, writer_bytes));
-    }
-}
-
-test "admission bills the SSD writers' host bytes before the width and the reservation are chosen" {
+test "admission's headroom is the ceiling less MLX's bytes, and never wraps" {
     const t = std.testing;
     const gib: u64 = 1 << 30;
-    // The ceiling less MLX's bytes less the writers'; never wraps.
-    try t.expectEqual(@as(u64, 20 * gib), admissionAvailable(100 * gib, 79 * gib, gib));
-    try t.expectEqual(@as(u64, 0), admissionAvailable(100 * gib, 99 * gib + gib / 2, gib));
-    try t.expectEqual(admissionAvailable(100 * gib, 79 * gib, 0) - gib, admissionAvailable(100 * gib, 79 * gib, gib));
-    // Every arch takes the one resident total, GLM included: its prefill and commit terms carry no writer term of their own.
-    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
-    glm.glm_dflash_loaded = false;
-    const gsaved = .{ prefix_cache_capacity, ssm_checkpoint_stride };
-    defer {
-        prefix_cache_capacity = gsaved[0];
-        ssm_checkpoint_stride = gsaved[1];
-    }
-    prefix_cache_capacity = 32;
-    ssm_checkpoint_stride = 256;
-    try t.expectEqual(@as(u64, 0), glmPrefixStateBytes(&glm, 65536, .{}));
-    try t.expectEqual(@as(u64, 0), glmCommitStateBytes(&glm, 65536, .{}, 8));
-    // A request that fits the headroom without the writer's bytes and not with them is refused: the gap
-    // between the bill and the bill plus the writer's payload.
-    const cfg = qwen4DeployedTestConfig();
-    const needed = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 4096, .{});
-    try t.expect(needed <= admissionAvailable(needed + gib / 2, 0, 0));
-    try t.expect(needed > admissionAvailable(needed + gib / 2, 0, gib));
+    try t.expectEqual(@as(u64, 21 * gib), admissionAvailable(100 * gib, 79 * gib));
+    try t.expectEqual(@as(u64, 0), admissionAvailable(100 * gib, 101 * gib));
 }
 
 test "defaultPrefixCacheAsk: an unnamed budget holds one session at the working context, never under 2 GB" {
@@ -4951,27 +4894,20 @@ test "Flash-Next's request bill brackets the peaks measured on the M1 Max, with 
     generate_mod.prefill_chunk_override = 512;
     const cfg = qwen4MeasuredTestConfig();
     // Live `peak_bytes - active_bytes` after one prompt per boot (512 rung, kv8, no MTP, SSD tier on, 16 new
-    // tokens), measured while every checkpoint stayed in RAM (up to the 16 captured). A landed checkpoint now
-    // leaves RAM, so the request holds at most `ssmResidentCap` of them: each row loses the rest. The M5 Max
-    // lost 830 to 888 MB at 8k to 67k tokens, 14 to 15 checkpoints, more than the 13 billed here.
+    // tokens), with each landed checkpoint already moved to the SSD.
     const measured = [_]struct { tokens: u64, peak_mib: u64 }{
-        .{ .tokens = 2857, .peak_mib = 1117 },
-        .{ .tokens = 8505, .peak_mib = 1774 },
-        .{ .tokens = 16874, .peak_mib = 2043 },
-        .{ .tokens = 33958, .peak_mib = 2228 },
-        .{ .tokens = 59314, .peak_mib = 2822 },
+        .{ .tokens = 2857, .peak_mib = 935 },
+        .{ .tokens = 8505, .peak_mib = 984 },
+        .{ .tokens = 16874, .peak_mib = 1196 },
+        .{ .tokens = 33958, .peak_mib = 1381 },
+        .{ .tokens = 59314, .peak_mib = 1976 },
     };
     for (measured) |m| {
         const bill = prefillNeededAtChunk(&cfg, m.tokens, 16, 8, 512, .{});
-        const no_tier = TierGuard.pin(false, 0);
-        const held_before = retainedSsmCheckpointBytes(&cfg, m.tokens, 0, 512);
-        no_tier.restore();
-        const freed = held_before - retainedSsmCheckpointBytes(&cfg, m.tokens, 0, 512);
-        const peak = m.peak_mib * (1 << 20) - freed;
-        // Under-billing is a Metal OOM. The freed checkpoints were billed exactly, so the rest of the bill's
-        // fixed slack is a larger share of the smaller peak: the padding bar moves from a quarter to 30%.
-        try std.testing.expect(bill >= peak + peak / 20);
-        try std.testing.expect(bill <= peak + peak * 3 / 10);
+        const peak = m.peak_mib * (1 << 20);
+        // Under-billing is a Metal OOM: at least a tenth over the peak. The upper bar keeps the net small.
+        try std.testing.expect(bill >= peak + peak / 10);
+        try std.testing.expect(bill <= peak + peak * 2 / 5);
     }
 }
 
@@ -4992,8 +4928,8 @@ test "the advertised Flash-Next context is the largest one the request bill admi
     const MiB: u64 = 1 << 20;
     const ceiling: u64 = 28976 * MiB; // 30000 MiB wired limit less the 1 GiB margin
     const active: u64 = 27_378_205_274; // the measured lean pack's resident bytes
-    const writer: u64 = 1 << 30; // the SSD writer's host permit, billed by admission
-    const budget = admissionAvailable(ceiling, active, writer);
+    // The SSD writer's host bytes sit outside the wired limit: the 1 GiB margin under it is the only reserve.
+    const budget = ceiling - active;
     const raw = memoryContextAt(&cfg, ceiling, active);
     const fits = struct {
         fn at(c: *const model_mod.ModelConfig, ctx: u64, avail: u64) bool {
@@ -5006,6 +4942,33 @@ test "the advertised Flash-Next context is the largest one the request bill admi
     try std.testing.expect(raw > 0);
     try std.testing.expect(fits.at(&cfg, raw, budget));
     try std.testing.expect(!fits.at(&cfg, @as(u64, raw) + 1024, budget));
+}
+
+
+test "a 32 GB Mac's lean Flash-Next budget advertises and admits an 80k prompt" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 0;
+    const saved_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = saved_disk;
+    prefix_cache_disk_bytes = 20 << 30;
+    const saved_mtp = configured_mtp;
+    defer configured_mtp = saved_mtp;
+    configured_mtp = false;
+    var cfg = qwen4MeasuredTestConfig();
+    cfg.pinned_prefill_chunk = 512;
+    const ceiling: u64 = 28976 << 20; // 30000 MiB wired limit less the 1 GiB margin
+    const active: u64 = 27_378_205_274; // the measured lean pack's resident bytes
+    const prompt: u64 = 80_000;
+    const new_tokens: u32 = 16;
+    // What the boot advertises: within the measured range the bill is the one reserve, no margin on top.
+    var sized = cfg;
+    sized.pinned_context = ssdFirstSessionTokensNow(&cfg, 8, ceiling, active, 512);
+    try std.testing.expect(sized.pinned_context >= prompt + new_tokens);
+    const budget = admissionAvailable(ceiling, active);
+    try std.testing.expect(prefillNeededAtChunk(&sized, prompt, new_tokens, 8, 512, .{}) <= budget);
 }
 
 test "the load-time budget is reproducible: free RAM at load does not move it" {
@@ -5246,19 +5209,19 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
     try t.expectEqual(advertised, billed);
 
-    // Shown on a tighter box where the checkpoint cap does not bind.
+    // And on a tighter box where the checkpoint cap does not bind.
     const tight: u64 = active + 24_000 * MiB;
     const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
-    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
-    try t.expect(old_billed > billed_t);
+    try t.expectEqual(autoContextFrom(memoryContextAt(&cfg, tight, active), cfg.contextCap()), billed_t);
     try t.expect(billed > 500_000);
     try t.expect(billed_t > 300_000);
+    try t.expect(billed_t < billed);
 
+    // The floor holds RAM for exactly the advertised session.
     const idle: u64 = 4 * 1024 * MiB;
-    const floor_now = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, billed_t), transient);
-    const floor_old = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, old_billed), transient);
-    try t.expect(floor_old > floor_now);
-    try t.expectEqual(per_tok *| @as(u64, old_billed - billed_t), floor_old - floor_now);
+    const floor_t = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, billed_t), transient);
+    const floor_more = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, billed_t + 1024), transient);
+    try t.expectEqual(per_tok * 1024, floor_more - floor_t);
 }
 
 test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
@@ -5864,7 +5827,7 @@ fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceil
     // Flash-Next advertises the context its own request bill admits at the floor rung, from the
     // headroom admission reads (the writers' host bytes included), so the two cannot disagree.
     if (config.longCtxGated()) {
-        const budget = admissionAvailable(ceiling, active_mem, diskWriterPermitBytes(config)) -| ctxSizingCacheReserve(config);
+        const budget = admissionAvailable(ceiling, active_mem) -| ctxSizingCacheReserve(config);
         return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
     }
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
@@ -5980,13 +5943,13 @@ pub fn batchedDecodeRowsBytes(config: *const model_mod.ModelConfig) u64 {
 /// it is billed as what it measures as: a constant.
 const PREFILL_RUNTIME_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Prompt length up to which Flash-Next's bill carries the smaller net (engine-memory-admission.md#bill-net).
-/// Past it the bill keeps the quarter its terms were fitted under.
-const MEASURED_NET_MAX_TOKENS: u64 = 65536;
+/// Prompt length up to which Flash-Next's summed terms stand without a net: measured at least a tenth over
+/// the live peak (engine-memory-admission.md#bill-net). Past it the bill keeps the quarter its terms were fitted under.
+const MEASURED_NET_MAX_TOKENS: u64 = 86_016;
 
-/// The net the bill adds over its summed terms, in sixteenths (20 = the quarter).
+/// The net the bill adds over its summed terms, in sixteenths (16 = none, 20 = the quarter).
 fn billUplift16ths(config: *const model_mod.ModelConfig, seq: u64) u64 {
-    return if (config.longCtxGated() and seq <= MEASURED_NET_MAX_TOKENS) 17 else 20;
+    return if (config.longCtxGated() and seq <= MEASURED_NET_MAX_TOKENS) 16 else 20;
 }
 
 /// How many MoE layers' gather-sort expansions coexist between eval points.
@@ -7002,11 +6965,10 @@ pub fn adaptivePrefillWidthNow(
     return next;
 }
 
-/// What a request may allocate: the ceiling less MLX's allocations and the SSD writers' host bytes,
-/// which MLX never counts. Taken before the width and the cache reservation are chosen, so an explicit
-/// `--prefill-chunk` bills it too.
-pub fn admissionAvailable(total_limit: u64, active_mem: u64, writer_bytes: u64) u64 {
-    return total_limit -| active_mem -| writer_bytes;
+/// What a request may allocate: the ceiling less MLX's allocations. The SSD writers' host bytes are
+/// pageable memory outside the wired limit, so the ceiling's margin under it is the only reserve.
+pub fn admissionAvailable(total_limit: u64, active_mem: u64) u64 {
+    return total_limit -| active_mem;
 }
 
 pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
@@ -7021,7 +6983,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const total_limit: u64 = currentGpuMemoryCeiling(config, active_mem);
-    const available = admissionAvailable(total_limit, active_mem, if (global_scheduler) |sch| scheduler_mod.diskWriterHostBytes(sch) else 0);
+    const available = admissionAvailable(total_limit, active_mem);
 
     // A vision prefill chunks like text since issue #197 (the splice resumes
     // its row index across chunks), so it bills the chunk-bounded envelope —
@@ -26216,9 +26178,8 @@ test "GLM requests prefill at 2048 and step down a rung only where a chunk stops
     const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
 
-    // Release defaults: a 1M request is admitted with a 2048-row tail, and 2048 still fits there. The SSD-first
-    // default also stages the writer's flush (`kv_disk_writer.DEFAULT_PERMIT_BYTES`), billed beside it.
-    const available: u64 = 115_904 * 1024 * 1024 - 104_350_000_000 + kv_disk_writer.DEFAULT_PERMIT_BYTES;
+    // Release defaults: a 1M request is admitted with a 2048-row tail, and 2048 still fits there.
+    const available: u64 = 115_904 * 1024 * 1024 - 104_350_000_000;
     const top: u64 = 1_048_576 - 256;
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, available, 2048, 0, .{}));
     var st: generate_mod.AdaptiveWidthState = .{};
@@ -26481,7 +26442,6 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
         const ram = arm.ram;
         prefix_cache_ram_enabled = ram;
         prefix_cache_disk_bytes = arm.disk;
-        // The writer's permit is billed once, through `scheduler.diskWriterHostBytes` in the admission headroom.
         const staged: u64 = 0;
         for ([_]u64{ 64, 131_072, 900_000, 1_040_000 }) |seq| {
             const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);

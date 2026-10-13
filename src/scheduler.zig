@@ -1300,9 +1300,6 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Host bytes every resident model's SSD writer holds or may hold (`LoadedModel.disk_stats`
-    /// summed), outside MLX's accounting; read through `diskWriterHostBytes`.
-    disk_writer_host_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// KV + recurrent state the live slots own beyond what the hot caches bill, once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -4810,7 +4807,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             ram_prefix_cache,
         );
         // Every tier writes off the inference thread, so a commit lands whole after the response.
-        if (entry.prefix_cache.?.disk) |*d| d.enableBackgroundWriter();
+        if (entry.prefix_cache.?.disk) |*d| {
+            d.writer_permit_bytes = @import("server.zig").disk_writer_permit_bytes;
+            d.enableBackgroundWriter();
+        }
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
             // Startup sweep of strays + root-wide LRU across sibling fingerprints.
@@ -6328,10 +6328,9 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     _ = mlx.mlx_clear_cache();
 }
 
-/// Publish every resident model's SSD tier (budget, bytes in use, entries, writer bytes) onto its own
-/// `LoadedModel`, and the writers' total for admission. Inference thread.
+/// Publish every resident model's SSD tier (budget, bytes in use, entries) onto its own `LoadedModel`.
+/// Inference thread.
 fn publishDiskStats(sch: *Scheduler) void {
-    var writer_total: u64 = 0;
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
     var it = sch.registry.entries.valueIterator();
@@ -6340,19 +6339,11 @@ fn publishDiskStats(sch: *Scheduler) void {
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .writer_bytes = d.writerHostBytes() };
+                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount() };
             };
         }
         entry.disk_stats.publish(snap);
-        writer_total +|= snap.writer_bytes;
     }
-    sch.disk_writer_host_bytes.store(writer_total, .monotonic);
-}
-
-/// The one reading admission bills for the SSD writers: host bytes every resident model's writer
-/// holds or may hold, which `mlx_get_active_memory` never counts. Safe from any thread.
-pub fn diskWriterHostBytes(sch: *const Scheduler) u64 {
-    return sch.disk_writer_host_bytes.load(.monotonic);
 }
 
 /// One `[disk-cache] usage` line per finished turn, from the finishing model's own tier.

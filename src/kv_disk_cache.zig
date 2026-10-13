@@ -508,6 +508,8 @@ pub const DiskTier = struct {
     /// Background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
+    /// The permit `enableBackgroundWriter` arms the writer with (the scheduler sets the host's).
+    writer_permit_bytes: u64 = disk_writer.DEFAULT_PERMIT_BYTES,
     /// The ceiling `max_bytes` is re-derived under before every store: the flag, or the formula / 20 GB cap;
     /// never a free-space number (`init` seeds it with `max_bytes`; the loader sets the real one).
     operator_cap: u64 = 0,
@@ -590,6 +592,7 @@ pub const DiskTier = struct {
         if (self.writer != null) return;
         const w = self.allocator.create(disk_writer.Writer) catch return;
         w.* = disk_writer.Writer.init(self.allocator, self.io);
+        w.permit_bytes = self.writer_permit_bytes;
         w.start() catch {
             self.allocator.destroy(w);
             log.warn("[disk-cache] background writer unavailable — writing synchronously\n", .{});
@@ -614,13 +617,6 @@ pub const DiskTier = struct {
         return w.pendingBytes();
     }
 
-    /// What the writer holds or may hold of host memory outside MLX's accounting: its unwritten
-    /// backlog, never under the permit its next submit may fill. Zero when the writer is not armed.
-    /// The single reading admission bills (`scheduler.diskWriterHostBytes` sums it over resident models).
-    pub fn writerHostBytes(self: *DiskTier) u64 {
-        const w = self.writer orelse return 0;
-        return @max(w.pendingBytes(), w.permit_bytes);
-    }
 
     /// Background write failures so far.
     pub fn writeErrors(self: *DiskTier) u64 {
@@ -7951,30 +7947,6 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     try testing.expect(!tier.store_declined);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
-}
-
-test "DiskTier.writerHostBytes: the permit when idle, the backlog when it is past it, zero without a writer" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-writer-bytes", 0, 128);
-    defer tier.deinit();
-    try testing.expectEqual(@as(u64, 0), tier.writerHostBytes());
-    tier.enableBackgroundWriter();
-    const w = tier.writer.?;
-    w.permit_bytes = 64 * 1024;
-    try testing.expectEqual(@as(u64, 64 * 1024), tier.writerHostBytes());
-    // A paused writer keeps what it was handed; one blob past the permit is what the host holds.
-    w.setPaused(true);
-    const path = try testing.allocator.dupe(u8, "/nonexistent/never-written.safetensors");
-    const blob = try testing.allocator.alloc(u8, 96 * 1024);
-    @memset(blob, 1);
-    w.submit(path, blob);
-    try testing.expectEqual(@as(u64, 96 * 1024), tier.writerHostBytes());
-    w.setPaused(false);
-    tier.drainWriter();
 }
 
 test "DiskTier: a budget the load line announced is a budget the store honours (10 GiB free on a 1 TiB volume)" {

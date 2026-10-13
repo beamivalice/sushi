@@ -1118,6 +1118,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
+    server_mod.disk_writer_permit_bytes = @import("kv_disk_writer.zig").permitForRam(@import("status.zig").getTotalMemBytes());
 
     if (serve_mode) {
         // Headless boot: `--model-dir` given, no `--model`. Start with no

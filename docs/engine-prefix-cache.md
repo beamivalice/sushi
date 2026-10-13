@@ -300,8 +300,8 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   is 1.9 GiB, which used to land whole.
 - **The writer's permit bounds the staged host bytes** (`Writer.waitForRoom` runs before a blob's buffer exists, and
   a file larger than half the permit goes in parts that append to one `tmp`, the last renaming it). A file's header
-  and the manifest (a few KB) are built before their room is reserved. At most 1 GiB beside the GPU, billed on every
-  disk tier. A flush that outruns the writer waits on it after the response, which delays the next request and any
+  and the manifest (a few KB) are built before their room is reserved. At most the permit (a 128th of host RAM, 128 MiB to 1 GiB) beside the GPU,
+  pageable host memory that admission does not bill. A flush that outruns the writer waits on it after the response, which delays the next request and any
   concurrent decode, not this one.
 - **The spec sidecar is written once per commit**, by the piece that completes the rows, and staged like any file;
   an earlier piece keeps what the entry had. Each piece used to rewrite it synchronously.

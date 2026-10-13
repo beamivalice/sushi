@@ -23,6 +23,15 @@ pub const Blob = struct {
 pub const Part = enum { whole, first, middle, last };
 
 pub const DEFAULT_PERMIT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MIN_PERMIT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The permit on a host with `ram` bytes (0 = unknown: the cap): a 128th of it, floor to cap. The SSD
+/// drains a prefill chunk's blob before the next is built, and admission bills the whole permit, so on a
+/// small Mac a larger one is context taken from every request.
+pub fn permitForRam(ram: u64) u64 {
+    if (ram == 0) return DEFAULT_PERMIT_BYTES;
+    return std.math.clamp(ram / 128, MIN_PERMIT_BYTES, DEFAULT_PERMIT_BYTES);
+}
 
 /// One blob the writer could not write; the tier invalidates the entry it belonged to.
 /// `path` is owned by whoever takes it out of `takeFailures`.
@@ -589,6 +598,16 @@ test "kv_disk_writer: the epoch fence drops staged bytes instead of writing them
     const after_fence = w.epoch;
     try testing.expect(after_fence > 1);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "never.bin", .{}));
+}
+
+test "kv_disk_writer: the permit scales with host RAM between its floor and its cap" {
+    const gib: u64 = 1 << 30;
+    try testing.expectEqual(@as(u64, 256 << 20), permitForRam(32 * gib));
+    try testing.expectEqual(@as(u64, 512 << 20), permitForRam(64 * gib));
+    try testing.expectEqual(DEFAULT_PERMIT_BYTES, permitForRam(128 * gib));
+    try testing.expectEqual(DEFAULT_PERMIT_BYTES, permitForRam(512 * gib));
+    try testing.expectEqual(MIN_PERMIT_BYTES, permitForRam(8 * gib));
+    try testing.expectEqual(DEFAULT_PERMIT_BYTES, permitForRam(0));
 }
 
 test "kv_disk_writer: the host-byte permit bounds staged bytes" {
