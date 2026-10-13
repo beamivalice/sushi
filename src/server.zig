@@ -4950,7 +4950,10 @@ test "Flash-Next's request bill brackets the peaks measured on the M1 Max, with 
     defer generate_mod.prefill_chunk_override = saved_width;
     generate_mod.prefill_chunk_override = 512;
     const cfg = qwen4MeasuredTestConfig();
-    // Live `peak_bytes - active_bytes` after one prompt per boot (512 rung, kv8, no MTP, SSD tier on, 16 new tokens).
+    // Live `peak_bytes - active_bytes` after one prompt per boot (512 rung, kv8, no MTP, SSD tier on, 16 new
+    // tokens), measured while every checkpoint stayed in RAM (up to the 16 captured). A landed checkpoint now
+    // leaves RAM, so the request holds at most `ssmResidentCap` of them: each row loses the rest. The M5 Max
+    // lost 830 to 888 MB at 8k to 67k tokens, 14 to 15 checkpoints, more than the 13 billed here.
     const measured = [_]struct { tokens: u64, peak_mib: u64 }{
         .{ .tokens = 2857, .peak_mib = 1117 },
         .{ .tokens = 8505, .peak_mib = 1774 },
@@ -4960,10 +4963,15 @@ test "Flash-Next's request bill brackets the peaks measured on the M1 Max, with 
     };
     for (measured) |m| {
         const bill = prefillNeededAtChunk(&cfg, m.tokens, 16, 8, 512, .{});
-        const peak = m.peak_mib * (1 << 20);
-        // Under-billing is a Metal OOM; billing past a quarter more than the peak is the padding.
+        const no_tier = TierGuard.pin(false, 0);
+        const held_before = retainedSsmCheckpointBytes(&cfg, m.tokens, 0, 512);
+        no_tier.restore();
+        const freed = held_before - retainedSsmCheckpointBytes(&cfg, m.tokens, 0, 512);
+        const peak = m.peak_mib * (1 << 20) - freed;
+        // Under-billing is a Metal OOM. The freed checkpoints were billed exactly, so the rest of the bill's
+        // fixed slack is a larger share of the smaller peak: the padding bar moves from a quarter to 30%.
         try std.testing.expect(bill >= peak + peak / 20);
-        try std.testing.expect(bill <= peak + peak / 4);
+        try std.testing.expect(bill <= peak + peak * 3 / 10);
     }
 }
 
@@ -5463,6 +5471,9 @@ test "the per-token widths the request chooser is built on" {
 
 // Bar: the ring is billed once per slot, independent of prompt length.
 test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
+    // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
     const t = std.testing;
@@ -6258,7 +6269,16 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     var n: u64 = seq / stride -| @min(matched, seq) / stride;
     if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
     if (ssm_checkpoint_max > 0) n = @min(n, ssm_checkpoint_max);
+    if (ssmResidentCap(config)) |cap| n = @min(n, cap);
     return n * per_cp;
+}
+
+/// The most checkpoint states a Qwen request holds at once when its model runs an SSD tier: the write-through
+/// frees each one once its file is written, and a request it cannot serve is thinned to the same number
+/// (`scheduler.qwenCheckpointCap`). Null = every checkpoint stays in RAM.
+fn ssmResidentCap(config: *const model_mod.ModelConfig) ?u64 {
+    if (!config.isQwen4() or !diskTierOn(config)) return null;
+    return transformer_mod.SSM_RESIDENT_MAX;
 }
 
 /// The checkpoints a GLM prefill of `seq` tokens takes after restoring `matched`: the one schedule the generator runs.
@@ -23310,6 +23330,9 @@ test "qwen4ExpOomConfig does not leak qsa_score_fused_override" {
 }
 
 test "the 458k prefill's two unbilled terms are billed: retained checkpoints and reserved capacity" {
+    // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
     const qsa_fused_off = qsaScoreFusedOffGuard();
@@ -24321,11 +24344,52 @@ test "the 64 GB Sushi-2.6bpw recipe's bills at both GDN widths: 250000 context, 
     configured_mtp = true;
     const warm = WarmPrefix{ .mtp_on = true };
     // The load bill's context term is the narrowest rung; a request runs the 4096 rung in 13,734 MB.
-    try t.expectEqual(@as(u64, 9_633), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 12_946), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    // With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
+    try t.expectEqual(@as(u64, 7_844), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 11_157), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
     cfg.gdn_state_f32 = false;
-    try t.expectEqual(@as(u64, 8_553), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 11_866), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_641), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 10_954), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+}
+
+test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths" {
+    const t = std.testing;
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(t.allocator);
+    const saved = .{ ssm_checkpoint_stride, ssm_checkpoint_max };
+    defer {
+        ssm_checkpoint_stride = saved[0];
+        ssm_checkpoint_max = saved[1];
+    }
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    const seq: u64 = 250_000;
+    for ([_]bool{ true, false }) |f32_state| {
+        cfg.gdn_state_f32 = f32_state;
+        const per_cp = cfg.ssmCheckpointBytes();
+        try t.expectEqual(if (f32_state) @as(u64, 115_458_048) else 58_834_944, per_cp);
+
+        const no_tier = TierGuard.pin(false, 0);
+        try t.expectEqual(@as(u64, 16) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
+        no_tier.restore();
+
+        // A write-through prefill holds two states; one it cannot serve is thinned to two and holds a third
+        // while one is captured: the bill covers the larger.
+        const ssd_only = TierGuard.pin(false, 20 << 30);
+        try t.expectEqual(@as(u64, 3) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
+        // A prompt under one stride captures its prompt-end snapshot alone and bills just that.
+        try t.expectEqual(per_cp, retainedSsmCheckpointBytes(&cfg, 300, 0, 512));
+        // A tier that did not come up bills as without one.
+        cfg.prefix_cache_disk_declined = true;
+        try t.expectEqual(@as(u64, 16) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
+        cfg.prefix_cache_disk_declined = false;
+        ssd_only.restore();
+
+        // A RAM tier beside the SSD one keeps its entry's newest two out of the same states.
+        const both = TierGuard.pin(true, 20 << 30);
+        try t.expectEqual(@as(u64, 3) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
+        both.restore();
+    }
 }
 
 test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_quant override" {
@@ -24470,6 +24534,9 @@ fn qwen4ExpLive364kConfig() model_mod.ModelConfig {
 }
 
 test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's" {
+    // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
     // Turn B: prompt 368,208, restored 364,478 by move, refused by 290 MB at width 512. 1,795 MB
@@ -24548,6 +24615,9 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
 }
 
 test "the live 364k session's admission numbers reproduce, to the megabyte" {
+    // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
     // The anchor: fed the deployed config and the incident's prompt lengths, the estimator prints

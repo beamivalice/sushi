@@ -1079,6 +1079,8 @@ pub const HotPrefixCache = struct {
             k -= 1;
             const p = positions[k];
             if (p > limit) continue;
+            // A released state restores from the SSD, not from this entry.
+            if (cps) |list| if (list[k].isReleased()) continue;
             if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
             const rows = @as(u64, p) * row_bytes;
             if (rows > budget) continue;
@@ -2189,8 +2191,11 @@ pub const HotPrefixCache = struct {
             ssm_cps = glm5_prefix.keepThrough(self.allocator, cps, rows.len);
         };
         // The pending record holds every checkpoint for the SSD tier, so the hot entry keeps only its newest.
-        const hot_keeps_newest = new_glm != null and self.pending_disk != null;
-        if (hot_keeps_newest) self.keepNewestCheckpoints(&ssm_cps);
+        // A GDN checkpoint past the record's text prefix is not in it and stays.
+        const hot_keeps_newest = self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
+        const record_text: usize = if (new_glm != null) std.math.maxInt(usize) else disk_len;
+        // GDN checkpoints are cut after the byte-budget trim below, which lands on one of them.
+        if (hot_keeps_newest and new_glm != null) self.keepNewestCheckpoints(&ssm_cps, record_text);
 
         // An entry's pixel key applies only to rows it actually covers. When
         // the committed range ends before the request's first media row — a
@@ -2623,7 +2628,7 @@ pub const HotPrefixCache = struct {
             const ring_bytes = ringCpsBytes(e.ring_cps);
             self.current_kv_bytes -|= e.kv_bytes;
 
-            if (hot_keeps_newest) self.keepNewestCheckpoints(&merged_cps);
+            if (hot_keeps_newest) self.keepNewestCheckpoints(&merged_cps, record_text);
             // Recompute ssm bytes from the merged list.
             var merged_ssm_bytes: u64 = 0;
             if (merged_cps) |cps| {
@@ -2678,7 +2683,7 @@ pub const HotPrefixCache = struct {
         }
 
         if (hot_keeps_newest) {
-            self.keepNewestCheckpoints(&eff_cps);
+            self.keepNewestCheckpoints(&eff_cps, record_text);
             var kept_bytes: u64 = 0;
             if (eff_cps) |cps| for (cps) |*cp| {
                 kept_bytes += ssmCheckpointBytes(cp);
@@ -3086,6 +3091,28 @@ pub const HotPrefixCache = struct {
             return;
         };
         if (d.last_store_id) |id| entry_id.* = id;
+    }
+
+    /// Qwen's prefill write-through: the rows and checkpoints so far go to the SSD tier as the prefill produces
+    /// them, and every checkpoint but the newest leaves RAM once its file is written. Best effort: what a failed
+    /// write could not land is released too, since the admission bill counts on the bound.
+    pub fn writeThroughHybrid(
+        self: *HotPrefixCache,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        config: kv_quant.KVQuantConfig,
+        prompt: []const u32,
+        has_tools: bool,
+        cps: []SSMCheckpoint,
+        flush_bound: u64,
+        s: mlx.mlx_stream,
+    ) void {
+        const d = if (self.disk) |*dd| dd else return;
+        // Below the tier's floor nothing is written yet, so no state may be freed.
+        const floor = prompt.len >= kv_disk_cache.MIN_PERSIST_TOKENS;
+        _ = d.appendCommitBounded(kv_entries, prompt.len, config, prompt, has_tools, if (cps.len > 0) cps else null, s, flush_bound) catch |err| {
+            log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
+        };
+        if (floor) d.settleCheckpoints(d.last_store_id, cps);
     }
 
     /// Write the pending record whole and release it: its rows may be a finished request's own
@@ -3699,16 +3726,27 @@ pub const HotPrefixCache = struct {
     }
 
     /// Frees all but the newest `glm5_prefix.checkpoint_hot_kept` of an ascending checkpoint list. The older
-    /// ones are restored from the SSD tier, which holds them all.
-    fn keepNewestCheckpoints(self: *HotPrefixCache, list: *?[]SSMCheckpoint) void {
+    /// ones are restored from the SSD tier, which holds them all; one past `text_len` is not in the SSD record
+    /// and stays.
+    fn keepNewestCheckpoints(self: *HotPrefixCache, list: *?[]SSMCheckpoint, text_len: usize) void {
         const cps = list.* orelse return;
-        const kept: usize = glm5_prefix.checkpoint_hot_kept;
-        if (cps.len <= kept) return;
-        const dropped = cps.len - kept;
-        for (cps[0..dropped]) |*cp| cp.deinit(self.allocator);
-        std.mem.copyForwards(SSMCheckpoint, cps[0..kept], cps[dropped..]);
-        for (cps[kept..]) |*stub| stub.* = .{ .pos = 0, .layers = &.{} };
-        list.* = self.allocator.realloc(cps, kept) catch cps;
+        const newest: usize = glm5_prefix.checkpoint_hot_kept;
+        var n_keep: usize = 0;
+        for (cps, 0..) |*cp, i| {
+            if (cps.len - i <= newest or cp.pos > text_len) n_keep += 1;
+        }
+        if (n_keep == cps.len) return;
+        var at: usize = 0;
+        for (cps, 0..) |*cp, i| {
+            if (cps.len - i <= newest or cp.pos > text_len) {
+                cps[at] = cp.*;
+                at += 1;
+            } else {
+                cp.deinit(self.allocator);
+            }
+        }
+        for (cps[at..]) |*stub| stub.* = .{ .pos = 0, .layers = &.{} };
+        list.* = self.allocator.realloc(cps, at) catch cps;
     }
 
     fn shedCheckpointsToFit(self: *HotPrefixCache) void {
@@ -6451,6 +6489,162 @@ test "HotPrefixCache: under SSD-first a decline rides pending_disk, never a seco
     try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
 }
 
+test "HotPrefixCache: with an SSD tier the RAM entry keeps only its newest two checkpoints" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tokens: [900]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var srcs: [8][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+
+    for ([_]bool{ true, false }) |with_disk| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &buf);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        if (with_disk) {
+            hc.ssd_first = true;
+            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-ram-keep", 0, 128);
+            hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
+        }
+
+        var c1 = try KVCache.init(testing.allocator, 3);
+        defer c1.deinit();
+        try testFillCache(&c1, s, 3, 700);
+        const cps1 = try testing.allocator.alloc(SSMCheckpoint, 5);
+        for (cps1, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], 512 + 32 * i, s);
+        _ = try hc.commitWithSsm(&c1, tokens[0..700], false, cps1, null, null);
+        const kept1 = hc.entries.items[0].ssm_checkpoints.?;
+        // Without a tier there is nowhere else to restore from: today's behaviour.
+        try testing.expectEqual(@as(usize, if (with_disk) 2 else 5), kept1.len);
+        try testing.expectEqual(@as(usize, 640), kept1[kept1.len - 1].pos);
+        try testing.expectEqual(@as(usize, if (with_disk) 608 else 512), kept1[0].pos);
+
+        // The next turn extends the entry and brings three more: still the newest two.
+        var c2 = try KVCache.init(testing.allocator, 3);
+        defer c2.deinit();
+        try testFillCache(&c2, s, 3, 900);
+        const cps2 = try testing.allocator.alloc(SSMCheckpoint, 3);
+        for (cps2, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[5 + i], 704 + 32 * i, s);
+        _ = try hc.commitWithSsm(&c2, tokens[0..900], false, cps2, null, null);
+        try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+        const kept2 = hc.entries.items[0].ssm_checkpoints.?;
+        try testing.expectEqual(@as(usize, if (with_disk) 2 else 8), kept2.len);
+        try testing.expectEqual(@as(usize, 768), kept2[kept2.len - 1].pos);
+        var bytes: u64 = 0;
+        for (kept2) |*cp| bytes += ssmCheckpointBytes(cp);
+        try testing.expectEqual(bytes, hc.entries.items[0].ssm_bytes);
+
+        if (with_disk) {
+            // Everything RAM let go is on the SSD record, to restore from there.
+            hc.flushPendingDisk(s);
+            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+            try testing.expectEqual(@as(usize, 8), hc.disk.?.entries.items[0].ssm_positions.len);
+        }
+    }
+}
+
+
+
+fn pcHeld(cps: []const SSMCheckpoint) usize {
+    var n: usize = 0;
+    for (cps) |*cp| n += @intFromBool(!cp.isReleased());
+    return n;
+}
+
+test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every position, and any of them restores from SSD exactly" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var tokens: [1500]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, 1500);
+    var srcs: [8][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qwen-wt", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+
+    var cps = std.ArrayList(SSMCheckpoint).empty;
+    errdefer {
+        for (cps.items) |*cp| cp.deinit(testing.allocator);
+        cps.deinit(testing.allocator);
+    }
+    var peak: usize = 0;
+    // The prefill loop: a checkpoint after each chunk, then the write-through.
+    for (0..7) |i| {
+        const pos = 512 + 128 * i;
+        try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], pos, s));
+        peak = @max(peak, pcHeld(cps.items));
+        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, cps.items, std.math.maxInt(u64), s);
+        try testing.expectEqual(@as(usize, 1), pcHeld(cps.items));
+    }
+    // The prompt-end snapshot is taken after the loop, past the hook.
+    try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[7], 1400, s));
+    try testing.expectEqual(@as(usize, 2), pcHeld(cps.items));
+    try testing.expect(peak <= 2);
+    try testing.expectEqual(@as(usize, 8), cps.items.len);
+
+    // The commit lists every position and the SSD record writes only the states still held.
+    const owned = try cps.toOwnedSlice(testing.allocator);
+    try testing.expectEqual(CommitStatus{ .disk_only = 1500 }, try hc.commitWithSsm(&cache, &tokens, false, owned, null, null));
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+    try testing.expectEqualSlices(u32, &.{ 512, 640, 768, 896, 1024, 1152, 1280, 1400 }, hc.disk.?.entries.items[0].ssm_positions);
+
+    // Released and held alike: each position restores its own state from the file.
+    for ([_]struct { pos: u32, conv: f32, ssm: f32 }{
+        .{ .pos = 512, .conv = 100, .ssm = 500 },
+        .{ .pos = 896, .conv = 400, .ssm = 2000 },
+        .{ .pos = 1280, .conv = 700, .ssm = 3500 },
+        .{ .pos = 1400, .conv = 800, .ssm = 4000 },
+    }) |w| {
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var dst = pcEmptySsm();
+        defer pcFreeHybrid(&dst);
+        try testing.expectEqual(w.pos, try hc.disk.?.restoreIntoHybrid(&cache2, &dst, 0, w.pos, s));
+        try testing.expectEqual(w.conv, pcSsmVal(dst[0].conv_state, 0, s));
+        try testing.expectEqual(w.ssm, pcSsmVal(dst[0].ssm_state, 0, s));
+    }
+}
+
+test "HotPrefixCache: a byte-budget trim never lands on a released checkpoint, which this entry cannot restore from" {
+    const cps = [_]SSMCheckpoint{
+        .{ .pos = 1024, .layers = &.{}, .released_bytes = 100 },
+        .{ .pos = 2048, .layers = &.{} },
+    };
+    const positions = [_]usize{ 1024, 2048 };
+    const bytes = [_]u64{ 0, 100 };
+    // 1024 is the highest position under the limit, and a placeholder: the entry declines to trim there.
+    try testing.expectEqual(@as(?usize, null), HotPrefixCache.trimLenForBudgetPure(10_000_000, 1500, 1000, &positions, &bytes, .min_span_recency, &cps));
+    const held = [_]SSMCheckpoint{ .{ .pos = 1024, .layers = &.{} }, .{ .pos = 2048, .layers = &.{} } };
+    try testing.expectEqual(@as(?usize, 1024), HotPrefixCache.trimLenForBudgetPure(10_000_000, 1500, 1000, &positions, &bytes, .min_span_recency, &held));
+}
+
 test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
     // Live 2026-09-07: an oversized decline discarded the cancelled
     // prefill's work entirely — under a 1 GB hot budget a 122k session's
@@ -6574,7 +6768,7 @@ test "HotPrefixCache: a commit that checked-out residents decline still reaches 
     }
 }
 
-test "HotPrefixCache: a fork's SSD entry keeps the checkpoints it inherits in RAM" {
+test "HotPrefixCache: a fork's SSD entry keeps the checkpoints its donor holds in RAM" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -6624,7 +6818,8 @@ test "HotPrefixCache: a fork's SSD entry keeps the checkpoints it inherits in RA
     const b_disk = for (d.entries.items) |*e| {
         if (e.tokens.len > 600 and e.tokens[600] == 210) break e;
     } else return error.TestExpectedForkEntry;
-    try testing.expectEqualSlices(u32, &.{ 256, 512, 600 }, b_disk.ssm_positions);
+    // A's RAM entry kept its newest two (512, 601): 256 stays only in A's own SSD entry.
+    try testing.expectEqualSlices(u32, &.{ 512, 600 }, b_disk.ssm_positions);
 }
 
 test "a fork's SSD entry keeps its donor's ring checkpoint, so a restart restores there with the donor gone" {

@@ -270,10 +270,11 @@ fn printUsage(io: std.Io) void {
         \\                        disables.
         \\  --ssm-checkpoint-max <n>
         \\                      Cap on SSM checkpoints retained per cache entry
-        \\                        (default: 16). The first stride-aligned position
-        \\                        is always kept; beyond the cap the oldest are
-        \\                        dropped. 0 = unlimited, bounded only by the
-        \\                        prefix cache's byte budget.
+        \\                        (default: 16). The first and the newest
+        \\                        positions are always kept; beyond the cap the
+        \\                        interior is thinned. 0 = unlimited, bounded only
+        \\                        by the prefix cache's byte budget. With an SSD
+        \\                        tier Qwen holds only the newest in RAM.
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 1, integers 1..32).

@@ -6588,18 +6588,15 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
     if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, cps, s);
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
-    _ = d.appendCommitBounded(
+    hc.writeThroughHybrid(
         slot.cache.entries,
-        abs_kv_pos,
         slot.cache.config,
         slot.full_prompt[0..abs_kv_pos],
         slot.has_tools,
-        if (cps.len > 0) cps else null,
-        s,
+        cps,
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
-    ) catch |err| {
-        log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
-    };
+        s,
+    );
 }
 
 /// The write-through hook's per-call flush bound: one byte, so the chunk loop stops after the first chunk it writes.
@@ -6635,6 +6632,22 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
         return false;
     }
     return true;
+}
+
+/// The checkpoints a Qwen request may list when no write-through frees them as they land: with an SSD tier
+/// behind the cache it holds at most `SSM_RESIDENT_MAX` states, which is what `server.ssmResidentCap` bills.
+/// A write-through request holds two whatever it lists (`HotPrefixCache.writeThroughHybrid`).
+fn qwenCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
+    if (!qwenCheckpointCapped(slot, write_through)) return cp_max;
+    const cap = transformer_mod.SSM_RESIDENT_MAX - 1;
+    return if (cp_max == 0) cap else @min(cp_max, cap);
+}
+
+fn qwenCheckpointCapped(slot: *Slot, write_through: bool) bool {
+    const cfg = slot.model.config orelse return false;
+    if (write_through or !cfg.isQwen4()) return false;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+    return hc.disk != null;
 }
 
 /// Does this GLM request's prefill move each KDA checkpoint to SSD and free its RAM copy? Admission bills
@@ -7120,6 +7133,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // out of prefill_ns below (the decoding slots got the time).
     var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
+    const write_through_on = writeThroughArmed(slot, prefill_tokens.len);
+    cp_max = qwenCheckpointCap(slot, cp_max, write_through_on);
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
         .sch = sch,
@@ -7194,6 +7209,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .skip_lazy_preforward = !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
+            .ssm_media_start = if (qwenCheckpointCapped(slot, write_through_on)) slot.media_start else null,
             .ssm_checkpoint_pos_offset = hot_matched,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.
@@ -7221,7 +7237,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else
                 null,
-            .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
+            .write_through_hook = if (write_through_on)
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else
                 null,

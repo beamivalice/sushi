@@ -1273,6 +1273,35 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 /// from HBM — the dominant cold-prefill cost. A too-small stride therefore
 /// silently tanks MoE prefill throughput (~25% on 35B-class models for an
 /// 850-token prompt at stride 256). Keeping typical prompts single-chunk is what
+/// Which checkpoint a capped list drops. With media in the prompt the SSD record ends at the last checkpoint at
+/// or below the first media row (`media_start`), so a text checkpoint a later text one supersedes goes first, then
+/// the oldest past the media; the newest always stays.
+fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.ThinPolicy, media_start: ?usize) usize {
+    if (media_start) |ms| {
+        var i: usize = 0;
+        while (i + 1 < items.len) : (i += 1) if (items[i + 1].pos <= ms) return i;
+        i = 0;
+        while (i + 1 < items.len) : (i += 1) if (items[i].pos > ms) return i;
+    }
+    return transformer_mod.ssmCheckpointDropIndex(items, policy, null);
+}
+
+test "a capped list with media keeps the checkpoint the SSD record ends at" {
+    const media: usize = 1000;
+    var list = [_]SSMCheckpoint{
+        .{ .pos = 512, .layers = &.{} },
+        .{ .pos = 768, .layers = &.{} },
+        .{ .pos = 1536, .layers = &.{} },
+    };
+    // 512 is superseded by 768, the boundary.
+    try testing.expectEqual(@as(usize, 0), checkpointDropIndex(&list, .min_span_recency, media));
+    list = .{ .{ .pos = 768, .layers = &.{} }, .{ .pos = 1536, .layers = &.{} }, .{ .pos = 2048, .layers = &.{} } };
+    // Past the media only the newest matters beside the boundary.
+    try testing.expectEqual(@as(usize, 1), checkpointDropIndex(&list, .min_span_recency, media));
+    // Without media the generic thinning decides.
+    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency, null));
+}
+
 /// `ssm_checkpoint_stride`'s default guards.
 /// A trailing remainder smaller than this merges into the preceding chunk
 /// instead of becoming its own chunk. Chat-templated prompts routinely land a
@@ -2257,6 +2286,10 @@ pub const Generator = struct {
         /// absolute positions usable by future warm-path lookups against
         /// the full prompt.
         ssm_checkpoint_pos_offset: usize = 0,
+        /// Absolute row of the prompt's first media placeholder, set where the list is capped without a
+        /// write-through to free it: the SSD record ends at the last checkpoint at or below it, so the
+        /// thinning keeps that one (`checkpointDropIndex`).
+        ssm_media_start: ?usize = null,
         /// Placeholder rows inside a restored prefix (prefix-cache hit on an
         /// image prompt): the vision splice starts here, not at row 0.
         vision_rows_before: usize = 0,
@@ -2847,7 +2880,7 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            checkpointDropIndex(ssm_checkpoints.items, cp_thin, options.ssm_media_start),
                         );
                         dropped.deinit(allocator);
                     }
@@ -2964,7 +2997,7 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            checkpointDropIndex(ssm_checkpoints.items, cp_thin, options.ssm_media_start),
                         );
                         dropped.deinit(allocator);
                     }

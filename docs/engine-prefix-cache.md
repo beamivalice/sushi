@@ -217,6 +217,34 @@ restore points and GLM state ([GLM](glm5-prefix-cache.md#glm)) survive restart. 
 
 Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
 
+<a id="checkpoints-on-ssd"></a>
+### Qwen's GDN checkpoints live on the SSD
+
+Qwen takes GLM's mechanism ([glm5-prefix-cache](glm5-prefix-cache.md#glm)): `SSMCheckpoint.release` keeps a position and
+frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but the newest once its file left the writer.
+
+- **A checkpoint leaves RAM as the next one is taken.** The write-through (`HotPrefixCache.writeThroughHybrid`) persists
+  the chunk with its checkpoints, then settles them; a prefill holds two states (the previous newest until its file is
+  written, and the one just taken) where it held every one it captured (up to 16: 897 MiB at `--qwen-gdn 16`, 1.76 GiB
+  at f32). Below `MIN_PERSIST_TOKENS` nothing is written, so nothing is released. A failed write is released too: not a
+  restore point, and the entry is poisoned at the next commit (`harvestWriteFailures`).
+- **Every position stays listed.** The commit, the thinning and the hot entry read positions from the same list; a
+  released one is skipped as a source of state (`ssmTargetPositions`, `highestCheckpointAtOrBelow`) and priced at the
+  bytes it held (`released_bytes`). A restore at any position reads its file.
+- **A request the write-through cannot serve** (an image-bearing one, a span under one disk chunk) releases nothing, so
+  its list is thinned to two (`scheduler.qwenCheckpointCap`) and it holds three states while one is captured. With media
+  in the prompt the thinning keeps the last checkpoint at or below the first media row, where the SSD record ends
+  (`generate.checkpointDropIndex`), then the newest. The byte-budget trim never lands on a released checkpoint.
+  `transformer.SSM_RESIDENT_MAX` is the number the admission bill counts
+  ([engine-memory-admission](engine-memory-admission.md#bill-checkpoints)).
+- **A RAM tier keeps its entry's newest two** (`keepNewestCheckpoints`, on commit, merge and inheritance), after the
+  byte-budget trim, and only where the commit's SSD record carries the rest: a checkpoint past the record's text prefix
+  has no other copy and stays. Older positions restore from the SSD (`lookupImpl` takes the disk checkpoint when it beats
+  the RAM one by `MIN_DISK_ADVANTAGE_TOKENS`). A RAM tier with no SSD tier keeps every checkpoint. A fork's record
+  inherits only the checkpoints its donor holds in RAM; the donor's older ones stay in the donor's own SSD entry.
+- Guards: `Qwen SSD-only: a prefill holds at most two checkpoint states...` and `with an SSD tier the RAM entry keeps only
+  its newest two checkpoints` (prefix_cache.zig), `an SSD tier bounds the checkpoints a Qwen prefill holds` (server.zig).
+
 <a id="one-tier-per-root"></a>
 ## One live tier per root
 

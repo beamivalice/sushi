@@ -11448,6 +11448,12 @@ pub const SSMCheckpoint = struct {
     }
 };
 
+/// Checkpoint states one Qwen request holds in RAM when an SSD tier backs its cache: a write-through prefill
+/// holds two (the one before the newest, until its file is written, and the one just captured); a request
+/// it cannot serve is thinned to two and holds a third while one is captured. The admission bill and the
+/// capture cap both read it.
+pub const SSM_RESIDENT_MAX: u32 = 3;
+
 /// Snapshot of every entry in `ssm_entries` at the current point. Caller owns
 /// the resulting buffer (free via `SSMCheckpoint.deinit`).
 ///
