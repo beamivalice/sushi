@@ -61,7 +61,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   term; request admission bills it.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
-  from the capture schedule the generator runs), one assistant window and the RAM tier's row copy (the SSD writer's
+  from the capture schedule the generator runs; 2 where SSD-only storage writes them through and frees their RAM
+  copy, `WarmPrefix.released`), one assistant window and the RAM tier's row copy (the SSD writer's
   1 GiB permit is the shared headroom term below, for every arch), and keeps fewer checkpoints where they do not fit, never refusing for them
   ([engine-prefix-cache](glm5-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard

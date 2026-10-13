@@ -430,7 +430,7 @@ fn rowBytes(a: mlx.mlx_array) u64 {
 }
 
 fn checkpointFileBytes(cp: *const transformer_mod.SSMCheckpoint) u64 {
-    var n: u64 = FILE_OVERHEAD_BYTES;
+    var n: u64 = FILE_OVERHEAD_BYTES + cp.released_bytes;
     for (cp.layers) |*l| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |a| {
         if (a.ctx != null) n += nbytesOf(a) + TENSOR_OVERHEAD_BYTES;
     };
@@ -635,6 +635,27 @@ pub const DiskTier = struct {
         const pre = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, id }) catch return true;
         defer self.allocator.free(pre);
         return w.pendingPrefix(pre);
+    }
+
+    /// Frees the RAM state of every checkpoint in `cps` (ascending by position) but the newest one still
+    /// held, after waiting for its file to leave the writer: staged for entry `id`, the file is the
+    /// restore point from then on. A checkpoint the tier did not take, or whose write failed, is not
+    /// a restore point (the failure poisons the entry on the next commit) and its state is not kept.
+    pub fn settleCheckpoints(self: *DiskTier, id: ?u64, cps: []transformer_mod.SSMCheckpoint) void {
+        var newest: ?usize = null;
+        for (cps, 0..) |*cp, i| {
+            if (!cp.isReleased()) newest = i;
+        }
+        for (cps, 0..) |*cp, i| {
+            if (cp.isReleased() or i == newest) continue;
+            if (self.writer) |w| if (id) |entry| {
+                if (std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, entry, cp.pos })) |path| {
+                    defer self.allocator.free(path);
+                    w.drainPrefix(path);
+                } else |_| {}
+            };
+            cp.release();
+        }
     }
 
     /// Attribute the writer's failed blobs to the entries that staged them and poison those
@@ -1868,7 +1889,7 @@ pub const DiskTier = struct {
         const chunks_done: u32 = chunk_i;
         const chunk_complete = chunks_done == n_chunks;
         const kv_len: u32 = if (chunk_complete) kv_target else chunks_done * self.chunk_tokens;
-        if (kv_len <= old_kv and ssm_res.positions.len == old_ssm_pos.len and ringsEqual(rings, old_rings)) {
+        if (kv_len <= old_kv and std.mem.eql(u32, ssm_res.positions, old_ssm_pos) and ringsEqual(rings, old_rings)) {
             // Cap so tight nothing new landed — nothing to commit (a
             // checkpoint-only write still counts as progress).
             chunk_sizes.deinit(self.allocator);
@@ -2761,7 +2782,8 @@ pub const DiskTier = struct {
         errdefer set.deinit(self.allocator);
         try set.appendSlice(self.allocator, old_positions);
         for (cps) |*cp| {
-            if (cp.pos == 0 or cp.pos > kv_len) continue;
+            // A released state has no bytes to write: it is a restore point only where its file already is.
+            if (cp.pos == 0 or cp.pos > kv_len or cp.isReleased()) continue;
             const p: u32 = @intCast(cp.pos);
             if (std.mem.indexOfScalar(u32, set.items, p) == null) try set.append(self.allocator, p);
         }

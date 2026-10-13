@@ -15,6 +15,13 @@ pub const pool_size: usize = 4;
 /// KDA checkpoints one entry or one prefill keeps: each is 141 MiB of FP32 state.
 pub const checkpoint_cap: u32 = 8;
 
+/// KDA states an SSD-only prefill holds in RAM at once: the checkpoint just taken and the one before it,
+/// whose write may still be landing. Older ones are on SSD and their RAM copy is released.
+pub const checkpoint_ram_held: u32 = 2;
+
+/// KDA checkpoints the RAM tier's hot entry keeps (the newest) when an SSD tier holds the rest.
+pub const checkpoint_hot_kept: u32 = 2;
+
 pub fn checkpointMax(global: u32) u32 {
     return if (global == 0) checkpoint_cap else @min(global, checkpoint_cap);
 }

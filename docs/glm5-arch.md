@@ -167,7 +167,8 @@ inside 1.46% drift) because verification per round grew 20.6%.
   attention with its second tile 256 MiB, index scores 8 MiB, and under kv8 the dense-prefill dequantization
   (≤ 2051 rows) plus one chunk's quantizer output, 3.1 MiB. Without NAX the packed tiles (the FP32 composite) keep
   their 256 MiB and the A6, MLA, index and cluster terms drop. With the prefix cache on, a
-  prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit
+  prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit;
+  under SSD-only storage the prefill writes each checkpoint through and frees its RAM copy, so it holds 2
   ([prefix cache](glm5-prefix-cache.md#glm)).
 - Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with
   the engine's 93% margin: GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +

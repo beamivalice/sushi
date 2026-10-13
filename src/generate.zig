@@ -2313,7 +2313,7 @@ pub const Generator = struct {
         /// runs atomically (pre-interleave behavior, and the
         /// SUSHI_PREFILL_INTERLEAVE=0 kill switch).
         interleave_hook: ?InterleaveHook = null,
-        /// SSD-first write-through (qwen4_exp only; see `WriteThroughHook`).
+        /// SSD-first write-through (qwen4_exp and GLM; see `WriteThroughHook`).
         write_through_hook: ?WriteThroughHook = null,
         /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
         /// `mlx_clear_cache` and before the interleave tick. Null keeps the admitted width.
@@ -2331,9 +2331,10 @@ pub const Generator = struct {
 
     /// SSD-first write-through: called at every completed prefill chunk with the absolute KV
     /// position and the SSM checkpoints so far, so a cancelled prefill leaves a restorable prefix.
+    /// The hook may `release` a checkpoint whose state it has put on SSD; its position stays listed.
     pub const WriteThroughHook = struct {
         ctx: *anyopaque,
-        call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []const SSMCheckpoint) void,
+        call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []SSMCheckpoint) void,
     };
 
     /// Returns the width the next chunk should run at (`cur` unchanged = no change).
@@ -19385,6 +19386,65 @@ test "the GLM prefill holds as many checkpoints as its schedule says, and ends o
         try testing.expectEqual(sched.peak, gen.ssm_cp_peak);
         try testing.expectEqual(@min(sched.events, cap), @as(u32, @intCast(gen.ssm_checkpoints.items.len)));
         try testing.expectEqual(sched.newest, gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].pos);
+    };
+}
+
+const GlmReleasing = struct {
+    peak: usize = 0,
+
+    fn call(raw: *anyopaque, _: usize, cps: []SSMCheckpoint) void {
+        const self: *GlmReleasing = @ptrCast(@alignCast(raw));
+        var held: usize = 0;
+        var newest: ?usize = null;
+        for (cps, 0..) |cp, i| {
+            if (cp.isReleased()) continue;
+            held += 1;
+            newest = i;
+        }
+        self.peak = @max(self.peak, held);
+        for (cps, 0..) |*cp, i| if (i != newest) cp.release();
+    }
+};
+
+test "a GLM prefill whose hook releases landed checkpoints holds at most two states and lists every restore point" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    var prompt: [300]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 4);
+    glm_checkpoint_stride = 64;
+    defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    for ([_]usize{ 14, 70, 150, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
+        var kept_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        defer kept_xfm.deinit();
+        const base: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = cap };
+        var kept = try Generator.initWithOptions(testing.io, a, &kept_xfm, &tok, prompt[0..len], 2, greedy, &.{}, base);
+        defer kept.deinit(a);
+
+        var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        defer xfm.deinit();
+        var releasing = GlmReleasing{};
+        var opts = base;
+        opts.write_through_hook = .{ .ctx = &releasing, .call = GlmReleasing.call };
+        var gen = try Generator.initWithOptions(testing.io, a, &xfm, &tok, prompt[0..len], 2, greedy, &.{}, opts);
+        defer gen.deinit(a);
+
+        const sched = glmCaptureSchedule(64, cap, 0, len);
+        try testing.expect(releasing.peak <= @min(sched.peak, 2));
+        if (len >= 300) try testing.expectEqual(@as(usize, 2), releasing.peak);
+        try testing.expectEqual(kept.ssm_checkpoints.items.len, gen.ssm_checkpoints.items.len);
+        var held: usize = 0;
+        for (kept.ssm_checkpoints.items, gen.ssm_checkpoints.items) |want, got| {
+            try testing.expectEqual(want.pos, got.pos);
+            held += @intFromBool(!got.isReleased());
+        }
+        try testing.expect(held <= 2);
+        try testing.expect(!gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].isReleased());
     };
 }
 

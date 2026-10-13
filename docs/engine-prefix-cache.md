@@ -192,7 +192,8 @@ With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` rep
 Context and prefill-chunk sizing also reserve zero idle-cache bytes in this mode, regardless
 of `--prefix-cache-mem`; live KV and temporary SSD write buffers still consume memory.
 
-Qwen prefill chunks write through continuously in SSD-only mode (no env turns it off; a turn with under one chunk of new tokens skips it). Hybrid SSM checkpoints, MiMo ring
+Qwen prefill chunks write through continuously in SSD-only mode (no env turns it off; a turn with under one chunk of new tokens skips it). GLM's
+prefill writes through too and frees each checkpoint's RAM copy once it is staged ([GLM](glm5-prefix-cache.md#glm)). Hybrid SSM checkpoints, MiMo ring
 restore points and GLM state ([GLM](glm5-prefix-cache.md#glm)) survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD is the opt-in
 `--prefix-cache-mem` arrangement. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
 `~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.

@@ -11419,12 +11419,32 @@ pub const SSMCheckpoint = struct {
     /// layers (plain attention) get a null-handle snapshot which is a no-op
     /// in `ssmRestore`.
     layers: []SSMCacheEntrySnapshot,
+    /// Nonzero once the state left RAM for SSD (`release`): the bytes it held, which a disk byte
+    /// budget still prices. The position stays, so every restore-point list still names it.
+    released_bytes: u64 = 0,
+
+    /// Frees the recurrent state, keeping the position.
+    pub fn release(self: *SSMCheckpoint) void {
+        if (self.released_bytes != 0) return;
+        self.released_bytes = ssmCheckpointBytes(self);
+        for (self.layers) |*l| {
+            ssmSnapshotDeinit(l);
+            l.conv_state = mlx.mlx_array_new();
+            l.ssm_state = mlx.mlx_array_new();
+            l.initialized = false;
+        }
+    }
+
+    pub fn isReleased(self: *const SSMCheckpoint) bool {
+        return self.released_bytes != 0;
+    }
 
     pub fn deinit(self: *SSMCheckpoint, allocator: std.mem.Allocator) void {
         for (self.layers) |*l| ssmSnapshotDeinit(l);
         allocator.free(self.layers);
         self.layers = &[_]SSMCacheEntrySnapshot{};
         self.pos = 0;
+        self.released_bytes = 0;
     }
 };
 
@@ -11622,7 +11642,7 @@ pub fn shareSsmCheckpoint(allocator: std.mem.Allocator, cp: *const SSMCheckpoint
         layers[i] = out;
         built = i + 1;
     }
-    return .{ .pos = cp.pos, .layers = layers };
+    return .{ .pos = cp.pos, .layers = layers, .released_bytes = cp.released_bytes };
 }
 
 /// Restore every layer of `ssm_entries` from `cp`. Mirrors the per-layer

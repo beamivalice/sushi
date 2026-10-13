@@ -722,7 +722,7 @@ pub const HotPrefixCache = struct {
         for (cps) |*cp| {
             // A deinit'd stub (`shedCheckpointsToFit`'s realloc-failure
             // leftover) has zero layers and restores nothing — skip it.
-            if (cp.layers.len == 0) continue;
+            if (cp.layers.len == 0 or cp.isReleased()) continue;
             if (cp.pos > limit) break;
             picked = cp;
         }
@@ -1152,9 +1152,16 @@ pub const HotPrefixCache = struct {
         var byte_buf: [SHED_SIM_MAX]u64 = undefined;
         for (cps, 0..) |*cp, i| {
             pos_buf[i] = cp.pos;
-            byte_buf[i] = ssmCheckpointBytes(cp);
+            // A released state is on the SSD tier already, and counts against its budget.
+            byte_buf[i] = if (cp.isReleased()) cp.released_bytes else ssmCheckpointBytes(cp);
         }
         const newest = glm5_prefix.commitRows(cps, offset);
+        // Beside an SSD tier the hot entry keeps only its newest checkpoints, so only those are priced.
+        if (!disk and budget > 0 and newest > 0 and self.capturesLiveForDisk()) {
+            var kept: u64 = 0;
+            for (byte_buf[cps.len -| glm5_prefix.checkpoint_hot_kept .. cps.len]) |b| kept += b;
+            if (@as(u64, newest) * row_bytes + kept + window_bytes <= budget) return newest;
+        }
         return glmCommitLenFor(self.cp_thin, budget, disk, newest, row_bytes, window_bytes, pos_buf[0..cps.len], byte_buf[0..cps.len]);
     }
 
@@ -2178,6 +2185,9 @@ pub const HotPrefixCache = struct {
         if (new_glm) |*rows| if (ssm_cps) |cps| {
             ssm_cps = glm5_prefix.keepThrough(self.allocator, cps, rows.len);
         };
+        // The pending record holds every checkpoint for the SSD tier, so the hot entry keeps only its newest.
+        const hot_keeps_newest = new_glm != null and self.pending_disk != null;
+        if (hot_keeps_newest) self.keepNewestCheckpoints(&ssm_cps);
 
         // An entry's pixel key applies only to rows it actually covers. When
         // the committed range ends before the request's first media row — a
@@ -2567,7 +2577,7 @@ pub const HotPrefixCache = struct {
             // turn 3 has nothing to restore from even though turn 2's match
             // covered nearly the full prefix. (Reproducible by alternating
             // identical-prompt requests at ssm_checkpoint_stride > prompt_len.)
-            const merged_cps: ?[]SSMCheckpoint = blk: {
+            var merged_cps: ?[]SSMCheckpoint = blk: {
                 const old = e.ssm_checkpoints orelse break :blk eff_cps;
                 // Detach old from its container either way: it is either moved
                 // wholesale or consumed by the merge, and the free-below must
@@ -2610,6 +2620,7 @@ pub const HotPrefixCache = struct {
             const ring_bytes = ringCpsBytes(e.ring_cps);
             self.current_kv_bytes -|= e.kv_bytes;
 
+            if (hot_keeps_newest) self.keepNewestCheckpoints(&merged_cps);
             // Recompute ssm bytes from the merged list.
             var merged_ssm_bytes: u64 = 0;
             if (merged_cps) |cps| {
@@ -2663,6 +2674,15 @@ pub const HotPrefixCache = struct {
             return .{ .ok = eff_tokens.len };
         }
 
+        if (hot_keeps_newest) {
+            self.keepNewestCheckpoints(&eff_cps);
+            var kept_bytes: u64 = 0;
+            if (eff_cps) |cps| for (cps) |*cp| {
+                kept_bytes += ssmCheckpointBytes(cp);
+            };
+            new_bytes -|= new_ssm_bytes -| kept_bytes;
+            new_ssm_bytes = kept_bytes;
+        }
         const incoming: Entry = .{
             .tokens = tokens_owned,
             .has_tools = has_tools,
@@ -3034,6 +3054,35 @@ pub const HotPrefixCache = struct {
         const quant = glm5_prefix.diskQuant(rows.latent_bits);
         if (whole) return d.appendCommitWhole(entries, rows.len, quant, tokens, has_tools, cps, dflash, null, null, s);
         return d.appendCommitWithSpec(entries, rows.len, quant, tokens, has_tools, cps, dflash, null, s);
+    }
+
+    /// GLM's prefill write-through: the rows through `request.offset` and the checkpoints so far go to the SSD tier
+    /// as the prefill produces them, and every checkpoint but the newest leaves RAM. `entry_id` follows the entry
+    /// across calls. Best effort: a failure leaves the checkpoints for the commit after the response.
+    pub fn writeThroughGlm(
+        self: *HotPrefixCache,
+        entry_id: *?u64,
+        request: *const glm5_forward.Request,
+        prompt: []const u32,
+        has_tools: bool,
+        cps: []SSMCheckpoint,
+        s: mlx.mlx_stream,
+    ) void {
+        const d = if (self.disk) |*dd| dd else return;
+        const len = prompt.len / glm5_prefix.pool_size * glm5_prefix.pool_size;
+        // Below the tier's floor nothing is written yet, so no state may be freed.
+        if (cps.len == 0 or len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+        defer d.settleCheckpoints(entry_id.*, cps);
+        var rows = glm5_prefix.MlaRows.shareLive(self.allocator, request, len, s) catch |err| {
+            log.warn("  [disk-cache] GLM prefill write-through rows not shared: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer rows.deinit();
+        _ = persistGlm(d, &rows, prompt[0..len], has_tools, cps, null, false, s) catch |err| {
+            log.warn("  [disk-cache] GLM prefill write-through failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        if (d.last_store_id) |id| entry_id.* = id;
     }
 
     /// Write the pending record whole and release it: its rows may be a finished request's own
@@ -3604,6 +3653,19 @@ pub const HotPrefixCache = struct {
         // Collected newest-first; the list contract is ascending by pos.
         std.mem.reverse(SSMCheckpoint, out.items);
         return try out.toOwnedSlice(allocator);
+    }
+
+    /// Frees all but the newest `glm5_prefix.checkpoint_hot_kept` of an ascending checkpoint list. The older
+    /// ones are restored from the SSD tier, which holds them all.
+    fn keepNewestCheckpoints(self: *HotPrefixCache, list: *?[]SSMCheckpoint) void {
+        const cps = list.* orelse return;
+        const kept: usize = glm5_prefix.checkpoint_hot_kept;
+        if (cps.len <= kept) return;
+        const dropped = cps.len - kept;
+        for (cps[0..dropped]) |*cp| cp.deinit(self.allocator);
+        std.mem.copyForwards(SSMCheckpoint, cps[0..kept], cps[dropped..]);
+        for (cps[kept..]) |*stub| stub.* = .{ .pos = 0, .layers = &.{} };
+        list.* = self.allocator.realloc(cps, kept) catch cps;
     }
 
     fn shedCheckpointsToFit(self: *HotPrefixCache) void {
@@ -12202,6 +12264,274 @@ test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps,
         try glm5_forward.expectArrayBits(want, got);
         try glm5_prefix.expectSameLogicalState(&cold, &warm);
     };
+}
+
+/// A GLM prefill driven chunk by chunk as the scheduler drives it: a KDA checkpoint after each chunk, then the write-through.
+const GlmPrefill = struct {
+    req: glm5_forward.Request,
+    cps: std.ArrayList(SSMCheckpoint) = .empty,
+    entry_id: ?u64 = null,
+    /// Most checkpoint states in RAM at once, read right after a capture.
+    peak_held: usize = 0,
+
+    /// The last chunk is the loop's end: its checkpoint is taken after the loop, past the hook, and the
+    /// rest of `tokens` is the final span.
+    fn run(hc: *HotPrefixCache, net: *const glm5_forward.Model, bits: u8, tokens: []const u32, chunks: []const usize) !GlmPrefill {
+        var self = GlmPrefill{ .req = try glm5_prefix.servedRequest(bits) };
+        errdefer self.deinit();
+        var at: usize = 0;
+        for (chunks, 0..) |n, i| {
+            _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &self.req, tokens[at .. at + n], &.{n}));
+            at += n;
+            if (i + 1 < chunks.len) try self.capture();
+            hc.writeThroughGlm(&self.entry_id, &self.req, tokens[0..at], false, self.cps.items, mlx.gpuStream());
+        }
+        try self.capture();
+        if (at < tokens.len) _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &self.req, tokens[at..], &.{tokens.len - at}));
+        return self;
+    }
+
+    fn capture(self: *GlmPrefill) !void {
+        try self.cps.append(testing.allocator, try glm5_prefix.captureKda(testing.allocator, &self.req, mlx.gpuStream()));
+        self.peak_held = @max(self.peak_held, self.held());
+    }
+
+    fn held(self: *const GlmPrefill) usize {
+        var n: usize = 0;
+        for (self.cps.items) |*cp| n += @intFromBool(!cp.isReleased());
+        return n;
+    }
+
+    /// The request's end-of-request commit for the SSD tier alone, as `commitGlmSlot` builds it.
+    fn commitSsdOnly(self: *GlmPrefill, hc: *HotPrefixCache, bits: u8, tokens: []const u32) !CommitStatus {
+        var cache = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
+        defer cache.deinit();
+        cache.step = self.req.offset;
+        const disk_rows = try glm5_prefix.MlaRows.shareLive(testing.allocator, &self.req, glm5_prefix.commitRows(self.cps.items, self.req.offset), mlx.gpuStream());
+        const owned = try self.cps.toOwnedSlice(testing.allocator);
+        return hc.commitGlmTiers(&cache, tokens, false, 0, 0, null, owned, null, disk_rows, null, tokens.len);
+    }
+
+    fn deinit(self: *GlmPrefill) void {
+        for (self.cps.items) |*cp| cp.deinit(testing.allocator);
+        self.cps.deinit(testing.allocator);
+        self.req.deinit();
+    }
+};
+
+/// A prompt that shares `shared` tokens with `first` and then differs.
+fn glmDiverging(buf: []u32, first: []const u32, shared: usize) []const u32 {
+    @memcpy(buf[0..shared], first[0..shared]);
+    for (buf[shared..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    return buf;
+}
+
+/// Restores `prompt` from `hc` at `at` and checks the continuation against a cold prefill of it, bit for bit.
+fn expectGlmRestoreLikeCold(hc: *HotPrefixCache, net: *const glm5_forward.Model, bits: u8, prompt: []const u32, at: usize) !void {
+    var warm = try glm5_prefix.servedRequest(bits);
+    defer warm.deinit();
+    const res = try glmLookup(hc, &warm, bits, prompt, 0, null, &.{});
+    try testing.expectEqual(at, res.matched);
+    const got = try glm5_prefix.prefill(net, &warm, prompt[at..], &.{prompt.len - at});
+    defer _ = mlx.mlx_array_free(got);
+    var cold = try glm5_prefix.servedRequest(bits);
+    defer cold.deinit();
+    const want = try glm5_prefix.prefill(net, &cold, prompt, &.{ at, prompt.len - at });
+    defer _ = mlx.mlx_array_free(want);
+    try glm5_forward.expectArrayBits(want, got);
+    try glm5_prefix.expectSameLogicalState(&cold, &warm);
+}
+
+test "GLM SSD-only: a prefill keeps at most two checkpoint states in RAM, and a restore at a released one reads SSD like a cold prefill" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    for ([_]u8{ 0, 8 }) |bits| {
+        var fp_buf: [32]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fp_buf, "glm-wt-{d}", .{bits});
+        var hc = try glmSsdOnlyCache(io, base, fp, 0, true);
+        defer hc.deinit();
+        var turn = try GlmPrefill.run(&hc, &fx.net, bits, &first, &.{ 512, 64, 64, 48 });
+        defer turn.deinit();
+        try testing.expect(turn.peak_held <= 2);
+        // The checkpoint of the last hooked chunk and the loop-end one beside it.
+        try testing.expectEqual(@as(usize, 2), turn.held());
+        for (turn.cps.items[0 .. turn.cps.items.len - 2]) |cp| try testing.expect(cp.isReleased());
+        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try turn.commitSsdOnly(&hc, bits, &first));
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        const on_disk = &hc.disk.?.entries.items[0];
+        try testing.expectEqual(@as(u32, 688), on_disk.kv_len);
+        try testing.expectEqualSlices(u32, &.{ 512, 576, 640, 688 }, on_disk.ssm_positions);
+
+        // The oldest, a middle one and the newest: each state comes off the disk.
+        var other: [800]u32 = undefined;
+        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..600], &first, 530), 512);
+        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..680], &first, 650), 640);
+        @memcpy(other[0..700], &first);
+        for (other[700..750], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, other[0..750], 688);
+    }
+}
+
+test "GLM RAM tier beside an SSD tier judges the byte budget by the two checkpoints that stay" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var probe = try GlmTurn.run(&fx.net, 8, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
+    // Room for every row and two checkpoints, not for four.
+    const budget = probe.rows.bytes() + 2 * ssmCheckpointBytes(&probe.cps[0]) + 1;
+    probe.rows.deinit();
+    for (probe.cps) |*cp| cp.deinit(testing.allocator);
+    testing.allocator.free(probe.cps);
+    probe.cache.deinit();
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    defer hc.deinit();
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "glm-price", 0, 128);
+    hc.disk.?.enableBackgroundWriter();
+    // The same session twice: the second commit replaces the first instead of being judged oversized and dropped.
+    for (0..2) |_| {
+        var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
+        defer turn.cache.deinit();
+        const disk_rows = try turn.rows.share();
+        try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
+        try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ssm_checkpoints.?.len);
+        try testing.expect(hc.current_kv_bytes <= budget);
+    }
+}
+
+test "GLM SSD-only: past the checkpoint cap the loop-end checkpoint still reaches disk" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [1400]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var hc = try glmSsdOnlyCache(io, base, "glm-wt-cap", 0, true);
+    defer hc.deinit();
+    hc.disk.?.ssm_max_per_entry = glm5_prefix.checkpoint_cap;
+    var chunks: [15]usize = @splat(64);
+    chunks[0] = 512;
+    chunks[14] = 40;
+    // 512 + 13 x 64 + 40 = 1384: thirteen grid checkpoints, the loop-end one after them, a 16-token final span.
+    var turn = try GlmPrefill.run(&hc, &fx.net, 8, &first, &chunks);
+    defer turn.deinit();
+    try testing.expect(turn.peak_held <= 2);
+    _ = try turn.commitSsdOnly(&hc, 8, first[0..1400]);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    const on_disk = &hc.disk.?.entries.items[0];
+    try testing.expectEqual(@as(usize, glm5_prefix.checkpoint_cap), on_disk.ssm_positions.len);
+    try testing.expectEqual(@as(u32, 1384), on_disk.ssm_positions[on_disk.ssm_positions.len - 1]);
+    var other: [1500]u32 = undefined;
+    @memcpy(other[0..1400], &first);
+    for (other[1400..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    try expectGlmRestoreLikeCold(&hc, &fx.net, 8, &other, 1384);
+}
+
+test "GLM SSD-only: a checkpoint whose write failed is not a restore point" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var hc = try glmSsdOnlyCache(io, base, "glm-wt-fail", 0, true);
+    defer hc.deinit();
+    hc.disk.?.writer.?.injectFailure("s0000512", .write);
+    var turn = try GlmPrefill.run(&hc, &fx.net, 8, &first, &.{ 512, 64, 112 });
+    defer turn.deinit();
+    try testing.expect(turn.peak_held <= 2);
+    _ = try turn.commitSsdOnly(&hc, 8, &first);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    const on_disk = &hc.disk.?.entries.items[0];
+    try testing.expect(!on_disk.poisoned);
+    try testing.expectEqualSlices(u32, &.{ 576, 688 }, on_disk.ssm_positions);
+    try testing.expectEqual(@as(u32, 688), on_disk.kv_len);
+
+    var other: [800]u32 = undefined;
+    var warm = try glm5_prefix.servedRequest(8);
+    defer warm.deinit();
+    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 8, glmDiverging(other[0..600], &first, 530), 0, null, &.{})).matched);
+    try expectGlmRestoreLikeCold(&hc, &fx.net, 8, glmDiverging(other[0..680], &first, 650), 576);
+}
+
+test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkpoints, the SSD tier all of them" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    for ([_]u8{ 0, 8 }) |bits| {
+        var fp_buf: [32]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fp_buf, "glm-ram-newest-{d}", .{bits});
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+        hc.disk.?.enableBackgroundWriter();
+        var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
+        defer turn.cache.deinit();
+        const disk_rows = try turn.rows.share();
+        try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
+        const e = &hc.entries.items[0];
+        try testing.expectEqual(@as(usize, 2), e.ssm_checkpoints.?.len);
+        try testing.expectEqualSlices(usize, &.{ 640, 700 }, &.{ e.ssm_checkpoints.?[0].pos, e.ssm_checkpoints.?[1].pos });
+        var bytes: u64 = 0;
+        for (e.ssm_checkpoints.?) |*cp| bytes += ssmCheckpointBytes(cp);
+        try testing.expectEqual(bytes, e.ssm_bytes);
+        try testing.expectEqual(e.glm.?.bytes() + bytes, e.kv_bytes);
+        try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqualSlices(u32, &.{ 512, 576, 640, 700 }, hc.disk.?.entries.items[0].ssm_positions);
+
+        // Under the RAM entry's oldest checkpoint the SSD tier restores.
+        var other: [800]u32 = undefined;
+        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..600], &first, 530), 512);
+        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..680], &first, 600), 576);
+    }
 }
 
 test "GLM SSD-only: two commits before one flush (two cancels culled in one pass) both reach disk" {

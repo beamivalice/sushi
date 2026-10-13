@@ -255,12 +255,19 @@ pub const SubmitParams = struct {
     model: *model_registry_mod.LoadedModel,
 };
 
+/// The KDA checkpoints a GLM request keeps for the prefix cache, as admission bills them: how many it
+/// keeps, and whether its prefill moves each to SSD and drops the RAM copy (`glmCheckpointsRelease`).
+pub const CheckpointPlan = struct {
+    keep: u32 = 0,
+    released: bool = false,
+};
+
 /// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory
 /// right now? Null (unit tests, no HTTP server) disables evict-to-admit. The trailing warm
 /// arguments are the restored rows, their capacity, and whether the restore checked the
 /// entry out (the only restore whose rows the request will not allocate); then MTP and the GLM
 /// checkpoints the request keeps (`server.WarmPrefix.checkpoints`).
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) bool = null;
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool = null;
 
 /// {needed, available, commit} of the same cold bill, live memory re-read (`server.prefillBillNumbersNow`).
 /// Null (unit tests) skips the inference thread's hold for an ungated arch.
@@ -344,7 +351,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) ?model_registry_mod.MemoryContextRefusal = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) ?model_registry_mod.MemoryContextRefusal = null;
 
 /// GPU bytes a vision encode may still take, read live (`server.visionEncodeAvailable`). Null skips the recheck.
 pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 = null;
@@ -6567,7 +6574,7 @@ const InterleaveCtx = struct {
 /// SSD-first write-through: persist each completed prefill chunk as the prefill produces it,
 /// so a cancelled or killed prefill leaves a restorable chunk-aligned prefix. Armed only with
 /// a live background writer, so the inference thread never pays the file write.
-fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const transformer_mod.SSMCheckpoint) void {
+fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []transformer_mod.SSMCheckpoint) void {
     const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
     const slot = wc.slot;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
@@ -6578,6 +6585,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
+    if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, cps, s);
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     _ = d.appendCommitBounded(
@@ -6600,6 +6608,8 @@ pub const WRITE_THROUGH_FLUSH_BOUND_BYTES: u64 = 1;
 const WriteThroughCtx = struct {
     slot: *Slot,
     chunks: u32 = 0,
+    /// GLM: the SSD entry this prefill is writing.
+    entry_id: ?u64 = null,
 };
 
 /// The write-through only pays when this turn's prefill produces at least one whole disk
@@ -6625,6 +6635,12 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
         return false;
     }
     return true;
+}
+
+/// Does this GLM request's prefill move each KDA checkpoint to SSD and free its RAM copy? Admission bills
+/// from this answer and the prefill arms its hook from the same one.
+fn glmCheckpointsRelease(slot: *Slot, new_span: usize) bool {
+    return slot.glm5_request != null and writeThroughArmed(slot, new_span);
 }
 
 /// Context for `Generator.InitOptions.chunk_width_hook`. `cfg` is optional (embedded engines).
@@ -7000,15 +7016,15 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 warm_will_donate: bool,
                 enable_mtp: bool,
                 /// The KDA checkpoints a GLM request keeps: billed here only, and fewer where they do not fit.
-                checkpoints: u32,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) bool,
+                checkpoints: CheckpointPlan,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
                     return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp, self.checkpoints);
                 }
                 fn keeping(ctx: ?*anyopaque, n: u32) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    self.checkpoints = n;
+                    self.checkpoints.keep = n;
                     return call(ctx);
                 }
             };
@@ -7022,7 +7038,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
                 .enable_mtp = slot.enable_mtp,
-                .checkpoints = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
+                .checkpoints = .{
+                    .keep = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
+                    .released = glmCheckpointsRelease(slot, slot.full_prompt.len - hot_matched),
+                },
                 .fits = fits_fn,
             };
             var fits = Probe.call(&probe);

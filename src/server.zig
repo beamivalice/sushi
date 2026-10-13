@@ -6001,6 +6001,9 @@ pub const WarmPrefix = struct {
     /// KDA checkpoints a GLM request keeps for the prefix cache. Only the inference thread's
     /// admission pass bills them, and it keeps fewer rather than refuse.
     checkpoints: u32 = 0,
+    /// The prefill moves each checkpoint to SSD as it is produced and frees the RAM copy, so at most
+    /// `glm5_prefix.checkpoint_ram_held` states are in RAM at once.
+    released: bool = false,
 
     /// Rows of KV this request will not allocate: the rows the restored buffer already holds.
     /// Capacity is a ceiling on the credit, never a switch: a growing chain outruns its capacity
@@ -6265,12 +6268,14 @@ fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureS
 }
 
 /// What a GLM request holds for the prefix cache while it runs: its prefill's KDA checkpoints (at
-/// most `warm.checkpoints`, plus the copy taken before each thin) and the assistant window it keeps from prefill end.
+/// most `warm.checkpoints`, plus the copy taken before each thin; a released prefill holds
+/// `glm5_prefix.checkpoint_ram_held`) and the assistant window it keeps from prefill end.
 fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix) u64 {
     if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config)) == 0) return 0;
     if (warm.checkpoints == 0) return 0;
     const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
-    const held = @as(u64, glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints).peak) * config.ssmCheckpointBytes();
+    const peak = glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints).peak;
+    const held = @as(u64, if (warm.released) @min(peak, glm5_prefix.checkpoint_ram_held) else peak) * config.ssmCheckpointBytes();
     return held +| window;
 }
 
@@ -6284,7 +6289,8 @@ fn glmCommitStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: War
     const bound = resolvedPrefixCacheMem();
     const copied: u64 = if (!prefix_cache_ram_enabled) 0 else if (bound == 0) rows else @min(rows, bound);
     const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
-    const kept = @as(u64, @min(sched.events, warm.checkpoints)) * config.ssmCheckpointBytes();
+    const listed = @min(sched.events, warm.checkpoints);
+    const kept = @as(u64, if (warm.released) @min(listed, glm5_prefix.checkpoint_ram_held) else listed) * config.ssmCheckpointBytes();
     return copied +| kept +| window;
 }
 
@@ -7115,13 +7121,14 @@ fn logAdmissionDecision(bill: AdmissionBill) void {
 /// Inference-thread predicate behind the scheduler's admission hook: does this request fit
 /// right now, with live memory re-read? Every input is forwarded, none defaulted (a hardcoded
 /// `kv_override = null` priced a `kv_quant: 4` request at fp16 and evicted a cache for nothing).
-pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: u32) bool {
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) bool {
     return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
         .will_donate = warm_will_donate,
         .mtp_on = enable_mtp,
-        .checkpoints = checkpoints,
+        .checkpoints = checkpoints.keep,
+        .released = checkpoints.released,
     }).fits();
 }
 
@@ -7141,14 +7148,15 @@ pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: us
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: u32) ?model_registry_mod.MemoryContextRefusal {
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) ?model_registry_mod.MemoryContextRefusal {
     // The same warm inputs the probe was refused on, the checkout decision included.
     const warm = WarmPrefix{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
         .will_donate = warm_will_donate,
         .mtp_on = enable_mtp,
-        .checkpoints = checkpoints,
+        .checkpoints = checkpoints.keep,
+        .released = checkpoints.released,
     };
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, warm);
     const mb = 1024 * 1024;
@@ -26373,6 +26381,9 @@ test "GLM billed checkpoint peak equals the checkpoints its prefill captures, wh
                 std.debug.print("stride {d} seq {d} matched {d} cap {d}: billed {d} cps, captured {d}\n", .{ stride, c.seq, c.matched, cap, billed / per_cp, want / per_cp });
                 return e;
             };
+            // A prefill that releases landed states holds the newest two, or all it captures if fewer.
+            const released = glmPrefixStateBytes(&cfg, c.seq, .{ .matched_tokens = c.matched, .checkpoints = cap, .released = true });
+            try std.testing.expectEqual(@min(want, 2 * per_cp), released);
         };
     }
 }
@@ -26469,6 +26480,42 @@ test "GLM SSD-only bills its checkpoints and window, no writer term (the shared 
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
     try std.testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     try std.testing.expectEqual(sizer_off, prefillTransientReserve(&cfg, 8, 2048));
+}
+
+test "GLM bills two KDA states, not nine, while its prefill moves each to SSD and frees the RAM copy" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.glm_dflash_loaded = true;
+    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max, prefix_cache_disk_bytes, prefix_cache_ram_enabled };
+    defer {
+        prefix_cache_capacity = saved[0];
+        ssm_checkpoint_stride = saved[1];
+        ssm_checkpoint_max = saved[2];
+        prefix_cache_disk_bytes = saved[3];
+        prefix_cache_ram_enabled = saved[4];
+    }
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    prefix_cache_capacity = 32;
+    prefix_cache_disk_bytes = 12 << 30;
+    prefix_cache_ram_enabled = false;
+    const per_cp = cfg.ssmCheckpointBytes();
+    const window = cfg.glm_dflash_window_bytes;
+    const cap = glm5_prefix.checkpointMax(16);
+    const keeps = WarmPrefix{ .checkpoints = cap };
+    const releases = WarmPrefix{ .checkpoints = cap, .released = true };
+    // 65,536 tokens capture 32 grid points and the prompt end: nine held before, two now.
+    try std.testing.expectEqual(9 * per_cp + window, glmPrefixStateBytes(&cfg, 65536, keeps));
+    try std.testing.expectEqual(2 * per_cp + window, glmPrefixStateBytes(&cfg, 65536, releases));
+    // A prompt that captures one checkpoint holds one either way.
+    try std.testing.expectEqual(per_cp + window, glmPrefixStateBytes(&cfg, 100, releases));
+    // The commit after the response: the checkpoints it lists, its two newest still in RAM.
+    try std.testing.expectEqual(8 * per_cp + window, glmCommitStateBytes(&cfg, 65536, keeps, 8));
+    try std.testing.expectEqual(2 * per_cp + window, glmCommitStateBytes(&cfg, 65536, releases, 8));
+    // Admission follows the storage: the difference is the seven states that are no longer held (a 5/4 margin rides the checkpoints).
+    const kept_bill = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, keeps);
+    const released_bill = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, releases);
+    try std.testing.expect(kept_bill - released_bill >= 7 * per_cp * 5 / 4 - 1 and kept_bill - released_bill <= 7 * per_cp * 5 / 4 + 1);
 }
 
 test "GLM near the top of its context keeps fewer checkpoints at the start width instead of being refused" {
