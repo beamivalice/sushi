@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 165 vars. By kind: tradeoff levers 13, diagnostics 39, microbenches 61, test-only seams 43, paths and config 6, flag twins that are not equivalents 3.
+**Summary.** 163 vars. By kind: tradeoff levers 13, diagnostics 38, microbenches 61, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (13)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `transformer.zig:5868` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (39)
+## Diagnostics (38)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -61,7 +61,6 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_PROFILE_ATTN` | `qwen4_forward.zig:2992` | `1` logs synced indexer/projection/QSA/tail laps per Qwen4 forward | once | yes: qwen4-qsa-long-context |
 | `SUSHI_RAW_DUMP_FILE` | `server.zig:11999, server.zig:17261` | `<abs path>` appends the full pre-parse buffer of every tools request (corpus harvest) | per tool request | yes: server-tool-calling |
 | `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` | `exl3/expert_exl3_kernels.zig` | prefill GEMM window rows (default 32) and `0` unaligns it; the window-geometry parity tests drive both | once | yes: engine-exl3-experts |
-| `SUSHI_KV_ATTN_MIN_TK` | `transformer.zig:13630` | per-layer kv-length floor of the packed decode arms (default 2048); an overridden value also replaces MiMo's matmul2d / split-K floors. No test sets it now | once | yes: engine-kv-cache |
 | `SUSHI_MTP_COST_TABLE` | `generate.zig:8369` | `0` uses the prior only, no measured round costs; `tests/test_mtp_equivalence.sh` needs it for a seeded sampled byte comparison | once | yes: engine-mtp, tests/CLAUDE |
 | `SUSHI_MTP_HEAD_PERSIST` | `generate.zig:600` | default on: Qwen4 MTP head history rides the prefix cache; `0` turns it off for `tests/test_qwen4_mtp_head_persist.sh` | once | yes: tests/CLAUDE |
 | `SUSHI_PREFILL_INTERLEAVE` | `scheduler.zig:6630` | default on: a cold prefill yields to decode streams; `0` is the byte-identity reference of `tests/test_prefill_interleave.sh` | once | yes: server-lifecycle, tests/CLAUDE |
@@ -124,13 +123,12 @@ A path, a credential or an output location.
 | `SUSHI_IMATRIX_OUT` | `imatrix.zig:34` | `<abs>.safetensors` enables expert-imatrix capture | boot | yes: engine-expert-streaming, quality-kld |
 | `SUSHI_NGRAM_BF16_DIR` | `model.zig:1174` | serves a Flash-Next pack with the original bf16 n-gram table (KLD isolation) | load | yes: engine-expert-streaming, quality-kld, qwen4-arch |
 
-## Flag twins that are not equivalents (3)
+## Flag twins that are not equivalents (2)
 
 Kept because the launch flag cannot express what the env does.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `SUSHI_KV_ATTN_FUSED` | `transformer.zig:13611` | `0` disables the packed quantized-KV decode arms. The only switch for MiMo's global-layer decode: no request field or flag reaches it (`kv_attn_mode` is accepted and read by nothing) | once | yes: mimo2-arch |
 | `SUSHI_MTP_ADAPTIVE` | `generate.zig:8895` | `0` selects the windowed depth controller, a different algorithm that can also disable MTP; `--mtp-min-depth n --mtp-max-depth n` pins a depth but cannot express it | once | yes: engine-mtp, tests/CLAUDE, --help |
 | `SUSHI_PREFIX_CACHE_DIR` | `kv_disk_cache.zig:4332` | absolute directory for the SSD prefix cache (default under `~/.sushi`); `--prefix-cache-disk` sets a size, not a directory | boot | yes: engine-prefix-cache, tests/CLAUDE, --help |
 
@@ -159,6 +157,7 @@ Cut from the code with the arm only they reached; the defaults are unchanged.
 ## Removed 2026-10-13
 
 - *Kill switches of a dead arm*: `SUSHI_KV_ATTN_KERNEL` and `SUSHI_KV_ATTN_VERIFY` (the SIMD packed decode / verify kernels; Flash-Next's gqa 12 x dk 256 never fit their threadgroup budget, and no other served model reached them).
+- *Packed-read switches MiMo never moves at its default*: `SUSHI_KV_ATTN_FUSED` (`0` sent every MiMo global decode to the whole-cache rebuild and turned batched decode off) and `SUSHI_KV_ATTN_MIN_TK` (replaced the 4096-key floors; no test set it). The floors are constants now.
 
 ## Tooling-only variables
 

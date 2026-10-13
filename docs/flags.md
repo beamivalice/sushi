@@ -166,7 +166,7 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 |---|---|
 | `--no-safety` | nothing; it was accepted and ignored |
 | `--warmup-eager`, `--no-warmup-eager` | the boot warmup always runs; test boots no longer shorten it |
-| `--kv-attn-mode` | `auto` is the server default; the per-request `kv_attn_mode` field and the `SUSHI_KV_ATTN_*` env vars stay; the field now reaches no arm |
+| `--kv-attn-mode` | nothing: no arm read it. The per-request `kv_attn_mode` field and the `SUSHI_KV_ATTN_*` env vars are gone with it; a request still sending the field is served as if it were absent |
 | `--decode-attn-quant`, `--no-decode-attn-quant` | nothing: the whole int8 requantization of dense attention at decode is gone; it only engaged on the BF16 source checkpoint, which made the KLD teacher lossy |
 | `--mtp-depth` | `--mtp-min-depth` / `--mtp-max-depth`; the tombstone message is gone |
 | `--mtp-history-window` | full head history (the old default 0); the windowing code is gone |

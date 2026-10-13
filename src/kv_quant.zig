@@ -198,7 +198,7 @@ pub fn dequantizeAffine(
     return out;
 }
 
-// ── Fused quant-attention path (opt-in via the request's `kv_attn_mode: "fused"`) ──
+// ── Composed quant-attention (no served path calls it; the parity tests use it as a reference) ──
 //
 // `quantAttention` reads K and V directly from their quantized triples,
 // avoiding the dense materialization that `KVCache.denseView` performs in
@@ -213,8 +213,6 @@ pub fn dequantizeAffine(
 //   * Hand-rolled qmm × 2 + softmax loses tile-level fusion but skips the
 //     dense K/V materialization. Wins at long context where K/V bandwidth
 //     dominates.
-// The crossover is data-driven; v1 ships behind `kv_attn_mode: "fused"` so the
-// default is unchanged.
 //
 // Shape contract:
 //   q_dense      : [B, H,    T_q, D] bf16 (Q already scaled or not; we apply scale below)
@@ -979,8 +977,8 @@ test "quantAttention GQA 6:1 causal T_q=9 matches dense SDPA (MTP verify width)"
 }
 
 test "quantAttention GQA 4:1 causal at gemma geometry (D=256, T=15, 4-bit)" {
-    // The exact live shape that answered "<pad><pad>" on gemma-4-e4b under
-    // kv_attn_mode "fused" (Hq=8, Hkv=2, hd 256, 4-bit, 15-token prefill).
+    // The exact live shape that answered "<pad><pad>" on gemma-4-e4b when
+    // this path served it (Hq=8, Hkv=2, hd 256, 4-bit, 15-token prefill).
     const none = mlx.mlx_array{ .ctx = null };
     try gqaParityCaseD(8, 2, 15, 15, 256, 4, "causal", none);
 }

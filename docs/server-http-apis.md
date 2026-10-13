@@ -56,6 +56,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `org/repo`) names its own entry as `/v1/load-model` resolves it (`routeRequestModel` → `registry.peekPath`), and an
   unregistered path is a 404 `model_not_found` (Anthropic `not_found_error`), never another model's answer.
 - A content array's text parts JOIN in order (`joinedTextParts`); its media parts render at the offset they sat at.
+- A body field the server does not read is ignored, never rejected: a client still sending the removed `kv_attn_mode` is served as if it were absent.
 - **Media is read from EVERY message** on all three surfaces: chat `image_url`/`video_url` parts in any role
   (`tool` included), Anthropic `image` blocks beside the text or inside a `tool_result`, Responses `input_image` in
   a message or a `function_call_output` array. Only base64 data URLs decode (remote URLs are refused, not fetched);

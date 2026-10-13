@@ -28,8 +28,6 @@ const fusedAddRmsNormRouted = trf.fusedAddRmsNormRouted;
 const fusedAddRmsNormUngated = trf.fusedAddRmsNormUngated;
 const fusedSdpaPrefillKv = trf.fusedSdpaPrefillKv;
 const groupLimitedRouting = trf.groupLimitedRouting;
-const kvAttnFusedEnvEnabled = trf.kvAttnFusedEnvEnabled;
-const kvAttnFusedMinTk = trf.kvAttnFusedMinTk;
 const lastDim = trf.lastDim;
 const layerCap = trf.layerCap;
 const log = trf.log;
@@ -37,7 +35,6 @@ const moeDumpBeginForward = trf.moeDumpBeginForward;
 const moeDumpForwardDone = trf.moeDumpForwardDone;
 const moeDumpTensor = trf.moeDumpTensor;
 const moeRouterTopK = trf.moeRouterTopK;
-const packedDecodeFloor = trf.packedDecodeFloor;
 const packedDecodeServesFrom = trf.packedDecodeServesFrom;
 const qkvAttnMpp = trf.qkvAttnMpp;
 const qkvAttnMppKernel = trf.qkvAttnMppKernel;
@@ -98,11 +95,9 @@ pub fn mimoGlobalDecodeArm(view: *const DenseKVView, t_q: c_int, nax: bool) Mimo
 }
 
 /// The most keys a MiMo global layer's decode still dequantizes whole: below the packed arms'
-/// floor, or every length once SUSHI_KV_ATTN_FUSED=0 takes them away. `server.kvDequantScratchBytes` bills it.
+/// floor. `server.kvDequantScratchBytes` bills it.
 pub fn mimoGlobalDecodeRebuildMaxKeys() u64 {
-    if (!kvAttnFusedEnvEnabled()) return std.math.maxInt(u64);
-    const floor = @max(packedDecodeFloor(QKV_MPP_DECODE_MIN_TK), packedDecodeFloor(QKV_SPLITK_DECODE_MIN_TK));
-    return @intCast(@max(floor, 1) - 1);
+    return @intCast(@max(QKV_MPP_DECODE_MIN_TK, QKV_SPLITK_DECODE_MIN_TK) - 1);
 }
 
 /// One MiMo query row attending `total_kv` keys with a decode tick's arithmetic. `view`
@@ -119,7 +114,7 @@ pub fn mimoDecodeAttn(
     attn_scale: f32,
     decode_mask: mlx.mlx_array,
 ) !mlx.mlx_array {
-    // The packed arm follows the cache's length every step, never the request's admission-time `kv_attn_fused`.
+    // The packed arm follows the cache's length every step.
     if (is_global and sinks.ctx == null) {
         const packed_read = switch (mimoGlobalDecodeArm(view, 1, mimoDecodeUsesNax())) {
             .mpp => try qkvAttnMppKernel(s, q, view, attn_scale, ""),
@@ -366,7 +361,7 @@ pub fn mimoGlobalRowsMpp(s: mlx.mlx_stream, q_rope: mlx.mlx_array, kv_view: *con
     if (seq_len < 2 or seq_len >= FUSED256_MIN_Q_LEN or !kv_view.has_quant_triple or !mimoDecodeUsesNax()) return null;
     const t_k = mlx.getShape(kv_view.k_triple_q)[2];
     const first = t_k - seq_len + 1;
-    if (!kvAttnFusedEnvEnabled() or first < kvAttnFusedMinTk() or first < packedDecodeFloor(QKV_MPP_DECODE_MIN_TK)) return null;
+    if (first < QKV_MPP_DECODE_MIN_TK) return null;
     // A serial tick whose decode template set failed its probe reads through dense SDPA instead.
     if (!qkvMppDecodeProbeOk(q_rope, kv_view)) return null;
     var r: c_int = 0;
@@ -608,9 +603,7 @@ pub fn forwardMimoBatchedDecode(
 }
 
 pub fn supportsBatchedMimoDecode(self: *const Transformer) bool {
-    // Without the packed global arms every row rebuilds its whole cache: the bill would be the context.
-    return self.config.supportsBatchedMimoDecode() and self.moe_layers != null and self.expert_stream == null and
-        mimoGlobalDecodeRebuildMaxKeys() != std.math.maxInt(u64);
+    return self.config.supportsBatchedMimoDecode() and self.moe_layers != null and self.expert_stream == null;
 }
 
 pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {

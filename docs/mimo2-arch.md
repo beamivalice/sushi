@@ -152,11 +152,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   body over the whole causal range (`qkvAttnSplitKKernel`, from `QKV_SPLITK_DECODE_MIN_TK` = 4096 keys; 512 keys per
   split, 64-128 splits, split count a runtime value); else the dense rebuild. `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
   takes the split-K arm on an M5 for A/B.
-- **The arm is chosen per decode STEP from the cache's current key count**, never from the request's admission-time
-  `kv_attn_fused` (`auto` resolves that from the PROMPT, so a short prompt that grew long stayed on the rebuild,
-  unbilled, and at 256k drove wired memory to the limit). The per-request `kv_attn_mode` field no longer reaches
-  these layers; `SUSHI_KV_ATTN_FUSED=0` still does, and `kvDequantScratchBytes` then bills the whole-cache rebuild
-  (`mimoGlobalDecodeRebuildMaxKeys`).
+- **The arm is chosen per decode STEP from the cache's current key count**, never from the prompt (an admission-time
+  choice left a short prompt that grew long on the rebuild, unbilled, and at 256k drove wired memory to the limit).
+  `kvDequantScratchBytes` bills the rebuild below the floor (`mimoGlobalDecodeRebuildMaxKeys`); no switch takes the
+  packed arms away.
   Attention-only microbench (9 layers, kv8) vs the per-call dequant+SDPA rebuild: split-K 0.62x at 4k, 0.50x at 16k,
   0.42x at 64k, 0.35-0.36x at 512k (M5 proxy for M4; split-K is compute-bound, the rebuild bandwidth-bound);
   matmul2d is ~1.2-1.4x faster than split-K at 16k-512k (cross-run). Live 64k split-K decode not yet measured.

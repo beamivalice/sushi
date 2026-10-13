@@ -19,9 +19,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   the default.
 - GLM (`glm5_next`) takes the kv8 default too, through its own MLA latent backend (`glm5_latent.zig`,
   [glm5-arch](glm5-arch.md#scope)); kv4 is refused.
-- A request's `kv_attn_mode` field is accepted and read by no arm: `ctx.kv_attn_fused` has no
-  reader since Flash-Next's SIMD packed kernels went (they never fit its gqa 12 x dk 256). MiMo's global-layer decode
-  picks its packed arm per step from the cache's length; `SUSHI_KV_ATTN_FUSED=0` is its only switch.
+- Nothing picks a packed read per request: MiMo's global-layer decode chooses its packed arm per step from the
+  cache's length (`mimoGlobalDecodeArm`), and Flash-Next's QSA arms follow the indexer.
 
 ## The kv-quant contract
 
@@ -32,9 +31,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   slot running `kv_quant=4` never restores from an entry committed at another width
   (`tests/test_kv_quant_per_request.sh`). Every generation endpoint, `/v1/completions` included, reads the per-request
   `kv_quant` through `parseKvQuantOverride` and logs the override it applied.
-- Packed reads are kernel-or-DENSE: MiMo's global layers read packed at t_q==1 (`kvAttnFusedEligible`, from a 4096-key
-  floor; `SUSHI_KV_ATTN_MIN_TK` replaces it) and Flash-Next's QSA arms read packed (next bullet); every other path
-  reads the dense view.
+- Packed reads are kernel-or-DENSE: MiMo's global layers read packed at t_q==1 (`packedDecodeServesFrom`, from a
+  4096-key floor) and Flash-Next's QSA arms read packed (next bullet); every other path reads the dense view.
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
   matmul2d decode kernel and the fused prefill on MiMo's global layers ([mimo2-arch](mimo2-arch.md#attention-kernels)).
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width

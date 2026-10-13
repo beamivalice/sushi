@@ -12867,8 +12867,6 @@ pub const ForwardCtx = struct {
     /// Scoped to the TRUNK: the qwen4 MTP head's forward builds its own ctx
     /// and its single QSA layer is not part of this tally.
     qsa_arms: QsaArmCounts = .{},
-    /// Set from the request's `kv_attn_mode`; no attention path reads it (MiMo's packed arms follow the cache's length).
-    kv_attn_fused: bool = false,
     /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
     /// by the BERT encoder forward so padded positions never attend. Null
     /// (the default) keeps the unmasked single-sequence path.
@@ -13597,64 +13595,21 @@ pub fn qkvAttnMpp(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVVi
     return out;
 }
 
-// ── Fused quant-attention gate (docs/kv-quant-perf.md Phase 1) ──
+// ── Packed decode floors ──
 
-pub var kv_attn_fused_override: ?bool = null;
-var kv_attn_fused_env: ?bool = null;
-pub fn kvAttnFusedEnvEnabled() bool {
-    if (kv_attn_fused_override) |v| return v;
-    if (kv_attn_fused_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_KV_ATTN_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    kv_attn_fused_env = enabled;
-    return enabled;
-}
-
-/// Per-LAYER kv-length floor: below this the packed read cannot pay for the
-/// kernel's split-KV merge ops (~11 dispatches/layer) — Laguna's 512-window
-/// sliding layers measured a net −2% when they fused, and gemma4-12B's
-/// 1024-window sliding layers sat exactly AT the old 1024 floor and measured
-/// a ~4 tok/s decode loss fused (masked kernel at ~1k KV vs near-free dense
-/// SDPA, 2026-08-15). Short-KV layers keep dense reads even inside a fused
-/// request. SUSHI_KV_ATTN_MIN_TK overrides (a test's way to exercise the
-/// packed arms on short prompts; the default is a PERF gate, not a correctness gate).
-pub const KV_ATTN_FUSED_MIN_TK: c_int = 2048;
-var kv_attn_min_tk_env: ?c_int = null;
-pub fn kvAttnFusedMinTk() c_int {
-    if (kv_attn_min_tk_env) |v| return v;
-    const v: c_int = blk: {
-        const raw = std.c.getenv("SUSHI_KV_ATTN_MIN_TK") orelse break :blk KV_ATTN_FUSED_MIN_TK;
-        break :blk std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch KV_ATTN_FUSED_MIN_TK;
-    };
-    kv_attn_min_tk_env = v;
-    return v;
-}
-
-/// Eligibility of the packed decode arms (`packedDecodeServesFrom`): decode width (t_q == 1) only,
-/// a packed cache, and the per-layer kv floor. Every other width reads the dense view.
-pub fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
-    if (!(view.has_quant_triple and t_q == 1 and kvAttnFusedEnvEnabled())) return false;
-    const ks = mlx.getShape(view.k_triple_q);
-    if (ks.len < 4) return false;
-    return ks[2] >= kvAttnFusedMinTk();
-}
-
-/// Decode width for the matmul2d arm at MiMo's global shape: the fused-read gate plus the floor
-/// measured on M5 Max (dense dequant + SDPA still wins at 2k keys).
+/// Decode width for the matmul2d arm at MiMo's global shape: the floor measured on M5 Max (dense
+/// dequant + SDPA still wins at 2k keys).
 pub const QKV_MPP_DECODE_MIN_TK: c_int = 4096;
 
 pub fn qkvMppDecodeServes(view: *const DenseKVView, t_q: c_int) bool {
     return packedDecodeServesFrom(view, t_q, QKV_MPP_DECODE_MIN_TK);
 }
 
+/// A packed cache read at decode width (t_q == 1) from `floor` keys; every other width reads the dense view.
 pub fn packedDecodeServesFrom(view: *const DenseKVView, t_q: c_int, floor: c_int) bool {
-    if (!kvAttnFusedEligible(view, t_q)) return false;
-    return mlx.getShape(view.k_triple_q)[2] >= packedDecodeFloor(floor);
-}
-
-pub fn packedDecodeFloor(floor: c_int) c_int {
-    // An overridden SUSHI_KV_ATTN_MIN_TK is a test's request to exercise the fused arms.
-    return if (kvAttnFusedMinTk() == KV_ATTN_FUSED_MIN_TK) floor else kvAttnFusedMinTk();
+    if (!(view.has_quant_triple and t_q == 1)) return false;
+    const ks = mlx.getShape(view.k_triple_q);
+    return ks.len >= 4 and ks[2] >= floor;
 }
 
 /// Decode floor for the split-K arm at MiMo's global shape where matrix units are absent.
@@ -28556,7 +28511,7 @@ test "qkvMppDecodeServes: decode width, packed cache, and the measured kv floor"
     defer _ = mlx.mlx_array_free(floor);
     const v_below = try View.at(s, QKV_MPP_DECODE_MIN_TK - 1, &below);
     const v_floor = try View.at(s, QKV_MPP_DECODE_MIN_TK, &floor);
-    try testing.expect(kvAttnFusedEligible(&v_below, 1)); // the shared gate's floor is lower
+    try testing.expect(packedDecodeServesFrom(&v_below, 1, QKV_MPP_DECODE_MIN_TK - 1)); // the floor is the caller's
     try testing.expect(!qkvMppDecodeServes(&v_below, 1));
     try testing.expect(qkvMppDecodeServes(&v_floor, 1));
     try testing.expect(!qkvMppDecodeServes(&v_floor, 2));
@@ -28620,20 +28575,6 @@ test "mimoGlobalDecodeArm: a packed cache grown one token at a time switches to 
             try testing.expectEqual(!packed_arm, keys <= mimoGlobalDecodeRebuildMaxKeys());
         }
     }
-}
-
-test "mimoGlobalDecodeRebuildMaxKeys: the dense decode arm serves every length once the kill switch takes the packed arms" {
-    const s = mlx.gpuStream();
-    const saved = kv_attn_fused_override;
-    defer kv_attn_fused_override = saved;
-    kv_attn_fused_override = false;
-    var q = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q);
-    try mlx.check(mlx.mlx_zeros(&q, &[_]c_int{ 1, 4, 1 << 16, 48 }, 4, .uint32, s));
-    const view: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = true, .k_triple_q = q };
-    try testing.expectEqual(MimoDecodeArm.dense, mimoGlobalDecodeArm(&view, 1, true));
-    try testing.expectEqual(MimoDecodeArm.dense, mimoGlobalDecodeArm(&view, 1, false));
-    try testing.expectEqual(std.math.maxInt(u64), mimoGlobalDecodeRebuildMaxKeys());
 }
 
 /// Serial decode ticks against one verify forward over the same rows, on twin caches.
@@ -28922,29 +28863,6 @@ test "mimo global verify rows µbench: per-row dispatches vs row-group passes, 9
         }
         _ = mlx.mlx_clear_cache();
     }
-}
-
-test "kvAttnFusedEligible: fused reads are decode-width (t_q == 1) only" {
-    const s = mlx.gpuStream();
-    const long_shape = [_]c_int{ 1, 2, KV_ATTN_FUSED_MIN_TK, 16 };
-    var kq_long = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(kq_long);
-    try mlx.check(mlx.mlx_zeros(&kq_long, &long_shape, 4, .uint32, s));
-    const short_shape = [_]c_int{ 1, 2, 512, 16 };
-    var kq_short = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(kq_short);
-    try mlx.check(mlx.mlx_zeros(&kq_short, &short_shape, 4, .uint32, s));
-
-    var view_with: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = true, .k_triple_q = kq_long };
-    var view_short: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = true, .k_triple_q = kq_short };
-    var view_without: DenseKVView = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false, .has_quant_triple = false };
-    try testing.expect(kvAttnFusedEligible(&view_with, 1));
-    try testing.expect(!kvAttnFusedEligible(&view_with, 2)); // verify width
-    try testing.expect(!kvAttnFusedEligible(&view_with, 9));
-    try testing.expect(!kvAttnFusedEligible(&view_with, 32));
-    try testing.expect(!kvAttnFusedEligible(&view_with, 2048)); // prefill width
-    try testing.expect(!kvAttnFusedEligible(&view_short, 1)); // below the kv floor
-    try testing.expect(!kvAttnFusedEligible(&view_without, 1));
 }
 
 test "KVCache step resets on truncate" {
@@ -46548,7 +46466,6 @@ test "qwen4 MTP verify token values equal serial ticks without near-tie acquitta
         const serial = try Qwen4TestSlot.init(a, config.num_hidden_layers);
         defer serial.deinit(a);
         try serial.cache.reinit(config.num_hidden_layers, kv);
-        serial.ctx.kv_attn_fused = true;
         try qwen4ReplayPrompt(&xfm, serial, replay_prompt);
         var expected: [continuation.len]usize = undefined;
         var gaps: [continuation.len]f32 = undefined;
@@ -46565,7 +46482,6 @@ test "qwen4 MTP verify token values equal serial ticks without near-tie acquitta
             const verify = try Qwen4TestSlot.init(a, config.num_hidden_layers);
             defer verify.deinit(a);
             try verify.cache.reinit(config.num_hidden_layers, kv);
-            verify.ctx.kv_attn_fused = true;
             try qwen4ReplayPrompt(&xfm, verify, replay_prompt);
             var begin: usize = 0;
             var reported: usize = 0;
@@ -53639,7 +53555,6 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
         const seed = try Qwen4TestSlot.init(a, config.num_hidden_layers);
         defer seed.deinit(a);
         try seed.cache.reinit(config.num_hidden_layers, KVQuantConfig.affine(8));
-        seed.ctx.kv_attn_fused = true;
         seed.ctx.skip_lm_head = true;
         dense.override = false;
         var at: usize = 0;
@@ -53689,7 +53604,6 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
                     }
                     for (slot.entries, snaps) |*entry, *snap| try ssmRestore(entry, snap);
                     slot.off = prefix;
-                    slot.ctx.kv_attn_fused = true;
                     try mlx.check(mlx.mlx_synchronize(s));
                     dense.override = arm == 1;
                     const before = dense.calls;
@@ -53808,7 +53722,6 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
     const history = [_]i32{ 4413, 220, 22, 18, 19, 11, 852, 14459, 310, 381, 2512, 328, 57517, 1288, 1467, 524, 3418, 3069, 279, 12313, 36811, 948, 781, 6749, 506, 279, 41564, 13, 1946, 28970, 11, 264 };
     for ([_]*Qwen4TestSlot{ serial, verify }) |slot| {
         try slot.cache.reinit(config.num_hidden_layers, KVQuantConfig.affine(8));
-        slot.ctx.kv_attn_fused = true;
         try qwen4ReplayPrompt(&xfm, slot, &prompt);
         var begin: usize = 0;
         while (begin < prefix) {

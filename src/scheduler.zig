@@ -218,10 +218,6 @@ pub const SubmitParams = struct {
     mtp: ?generate_mod.MtpHeadRef = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
-    /// Phase 2 (Plan ricky): route SDPA through `kv_quant.quantAttention`
-    /// instead of dequant + dense SDPA. No effect when the cache scheme
-    /// isn't `.affine`. Default false → unchanged behavior.
-    kv_attn_fused: bool = false,
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
@@ -482,8 +478,6 @@ pub const Slot = struct {
     allow_batch_mtp: bool,
     mtp: ?generate_mod.MtpHeadRef,
     mtp_depth: u32,
-    /// Phase 2 (Plan ricky): see SubmitParams.kv_attn_fused.
-    kv_attn_fused: bool,
     cached_tokens: u32,
     logprobs_n: u32,
     serial_reason_logged: bool = false,
@@ -695,7 +689,6 @@ pub const Slot = struct {
             .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
-            .kv_attn_fused = params.kv_attn_fused,
             .cached_tokens = params.cached_tokens,
             .logprobs_n = params.logprobs_n,
             .state = .pending_prefill,
@@ -740,7 +733,6 @@ pub const Slot = struct {
             .mrope_total = slot.mrope_total,
             .mrope_delta = slot.mrope_delta,
             .capture_hidden = null,
-            .kv_attn_fused = params.kv_attn_fused,
         };
 
         return slot;
@@ -6850,7 +6842,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.mrope_total = slot.mrope_total;
     slot.ctx.mrope_delta = slot.mrope_delta;
     slot.ctx.capture_hidden = null;
-    slot.ctx.kv_attn_fused = slot.kv_attn_fused;
     if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // A module-owned arch that CAN rewind (`moduleStateSpecRollback`) may run

@@ -1,7 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
-const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const mtp_mod = @import("mtp.zig");
@@ -491,53 +490,6 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 // etc.). `default_enable_drafter` semantics (`drafter != null and !isMoe()`)
 // is re-computed per-request as `lm.drafter != null and !config.isMoe()`.
 
-/// Server-level configuration. Single source of truth for all process-wide
-/// defaults that handlers might consult. Populated once by `serve()` from
-/// its CLI args; read-only afterwards (no synchronization required, the
-/// values don't change for the server's lifetime).
-pub const KvAttnMode = enum { dense, fused, auto };
-
-/// docs/kv-quant-perf.md Phase 2 — auto-mode crossover. µbench (Phase 0
-/// table in the doc): the decode kernel is ~break-even with dense-mode reads
-/// at 8K context and wins from ~16K on every measured geometry (48/8 and
-/// 32/8 at hd 128, 16/8 at hd 256), so `auto` engages fused reads from 8K
-/// prompt tokens. One constant to start (per the plan); the per-request
-/// `kv_attn_mode` field outranks it.
-pub const KV_ATTN_AUTO_CROSSOVER_TOKENS: usize = 8192;
-
-/// Pure resolution core (unit-tested): explicit per-request choice >
-/// server mode; `auto` = fused iff the request's EFFECTIVE cache scheme is
-/// .affine and the prompt clears the crossover.
-pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usize, scheme: kv_quant_mod.Scheme) bool {
-    if (explicit) |e| return e;
-    return switch (mode) {
-        .dense => false,
-        .fused => true,
-        .auto => scheme == .affine and prompt_len >= KV_ATTN_AUTO_CROSSOVER_TOKENS,
-    };
-}
-
-/// Wrapper reading the live server config + scheduler default scheme.
-fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
-    const scheme: kv_quant_mod.Scheme = (kv_override orelse configuredKvQuantFor(config)).scheme;
-    return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
-}
-
-/// Per-request `kv_attn_mode` body field: "fused" | "dense" force the read
-/// path; "auto" or an absent/unrecognized value falls back to the server
-/// mode (the kv_quant field's tolerant precedent).
-fn parseKvAttnExplicit(root: std.json.ObjectMap) ?bool {
-    const v = root.get("kv_attn_mode") orelse return null;
-    switch (v) {
-        .string => |s| {
-            if (std.mem.eql(u8, s, "fused")) return true;
-            if (std.mem.eql(u8, s, "dense")) return false;
-            return null;
-        },
-        else => return null,
-    }
-}
-
 fn closeEmbeddedListener(io: std.Io, listener: *std.Io.net.Server, client: ?std.Thread) void {
     listener.deinit(io);
     if (client) |thread| thread.join();
@@ -547,6 +499,10 @@ pub fn requestShutdown() void {
     shutdown_requested.store(true, .release);
 }
 
+/// Server-level configuration. Single source of truth for all process-wide
+/// defaults that handlers might consult. Populated once by `serve()` from
+/// its CLI args; read-only afterwards (no synchronization required, the
+/// values don't change for the server's lifetime).
 pub const ServerConfig = struct {
     /// Starts an embedded client only after this process owns its listening socket.
     on_ready: ?*const fn (u16) anyerror!std.Thread = null,
@@ -557,13 +513,6 @@ pub const ServerConfig = struct {
     /// Default reasoning budget in tokens (-1 = unlimited).
     /// `--reasoning-budget N`. Per-request body fields override.
     default_reasoning_budget: i32 = -1,
-    /// docs/kv-quant-perf.md Phase 2: how quantized-KV requests READ the
-    /// cache at decode. The per-request `kv_attn_mode` body field
-    /// ("dense"/"fused") outranks it. Only takes
-    /// effect at `--kv-quant 4|8` (.affine cache scheme); other schemes
-    /// always read dense. `auto` (the default) engages fused reads when the
-    /// prompt is at/above the measured crossover — see `resolveKvAttnFused`.
-    kv_attn_mode: KvAttnMode = .auto,
     /// Defaults for sampling fields the request OMITS, set by `--temp` /
     /// `--top-p` / `--top-k` in serve mode (the macOS app passes its Settings
     /// values so external clients like Claude Code — which send no sampling
@@ -5944,11 +5893,10 @@ pub fn slotRingBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
 
 /// What the other rows of a batched MiMo decode hold beside this slot's tick: each row
 /// rebuilds one global layer dense below the packed arms' floor, where a solo tick's rebuild
-/// was alone. Zero where decode does not batch (the packed-arm kill switch turns it off).
+/// was alone. Zero where decode does not batch.
 pub fn batchedDecodeRowsBytes(config: *const model_mod.ModelConfig) u64 {
     if (!config.supportsBatchedMimoDecode()) return 0;
     const keys = transformer_mod.mimoGlobalDecodeRebuildMaxKeys();
-    if (keys == std.math.maxInt(u64)) return 0;
     var widest: u64 = 0;
     var li: u32 = 0;
     while (li < config.num_hidden_layers) : (li += 1) {
@@ -8162,7 +8110,6 @@ const PropsSettings = struct {
     engine: []const u8,
     kv_quant: []const u8,
     kv_cache: transformer_mod.KvCacheChoice = .{ .config = transformer_mod.KVQuantConfig.engine_default, .source = .default },
-    kv_attn_mode: KvAttnMode,
     prefill_chunk: usize,
     prefill_decode_share: f32 = 0,
     mtp_loaded: bool,
@@ -8203,7 +8150,6 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .engine = "mlx",
         .kv_quant = if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_cache = kv_cache,
-        .kv_attn_mode = server_config.kv_attn_mode,
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
         .mtp_loaded = mtpCapable(lm),
@@ -8241,10 +8187,10 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
     };
     var vision_buf: [160]u8 = undefined;
     const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"kv_attn_mode\":\"{s}\",\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                st.kv_cache.label(),
-        st.kv_cache.sourceName(),                   @tagName(st.kv_attn_mode),
+        st.kv_cache.sourceName(),
         st.prefill_chunk,
         st.mtp_loaded,                              st.mtp_default_on,
         st.mtp_choice.sourceName(),                 st.mtp_acceptance_source,
@@ -9351,7 +9297,6 @@ fn handleChatCompletions(
     // hot-prefix-cache hits never happen — entries record their scheme and
     // findBestMatch filters on it.
     const kv_quant_override = parseKvQuantOverride(root);
-    const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Parse enable_drafter: per-request override of the --drafter default.
     // Auto-disabled when:
@@ -9582,13 +9527,13 @@ fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9822,7 +9767,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = spec.use_drafter;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, null, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -9931,7 +9876,6 @@ fn handleStreamingCompletion(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
         .kv_quant_config = kv_quant_override,
@@ -10215,7 +10159,6 @@ fn nonStreamingViaScheduler(
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
-    kv_attn_explicit: ?bool,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -10240,7 +10183,6 @@ fn nonStreamingViaScheduler(
         .enable_mtp = enable_mtp and mtpCapable(lm),
         .mtp = if (enable_mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
         .media_chain = media_chain,
@@ -10439,7 +10381,6 @@ fn handleNonStreamingGeneration(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
-    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
@@ -10469,7 +10410,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences });
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -11036,7 +10977,6 @@ fn handleStreamingGeneration(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
-    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns measured by the request handler before
     /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
     /// usage SSE chunk so streaming clients see the same metric as
@@ -11101,7 +11041,6 @@ fn handleStreamingGeneration(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
@@ -15866,7 +15805,6 @@ fn handleAnthropicMessages(
 
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
     const kv_quant_override = parseKvQuantOverride(root);
-    const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Drafter: same disable rules as chat-completions parse site.
     const lm_default_enable_drafter: bool = lm.dflash != null;
@@ -16079,12 +16017,12 @@ fn handleAnthropicMessages(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -16121,7 +16059,6 @@ fn handleAnthropicNonStreaming(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
-    kv_attn_explicit: ?bool,
     /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
@@ -16152,7 +16089,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, stream, .{ .stops = stop_sequences });
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -16379,7 +16316,6 @@ fn handleAnthropicStreaming(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
-    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
     /// doesn't currently emit `timings` over SSE (spec doesn't model it),
     /// but plumbing the value through keeps the signature consistent with
@@ -16425,7 +16361,6 @@ fn handleAnthropicStreaming(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
@@ -17719,7 +17654,6 @@ fn handleResponsesInner(
         return;
     }
     const kv_quant_override = parseKvQuantOverride(root);
-    const kv_attn_explicit = parseKvAttnExplicit(root);
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
@@ -17939,7 +17873,6 @@ fn handleResponsesInner(
             .mrope_pos = slot_mrope_resp.pos,
             .mrope_total = slot_mrope_resp.total,
             .mrope_delta = slot_mrope_resp.delta,
-            .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         });
@@ -18237,7 +18170,7 @@ fn handleResponsesInner(
         const slot_mrope_ns = req_media.mrope;
         req_media.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences.items });
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, stream, .{ .stops = stop_sequences.items });
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -20724,7 +20657,7 @@ test "queryModel: GET /props?model=<id> routes to that model, percent-decoded" {
 }
 
 test "settingsPropsJson: /props names the vision choice and a streamed tower's bill" {
-    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .prefill_chunk = 2048, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .vision = .{ .loaded = true, .source = "--vision", .tower_bytes = 493_389_824, .encode_bytes = 5_000_000_000 } });
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 2048, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .vision = .{ .loaded = true, .source = "--vision", .tower_bytes = 493_389_824, .encode_bytes = 5_000_000_000 } });
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
     const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
@@ -20743,7 +20676,6 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
         .engine = "mlx",
         .kv_quant = "4",
         .kv_cache = transformer_mod.KvCacheChoice.resolve(transformer_mod.KVQuantConfig.affine(4), transformer_mod.KVQuantConfig.engine_default, false),
-        .kv_attn_mode = .auto,
         .prefill_chunk = 8192,
         .mtp_loaded = true,
         .mtp_default_on = true,
@@ -20771,7 +20703,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     const kv_cache = st.get("kv_cache").?.object;
     try testing.expectEqualStrings("kv4", kv_cache.get("scheme").?.string);
     try testing.expectEqualStrings("model-settings.json", kv_cache.get("source").?.string);
-    try testing.expectEqualStrings("auto", st.get("kv_attn_mode").?.string);
+    try testing.expect(st.get("kv_attn_mode") == null);
     try testing.expect(st.get("decode_attn_quant") == null);
     const mtp = st.get("mtp").?.object;
     try testing.expect(mtp.get("default_on").?.bool);
@@ -20784,7 +20716,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 4), st.get("max_concurrent").?.integer);
     try testing.expect(st.get("prefix_cache").?.object.get("ram_enabled").?.bool);
 
-    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
+    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(used);
     var up = try std.json.parseFromSlice(std.json.Value, testing.allocator, used[",\"settings\":".len..], .{});
     defer up.deinit();
@@ -20793,7 +20725,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 3 << 30), pc.get("disk_used_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5), pc.get("disk_entries").?.integer);
 
-    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "llama", .kv_quant = "q4", .kv_attn_mode = .dense, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
+    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "llama", .kv_quant = "q4", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(exact);
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
@@ -20804,7 +20736,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
 
 test "settingsPropsJson: /props names the greedy tail and where it came from" {
     for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
-        const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
+        const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
         defer testing.allocator.free(frag);
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
         defer parsed.deinit();
@@ -22669,22 +22601,6 @@ test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormal
     const zt = truncateEmbeddingDims(&z, 2);
     try t.expectEqual(@as(usize, 2), zt.len);
     for (zt) |x| try t.expect(!std.math.isNan(x));
-}
-
-test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" {
-    const t = std.testing;
-    // Explicit per-request choice outranks every mode.
-    try t.expect(resolveKvAttnFusedPure(.dense, true, 0, .off));
-    try t.expect(!resolveKvAttnFusedPure(.fused, false, 1 << 20, .affine));
-    // Fixed modes.
-    try t.expect(!resolveKvAttnFusedPure(.dense, null, 1 << 20, .affine));
-    try t.expect(resolveKvAttnFusedPure(.fused, null, 0, .affine));
-    // Auto: affine + prompt at/above the crossover.
-    try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS, .affine));
-    try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS + 1, .affine));
-    try t.expect(!resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS - 1, .affine));
-    // Auto never engages off (no triples to consume).
-    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
 }
 
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
@@ -24809,16 +24725,9 @@ test "a ringed arch's kv-quant dequant scratch is one layer's rebuild, not the m
     try t.expectEqual(fused, kvDequantScratchBytes(&cfg, 2 * seq, 1024));
     transformer_mod.fused256_override = false;
 
-    // A decode forward bills whatever the global-layer decode rebuilds whole: a
-    // floor's worth of keys while the packed arms serve, the whole cache under
-    // the kill switch that takes them away.
+    // A decode forward bills whatever the global-layer decode rebuilds whole: a floor's worth of keys.
     transformer_mod.fused256_override = true;
     try t.expectEqual(fused, kvDequantScratchBytes(&cfg, seq, 1));
-    const saved_fused = transformer_mod.kv_attn_fused_override;
-    defer transformer_mod.kv_attn_fused_override = saved_fused;
-    transformer_mod.kv_attn_fused_override = false;
-    try t.expectEqual(seq * 2 * (192 + 128) * 2, kvDequantScratchBytes(&cfg, seq, 1));
-    transformer_mod.kv_attn_fused_override = saved_fused;
     transformer_mod.fused256_override = false;
 
     // A short prompt never rebuilds more than it stores, and below the ring the
@@ -25669,7 +25578,7 @@ test "a request renders with its own preserve_thinking and leaves the model's co
 }
 
 test "settingsPropsJson: /props reports the prefill decode share" {
-    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .kv_attn_mode = .auto, .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
     defer testing.allocator.free(frag);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
     defer parsed.deinit();
