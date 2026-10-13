@@ -26,21 +26,23 @@ function fakeSelect() {
 
 const select = fakeSelect();
 const label = { textContent: '' };
+const budget = { value: '', disabled: false, placeholder: '', dataset: {} };
 const store = {};
 let model = null;
 const page = vm.createContext({
-  $: (id) => ({ effortSelect: select, composerEffortName: label })[id],
+  $: (id) => ({ effortSelect: select, composerEffortName: label, optThinkBudget: budget })[id],
   el: (tag, className, text) => ({ tag, text, value: '' }),
   readStore: (key) => store[key] ?? null,
   selectedModel: () => model,
 });
 vm.runInContext(slice('function renderEffortOptions(', 'function renderModelStatus('), page);
+const pick = (word) => { select.value = word; page.applyEffortBudget(); return budget.value; };
 const show = (m) => { model = m; page.renderEffortOptions(); return select.value; };
 
 const models = {
-  qwen: { id: 'qwen', reasoning_efforts: ['off', 'low', 'medium', 'xhigh'], default_reasoning_effort: 'off' },
-  mimo: { id: 'mimo', reasoning_efforts: ['off', 'on'], default_reasoning_effort: 'on' },
-  glm: { id: 'glm', reasoning_efforts: ['low', 'high', 'max'], default_reasoning_effort: 'high' },
+  qwen: { id: 'qwen', reasoning_efforts: ['off', 'low', 'medium', 'xhigh'], reasoning_effort_budgets: { low: 2048, medium: 8192 }, default_reasoning_effort: 'off' },
+  mimo: { id: 'mimo', reasoning_efforts: ['off', 'on'], reasoning_effort_budgets: {}, default_reasoning_effort: 'on' },
+  glm: { id: 'glm', reasoning_efforts: ['low', 'high', 'max'], reasoning_effort_budgets: {}, default_reasoning_effort: 'high' },
 };
 for (const m of Object.values(models)) {
   assert.equal(show(m), m.default_reasoning_effort, `${m.id} starts on its own default`);
@@ -57,10 +59,37 @@ assert.equal(show(models.qwen), 'off');
 store['sushi-effort'] = 'default';
 assert.equal(show(models.mimo), 'on');
 
-// Every request names the selected effort.
-const request = vm.createContext({ $: (id) => (id === 'effortSelect' ? select : { value: '' }) });
+// The budget box takes the picked word's budget; an uncapped word leaves it empty, off disables it.
+show(models.qwen);
+assert.equal(pick('medium'), '8192');
+assert.equal(budget.disabled, false);
+assert.equal(pick('low'), '2048');
+assert.equal(pick('xhigh'), '');
+assert.equal(pick('off'), '');
+assert.equal(budget.disabled, true);
+// A typed budget survives the model poll's re-render, and moves again only when the word or model does.
+pick('medium');
+budget.value = '3000';
+store['sushi-effort'] = 'medium';
+show(models.qwen);
+assert.equal(budget.value, '3000');
+assert.equal(pick('low'), '2048');
+show(models.glm);
+assert.equal(budget.value, '');
+assert.equal(budget.disabled, false, 'an uncapped word can still be capped by hand');
+
+// Every request names the selected effort, and the box's budget when it holds one.
+const request = vm.createContext({ $: (id) => ({ effortSelect: select, optThinkBudget: budget })[id] ?? { value: '' } });
 vm.runInContext(slice('function wireMessages(', 'function createStreamingView('), request);
+store['sushi-effort'] = 'default';
+show(models.mimo);
 assert.equal(request.buildRequest('mimo', []).reasoning_effort, 'on');
+assert.equal('reasoning_budget_tokens' in request.buildRequest('mimo', []), false);
+budget.value = '1500';
+assert.equal(request.buildRequest('mimo', []).reasoning_budget_tokens, 1500);
 show(models.qwen);
 assert.equal(request.buildRequest('qwen', []).reasoning_effort, 'off');
+assert.equal('reasoning_budget_tokens' in request.buildRequest('qwen', []), false, 'off sends no budget');
+pick('medium');
+assert.equal(request.buildRequest('qwen', []).reasoning_budget_tokens, 8192);
 console.log('Web UI effort menu: passed');

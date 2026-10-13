@@ -25,7 +25,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   uncapped, and off/none is off.
 - `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
   none runs at (`model.defaultReasoningEffort`: `--think`, else GLM high, else off/on per `defaultEnableThinking`,
-  where a thinking Qwen silence renders low).
+  where a thinking Qwen silence renders low), and `reasoning_effort_budgets`, the thinking-token cap of each capped word
+  (Qwen `low` 2048, `medium` 8192; `{}` for MiMo and GLM).
 - CLI `--think X` requires an explicit effort word and is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
   any X but off is on) or, lacking it, keeps its own default. It never fails a load.
 - A thinking request that names NO effort gets no server budget (decided): Qwen3.8 renders it as low
@@ -254,6 +255,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   server cancels on disconnect.
 - The effort menu lists exactly the row's `reasoning_efforts`, with no default entry; it shows the stored choice where
   the model takes it, else the row's `default_reasoning_effort`, and every request sends the shown word.
+- The thinking-budget box beside it takes the word's `reasoning_effort_budgets` value whenever the model or the word
+  changes (empty for an uncapped word, disabled at `off`); a typed value holds until then and is sent as
+  `reasoning_budget_tokens`.
 - Under `--api-key` the page is served without the key (it holds no data), asks for it on the first 401 and sends it as
   a Bearer token. Its fetches use `credentials: "omit"`: the 401's Basic challenge would otherwise open the browser's
   own login dialog.

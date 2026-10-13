@@ -789,7 +789,10 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
       <summary><svg><use href="#i-box"/></svg>Model / Thinking</summary>
       <div class="side-body">
         <label class="field">Model <select id="modelSelect" aria-label="Model"></select></label>
-        <label class="field">Thinking effort <select id="effortSelect" aria-label="Thinking effort"></select></label>
+        <div class="opt-grid">
+          <label class="field">Thinking effort <select id="effortSelect" aria-label="Thinking effort"></select></label>
+          <label class="field">Thinking budget <input id="optThinkBudget" type="number" min="1" step="1" placeholder="no cap" title="Thinking tokens before the model must answer" /></label>
+        </div>
         <div class="side-status" id="modelStatus"></div>
       </div>
     </details>
@@ -1481,6 +1484,8 @@ for (const id of optionFields) $(id).addEventListener("change", persistChatOptio
 $("chatOptionsReset").onclick = () => {
   for (const id of optionFields) $(id).value = "";
   persistChatOptions();
+  $("optThinkBudget").dataset.budgetFor = "";
+  applyEffortBudget();
   toast("Chat settings reset", "ok");
 };
 
@@ -1573,6 +1578,20 @@ function renderEffortOptions() {
   select.value = efforts.includes(stored) ? stored : model?.default_reasoning_effort ?? efforts[0] ?? "";
   select.disabled = efforts.length === 0;
   $("composerEffortName").textContent = select.value || "—";
+  applyEffortBudget();
+}
+// The box takes the word's budget when the model or the word changes; a typed value holds until then.
+function applyEffortBudget() {
+  const box = $("optThinkBudget");
+  const model = selectedModel();
+  const effort = $("effortSelect").value;
+  box.disabled = !effort || effort === "off";
+  box.placeholder = box.disabled ? "off" : "no cap";
+  const key = `${model?.id ?? ""}|${effort}`;
+  if (box.dataset.budgetFor === key) return;
+  box.dataset.budgetFor = key;
+  const budget = box.disabled ? null : model?.reasoning_effort_budgets?.[effort];
+  box.value = budget == null ? "" : String(budget);
 }
 function renderModelStatus() {
   const model = selectedModel();
@@ -1602,6 +1621,7 @@ $("modelSelect").addEventListener("change", () => {
 $("effortSelect").addEventListener("change", () => {
   writeStore("sushi-effort", $("effortSelect").value);
   $("composerEffortName").textContent = $("effortSelect").value;
+  applyEffortBudget();
 });
 
 /* ------------------------------------------------------------
@@ -2182,6 +2202,8 @@ function buildRequest(model, history, tools = null) {
   else body.tool_choice = "none";
   const effort = $("effortSelect").value;
   if (effort) body.reasoning_effort = effort;
+  const budget = parseInt($("optThinkBudget").value.trim(), 10);
+  if (effort !== "off" && budget > 0) body.reasoning_budget_tokens = budget;
   const numeric = [
     ["optMaxTokens", "max_tokens", parseInt],
     ["optTemperature", "temperature", parseFloat],

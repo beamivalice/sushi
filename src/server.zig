@@ -8764,15 +8764,21 @@ fn effortRefusal(allocator: std.mem.Allocator, word: []const u8, model_name: []c
     return out.toOwnedSlice(allocator);
 }
 
-/// The `/v1/models` row fields listing the accepted effort words and the one a request
-/// naming none runs at; "" for an arch without a table.
+/// The `/v1/models` row fields listing the accepted effort words, the thinking-token budget of
+/// each capped word, and the one a request naming none runs at; "" for an arch without a table.
 fn reasoningEffortsJson(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
     const table = model_mod.effortArms(config.model_type) orelse return allocator.dupe(u8, "");
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, ",\"reasoning_efforts\":[");
     for (table, 0..) |a, i| try out.print(allocator, "{s}\"{s}\"", .{ if (i > 0) "," else "", @tagName(a.effort) });
-    try out.append(allocator, ']');
+    try out.appendSlice(allocator, "],\"reasoning_effort_budgets\":{");
+    var first = true;
+    for (table) |a| if (a.budget) |b| {
+        try out.print(allocator, "{s}\"{s}\":{d}", .{ if (first) "" else ",", @tagName(a.effort), b });
+        first = false;
+    };
+    try out.append(allocator, '}');
     if (model_mod.defaultReasoningEffort(config)) |w| try out.print(allocator, ",\"default_reasoning_effort\":\"{s}\"", .{w});
     return out.toOwnedSlice(allocator);
 }
@@ -21535,7 +21541,7 @@ test "effort refusal and /v1/models list name the model's accepted words" {
     try std.testing.expectEqualStrings("reasoning effort 'high' is not supported by Qwen3.8-Flash-Next-EXL3-K4; use one of: off, low, medium, xhigh", msg);
     const row = try reasoningEffortsJson(allocator, &.{ .model_type = "qwen4_exp" });
     defer allocator.free(row);
-    try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"default_reasoning_effort\":\"off\"", row);
+    try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"off\"", row);
     const legacy = try reasoningEffortsJson(allocator, &.{ .model_type = "llama" });
     defer allocator.free(legacy);
     try std.testing.expectEqualStrings("", legacy);
@@ -21555,10 +21561,10 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
     var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
     const Case = struct { arch: []const u8, gen: []const u8, want: []const u8 };
     for ([_]Case{
-        .{ .arch = "qwen4_exp", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"default_reasoning_effort\":\"off\"" },
+        .{ .arch = "qwen4_exp", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"off\"" },
         .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":true}}", .want = ",\"default_reasoning_effort\":\"low\"" },
-        .{ .arch = "mimo_v2", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"on\"],\"default_reasoning_effort\":\"on\"" },
-        .{ .arch = "glm5_next", .gen = "{}", .want = ",\"reasoning_efforts\":[\"low\",\"high\",\"max\"],\"default_reasoning_effort\":\"high\"" },
+        .{ .arch = "mimo_v2", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"on\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"on\"" },
+        .{ .arch = "glm5_next", .gen = "{}", .want = ",\"reasoning_efforts\":[\"low\",\"high\",\"max\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"high\"" },
     }) |c| {
         const config_json = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"{s}\"}}", .{c.arch});
         defer t.allocator.free(config_json);
