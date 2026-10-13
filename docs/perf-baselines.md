@@ -211,3 +211,11 @@ before each server. One binary built from `bb9adb6a`.
 - Qwen 2.6bpw and 4bpw come from the first pass.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
+
+## v1.2.3 release context ladder
+
+[Version summary and per-model reports](bench/v1.2.3/summary.md), 2026-10-13, Apple M5 Max 128 GB. llmprobe 0.6.15,
+`--bench-only` 2K–128K, 2 runs, all on AC power, `iogpu.wired_limit_mb=120000`. `taskpolicy -a`, per-model GPU lock,
+fans max, 3 minutes idle before each server. One binary built from `4a1f1f1b` (SHA `b5cd630a`).
+- Qwen 2.6bpw, MiMo and GLM ran 5–20% under their v1.2.2 rows that day; the released v1.2.2 binary, rerun the same day
+  on 2K–32K, measured the same, so compare v1.2.3 against those same-day reruns, not against the v1.2.2 report.
