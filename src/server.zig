@@ -4911,6 +4911,29 @@ test "Flash-Next's request bill brackets the peaks measured on the M1 Max, with 
     }
 }
 
+test "Flash-Next's streamed request bill brackets the streamed peaks measured on the M1 Max" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 49152;
+    var cfg = qwen4MeasuredTestConfig();
+    cfg.expert_streaming = true;
+    cfg.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&cfg, 1_848_000_000);
+    // Live `peak_bytes - active_bytes` after one cold prompt per width, `--ssd-budget-gb 23`, kv8, no MTP, SSD tier on.
+    const measured = [_]struct { tokens: u64, chunk: u64, peak_mib: u64 }{
+        .{ .tokens = 7987, .chunk = 1024, .peak_mib = 1224 },
+        .{ .tokens = 45106, .chunk = 512, .peak_mib = 1683 },
+    };
+    for (measured) |m| {
+        const bill = prefillNeededAtChunk(&cfg, m.tokens, 16, 8, m.chunk, .{});
+        const peak = m.peak_mib << 20;
+        try std.testing.expect(bill >= peak + peak / 10);
+        try std.testing.expect(bill <= peak + peak * 2 / 5);
+    }
+}
+
+
 test "the advertised Flash-Next context is the largest one the request bill admits" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();

@@ -1863,7 +1863,7 @@ pub const Scheduler = struct {
                 .drop_default, .off => {},
             }
             const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, settings_budget, coldLoadVision(owned.config, true));
-            break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
+            break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config, false), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
         else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
@@ -2929,6 +2929,12 @@ pub fn fp8ExpertScratchBytes(layout: expert_stream_mod.quant.Layout, geometry: e
     return @as(u64, geometry.experts) *| codes *| (2 + 1);
 }
 
+/// The expert fill peak a streamed load and its requests bill. Flash-Next's streamed prefill peaked no higher than
+/// its resident one, the union workspace and bounce already inside the budget (engine-expert-streaming.md#budget).
+pub fn billedFillPeakBytes(config: *const ModelConfig, prefill_peak_bytes: u64) u64 {
+    return if (config.longCtxGated()) 0 else prefill_peak_bytes;
+}
+
 /// Marks the config streamed: the fields every streamed forward and bill reads.
 pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_bytes: u64) void {
     config.expert_layout = plan.layout;
@@ -2937,7 +2943,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_ssd_budget_bytes = if (plan.resolved.ledger != null) budget_bytes else 0;
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
     config.expert_bounce_bytes = plan.cache.bounce_bytes;
-    config.expert_fill_peak_bytes = plan.cache.prefill_peak_bytes;
+    config.expert_fill_peak_bytes = billedFillPeakBytes(config, plan.cache.prefill_peak_bytes);
     config.expert_vision_tower_bytes = plan.split.vision;
     config.expert_vision_encode_bytes = if (plan.vision.on) plan.vision.encode_bytes else 0;
 }
@@ -3895,6 +3901,16 @@ test "a load bills weights, then the larger of the measured warmup plus a 1 GiB 
     try testing.expectEqual(44 * gib + 6 * gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
     try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, gib));
     try testing.expectEqual(44 * gib + gib * 9 / 4, loadRequirementBytes(&f.qwen, 44 * gib, true, gib * 9 / 4));
+}
+
+test "a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs" {
+    const fill: u64 = 1_848_000_000;
+    const qwen = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
+    const mimo = ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
+    const glm = ModelConfig{ .model_type = "glm5_next", .expert_streaming = true };
+    try testing.expectEqual(@as(u64, 0), billedFillPeakBytes(&qwen, fill));
+    try testing.expectEqual(fill, billedFillPeakBytes(&mimo, fill));
+    try testing.expectEqual(fill, billedFillPeakBytes(&glm, fill));
 }
 
 test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {

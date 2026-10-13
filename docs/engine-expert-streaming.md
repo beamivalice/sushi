@@ -94,6 +94,10 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit
   `--prefill-chunk` only lowers the floor the load proves.
+- **A streamed Flash-Next bills no expert fill peak** (`scheduler.billedFillPeakBytes`); MiMo and GLM keep theirs. The
+  fill peak (`fillPeakBytes`: two union workspaces, a cache layer, a batch) rode on top of a budget that already holds
+  the union workspace and the bounce. M1 Max, `--ssd-budget-gb 23`, kv8, lean: a cold 8k prompt peaked 1,224 MiB over
+  the loaded weights and a 45k 1,683, the resident pack's own peak, against bills of 3,270 and 3,821 that carried it.
 - Admission `budget + planned KV (+ the largest image encode under --vision) <= wired limit`; the refusal names the
   `iogpu.wired_limit_mb` that would admit.
   Planned KV is the session bill per token (KV at its width plus Qwen's QSA history or GLM's pooled index) times the
