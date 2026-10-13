@@ -109,6 +109,11 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **Streamed serial decode** can add its already gated shared expert in the finish reduce, removing a dependent
   elementwise dispatch. The routed sum is rounded to its output dtype before the shared addition, matching the
   separate store and add bit for bit. Other widths, mixed gate/up rates and dtype mismatches retain the separate add.
+- **Resident bf16 serial decode folds the whole shared-expert tail** (`moeWithGatedShared`): the finish reduce reads
+  the shared down projection and the gate logit and adds `sigmoid(logit) * down`, removing Sigmoid, Multiply and Add
+  (three dependent dispatches per MoE layer). The gate follows MLX's bf16 Sigmoid step by step (precise exp, then
+  reciprocal, then `1 - r` for a non-negative logit, each rounded to bf16) and the product rounds to bf16 before the
+  add; the unit test sweeps every bf16 logit against the MLX ops. Other widths and dtypes run the three ops.
 - **The decode GEMVs are bound by fixed per-tile work, not DRAM** (64-bit index math, two word loads and a 64-bit
   shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: every n below 64) carry two output
   tiles per threadgroup, load both k-tiles of an iteration before decoding, and bump pointers; the per-tile

@@ -609,3 +609,53 @@ Bills (default flags, kv8, `--mtp`, a 6000-token prompt sent twice, an empty SSD
   `1 ssm-cp, 121.4 MB`, resident 201.8 MB.
 - The admission bill at that request rises 4549 → 4616 MB (+67 MB).
 - Auto context stays 1,048,576 tokens and the boot `active_bytes` stay 47.51 GB on this 128 GB box.
+
+<a id="serial-decode-loaders"></a>
+## Serial decode: QSA loader simdgroups and the shared-expert tail fold
+
+Two bit-identical changes against main `7a2b4389` (binary sha256 `efe7b306…`). Branch binary `43a20cba` + meter-only
+edits (sha256 `d75f716d…`). Both ReleaseFast, Sushi-2.6bpw, M5 Max 128 GB on AC, `taskpolicy -a`, GPU lock per run,
+quiet window, fans max, 2026-10-13.
+
+- **Loader simdgroups.** At decode width the QSA split-K grid is 2 KV heads x 16 splits, 32 threadgroups of 2
+  simdgroups each, and it waits on tile loads. Simdgroups past the two that run the mma now only stage tiles. 16 total
+  is the policy, engaged when `seq_len * h_kv * nsplit <= 32`.
+  - µbench (12 dependent layers): 92-95 µs → 56 µs per call.
+  - Decode meter (`--no-mtp`, kv8), one process, ms per forward:
+
+    | keys | 2 sg | 4 sg | 8 sg | 16 sg |
+    |---|---|---|---|---|
+    | 4096 | 18.02 / 18.14 | 17.78 | 17.57 / 17.59 | 17.37 |
+    | 32k | 18.28 / 18.32 / 18.30 | | | 17.69 / 17.67 / 17.77 |
+
+  - At verify widths 2-8, 16 simdgroups is 3-8% slower, so the policy keeps them at two.
+- **Shared-expert tail fold.** The one-row resident decode finish reduce also applies `sigmoid(gate) * shared`. This
+  removes 144 dispatches per token. Meter A B B A (loaders only vs both): 17.394 / 17.589 against 17.306 / 17.306 ms.
+- Where the forward goes at 4096 keys (main, 17.99 ms: 1.33 build + 16.65 GPU eval, 3861 ops; GPU ms removed by each
+  stand-in): GDN 5.04, MLP 4.66, attention 3.57 (QSA 0.68, SDPA 1.85), HC 2.58, shared expert 0.62, lm_head 1.09.
+  `mlx_async_eval` takes ~13.6 ms wall for 5.2 ms thread CPU, so the encoder waits on in-flight buffers: the forward is
+  GPU-bound. A dependent tiny op costs ~1.5 µs.
+
+Live, llmprobe 0.6.15 `--bench-only --rungs 4k,32k --runs 3`, `--kv-quant 8 --no-mtp`, an empty prefix-cache base
+per boot, 3 min idle between boots, boots main / branch / branch / main, tok/s:
+
+| cell | main | branch | branch | main | ms/token |
+|---|---|---|---|---|---|
+| decode (short prompt) | 66.9 | 67.9 | 67.7 | 67.0 | -1.3% |
+| ~4.2k rung | 60.4 | 63.3 | 63.3 | 60.3 | -4.7% |
+| ~32.9k rung | 59.7 | 62.6 | 62.6 | 59.7 | -4.6% |
+| prefill (10k prompt) | 2231 | 2238 | 2215 | 2259 | unchanged |
+
+MTP (default, no `--no-mtp`), same settings and binaries, boots main / branch / branch / main, 40 MTP requests per
+boot. The verify widths run unchanged kernels, so only the one-row forwards inside a round can move:
+
+| cell | main | branch | branch | main |
+|---|---|---|---|---|
+| decode (short prompt), tok/s | 100.2 | 91.8 | 96.8 | 91.9 |
+| ~4.2k rung, tok/s | 92.6 | 93.7 | 86.5 | 90.7 |
+| ~32.9k rung, tok/s | 89.0 | 90.9 | 96.9 | 94.9 |
+| every round in the log, ms per token | 10.19 | 10.11 | 10.21 | 10.30 |
+
+- The llmprobe cells swing 5-10% within an arm, as tokens per round varies. The server's own round log, summed over
+  every request in the boot, puts the branch 0.9% faster: no regression.
+- `tests/test_mtp_equivalence.sh` on the branch binary: 18 passed, 0 failed.

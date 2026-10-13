@@ -4363,6 +4363,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw = io_u.Stopwatch.init(tio);
             var build_ns: u64 = 0;
             var eval_ns: u64 = 0;
+            var submit_ns: u64 = 0;
+            var submit_cpu_ns: u64 = 0;
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
@@ -4374,6 +4376,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 build_ns += swb.read();
                 ops_total += mlx.op_count.load(.monotonic) - ops_before;
                 var swe = io_u.Stopwatch.init(tio);
+                const lg_vec = mlx.mlx_vector_array_new_value(lg);
+                var cpu0: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.THREAD_CPUTIME_ID, &cpu0);
+                _ = mlx.mlx_async_eval(lg_vec);
+                var cpu1: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.THREAD_CPUTIME_ID, &cpu1);
+                submit_cpu_ns += @intCast((cpu1.sec - cpu0.sec) * std.time.ns_per_s + (cpu1.nsec - cpu0.nsec));
+                _ = mlx.mlx_vector_array_free(lg_vec);
+                submit_ns += swe.read();
                 _ = mlx.mlx_array_eval(lg);
                 eval_ns += swe.read();
                 _ = mlx.mlx_array_free(lg);
@@ -4382,11 +4393,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (fold_arms) log.info("[fwd-ubench] gdn fold launches: {d}\n", .{transformer_mod.gdn_verify_fold_calls});
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
                 done,
                 ms,
                 @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(submit_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(submit_cpu_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(ops_total)) / dn,
             });
             // SUSHI_DECODE_FWD_GRAPH=<abs path>: one forward's unevaluated tape, one primitive per

@@ -4033,7 +4033,8 @@ const QSA_ATTN_Q_SOURCE =
     \\constexpr int VC = DV / 8;
     \\constexpr int LDK = BK + 8;
     \\constexpr int LDV = DV + 8;
-    \\constexpr int NT = 32 * NSG;
+    \\// Simdgroups past NSG only stage tiles: who loads an element never changes its value.
+    \\constexpr int NT = 32 * NSGT;
     \\constexpr int KT = BK / 8;
     \\constexpr int VPW = 32 / BITS;
     \\constexpr int NW = 8 / VPW;
@@ -4103,6 +4104,7 @@ const QSA_ATTN_Q_SOURCE =
     \\const int Vs_off = sm * LDV + sn;
     \\const int row = tm + sm;
     \\const bool row_ok = row < gqa;
+    \\const bool mma_sg = int(warp) < NSG;
     \\
     \\float2 Qfrag[KC];
     \\if (row_ok) {
@@ -4157,6 +4159,7 @@ const QSA_ATTN_Q_SOURCE =
     \\
     \\  float2 Sfrag[KT];
     \\  for (int i = 0; i < KT; ++i) Sfrag[i] = float2(0.0f);
+    \\  if (mma_sg) {
     \\  for (int dd = 0; dd < KC; ++dd) {
     \\    const float2 qf = Qfrag[dd];
     \\    const int kbase = Ks_off + dd * 8 * LDK;
@@ -4171,6 +4174,7 @@ const QSA_ATTN_Q_SOURCE =
     \\      if (kt * 8 + sn >= rows_k) Sfrag[kt].x = -INFINITY;
     \\      if (kt * 8 + sn + 1 >= rows_k) Sfrag[kt].y = -INFINITY;
     \\    }
+    \\  }
     \\  }
     \\
     \\  // V tile: dequantize straight into the row-major staging.
@@ -4202,6 +4206,7 @@ const QSA_ATTN_Q_SOURCE =
     \\    for (int j = 0; j < 8; ++j) Vs[r * LDV + cb + j] = ev[j];
     \\  }
     \\
+    \\  if (mma_sg) {
     \\  float new_max = max_score;
     \\  for (int kt = 0; kt < KT; ++kt) new_max = metal::max(new_max, sushi_row_max(Sfrag[kt]));
     \\  float rowsum = 0.0f;
@@ -4213,14 +4218,17 @@ const QSA_ATTN_Q_SOURCE =
     \\  max_score = new_max;
     \\  sum_score = sum_score * factor + rowsum;
     \\  for (int i = 0; i < VC; ++i) Ofrag[i] *= factor;
+    \\  }
     \\
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (mma_sg) {
     \\  for (int id = 0; id < VC; ++id) {
     \\    const int vbase = Vs_off + id * 8;
     \\    for (int kt = 0; kt < KT; ++kt) {
     \\      const float2 vf = float2(float(Vs[vbase + kt * 8 * LDV]), float(Vs[vbase + kt * 8 * LDV + 1]));
     \\      sushi_mma(Ofrag[id], Sfrag[kt], vf);
     \\    }
+    \\  }
     \\  }
     \\}
     \\
@@ -4306,6 +4314,15 @@ pub fn qsaAttnNSplit() c_int {
         return f;
     }
     return QSA_ATTN_NSPLIT_DEFAULT;
+}
+
+/// Test and microbench seam: forces the simdgroups per threadgroup (floored at the computing ones).
+pub var qsa_attn_simdgroups_override: ?c_int = null;
+
+/// Simdgroups per QSA split-K threadgroup: a small grid stages each tile with loader simdgroups.
+pub fn qsaAttnSimdgroups(seq_len: c_int, h_kv: c_int, nsg: c_int, nsplit: c_int) c_int {
+    const fallback: c_int = if (seq_len * h_kv * nsplit <= 32) 16 else nsg;
+    return @max(nsg, @min(qsa_attn_simdgroups_override orelse fallback, 32));
 }
 
 /// Widest query width the split-K kernel serves on a PACKED cache: past it the gathers win
@@ -4475,6 +4492,8 @@ const QsaAttnCfgKey = struct {
     /// False = no block list: every row attends its whole causal range.
     sparse: bool,
     nsg: c_int,
+    /// Simdgroups per threadgroup, `nsg` of them computing.
+    nsgt: c_int,
     nsplit: c_int,
     bk: c_int,
     ratio: c_int,
@@ -4506,11 +4525,11 @@ fn splitKAttnDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, blocks: mlx.mlx_array
         const ml_shape = [_]c_int{ qs[1], seq_len, key.nsplit, 2 };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &acc_shape, 4, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 4, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, seq_len * 32, key.h_kv * key.nsg, key.nsplit));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, key.nsg, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, seq_len * 32, key.h_kv * key.nsgt, key.nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, key.nsgt, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", key.dtype));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", key.nsg));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", key.bk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSGT", key.nsgt));        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", key.bk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", key.ratio));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(key.bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(key.gs)));
@@ -4621,7 +4640,7 @@ pub fn qsaSparseAttn(
         .quant = quant,
         .sparse = true,
         .nsg = @divTrunc(gqa + 7, 8),
-        .nsplit = qsaAttnNSplit(),
+        .nsgt = qsaAttnSimdgroups(seq_len, h_kv, @divTrunc(gqa + 7, 8), qsaAttnNSplit()),        .nsplit = qsaAttnNSplit(),
         .bk = qsaAttnBk(),
         .ratio = ratio,
         .dtype = .bfloat16,
@@ -4697,6 +4716,7 @@ pub fn qkvAttnSplitKKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const 
         .quant = true,
         .sparse = false,
         .nsg = @divTrunc(gqa + 7, 8),
+        .nsgt = @divTrunc(gqa + 7, 8),
         .nsplit = qkvSplitKSplits(t_k),
         .bk = QSA_ATTN_BK,
         .ratio = 1,
@@ -18279,12 +18299,16 @@ pub const Transformer = struct {
         return result;
     }
 
+    fn moeSharedGateLogit(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+        const seg_w = mw.shared_expert_gate_w.?;
+        const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
+        return qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
+    }
+
     fn moeSharedGated(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
         defer _ = mlx.mlx_array_free(down);
-        const seg_w = mw.shared_expert_gate_w.?;
-        const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
-        const gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
+        const gate_logit = try self.moeSharedGateLogit(expert_x, mw);
         defer _ = mlx.mlx_array_free(gate_logit);
         var gate_sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_sig);
@@ -18304,9 +18328,7 @@ pub const Transformer = struct {
 
     fn moeAddSharedDown(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, down: mlx.mlx_array, mw: *const MoeMlpWeights, gate_logit_in: ?mlx.mlx_array) !mlx.mlx_array {
         if (gate_logit_in) |logit| return self.moeSharedGateTail(expert_sum, logit, down);
-        const seg_w = mw.shared_expert_gate_w.?;
-        const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
-        const gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
+        const gate_logit = try self.moeSharedGateLogit(expert_x, mw);
         defer _ = mlx.mlx_array_free(gate_logit);
         return self.moeSharedGateTail(expert_sum, gate_logit, down);
     }
@@ -18988,7 +19010,7 @@ pub const Transformer = struct {
     /// MoE MLP with separate router and expert inputs.
     /// router_x: input for routing (raw hidden states).
     /// expert_x: input for expert computation (possibly normalized).
-    fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool, shared: ?mlx.mlx_array) !mlx.mlx_array {
+    fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool, shared: ?mlx.mlx_array, shared_gate: ?mlx.mlx_array) !mlx.mlx_array {
         if (verify_rows) mtp_verify_expert_rows_calls +%= 1;
         if (mw.exl3_group_count > 0) return sushi_exl3.moeGroups(self.s, expert_x, mw.exl3_groups[0..mw.exl3_group_count], inds, scores, .{
             .codebook = self.config.expert_quant_codebook,
@@ -19003,7 +19025,10 @@ pub const Transformer = struct {
             .codebook = self.config.expert_quant_codebook,
             .window = self.config.expert_quant_window,
         };
-        if (shared) |value| return sushi_exl3.moeWithShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value);
+        if (shared) |value| {
+            if (shared_gate) |logit| return sushi_exl3.moeWithGatedShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value, logit);
+            return sushi_exl3.moeWithShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value);
+        }
         return sushi_exl3.moe(self.s, expert_x, bank, inds, scores, dec, verify_rows);
     }
 
@@ -19136,7 +19161,18 @@ pub const Transformer = struct {
         if (cfg.expert_layout == .exl3_k4) {
             const shared = if (routing_override) |given| given.shared_gated else null;
             const fold_shared = shared != null and mw.exl3_group_count == 0 and moeDumpDir() == null;
-            const y = try self.moeExl3(expert_x, mw, inds, norm_scores, skip_shared and router_override != null, if (fold_shared) shared else null);
+            const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
+            if (tail_shared and mw.exl3_group_count == 0 and moeDumpDir() == null) {
+                const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
+                defer _ = mlx.mlx_array_free(down);
+                const own_logit = routed.gate_logit.ctx == null;
+                const logit = if (own_logit) try self.moeSharedGateLogit(expert_x, mw) else routed.gate_logit;
+                defer if (own_logit) {
+                    _ = mlx.mlx_array_free(logit);
+                };
+                return self.moeExl3(expert_x, mw, inds, norm_scores, false, down, logit);
+            }
+            const y = try self.moeExl3(expert_x, mw, inds, norm_scores, skip_shared and router_override != null, if (fold_shared) shared else null, null);
             if (moeDumpDir() != null) {
                 moeDumpTensor(self.s, "y", moe_dump_layer, y);
             }
@@ -26491,6 +26527,11 @@ const Exl3MoeHarness = struct {
     const dim: usize = 128;
 
     pub fn init(alloc: std.mem.Allocator, s: mlx.mlx_stream, rows: usize, seed: u64) !Exl3MoeHarness {
+        return initDtype(alloc, s, rows, seed, .float16);
+    }
+
+    /// `act_dtype` is the dtype of x and of every dense weight; the EXL3 scale vectors stay f16.
+    pub fn initDtype(alloc: std.mem.Allocator, s: mlx.mlx_stream, rows: usize, seed: u64, act_dtype: mlx.mlx_dtype) !Exl3MoeHarness {
         const exl3 = expert_exl3;
         const fixture = exl3.fixtures.k4;
         const header_len = std.mem.readInt(u64, fixture[0..8], .little);
@@ -26590,6 +26631,21 @@ const Exl3MoeHarness = struct {
         h.xfm.compiled_gelu = null;
         h.xfm.compiled_geglu = null;
         h.xfm.cost_trace_active = false;
+        if (act_dtype != .float16) {
+            const dense = [_]*mlx.mlx_array{ &h.owned[3], &h.owned[4], &h.owned[5], &h.owned[6], &h.owned[7], &h.owned[8] };
+            for (dense) |slot| {
+                var cast = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&cast, slot.*, act_dtype, s));
+                _ = mlx.mlx_array_free(slot.*);
+                slot.* = cast;
+            }
+            h.x = h.owned[8];
+            h.mw.router_w = h.owned[3];
+            h.mw.shared_gate_w = h.owned[4];
+            h.mw.shared_up_w = h.owned[5];
+            h.mw.shared_down_w = h.owned[6];
+            h.mw.shared_expert_gate_w = h.owned[7];
+        }
         for (h.owned) |a| try mlx.check(mlx.mlx_array_eval(a));
         return h;
     }
@@ -27211,6 +27267,44 @@ test "exl3 MoE answers the shared-expert standin with the routed sum" {
         const a: u16 = @bitCast(pr[i]);
         const b: u16 = @bitCast(pg[i]);
         try t.expectEqual(a, b);
+    }
+}
+
+test "exl3 resident decode folds the shared-expert gate tail into the finish reduce" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const prev_st = qwen4_forward.qwen4_standin_override;
+    defer qwen4_forward.qwen4_standin_override = prev_st;
+    qwen4_forward.qwen4_standin_override = .{};
+    for ([_]u64{ 71, 72, 73 }) |seed| {
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        var h = try Exl3MoeHarness.initDtype(arena.allocator(), s, 1, seed, .bfloat16);
+        defer h.deinit();
+        var rng = std.Random.DefaultPrng.init(seed);
+        const seg = try attn256RandBf16Scaled(rng.random(), &.{ Exl3MoeHarness.dim, 1 }, 8.0, s);
+        defer _ = mlx.mlx_array_free(seg);
+        h.mw.shared_expert_gate_w = seg;
+
+        for ([_]bool{ true, false }) |skip| _ = mlx.mlx_array_free(try h.xfm.moeMLP2WithRouter(h.x, h.x, &h.mw, null, skip, null, null));
+        const ops0 = mlx.op_count.load(.monotonic);
+        const routed = try h.xfm.moeMLP2WithRouter(h.x, h.x, &h.mw, null, true, null, null);
+        defer _ = mlx.mlx_array_free(routed);
+        const down = (try h.xfm.moeSharedDown(.qmatmul, h.x, &h.mw, &.{})).?;
+        defer _ = mlx.mlx_array_free(down);
+        const logit = try h.xfm.moeSharedGateLogit(h.x, &h.mw);
+        defer _ = mlx.mlx_array_free(logit);
+        const ops2 = mlx.op_count.load(.monotonic);
+        const want = try h.xfm.moeSharedGateTail(routed, logit, down);
+        defer _ = mlx.mlx_array_free(want);
+
+        const ops3 = mlx.op_count.load(.monotonic);
+        const got = try h.xfm.moeMLP(h.x, &h.mw);
+        defer _ = mlx.mlx_array_free(got);
+        // The routed sum plus the shared projections, and nothing for sigmoid, multiply or add.
+        try t.expectEqual(ops2 - ops0, mlx.op_count.load(.monotonic) - ops3);
+        try qwen4ExpectMoeBitsEqual(want, got);
     }
 }
 
@@ -41998,6 +42092,111 @@ test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q 
     const b = (try qsaSparseAttn(s, q, &v_noreuse, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
     defer _ = mlx.mlx_array_free(b);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(a, b, s));
+}
+
+test "qsa sparse attn: loader simdgroups leave every output bit unchanged" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    var prng = std.Random.DefaultPrng.init(0x10AD_5165);
+    const rnd = prng.random();
+    defer qsa_attn_simdgroups_override = null;
+
+    const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, bits: u8 }{
+        .{ .s = 1, .kv = 4096, .kb = 512, .bits = 8 },
+        .{ .s = 1, .kv = 70001, .kb = 512, .bits = 8 },
+        .{ .s = 1, .kv = 9000, .kb = 512, .bits = 4 },
+        .{ .s = 3, .kv = 20002, .kb = 512, .bits = 8 },
+        .{ .s = 8, .kv = 4097, .kb = 2048, .bits = 8 },
+    };
+    for (cases) |c| {
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, c.s, 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, c.kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(k_dense);
+        const v_dense = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, c.kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(v_dense);
+        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, c.s, c.kv, c.kb, ratio);
+        defer ta.free(blocks_host);
+        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, c.s, c.kb }, 3, .int32);
+        defer _ = mlx.mlx_array_free(blocks);
+        var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(c.bits));
+        defer cache.deinit();
+        var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.affine(c.bits), &cache);
+        defer view.deinit();
+
+        qsa_attn_simdgroups_override = 2;
+        const base = (try qsaSparseAttn(s, q, &view, blocks, ratio, 1.0 / 16.0)) orelse return error.SparseAttnDeclined;
+        defer _ = mlx.mlx_array_free(base);
+        for ([_]c_int{ 4, 8, 16 }) |sgs| {
+            qsa_attn_simdgroups_override = sgs;
+            const got = (try qsaSparseAttn(s, q, &view, blocks, ratio, 1.0 / 16.0)) orelse return error.SparseAttnDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, base, s));
+        }
+    }
+    // The decode grid (2 kv heads x 16 splits) is too small to hide the tile loads alone.
+    qsa_attn_simdgroups_override = null;
+    try std.testing.expect(qsaAttnSimdgroups(1, 2, 2, QSA_ATTN_NSPLIT_DEFAULT) > 2);
+}
+
+test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN_UBENCH=1)" {
+    if (!diagEnvOn("SUSHI_QSA_ATTN_UBENCH")) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    const layers: usize = 12;
+    const chain: usize = 8;
+    const reps: usize = 7;
+    var prng = std.Random.DefaultPrng.init(0x0B5E_7A11);
+    const rnd = prng.random();
+    defer qsa_attn_simdgroups_override = null;
+    const arms = [_]c_int{ 2, 16 };
+    for ([_]c_int{ 4096, 32768 }) |kv| {
+        var caches: [layers]KVCache = undefined;
+        var views: [layers]DenseKVView = undefined;
+        var built: usize = 0;
+        defer for (0..built) |i| {
+            views[i].deinit();
+            caches[i].deinit();
+        };
+        for (0..layers) |i| {
+            const k = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+            defer _ = mlx.mlx_array_free(v);
+            caches[i] = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
+            views[i] = try qsaAttnCacheFixture(ta, s, k, v, kv, kv - 1, kv_quant.KVQuantConfig.affine(8), &caches[i]);
+            built += 1;
+        }
+        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, 1, kv, 512, ratio);
+        defer ta.free(blocks_host);
+        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, 1, 512 }, 3, .int32);
+        defer _ = mlx.mlx_array_free(blocks);
+        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
+        defer _ = mlx.mlx_array_free(q0);
+        var us: [arms.len][reps]f64 = undefined;
+        for (0..reps + 1) |rep| for (arms, 0..) |arm, ai| {
+            qsa_attn_simdgroups_override = arm;
+            var q = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&q, q0));
+            for (0..chain) |_| for (&views) |*view| {
+                const out = (try qsaSparseAttn(s, q, view, blocks, ratio, 1.0 / 16.0)) orelse return error.SparseAttnDeclined;
+                _ = mlx.mlx_array_free(q);
+                q = out;
+            };
+            var clk = ProfClock.init();
+            try mlx.check(mlx.mlx_array_eval(q));
+            const ns = clk.lap();
+            _ = mlx.mlx_array_free(q);
+            if (rep > 0) us[ai][rep - 1] = @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(layers * chain));
+        };
+        for (arms, 0..) |arm, ai| {
+            std.mem.sort(f64, &us[ai], {}, std.sort.asc(f64));
+            std.debug.print("[qsa-attn-ubench] kv={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, arm, us[ai][reps / 2], reps });
+        }
+    }
 }
 
 test "qsa sparse attn: one fused dispatch replaces the arm's op chain (>= 100 ops over 12 layers)" {

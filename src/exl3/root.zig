@@ -20,7 +20,7 @@ pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 /// returned in x's shape and dtype. Up to `kernels.DECODE_ROWS_MAX` rows (or any
 /// verify rows) take the decode chain, wider the prefill GEMM.
 pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool) !mlx.mlx_array {
-    return moeOutput(s, x, bank, inds, scores, dec, verify_rows, mlx.mlx_array_dtype(x), null);
+    return moeOutput(s, x, bank, inds, scores, dec, verify_rows, mlx.mlx_array_dtype(x), null, null);
 }
 
 /// Add an already gated shared expert, preserving the routed output's rounding.
@@ -28,7 +28,7 @@ pub fn moeWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.
     const xsh = mlx.getShape(x);
     if (xsh[0] * xsh[1] == 1 and mlx.mlx_array_dtype(shared) == mlx.mlx_array_dtype(x) and
         mlx.mlx_array_size(shared) == mlx.mlx_array_size(x) and mlx.getShape(bank.gate.trellis)[3] == mlx.getShape(bank.up.trellis)[3])
-        return moeOutput(s, x, bank, inds, scores, dec, verify_rows, mlx.mlx_array_dtype(x), shared);
+        return moeOutput(s, x, bank, inds, scores, dec, verify_rows, mlx.mlx_array_dtype(x), shared, null);
     const routed = try moe(s, x, bank, inds, scores, dec, verify_rows);
     defer _ = mlx.mlx_array_free(routed);
     var out = mlx.mlx_array_new();
@@ -37,8 +37,30 @@ pub fn moeWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.
     return out;
 }
 
-fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array) !mlx.mlx_array {
-    return moeOutputClamped(s, x, bank, inds, scores, dec, verify_rows, out_dtype, shared, 0);
+/// A decode row adds `sigmoid(gate) * down` (the shared expert, bf16) in the finish reduce, bit-identical to
+/// the Sigmoid, Multiply and Add ops it replaces; any other shape or dtype runs those ops.
+pub fn moeWithGatedShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, down: mlx.mlx_array, gate: mlx.mlx_array) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    if (xsh[0] * xsh[1] == 1 and mlx.mlx_array_dtype(x) == .bfloat16 and mlx.mlx_array_dtype(down) == .bfloat16 and
+        mlx.mlx_array_dtype(gate) == .bfloat16 and mlx.mlx_array_size(down) == mlx.mlx_array_size(x) and mlx.mlx_array_size(gate) == 1 and
+        mlx.getShape(bank.gate.trellis)[3] == mlx.getShape(bank.up.trellis)[3])
+        return moeOutput(s, x, bank, inds, scores, dec, verify_rows, .bfloat16, down, gate);
+    const routed = try moe(s, x, bank, inds, scores, dec, verify_rows);
+    defer _ = mlx.mlx_array_free(routed);
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, gate, s));
+    var gated = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gated);
+    try mlx.check(mlx.mlx_multiply(&gated, sig, down, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_add(&out, routed, gated, s));
+    return out;
+}
+
+fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, shared_gate: ?mlx.mlx_array) !mlx.mlx_array {
+    return moeOutputClamped(s, x, bank, inds, scores, dec, verify_rows, out_dtype, shared, shared_gate, 0);
 }
 
 /// GLM's gate is upper-clamped and its up branch is symmetrically clamped,
@@ -68,7 +90,7 @@ pub fn moeClampedWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, ind
     try validateClampedProjection(bank.gate, gs[0], sh[2], width);
     try validateClampedProjection(bank.up, gs[0], sh[2], width);
     try validateClampedProjection(bank.down, gs[0], width, sh[2]);
-    return moeOutputClamped(s, x, bank, inds, scores, dec, false, mlx.mlx_array_dtype(x), shared, limit);
+    return moeOutputClamped(s, x, bank, inds, scores, dec, false, mlx.mlx_array_dtype(x), shared, null, limit);
 }
 
 pub fn validateClampedProjection(p: Proj, experts: c_int, input: c_int, output: c_int) !void {
@@ -81,7 +103,7 @@ pub fn validateClampedProjection(p: Proj, experts: c_int, input: c_int, output: 
     if (mlx.mlx_array_dtype(p.trellis) != .uint16 or mlx.mlx_array_dtype(p.suh) != .float16 or mlx.mlx_array_dtype(p.svh) != .float16) return error.BadExl3Dtype;
 }
 
-fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, limit: c_int) !mlx.mlx_array {
+fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, shared_gate: ?mlx.mlx_array, limit: c_int) !mlx.mlx_array {
     // Which kernel a dispatch picks is read off ONE process-global codebook,
     // and several EXL3 packs can be resident at once: set it per call.
     kernels.setDecodeParams(dec);
@@ -115,7 +137,7 @@ fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.m
         try kernels.moeSwigluClampedWithShared(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, limit, xd, shared)
     else if (rows <= kernels.DECODE_ROWS_MAX or verify_rows)
         if (mlx.getShape(g.trellis)[3] == mlx.getShape(u.trellis)[3])
-            try kernels.moeSwigluFusedWithShared(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, xd, shared)
+            try kernels.moeSwigluFusedWithShared(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, xd, shared, shared_gate)
         else
             try moeMixedDecode(s, x2, bank, slots_u, sc, K, xd)
     else
@@ -442,7 +464,7 @@ pub fn moeGroups(s: mlx.mlx_stream, x: mlx.mlx_array, banks: []const Bank, inds:
         var weight = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(weight);
         try mlx.check(mlx.mlx_where(&weight, mask, scores, zero, s));
-        const partial = try moeOutput(s, x, bank, local, weight, dec, verify_rows, .float32, null);
+        const partial = try moeOutput(s, x, bank, local, weight, dec, verify_rows, .float32, null, null);
         defer _ = mlx.mlx_array_free(partial);
         var wide = mlx.mlx_array_new();
         defer if (wide.ctx != null) {

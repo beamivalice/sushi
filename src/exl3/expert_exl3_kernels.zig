@@ -2602,6 +2602,28 @@ const REDUCE_SHARED_SOURCE: [:0]const u8 = blk: {
     ++ REDUCE_SOURCE[at + stores.len ..];
 };
 
+/// `shared` is the shared expert's raw down projection and `gate[0]` its gate logit, both T = bf16. The gate and the
+/// product round to T at each step MLX's bf16 Sigmoid and Multiply do, so the sum equals the three-op chain's.
+const REDUCE_GATED_SHARED_SOURCE: [:0]const u8 = blk: {
+    const stores =
+        \\  y[yb + lane] = T(a0);
+        \\  y[yb + lane + 32u] = T(a1);
+        \\  y[yb + lane + 64u] = T(a2);
+        \\  y[yb + lane + 96u] = T(a3);
+    ;
+    const at = std.mem.indexOf(u8, REDUCE_SOURCE, stores).?;
+    break :blk REDUCE_SOURCE[0..at] ++
+        \\  const T lg = gate[0];
+        \\  const T ex = T(metal::precise::exp(float(metal::abs(lg))));
+        \\  const T rc = T(1.0f / float(T(1.0f + float(ex))));
+        \\  const float sig = float(lg < T(0.0f) ? rc : T(1.0f - float(rc)));
+        \\  y[yb + lane] = T(float(T(a0)) + float(T(sig * float(shared[yb + lane]))));
+        \\  y[yb + lane + 32u] = T(float(T(a1)) + float(T(sig * float(shared[yb + lane + 32u]))));
+        \\  y[yb + lane + 64u] = T(float(T(a2)) + float(T(sig * float(shared[yb + lane + 64u]))));
+        \\  y[yb + lane + 96u] = T(float(T(a3)) + float(T(sig * float(shared[yb + lane + 96u]))));
+    ++ REDUCE_SOURCE[at + stores.len ..];
+};
+
 const FunnelArm = enum { pair, fused_mid_down, prepared_down, nax, simdmat };
 var funnel_engaged: [5]bool = @splat(false);
 
@@ -2617,6 +2639,7 @@ var mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_shared_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_shared_lead_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var reduce_gated_shared_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var down_fused_kernel: KernelSlots = no_kernels;
 
 fn getNamedKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -2735,10 +2758,10 @@ fn midSwigluPrepWithLimit(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_arra
 pub const REDUCE_MAX_TOPK: c_int = 32;
 
 pub fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
-    return downFinishReduceWithShared(s, inner, svh, slots, scores, out_dim, rows, topk, out_dtype, null, false);
+    return downFinishReduceWithShared(s, inner, svh, slots, scores, out_dim, rows, topk, out_dtype, null, null, false);
 }
 
-fn downFinishReduceWithShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, shared_leads: bool) !mlx.mlx_array {
+fn downFinishReduceWithShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, gate: ?mlx.mlx_array, shared_leads: bool) !mlx.mlx_array {
     if (topk < 1 or topk > REDUCE_MAX_TOPK) return error.Exl3TopkUnsupported;
     const key = DecodeReduceKey{ .out_dim = out_dim, .rows = rows, .topk = topk, .dtype = out_dtype };
     const cfg = reduce_cfgs.get(key) orelse blk: {
@@ -2759,6 +2782,11 @@ fn downFinishReduceWithShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.
     const ins = [_][*:0]const u8{ "inner", "svh", "slots", "sc" };
     const outs = [_][*:0]const u8{"y"};
     const ov = if (shared) |value| blk: {
+        if (gate) |logit| {
+            const gated_ins = ins ++ [_][*:0]const u8{ "shared", "gate" };
+            const kernel = try getNamedKernel(&reduce_gated_shared_kernel, "sushi_exl3_down_reduce_gated_shared", &gated_ins, &outs, REDUCE_GATED_SHARED_SOURCE, "");
+            break :blk try applyOuts(s, kernel, &.{ inner, svh, slots, scores, value, logit }, cfg, 1);
+        }
         if (shared_leads) {
             // MLX encodes inputs in order: a serial decode layer then runs its shared chain before the routed one.
             const lead_ins = [_][*:0]const u8{"shared"} ++ ins;
@@ -2780,7 +2808,12 @@ fn downFinishReduceWithShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.
 }
 
 pub fn downFinishReduceShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, shared: mlx.mlx_array) !mlx.mlx_array {
-    return downFinishReduceWithShared(s, inner, svh, slots, scores, out_dim, rows, topk, out_dtype, shared, false);
+    return downFinishReduceWithShared(s, inner, svh, slots, scores, out_dim, rows, topk, out_dtype, shared, null, false);
+}
+
+/// `down` is the shared expert's projection and `gate` its logit [1], both bf16; the reduce adds sigmoid(gate) * down.
+pub fn downFinishReduceGatedShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, down: mlx.mlx_array, gate: mlx.mlx_array) !mlx.mlx_array {
+    return downFinishReduceWithShared(s, inner, svh, slots, scores, out_dim, rows, topk, .bfloat16, down, gate, false);
 }
 
 fn prepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suh: mlx.mlx_array, slots: mlx.mlx_array, order: mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !mlx.mlx_array {
@@ -2910,7 +2943,7 @@ pub fn moeSwigluFused(
     scores: mlx.mlx_array,
     out_dtype: mlx.mlx_dtype,
 ) !mlx.mlx_array {
-    return moeSwigluFusedWithShared(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, out_dtype, null);
+    return moeSwigluFusedWithShared(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, out_dtype, null, null);
 }
 
 pub fn moeSwigluFusedWithShared(
@@ -2929,6 +2962,7 @@ pub fn moeSwigluFusedWithShared(
     scores: mlx.mlx_array,
     out_dtype: mlx.mlx_dtype,
     shared: ?mlx.mlx_array,
+    shared_gate: ?mlx.mlx_array,
 ) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const ssh = mlx.getShape(slots);
@@ -2972,7 +3006,7 @@ pub fn moeSwigluFusedWithShared(
         try dumpAbsMax(s, down_inner, "down_inner");
         swiglu_maxabs_dumped += 1;
     }
-    const out = try downFinishReduceWithShared(s, down_inner, down_svh, slots, scores, hidden, rows, topk, out_dtype, shared, false);
+    const out = try downFinishReduceWithShared(s, down_inner, down_svh, slots, scores, hidden, rows, topk, out_dtype, shared, shared_gate, false);
     errdefer _ = mlx.mlx_array_free(out);
     try ubenchEval(out, "reduce");
     if (applyUbenchOn()) {
@@ -3233,7 +3267,7 @@ pub fn moeSwigluClampedWithShared(
             break :blk try indexedGemvCoopF16(s, prepared, down_t, slots);
         };
         defer _ = mlx.mlx_array_free(down);
-        if (shared) |value| return downFinishReduceWithShared(s, down, down_svh, slots, scores, hidden, rows, topk, out_dtype, value, true);
+        if (shared) |value| return downFinishReduceWithShared(s, down, down_svh, slots, scores, hidden, rows, topk, out_dtype, value, null, true);
         return downFinishReduce(s, down, down_svh, slots, scores, hidden, rows, topk, out_dtype);
     }
     if (shared != null) return error.Exl3SharedNeedsDecodeRows;
@@ -9546,6 +9580,68 @@ test "exl3 shared reduction preserves the routed output rounding before addition
     }
 }
 
+test "exl3 gated shared reduction equals MLX sigmoid, multiply and add for every bf16 gate logit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(1702);
+    const rnd = prng.random();
+    var ih: [10 * 256]u16 = undefined;
+    var vh: [4 * 256]u16 = undefined;
+    var dh: [256]u16 = undefined;
+    for (&ih) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 3);
+    for (&vh) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 2);
+    for (&dh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 4)) >> 16);
+    const inner = mlx.mlx_array_new_data(&ih, &.{ 10, 256 }, 2, .float16);
+    defer _ = mlx.mlx_array_free(inner);
+    const svh = mlx.mlx_array_new_data(&vh, &.{ 4, 256 }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    const slots = mlx.mlx_array_new_data(&[_]u32{ 0, 1, 2, 3, 0, 2, 1, 3, 0, 2 }, &.{10}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const scores = mlx.mlx_array_new_data(&[_]f32{ 0.03, 0.08, 0.15, 0.2, 0.02, 0.01, 0.09, 0.17, 0.11, 0.14 }, &.{10}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const down = mlx.mlx_array_new_data(&dh, &.{256}, 1, .bfloat16);
+    defer _ = mlx.mlx_array_free(down);
+    const routed = try downFinishReduce(s, inner, svh, slots, scores, 256, 1, 10, .bfloat16);
+    defer _ = mlx.mlx_array_free(routed);
+
+    const chunk = 512;
+    var logit_bits: u32 = 0;
+    while (logit_bits < 0x10000) {
+        var got: [chunk]mlx.mlx_array = undefined;
+        var want: [chunk]mlx.mlx_array = undefined;
+        var live: usize = 0;
+        defer for (0..live) |i| {
+            _ = mlx.mlx_array_free(got[i]);
+            _ = mlx.mlx_array_free(want[i]);
+        };
+        while (live < chunk and logit_bits < 0x10000) : (logit_bits += 1) {
+            const bits: u16 = @intCast(logit_bits);
+            if ((bits & 0x7f80) == 0x7f80 and (bits & 0x7f) != 0) continue;
+            const gate = mlx.mlx_array_new_data(&bits, &.{1}, 1, .bfloat16);
+            defer _ = mlx.mlx_array_free(gate);
+            got[live] = try downFinishReduceGatedShared(s, inner, svh, slots, scores, 256, 1, 10, down, gate);
+            var sig = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sig);
+            var gated = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gated);
+            want[live] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_sigmoid(&sig, gate, s));
+            try mlx.check(mlx.mlx_multiply(&gated, sig, down, s));
+            try mlx.check(mlx.mlx_add(&want[live], routed, gated, s));
+            live += 1;
+        }
+        const pending = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(pending);
+        for (0..live) |i| {
+            try mlx.check(mlx.mlx_vector_array_append_value(pending, got[i]));
+            try mlx.check(mlx.mlx_vector_array_append_value(pending, want[i]));
+        }
+        try mlx.check(mlx.mlx_eval(pending));
+        for (0..live) |i| try t.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(want[i]).?[0..256], mlx.mlx_array_data_bfloat16(got[i]).?[0..256]);
+    }
+}
+
 // Staged oracle keeps the original projection and reduction ordering.
 fn clampedSortedReference(
     s: mlx.mlx_stream,
@@ -10653,7 +10749,7 @@ fn t1ChainNs(s: mlx.mlx_stream, f: *const MimoMoeFixture, x0: mlx.mlx_array, sha
                         if (upto == 4) {
                             dep = try applyUnary(s, link, &.{ x0, down }, cfg);
                         } else {
-                            const y = try downFinishReduceWithShared(s, down, a[6], slots, a[9], 4096, 1, 8, .bfloat16, shared, true);
+                            const y = try downFinishReduceWithShared(s, down, a[6], slots, a[9], 4096, 1, 8, .bfloat16, shared, null, true);
                             defer _ = mlx.mlx_array_free(y);
                             dep = try applyUnary(s, link, &.{ x0, y }, cfg);
                         }
