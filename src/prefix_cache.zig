@@ -55,6 +55,9 @@ pub const RING_RESTORE_MIN_TOKENS: usize = 64;
 /// (where the conversation goes on) stay (`thinRingCps`). One is ~16 MiB on MiMo at kv8.
 pub const RING_CHECKPOINT_MAX: usize = 8;
 
+/// Ring checkpoints a hot entry keeps in RAM when the SSD tier holds the older ones.
+pub const RING_CHECKPOINT_RAM_KEEP: usize = 2;
+
 /// Message starts one prefill takes a ring checkpoint at (`ringMarkPositions`).
 pub const RING_MARKS_MAX: usize = 4;
 
@@ -3122,10 +3125,50 @@ pub const HotPrefixCache = struct {
         };
     }
 
+    /// With both tiers on, a flushed entry keeps its newest `RING_CHECKPOINT_RAM_KEEP` ring
+    /// checkpoints in RAM; each older one the SSD tier holds a file for is released, and a lookup
+    /// that needs it restores from that file. A staged file counts: its bytes are the writer's, billed
+    /// by its permit. One with no file in the index (a cut or failed staging) stays.
+    fn releaseRingCpsToDisk(self: *HotPrefixCache) void {
+        if (!self.ram_enabled) return;
+        const d = if (self.disk) |*dd| dd else return;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by != null) continue;
+            const cps = e.ring_cps orelse continue;
+            if (cps.len <= RING_CHECKPOINT_RAM_KEEP) continue;
+            const older = cps.len - RING_CHECKPOINT_RAM_KEEP;
+            var steps: [RING_CHECKPOINT_MAX]usize = undefined;
+            var held: [RING_CHECKPOINT_MAX]bool = undefined;
+            for (cps[0..older], steps[0..older]) |cp, *st| st.* = cp.step;
+            d.ringPointsHeld(e.tokens, e.has_tools, e.quant_config, steps[0..older], held[0..older]);
+            var released: usize = 0;
+            for (held[0..older]) |h| released += @intFromBool(h);
+            if (released == 0) continue;
+            const kept = self.allocator.alloc(KVCacheSnapshot, cps.len - released) catch continue;
+            var n: usize = 0;
+            var freed: u64 = 0;
+            for (cps, 0..) |*cp, i| {
+                if (i < older and held[i]) {
+                    freed += snapshotBytes(cp);
+                    cp.deinit();
+                } else {
+                    kept[n] = cp.*;
+                    n += 1;
+                }
+            }
+            self.allocator.free(cps);
+            e.ring_cps = kept;
+            e.kv_bytes -|= freed;
+            self.current_kv_bytes -|= freed;
+            log.info("  [hot-cache] released {d} ring checkpoints to the SSD tier ({d} kept in RAM)\n", .{ released, kept.len });
+        }
+    }
+
     pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
         if (!self.disk_dirty) return;
         self.disk_dirty = false;
         const d = if (self.disk) |*dd| dd else return;
+        defer self.releaseRingCpsToDisk();
         // Flush the live state captured at commit, not what the RAM entry retained after its trim.
         if (self.pending_disk != null) return self.flushPendingRecord(d, s);
         if (self.entries.items.len == 0) return;
@@ -6650,6 +6693,260 @@ test "a fork's SSD entry keeps its donor's ring checkpoint, so a restart restore
     const hit = try hc2.lookupAndRestore(&restored, &moe_off, null, s, &next, false, 0, null, null);
     try testing.expectEqual(@as(usize, prompt), hit.matched);
     try expectRingContinuesCold(&restored, s, n_layers, window, prompt, next.len);
+}
+
+/// A MiMo-shaped turn whose slot took a ring checkpoint at each of `at` (ascending, the last the
+/// prompt end, the rest marks), then `reply` rows.
+fn ringTurnAt(live: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, at: []const u32, reply: u32) !SlotRingCps {
+    live.setSwaRing(window);
+    var cps: SlotRingCps = .{};
+    errdefer cps.deinit();
+    var from: u32 = 0;
+    for (at, 0..) |p, i| {
+        try ringFill(live, s, n_layers, window, from, p, 64);
+        from = p;
+        const cp = (try live.ringCheckpoint(p, s)).?;
+        if (i + 1 == at.len) {
+            cps.prompt_end = cp;
+        } else {
+            cps.marks[cps.n_marks] = cp;
+            cps.n_marks += 1;
+        }
+    }
+    try ringFill(live, s, n_layers, window, from, from + reply, 16);
+    return cps;
+}
+
+fn ringCpSteps(hc: *const HotPrefixCache, entry: usize, out: *[RING_CHECKPOINT_MAX]usize) []const usize {
+    const cps = hc.entries.items[entry].ring_cps orelse return out[0..0];
+    for (cps, 0..) |cp, i| out[i] = cp.step;
+    return out[0..cps.len];
+}
+
+test "RAM and SSD: a flushed ringed entry keeps its newest two ring checkpoints, and an older point restores its exact rows from SSD" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const reply: u32 = 600;
+
+    var toks: [700 + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-keep", 0, 128);
+    hc.disk.?.enableBackgroundWriter();
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cps = try ringTurnAt(&live, s, n_layers, window, &.{ 300, 450, 600, 700 }, reply);
+    _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, 700, cps);
+
+    var steps: [RING_CHECKPOINT_MAX]usize = undefined;
+    try testing.expectEqualSlices(usize, &.{ 300, 450, 600, 700 }, ringCpSteps(&hc, 0, &steps));
+    const before = hc.current_kv_bytes;
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    try testing.expectEqualSlices(usize, &.{ 600, 700 }, ringCpSteps(&hc, 0, &steps));
+
+    // The bill follows the storage: two checkpoints' bytes left it, and the cache total agrees.
+    var cp_bytes: u64 = 0;
+    for (live.entries) |*e| {
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+    }
+    try testing.expectEqual(before - 2 * cp_bytes, hc.current_kv_bytes);
+    try testing.expectEqual(hc.entries.items[0].kv_bytes, hc.current_kv_bytes);
+
+    // Between two points no RAM checkpoint reaches: the SSD tier's file at 450 serves it.
+    var next: [520]u32 = undefined;
+    @memcpy(next[0..460], toks[0..460]);
+    for (next[460..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 450), hit.matched);
+    try expectRingContinuesCold(&restored, s, n_layers, window, 450, next.len);
+
+    // A newest point still restores from RAM.
+    var newest: [660]u32 = undefined;
+    @memcpy(newest[0..610], toks[0..610]);
+    for (newest[610..], 0..) |*t, i| t.* = @intCast(800_000 + i);
+    var from_ram = try KVCache.init(testing.allocator, n_layers);
+    defer from_ram.deinit();
+    from_ram.setSwaRing(window);
+    const ram_hit = try hc.lookupAndRestore(&from_ram, &moe_off, null, s, &newest, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 600), ram_hit.matched);
+    try expectRingContinuesCold(&from_ram, s, n_layers, window, 600, newest.len);
+}
+
+test "RAM tier without an SSD tier keeps every ring checkpoint" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    var toks: [1300]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cps = try ringTurnAt(&live, s, n_layers, window, &.{ 300, 450, 600, 700 }, 600);
+    _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, 700, cps);
+    hc.flushPendingDisk(s);
+    var steps: [RING_CHECKPOINT_MAX]usize = undefined;
+    try testing.expectEqualSlices(usize, &.{ 300, 450, 600, 700 }, ringCpSteps(&hc, 0, &steps));
+}
+
+test "RAM and SSD: a ring checkpoint whose write failed stays in RAM" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    var toks: [1300]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-fail", 0, 128);
+    hc.disk.?.enableBackgroundWriter();
+    hc.disk.?.writer.?.injectFailure("r0000450", .submit);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cps = try ringTurnAt(&live, s, n_layers, window, &.{ 300, 450, 600, 700 }, 600);
+    _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, 700, cps);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    // The entry the failure invalidated holds no restore point, so RAM gives none up.
+    var steps: [RING_CHECKPOINT_MAX]usize = undefined;
+    try testing.expectEqualSlices(usize, &.{ 300, 450, 600, 700 }, ringCpSteps(&hc, 0, &steps));
+}
+
+test "a ring file past the rows its entry persisted is not a held restore point" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    var toks: [1300]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-kvlen", 0, 128);
+    hc.disk.?.enableBackgroundWriter();
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cps = try ringTurnAt(&live, s, n_layers, window, &.{ 300, 450, 600, 700 }, 600);
+    _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, 700, cps);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+
+    // A flush the byte cap stopped leaves ring files above the rows the entry holds.
+    hc.disk.?.entries.items[0].kv_len = 500;
+    var held: [2]bool = undefined;
+    hc.disk.?.ringPointsHeld(&toks, false, live.config, &.{ 450, 600 }, &held);
+    try testing.expectEqualSlices(bool, &.{ true, false }, &held);
+}
+
+test "RAM and SSD: a fork inherits the donor's newest checkpoints, and the donor's older points stay on its SSD entry" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const fork_prompt: u32 = prompt + 100 + 330;
+
+    var toks: [fork_prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var donor_toks: [prompt + reply]u32 = undefined;
+    @memcpy(donor_toks[0..prompt], toks[0..prompt]);
+    for (donor_toks[prompt..], 0..) |*t, i| t.* = @intCast(700_000 + i);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-donor", 0, 128);
+    hc.disk.?.enableBackgroundWriter();
+    var donor = try KVCache.init(testing.allocator, n_layers);
+    defer donor.deinit();
+    const donor_cps = try ringTurnAt(&donor, s, n_layers, window, &.{ 300, 450, 600, prompt }, reply);
+    _ = try hc.commitWithRing(&donor, &donor_toks, false, 0, 0, null, null, null, null, prompt, donor_cps);
+    hc.flushPendingDisk(s);
+    var steps: [RING_CHECKPOINT_MAX]usize = undefined;
+    try testing.expectEqualSlices(usize, &.{ 600, prompt }, ringCpSteps(&hc, 0, &steps));
+
+    // The side request restores off the donor and appends its own tail.
+    var fork = try KVCache.init(testing.allocator, n_layers);
+    defer fork.deinit();
+    fork.setSwaRing(window);
+    var moe_off: usize = 0;
+    const fork_hit = try hc.lookupAndRestore(&fork, &moe_off, null, s, toks[0..fork_prompt], false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), fork_hit.matched);
+    try ringFill(&fork, s, n_layers, window, prompt, fork_prompt, 64);
+    var fork_cp = try fork.ringCheckpoint(fork_prompt, s);
+    errdefer if (fork_cp) |*c| c.deinit();
+    try ringFill(&fork, s, n_layers, window, fork_prompt, fork_prompt + reply, 16);
+    const moved_cp = fork_cp;
+    fork_cp = null;
+    _ = try hc.commitWithRing(&fork, &toks, false, 0, 0, null, null, null, null, fork_prompt, .{ .prompt_end = moved_cp });
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    const fork_idx: usize = for (hc.entries.items, 0..) |*e, i| {
+        if (e.tokens.len == toks.len) break i;
+    } else return error.TestUnexpectedResult;
+    // It inherited the donor's 600 and prompt end, then released the older of its three.
+    try testing.expectEqualSlices(usize, &.{ prompt, fork_prompt }, ringCpSteps(&hc, fork_idx, &steps));
+
+    // An unrelated request under the count cap evicts the donor from RAM.
+    var other = try KVCache.init(testing.allocator, n_layers);
+    defer other.deinit();
+    other.setSwaRing(window);
+    try ringFill(&other, s, n_layers, window, 0, 300, 64);
+    var other_toks: [300]u32 = undefined;
+    for (&other_toks, 0..) |*t, i| t.* = @intCast(500_000 + i);
+    _ = try hc.commitWithState(&other, &other_toks, false, 0, null, null, null);
+    for (hc.entries.items) |*e| try testing.expect(e.tokens.len != donor_toks.len);
+
+    // A turn diverging at the inherited 600 restores there from the fork's SSD entry.
+    var at_600: [660]u32 = undefined;
+    @memcpy(at_600[0..610], toks[0..610]);
+    for (at_600[610..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var a = try KVCache.init(testing.allocator, n_layers);
+    defer a.deinit();
+    a.setSwaRing(window);
+    const hit_a = try hc.lookupAndRestore(&a, &moe_off, null, s, &at_600, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 600), hit_a.matched);
+    try expectRingContinuesCold(&a, s, n_layers, window, 600, at_600.len);
+
+    // One diverging at the donor's released 450 restores from the donor's SSD entry.
+    var at_450: [520]u32 = undefined;
+    @memcpy(at_450[0..460], toks[0..460]);
+    for (at_450[460..], 0..) |*t, i| t.* = @intCast(800_000 + i);
+    var b = try KVCache.init(testing.allocator, n_layers);
+    defer b.deinit();
+    b.setSwaRing(window);
+    const hit_b = try hc.lookupAndRestore(&b, &moe_off, null, s, &at_450, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 450), hit_b.matched);
+    try expectRingContinuesCold(&b, s, n_layers, window, 450, at_450.len);
 }
 
 test "HotPrefixCache: a decline-spill is not bounded by the per-flush byte cap" {
@@ -11767,6 +12064,9 @@ test "SSD-only ring checkpoints survive restart without idle RAM" {
             hc.flushPendingDisk(s);
             hc.disk.?.drainWriter();
             try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+            // Once the writer has landed them, no restore point is held in RAM.
+            try testing.expect(hc.pending_disk == null);
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.stagedHostBytes());
         } else {
             var next: [800]u32 = undefined;
             @memcpy(next[0..prompt], tokens[0..prompt]);

@@ -120,7 +120,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's
   `SLOT_RING_CHECKPOINTS` = 6 copies beside the ring (its restore, up to four message marks, its prompt end; 158
   rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`); each entry bills its own in `kv_bytes`, up to eight with
-  those it inherits from the entry it forked off (`bestRingDonor`). `slotRingBytes` also bills the global-layer
+  those it inherits from the entry it forked off (`bestRingDonor`) until its flush; with an SSD tier it then keeps the
+  newest two and `kv_bytes` drops by the rest (`RING_CHECKPOINT_RAM_KEEP`). One is 16 MiB at kv8, so the entry holds
+  at most 128 MiB for eight and 32 MiB for two. `slotRingBytes` also bills the global-layer
   decode rebuilds the other rows of a batched decode hold below the packed arms' floor (`batchedDecodeRowsBytes`).
 - **A hot entry holds a ringed layer's RETAINED ROWS, never the ring's capacity** (`KVCache.snapshotRetained`): the
   buffer is allocated at `ringCap` from token one, so a plain share billed and pinned rows no restore can read.

@@ -142,6 +142,11 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   bills its restore's coexistence (`oldBuffersInEvalWindow`) ([engine-prefix-cache](engine-prefix-cache.md#defaults)). Context sizing reserves nothing
   for an idle cache (`ctxSizingCacheReserve` is 0 with RAM off). A model whose tier did not come up bills as without one
   (`server.diskTierOn`).
+- A ringed (MiMo) hot entry bills its ring checkpoints at their real bytes in `kv_bytes`: up to eight until its flush, the
+  newest two after it when an SSD tier holds the rest ([engine-prefix-cache](engine-prefix-cache.md#basics)). The
+  eight-checkpoint term in `oneSessionEntryBytes` sizes only a RAM tier with no SSD tier (a ringed arch with one sizes
+  through `ssdFirstSessionKvBytes`: the session plus `slotRingBytes`, the slot's own six). SSD-only retains none, and
+  the writer's ring files ride its ~1 GiB permit below.
 - **Admission bills the SSD writers' host bytes** (`prefillAdmissionBill` -> `admissionAvailable`): the writer holds its
   backlog, up to its ~1 GiB permit, outside `mlx_get_active_memory`, so every resident model's `writerHostBytes` (the
   larger of the backlog and the permit) is taken off the headroom BEFORE the width and the cache reservation are chosen,

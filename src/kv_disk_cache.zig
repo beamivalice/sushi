@@ -935,6 +935,32 @@ pub const DiskTier = struct {
         return best;
     }
 
+    /// Which of the ascending restore points `steps` of a cache holding `tokens` an intact entry
+    /// keeps a ring file for. A file counts once staged: a restore drains its entry first, and a
+    /// write that then fails poisons the entry (`harvestWriteFailures`).
+    pub fn ringPointsHeld(
+        self: *const DiskTier,
+        tokens: []const u32,
+        has_tools: bool,
+        quant: kv_quant.KVQuantConfig,
+        steps: []const usize,
+        held: []bool,
+    ) void {
+        @memset(held, false);
+        for (self.entries.items) |*e| {
+            if (e.poisoned or e.rings.len == 0) continue;
+            if (e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant, quant)) continue;
+            const common = commonPrefixLen(e.tokens, tokens);
+            for (steps, held) |step, *h| {
+                if (h.* or step > common or step > e.kv_len) continue;
+                for (e.rings) |r| {
+                    if (r.pos == step) h.* = true;
+                }
+            }
+        }
+    }
+
     /// Rebuild `entries[idx]` at `len` into a ringed cache: the chunked layers up to `len`, then
     /// ring file `pos` (>= len) under the ringed layers (`KVCache.restoreRing`), clamped to
     /// `len`. On error the cache may be half-rebuilt; the caller resets it.

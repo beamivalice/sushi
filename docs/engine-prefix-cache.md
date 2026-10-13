@@ -62,6 +62,23 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
   `RING_DISK_MAX_PER_ENTRY` = 8 kept, thinned as in RAM, salvaged per file at scan; manifest v9, which an older reader
   drops) ([mimo2-arch](mimo2-arch.md#sliding-layers-the-ring)).
+- **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
+  (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
+  tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves
+  the entry and its `kv_bytes`, and a lookup needing it restores from the file (the SSD tier wins past
+  `MIN_DISK_ADVANTAGE_TOKENS`, bit-identical rows). A staged file counts: its bytes are the writer's, billed by its
+  permit, and a restore drains them first. A point with no file in the index (a cut or failed staging) stays in RAM.
+  A donor's released points are not inherited into a fork's RAM entry or record; they stay on the donor's SSD entry.
+  A RAM tier with no SSD tier keeps all eight; SSD-only holds none (its commit is a `disk_only` record the flush stages
+  and frees). Limits: a staged write that later fails poisons its entry (`harvestWriteFailures`), and the released
+  points go with it; points under `MIN_DISK_ADVANTAGE_TOKENS` have no file and stay, so a lookup whose only SSD
+  candidate lies within 256 tokens of such a RAM point takes the RAM one.
+  Measured (MiMo-V2.6-Flash-Sushi-2.3bpw, kv8, `--prefix-cache-mem 4GB`, a 46,223-token prompt of four messages, binary
+  stamp 09:38 of this change vs 20f6068d, `taskpolicy -a`, GPU lock per boot, QUIET, 2026-10-13): `/props` hot-cache bytes
+  after the cold turn 684 -> 636 MiB, after the append 1378 -> 1250, after two more 1890 -> 1759; a turn diverging at an
+  old message mark restores 15,518 tokens from SSD in 25 ms (`ring@15518`) where it was a RAM checkpoint. Default
+  SSD-only: `/props` active bytes after every turn equal the boot figure (91,806 MiB) with the SSD tier on or off, so
+  nothing is retained; peak during the cold turn +1.9 GiB either way (live KV and prefill).
 - **A disk restore fills its buffers chunk by chunk** (`restoreKvInto`): each chunk is evaluated into buffers
   allocated at the restored length before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
   eval (one eval at the end failed past the soft limit of 256 files), and a concatenation at the end held every chunk
@@ -242,7 +259,8 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
     finished request's buffers, is gone after the flush), and otherwise keeps the legacy path: the RAM entry, one
     piece per turn, a declined candidate spilled synchronously.
 - **The record carries the restore points the RAM entry inherits**: a donor's SSM or ring checkpoints below the
-  shared prefix (`bestCheckpointDonor`, `bestRingDonor`), taken before the RAM tier sheds any. Chunk sharing links a
+  shared prefix (`bestCheckpointDonor`, `bestRingDonor`; a ringed donor with an SSD tier holds its newest two), taken
+  before the RAM tier sheds any. Chunk sharing links a
   fork's chunks, never its donor's checkpoint or ring files, so without them a fork restored only above the fork
   once the donor left the SSD tier.
 - **A second commit before the flush flushes the first** (`capturePendingDisk`): the cull pass commits every
