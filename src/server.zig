@@ -4933,7 +4933,7 @@ fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
     return @intCast(rungWidth(cfg, seq, rung, cfg.longCtxGated()));
 }
 
-/// The served Flash-Next geometry at `--qwen-gdn 16`, as the M1 Max ternary runs measured it.
+/// The served Flash-Next geometry at `--qwen-gdn 16`, as the M1 Max runs measured it.
 fn qwen4MeasuredTestConfig() model_mod.ModelConfig {
     var cfg = qwen4DeployedTestConfig();
     cfg.gdn_state_f32 = false;
@@ -4991,7 +4991,7 @@ test "the advertised Flash-Next context is the largest one the request bill admi
     cfg.pinned_prefill_chunk = 512;
     const MiB: u64 = 1 << 20;
     const ceiling: u64 = 28976 * MiB; // 30000 MiB wired limit less the 1 GiB margin
-    const active: u64 = 27_378_205_274; // the lean ternary pack's resident bytes
+    const active: u64 = 27_378_205_274; // the measured lean pack's resident bytes
     const writer: u64 = 1 << 30; // the SSD writer's host permit, billed by admission
     const budget = admissionAvailable(ceiling, active, writer);
     const raw = memoryContextAt(&cfg, ceiling, active);

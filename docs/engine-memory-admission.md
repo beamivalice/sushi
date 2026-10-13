@@ -185,7 +185,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - The forward is not at the gate's width: it starts at 2048, steps down by headroom, and its peak was flat at
   1,287 MiB from 2.8k to 16.9k tokens, while the engine priced that first chunk at 2,631 MiB.
 
-Ternary pack (`Qwen3.8-Flash-Next-Sushi-Ternary`), M1 Max 32 GB, `iogpu.wired_limit_mb=30000`, 4a1f1f1b plus the
+A lean Flash-Next pack (27.4 GB resident), M1 Max 32 GB, `iogpu.wired_limit_mb=30000`, 4a1f1f1b plus the
 preflight commit with the diagnostic counters, ReleaseFast, `taskpolicy -a`, GPU lock, no baseline rerun. `--qwen-gdn 16
 --no-vision --no-mtp --prefill-chunk 512`, SSD tier on, one fresh prompt per boot, 16 new tokens; peak = `peak_bytes` less
 `active_bytes`, MiB:
@@ -231,7 +231,7 @@ prompt captures a checkpoint every 8192 tokens up to 16:
 | 65,536 | 16 / 32 | 3,007 / 3,523 | 2,649 / 2,821 |
 | 131,072 | 16 / 32 | 5,704 / 6,784 | 4,792 / 4,995 |
 
-The advertised auto-context of the 32 GB recipe (wired 30,000 MiB, `--no-vision --no-mtp --qwen-gdn 16`, kv8, the ternary
+The advertised auto-context of the 32 GB recipe (wired 30,000 MiB, `--no-vision --no-mtp --qwen-gdn 16`, kv8, that lean
 pack's 27,378,205,274 resident bytes) goes from a raw 28,995 tokens to 31,532 (advertised after the 93% margin and the
 1,024 step: 26,624 to 28,672).
 
