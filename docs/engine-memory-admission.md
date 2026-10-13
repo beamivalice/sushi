@@ -128,6 +128,10 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - **Auto-context is PINNED at load** (`pinAutoContext`, one 93% margin on the memory ceiling for every model, then
   capped at the checkpoint's own maximum, un-margined); ask `getEffectiveContextLength`. It bills KV at the CONFIGURED
   width and activations ONCE.
+- **Flash-Next's auto-context is the largest context its request bill admits at the floor rung** (`memoryContextAtChunk`
+  inverts `prefillNeededAtChunk` over the headroom admission reads: ceiling less resident bytes, less the SSD writer's
+  1 GiB permit while the tier is on), then the 93% margin. Sizer and admission were two formulas: a 32 GB M1 Max
+  advertised 71,680 tokens and refused past 20,549. The other archs keep `contextForBudget`.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
@@ -158,6 +162,38 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - Disconnect cancellation takes effect at the next prefill chunk boundary; a wall-time cancellation test must bound
   its chunk size rather than assume the auto-sized chunk fits a fixed deadline.
 - Admission-bill tests pin synthetic contexts and use request shapes that fit them, never the test host's auto-context.
+
+<a id="bill-net"></a>
+### The request bill's net
+
+- `prefillMemoryNeeded` sums its terms and adds a net: a quarter (`uplift_16ths` 20) for every arch, a sixteenth (17)
+  for Flash-Next up to `MEASURED_NET_MAX_TOKENS` (65,536). Past it the terms were fitted at 300k+ against measured
+  steps (`the deployed pack's 8192 step...` and the 364k and 64 GB recipe tests), so the quarter stays and the README
+  tables and recipes at 128k and above do not move.
+- Within the range the summed terms ran 4% to 13% over the live peak, which is why a sixteenth is enough. **The SSD
+  tier's checkpoints are real memory**: 34k tokens at the 512 rung peaked 2,284 MiB with the tier on and 1,318 off,
+  the billed 897 MiB of checkpoints. Measure with the default tier; off is a dev-only reading.
+- The forward is not at the gate's width: it starts at 2048, steps down by headroom, and its peak was flat at
+  1,287 MiB from 2.8k to 16.9k tokens, while the engine priced that first chunk at 2,631 MiB.
+
+Ternary pack (`Qwen3.8-Flash-Next-Sushi-Ternary`), M1 Max 32 GB, `iogpu.wired_limit_mb=30000`, 4a1f1f1b plus the
+preflight commit with the diagnostic counters, ReleaseFast, `taskpolicy -a`, GPU lock, no baseline rerun. `--qwen-gdn 16
+--no-vision --no-mtp --prefill-chunk 512`, SSD tier on, one fresh prompt per boot, 16 new tokens; peak = `peak_bytes` less
+`active_bytes`, MiB:
+
+| tokens | live peak | summed terms | quarter net (before) | sixteenth net (now) |
+|---:|---:|---:|---:|---:|
+| 2,857 | 1,117 | 1,265 | 1,581 | 1,347 |
+| 8,505 | 1,774 | 1,946 | 2,433 | 2,075 |
+| 16,874 | 2,043 | 2,125 | 2,656 | 2,272 |
+| 33,958 | 2,228 | 2,496 | 3,120 | 2,682 |
+| 59,314 | 2,822 | 3,036 | 3,795 | 3,278 |
+
+Final binary, no flags but `--no-vision --no-mtp --qwen-gdn 16` (1,842 MiB available): advertised 26,624 tokens, a
+26,426-token prompt admitted at a bill of 1,781 and peaking 1,542 over the weights; `--kv-quant 4` advertised 32,768, a
+32,556-token prompt billed 1,723 and peaking 1,430. A prompt past the advertised context is refused by name. The
+tests `Flash-Next's request bill brackets the peaks measured...` and `the advertised Flash-Next context is the
+largest one the request bill admits` hold both.
 
 <a id="recipe-64gb"></a>
 ### The 48 GB and 64 GB recipe contexts

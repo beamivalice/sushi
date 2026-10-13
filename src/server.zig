@@ -1083,6 +1083,11 @@ pub fn diskTierOn(config: *const model_mod.ModelConfig) bool {
     return prefix_cache_disk_bytes > 0 and !config.prefix_cache_disk_declined;
 }
 
+/// Host bytes the model's SSD writer may hold outside MLX's count: its permit while the tier is on.
+fn diskWriterPermitBytes(config: *const model_mod.ModelConfig) u64 {
+    return if (diskTierOn(config)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
+}
+
 /// The disk bytes the SSD-tier-dependent policies read: the launch ask, or 0 for a model whose tier is off.
 fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
     return if (diskTierOn(config)) prefix_cache_disk_bytes else 0;
@@ -3245,6 +3250,7 @@ pub fn prefillTransientReserveAtKv(
             .state_bytes = if (mtpHeadDefaultOn(config)) mimo_mtp.State.billedBytes(config) else 0,
             .qsa_ring_bytes = slotRingBytes(config, kv_bits),
             .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
+            .uplift_16ths = billUplift16ths(config, seq),
         },
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
@@ -3478,10 +3484,15 @@ pub fn maxSushiContextForBudget(config: *const model_mod.ModelConfig, kv_bits: u
 fn maxSushiContextAtWidth(config: *const model_mod.ModelConfig, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix) u32 {
     var low: u32 = 0;
     var high: u32 = if (config.contextCap() > 0) config.contextCap() else std.math.maxInt(u32);
+    // Before the auto context is pinned the bill's reservation reads `getEffectiveContextLength`,
+    // which is this very search: bill each probe as the context it is asking about.
+    const unpinned = manualContext(config) == 0 and config.pinned_context == 0;
     while (low < high) {
         const mid = low + @as(u32, @intCast((@as(u64, high) - low + 1) / 2));
-        const chunk = fixed_chunk orelse sushiContextBytesAt(config, mid, kv_bits).chunk;
-        if (prefillNeededAtChunk(config, mid, 0, kv_bits, chunk, warm) <= budget)
+        var probe = config.*;
+        if (unpinned) probe.pinned_context = mid;
+        const chunk = fixed_chunk orelse sushiContextBytesAt(&probe, mid, kv_bits).chunk;
+        if (prefillNeededAtChunk(&probe, mid, 0, kv_bits, chunk, warm) <= budget)
             low = mid
         else
             high = mid - 1;
@@ -3807,6 +3818,7 @@ pub fn resolvedContextForLoad(
 /// the same reserve constant the RAM arm and `computeMemoryContext` pass, and the boot's
 /// configured KV width (billing at bf16 on a `--kv-quant 8` boot was the 22,464-vs-13,824 MB defect).
 fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
+    if (billedAutoContext(config)) return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap());
     return resolvedContextForLoad(
         manualContext(config),
         config.pinned_context,
@@ -3883,8 +3895,14 @@ fn legacyPrefixCacheAsk(config: *const model_mod.ModelConfig) u64 {
     return prefix_cache_mem_bytes; // legacy_ask_read
 }
 
+/// An arch whose auto context is the largest one its request bill admits, and that has none pinned yet.
+fn billedAutoContext(config: *const model_mod.ModelConfig) bool {
+    return config.longCtxGated() and manualContext(config) == 0 and config.pinned_context == 0;
+}
+
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
 fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
+    if (billedAutoContext(config)) return autoContextFrom(memoryContextAtChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, chunk), config.contextCap());
     return resolvedContextForLoad(
         manualContext(config),
         config.pinned_context,
@@ -4915,6 +4933,73 @@ fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
     return @intCast(rungWidth(cfg, seq, rung, cfg.longCtxGated()));
 }
 
+/// The served Flash-Next geometry at `--qwen-gdn 16`, as the M1 Max ternary runs measured it.
+fn qwen4MeasuredTestConfig() model_mod.ModelConfig {
+    var cfg = qwen4DeployedTestConfig();
+    cfg.gdn_state_f32 = false;
+    return cfg;
+}
+
+test "Flash-Next's request bill brackets the peaks measured on the M1 Max, with no padding beyond a small net" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 100000;
+    const saved_width = generate_mod.prefill_chunk_override;
+    defer generate_mod.prefill_chunk_override = saved_width;
+    generate_mod.prefill_chunk_override = 512;
+    const cfg = qwen4MeasuredTestConfig();
+    // Live `peak_bytes - active_bytes` after one prompt per boot (512 rung, kv8, no MTP, SSD tier on, 16 new tokens).
+    const measured = [_]struct { tokens: u64, peak_mib: u64 }{
+        .{ .tokens = 2857, .peak_mib = 1117 },
+        .{ .tokens = 8505, .peak_mib = 1774 },
+        .{ .tokens = 16874, .peak_mib = 2043 },
+        .{ .tokens = 33958, .peak_mib = 2228 },
+        .{ .tokens = 59314, .peak_mib = 2822 },
+    };
+    for (measured) |m| {
+        const bill = prefillNeededAtChunk(&cfg, m.tokens, 16, 8, 512, .{});
+        const peak = m.peak_mib * (1 << 20);
+        // Under-billing is a Metal OOM; billing past a quarter more than the peak is the padding.
+        try std.testing.expect(bill >= peak + peak / 20);
+        try std.testing.expect(bill <= peak + peak / 4);
+    }
+}
+
+test "the advertised Flash-Next context is the largest one the request bill admits" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 0;
+    const saved_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = saved_disk;
+    prefix_cache_disk_bytes = 20 << 30;
+    const saved_mtp = configured_mtp;
+    defer configured_mtp = saved_mtp;
+    configured_mtp = false;
+    var cfg = qwen4MeasuredTestConfig();
+    cfg.pinned_prefill_chunk = 512;
+    const MiB: u64 = 1 << 20;
+    const ceiling: u64 = 28976 * MiB; // 30000 MiB wired limit less the 1 GiB margin
+    const active: u64 = 27_378_205_274; // the lean ternary pack's resident bytes
+    const writer: u64 = 1 << 30; // the SSD writer's host permit, billed by admission
+    const budget = admissionAvailable(ceiling, active, writer);
+    const raw = memoryContextAt(&cfg, ceiling, active);
+    const fits = struct {
+        fn at(c: *const model_mod.ModelConfig, ctx: u64, avail: u64) bool {
+            var sized = c.*;
+            sized.pinned_context = @intCast(ctx);
+            return prefillNeededAtChunk(&sized, ctx, 0, 8, 512, .{}) <= avail;
+        }
+    };
+    // What admission accepts is what the sizer advertises, to within the search step.
+    try std.testing.expect(raw > 0);
+    try std.testing.expect(fits.at(&cfg, raw, budget));
+    try std.testing.expect(!fits.at(&cfg, @as(u64, raw) + 1024, budget));
+}
+
 test "the load-time budget is reproducible: free RAM at load does not move it" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
@@ -5064,10 +5149,7 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     try t.expectEqual(reserve_floor, plan.reserve);
 
     // The session the floor holds is the one the server advertises.
-    const advertised = autoContextFrom(
-        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
-        cfg.contextCap(),
-    );
+    const advertised = autoContextFrom(memoryContextAt(&cfg, ceiling, active), cfg.contextCap());
     try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
 }
 
@@ -5152,10 +5234,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
     const transient: u64 = prefillTransientReserve(&cfg, kv_bits, chunk);
 
-    const advertised = autoContextFrom(
-        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0),
-        cfg.contextCap(),
-    );
+    const advertised = autoContextFrom(memoryContextAt(&cfg, ceiling, active), cfg.contextCap());
     const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
     try t.expectEqual(advertised, billed);
 
@@ -5247,7 +5326,7 @@ test "with no --kv-quant, the per-token KV bill and the auto-context follow the 
 
     // One fixed memory reading for every arm: live free RAM moves between two reads.
     const ceiling: u64 = 96 << 30;
-    const active: u64 = 40 << 30;
+    const active: u64 = 90 << 30; // tight enough that the checkpoint's own cap does not bind
     configured_kv_quant = null;
     try t.expectEqual(@as(u64, 8), defaultKvBits(&cfg));
     try t.expectEqual(sessionBytesPerToken(&cfg, 8), sessionBytesPerToken(&cfg, defaultKvBits(&cfg)));
@@ -5771,6 +5850,12 @@ fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_me
 /// `memoryContextAt` for a given prefill width, before the checkpoint's position cap.
 fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
     if (config.num_attention_heads == 0) return 16384;
+    // Flash-Next advertises the context its own request bill admits at the floor rung, from the
+    // headroom admission reads (the writers' host bytes included), so the two cannot disagree.
+    if (config.longCtxGated()) {
+        const budget = admissionAvailable(ceiling, active_mem, diskWriterPermitBytes(config)) -| ctxSizingCacheReserve(config);
+        return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
+    }
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
     const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
     return safeContextForBudget(
@@ -5883,6 +5968,15 @@ pub fn batchedDecodeRowsBytes(config: *const model_mod.ModelConfig) u64 {
 /// does NOT scale with the weights — a dense bf16 checkpoint pays it too — so
 /// it is billed as what it measures as: a constant.
 const PREFILL_RUNTIME_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Prompt length up to which Flash-Next's bill carries the smaller net (engine-memory-admission.md#bill-net).
+/// Past it the bill keeps the quarter its terms were fitted under.
+const MEASURED_NET_MAX_TOKENS: u64 = 65536;
+
+/// The net the bill adds over its summed terms, in sixteenths (20 = the quarter).
+fn billUplift16ths(config: *const model_mod.ModelConfig, seq: u64) u64 {
+    return if (config.longCtxGated() and seq <= MEASURED_NET_MAX_TOKENS) 17 else 20;
+}
 
 /// How many MoE layers' gather-sort expansions coexist between eval points.
 /// Mirrors `Transformer.MOE_EVAL_EVERY_N_LAYERS` — the MoE prefill loop evals
@@ -6006,6 +6100,8 @@ pub const PrefillRequestTerms = struct {
     grow_coexist_bytes: u64 = 0,
     qsa_ring_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
+    /// The bill's net over the summed terms, in sixteenths (20 = the historical quarter).
+    uplift_16ths: u64 = 20,
     /// The dense rebuild ONE quantized-KV layer really makes at this prompt
     /// length (`kvDequantScratchBytes`). Zero = the generic
     /// `2 · seq · kv_heads · hdim · 2` below, which is exact for every arch
@@ -6044,7 +6140,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
         req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
-    return (gross -| req.shared_resident_bytes) * 5 / 4;
+    return (gross -| req.shared_resident_bytes) * req.uplift_16ths / 16;
 }
 
 /// Per-TOKEN bytes of prefill working set that live OUTSIDE the MLP envelope,
@@ -6352,6 +6448,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
+        .uplift_16ths = billUplift16ths(config, seq),
     };
 }
 
