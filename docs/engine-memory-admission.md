@@ -30,6 +30,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
     17 GB as macOS compressed the idle model.
   - Both runs: `e8c9c47e`, 2026-10-11.
   - Kept as is: under a declared `iogpu.wired_limit_mb` the wired-limit floor, not this figure, sets the request ceiling.
+- **Under a declared `iogpu.wired_limit_mb` the ceiling IS the limit less `--wired-margin-gib`** (`gpuCeilingWithWiredFloor`),
+  however much RAM is free. It was the larger of that and the free-RAM term, whose working set is the limit itself: a
+  streamed load on a quiet 32 GB box saw 27,936 MiB of ceiling where its requests saw 26,976, and proved an 86k context
+  each request then refused.
 - **A declared `iogpu.wired_limit_mb` lifts the resident Sushi preflight's available figure to the same floor request admission reads** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib`, less resident buffers, still under the working set). Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,

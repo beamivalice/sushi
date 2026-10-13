@@ -2906,15 +2906,16 @@ pub fn wiredLimitMbForBudget(budget_bytes: u64, kv_bytes: u64) u64 {
 pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
 /// PURE: the ceiling with the wired-limit floor applied. `wired_floor == 0` returns
-/// `physicalMemoryCeiling` byte for byte.
+/// `physicalMemoryCeiling` byte for byte. A declared limit IS the ceiling, its margin included:
+/// the working-set term is the limit itself, so on a quiet box it would plan into the margin.
 pub fn gpuCeilingWithWiredFloor(
     working_set_limit: u64,
     mlx_footprint: u64,
     free_system: u64,
     wired_floor: u64,
 ) u64 {
-    const physical = physicalMemoryCeiling(working_set_limit, mlx_footprint, free_system);
-    return @max(physical, wired_floor);
+    if (wired_floor > 0) return wired_floor;
+    return physicalMemoryCeiling(working_set_limit, mlx_footprint, free_system);
 }
 
 /// Test seam: `iogpu.wired_limit_mb` in MB; `null` reads the machine.
@@ -20022,6 +20023,12 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
     try t.expectEqual(@as(u64, 31_254), (lifted -| footprint) / mb);
     try t.expect(needed <= lifted -| footprint);
+
+    // Under a declared limit the margin holds however much RAM is free: a load on a quiet box saw the
+    // working set, the margin gone, and proved a context its own requests then refused.
+    const floor = wiredCeilingFloorForRam(&cfg, total_ram);
+    try t.expectEqual(floor, gpuCeilingWithWiredFloor(working_set, 0, working_set, floor));
+    try t.expectEqual(floor, gpuCeilingWithWiredFloor(working_set, footprint, 400 * (1 << 30), floor));
 }
 
 test "parseWiredMarginGib accepts 1..32 and names a bad value" {
