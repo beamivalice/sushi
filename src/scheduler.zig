@@ -3713,9 +3713,12 @@ fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
     return avail;
 }
 
-/// A resident Sushi load shares the working-set cap with already active model buffers.
-fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64) u64 {
-    const available = effectiveAvailableBytes(host_avail, proc_avail, gpu_limit);
+/// A resident Sushi load shares the working-set cap with already active model buffers. A declared
+/// wired limit (`wired_floor`, 0 = none) lifts the free-RAM figure to what that limit leaves the
+/// GPU, the same floor request admission reads.
+fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) u64 {
+    const host = if (wired_floor > 0) @max(host_avail, wired_floor -| active) else host_avail;
+    const available = effectiveAvailableBytes(host, proc_avail, gpu_limit);
     return if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
 }
 
@@ -3743,10 +3746,23 @@ test "load preflight waits for a prior process's memory to come back, and only w
 
 test "Sushi quant memory subtracts existing resident buffers from the GPU limit" {
     const gib: u64 = 1 << 30;
-    try testing.expectEqual(@as(u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib));
-    try testing.expectEqual(@as(u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib));
-    try testing.expectEqual(@as(u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib));
-    try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib));
+    try testing.expectEqual(@as(u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib, 0));
+}
+
+test "a declared wired limit lifts the load preflight's free-RAM figure, never past the working set" {
+    const gib: u64 = 1 << 30;
+    // 32 GB box, iogpu.wired_limit_mb raised: file cache and other apps' pages read as gone,
+    // but the declared limit says the GPU may claim the floor.
+    try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
+    // Resident buffers come off the floor, as they come off the working set.
+    try testing.expectEqual(@as(u64, 18 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
+    // More free RAM than the floor keeps the larger figure; the working set still caps it.
+    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
+    // A floor above the working set never raises the cap.
+    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 31 * gib));
 }
 
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {
@@ -4030,17 +4046,18 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             io: std.Io,
             gpu_limit: usize,
             sushi: bool,
+            wired_floor: u64,
             fn read(r: *@This()) u64 {
                 if (!r.sushi) return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
                 var active: usize = 0;
                 _ = mlx.mlx_get_active_memory(&active);
-                return effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active);
+                return effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active, r.wired_floor);
             }
             fn sleep(r: *@This()) void {
                 std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
             }
         };
-        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
+        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = @import("server.zig").wiredCeilingFloorFor(params.config) };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
         var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;

@@ -2937,7 +2937,7 @@ var wired_floor_logged = std.atomic.Value(bool).init(false);
 
 /// Long-context models and engaged expert streams honor the operator's wired limit.
 /// `null` config (no model resolved yet) takes no floor.
-fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
+pub fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
     return wiredCeilingFloorForRam(config, metrics.getTotalMemBytes());
 }
 
