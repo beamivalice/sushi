@@ -60,12 +60,9 @@ const gatherQsa256 = trf.gatherQsa256;
 const gatherQsa256Packed = trf.gatherQsa256Packed;
 const gdnGateChain = trf.gdnGateChain;
 const initMoeLayers = trf.initMoeLayers;
-const kvAttnFusedEligible = trf.kvAttnFusedEligible;
-const kvAttnVerifyEligible = trf.kvAttnVerifyEligible;
 const layerCap = trf.layerCap;
 const loadHcWeights = trf.loadHcWeights;
 const log = trf.log;
-const logKvAttnFusedEngaged = trf.logKvAttnFusedEngaged;
 const materializedOwnedCopy = trf.materializedOwnedCopy;
 const moeDumpBeginForward = trf.moeDumpBeginForward;
 const moeDumpForwardDone = trf.moeDumpForwardDone;
@@ -73,8 +70,6 @@ const moeRouterFusedEnabled = trf.moeRouterFusedEnabled;
 const mtp_mod = trf.mtp_mod;
 const noteExpertDeferred = trf.noteExpertDeferred;
 const noteQsaArmForSlots = qwen4_qsa.noteQsaArmForSlots;
-const qkvAttnDecodeKernel = trf.qkvAttnDecodeKernel;
-const qkvAttnVerifyKernel = trf.qkvAttnVerifyKernel;
 const qsaAlignedSparseAttn = qwen4_qsa.qsaAlignedSparseAttn;
 const qsaDecodeGatherAttn = trf.qsaDecodeGatherAttn;
 const qsaHistoryRows = trf.qsaHistoryRows;
@@ -2423,9 +2418,6 @@ pub fn gatedFullAttnProjected(
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
 
-    // Fused-attn opt-in: see standard attention site for design notes
-    // (kernel-or-DENSE — a declined kernel falls to the arms below).
-    const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
     if (Qwen4AttnProf.active) {
         if (kv_view.has_quant_triple) {
             for ([_]mlx.mlx_array{ kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases, kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases }) |a| Qwen4AttnProf.sync(a);
@@ -2435,7 +2427,6 @@ pub fn gatedFullAttnProjected(
         }
         Qwen4AttnProf.lap(q_rope, .proj);
     }
-    var kv_fused_done = false;
     if (ctx.qsa_blocks.ctx != null or ctx.qsa_mask.ctx != null) {
         // qwen4_exp QSA: the indexer already chose the visible blocks
         // (causal folded in). Prefill gathers them by index; decode/
@@ -2502,25 +2493,6 @@ pub fn gatedFullAttnProjected(
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", ctx.qsa_mask, .{ .ctx = null }, false, self.s));
             }
         }
-        kv_fused_done = true;
-    } else if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
-        if (try qkvAttnDecodeKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode_moe, none_mask)) |fused| {
-            logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
-            _ = mlx.mlx_array_free(attn_out);
-            attn_out = fused;
-            kv_fused_done = true;
-        }
-    } else if (ctx.kv_attn_fused and kvAttnVerifyEligible(&kv_view, seq_len)) {
-        // Spec-verify widths (Phase 2): is_prefill is seq_len > 1, so
-        // sel_mode_moe is "causal" here — the mode the kernel serves.
-        if (try qkvAttnVerifyKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode_moe)) |fused| {
-            _ = mlx.mlx_array_free(attn_out);
-            attn_out = fused;
-            kv_fused_done = true;
-        }
-    }
-    if (kv_fused_done) {
-        // packed kernel handled this layer
     } else if (is_prefill) {
         if (try fusedSdpaPrefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
             _ = mlx.mlx_array_free(attn_out);
