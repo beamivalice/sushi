@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **Qwen3.8-Flash-Next decodes long prompts faster with the same output**: decode without MTP runs about 5% faster
   from 4k to 32k tokens of context.
+- **Quoted control tokens in a message no longer end the turn**: `<think>`, `</think>` or `<|im_end|>` written as text
+  in a user, system or tool message (a source file Claude Code read) stays text instead of reading as a real boundary.
 
 ## v1.2.3 — Faster GLM, 32-bit Qwen GDN state
 
@@ -21,8 +23,6 @@ earlier history is mlx-serve's, in that project's changelog.
   change, since older entries hold a bf16 gate.
 - **64 GB Macs boot the recommended context again**: the load check no longer asks for 1 GB more than the requested
   context needs, which could refuse the documented 64 GB launch (`--ctx-size 250000`) in v1.2.2.
-- **Quoted control tokens in a message no longer end the turn**: `<think>`, `</think>` or `<|im_end|>` written as text
-  in a user, system or tool message (a source file Claude Code read) stays text instead of reading as a real boundary.
 - **GLM keeps its speed in `sushi run`**: DFlash2 now stays on for requests that carry `logit_bias` or
   `tool_choice: "none"`, which every `sushi run` turn sends, so thinking answers there decode about 40% faster.
 - **Less memory per request with the SSD prefix cache**: Qwen and GLM write each prefill checkpoint to the SSD as they
