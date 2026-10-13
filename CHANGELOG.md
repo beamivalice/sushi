@@ -8,6 +8,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **Qwen3.8-Flash-Next decodes long prompts faster with the same output**: decode without MTP runs about 5% faster
   from 4k to 32k tokens of context.
+- **Image conversations keep their prompt cache across a restart**: an SSD prefix-cache record now carries the images
+  it was computed under, so a text -> image -> text conversation restores past its images instead of re-reading
+  everything after the first one, and a changed image still invalidates only what follows it.
 - **Quoted control tokens in a message no longer end the turn**: `<think>`, `</think>` or `<|im_end|>` written as text
   in a user, system or tool message (a source file Claude Code read) stays text instead of reading as a real boundary.
 

@@ -29,6 +29,21 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   the entry key is the last). An entry keyed by a request's block k restores up to block k+1, so a turn that appends
   a screenshot reuses everything before it; any other key mismatch shares only the text before the first media row
   (`crossKeyBoundary`). The splice resumes at the placeholder count inside the restored prefix.
+- **BOTH tiers apply that one rule, and the SSD tier stores the identity to apply it to** (`vision_key` +
+  `media_start` per record, manifest v10). `prefix_cache.MediaRule` closes over the request's chain and the tier asks
+  it per candidate (`kv_disk_cache.MediaLimits`), so the tier never learns what a pixel is. The rule is load-bearing
+  in BOTH directions: placeholder ids are ordinary vocabulary entries, so a TEXT prompt can match a media record's
+  tokens past its first image row while the rows there are that record's pixels — a text request is held to the
+  record's pre-media text, never given its image rows.
+- **A record claims only the media blocks its rows cover** (`truncatedMediaKey`): a write-through chunk or a cancelled
+  prefill that stops between two blocks claims the chain up to the last block inside it. Key 0 means no media row at
+  all, which is what lets a text prompt share a record whole. Overclaiming is safe (an equal key is clamped by
+  `kv_len`, a different one falls to the pre-media text) but costs the reuse of the blocks the record does hold.
+- **The media key is a PERSISTED format.** It is `mediaChain`'s Wyhash over each block's preprocessed pixels, grid and
+  position (`server.zig`), stored as hex because a u64 key runs past JSON's i64. Changing what it hashes without
+  changing the hash would make a stale record match a prompt it does not describe; a changed hash only costs misses.
+  The tier fingerprint (model dir + `config.json`) covers the tower's weights, and `ImageData.pixels` is already
+  post-preprocessing, so a preprocessing change rolls the key by itself.
 - **A restore is not bit-identical on a HYBRID** (≤ 0.047 nats; the chunking class ~0.3 nats top-5 for QSA state) ⇒
   byte-stable greedy needs `--prefix-cache-entries 0`. A hybrid cache hit moves the top logprob ~0.2 nats, so any
   scorer boots with the cache off.
@@ -61,7 +76,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **The SSD tier restores a ringed entry only at a ring file** (`bestRingMatch`, `restoreIntoRinged`): chunks hold the
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
   `RING_DISK_MAX_PER_ENTRY` = 8 kept, thinned as in RAM, salvaged per file at scan; manifest v9, which an older reader
-  drops) ([mimo2-arch](mimo2-arch.md#sliding-layers-the-ring)).
+  drops; a media-bearing record stamps v10 for the same reason) ([mimo2-arch](mimo2-arch.md#sliding-layers-the-ring)).
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
   (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
   tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves
@@ -209,9 +224,11 @@ With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` rep
 Context and prefill-chunk sizing also reserve zero idle-cache bytes in this mode, regardless
 of `--prefix-cache-mem`; live KV and temporary SSD write buffers still consume memory.
 
-Qwen prefill chunks write through continuously in SSD-only mode (no env turns it off; a turn with under one chunk of new tokens skips it). GLM's
+Qwen prefill chunks write through continuously in SSD-only mode (no env turns it off; a turn with under one chunk of new tokens skips it), image-bearing turns included. GLM's
 prefill writes through too and frees each checkpoint's RAM copy once it is staged ([GLM](glm5-prefix-cache.md#glm)). Hybrid SSM checkpoints, MiMo ring
-restore points and GLM state ([GLM](glm5-prefix-cache.md#glm)) survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD is the opt-in
+restore points and GLM state ([GLM](glm5-prefix-cache.md#glm)) survive restart. Image-bearing entries persist whole, keyed by their media
+chain, so a text -> image -> text conversation restores past its images after a restart (issue #47;
+`tests/test_media_prefix_persist.sh` runs that on all three archs). RAM+SSD is the opt-in
 `--prefix-cache-mem` arrangement. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
 `~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.
 
@@ -231,10 +248,11 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - **Every position stays listed.** The commit, the thinning and the hot entry read positions from the same list; a
   released one is skipped as a source of state (`ssmTargetPositions`, `highestCheckpointAtOrBelow`) and priced at the
   bytes it held (`released_bytes`). A restore at any position reads its file.
-- **A request the write-through cannot serve** (an image-bearing one, a span under one disk chunk) releases nothing, so
-  its list is thinned to two (`scheduler.qwenCheckpointCap`) and it holds three states while one is captured. With media
-  in the prompt the thinning keeps the last checkpoint at or below the first media row, where the SSD record ends
-  (`generate.checkpointDropIndex`), then the newest. The byte-budget trim never lands on a released checkpoint.
+- **A request the write-through cannot serve** (a span under one disk chunk) releases nothing, so its list is thinned
+  to two (`scheduler.qwenCheckpointCap`) and it holds three states while one is captured. The thinning is
+  span-preserving whatever the prompt carries (`generate.checkpointDropIndex`): a media record persists whole, so
+  there is no boundary to protect, and protecting one dropped every checkpoint ABOVE the image — exactly the state
+  the next image-bearing turn restores from. The byte-budget trim never lands on a released checkpoint.
   `transformer.SSM_RESIDENT_MAX` is the number the admission bill counts
   ([engine-memory-admission](engine-memory-admission.md#bill-checkpoints)).
 - **A RAM tier keeps its entry's newest two** (`keepNewestCheckpoints`, on commit, merge and inheritance), after the

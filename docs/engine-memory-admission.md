@@ -232,8 +232,16 @@ request holds, not the ones it captures (`server.ssmResidentCap`, `transformer.S
 
 The write-through frees the older state the way GLM's does (`DiskTier.settleCheckpoints`: wait out its file, then
 `release`), so the bound is hard, not "whatever has landed". The scheduler thins a request the write-through cannot
-serve (an image-bearing one, a span under one disk chunk) to two listed checkpoints (`qwenCheckpointCap`) rather than
+serve (a span under one disk chunk) to two listed checkpoints (`qwenCheckpointCap`) rather than
 under-bill it. A RAM tier's hot entry keeps the newest two of those held states, so it adds nothing to the request's.
+
+An image-bearing request arms the write-through like any other since media-aware persistence
+([engine-prefix-cache](engine-prefix-cache.md#checkpoints-on-ssd)). Qwen's bill does not move -- it was already 3 --
+but such a request now really holds two states instead of three. GLM's bill DROPS: `glmCheckpointsRelease` rides the
+same gate, so a media turn bills `glm5_prefix.checkpoint_ram_held` (2) KDA checkpoints where it billed the prefill's
+peak (up to 9), about 1.2 GiB less at and above ~18,432 tokens once the branch's 5/4 is applied. No model's advertised
+or auto context moves: context sizing bills checkpoints from an EMPTY `WarmPrefix`, where Qwen's term is the resident
+cap already and GLM's is zero.
 
 Bill at the 512 rung, kv8, 16 new tokens, no MTP, the lean Flash-Next geometry (`qwen4MeasuredTestConfig`), MiB, before
 this change (RAM only is that bill: the main before it ignored the tier) against after (one scratch test, ReleaseFast). Stride is the default chunk, so a

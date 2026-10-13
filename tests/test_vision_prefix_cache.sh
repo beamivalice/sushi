@@ -208,7 +208,8 @@ check "Anthropic historical image decodes" "$((decode_after-decode_before))" "1"
 check "Anthropic text-only continuation completes" "$(echo "$r0a" | grep -cE '.+' | sed 's/^[1-9][0-9]*$/1/')" "1"
 
 echo "[10] assistant-prefix continuation keeps current-turn media"
-mm_before=$mm_after
+# Fresh count, not [6]'s: sections [7]-[9] each process media of their own.
+mm_before=$(grep -c 'Multimodal: processing' "$LOG" || true)
 r0p=$(injected_context_body "$F1" assistant-prefix | ask); echo "  $r0p"
 mm_after=$(grep -c 'Multimodal: processing' "$LOG" || true)
 check "assistant-prefix continuation processes one image" "$((mm_after-mm_before))" "1"

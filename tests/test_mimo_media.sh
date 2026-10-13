@@ -123,7 +123,9 @@ check "Anthropic image block read" "$(hits "$ra" 'gr[ae]y fox|waterfall')" "1"
 echo "[3] prefix cache keyed on the pixels"
 rs2=$(body "$SIGNS" "What text is written on the green street signs? Answer with the words only." false | ask); echo "  $rs2"
 check "same image: cached_tokens > 0" "$(python3 -c "print(1 if int('${rs2%% |*}') > 0 else 0)")" "1"
-check "hot-cache reused line" "$(grep -c 'hot-cache\] reused' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
+# Whichever tier this boot retains: at the defaults RAM retention is off, so the reuse comes off
+# the SSD tier, and asserting only the RAM line hid that an image turn reused nothing at all.
+check "a tier reports the reuse" "$(grep -cE 'hot-cache\] reused|disk-cache\] restored' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 check "warm answer still reads the signs" "$(hits "$rs2" 'gr[ae]y fox|waterfall')" "1"
 rh=$(body "$HOUSE" "What text is written on the green street signs? Answer with the words only." false | ask); echo "  $rh"
 check "different image: nothing reused past the chat header" "$(before_image "${rh%% |*}")" "1"
