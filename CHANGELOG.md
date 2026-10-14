@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **An interrupted `sushi pull` resumes instead of reporting the pack downloaded**: `sushi pull` now checks every file
+  against the pack's listing, which also finishes a folder an earlier version left short, and `sushi list` no longer
+  shows a pack as downloaded while a pull of it is unfinished.
 - **Qwen3.8-Flash-Next decodes long prompts faster with the same output**: decode without MTP runs about 5% faster
   from 4k to 32k tokens of context.
 - **Image conversations keep their prompt cache across a restart**: an SSD prefix-cache record now carries the images

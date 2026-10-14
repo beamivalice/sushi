@@ -514,7 +514,7 @@ fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
 /// as present skipped the resume and fed a weightless dir to the loader
 /// (live SIGSEGV — see tests/test_partial_download.sh). Complete means: no
 /// .partial leftovers anywhere (top level or one subdir deep, e.g.
-/// mtp/weights.safetensors.partial), plus config.json AND at least one
+/// mtp/weights.safetensors.partial) and no `pull_marker`, plus config.json AND at least one
 /// .safetensors.
 pub fn modelPresent(io: std.Io, dir_path: []const u8) bool {
     if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return false;
@@ -530,7 +530,7 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
     while (it.next(io) catch null) |entry| {
         switch (entry.kind) {
             .file => {
-                if (std.mem.endsWith(u8, entry.name, ".partial")) return false;
+                if (std.mem.endsWith(u8, entry.name, ".partial") or std.mem.eql(u8, entry.name, pull_marker)) return false;
                 if (std.mem.eql(u8, entry.name, "config.json")) has_config = true;
                 if (std.mem.endsWith(u8, entry.name, ".safetensors")) has_safetensors = true;
             },
@@ -548,6 +548,21 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
         }
     }
     return has_config and has_safetensors;
+}
+
+/// Present for the whole of a pull and removed only after the last file verifies: a refused request (HTTP 429)
+/// leaves no `.partial`, so the files alone cannot tell an interrupted pull from a finished one. A pack pulled
+/// before the marker existed never has it and keeps the `.partial` rule.
+const pull_marker = ".pull-incomplete";
+
+fn setPullMarker(io: std.Io, dest_dir: []const u8, on: bool) !void {
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dest_dir, .{});
+    defer dir.close(io);
+    if (on) {
+        try dir.writeFile(io, .{ .sub_path = pull_marker, .data = "" });
+    } else {
+        dir.deleteFile(io, pull_marker) catch |err| if (err != error.FileNotFound) return err;
+    }
 }
 
 /// Download `resolved.repo` into `dest_dir`. Skips files already complete
@@ -583,6 +598,10 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         return error.PullFailed;
     }
     reporter.say("{d} files, {d} MB total", .{ wanted, total_bytes / (1024 * 1024) });
+    setPullMarker(io, dest_dir, true) catch {
+        reporter.say("error: cannot write to {s}", .{dest_dir});
+        return error.PullFailed;
+    };
 
     var idx: usize = 0;
     for (files) |f| {
@@ -606,6 +625,10 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
             return error.PullFailed;
         };
     }
+    setPullMarker(io, dest_dir, false) catch {
+        reporter.say("error: cannot finish {s}: remove {s}/{s} by hand", .{ resolved.repo, dest_dir, pull_marker });
+        return error.PullFailed;
+    };
     reporter.say("success: {s} ready", .{resolved.repo});
 }
 
@@ -655,7 +678,7 @@ fn warnBelowTier(repo: []const u8) void {
 }
 
 pub fn cmdPull(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void {
-    _ = checkPullable(name) catch |err| switch (err) {
+    const resolved = checkPullable(name) catch |err| switch (err) {
         error.UnknownModel => {
             log.err("unknown model '{s}'\n", .{name});
             printKnownAliases(io);
@@ -663,8 +686,11 @@ pub fn cmdPull(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void
         },
         error.NotBeamster => refuseOrg(io, name),
     };
-    const dir = try ensureModelAvailable(allocator, io, name);
+    const dir = try modelDestPath(allocator, homeDir(), resolved.repo);
     defer allocator.free(dir);
+    // Always against the manifest: a folder an older pull left short carries no `pull_marker` and looks complete.
+    if (!modelPresent(io, dir)) warnBelowTier(resolved.repo);
+    try pullRepo(allocator, io, resolved, dir, stderr_reporter, true);
     log.info("model at {s}\n", .{dir});
     log.info("run it: sushi run {s}\n", .{name});
 }
@@ -2178,6 +2204,29 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
         defer d.close(io);
         try testing.expect(!modelPresentInDir(io, d));
     }
+}
+
+test "cli: a pull cut short without a .partial file is not a present model" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const pack = try std.fmt.allocPrint(testing.allocator, "{s}/pack", .{root});
+    defer testing.allocator.free(pack);
+
+    try tmp.dir.createDirPath(io, "pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/model-00001.safetensors", .data = "x" });
+    // Packs pulled before the marker existed are complete.
+    try testing.expect(modelPresent(io, pack));
+
+    try setPullMarker(io, pack, true);
+    try testing.expect(!modelPresent(io, pack));
+
+    try setPullMarker(io, pack, false);
+    try testing.expect(modelPresent(io, pack));
+    try setPullMarker(io, pack, false);
 }
 
 test "cli: parseTreeJson uses lfs size and skips directories" {

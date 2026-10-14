@@ -59,6 +59,27 @@ wait "$PID" 2>/dev/null
 if grep -q "pulling manifest" "$OUT"; then SEEN=0; fi
 check "interrupted pull is resumed, not treated as already-present" "$SEEN"
 
+# ── C. an explicit pull checks a dir that looks complete against the manifest ──
+# A pull refused mid-way (HTTP 429) leaves whole files and no .partial; a dir an older version left that way has no
+# marker to tell, so `sushi pull` must fetch the manifest rather than take the fast path.
+SHORT_DIR="$SCRATCH/home2/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-3bpw"
+mkdir -p "$SHORT_DIR"
+printf '{"model_type": "qwen4_exp"}\n' > "$SHORT_DIR/config.json"
+printf 'x' > "$SHORT_DIR/model-00001.safetensors"
+OUT="$SCRATCH/pull2.txt"
+HOME="$SCRATCH/home2" "$BIN" pull qwen3.8-flash-next > "$OUT" 2>&1 &
+PID=$!
+for _ in $(seq 1 40); do
+    grep -q "pulling manifest" "$OUT" && break
+    kill -0 "$PID" 2>/dev/null || break
+    sleep 0.5
+done
+kill -9 "$PID" 2>/dev/null
+wait "$PID" 2>/dev/null
+SEEN=1
+if grep -q "pulling manifest for beamster/Qwen3.8-Flash-Next-Sushi-3bpw" "$OUT"; then SEEN=0; fi
+check "explicit pull of a complete-looking dir checks the manifest" "$SEEN"
+
 # ── B. loading the partial dir fails cleanly (no SIGSEGV) ──
 # The old cleanup-on-undefined-memory bug is nondeterministic (malloc reuse),
 # so exercise the load a few times; any signal death fails.
