@@ -22,6 +22,9 @@ To download a pack and see which one suits your Mac: [`sushi pull` and `sushi li
 then load it by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`)
 or `beamster/<repo>`. Only packs of the Hugging Face org `beamster` are accepted; any other `org/repo` exits with an
 error before anything downloads (`sushi run <model>` follows the same rule when it has to download).
+`sushi pull` checks every file of the pack against its Hugging Face listing and downloads only what is missing or short,
+so rerunning it finishes an interrupted download. Until it finishes, the pack folder holds a `.pull-incomplete` file and
+`sushi list` does not show the pack as downloaded.
 
 `sushi list` shows each published pack with its size, whether it is downloaded and whether this Mac meets the pack's
 memory tier, and marks the pack it recommends for this Mac; the other models on disk follow. A Mac's tier is its
