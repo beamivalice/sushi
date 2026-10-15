@@ -183,6 +183,48 @@ Sushi-4bpw took one boot per arm.
   On the fix, n32 to n62 read 0.92-1.19 quiet and up to 1.25 with three copies contending; n64 reads 1.34-1.41.
   Its limits are 1.4, and 1.8 for n64.
 
+<a id="exl3-lane-funnel"></a>
+## EXL3 decode lane: the third word as two 32-bit funnels (n42 to n62)
+
+The decode GEMVs at Flash-Next geometry are ALU-bound, not load-bound: at n42 the third word cost 10% of the one-row
+chain through the 64-bit OR, not through its load. A scratch harness (not landed) swapped the lane read inside the
+chain ubench below, n42, us per step, arms interleaved in one process. Run 1: main 60.8; no third load but the OR
+kept (wrong bytes) 57.9; no third word at all (wrong bytes) 50.7; the third word by `simd_shuffle` from the lane
+that loads it 62.6; one load per lane plus three shuffles 79.7. Run 2: main 59.7; the two-funnel merge 52.1; a
+packed three-word load with selects for the wrap lanes 57.8; a branch to that packed load 68.8. Merging the word as
+two 32-bit funnels of adjacent words keeps the three loads and every byte.
+
+Setup: M5 Max 128 GB, 2026-10-15, fans at max, `taskpolicy -a`, GPU lock `lane3-opt`, quiet window (no build or test
+running), on battery at 100%. Base = main `2df81de2`; new = `2eedbef9`; the live binary was built from
+`3da27606`, the same served code before a test limit moved. All ReleaseFast.
+
+`SUSHI_EXL3_CHAIN_UBENCH=1` (exl3 test binary): 48 dependent pair GEMV + fused-mid down steps, E=16, 2560 -> 640,
+top-10, MCG w15, one row; the 64-bit merge and the funnel interleaved in one process, median of 9; us per step:
+
+| n | 24 | 32 | 36 | 40 | 42 | 44 | 46 | 48 | 50 | 52 | 54 | 56 | 58 | 60 | 62 | 64 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| merge | 48.4 | 50.3 | 49.9 | 51.4 | 59.2 | 58.5 | 59.0 | 51.6 | 59.1 | 60.7 | 58.6 | 59.6 | 60.0 | 60.8 | 59.9 | 68.7 |
+| funnel | 48.9 | 50.3 | 49.3 | 51.1 | 53.0 | 53.2 | 53.8 | 51.3 | 52.8 | 53.1 | 54.5 | 55.1 | 54.2 | 55.0 | 53.3 | 68.2 |
+
+- Rates that read two words (n24 to n40, n48) and n64's packed branch compile to the same AIR in both arms (pair GEMV
+  and fused-mid down at n32, n36, n40, n48, n64, metadata stripped), so MiMo, GLM, Sushi-2bpw, Sushi-3bpw and
+  Sushi-4bpw are untouched; their rows above differ by run-to-run noise only.
+- n66 to n108 take the funnel too: 2.4-12% faster per step; n110 to n128 (two-window lanes) are unchanged.
+- The margin test reads n42 at 1.006 over n48 and n44 to n62 at 1.02-1.06 (main: n42 1.13); its limit is 1.12.
+
+Forward meter on Sushi-2.6bpw (`SUSHI_DECODE_FWD_UBENCH=50`, `SUSHI_DECODE_FWD_UBENCH_S=1,2,3,4,6`, `--no-mtp
+--kv-quant 8 --ctx-size 131072`), boots base, new, new, base; ms per forward, both boots per cell:
+
+| arm | 1 row | 2 rows | 3 rows | 4 rows | 6 rows |
+|---|---|---|---|---|---|
+| main `2df81de2` | 17.81 / 17.52 | 20.47 / 20.53 | 23.91 / 23.93 | 27.88 / 27.79 | 35.69 / 35.78 |
+| funnel `3da27606` | 17.34 / 17.52 | 20.06 / 19.94 | 23.50 / 23.22 | 27.04 / 26.91 | 34.64 / 33.88 |
+
+The forward gains less than the chain (-1.4% at one row, within boot noise; -2.3% to -4.1% at the verify widths):
+likely because the served 512-expert bank streams from DRAM, where the cache-resident ubench bank does not.
+
+llmprobe (`--mtp`, six boots) did not resolve the change on battery: prefill, whose kernels are unchanged, drifted 26%.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
