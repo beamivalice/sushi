@@ -11,14 +11,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 ## Defaults and flags
 
 - **kv8 is the engine default.** Every load logs `[kv-cache] <scheme> (<source>)`, i.e.
-  `[kv-cache] <kv8|kv4|off> (<default|--kv-quant|model-settings.json>)`
+  `[kv-cache] <kv8|kv6|kv4|off> (<default|--kv-quant|model-settings.json>)`
   (scheduler adds `; ctx N (source)`); `/props` reports `settings.kv_cache`, `/v1/models` `meta.kv_cache`.
   `kld capture|compare` teachers stay dense; the qwen4 MTP head KV is dense unless `--mtp-head-kv-quant`.
-- `--kv-quant 8|4|16` (16 = dense BF16, also spelled `off`/`0`; `src/kv_quant.zig`, `configuredKvQuantFor(config)`); an explicit flag beats
+- `--kv-quant 8|6|4|16` (16 = dense BF16, also spelled `off`/`0`; `src/kv_quant.zig`, `configuredKvQuantFor(config)`); an explicit flag beats
   `model-settings.json` `kv_quant`, which beats the default. A per-model setting of `kv_quant: off` still wins over
   the default.
 - GLM (`glm5_next`) takes the kv8 default too, through its own MLA latent backend (`glm5_latent.zig`,
-  [glm5-arch](glm5-arch.md#scope)); kv4 is refused.
+  [glm5-arch](glm5-arch.md#scope)); kv6 and kv4 are refused.
 - Nothing picks a packed read per request: MiMo's global-layer decode chooses its packed arm per step from the
   cache's length (`mimoGlobalDecodeArm`), and Flash-Next's QSA arms follow the indexer.
 
@@ -31,6 +31,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   slot running `kv_quant=4` never restores from an entry committed at another width
   (`tests/test_kv_quant_per_request.sh`). Every generation endpoint, `/v1/completions` included, reads the per-request
   `kv_quant` through `parseKvQuantOverride` and logs the override it applied.
+- **kv6 sits between kv4 and kv8**: 6-bit affine, group 64, so a row bills 6.5 bits per element against kv8's 8.5.
+  `mlx_quantize` packs four values into three bytes (a little-endian bitstream), so a row is `D * 6 / 32` words and
+  a value can straddle two of them: every custom reader unpacks it bytewise (`sushi_kv_unpack8`) or in three-word
+  units (matmul2d), and each is pinned against its dense oracle at 6 bits. The memory bill is the generic
+  `(2 * bits + 1) / 32` of the dense row, so no bill changed. The fused MiMo QKV prep and the batched affine append stay
+  kv8-only, so kv6 composes `quantizeAffine` per slot like kv4, and the MTP round-cost profiles are measured at kv8
+  only, so a kv6 load runs the generic one.
 - Packed reads are kernel-or-DENSE: MiMo's global layers read packed at t_q==1 (`packedDecodeServesFrom`, from a
   4096-key floor) and Flash-Next's QSA arms read packed (next bullet); every other path reads the dense view.
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the

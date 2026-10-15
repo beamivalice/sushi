@@ -219,7 +219,7 @@ pub const USAGE =
     \\  --no-template         feed the raw prompt text, no chat template
     \\  --json <file>         compare: write the numbers as JSON
     \\  --ctx-size <n>        context length override
-    \\  --kv-quant <16|8|4>   KV cache quantization (16 = BF16, also off)
+    \\  --kv-quant <16|8|6|4> KV cache quantization (16 = BF16, also off)
     \\  --qwen-gdn <32|16>    Qwen only: bits of the GatedDeltaNet recurrent state (default 32 =
     \\                        f32; 16 = bf16, the decay gate is f32 either way). A student at 16 is
     \\                        scored against the f32 teacher. A GLM pack has no GDN arm and refuses it.
@@ -866,6 +866,7 @@ pub fn kvCacheFormat(cfg: transformer_mod.KVQuantConfig) []const u8 {
         .off => "bf16",
         .affine => switch (cfg.bits) {
             4 => "affine4",
+            6 => "affine6",
             8 => "affine8",
             else => "affine",
         },
@@ -2079,6 +2080,7 @@ test "kld: the recorded strict NLL is the teacher's own log-softmax, as the capt
 test "kld: kvCacheFormat names the effective KV width" {
     try testing.expectEqualStrings("bf16", kvCacheFormat(transformer_mod.KVQuantConfig.dense));
     try testing.expectEqualStrings("affine4", kvCacheFormat(transformer_mod.KVQuantConfig.affine(4)));
+    try testing.expectEqualStrings("affine6", kvCacheFormat(transformer_mod.KVQuantConfig.affine(6)));
     try testing.expectEqualStrings("affine8", kvCacheFormat(transformer_mod.KVQuantConfig.affine(8)));
 }
 

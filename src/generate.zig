@@ -17313,7 +17313,7 @@ test "a warm prefill grows its restored layers to the reservation before the fir
     try mlx.check(mlx.mlx_zeros(&one, &[_]c_int{ 1, 2, 1, 64 }, 4, .bfloat16, s));
     for ([_]*const model_mod.ModelConfig{ &qwen4, &mimo }) |cfg| {
         const ring: u32 = if (cfg.swaRingTokens() > 0) cfg.sliding_window else 0;
-        for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8) }) |kvq| {
+        for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8), .affine(6) }) |kvq| {
             for ([_]bool{ true, false }) |donate| {
                 // The previous turn's cache: it reserved C and holds the matched rows. Layer 1 rings on MiMo.
                 var donor = try KVC.initWithConfig(t.allocator, 2, kvq);

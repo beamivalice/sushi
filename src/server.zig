@@ -8148,7 +8148,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const disk = lm.disk_stats.snapshot();
     return .{
         .engine = "mlx",
-        .kv_quant = if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
+        .kv_quant = kv.wireName(),
         .kv_cache = kv_cache,
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
@@ -13609,8 +13609,8 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
 }
 
 /// Wave 1.A — parse the optional per-request `kv_quant` body field. Accepts
-/// the string forms `"off"`, `"0"`, `"4"`, `"8"` and the integer forms `0`,
-/// `4`, `8`. Returns null when the field is absent or unrecognized (the
+/// the string forms `"off"`, `"0"`, `"4"`, `"6"`, `"8"` and the integer forms `0`,
+/// `4`, `6`, `8`. Returns null when the field is absent or unrecognized (the
 /// caller falls back to the process-level `--kv-quant` default carried on
 /// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
 fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
@@ -20105,7 +20105,13 @@ test "kvBytesPerTokenAtBits: the KV bill follows the CONFIGURED quant width" {
     // SAME expression prefillMemoryNeeded bills — the sizer and the admission
     // guard must not disagree about what one token costs.
     try t.expectEqual(dense * 9 / 32, kvBytesPerTokenAtBits(dense, 4)); // 18432
+    try t.expectEqual(dense * 13 / 32, kvBytesPerTokenAtBits(dense, 6));
     try t.expectEqual(dense * 17 / 32, kvBytesPerTokenAtBits(dense, 8));
+    // The bill is what the cache stores: `bits` per element plus a bf16 scale and bias per group of 64.
+    for ([_]u64{ 4, 6, 8 }) |bits| {
+        const elems = dense / 2;
+        try t.expectEqual(elems * bits / 8 + elems / 64 * 4, kvBytesPerTokenAtBits(dense, bits));
+    }
     // 4-bit is what makes the 16 GB tier reachable: under a third of dense.
     try t.expect(kvBytesPerTokenAtBits(dense, 4) * 3 < dense);
 }

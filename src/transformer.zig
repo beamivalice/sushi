@@ -3300,24 +3300,56 @@ fn getQsaNaxKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+/// Dequantizes chunk `c8` (8 values) of one packed row into `ev`. 4 and 8 bits fill whole uint32
+/// words; 6 bits packs four values into three bytes (little-endian bitstream, `mlx_quantize`'s
+/// layout), so a chunk is six bytes and the row is read bytewise.
+const KV_UNPACK_HEADER =
+    \\template <typename T, int BITS>
+    \\inline void sushi_kv_unpack8(const device uint32_t* wq, int c8, float sj, float bj, thread T* ev) {
+    \\  constexpr uint MASKB = (1u << BITS) - 1u;
+    \\  if constexpr (BITS == 6) {
+    \\    const device uchar* p = ((const device uchar*)wq) + c8 * 6;
+    \\    const uint lo = uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16);
+    \\    const uint hi = uint(p[3]) | (uint(p[4]) << 8) | (uint(p[5]) << 16);
+    \\    for (int u = 0; u < 4; ++u) {
+    \\      ev[u] = T(float((lo >> (u * 6)) & MASKB) * sj + bj);
+    \\      ev[4 + u] = T(float((hi >> (u * 6)) & MASKB) * sj + bj);
+    \\    }
+    \\  } else {
+    \\    constexpr int VPW = 32 / BITS;
+    \\    constexpr int NW = 8 / VPW;
+    \\    for (int wj = 0; wj < NW; ++wj) {
+    \\      const uint w = wq[c8 * NW + wj];
+    \\      for (int u = 0; u < VPW; ++u) ev[wj * VPW + u] = T(float((w >> (u * BITS)) & MASKB) * sj + bj);
+    \\    }
+    \\  }
+    \\}
+    \\
+    \\// Sixteen 6-bit values from three words (96 bits), as the matmul2d kernels load them.
+    \\template <typename T>
+    \\inline void sushi_kv_store16_b6(uint w0, uint w1, uint w2, float sj, float bj, threadgroup T* dst) {
+    \\  const uint ws[4] = {w0, w1, w2, 0u};
+    \\  #pragma clang loop unroll(full)
+    \\  for (int u = 0; u < 16; ++u) {
+    \\    const int bit = u * 6;
+    \\    const int wi = bit >> 5;
+    \\    const int sh = bit & 31;
+    \\    uint v = ws[wi] >> sh;
+    \\    if (sh + 6 > 32) v |= ws[wi + 1] << (32 - sh);
+    \\    dst[u] = T(float(v & 63u) * sj + bj);
+    \\  }
+    \\}
+    \\
+;
+
 /// Prepended to a gather kernel's header to build its packed-cache variant: each staged row
 /// chunk of 8 is dequantized from the cache's affine words (the qsaSparseAttn arithmetic).
-const QSA_PACKED_HEADER =
-    \\#define QSA_PACKED 1
+const QSA_PACKED_HEADER = "#define QSA_PACKED 1\n" ++ KV_UNPACK_HEADER ++
     \\template <typename T, int BITS, int GS>
     \\inline uint4 sushi_qsa_unpack8(const device uint32_t* wq, const device T* sc, const device T* bi, int c8) {
-    \\  constexpr int VPW = 32 / BITS;
-    \\  constexpr int NW = 8 / VPW;
-    \\  constexpr uint MASKB = (1u << BITS) - 1u;
     \\  const int g = (c8 * 8) / GS;
-    \\  const float sj = float(sc[g]);
-    \\  const float bj = float(bi[g]);
     \\  uint4 out = uint4(0);
-    \\  thread T* e = (thread T*)&out;
-    \\  for (int wj = 0; wj < NW; ++wj) {
-    \\    const uint w = wq[c8 * NW + wj];
-    \\    for (int u = 0; u < VPW; ++u) e[wj * VPW + u] = T(float((w >> (u * BITS)) & MASKB) * sj + bj);
-    \\  }
+    \\  sushi_kv_unpack8<T, BITS>(wq, c8, float(sc[g]), float(bi[g]), (thread T*)&out);
     \\  return out;
     \\}
     \\
@@ -3403,9 +3435,8 @@ fn gatherQsa256Impl(
     const ks = mlx.getShape(k);
     const vs = mlx.getShape(v);
     const bs = mlx.getShape(blocks);
-    const vpw: c_int = if (is_packed) @divExact(32, @as(c_int, view.bits)) else 1;
     if (is_packed) {
-        if (view.bits != 4 and view.bits != 8) return null;
+        if (!KVQuantConfig.supportedBits(view.bits)) return null;
         if (view.group_size == 0 or 256 % view.group_size != 0 or view.group_size % 8 != 0) return null;
         const g: c_int = @intCast(256 / view.group_size);
         for ([_]mlx.mlx_array{ view.k_triple_scales, view.k_triple_biases, view.v_triple_scales, view.v_triple_biases }) |a| {
@@ -3416,7 +3447,8 @@ fn gatherQsa256Impl(
         if (mlx.mlx_array_dtype(k) != .uint32 or mlx.mlx_array_dtype(v) != .uint32) return null;
         if (mlx.mlx_array_strides(k)[3] != 1 or mlx.mlx_array_strides(v)[3] != 1) return null;
     } else if (mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16 or !attn256Base16Aligned(k) or !attn256Base16Aligned(v)) return null;
-    if (qs[3] != 256 or ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
+    const row_cols: c_int = if (is_packed) kv_quant.packedWords(256, view.bits) else 256;
+    if (qs[3] != 256 or ks[3] != row_cols or vs[3] != row_cols) return null;
     if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
     const gqa: c_int = @divTrunc(qs[1], ks[1]);
     if (gqa > 64) return null;
@@ -4036,9 +4068,6 @@ const QSA_ATTN_Q_SOURCE =
     \\// Simdgroups past NSG only stage tiles: who loads an element never changes its value.
     \\constexpr int NT = 32 * NSGT;
     \\constexpr int KT = BK / 8;
-    \\constexpr int VPW = 32 / BITS;
-    \\constexpr int NW = 8 / VPW;
-    \\constexpr uint MASKB = (1u << BITS) - 1u;
     \\constexpr int KV_ELEMS = (DK * LDK > BK * LDV) ? DK * LDK : BK * LDV;
     \\// Per-length split counts ride the grid, never a template.
     \\const int NSPLIT = int(threadgroups_per_grid.z);
@@ -4143,10 +4172,7 @@ const QSA_ATTN_Q_SOURCE =
     \\      const int g = cb / GS;
     \\      const float sj = float(ksc[ksc_base + (long)pos * ksc_strides[2] + (long)g]);
     \\      const float bj = float(kbi[kbi_base + (long)pos * kbi_strides[2] + (long)g]);
-    \\      for (int wj = 0; wj < NW; ++wj) {
-    \\        const uint w = uint(kq[wrow + (long)(cb / VPW + wj)]);
-    \\        for (int u = 0; u < VPW; ++u) ev[wj * VPW + u] = T(float((w >> (u * BITS)) & MASKB) * sj + bj);
-    \\      }
+    \\      sushi_kv_unpack8<T, BITS>((const device uint32_t*)(kq + wrow), c8, sj, bj, ev);
     \\      } else {
     \\        for (int j = 0; j < 8; ++j) ev[j] = T(kq[kq_base + (long)pos * kq_strides[2] + cb + j]);
     \\      }
@@ -4193,10 +4219,7 @@ const QSA_ATTN_Q_SOURCE =
     \\      const int g = cb / GS;
     \\      const float sj = float(vsc[vsc_base + (long)pos * vsc_strides[2] + (long)g]);
     \\      const float bj = float(vbi[vbi_base + (long)pos * vbi_strides[2] + (long)g]);
-    \\      for (int wj = 0; wj < NW; ++wj) {
-    \\        const uint w = uint(vq[wrow + (long)(cb / VPW + wj)]);
-    \\        for (int u = 0; u < VPW; ++u) ev[wj * VPW + u] = T(float((w >> (u * BITS)) & MASKB) * sj + bj);
-    \\      }
+    \\      sushi_kv_unpack8<T, BITS>((const device uint32_t*)(vq + wrow), c8, sj, bj, ev);
     \\      } else {
     \\        for (int j = 0; j < 8; ++j) ev[j] = T(vq[vq_base + (long)pos * vq_strides[2] + cb + j]);
     \\      }
@@ -4404,7 +4427,7 @@ fn getQsaAttnQKernel() !mlx.mlx_fast_metal_kernel {
         in_vec,
         out_vec,
         QSA_ATTN_Q_SOURCE,
-        ATTN_QSA256_KERNEL_HEADER,
+        KV_UNPACK_HEADER ++ ATTN_QSA256_KERNEL_HEADER,
         false, // packed triples are cache VIEWS — a contiguous copy erases the win
         false,
     );
@@ -4604,7 +4627,7 @@ pub fn qsaSparseAttn(
     const quant = kv_view.has_quant_triple;
     const bits: u8 = if (quant) kv_view.bits else 8;
     const gs: u32 = if (quant) kv_view.group_size else 64;
-    if (bits != 4 and bits != 8) return null;
+    if (!KVQuantConfig.supportedBits(bits)) return null;
     if (gs == 0 or @rem(@as(u32, 256), gs) != 0 or gs % 8 != 0) return null;
     const arrays = if (quant)
         [_]mlx.mlx_array{ kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases, kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases }
@@ -4616,8 +4639,8 @@ pub fn qsaSparseAttn(
     if (!quant and (mlx.mlx_array_dtype(arrays[0]) != .bfloat16 or mlx.mlx_array_dtype(arrays[3]) != .bfloat16)) return null;
     const ks = mlx.getShape(arrays[0]);
     const vs = mlx.getShape(arrays[3]);
-    const vpw: c_int = if (quant) @divExact(@as(c_int, 32), @as(c_int, bits)) else 1;
-    if (ks[0] != 1 or vs[0] != 1 or ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
+    const row_cols: c_int = if (quant) kv_quant.packedWords(256, bits) else 256;
+    if (ks[0] != 1 or vs[0] != 1 or ks[3] != row_cols or vs[3] != row_cols) return null;
     const h_kv = ks[1];
     const kv = ks[2];
     if (h_kv <= 0 or kv < seq_len or vs[1] != h_kv or vs[2] != kv or @rem(qs[1], h_kv) != 0) return null;
@@ -4675,7 +4698,7 @@ var qkv_splitk_engaged: bool = false;
 /// (DK, DV) up to 256 in multiples of the quant group. Null = declined.
 pub fn qkvAttnSplitKKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
-    if (!view.has_quant_triple or (view.bits != 4 and view.bits != 8)) return null;
+    if (!view.has_quant_triple or !KVQuantConfig.supportedBits(view.bits)) return null;
     const gs: c_int = @intCast(view.group_size);
     if (gs == 0 or @rem(gs, 8) != 0) return null;
     if (mlx.mlx_array_ndim(q_in) != 4 or mlx.mlx_array_dtype(q_in) != .bfloat16) return null;
@@ -4689,9 +4712,8 @@ pub fn qkvAttnSplitKKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const 
     }
     const ks = mlx.getShape(arrays[0]);
     const vs = mlx.getShape(arrays[3]);
-    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, view.bits));
-    const dk: c_int = ks[3] * vpw;
-    const dv: c_int = vs[3] * vpw;
+    const dk: c_int = kv_quant.unpackedDim(ks[3], view.bits);
+    const dv: c_int = kv_quant.unpackedDim(vs[3], view.bits);
     // Registers hold DK/8 + DV/8 fragments; the staging holds a DK x (BK + 8) tile.
     if (qs[3] != dk or dk > 256 or dv > 256 or @rem(dk, gs) != 0 or @rem(dv, gs) != 0) return null;
     const h_kv = ks[1];
@@ -5053,14 +5075,14 @@ pub fn qsaDecodeGatherAttn(
     defer _ = mlx.mlx_array_free(add4);
     try mlx.check(mlx.mlx_reshape(&add4, addv, &[_]c_int{ 1, 1, 1, gathered_len }, 4, s));
 
-    // Gather rows: quant triples when the view carries affine 4/8-bit (then
+    // Gather rows: quant triples when the view carries affine 4/6/8-bit (then
     // dequantize ONLY the subset), else dense rows. Dequantize is per-token
     // along D, so subset-first is exactly full-first-restricted.
     var gk = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gk);
     var gv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gv);
-    if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
+    if (kv_view.has_quant_triple and KVQuantConfig.supportedBits(kv_view.bits)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
         if (kq.ctx == null or vq.ctx == null) return dq.no(.quant_layout);
@@ -5616,7 +5638,7 @@ pub fn qsaVerifyGatherAttn(
     defer _ = mlx.mlx_array_free(add4);
     try mlx.check(mlx.mlx_reshape(&add4, addv, &[_]c_int{ 1, 1, seq_len, geom.rows }, 4, s));
 
-    // Gather rows: quant triples when the view carries affine 4/8-bit (then
+    // Gather rows: quant triples when the view carries affine 4/6/8-bit (then
     // dequantize ONLY the subset — the whole point at `--kv-quant 8`), else
     // dense rows. Dequantize groups along D, so subset-first is exactly
     // full-first-restricted (pinned by the take-then-dequantize test).
@@ -5624,7 +5646,7 @@ pub fn qsaVerifyGatherAttn(
     defer _ = mlx.mlx_array_free(gk);
     var gv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gv);
-    if (kv_view.has_quant_triple and (kv_view.bits == 4 or kv_view.bits == 8)) {
+    if (kv_view.has_quant_triple and KVQuantConfig.supportedBits(kv_view.bits)) {
         const kq = kv_view.k_triple_q;
         const vq = kv_view.v_triple_q;
         if (kq.ctx == null or vq.ctx == null) return dq.no(.quant_layout);
@@ -13111,9 +13133,11 @@ const QKV_MPP_KERNEL_SOURCE =
     \\constexpr int M = MPAD; // matmul2d wants rows in multiples of 8; pad rows carry zero queries
     \\constexpr int N = 32;
     \\constexpr int NT = 128; // the page loop is barrier- and matmul-latency bound: 8 simdgroups wait on each other
-    \\constexpr int KC = DK / VPW / 2; // uint2 words per K row
-    \\constexpr int VC = DV / VPW / 2;
-    \\constexpr int CPG = GS / VPW / 2; // uint2 words per quant group
+    \\constexpr int UW = BITS == 6 ? 3 : 2; // uint32 words per load unit
+    \\constexpr int UV = UW * 32 / BITS; // values per unit: 16 at 4 and 6 bits, 8 at 8
+    \\constexpr int KC = DK / UV; // units per K row
+    \\constexpr int VC = DV / UV;
+    \\constexpr int CPG = GS / UV; // units per quant group
     \\constexpr int KIT = (N * KC + NT - 1) / NT;
     \\constexpr int VIT = (N * VC + NT - 1) / NT;
     \\const uint tid = thread_position_in_threadgroup.x;
@@ -13156,8 +13180,8 @@ const QKV_MPP_KERNEL_SOURCE =
     \\
     \\const long kq0 = (long)hkv * kq_strides[1], ks0 = (long)hkv * ksc_strides[1], kb0 = (long)hkv * kbi_strides[1];
     \\const long vq0 = (long)hkv * vq_strides[1], vs0 = (long)hkv * vsc_strides[1], vb0 = (long)hkv * vbi_strides[1];
-    \\uint2 kr[KIT]; float ksr[KIT], kbr[KIT];
-    \\uint2 vr[VIT]; float vsr[VIT], vbr[VIT];
+    \\uint2 kr[KIT]; uint kr3[KIT]; float ksr[KIT], kbr[KIT];
+    \\uint2 vr[VIT]; uint vr3[VIT]; float vsr[VIT], vbr[VIT];
     \\// Rows past Tk re-read row Tk-1 and are masked in the softmax.
     \\#define QKV_LOAD(C, IT, REG, SREG, BREG, QP, Q0, QSTR, SP, S0, SSTR, BP, B0, BSTR, TOK0) \
     \\  for (int i = 0; i < IT; ++i) { \
@@ -13165,7 +13189,13 @@ const QKV_MPP_KERNEL_SOURCE =
     \\    if (c < N * C) { \
     \\      const int n = c / C, ci = c % C, g = ci / CPG; \
     \\      const long r = (long)min((TOK0) + n, Tk - 1); \
-    \\      REG[i] = ((const device uint2*)(QP + Q0 + r * QSTR[2]))[ci]; \
+    \\      if constexpr (BITS == 6) { \
+    \\        const device uint* wp = (const device uint*)(QP + Q0 + r * QSTR[2]) + ci * 3; \
+    \\        REG[i] = uint2(wp[0], wp[1]); \
+    \\        REG##3[i] = wp[2]; \
+    \\      } else { \
+    \\        REG[i] = ((const device uint2*)(QP + Q0 + r * QSTR[2]))[ci]; \
+    \\      } \
     \\      SREG[i] = float(SP[S0 + r * SSTR[2] + g]); \
     \\      BREG[i] = float(BP[B0 + r * BSTR[2] + g]); \
     \\    } \
@@ -13174,10 +13204,14 @@ const QKV_MPP_KERNEL_SOURCE =
     \\  for (int i = 0; i < IT; ++i) { \
     \\    const int c = int(tid) + i * NT; \
     \\    if (c < N * C) { \
-    \\      threadgroup T* dst = tile + (c / C) * D + (c % C) * 2 * VPW; \
-    \\      for (int h = 0; h < 2; ++h) \
-    \\        for (int u = 0; u < VPW; ++u) \
-    \\          dst[h * VPW + u] = T(float((REG[i][h] >> (u * BITS)) & mask_bits) * SREG[i] + BREG[i]); \
+    \\      threadgroup T* dst = tile + (c / C) * D + (c % C) * UV; \
+    \\      if constexpr (BITS == 6) { \
+    \\        sushi_kv_store16_b6<T>(REG[i].x, REG[i].y, REG##3[i], SREG[i], BREG[i], dst); \
+    \\      } else { \
+    \\        for (int h = 0; h < 2; ++h) \
+    \\          for (int u = 0; u < VPW; ++u) \
+    \\            dst[h * VPW + u] = T(float((REG[i][h] >> (u * BITS)) & mask_bits) * SREG[i] + BREG[i]); \
+    \\      } \
     \\    } \
     \\  }
     \\if (pb < pe) { QKV_LOAD(KC, KIT, kr, ksr, kbr, kq, kq0, kq_strides, ksc, ks0, ksc_strides, kbi, kb0, kbi_strides, pb * N) }
@@ -13246,9 +13280,11 @@ const QKV_MPP_ROWS_KERNEL_SOURCE =
     \\constexpr int MR = GQA * TQ;
     \\constexpr int N = 32;
     \\constexpr int NT = 128;
-    \\constexpr int KC = DK / VPW / 2;
-    \\constexpr int VC = DV / VPW / 2;
-    \\constexpr int CPG = GS / VPW / 2;
+    \\constexpr int UW = BITS == 6 ? 3 : 2;
+    \\constexpr int UV = UW * 32 / BITS;
+    \\constexpr int KC = DK / UV;
+    \\constexpr int VC = DV / UV;
+    \\constexpr int CPG = GS / UV;
     \\constexpr int KIT = (N * KC + NT - 1) / NT;
     \\constexpr int VIT = (N * VC + NT - 1) / NT;
     \\const uint tid = thread_position_in_threadgroup.x;
@@ -13291,15 +13327,21 @@ const QKV_MPP_ROWS_KERNEL_SOURCE =
     \\
     \\const long kq0 = (long)hkv * kq_strides[1], ks0 = (long)hkv * ksc_strides[1], kb0 = (long)hkv * kbi_strides[1];
     \\const long vq0 = (long)hkv * vq_strides[1], vs0 = (long)hkv * vsc_strides[1], vb0 = (long)hkv * vbi_strides[1];
-    \\uint2 kr[KIT]; float ksr[KIT], kbr[KIT];
-    \\uint2 vr[VIT]; float vsr[VIT], vbr[VIT];
+    \\uint2 kr[KIT]; uint kr3[KIT]; float ksr[KIT], kbr[KIT];
+    \\uint2 vr[VIT]; uint vr3[VIT]; float vsr[VIT], vbr[VIT];
     \\#define QKV_LOAD(C, IT, REG, SREG, BREG, QP, Q0, QSTR, SP, S0, SSTR, BP, B0, BSTR, TOK0) \
     \\  for (int i = 0; i < IT; ++i) { \
     \\    const int c = int(tid) + i * NT; \
     \\    if (c < N * C) { \
     \\      const int n = c / C, ci = c % C, g = ci / CPG; \
     \\      const long r = (long)min((TOK0) + n, Tk - 1); \
-    \\      REG[i] = ((const device uint2*)(QP + Q0 + r * QSTR[2]))[ci]; \
+    \\      if constexpr (BITS == 6) { \
+    \\        const device uint* wp = (const device uint*)(QP + Q0 + r * QSTR[2]) + ci * 3; \
+    \\        REG[i] = uint2(wp[0], wp[1]); \
+    \\        REG##3[i] = wp[2]; \
+    \\      } else { \
+    \\        REG[i] = ((const device uint2*)(QP + Q0 + r * QSTR[2]))[ci]; \
+    \\      } \
     \\      SREG[i] = float(SP[S0 + r * SSTR[2] + g]); \
     \\      BREG[i] = float(BP[B0 + r * BSTR[2] + g]); \
     \\    } \
@@ -13308,10 +13350,14 @@ const QKV_MPP_ROWS_KERNEL_SOURCE =
     \\  for (int i = 0; i < IT; ++i) { \
     \\    const int c = int(tid) + i * NT; \
     \\    if (c < N * C) { \
-    \\      threadgroup T* dst = tile + (c / C) * D + (c % C) * 2 * VPW; \
-    \\      for (int h = 0; h < 2; ++h) \
-    \\        for (int u = 0; u < VPW; ++u) \
-    \\          dst[h * VPW + u] = T(float((REG[i][h] >> (u * BITS)) & mask_bits) * SREG[i] + BREG[i]); \
+    \\      threadgroup T* dst = tile + (c / C) * D + (c % C) * UV; \
+    \\      if constexpr (BITS == 6) { \
+    \\        sushi_kv_store16_b6<T>(REG[i].x, REG[i].y, REG##3[i], SREG[i], BREG[i], dst); \
+    \\      } else { \
+    \\        for (int h = 0; h < 2; ++h) \
+    \\          for (int u = 0; u < VPW; ++u) \
+    \\            dst[h * VPW + u] = T(float((REG[i][h] >> (u * BITS)) & mask_bits) * SREG[i] + BREG[i]); \
+    \\      } \
     \\    } \
     \\  }
     \\if (pb < pe) { QKV_LOAD(KC, KIT, kr, ksr, kbr, kq, kq0, kq_strides, ksc, ks0, ksc_strides, kbi, kb0, kbi_strides, pb * N) }
@@ -13429,11 +13475,10 @@ fn qkvMppRunProbe(kernel: mlx.mlx_fast_metal_kernel, key: QkvMppKey) bool {
     defer mlx.dropLatchedErrorUnless(had_error);
     const cfg = qkvMppConfig(key, 1, 1) catch return false;
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    const vpw: c_int = @divExact(32, @as(c_int, key.bits));
     const gs: c_int = @intCast(key.gs);
     const shapes = [_][4]c_int{
-        .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dk, vpw) }, .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dk, gs) },
-        .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dk, gs) },  .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dv, vpw) },
+        .{ 1, 1, QKV_MPP_PAGE, kv_quant.packedWords(key.dk, key.bits) }, .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dk, gs) },
+        .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dk, gs) },                  .{ 1, 1, QKV_MPP_PAGE, kv_quant.packedWords(key.dv, key.bits) },
         .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dv, gs) },  .{ 1, 1, QKV_MPP_PAGE, @divExact(key.dv, gs) },
     };
     var arrs: [9]mlx.mlx_array = @splat(.{ .ctx = null });
@@ -13481,7 +13526,7 @@ fn qkvMppKernelFor(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, sourc
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kk = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, QSA_SCORE_KERNEL_HEADER, false, false);
+    const kk = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, KV_UNPACK_HEADER ++ QSA_SCORE_KERNEL_HEADER, false, false);
     if (kk.ctx == null) return null;
     slot.* = kk;
     return kk;
@@ -13497,7 +13542,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
 pub fn qkvAttnMpp(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8, rows: bool) !?mlx.mlx_array {
     if (!verifyQmmNaxAvailable()) return null;
     if (!view.has_quant_triple or view.group_size == 0) return null;
-    if (view.bits != 4 and view.bits != 8) return null;
+    if (!KVQuantConfig.supportedBits(view.bits)) return null;
     if (mlx.mlx_array_ndim(q_in) != 4) return null;
     const qs = mlx.getShape(q_in);
     const t_q: c_int = qs[2];
@@ -13509,18 +13554,19 @@ pub fn qkvAttnMpp(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVVi
     if (mlx.mlx_array_ndim(view.k_triple_q) != 4 or mlx.mlx_array_ndim(view.v_triple_q) != 4) return null;
     const ks = mlx.getShape(view.k_triple_q);
     const vs = mlx.getShape(view.v_triple_q);
-    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, view.bits));
-    const dk: c_int = ks[3] * vpw;
-    const dv: c_int = vs[3] * vpw;
+    const dk: c_int = kv_quant.unpackedDim(ks[3], view.bits);
+    const dv: c_int = kv_quant.unpackedDim(vs[3], view.bits);
     // Measured shapes only: the tile holds 32 rows of max(DK, DV), 16 KiB at 256.
     if (qs[3] != dk or !((dk == 256 and dv == 256) or (dk == 192 and dv == 128))) return null;
     const gs: c_int = @intCast(view.group_size);
     if (@rem(dk, gs) != 0 or @rem(dv, gs) != 0) return null;
-    // The kernel reads packed words in aligned pairs that never straddle a quant group.
-    if (@rem(@divTrunc(gs, vpw), 2) != 0) return null;
+    // The kernel loads packed words in units that never straddle a quant group: aligned pairs, or
+    // word triples at 6 bits (sixteen values, read as plain words).
+    const unit_words: c_int = if (view.bits == 6) 3 else 2;
+    if (@rem(kv_quant.packedWords(gs, view.bits), unit_words) != 0) return null;
     for ([_]mlx.mlx_array{ view.k_triple_q, view.v_triple_q }) |a| {
         const st = mlx.mlx_array_strides(a);
-        if (@rem(st[1], 2) != 0 or @rem(st[2], 2) != 0) return null;
+        if (unit_words == 2 and (@rem(st[1], 2) != 0 or @rem(st[2], 2) != 0)) return null;
     }
     const h_q: c_int = qs[1];
     const h_kv: c_int = ks[1];
@@ -13678,13 +13724,12 @@ pub fn qkvMppPartition(t_k: c_int) [2]c_int {
 
 /// Whether a decode row (t_q 1) over `view` gets the matmul2d kernel, its template set probed.
 pub fn qkvMppDecodeProbeOk(q: mlx.mlx_array, view: *const DenseKVView) bool {
-    if (view.bits != 4 and view.bits != 8) return false;
+    if (!KVQuantConfig.supportedBits(view.bits)) return false;
     const kernel = qkvMppKernel() orelse return false;
-    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, view.bits));
     const ks = mlx.getShape(view.k_triple_q);
     return qkvMppProbe(kernel, .{
-        .dk = ks[3] * vpw,
-        .dv = mlx.getShape(view.v_triple_q)[3] * vpw,
+        .dk = kv_quant.unpackedDim(ks[3], view.bits),
+        .dv = kv_quant.unpackedDim(mlx.getShape(view.v_triple_q)[3], view.bits),
         .bits = view.bits,
         .gs = view.group_size,
         .gqa = @divTrunc(mlx.getShape(q)[1], ks[1]),
@@ -28218,6 +28263,8 @@ test "composed quantAttention is correct on STRIDED cache views" {
     // routes t_q == 1 here, but the helper's contract is width-agnostic and
     // the strided-view class is the point.)
     try composedStridedCase(8, 2, 64, 4, 20, 4, "causal");
+    try composedStridedCase(8, 2, 64, 6, 20, 4, "causal");
+    try composedStridedCase(8, 2, 256, 6, 20, 15, "array");
     try composedStridedCase(8, 2, 256, 4, 0, 15, "causal");
     try composedStridedCase(8, 2, 256, 4, 0, 15, "array");
     try composedStridedCase(8, 2, 256, 4, 20, 15, "array");
@@ -28384,7 +28431,7 @@ test "qkv matmul2d kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs 
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x3D2D_0192);
     const rnd = prng.random();
-    for ([_]u8{ 8, 4 }) |bits| {
+    for ([_]u8{ 8, 6, 4 }) |bits| {
         // 1000 + Tq keys: a partial last page.
         for (1..5) |tq| try qkvPackedParityCase(qkvAttnMppKernel, rnd, 64, 4, 192, 128, bits, 1000, @intCast(tq));
     }
@@ -28401,6 +28448,8 @@ test "qkv matmul2d kernel parity: many splits, and the narrower gqa 4 and 24/4 h
     try qkvPackedParityCase(qkvAttnMppKernel, rnd, 16, 4, 192, 128, 8, 3000, 1);
     try qkvPackedParityCase(qkvAttnMppKernel, rnd, 24, 4, 256, 256, 8, 3000, 1);
     try qkvPackedParityCase(qkvAttnMppKernel, rnd, 24, 4, 256, 256, 4, 3000, 2);
+    try qkvPackedParityCase(qkvAttnMppKernel, rnd, 24, 4, 256, 256, 6, 3000, 2);
+    try qkvPackedParityCase(qkvAttnMppKernel, rnd, 64, 4, 192, 128, 6, 20000, 4);
 }
 
 test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs the fp32 truth, no matrix units" {
@@ -28411,7 +28460,7 @@ test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs t
     defer qkv_splitk_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x3D2D_5A11);
     const rnd = prng.random();
-    for ([_]u8{ 8, 4 }) |bits| {
+    for ([_]u8{ 8, 6, 4 }) |bits| {
         // 1001 keys: a partial last tile. Tq 3 = the causal verify rows.
         qkv_splitk_split_override = null;
         try qkvPackedParityCase(qkvAttnSplitKKernel, rnd, 64, 4, 192, 128, bits, 1000, 1);
@@ -28427,6 +28476,7 @@ test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs t
     // Flash-Next's own width through the same range body.
     qkv_splitk_split_override = null;
     try qkvPackedParityCase(qkvAttnSplitKKernel, rnd, 24, 2, 256, 256, 8, 3000, 1);
+    try qkvPackedParityCase(qkvAttnSplitKKernel, rnd, 24, 2, 256, 256, 6, 3000, 1);
 }
 
 const KvqUbArm = union(enum) {
@@ -28861,6 +28911,9 @@ test "mimo global verify rows on a packed cache share matmul2d passes in groups,
         .{ .prefix = 65566, .width = 4, .shared = true }, // pages 2049 -> 2050, 17 per split
         .{ .prefix = 65566, .width = 4, .shared = true, .kv_heads = 4 },
         .{ .prefix = 65567, .width = 4, .shared = true, .bits = 4 },
+        .{ .prefix = 65567, .width = 4, .shared = true, .bits = 6 },
+        .{ .prefix = 65566, .width = 4, .shared = true, .bits = 6, .kv_heads = 4 },
+        .{ .prefix = 65565, .width = 7, .shared = true, .bits = 6 },
         .{ .prefix = 65567, .width = 4, .shared = true }, // pages 2049 -> 2050 inside the first pair
         .{ .prefix = 65534, .width = 4, .shared = true }, // pages 2048 -> 2049 between the two pairs
         .{ .prefix = 65535, .width = 4, .shared = false }, // pages 2048 -> 2049 inside the first pair: 16 -> 17 per split
@@ -29548,13 +29601,14 @@ test "batched KV append: per-layer op count is quantize-once plus per-slot write
     try testing.expect((bat_at[2] - bat_at[0]) < (solo_at[2] - solo_at[0]));
 }
 
-test "batched KV append: dense and affine-4 stay on the per-slot path" {
+test "batched KV append: dense, affine-4 and affine-6 stay on the per-slot path" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const schemes = [_]kv_quant.KVQuantConfig{
         kv_quant.KVQuantConfig.dense,
         kv_quant.KVQuantConfig.affine(4),
+        kv_quant.KVQuantConfig.affine(6),
     };
     for (schemes) |cfg| {
         var solo: [2]KVCache = .{ try KVCache.initWithConfig(alloc, 1, cfg), try KVCache.initWithConfig(alloc, 1, cfg) };
@@ -38758,6 +38812,35 @@ test "fusedSdpaPrefillKv: a quantized cache is read per dispatch, never rebuilt 
     try std.testing.expect(sliced_err <= (try attn256MaxDiff(ref, truth, s)) + scale_of * 0.00390625);
 }
 
+test "fusedSdpaPrefillKv: a kv6 cache is read per dispatch and matches the dense arm over its rebuild" {
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
+    var prng = std.Random.DefaultPrng.init(0x19286);
+    const rnd = prng.random();
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 16, 70, 192 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 1993, 192 }, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 1993, 128 }, s);
+    defer _ = mlx.mlx_array_free(v);
+    const scale: f32 = 1.0 / @sqrt(192.0);
+    var qv = try TestQuantView.init(s, k, v, 6, 64);
+    defer qv.deinit();
+
+    fused256_budget_override = 16 * 70 * 256;
+    defer fused256_budget_override = null;
+    const sliced = (try fusedSdpaPrefillKv(s, q, &qv.view, scale, 0, .{ .ctx = null })) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(sliced);
+    try std.testing.expect(fused256_last_dispatch_count > 1);
+    fused256_budget_override = 0;
+    const whole = (try fusedSdpaPrefill(s, q, qv.view.k, qv.view.v, scale, 0)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(whole);
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(sliced, whole, s));
+}
+
 test "fusedSdpaPrefillKv: an unquantized cache view takes the dense arm unchanged" {
     const s = mlx.gpuStream();
     fused256_override = true;
@@ -41696,7 +41779,7 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
     var prng = std.Random.DefaultPrng.init(0x5A17_C0DE);
     const rnd = prng.random();
 
-    const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, hq: c_int, hkv: c_int }{
+    const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, hq: c_int, hkv: c_int, bits: u8 = 8 }{
         // Decode width: NSPLIT hits the ceiling, most splits are empty.
         .{ .s = 1, .kv = 4096, .kb = 64, .hq = 24, .hkv = 2 },
         .{ .s = 1, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2 },
@@ -41713,6 +41796,10 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
         .{ .s = 6, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2 },
         // Fewer visible blocks than the budget: the INT_MAX pads must never be read.
         .{ .s = 6, .kv = 4096, .kb = 2048, .hq = 24, .hkv = 2 },
+        .{ .s = 1, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2, .bits = 6 },
+        .{ .s = 6, .kv = 20000, .kb = 128, .hq = 24, .hkv = 2, .bits = 6 },
+        .{ .s = 15, .kv = 20001, .kb = 128, .hq = 12, .hkv = 1, .bits = 6 },
+        .{ .s = 6, .kv = 4096, .kb = 2048, .hq = 24, .hkv = 2, .bits = 6 },
     };
 
     for (cases) |c| {
@@ -41751,10 +41838,10 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
             try std.testing.expect(dd <= d_bar);
         }
 
-        // Packed arm: a real affine-8 cache, filled in two appends so the view is strided.
-        var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
+        // Packed arm: a real affine cache, filled in two appends so the view is strided.
+        var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(c.bits));
         defer cache.deinit();
-        var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.affine(8), &cache);
+        var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.affine(c.bits), &cache);
         defer view.deinit();
         try std.testing.expect(view.has_quant_triple);
         try std.testing.expectEqual(c.kv, mlx.getShape(view.k)[2]);
@@ -41767,7 +41854,7 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
         const qd = try attn256MaxDiff(got_q, ref_q, s);
         const qc = try attn256Cosine(got_q, ref_q, s);
         const q_bar = try attn256UlpBar(ref_q, s);
-        errdefer std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} affine-8: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), qd, qc, q_bar });
+        errdefer std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} affine-{d}: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), c.bits, qd, qc, q_bar });
         try std.testing.expect(qc > 0.99999);
         try std.testing.expect(qd <= q_bar);
 
@@ -41795,6 +41882,8 @@ test "qsa sparse attn: packed caches serve widths past 15 within the error bar o
         .{ .s = 32, .kv = 62003, .kb = 512, .bits = 4 },
         .{ .s = QSA_ATTN_PACKED_MAX_S, .kv = 70000, .kb = 512, .bits = 8 },
         .{ .s = QSA_ATTN_PACKED_MAX_S, .kv = 33333, .kb = 512, .bits = 4 },
+        .{ .s = 24, .kv = 62003, .kb = 512, .bits = 6 },
+        .{ .s = QSA_ATTN_PACKED_MAX_S, .kv = 33335, .kb = 512, .bits = 6, .nsplit = 64 },
         // Fewer visible blocks than the budget: the INT_MAX pads must never be read.
         .{ .s = 32, .kv = 4097, .kb = 2048, .bits = 8 },
         .{ .s = 16, .kv = 70002, .kb = 512, .bits = 8, .nsplit = 64 },
@@ -41883,8 +41972,11 @@ test "qsa packed gather: prefill widths read the packed cache as precisely as th
         .{ .s = 64, .kv = 33333, .kb = 512, .bits = 4 },
         .{ .s = 256, .kv = 20002, .kb = 512, .bits = 8 },
         .{ .s = 1024, .kv = 12345, .kb = 512, .bits = 8 },
+        .{ .s = 128, .kv = 20003, .kb = 512, .bits = 6 },
+        .{ .s = 1024, .kv = 12347, .kb = 512, .bits = 6 },
         // Fewer visible blocks than the budget: the INT_MAX pads must never be read.
         .{ .s = 512, .kv = 4097, .kb = 2048, .bits = 4 },
+        .{ .s = 512, .kv = 4099, .kb = 2048, .bits = 6 },
         // A first chunk: the early rows see every block they have.
         .{ .s = 3001, .kv = 3001, .kb = 512, .bits = 8 },
     };

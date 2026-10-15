@@ -17,7 +17,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
   which admission evicts for a long prefill; long reuse belongs on `--prefix-cache-disk` or SSD-only.
 - Cache: kv8 compressed MLA latent plus FP32 KDA state, the engine default; it passed its KLD gate
   ([quality-kld](quality-kld.md)). `--kv-quant 16` (or `kv_quant: 16` per request or in model-settings) keeps the
-  latent BF16. The pooled index and KDA state stay lossless. kv4 is refused (`GlmKvQuantUnsupported`), and the KLD teacher capture refuses any kv-quant.
+  latent BF16. The pooled index and KDA state stay lossless. kv4 and kv6 are refused (`GlmKvQuantUnsupported`), and the KLD teacher capture refuses any kv-quant.
 - Thinking: `low`, `high`, `max` (the template's `effective_reasoning_effort`); Sushi defaults to `high` (the HF
   template defaults to `max`); thinking off is refused. The effort words impose no token cap.
 - Image and video input through the native tower, on when present (a streamed load only with `--vision`);

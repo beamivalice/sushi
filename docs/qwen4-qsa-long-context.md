@@ -15,7 +15,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 - Rows 1..15 (decode and verify) = the fused split-K `qsaSparseAttn` on dense and packed caches alike
   (`qsaAlignedSparseAttn`). When it declines, decode falls to
   `qsaDecodeGatherAttn` and rows 2..15 to the union gather `qsaVerifyGatherAttn`.
-- **A PACKED (kv8/kv4) cache never takes the dense-mask arm and never rebuilds whole per layer**
+- **A PACKED (kv8/kv6/kv4) cache never takes the dense-mask arm and never rebuilds whole per layer**
   (`qsaSparseAttnServes`): split-K serves up to `QSA_ATTN_PACKED_MAX_S` = 40 rows; past that
   `gatherQsa256Packed` gathers the packed rows in place while each cache row is staged at most
   `QSA_PACKED_GATHER_MAX_REUSE` = 4 times (`qsaPackedGatherServes`), else a gather over ONE rebuild.

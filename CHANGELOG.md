@@ -4,6 +4,11 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **`--kv-quant 6`**: a 6-bit KV cache between kv4 and kv8, with `kv_quant` 6 in `model-settings.json` and per request;
+  GLM still takes only kv8 and BF16.
+
 ## v1.2.4 — Faster Qwen3.8-Flash-Next, more context admission, image cache
 
 - **Qwen3.8-Flash-Next Sushi-2.6bpw decodes faster with the same output**: its expert kernels run about 10% faster

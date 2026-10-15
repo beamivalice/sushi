@@ -230,8 +230,8 @@ fn printUsage(io: std.Io) void {
         \\                      Flash-Next) to save memory on smaller machines.
         \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
-        \\                        8 or 4 — affine group quant; default 8 on
-        \\                          every model (GLM refuses 4). 16 (or `off`)
+        \\                        8, 6 or 4 — affine group quant; default 8 on
+        \\                          every model (GLM refuses 6, 4). 16 (or `off`)
         \\                          keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`
@@ -838,7 +838,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             kv_quant_explicit = true;
             kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
-                log.err("--kv-quant: expected one of {{16, 8, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
+                log.err("--kv-quant: expected one of {{16, 8, 6, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--ssd-budget-gb") and i + 1 < args.len) {
