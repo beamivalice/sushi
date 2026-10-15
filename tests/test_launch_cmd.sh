@@ -111,7 +111,7 @@ fi
 
 # ── [5] claude --print ──
 OUT=$("$BIN" launch claude --print --url "$BASE" 2>&1)
-EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 4)))")
+EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 2)))")
 OK=1
 echo "$OUT" | grep -q "export ANTHROPIC_BASE_URL='$BASE'" || OK=0
 echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=$EXPECT_OUT" || OK=0
