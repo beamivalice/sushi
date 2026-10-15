@@ -1,6 +1,6 @@
 .{
     .name = .sushi,
-    .version = "1.2.3",
+    .version = "1.2.4",
     .fingerprint = 0xeb4cd3f692edeafd,
     .minimum_zig_version = "0.17.0",
     .paths = .{

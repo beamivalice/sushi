@@ -4,10 +4,13 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.2.4 — Faster Qwen3.8-Flash-Next, more context admission, image cache
 
 - **Qwen3.8-Flash-Next Sushi-2.6bpw decodes faster with the same output**: its expert kernels run about 10% faster
   per layer, about 2-4% per forward when MTP verifies drafts.
+- **Twice the context on a 32 GB Mac**: Qwen3.8-Flash-Next streamed from the SSD stops billing memory it never
+  uses, so Sushi-2bpw on a 32 GB Mac advertises 261k tokens instead of 140k and serves a 250k-token prompt, and a
+  context that loads is one its own requests admit.
 - **An interrupted `sushi pull` resumes instead of reporting the pack downloaded**: `sushi pull` now checks every file
   against the pack's listing, which also finishes a folder an earlier version left short, and `sushi list` no longer
   shows a pack as downloaded while a pull of it is unfinished.
@@ -16,6 +19,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Image conversations keep their prompt cache across a restart**: an SSD prefix-cache record now carries the images
   it was computed under, so a text -> image -> text conversation restores past its images instead of re-reading
   everything after the first one, and a changed image still invalidates only what follows it.
+- **A thinking budget in the web UI**: a budget box beside the effort menu shows the chosen effort's thinking-token
+  cap and takes a typed value for the request.
 - **Quoted control tokens in a message no longer end the turn**: `<think>`, `</think>` or `<|im_end|>` written as text
   in a user, system or tool message (a source file Claude Code read) stays text instead of reading as a real boundary.
 

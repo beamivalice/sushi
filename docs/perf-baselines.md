@@ -254,6 +254,15 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## v1.2.4 release context ladder
+
+[Version summary and per-model reports](bench/v1.2.4/summary.md), 2026-10-15, Apple M5 Max 128 GB. llmprobe 0.6.15,
+`--bench-only` 2K–64K, 2 runs, all on AC power, `iogpu.wired_limit_mb=120000`. `taskpolicy -a`, per-model GPU lock,
+fans max, 3 minutes idle before each server. One binary built from `a65539e1` (SHA `85c6de9c`).
+- MiMo is the empty-prefix-cache run: on the shared cache, over its budget, MiMo prefill read 8–17% low. An
+  empty-cache A/B in one session put the released v1.2.3 binary and `a65539e1` within 1% (2K 1,214 vs 1,223, 8K 1,224
+  vs 1,218 tok/s prefill).
+
 ## v1.2.3 release context ladder
 
 [Version summary and per-model reports](bench/v1.2.3/summary.md), 2026-10-13, Apple M5 Max 128 GB. llmprobe 0.6.15,
