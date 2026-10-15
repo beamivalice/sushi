@@ -73,14 +73,16 @@ mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does
 
 ## Recommended pin
 
-sushi v1.2.3 (2c602b9e), proposed in ddalcu/mlx-serve#836; mlx-serve main pins v1.2.1 (3f3ff7bc) until it merges,
-since ddalcu/mlx-serve#768, which also serves the GLM and MiMo packs in-process. Reasons it matters, oldest first:
+sushi v1.2.4 (0bc61aa6), proposed in ddalcu/mlx-serve#864; mlx-serve main pins v1.2.3 (2c602b9e) until it merges.
+mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#768. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
 - d1408a57 (after v1.1.1) adds the branch-free NAX prefill GEMM body: each expert GEMM runs in x0.73-0.75 of its time,
   output bytes unchanged ([perf-baselines](mimo2-perf.md#mimo-prefill-nax-body)).
 - v1.2.3 adds `moeClampedWithShared`, which folds GLM's shared expert into the routed finish reduce on a decode row;
   `moeClamped` is unchanged, so the bump needs no mlx-serve source change.
+- v1.2.4 adds `moeWithGatedShared`, which folds a gated shared expert into the routed finish reduce on a decode
+  row, and a decode lane that reads its third word through two 32-bit funnels; both bit-identical and additive.
 
 ## Handing a new engine to mlx-serve
 
