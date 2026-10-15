@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen3.8-Flash-Next Sushi-2.6bpw decodes faster with the same output**: its expert kernels run about 10% faster
+  per layer, about 2-4% per forward when MTP verifies drafts.
 - **An interrupted `sushi pull` resumes instead of reporting the pack downloaded**: `sushi pull` now checks every file
   against the pack's listing, which also finishes a folder an earlier version left short, and `sushi list` no longer
   shows a pack as downloaded while a pull of it is unfinished.

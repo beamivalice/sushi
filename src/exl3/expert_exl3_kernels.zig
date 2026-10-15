@@ -1023,10 +1023,25 @@ fn codebookHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]co
         \\// j's codeword ends exl3_lane_sh(N, j) bits before that. The least nonzero end % 32 is
         \\// W's lowest set bit, so a longer first codeword takes the third word.
         \\static inline constexpr uint exl3_lane_sh(uint N, uint j) { return N / 2u - exl3_end(N, j); }
-        \\template<bool Wide> struct exl3_lane_type {
+        \\template<bool Wide, bool Funnel = false> struct exl3_lane_type {
         \\  using type = ulong;
         \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
         \\    return exl3_window(words, end, W, full);
+        \\  }
+        \\};
+        \\// exl3_window's bits with a third word, built as two 32-bit funnels of adjacent words
+        \\// (s < 32): OR-ing the third word into a 64-bit shift costs the ALU-bound decode GEMV far more.
+        \\template<> struct exl3_lane_type<false, true> {
+        \\  using type = ulong;
+        \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+        \\    const uint last = (end - 1u) >> 5u;
+        \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+        \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
+        \\    const uint s = (0u - end) & 31u;
+        \\    const uint a = words[last];
+        \\    const uint b = words[prev];
+        \\    const uint c = words[third];
+        \\    return as_type<ulong>(uint2(uint((((ulong)b << 32u) | (ulong)a) >> s), uint((((ulong)c << 32u) | (ulong)b) >> s)));
         \\  }
         \\};
         \\template<> struct exl3_lane_type<true> {
@@ -1044,8 +1059,10 @@ fn codebookHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]co
         \\static inline exl3_lane_bits<N> exl3_lane(const device uint *words, uint lane) {
         \\  constexpr uint W = N / 2u;
         \\  constexpr uint low = W & (0u - W);
+        \\  constexpr bool wide = exl3_lane_sh(N, 0u) + 16u > 64u;
+        \\  constexpr bool full = exl3_lane_sh(N, 0u) + 16u > 32u + (low < 32u ? low : 32u);
         \\  const uint end = W * lane + W;
-        \\  return exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u)>::read(words, end, W, exl3_lane_sh(N, 0u) + 16u > 32u + (low < 32u ? low : 32u));
+        \\  return exl3_lane_type<wide, !wide && full>::read(words, end, W, full);
         \\}
         \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
         \\// K = N/16; the pair (t0, t0+1) shares one 32-bit funnel read.
@@ -9099,7 +9116,7 @@ test "exl3 every K1.5 to K4 rate decodes within a margin of n48" {
             break @as(f64, @floatFromInt(@min(best[0], best[1]))) / @as(f64, @floatFromInt(@min(best[2], best[3])));
         } else return error.SkipZigTest;
         // n64's packed branch carries one output tile per threadgroup where the funnel carries two.
-        const limit: f64 = if (n == 64) 1.8 else 1.4;
+        const limit: f64 = if (n == 64) 1.8 else 1.12;
         benchPrint("[exl3-lane-margin] n{d} over n48: {d:.3}\n", .{ n, ratio });
         try std.testing.expect(ratio < limit);
     }
@@ -9193,6 +9210,56 @@ test "exl3 low-rate decode and prefill timing over n32 (SUSHI_EXL3_LOWK_UBENCH=1
                 std.debug.print("[lowk-prefill] w{d} {d}->{d} n{d} over n32: {d:.3} (n32 {d:.1} us)\n", .{ win.bits(), shape[0], shape[1], n, ratio, @as(f64, @floatFromInt(t[0][ROUNDS / 2])) / 1000.0 });
             }
         }
+    }
+}
+
+// One-row decode chain at every even rate n24..n64, Flash-Next geometry, MCG w15: the tree's
+// funnel lane reader against the 64-bit merge of the third word, interleaved in one process.
+// Prints only under SUSHI_EXL3_CHAIN_UBENCH (a diagnostic, never a test).
+test "exl3 decode chain timing at every rate, funnel lane reader vs the 64-bit merge (SUSHI_EXL3_CHAIN_UBENCH=1)" {
+    if (!diagEnvValueOn(std.c.getenv("SUSHI_EXL3_CHAIN_UBENCH"))) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
+    setDecodeParams(dec);
+    defer setDecodeParams(.mul1);
+    const header = comptime metalReplaceAll(codebookHelpers(.mcg, .w15), "!wide && full>", "false>");
+    var base: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+    const pair = try getNamedKernel(&base[0], "sushi_exl3_pair_gemv_merge64", &.{ "x", "suhg", "suhu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_GEMV_SOURCE, header);
+    const down = try getNamedKernel(&base[1], "sushi_exl3_down_fused_merge64", &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" }, &.{"y"}, DOWN_FUSED_SOURCE, header);
+    defer for (base) |k| {
+        _ = mlx.mlx_fast_metal_kernel_free(k.?);
+    };
+    const pair_slot = &pair_gemv_kernel[cbIndex(.mcg)][dec.window.index()];
+    const down_slot = &down_fused_kernel[cbIndex(.mcg)][dec.window.index()];
+    const ROUNDS = 9;
+    var n: u32 = 24;
+    while (n <= 64) : (n += 2) {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const c: MimoMoeCase = .{ .e = 16, .hidden = 2560, .inter = 640, .topk = 10, .rows = 1, .rate = .{ .n = n }, .dec = dec, .seed = 5200 + n };
+        var f = try mimoMoeFixture(arena.allocator(), c);
+        defer f.deinit();
+        _ = try laneChainNs(s, &f, c, 4);
+        const tree_pair = pair_slot.*;
+        const tree_down = down_slot.*;
+        defer pair_slot.* = tree_pair;
+        defer down_slot.* = tree_down;
+        var us: [2][ROUNDS + 1]f64 = undefined;
+        for (0..ROUNDS + 1) |round| {
+            for (0..2) |j| {
+                const arm = (round + j) % 2;
+                pair_slot.* = if (arm == 0) pair else tree_pair;
+                down_slot.* = if (arm == 0) down else tree_down;
+                us[arm][round] = @as(f64, @floatFromInt(try laneChainNs(s, &f, c, 48))) / 48e3;
+            }
+        }
+        var med: [2]f64 = undefined;
+        for (&us, &med) |*a, *m| {
+            std.mem.sort(f64, a[1..], {}, std.sort.asc(f64));
+            m.* = a[1 + ROUNDS / 2];
+        }
+        std.debug.print("[exl3-chain] n{d} merge64 {d:.1} us, funnel {d:.1} us per step ({d:.3})\n", .{ n, med[0], med[1], med[1] / med[0] });
     }
 }
 
