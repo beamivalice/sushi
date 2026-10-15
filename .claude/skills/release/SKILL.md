@@ -32,6 +32,9 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
   carry into the next model), commit, binary SHA-256 and mtime in
   the header. A model whose speculative mode (MTP, DFlash2) did not engage is chased before shipping; a low cell gets
   one rerun on a quiet box before anyone bisects.
+- **Each model's server starts on an EMPTY SSD prefix cache**: a fresh `HOME` per server (or `~/.sushi/kv-cache`
+  emptied right before it). A shared cache over its cap made every boot evict other models' entries during the probe:
+  MiMo prefill read 8–17% low on 2026-10-15, and an empty-cache A/B put v1.2.3 and 1.2.4 within 1%.
 - **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k.
 - **Never quote a win without naming the engine it is over.**
 - **`benchmarks.md` gets one new column per release**, from step 2's report. Obey its header rules: tables
