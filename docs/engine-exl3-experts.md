@@ -40,11 +40,11 @@ kernel on supported hardware.
   `exl3ExpertBytes`); a K printed anywhere reads 2.25, not 36.
 - **Every fast path serves every admitted n; a guard test enumerates them** (`every admitted rate takes the fast
   arms`). The funnel readers take their word indices and shifts from n at compile time: eight weights span n/2 whole
-  bits, and 16 weights span n. Below n64 every codebook reads through them. n64 keeps its packed K4 branch, which does
-  the same reads at a word-aligned rate, one output tile per threadgroup:
-  - decode GEMV lane: 64 bits ending at the lane's last bit. A third word is read only when the first codeword can
-    start before the two words (every n from 42 to 62 but 48), and then on every lane: a branch around that load on
-    the lane's bit alignment kept every byte and doubled the n42 pair GEMV
+  bits, and 16 weights span n. The decode GEMVs read every n through them; the prefill readers every n below 64,
+  where a packed K4 branch does the same reads at a word-aligned rate:
+  - decode GEMV lane: 64 bits ending at the lane's last bit (at n64, two whole words). A third word is read only
+    when the first codeword can start before the two words (every n from 42 to 62 but 48), and then on every lane:
+    a branch around that load on the lane's bit alignment kept every byte and doubled the n42 pair GEMV
     ([perf-baselines](perf-baselines.md#exl3-lane-third-word)). The decode GEMVs are ALU-bound, so the third word
     is merged as two 32-bit funnels of adjacent words, never OR-ed into a 64-bit shift (10% of the one-row chain at
     n42); a register shuffle, selects or a branch to save the load cost more than the load
@@ -118,16 +118,18 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   reciprocal, then `1 - r` for a non-negative logit, each rounded to bf16) and the product rounds to bf16 before the
   add; the unit test sweeps every bf16 logit against the MLX ops. Other widths and dtypes run the three ops.
 - **The decode GEMVs are bound by fixed per-tile work, not DRAM** (64-bit index math, two word loads and a 64-bit
-  shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: every n below 64) carry two output
+  shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: every n) carry two output
   tiles per threadgroup, load both k-tiles of an iteration before decoding, and bump pointers; the per-tile
   accumulation order is unchanged, so the bytes equal the one-tile generic reader's (`FUNNEL=0`, the test's
   reference). A layout that changes which simdgroup sums which k-tile (8 simdgroups) is NOT bit-identical.
 - A rate on the generic reader decodes ~40% slower per GEMV than on the funnel, with no other symptom. The engagement
   line `[exl3] n<n> funnel engaged arm=<arm>` names the rate and arm in a live log.
+- A decode rate kept off the lane layout keeps every byte and loses its speed: n64's own packed branch (one tile and
+  one k-tile per step) ran the one-row chain 1.27x n62's; through the funnel it runs 0.93x.
 - **A reader change is timed on every served pack's decode before it lands** (forward meter, against its parent): the
   byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K1.5 to K4, the
   range the converters write: the test `every K1.5 to K4 rate decodes within a margin of n48` holds each even n from
-  24 to 64 within 1.12x of n48's GEMV steps (n64's packed branch 1.8x). Rates below K1.5 and above K4 stay admitted and tested for correctness,
+  24 to 64 within 1.12x of n48's GEMV steps. Rates below K1.5 and above K4 stay admitted and tested for correctness,
   never timed. `SUSHI_EXL3_LOWK_UBENCH=1` on the exl3 test binary prints n24..n48's decode chain and sorted prefill
   GEMMs over n32's at Flash-Next geometry (w8, w12, w15), interleaved in one process; `SUSHI_EXL3_CHAIN_UBENCH=1`
   times the one-row chain at every even n from 24 to 64, the lane funnel against the 64-bit merge.

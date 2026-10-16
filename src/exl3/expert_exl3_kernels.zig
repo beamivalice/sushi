@@ -36,8 +36,8 @@ pub fn setPairSplitsForTest(n: ?u32) void {
 /// threadgroup: the byte reference the lane funnel's layout is held to.
 var funnel_off_for_test: bool = false;
 
-/// Every rate below K4 reads its weights through funnels whose shifts follow from
-/// n; K4 keeps its own packed branch, the same reads at a word-aligned rate.
+/// Every prefill reader below K4 reads its weights through funnels whose shifts follow
+/// from n; K4 keeps its own packed prefill branch, the same reads at a word-aligned rate.
 fn funnelReads(n: u32) bool {
     return n != 64;
 }
@@ -47,8 +47,8 @@ fn funnelReads(n: u32) bool {
 /// and the prepare; the other readers carry one.
 const GemvLayout = struct { funnel: bool, tiles: c_int };
 
-fn gemvLayout(n: u32, out_tiles: c_int) GemvLayout {
-    const funnel = !funnel_off_for_test and funnelReads(n);
+fn gemvLayout(out_tiles: c_int) GemvLayout {
+    const funnel = !funnel_off_for_test;
     return .{ .funnel = funnel, .tiles = if (funnel and @rem(out_tiles, 2) == 0) 2 else 1 };
 }
 
@@ -2115,25 +2115,7 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\const uint row3 = prow + 9u;
     \\float acc[OTPT][8] = {};
     \\const device uint* trellis_e = (const device uint*)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW);
-    \\if (N == 64u) {
-    \\for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
-    \\  const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
-    \\  const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
-    \\  const float in0 = float(prepared[tk * TILE + row0]);
-    \\  const float in1 = float(prepared[tk * TILE + row1]);
-    \\  const float in2 = float(prepared[tk * TILE + row2]);
-    \\  const float in3 = float(prepared[tk * TILE + row3]);
-    \\  const uint sh[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
-    \\  const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
-    \\  for (uint p = 0u; p < 4u; p++) {
-    \\    const uint2 cw = uint2(uint(merged >> sh[p * 2u]), uint(merged >> sh[p * 2u + 1u])) & uint2(0xffffu);
-    \\    const float2 w = exl3_decode2(cw);
-    \\    acc[0][p * 2u] = fma(ins[p * 2u], w.x, acc[0][p * 2u]);
-    \\    acc[0][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[0][p * 2u + 1u]);
-    \\  }
-    \\}
-    \\}
-    \\else if (FUNNEL) {
+    \\if (FUNNEL) {
     \\  // Both k-tiles' words load before either decodes; a k range is whole H128
     \\  // blocks (8 tiles), so the second k-tile of an iteration is always in range.
     \\  const device uint *wp = trellis_e + ((size_t)(tk0 + sg) * (size_t)OT + ot) * PACKED_W;
@@ -2235,7 +2217,7 @@ pub fn downGemvFusedMid(
     const rate = try packedRate(tsh[tsh.len - 1]);
     const out_tiles = @divExact(out_dim, 16);
     const nsplit: c_int = @intCast(pairSplitCountFor(out_dim));
-    const layout = gemvLayout(rate.n, out_tiles);
+    const layout = gemvLayout(out_tiles);
     const key = DownFusedKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit, .n = rate.n, .layout = layout };
     const cfg = down_fused_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
@@ -2350,25 +2332,7 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\  device float *y = (proj == 0u) ? yg : yu;
     \\  float acc[OTPT][8] = {};
     \\  const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW);
-    \\  if (N == 64u) {
-    \\  for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
-    \\    const device uint *words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
-    \\    const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
-    \\    const float in0 = float(prepared[xb + (tk - tk0) * TILE + row0]);
-    \\    const float in1 = float(prepared[xb + (tk - tk0) * TILE + row1]);
-    \\    const float in2 = float(prepared[xb + (tk - tk0) * TILE + row2]);
-    \\    const float in3 = float(prepared[xb + (tk - tk0) * TILE + row3]);
-    \\    const uint sh[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
-    \\    const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
-    \\    for (uint p = 0u; p < 4u; p++) {
-    \\      const uint2 cw = uint2(uint(merged >> sh[p * 2u]), uint(merged >> sh[p * 2u + 1u])) & uint2(0xffffu);
-    \\      const float2 w = exl3_decode2(cw);
-    \\      acc[0][p * 2u] = fma(ins[p * 2u], w.x, acc[0][p * 2u]);
-    \\      acc[0][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[0][p * 2u + 1u]);
-    \\    }
-    \\  }
-    \\  }
-    \\  else if (FUNNEL) {
+    \\  if (FUNNEL) {
     \\    // Both k-tiles' words load before either decodes; a k range is whole H128
     \\    // blocks (8 tiles), so the second k-tile of an iteration is always in range.
     \\    const device uint *wp = trellis_e + ((size_t)(tk0 + sg) * (size_t)OT + ot) * PACKED_W;
@@ -2718,7 +2682,7 @@ pub fn pairGemv(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: 
     const ush = mlx.getShape(tu);
     const rate = try packedRate(tsh[tsh.len - 1]);
     if (ush[ush.len - 1] != tsh[tsh.len - 1]) return error.BadExl3Shape;
-    const layout = gemvLayout(rate.n, @divExact(out_dim, 16));
+    const layout = gemvLayout(@divExact(out_dim, 16));
     const group: c_int = if (layout.funnel) group_ask else 0;
     const cfg = try pairGemvConfig(in_dim, out_dim, nslots, topk, rate, layout, group);
     const ins = [_][*:0]const u8{ "x", "suhg", "suhu", "tg", "tu", "slots" };
@@ -8559,7 +8523,7 @@ pub fn pairGemvPrepared(s: mlx.mlx_stream, prep: mlx.mlx_array, tg: mlx.mlx_arra
     const tsh = mlx.getShape(tg);
     const rate = try packedRate(tsh[tsh.len - 1]);
     if (mlx.getShape(tu)[mlx.getShape(tu).len - 1] != tsh[tsh.len - 1]) return error.BadExl3Shape;
-    const layout = gemvLayout(rate.n, @divExact(out_dim, 16));
+    const layout = gemvLayout(@divExact(out_dim, 16));
     const group: c_int = if (layout.funnel) group_ask else 0;
     const cfg = try pairGemvConfig(in_dim, out_dim, nslots, topk, rate, layout, group);
     const ins = [_][*:0]const u8{ "prep", "tg", "tu", "slots" };
@@ -8619,7 +8583,7 @@ fn downGemvPreparedMid(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, 
     const tsh = mlx.getShape(trellis);
     const rate = try packedRate(tsh[tsh.len - 1]);
     const out_tiles = @divExact(out_dim, 16);
-    const layout = gemvLayout(rate.n, out_tiles);
+    const layout = gemvLayout(out_tiles);
     const group: c_int = if (layout.funnel) group_ask else 0;
     const key = DownFusedKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit, .n = rate.n, .layout = layout, .group = group };
     const cfg = down_prepared_cfgs.get(key) orelse blk: {
@@ -8744,18 +8708,14 @@ test "exl3 decode GEMV layout: the lane funnel carries two tiles, every other re
     const t = std.testing;
     defer setDecodeParams(.mul1);
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(40, 128));
-    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(48, 40));
-    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 1 }, gemvLayout(40, 45));
-    try t.expectEqual(GemvLayout{ .funnel = false, .tiles = 1 }, gemvLayout(64, 128));
-    for ([_]u32{ 32, 36, 42, 44, 62 }) |n| try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(n, 40));
+    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(128));
+    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(40));
+    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 1 }, gemvLayout(45));
     setDecodeParams(.{ .codebook = .mul1, .window = .w16 });
-    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(40, 128));
-    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(42, 40));
-    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(48, 40));
+    try t.expectEqual(GemvLayout{ .funnel = true, .tiles = 2 }, gemvLayout(128));
     funnel_off_for_test = true;
     defer funnel_off_for_test = false;
-    try t.expectEqual(GemvLayout{ .funnel = false, .tiles = 1 }, gemvLayout(40, 128));
+    try t.expectEqual(GemvLayout{ .funnel = false, .tiles = 1 }, gemvLayout(128));
 }
 
 fn gemvOutBytes(a: mlx.mlx_array) ![]const u8 {
@@ -8795,8 +8755,7 @@ fn funnelLayoutBytesMatch(c: MimoMoeCase) !void {
         outs[arm][0], outs[arm][1] = try pairGemv(s, a[8], a[3], a[3], a[0], a[1], a[7], hidden, inter, nslots, @intCast(c.topk), 0);
         outs[arm][2] = try downGemvFusedMid(s, outs[0][0].?, outs[0][1].?, a[2], a[4], a[4], a[5], a[7], inter, hidden, nslots);
         outs[arm][3] = try downGemvPreparedMid(s, outs[0][0].?, outs[0][1].?, a[2], a[4], a[4], a[5], a[7], inter, hidden, nslots, 0);
-        const funnel = arm == 1 and c.rate.n != 64;
-        for ([_]FunnelArm{ .pair, .fused_mid_down, .prepared_down }) |fa| try std.testing.expectEqual(funnel, funnel_engaged[@backingInt(fa)]);
+        for ([_]FunnelArm{ .pair, .fused_mid_down, .prepared_down }) |fa| try std.testing.expectEqual(arm == 1, funnel_engaged[@backingInt(fa)]);
     }
     for (outs[0], outs[1]) |want, got| try std.testing.expectEqualSlices(u8, try gemvOutBytes(want.?), try gemvOutBytes(got.?));
 }
@@ -8848,7 +8807,7 @@ fn mimoChainBytesMatch(c: MimoMoeCase) !void {
         funnel_engaged = @splat(false);
         grouped_engaged = false;
         ys[arm] = try moeSwigluFused(s, ar[8], ar[0], ar[3], ar[4], ar[1], ar[3], ar[4], ar[2], ar[5], ar[6], ar[7], ar[9], .bfloat16);
-        const fast = arm == 1 and c.rate.n != 64;
+        const fast = arm == 1;
         try std.testing.expectEqual(fast, funnel_engaged[@backingInt(FunnelArm.pair)]);
         try std.testing.expectEqual(fast, funnel_engaged[@backingInt(FunnelArm.prepared_down)]);
         try std.testing.expectEqual(fast and c.rows >= 2, grouped_engaged);
@@ -8860,12 +8819,12 @@ fn mimoChainBytesMatch(c: MimoMoeCase) !void {
 }
 
 // Every rate the format admits takes the fast arms: a rate that falls back to the
-// generic reader fails here. K4 (n64) keeps its own packed branch, one tile a threadgroup.
+// generic reader fails here. K4 (n64) keeps its own packed prefill branch.
 test "exl3 every admitted rate takes the fast arms, bit-identical to the generic reader" {
     const w12: exl3.Decode = .{ .codebook = .mcg, .window = .w12 };
     inline for (exl3.Rate.min_n / 2..exl3.Rate.max_n / 2 + 1) |half| {
         const n: u32 = 2 * half;
-        if (n != 64) try weightReaderExact(n, .mcg, .w16, true, .lane);
+        try weightReaderExact(n, .mcg, .w16, true, .lane);
         inline for (.{ .nax, .simdmat }) |reader| try weightReaderExact(n, .mcg, .w16, true, reader);
         for ([_]usize{ 1, 4 }) |rows| {
             try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = w12, .seed = 418 + n + rows, .banks = MIMO_BANKS, .x_scale = 3 });
@@ -9030,7 +8989,6 @@ test "exl3 Sushi CPU dispatch selects fast layouts for every rate" {
     for (8..65) |half| {
         const n: u32 = @intCast(half * 2);
         try std.testing.expectEqual(n != 64, funnelReads(n));
-        try std.testing.expectEqual(GemvLayout{ .funnel = n != 64, .tiles = if (n == 64) 1 else 2 }, gemvLayout(n, 128));
         try std.testing.expectEqual(n, (try packedRate(@intCast(n))).n);
     }
 }
@@ -9115,10 +9073,8 @@ test "exl3 every K1.5 to K4 rate decodes within a margin of n48" {
             if (@max(best[2], best[3]) * 100 > @min(best[2], best[3]) * 110) continue;
             break @as(f64, @floatFromInt(@min(best[0], best[1]))) / @as(f64, @floatFromInt(@min(best[2], best[3])));
         } else return error.SkipZigTest;
-        // n64's packed branch carries one output tile per threadgroup where the funnel carries two.
-        const limit: f64 = if (n == 64) 1.8 else 1.12;
         benchPrint("[exl3-lane-margin] n{d} over n48: {d:.3}\n", .{ n, ratio });
-        try std.testing.expect(ratio < limit);
+        try std.testing.expect(ratio < 1.12);
     }
 }
 
