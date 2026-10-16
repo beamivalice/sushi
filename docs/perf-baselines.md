@@ -199,16 +199,23 @@ running), on battery at 100%. Base = main `2df81de2`; new = `2eedbef9`; the live
 `3da27606`, the same served code before a test limit moved. All ReleaseFast.
 
 `SUSHI_EXL3_CHAIN_UBENCH=1` (exl3 test binary): 48 dependent pair GEMV + fused-mid down steps, E=16, 2560 -> 640,
-top-10, MCG w15, one row; the 64-bit merge and the funnel interleaved in one process, median of 9; us per step:
+top-10, MCG, one row; the 64-bit merge and the funnel interleaved in one process; us per step. Re-timed on main
+`5feaacf1` (n64 on the lane funnel): 2026-10-16, fans at max, `taskpolicy -a`, GPU lock `lowk-rungs`, quiet window,
+on battery at 95%, median of 15. The arms are `5feaacf1`'s reader, built into a later exl3 test binary (e4951a82)
+whose lane split was off; `=` marks a two-word rate where both arms are the same code.
 
-| n | 24 | 32 | 36 | 40 | 42 | 44 | 46 | 48 | 50 | 52 | 54 | 56 | 58 | 60 | 62 | 64 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| merge | 48.4 | 50.3 | 49.9 | 51.4 | 59.2 | 58.5 | 59.0 | 51.6 | 59.1 | 60.7 | 58.6 | 59.6 | 60.0 | 60.8 | 59.9 | 68.7 |
-| funnel | 48.9 | 50.3 | 49.3 | 51.1 | 53.0 | 53.2 | 53.8 | 51.3 | 52.8 | 53.1 | 54.5 | 55.1 | 54.2 | 55.0 | 53.3 | 68.2 |
+| n | 24 | 26 | 28 | 30 | 32 | 34 | 36 | 38 | 40 | 42 | 44 | 46 | 48 | 50 | 52 | 54 | 56 | 58 | 60 | 62 | 64 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w15 merge | 49.5 | 48.8 | 48.9 | 49.2 | 49.0 | 49.5 | 49.0 | 49.0 | = | 58.2 | 59.2 | 59.2 | = | 59.1 | 59.6 | 59.6 | 60.4 | 60.3 | 60.4 | 60.7 | = |
+| w15 funnel | 49.7 | 49.8 | 49.0 | 49.3 | 49.0 | 49.9 | 49.7 | 49.0 | 50.6 | 51.8 | 53.0 | 53.5 | 52.3 | 53.3 | 54.0 | 53.6 | 53.9 | 54.8 | 55.1 | 54.3 | 49.6 |
+| w16 merge | 47.7 | 48.2 | 48.3 | 48.0 | 48.4 | 48.7 | 47.9 | 48.8 | = | 56.6 | 57.9 | 58.6 | = | 57.3 | 57.9 | 57.8 | 59.0 | 57.6 | 58.1 | 58.1 | = |
+| w16 funnel | 47.3 | 48.8 | 48.2 | 48.2 | 48.6 | 48.6 | 47.9 | 48.9 | 48.8 | 49.8 | 50.7 | 50.9 | 49.3 | 50.2 | 52.1 | 51.5 | 51.7 | 51.6 | 51.8 | 51.0 | 47.5 |
 
-- Rates that read two words (n24 to n40, n48) and n64's packed branch compile to the same AIR in both arms (pair GEMV
-  and fused-mid down at n32, n36, n40, n48, n64, metadata stripped), so MiMo, GLM, Sushi-2bpw, Sushi-3bpw and
-  Sushi-4bpw are untouched; their rows above differ by run-to-run noise only.
+- Rates that read two words (n24 to n40, n48, and n64 since `5feaacf1`) run the same reader in both arms, so MiMo,
+  GLM, Sushi-2bpw, Sushi-3bpw and Sushi-4bpw are untouched; their merge cells differ by run-to-run noise only.
+- Forward meter on `5feaacf1` (binary d64a79f2, same settings and meter as below, two boots): Sushi-4bpw 16.07 / 16.10,
+  20.01 / 19.99, 23.13 / 23.14, 26.59 / 26.78, 33.97 / 33.78 ms at 1 / 2 / 3 / 4 / 6 rows; MiMo Sushi-2.3bpw 19.65 /
+  19.50, 26.92 / 25.97, 31.39 / 31.16, 36.79 / 37.64, 50.48 / 50.90.
 - n66 to n108 take the funnel too: 2.4-12% faster per step; n110 to n128 (two-window lanes) are unchanged.
 - The margin test reads n42 at 1.006 over n48 and n44 to n62 at 1.02-1.06 (main: n42 1.13); its limit is 1.12.
 
