@@ -92,4 +92,8 @@ assert.equal(request.buildRequest('qwen', []).reasoning_effort, 'off');
 assert.equal('reasoning_budget_tokens' in request.buildRequest('qwen', []), false, 'off sends no budget');
 pick('medium');
 assert.equal(request.buildRequest('qwen', []).reasoning_budget_tokens, 8192);
+const meta = vm.createContext({ fmtInt: (n) => String(n) });
+vm.runInContext(slice('function replyMeta(', 'async function streamReply('), meta);
+assert.equal(meta.replyMeta(null, null, null, false, 0, 'Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`'), 'Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`');
+assert.equal(meta.replyMeta({ completion_tokens: 3 }, null, 'stop', false, 0, null), '3 tokens');
 console.log('Web UI effort menu: passed');

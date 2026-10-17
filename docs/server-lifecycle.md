@@ -67,8 +67,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   and exit, even with redirected stdin. The prompt is passed verbatim, including leading/trailing whitespace.
 - Explicit prompts use the normal scheduler and chat request policy through a private loopback listener on an OS-assigned
   port. They never connect to an existing server or enter the REPL; the client is joined and the listener closes on exit.
-- `--think` enables thinking; `--think <word>` selects an effort the `--model` model takes (GLM low|high|max, Qwen
-  off|low|medium|xhigh, MiMo off or any level as on; `/think` alike); another word fails with the accepted list and a
+- `--think` enables thinking; `--think <word>` selects an effort the `--model` model takes (GLM low|high|max, with
+  `medium` served as `high` and `xhigh` as `max` and logged; Qwen off|low|medium|xhigh, with `high` and `max` served as `xhigh` and logged; MiMo off or any level as on; `/think` alike); another word fails with the accepted list and a
   nonzero exit. Omission keeps the model default, one-shot and REPL alike. A model loaded on demand takes the word where it can, else keeps its own
   default ([server-http-apis](server-http-apis.md)).
 - MTP/KV settings, context, timeout, reasoning budgets, and sampling flags follow the serving policy, including

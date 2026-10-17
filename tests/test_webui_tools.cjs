@@ -93,7 +93,7 @@ vm.runInContext(script.slice(streamStart, script.indexOf('function setChatBusy('
     ];
     const bytes = Buffer.from(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('') + 'data: [DONE]\n\n');
     let offset = 0;
-    streaming.api = async () => ({ ok: true, body: { getReader: () => ({
+    streaming.api = async () => ({ ok: true, headers: new Headers(), body: { getReader: () => ({
       read: async () => offset >= bytes.length ? { done: true } : { done: false, value: bytes.subarray(offset, offset = Math.min(offset + 7, bytes.length)) },
     }) } });
     const reply = await streaming.streamReply('test', [], { aborted: false }, tools);

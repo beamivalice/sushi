@@ -7413,7 +7413,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         while (i < mtp_n) {
             var j = i + 1;
             while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
-            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
+            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len and !anyPenalised(mtp_buf[i..j])) {
                 for (mtp_buf[i..j]) |slot| {
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {
@@ -8183,7 +8183,7 @@ fn slotMimoMtpCrowdable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or generate_mod.penaltyActive(slot.sampling)) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedMimoDecode()) return false;
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
@@ -8506,6 +8506,7 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     var pending_draft = false;
     for (active, 0..) |slot, i| {
         if (slot.model != active[0].model or !slot.allow_batch_mtp) return false;
+        if (generate_mod.penaltyActive(slot.sampling)) return false;
         const gen = if (slot.legacy_gen) |*g| g else return false;
         if (gen.ctx.mrope_pos != null) return false;
         pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
@@ -8659,6 +8660,14 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     if (t.config.isMimo()) return true;
     // qwen4_exp verify rows are expert bytes, so a batched verify measured no better than solo rounds.
     return t.qwen4 != null;
+}
+
+/// A plain batched tick samples no repeat or presence penalty, so a penalised slot keeps its MTP round.
+fn anyPenalised(slots: []const *Slot) bool {
+    for (slots) |slot| {
+        if (generate_mod.penaltyActive(slot.sampling)) return true;
+    }
+    return false;
 }
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -9005,6 +9014,7 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
         st.verify_hidden_all = all_rows[i];
         st.verify_len = width;
         _ = try slot.legacy_gen.?.thinkShiftRows(&st.verify_logits, padded[i]);
+        _ = try slot.legacy_gen.?.penaltyShiftRows(&st.verify_logits, padded[i]);
     }
     if (sch.metrics) |m| m.batched_group_size.set(n);
     for (states[0..n], live[0..n]) |*st, slot| {
@@ -10813,6 +10823,36 @@ test "MiMo crowded MTP takes an eligible slot" {
     slot.sampling = .{};
     slot.logprobs_n = 0;
     try testing.expect(slotMimoMtpCrowdable(&slot));
+}
+
+test "a penalised MTP slot never joins a plain batched tick, which samples no penalty" {
+    var xfm: Transformer = undefined;
+    xfm.config = .{ .model_type = "mimo_v2" };
+    xfm.moe_layers = &.{};
+    xfm.expert_stream = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = &xfm;
+    var gen: Generator = undefined;
+    gen.mtp = .{ .mimo = undefined };
+    gen.mtp_cache = .{ .mimo = undefined };
+    gen.has_last_hidden = true;
+    gen.spec_disabled_runtime = false;
+    gen.mtp_serial_left = 0;
+    gen.mtp_serial_exit = .none;
+    gen.dflash = null;
+    var slot: Slot = undefined;
+    slot.model = &model;
+    slot.legacy_gen = gen;
+    slot.enable_mtp = true;
+    slot.enable_drafter = false;
+    slot.logprobs_n = 0;
+    slot.sampling = .{ .presence_penalty = 1.5 };
+    try testing.expect(!slotMimoMtpCrowdable(&slot));
+    var plain: Slot = slot;
+    plain.sampling = .{};
+    try testing.expect(slotMimoMtpCrowdable(&plain));
+    try testing.expect(anyPenalised(&.{ &plain, &slot }));
+    try testing.expect(!anyPenalised(&.{&plain}));
 }
 
 test "single MTP slot reaches the round entry through runDecodeTick" {

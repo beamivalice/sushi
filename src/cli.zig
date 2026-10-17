@@ -1112,6 +1112,26 @@ pub fn writeEffortRefusal(w: *std.Io.Writer, word: []const u8, model_id: []const
     try writeEffortOptions(w, accepted);
 }
 
+/// The server's `[effort]` line, when `/think` re-routed `asked`. False when the word was accepted as itself.
+pub fn writeEffortReroute(w: *std.Io.Writer, model_id: []const u8, asked: model.Effort, accepted: []const model.Effort) !bool {
+    if (accepted.len == 0) return false;
+    const pick = model.selectEffortPick(accepted, asked) orelse return false;
+    const from = pick.rerouted_from orelse return false;
+    try w.print("[effort] " ++ model.effort_reroute_notice ++ "\n", .{ model_id, @tagName(from), @tagName(pick.effort) });
+    return true;
+}
+
+fn writeResponseEffortNotice(w: *std.Io.Writer, head: anytype) !void {
+    var it = head.iterateHeaders();
+    while (it.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "x-sushi-effort-notice")) continue;
+        const text = std.mem.trim(u8, h.value, " \t");
+        if (text.len == 0) return;
+        try w.print("[effort] {s}\n", .{text});
+        return;
+    }
+}
+
 pub fn writeThinkSetting(w: *std.Io.Writer, think: Think, accepted: []const model.Effort) !void {
     try w.writeAll("thinking: ");
     try w.writeAll(switch (think) {
@@ -1531,12 +1551,16 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     defer if (models_info) |m| m.deinit(allocator);
     const accepted: []const model.Effort = if (models_info) |m| m.efforts else &.{};
     var think = opts.think;
-    if (think == .effort) think = .{ .effort = acceptedEffort(think.effort, accepted) orelse {
-        try writeEffortRefusal(w, @tagName(think.effort), if (models_info) |m| m.id else "this model", accepted);
-        try w.writeAll("\n");
-        try w.flush();
-        return error.ReplThinkUnsupported;
-    } };
+    if (think == .effort) {
+        const asked = think.effort;
+        think = .{ .effort = acceptedEffort(asked, accepted) orelse {
+            try writeEffortRefusal(w, @tagName(asked), if (models_info) |m| m.id else "this model", accepted);
+            try w.writeAll("\n");
+            try w.flush();
+            return error.ReplThinkUnsupported;
+        } };
+        _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
+    }
     // The initial load finishes BEFORE the listener binds, so an answering
     // /health is the post-load moment. `run` quieted the log to warn on a TTY,
     // so this one line is printed here rather than logged.
@@ -1594,6 +1618,8 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
                 .set => |t| {
                     think = t;
                     try writeThinkSetting(w, think, accepted);
+                    const word = std.mem.trim(u8, trimmed["/think".len..], " \t");
+                    if (model.parseEffort(word)) |asked| _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
                 },
                 .refuse => |word| try writeEffortRefusal(w, word, if (models_info) |m| m.id else "this model", accepted),
             }
@@ -1828,6 +1854,7 @@ fn streamOneTurn(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body
         try w.flush();
         return error.ReplHttpStatus;
     }
+    try writeResponseEffortNotice(w, response.head);
 
     var full = std.ArrayList(u8).empty;
     errdefer full.deinit(allocator);
@@ -2307,11 +2334,29 @@ test "cli: --think requires an effort word" {
 test "cli: /think shows, sets an accepted word, and refuses the rest" {
     const qwen = [_]model.Effort{ .off, .low, .medium, .xhigh };
     try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("/thinking about it", &qwen));
+    var notice: [160]u8 = undefined;
+    var nw: std.Io.Writer = .fixed(&notice);
+    try testing.expect(try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .high, &qwen));
+    try testing.expectEqualStrings("[effort] Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`\n", nw.buffered());
+    nw = .fixed(&notice);
+    try testing.expect(!try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .low, &qwen));
+    try testing.expect(!try writeEffortReroute(&nw, "MiMo", .high, &.{ .off, .on }));
+    const glm = [_]model.Effort{ .low, .high, .max };
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .high } }), parseThinkCommand("/think medium", &glm));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .max } }), parseThinkCommand("/think xhigh", &glm));
+    nw = .fixed(&notice);
+    try testing.expect(try writeEffortReroute(&nw, "GLM-5.3-Flash", .medium, &glm));
+    try testing.expectEqualStrings("[effort] GLM-5.3-Flash has no `medium` effort; served at `high`\n", nw.buffered());
+    nw = .fixed(&notice);
+    try testing.expect(try writeEffortReroute(&nw, "GLM-5.3-Flash", .xhigh, &glm));
+    try testing.expectEqualStrings("[effort] GLM-5.3-Flash has no `xhigh` effort; served at `max`\n", nw.buffered());
+    try testing.expect(!try writeEffortReroute(&nw, "GLM-5.3-Flash", .off, &glm));
     try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("hello", &qwen));
     try testing.expectEqual(@as(?ThinkCommand, .show), parseThinkCommand("/think", &qwen));
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .medium } }), parseThinkCommand("/think medium", &qwen));
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think  off ", &qwen));
-    try testing.expectEqualStrings("high", parseThinkCommand("/think high", &qwen).?.refuse);
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", &qwen));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &qwen));
     try testing.expectEqualStrings("hgih", parseThinkCommand("/think hgih", &qwen).?.refuse);
     // A server that lists no efforts leaves the whole vocabulary to it.
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .max } }), parseThinkCommand("/think max", &.{}));
@@ -2902,8 +2947,10 @@ pub fn runPrompt(allocator: std.mem.Allocator, io: std.Io, port: u16, body: []co
         log.err("prompt HTTP {d}: {s}\n", .{ @backingInt(response.head.status), detail });
         return error.PromptHttpStatus;
     }
+
     var out_buf: [16 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    try writeResponseEffortNotice(&stdout.interface, response.head);
     var buffered: std.Io.Writer.Allocating = .init(allocator);
     defer buffered.deinit();
     const target = if (stream) &stdout.interface else &buffered.writer;
@@ -2991,7 +3038,8 @@ test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM o
     try testing.expectEqual(@as(?model.Effort, .on), acceptedEffort(.high, &mimo));
     try testing.expect(parseThinkCommand("/think off", &.{ .low, .high, .max }).? == .refuse);
     try testing.expect(parseThinkCommand("/think minimal", &.{ .low, .high, .max }).? == .refuse);
-    try testing.expect(parseThinkCommand("/think high", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", &.{ .off, .low, .medium, .xhigh }));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &.{ .off, .low, .medium, .xhigh }));
     try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
     try testing.expectEqual(@as(?model.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
 }

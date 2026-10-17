@@ -356,6 +356,10 @@ pub const Conn = struct {
     sse_headers_sent: bool = false,
     /// A Content-Length response ends by length and can release its socket immediately.
     length_framed: bool = false,
+    /// Set for one request when Qwen `high`/`max` was served as `xhigh`. The
+    /// text is the log line; `effort_notice_json` is `,"effort_notice":"..."`.
+    effort_notice: ?[]const u8 = null,
+    effort_notice_json: ?[]const u8 = null,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -365,6 +369,8 @@ pub const Conn = struct {
         c.ws_mode = null;
         c.sse_headers_sent = false;
         c.length_framed = false;
+        c.effort_notice = null;
+        c.effort_notice_json = null;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -8711,7 +8717,7 @@ fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) EscapedText
 /// word — dsv4-family templates map it into the
 /// render via `chat.dsv4EffortFor`; every other consumer only reads
 /// enable/budget.
-const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null };
+const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null, rerouted_from: ?[]const u8 = null };
 
 /// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
 /// low | medium | high | xhigh — values are model-dependent, so unknown
@@ -8735,13 +8741,18 @@ fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_
 /// One effort word → one thinking config, whatever field carried the word —
 /// OpenAI's flat `reasoning_effort`, Responses' `reasoning.effort` and
 /// Anthropic's `output_config.effort` must not drift on what "low" means.
-/// `arms` is the model's `model.effortArms` table, read through `model.armForWord`.
+/// `arms` is the model's `model.effortArms` table, read through `model.selectEffortPick`.
 fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consumes_effort: bool, arms: ?[]const model_mod.EffortArm) error{EffortRefused}!ReasoningEffort {
     if (arms) |table| {
-        const arm = model_mod.armForWord(table, word) orelse return error.EffortRefused;
-        if (arm.effort == .off) return .{ .enable = false, .budget = default_budget, .effort = word };
+        var offered: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
+        for (table, 0..) |a, i| offered[i] = a.effort;
+        const asked = model_mod.parseEffort(word) orelse return error.EffortRefused;
+        const pick = model_mod.selectEffortPick(offered[0..table.len], asked) orelse return error.EffortRefused;
+        const arm = model_mod.findEffortArm(table, pick.effort) orelse return error.EffortRefused;
+        const from: ?[]const u8 = if (pick.rerouted_from) |f| @tagName(f) else null;
+        if (arm.effort == .off) return .{ .enable = false, .budget = default_budget, .effort = word, .rerouted_from = from };
         const budget = if (template_consumes_effort) default_budget else arm.budget orelse default_budget;
-        return .{ .enable = true, .budget = budget, .effort = @tagName(arm.effort) };
+        return .{ .enable = true, .budget = budget, .effort = @tagName(arm.effort), .rerouted_from = from };
     }
     if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
     // Where the TEMPLATE reads the effort word, the word is the behavioral
@@ -8753,6 +8764,71 @@ fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consu
     else
         responses_mod.effortBudget(word, default_budget);
     return .{ .enable = true, .budget = budget, .effort = word };
+}
+
+const EffortNotice = struct {
+    text: []u8,
+    json: []u8,
+
+    fn deinit(self: EffortNotice, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.json);
+    }
+};
+
+fn effortModelName(lm: *LoadedModel) []const u8 {
+    const config = lm.config.?;
+    return if (lm.id.len > 0) lm.id else config.model_type;
+}
+
+/// One line for the log, the header and `effort_notice`. Caller frees.
+fn makeEffortNotice(allocator: std.mem.Allocator, model_name: []const u8, from_word: []const u8, to_word: []const u8) !EffortNotice {
+    const from = model_mod.parseEffort(from_word) orelse return error.EffortRefused;
+    const to = model_mod.parseEffort(to_word) orelse return error.EffortRefused;
+    const text = try model_mod.formatEffortRerouteNotice(allocator, model_name, from, to);
+    errdefer allocator.free(text);
+    const esc = try jsonEscape(allocator, text);
+    defer allocator.free(esc);
+    const json_field = try std.fmt.allocPrint(allocator, ",\"effort_notice\":{s}", .{esc});
+    log.info("[effort] {s}\n", .{text});
+    return .{ .text = text, .json = json_field };
+}
+
+fn armEffortNotice(stream: *Conn, notice: EffortNotice) void {
+    stream.effort_notice = notice.text;
+    stream.effort_notice_json = notice.json;
+}
+
+fn clearEffortNotice(stream: *Conn) void {
+    stream.effort_notice = null;
+    stream.effort_notice_json = null;
+}
+
+fn holdEffortNotice(allocator: std.mem.Allocator, stream: *Conn, model_name: []const u8, cfg: ReasoningEffort) !?EffortNotice {
+    const from = cfg.rerouted_from orelse return null;
+    const notice = try makeEffortNotice(allocator, model_name, from, cfg.effort orelse return error.EffortRefused);
+    armEffortNotice(stream, notice);
+    return notice;
+}
+
+fn effortNoticeHeaderSafe(notice: []const u8) bool {
+    for (notice) |c| if (c < 0x20 or c == 0x7f) return false;
+    return true;
+}
+
+fn writeEffortNoticeHeader(stream: *Conn) !void {
+    const notice = stream.effort_notice orelse return;
+    if (!effortNoticeHeaderSafe(notice)) return;
+    try stream.writeAllNoFlush("X-Sushi-Effort-Notice: ");
+    try stream.writeAllNoFlush(notice);
+    try stream.writeAllNoFlush("\r\nAccess-Control-Expose-Headers: X-Sushi-Effort-Notice\r\n");
+}
+
+fn withEffortNoticeJson(allocator: std.mem.Allocator, json: []const u8, field: ?[]const u8) ![]u8 {
+    const extra = field orelse return allocator.dupe(u8, json);
+    if (extra.len == 0 or json.len == 0 or json[json.len - 1] != '}') return allocator.dupe(u8, json);
+    if (std.mem.indexOf(u8, json, "\"effort_notice\":") != null) return allocator.dupe(u8, json);
+    return std.fmt.allocPrint(allocator, "{s}{s}}}", .{ json[0 .. json.len - 1], extra });
 }
 
 /// The 400 text for an effort word the model's table refuses; caller frees.
@@ -9287,6 +9363,10 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         return;
     };
+    var effort_notice: ?EffortNotice = null;
+    defer if (effort_notice) |n| n.deinit(allocator);
+    defer clearEffortNotice(stream);
+    if (effort_cfg) |e| effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), e);
     var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking());
     if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
 
@@ -9768,7 +9848,7 @@ fn handleNonStreamingCompletion(
     // Spec dispatch: `requestSpecModes` (DFlash > MTP).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
@@ -9856,9 +9936,10 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, logprobs_n);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -10405,7 +10486,7 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
@@ -10893,7 +10974,8 @@ pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 /// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
 /// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
 /// false` hand the round back to MTP. The gemma cross-attention drafter
-/// stays below MTP. logprobs and a grammar constraint disable every mode.
+/// stays below MTP. logprobs and a grammar constraint disable every mode; a repeat or presence
+/// penalty disables only the sidecar and the drafter, since MTP shifts its verify rows for it.
 /// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
 /// already applied at every surface's parse site.
 pub fn requestSpecModes(
@@ -10901,11 +10983,11 @@ pub fn requestSpecModes(
     enable_mtp: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    has_constraint: bool,
+    sampling: generate_mod.SamplingParams,
     logprobs_n: u32,
 ) RequestSpec {
-    const spec_ok = logprobs_n == 0 and !has_constraint;
-    const sidecar = spec_ok and enable_drafter and dflash_loaded;
+    const spec_ok = !generate_mod.mtpUnsupported(sampling, logprobs_n);
+    const sidecar = spec_ok and !generate_mod.penaltyActive(sampling) and enable_drafter and dflash_loaded;
     const use_dflash = sidecar and dflash_loaded;
     const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
     const use_drafter = use_dflash or (!use_mtp and sidecar);
@@ -10915,41 +10997,68 @@ pub fn requestSpecModes(
     };
 }
 
+/// A request that asked for MTP and runs without it says why; the boot line says MTP is on.
+fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: generate_mod.SamplingParams, logprobs_n: u32) void {
+    if (!enable_mtp or !mtp_loaded) return;
+    if (generate_mod.mtpRefusal(sampling, logprobs_n)) |why| log.info("  mtp=disabled ({s})\n", .{why});
+}
+
 fn pickStreamMode(
     enable_drafter: bool,
     enable_mtp: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    has_constraint: bool,
+    sampling: generate_mod.SamplingParams,
     logprobs_n: u32,
 ) StreamMode {
-    const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
+    const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n);
     if (r.use_mtp) return .mtp;
     if (r.use_drafter) return .drafter;
     return .regular;
 }
 
 test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head" {
+    const plain = generate_mod.SamplingParams{};
     // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
-    var r = requestSpecModes(true, true, true, true, false, 0);
+    var r = requestSpecModes(true, true, true, true, plain, 0);
     try std.testing.expect(r.use_drafter and !r.use_mtp);
-    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, false, 0));
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, plain, 0));
     // No sidecar loaded -> MTP keeps its rank.
-    r = requestSpecModes(true, true, false, true, false, 0);
+    r = requestSpecModes(true, true, false, true, plain, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, false, 0));
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, plain, 0));
     // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
-    r = requestSpecModes(false, true, true, true, false, 0);
+    r = requestSpecModes(false, true, true, true, plain, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
     // logprobs / grammar disable every spec mode, dflash included.
-    r = requestSpecModes(true, true, true, true, false, 3);
+    r = requestSpecModes(true, true, true, true, plain, 3);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
-    r = requestSpecModes(true, true, true, true, true, 0);
+    var dummy: generate_mod.Constraint = undefined;
+    r = requestSpecModes(true, true, true, true, .{ .constraint = &dummy }, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
     // Nothing loaded -> regular decode.
-    r = requestSpecModes(true, true, false, false, false, 0);
+    r = requestSpecModes(true, true, false, false, plain, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, false, 0));
+    try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, plain, 0));
+}
+
+test "requestSpecModes: a repeat or presence penalty keeps the sidecar off but MTP on" {
+    const presence = generate_mod.SamplingParams{ .presence_penalty = 1.5 };
+    const repeat = generate_mod.SamplingParams{ .repeat_penalty = 1.1 };
+    for ([_]generate_mod.SamplingParams{ presence, repeat }) |sampling| {
+        // A loaded sidecar cannot take the request, so the round falls to MTP.
+        var r = requestSpecModes(true, true, true, true, sampling, 0);
+        try std.testing.expect(r.use_mtp and !r.use_drafter);
+        try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, sampling, 0));
+        r = requestSpecModes(true, true, false, true, sampling, 0);
+        try std.testing.expect(r.use_mtp and !r.use_drafter);
+        // Without MTP the penalty leaves the sidecar nothing to run.
+        r = requestSpecModes(true, false, true, false, sampling, 0);
+        try std.testing.expect(!r.use_mtp and !r.use_drafter);
+        // logprobs still beat it.
+        r = requestSpecModes(true, true, false, true, sampling, 2);
+        try std.testing.expect(!r.use_mtp and !r.use_drafter);
+    }
 }
 
 fn handleStreamingGeneration(
@@ -11014,9 +11123,10 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, logprobs_n);
 
     // Scheduler's inference thread runs prefill + per-tick decode (regular
     // / PLD / drafter) and pushes generated tokens into the slot's output
@@ -12050,10 +12160,11 @@ fn sendSSEChunk(
     , .{ chat_id, nowSecs(stream.io), model_name, delta_buf.items, fr_str, fd_str, lp_buf.items, usage_str, timings_tail_buf.items });
     defer allocator.free(chunk);
 
-    // Write as SSE event
-    logHttpSseData(chunk);
+    const shipped = if (finish != null) try withEffortNoticeJson(allocator, chunk, stream.effort_notice_json) else try allocator.dupe(u8, chunk);
+    defer allocator.free(shipped);
+    logHttpSseData(shipped);
     try stream.writeAllNoFlush("data: ");
-    try stream.writeAllNoFlush(chunk);
+    try stream.writeAllNoFlush(shipped);
     try stream.writeAllNoFlush("\n\n");
     try stream.flush();
 }
@@ -12079,10 +12190,12 @@ fn sendSSEUsageChunk(
         \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[],"usage":{s}{s}}}
     , .{ chat_id, nowSecs(stream.io), model_name, usage_json, timings_tail_buf.items });
     defer allocator.free(chunk);
+    const shipped = try withEffortNoticeJson(allocator, chunk, stream.effort_notice_json);
+    defer allocator.free(shipped);
 
-    logHttpSseData(chunk);
+    logHttpSseData(shipped);
     try stream.writeAllNoFlush("data: ");
-    try stream.writeAllNoFlush(chunk);
+    try stream.writeAllNoFlush(shipped);
     try stream.writeAllNoFlush("\n\n");
     try stream.flush();
 }
@@ -12104,22 +12217,31 @@ fn sendResponseQuiet(stream: *Conn, status: []const u8, content_type: []const u8
 }
 
 fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+    const extra = stream.effort_notice_json orelse "";
+    const inject = extra.len > 0 and body.len > 0 and body[body.len - 1] == '}' and std.mem.indexOf(u8, body, "\"effort_notice\":") == null;
+    const out_len = body.len + if (inject) extra.len else 0;
     if (stream.ws_mode) |bridge| {
-        // WS transport: skip HTTP framing, send body as a single text frame.
-        // Compliance suite expects errors as `{"type":"error", ...}` text frames.
         if (body.len > 0) try bridge.sendText(body);
         return;
     }
 
     var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n", .{
         status,
         content_type,
-        body.len,
+        out_len,
     }) catch return error.Overflow;
-    try stream.writeAll(hdr);
+    try stream.writeAllNoFlush(hdr);
+    try writeEffortNoticeHeader(stream);
+    try stream.writeAllNoFlush("\r\n");
     stream.length_framed = true;
-    if (body.len > 0) try stream.writeAll(body);
+    if (inject) {
+        try stream.writeAllNoFlush(body[0 .. body.len - 1]);
+        try stream.writeAllNoFlush(extra);
+        try stream.writeAll("}");
+    } else if (body.len > 0) {
+        try stream.writeAll(body);
+    } else try stream.flush();
 }
 
 fn logHttpRequest(method: []const u8, path: []const u8, body: []const u8) void {
@@ -12149,7 +12271,9 @@ fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8) !v
         "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
         "Access-Control-Allow-Headers: ");
     try stream.writeAllNoFlush(allow_headers);
-    try stream.writeAll("\r\n\r\n");
+    try stream.writeAllNoFlush("\r\n");
+    try writeEffortNoticeHeader(stream);
+    try stream.writeAll("\r\n");
     stream.sse_headers_sent = true;
     logHttpStreamStart(kind);
 }
@@ -15794,6 +15918,9 @@ fn handleAnthropicMessages(
         return;
     }
     var effort_word: ?[]const u8 = model_mod.defaultEffortWord(config);
+    var effort_notice: ?EffortNotice = null;
+    defer if (effort_notice) |n| n.deinit(allocator);
+    defer clearEffortNotice(stream);
     if (output_cfg.effort) |word| {
         const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
             const msg = try effortRefusalFor(allocator, lm, word);
@@ -15802,6 +15929,7 @@ fn handleAnthropicMessages(
             return;
         };
         effort_word = cfg.effort;
+        effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
     }
@@ -16079,7 +16207,7 @@ fn handleAnthropicNonStreaming(
 
     // Speculative decoding dispatch — same `requestSpecModes` as
     // chat-completions (DFlash > MTP).
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
@@ -16338,9 +16466,10 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, 0);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -16386,8 +16515,8 @@ fn handleAnthropicStreaming(
     // message_start
     {
         const data = try std.fmt.allocPrint(allocator,
-            \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
-        , .{ nextCompletionId(&completion_id_counter, nowMs(stream.io)), model_name, prompt_token_count });
+            \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}{s}}}}}
+        , .{ nextCompletionId(&completion_id_counter, nowMs(stream.io)), model_name, prompt_token_count, stream.effort_notice_json orelse "" });
         defer allocator.free(data);
         try sendAnthropicEvent(stream, "message_start", data);
     }
@@ -17483,6 +17612,9 @@ fn handleResponsesInner(
     if (root.get("reasoning") == null) reasoning_cfg.effort = model_mod.defaultEffortWord(config);
     var enable_thinking = reasoning_cfg.enable;
     var effort_budget: i32 = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
+    var effort_notice: ?EffortNotice = null;
+    defer if (effort_notice) |n| n.deinit(allocator);
+    defer clearEffortNotice(stream);
     if (reasoning_cfg.effort) |word| {
         const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
             const msg = try effortRefusalFor(allocator, lm, word);
@@ -17490,8 +17622,10 @@ fn handleResponsesInner(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
             return;
         };
+        reasoning_cfg.effort = cfg.effort;
         enable_thinking = cfg.enable;
         effort_budget = cfg.budget;
+        effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
     }
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
@@ -17803,10 +17937,12 @@ fn handleResponsesInner(
             0,
         );
         defer allocator.free(skel);
-        const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
+        const skel_noted = try withEffortNoticeJson(allocator, skel, stream.effort_notice_json);
+        defer allocator.free(skel_noted);
+        const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel_noted});
         defer allocator.free(created_payload);
         try sendResponsesEvent(allocator, stream, seq_num, "response.created", created_payload);
-        const ip_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.in_progress\",\"response\":{s}}}", .{skel});
+        const ip_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.in_progress\",\"response\":{s}}}", .{skel_noted});
         defer allocator.free(ip_payload);
         try sendResponsesEvent(allocator, stream, seq_num, "response.in_progress", ip_payload);
     }
@@ -17841,9 +17977,10 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
+        const stream_mode = pickStreamMode(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling, 0);
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
+        noteMtpRefused(enable_mtp_resp, lm.mtp != null, sampling, 0);
 
         var slot_handle: ?*scheduler_mod.Slot = null;
         defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -18167,7 +18304,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > drafter) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
+        const spec = requestSpecModes(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling, 0);
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         // Transfer vision ownership into the slot.
@@ -18343,17 +18480,19 @@ fn handleResponsesInner(
         result.completion_tokens,
     );
     defer allocator.free(envelope);
+    const envelope_noted = try withEffortNoticeJson(allocator, envelope, stream.effort_notice_json);
+    defer allocator.free(envelope_noted);
 
     // ── store response ──
     if (responsesStoresFinish(finish_reason, should_store)) {
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
-        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
+        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope_noted, pi.messages.items, visible_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
             log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
         };
     }
 
     if (is_stream) {
-        const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
+        const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope_noted});
         defer allocator.free(completed_payload);
         try sendResponsesEvent(allocator, stream, seq_num, "response.completed", completed_payload);
         // OpenAI terminates the Responses HTTP SSE stream with the same
@@ -18367,7 +18506,7 @@ fn handleResponsesInner(
             try stream.writeAll("data: [DONE]\n\n");
         }
     } else {
-        try sendResponse(stream, "200 OK", "application/json", envelope);
+        try sendResponse(stream, "200 OK", "application/json", envelope_noted);
     }
 }
 
@@ -21515,12 +21654,38 @@ test "reasoningEffortFromWord: none disables, words budget exactly like the Open
     try std.testing.expectEqual(@as(i32, -1), consumed.budget);
 }
 
-test "reasoningEffortFromWord: a served arch's table refuses words outside it, never rounds" {
+test "reasoningEffortFromWord: a served arch refuses unknown words, and re-routes only the announced folds" {
     const qwen = model_mod.effortArms("qwen4_exp").?;
     const mimo = model_mod.effortArms("mimo_v2").?;
-    for ([_][]const u8{ "high", "max", "ultra" }) |w| {
-        try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord(w, -1, false, qwen));
+    const glm = model_mod.effortArms("glm5_next").?;
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, false, qwen));
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, false, qwen));
+    for ([_][]const u8{ "high", "max" }) |w| {
+        const got = try reasoningEffortFromWord(w, -1, false, qwen);
+        try std.testing.expect(got.enable);
+        try std.testing.expectEqualStrings("xhigh", got.effort.?);
+        try std.testing.expectEqualStrings(w, got.rerouted_from.?);
+        try std.testing.expectEqual(@as(i32, -1), got.budget);
     }
+    const consumed = try reasoningEffortFromWord("max", 4096, true, qwen);
+    try std.testing.expectEqual(@as(i32, 4096), consumed.budget);
+    try std.testing.expectEqualStrings("xhigh", consumed.effort.?);
+    const glm_med = try reasoningEffortFromWord("medium", -1, false, glm);
+    try std.testing.expect(glm_med.enable);
+    try std.testing.expectEqualStrings("high", glm_med.effort.?);
+    try std.testing.expectEqualStrings("medium", glm_med.rerouted_from.?);
+    const glm_xh = try reasoningEffortFromWord("xhigh", -1, false, glm);
+    try std.testing.expect(glm_xh.enable);
+    try std.testing.expectEqualStrings("max", glm_xh.effort.?);
+    try std.testing.expectEqualStrings("xhigh", glm_xh.rerouted_from.?);
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("off", -1, false, glm));
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, false, glm));
+    const glm_high = try reasoningEffortFromWord("high", -1, false, glm);
+    try std.testing.expect(glm_high.rerouted_from == null);
+    try std.testing.expectEqualStrings("high", glm_high.effort.?);
+    const mimo_high = try reasoningEffortFromWord("high", 4096, false, mimo);
+    try std.testing.expectEqualStrings("on", mimo_high.effort.?);
+    try std.testing.expect(mimo_high.rerouted_from == null);
     try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, false, mimo));
     for ([_][]const u8{ "off", "none" }) |w| {
         try std.testing.expect(!(try reasoningEffortFromWord(w, -1, false, qwen)).enable);
@@ -21539,12 +21704,52 @@ test "reasoningEffortFromWord: a served arch's table refuses words outside it, n
     try std.testing.expect((try reasoningEffortFromWord("ultra", -1, false, null)).enable);
 }
 
+test "withEffortNoticeJson appends the notice and leaves the answer bytes" {
+    const a = std.testing.allocator;
+    const body = "{\"content\":\"page summary\"}";
+    const field = ",\"effort_notice\":\"Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`\"";
+    const out = try withEffortNoticeJson(a, body, field);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("{\"content\":\"page summary\",\"effort_notice\":\"Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`\"}", out);
+    const same = try withEffortNoticeJson(a, body, null);
+    defer a.free(same);
+    try std.testing.expectEqualStrings(body, same);
+    const twice = try withEffortNoticeJson(a, out, field);
+    defer a.free(twice);
+    try std.testing.expectEqualStrings(out, twice);
+}
+
+test "effort notice rides the response header and does not replace the answer" {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
+    const notice = "Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`";
+    conn.effort_notice = notice;
+    conn.effort_notice_json = ",\"effort_notice\":\"Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`\"";
+    try sendResponseFramed(&conn, "200 OK", "application/json", "{\"content\":\"page summary\"}");
+    conn.close();
+    var buf: [2048]u8 = undefined;
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.recv(sv[1], buf[got..].ptr, buf.len - got, 0);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    const raw = buf[0..got];
+    try std.testing.expect(std.mem.indexOf(u8, raw, "X-Sushi-Effort-Notice: " ++ notice ++ "\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Access-Control-Expose-Headers: X-Sushi-Effort-Notice\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"content\":\"page summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"effort_notice\":\"" ++ notice ++ "\"") != null);
+}
+
 test "effort refusal and /v1/models list name the model's accepted words" {
     const allocator = std.testing.allocator;
     const qwen = model_mod.effortArms("qwen4_exp").?;
-    const msg = try effortRefusal(allocator, "high", "Qwen3.8-Flash-Next-EXL3-K4", qwen);
+    const msg = try effortRefusal(allocator, "minimal", "Qwen3.8-Flash-Next-EXL3-K4", qwen);
     defer allocator.free(msg);
-    try std.testing.expectEqualStrings("reasoning effort 'high' is not supported by Qwen3.8-Flash-Next-EXL3-K4; use one of: off, low, medium, xhigh", msg);
+    try std.testing.expectEqualStrings("reasoning effort 'minimal' is not supported by Qwen3.8-Flash-Next-EXL3-K4; use one of: off, low, medium, xhigh", msg);
     const row = try reasoningEffortsJson(allocator, &.{ .model_type = "qwen4_exp" });
     defer allocator.free(row);
     try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"off\"", row);
@@ -26050,16 +26255,33 @@ test "a streamed --vision load proves its largest image encode beside the budget
     try std.testing.expect(!ssdBudgetAdmits(32 << 30, expertStreamingBesideBudgetBytes(&cfg), (32 << 30) + kv));
 }
 
-test "thinking policy HTTP: Qwen and GLM accept their own words, MiMo takes every thinking word as on" {
+test "thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo folds to on" {
     for ([_]struct { arch: []const u8, accepted: []const model_mod.Effort }{
         .{ .arch = "glm5_next", .accepted = &.{ .low, .high, .max } },
         .{ .arch = "qwen4_exp", .accepted = &.{ .off, .low, .medium, .xhigh } },
     }) |c| {
         for (std.enums.values(model_mod.Effort)) |e| {
+            const result = reasoningEffortFromWord(@tagName(e), -1, true, model_mod.effortArms(c.arch));
             if (std.mem.indexOfScalar(model_mod.Effort, c.accepted, e) != null) {
-                const got = try reasoningEffortFromWord(@tagName(e), -1, true, model_mod.effortArms(c.arch));
+                const got = try result;
                 try std.testing.expectEqual(e != .off, got.enable);
-            } else try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord(@tagName(e), -1, true, model_mod.effortArms(c.arch)));
+                try std.testing.expect(got.rerouted_from == null);
+            } else if (std.mem.eql(u8, c.arch, "qwen4_exp") and (e == .high or e == .max)) {
+                const got = try result;
+                try std.testing.expect(got.enable);
+                try std.testing.expectEqualStrings("xhigh", got.effort.?);
+                try std.testing.expectEqualStrings(@tagName(e), got.rerouted_from.?);
+            } else if (std.mem.eql(u8, c.arch, "glm5_next") and e == .medium) {
+                const got = try result;
+                try std.testing.expect(got.enable);
+                try std.testing.expectEqualStrings("high", got.effort.?);
+                try std.testing.expectEqualStrings("medium", got.rerouted_from.?);
+            } else if (std.mem.eql(u8, c.arch, "glm5_next") and e == .xhigh) {
+                const got = try result;
+                try std.testing.expect(got.enable);
+                try std.testing.expectEqualStrings("max", got.effort.?);
+                try std.testing.expectEqualStrings("xhigh", got.rerouted_from.?);
+            } else try std.testing.expectError(error.EffortRefused, result);
         }
         try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, true, model_mod.effortArms(c.arch)));
     }
@@ -26068,6 +26290,7 @@ test "thinking policy HTTP: Qwen and GLM accept their own words, MiMo takes ever
         const got = try reasoningEffortFromWord(w, -1, true, mimo);
         try std.testing.expect(got.enable);
         try std.testing.expectEqualStrings("on", got.effort.?);
+        try std.testing.expect(got.rerouted_from == null);
     }
     for ([_][]const u8{ "off", "none" }) |w| try std.testing.expect(!(try reasoningEffortFromWord(w, -1, true, mimo)).enable);
     try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, true, mimo));

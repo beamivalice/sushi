@@ -1154,15 +1154,17 @@ pub fn main(init: std.process.Init) !void {
     const config = config_storage;
     scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
     if (model_mod.think_effort_flag) |e| if (model_mod.effortArms(config.model_type)) |arms| {
+        var choices: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
+        for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
         if (model_mod.armForWord(arms, @tagName(e)) == null) {
-            var choices: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
-            for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
             var w = std.Io.Writer.Allocating.init(allocator);
             defer w.deinit();
             try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, choices[0..arms.len]);
             log.err("--think: {s}\n", .{w.written()});
             std.process.exit(1);
-        }
+        } else if (model_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
+            log.info("[effort] " ++ model_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
+        };
     };
     if (config.glm_fp8_trunk) {
         log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });

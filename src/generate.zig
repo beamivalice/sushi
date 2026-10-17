@@ -22,6 +22,7 @@ const depth_bounds = @import("mtp_depth_bounds.zig");
 const chip_mod = @import("chip.zig");
 const scheduler_mod = @import("scheduler.zig");
 const think_penalty = @import("think_penalty.zig");
+const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -1157,8 +1158,22 @@ fn specDecodeUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
     return draftsRefused(sampling) or logprobs_n != 0;
 }
 
+/// MTP rounds shift every verify row for a repeat or presence penalty (`penaltyShiftRows`), so
+/// only what a draft run cannot honour keeps them off.
+pub fn mtpUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
+    return mtpRefusal(sampling, logprobs_n) != null;
+}
+
+/// Why a request runs without MTP, for the log; null when MTP may run.
+pub fn mtpRefusal(sampling: SamplingParams, logprobs_n: u32) ?[]const u8 {
+    if (logprobs_n != 0) return "logprobs requested";
+    if (sampling.constraint != null) return "grammar-constrained output";
+    if (sampling.call_force != null) return "forced tool call";
+    return null;
+}
+
 /// A grammar mask or a forced tool call decides tokens a draft run would skip past, and a
-/// repeat or presence penalty reads ids no verify row has committed yet.
+/// repeat or presence penalty reads ids no verify row has committed yet; only MTP shifts the rows.
 pub fn draftsRefused(sampling: SamplingParams) bool {
     return sampling.constraint != null or sampling.call_force != null or penaltyActive(sampling);
 }
@@ -1204,7 +1219,7 @@ pub fn penaltyActive(sampling: SamplingParams) bool {
 }
 
 fn repeatPenaltyOn(repeat_penalty: f32) bool {
-    return repeat_penalty > 0.0 and repeat_penalty != 1.0;
+    return seen_penalty.repeatOn(repeat_penalty);
 }
 
 /// Generation result (for non-streaming use).
@@ -3768,6 +3783,21 @@ pub const Generator = struct {
         return true;
     }
 
+    /// Row j of a verify block under the request's repeat and presence penalties, over the committed
+    /// ids and `ids[0..j]` (inclusive): the logits its serial tick would sample. Drafts stay raw.
+    pub fn penaltyShiftRows(self: *Generator, logits: *mlx.mlx_array, ids: mlx.mlx_array) !bool {
+        if (!penaltyActive(self.sampling)) return false;
+        const shape = mlx.getShape(logits.*);
+        const committed = try think_penalty.buildMask(std.heap.page_allocator, self.generated_ids.items, @intCast(shape[shape.len - 1]));
+        defer _ = mlx.mlx_array_free(committed);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try seen_penalty.shiftRows(&out, logits.*, ids, committed, self.sampling.repeat_penalty, self.sampling.presence_penalty, self.xfm.s);
+        _ = mlx.mlx_array_free(logits.*);
+        logits.* = out;
+        return true;
+    }
+
     /// The host-decided penalty for a sample after the committed ids, for `sampleToken`.
     fn markerShiftCommitted(self: *Generator) ?MarkerShift {
         const tp = &self.sampling.think_penalty;
@@ -6218,7 +6248,7 @@ pub const Generator = struct {
         if (group_planner.enabled() and self.mtp_planner_owned and self.mtp_hidden_stale) return error.MtpHiddenStale;
         // Release-enforced guard (issue #97): the MTP path cannot honor a
         // grammar constraint or logprobs (compiled-out asserts before).
-        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        if (mtpUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         // `--max-mtp-ctx`, checked at the top of the round against prompt + generated. Sticky
         // (context only grows), routed through the same `spec_disabled_runtime` fallback.
@@ -6552,6 +6582,7 @@ pub const Generator = struct {
         errdefer xfm.discardDeferredPle(&self.ctx);
         try xfm.flushDeferredPle(&self.ctx);
         _ = try self.thinkShiftRows(&verify_logits, st.verify_input);
+        _ = try self.penaltyShiftRows(&verify_logits, st.verify_input);
         st.verify_logits = verify_logits;
         st.new_hidden = new_hidden;
         st.verify_hidden_all = verify_hidden_all;
@@ -6592,6 +6623,7 @@ pub const Generator = struct {
             // Row 0 owns the joined block for the round when the lm_head ran once.
             if (i == 0) st.group_logits = xfm.takeJoinedVerifyLogits();
             if (try gen.thinkShiftRows(&st.verify_logits, st.verify_input)) shifted_any = true;
+            if (try gen.penaltyShiftRows(&st.verify_logits, st.verify_input)) shifted_any = true;
             if (st.tracing) {
                 gen.mtp_trace.add(.verify, row_ns[i]);
                 const laps = xfm.verify_laps;
@@ -12288,71 +12320,7 @@ fn applyRepeatPenaltyWithAllocator(allocator: std.mem.Allocator, res: *mlx.mlx_a
     const mask_arr = mlx.mlx_array_new_data(mask_data.ptr, &arr_shape, 2, .bool_);
     defer _ = mlx.mlx_array_free(mask_arr);
 
-    var current = logits;
-
-    // Repeat penalty: multiply seen tokens by 1/penalty (positive) or penalty (negative)
-    // This is equivalent to: where(mask & logits > 0, logits / penalty, where(mask, logits * penalty, logits))
-    // Simplified: where(mask, where(logits > 0, logits / penalty, logits * penalty), logits)
-    var penalized = mlx.mlx_array_new();
-    var penalized_owned = false;
-    defer if (penalized_owned) {
-        _ = mlx.mlx_array_free(penalized);
-    };
-
-    if (repeatPenaltyOn(repeat_penalty)) {
-        const rp = mlx.mlx_array_new_float(repeat_penalty);
-        defer _ = mlx.mlx_array_free(rp);
-        const inv_rp = mlx.mlx_array_new_float(1.0 / repeat_penalty);
-        defer _ = mlx.mlx_array_free(inv_rp);
-        const zero = mlx.mlx_array_new_float(0.0);
-        defer _ = mlx.mlx_array_free(zero);
-
-        // positive_mask = logits > 0
-        var positive_mask = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(positive_mask);
-        try mlx.check(mlx.mlx_greater(&positive_mask, current, zero, s));
-
-        // penalized_positive = logits * (1/penalty)
-        var pen_pos = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(pen_pos);
-        try mlx.check(mlx.mlx_multiply(&pen_pos, current, inv_rp, s));
-
-        // penalized_negative = logits * penalty
-        var pen_neg = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(pen_neg);
-        try mlx.check(mlx.mlx_multiply(&pen_neg, current, rp, s));
-
-        // sign_selected = where(positive, logits/penalty, logits*penalty)
-        var sign_selected = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sign_selected);
-        try mlx.check(mlx.mlx_where(&sign_selected, positive_mask, pen_pos, pen_neg, s));
-
-        // result = where(mask, sign_selected, logits)
-        try mlx.check(mlx.mlx_where(&penalized, mask_arr, sign_selected, current, s));
-        current = penalized;
-        penalized_owned = true;
-    }
-
-    // Presence penalty: subtract from seen tokens
-    if (presence_penalty != 0.0) {
-        const pp = mlx.mlx_array_new_float(presence_penalty);
-        defer _ = mlx.mlx_array_free(pp);
-
-        // Cast mask to float for arithmetic
-        var mask_float = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mask_float);
-        try mlx.check(mlx.mlx_astype(&mask_float, mask_arr, .float16, s));
-
-        // subtract = mask * presence_penalty
-        var subtract = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(subtract);
-        try mlx.check(mlx.mlx_multiply(&subtract, mask_float, pp, s));
-
-        // result = current - subtract
-        try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
-    } else {
-        try mlx.check(mlx.mlx_copy(res, current, s));
-    }
+    try seen_penalty.apply(res, logits, mask_arr, repeat_penalty, presence_penalty, s);
 }
 
 /// Greedy argmax over the last axis.
@@ -12420,7 +12388,7 @@ test "specDecodeUnsupported: a forced tool call keeps every draft path off" {
     try testing.expect(specDecodeUnsupported(.{ .call_force = &cf }, 0));
 }
 
-test "a repeat or presence penalty keeps every draft path off and samples on the synchronous path" {
+test "a repeat or presence penalty keeps DFlash and the drafter off and samples on the synchronous path" {
     try testing.expect(specDecodeUnsupported(.{ .presence_penalty = 0.5 }, 0));
     try testing.expect(specDecodeUnsupported(.{ .repeat_penalty = 1.1 }, 0));
     try testing.expect(draftsRefused(.{ .presence_penalty = 0.5 }));
@@ -12435,6 +12403,71 @@ test "a repeat or presence penalty keeps every draft path off and samples on the
     try testing.expect(!g.samplesSync());
     g.logprobs_n = 2;
     try testing.expect(g.samplesSync());
+}
+
+test "penalty rows: every verify row equals its serial tick over the committed ids and the round's ids through it" {
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 40;
+    const Case = struct { committed: []const u32, ids: []const i32 };
+    const cases = [_]Case{
+        .{ .committed = &.{ 3, 7, 7, 12 }, .ids = &.{ 7, 5, 5, 31, 3 } },
+        .{ .committed = &.{}, .ids = &.{ 9, 9, 2 } },
+        .{ .committed = &.{ 0, 39 }, .ids = &.{ 20 } },
+    };
+    const Pen = struct { repeat: f32, presence: f32 };
+    const pens = [_]Pen{ .{ .repeat = 1.3, .presence = 0 }, .{ .repeat = 1, .presence = 1.5 }, .{ .repeat = 1.2, .presence = 0.7 }, .{ .repeat = 0.8, .presence = 0.25 } };
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
+        for (cases) |c| {
+            const rows = c.ids.len;
+            var host: [8 * v]f32 = undefined;
+            for (host[0 .. rows * v], 0..) |*x, i| x.* = @as(f32, @floatFromInt((i * 37) % 23)) * 0.375 - 4.0;
+            const shape = [_]c_int{ 1, @intCast(rows), @intCast(v) };
+            const raw = mlx.mlx_array_new_data(&host, &shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(raw);
+            var block = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(block);
+            try mlx.check(mlx.mlx_astype(&block, raw, dtype, s));
+            const id_shape = [_]c_int{ 1, @intCast(rows) };
+            const ids = mlx.mlx_array_new_data(c.ids.ptr, &id_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(ids);
+            const committed = try think_penalty.buildMask(a, c.committed, v);
+            defer _ = mlx.mlx_array_free(committed);
+            for (pens) |p| {
+                var shifted = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(shifted);
+                try seen_penalty.shiftRows(&shifted, block, ids, committed, p.repeat, p.presence, s);
+                const got = try samplerTestReadFlat(a, shifted, rows * v, s);
+                defer a.free(got);
+                for (0..rows) |j| {
+                    var history: [16]u32 = undefined;
+                    @memcpy(history[0..c.committed.len], c.committed);
+                    for (c.ids[0 .. j + 1], 0..) |id, k| history[c.committed.len + k] = @intCast(id);
+                    var row = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(row);
+                    try mlx.check(mlx.mlx_slice(&row, block, &.{ 0, @intCast(j), 0 }, 3, &.{ 1, @as(c_int, @intCast(j)) + 1, @intCast(v) }, 3, &.{ 1, 1, 1 }, 3, s));
+                    var serial = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(serial);
+                    try applyRepeatPenalty(&serial, row, history[0 .. c.committed.len + j + 1], p.repeat, p.presence, s);
+                    const want = try samplerTestReadFlat(a, serial, v, s);
+                    defer a.free(want);
+                    try testing.expectEqualSlices(f32, want, got[j * v ..][0..v]);
+                }
+            }
+        }
+    }
+}
+
+test "a penalty keeps DFlash and the drafter off but not MTP" {
+    try testing.expect(!mtpUnsupported(.{ .presence_penalty = 1.5 }, 0));
+    try testing.expect(!mtpUnsupported(.{ .repeat_penalty = 1.1, .presence_penalty = 0.5 }, 0));
+    try testing.expect(mtpUnsupported(.{ .presence_penalty = 1.5 }, 2));
+    var cf = CallForce{ .forced = &.{1}, .call_at = 0, .closer_id = null, .phase = .answer, .last = 0 };
+    try testing.expect(mtpUnsupported(.{ .call_force = &cf, .presence_penalty = 1.5 }, 0));
+    try testing.expect(specDecodeUnsupported(.{ .presence_penalty = 1.5 }, 0));
+    try testing.expect(mtpRefusal(.{ .presence_penalty = 1.5 }, 0) == null);
+    try testing.expectEqualStrings("logprobs requested", mtpRefusal(.{}, 1).?);
+    try testing.expectEqualStrings("forced tool call", mtpRefusal(.{ .call_force = &cf }, 0).?);
 }
 
 test "a repeat penalty of 0 or below is off" {
