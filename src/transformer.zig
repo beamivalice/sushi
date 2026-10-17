@@ -6996,13 +6996,13 @@ pub const KVCache = struct {
         max_seq: u32,
         scheme: KVQuantConfig,
     ) !void {
-        if (scheme.scheme == .affine and scheme.bits == 8) {
+        if (scheme.scheme == .affine and (scheme.bits == 8 or scheme.bits == 6)) {
             const Once = struct {
                 var logged: bool = false;
             };
             if (!Once.logged) {
                 Once.logged = true;
-                log.info("[batched] affine-8 kv append engaged (slots={d}) (batched_kv_append_override=false restores per-slot appends)\n", .{caches.len});
+                log.info("[batched] affine-{d} kv append engaged (slots={d}) (batched_kv_append_override=false restores per-slot appends)\n", .{ scheme.bits, caches.len });
             }
             try appendAffineBatched(stacked_k, stacked_v, caches, layer, s, max_seq, scheme);
             return;
@@ -29454,11 +29454,11 @@ fn kvAppendDummyAttn(cache: *KVCache, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
-test "batched KV append: affine-8 N=2/4/8 matches N solo updates at production geometry" {
+fn batchedAppendMatchesSolo(bits: u8) !void {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
-    const cfg = kv_quant.KVQuantConfig.affine(8);
+    const cfg = kv_quant.KVQuantConfig.affine(bits);
     const ns = [_]usize{ 2, 4, 8 };
     const lens = [_]usize{ 2, 5, 3, 8, 4, 7, 6, 9 };
     for (ns) |n| {
@@ -29497,6 +29497,14 @@ test "batched KV append: affine-8 N=2/4/8 matches N solo updates at production g
             try testing.expect(try qsaArraysAllEqual(attn_s, attn_b, s));
         }
     }
+}
+
+test "batched KV append: affine-8 N=2/4/8 matches N solo updates at production geometry" {
+    try batchedAppendMatchesSolo(8);
+}
+
+test "batched KV append: affine-6 N=2/4/8 matches N solo updates at production geometry" {
+    try batchedAppendMatchesSolo(6);
 }
 
 test "batched KV append: two restored siblings append and truncate independently; the snapshot stays byte-identical" {
@@ -29554,11 +29562,11 @@ test "batched KV append: two restored siblings append and truncate independently
     try testing.expect(try qsaArraysAllEqual(snap.entries[0].keys, snap_k, s));
 }
 
-test "batched KV append: per-layer op count is quantize-once plus per-slot writes, not N x (2 slices + update)" {
+fn batchedAppendOpCount(bits: u8) !void {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
-    const cfg = kv_quant.KVQuantConfig.affine(8);
+    const cfg = kv_quant.KVQuantConfig.affine(bits);
     const ns = [_]usize{ 2, 4, 8 };
     const lens = [_]usize{ 2, 5, 3, 8, 4, 7, 6, 9 };
     var solo_at: [3]u64 = undefined;
@@ -29601,14 +29609,18 @@ test "batched KV append: per-layer op count is quantize-once plus per-slot write
     try testing.expect((bat_at[2] - bat_at[0]) < (solo_at[2] - solo_at[0]));
 }
 
-test "batched KV append: dense, affine-4 and affine-6 stay on the per-slot path" {
+test "batched KV append: per-layer op count is quantize-once plus per-slot writes, not N x (2 slices + update)" {
+    try batchedAppendOpCount(8);
+    try batchedAppendOpCount(6);
+}
+
+test "batched KV append: dense and affine-4 stay on the per-slot path" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const schemes = [_]kv_quant.KVQuantConfig{
         kv_quant.KVQuantConfig.dense,
         kv_quant.KVQuantConfig.affine(4),
-        kv_quant.KVQuantConfig.affine(6),
     };
     for (schemes) |cfg| {
         var solo: [2]KVCache = .{ try KVCache.initWithConfig(alloc, 1, cfg), try KVCache.initWithConfig(alloc, 1, cfg) };
