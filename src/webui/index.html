@@ -2260,7 +2260,7 @@ function createStreamingView() {
   scrollChat(true);
   return state;
 }
-function replyMeta(usage, timings, finishReason, aborted, clientRate) {
+function replyMeta(usage, timings, finishReason, aborted, clientRate, effortNotice) {
   const parts = [];
   const tokens = Number(usage?.completion_tokens ?? 0);
   if (tokens > 0) parts.push(`${fmtInt(tokens)} tokens`);
@@ -2268,6 +2268,7 @@ function replyMeta(usage, timings, finishReason, aborted, clientRate) {
   if (rate > 0) parts.push(`${rate.toFixed(1)} tok/s`);
   if (aborted) parts.push("stopped");
   else if (finishReason === "length") parts.push("hit the token limit");
+  if (typeof effortNotice === "string" && effortNotice) parts.push(effortNotice);
   return parts.join(" · ") || null;
 }
 async function streamReply(model, history, signal, tools = null) {
@@ -2276,6 +2277,7 @@ async function streamReply(model, history, signal, tools = null) {
   const toolCalls = [];
   let usage = null;
   let timings = null;
+  let effortNotice = null;
   let finishReason = null;
   let streamError = null;
   let firstAt = 0;
@@ -2294,6 +2296,7 @@ async function streamReply(model, history, signal, tools = null) {
       } catch {}
       throw new Error(`${response.status}: ${String(detail).slice(0, 240)}`);
     }
+    effortNotice = response.headers.get("x-sushi-effort-notice") || null;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -2316,6 +2319,7 @@ async function streamReply(model, history, signal, tools = null) {
         }
         if (json.usage) usage = json.usage;
         if (json.timings) timings = json.timings;
+        if (typeof json.effort_notice === "string" && json.effort_notice) effortNotice = json.effort_notice;
         const choice = json.choices?.[0];
         if (!choice) return;
         if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -2355,7 +2359,7 @@ async function streamReply(model, history, signal, tools = null) {
     text: view.text,
     reasoning: view.reasoning,
     aborted: signal.aborted,
-    meta: replyMeta(usage, timings, finishReason, signal.aborted, clientRate),
+    meta: replyMeta(usage, timings, finishReason, signal.aborted, clientRate, effortNotice),
   };
 }
 function setChatBusy(busy) {

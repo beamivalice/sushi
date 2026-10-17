@@ -17,10 +17,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
 - **Effort vocabulary** `off on minimal low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024
   budget on inherited arches): each served arch accepts a subset (`model.effortArms`), read through
-  `model.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike; a word outside it is
-  refused with the accepted list, never rounded. Uncapped = `--reasoning-budget`.
-- qwen4_exp: off, low (2048), medium (8192), xhigh (uncapped); the template reads the word; `minimal`, high, max 400.
-- glm5_next: low, high, max (uncapped, a prompt instruction); off and every other word 400.
+  `model.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike. A word outside it
+  is refused with the accepted list. Announced folds: Qwen `high` and `max` → `xhigh`, GLM `medium` → `high` and
+  `xhigh` → `max`. The request is served, and every re-route logs `[effort]` and rides back as
+  `X-Sushi-Effort-Notice` plus `effort_notice` (not in the answer text). MiMo's silent on-fold is unchanged.
+  Uncapped = `--reasoning-budget`.
+- qwen4_exp: off, low (2048), medium (8192), xhigh (uncapped); the template reads the word; `high` and `max`
+  are served as `xhigh` with that notice; `minimal` still 400.
+- glm5_next: low, high, max (uncapped, a prompt instruction); `medium` is served as `high` and `xhigh` as `max`
+  with that notice; off and every other word 400.
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
   uncapped, and off/none is off.
 - `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
