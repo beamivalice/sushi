@@ -10992,6 +10992,8 @@ test "group cost geometry rejects partial rounds and keeps complete cache format
     b.group_size = 128;
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
+    try testing.expect(cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
 }
 
 test "scheduler prices each shared execution once and preserves row sampling geometry" {
@@ -11525,6 +11527,7 @@ test "a submit that fails before its slot exists hands the vision array to the i
     var glm_cfg = ModelConfig{ .num_hidden_layers = 0, .model_type = "glm5_next" };
     model.config = &glm_cfg;
     try Probe.expectHandedOver(testing.allocator, &model, .affine(4), error.GlmKvQuantUnsupported);
+    try Probe.expectHandedOver(testing.allocator, &model, .affine(6), error.GlmKvQuantUnsupported);
 
     // Every allocation Slot.init makes is a point where it can fail.
     model.config = &cfg;
@@ -11603,7 +11606,7 @@ test "every GLM slot owns its native request and hands it to its forward context
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
 }
 
-test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted slot's cache as that scheme" {
+test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitted slot's cache as that scheme" {
     const allocator = testing.allocator;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
@@ -11635,6 +11638,8 @@ test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted s
         .{ .body = .{ .integer = 16 }, .want = transformer_mod.KVQuantConfig.dense },
         .{ .body = .{ .string = "16" }, .want = transformer_mod.KVQuantConfig.dense },
         .{ .body = .{ .integer = 8 }, .want = transformer_mod.KVQuantConfig.affine(8) },
+        .{ .body = .{ .integer = 6 }, .want = transformer_mod.KVQuantConfig.affine(6) },
+        .{ .body = .{ .string = "6" }, .want = transformer_mod.KVQuantConfig.affine(6) },
         .{ .body = .{ .integer = 4 }, .want = transformer_mod.KVQuantConfig.affine(4) },
     }) |c| {
         const override = transformer_mod.KVQuantConfig.fromJsonValue(c.body).?;
@@ -11645,7 +11650,7 @@ test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted s
     }
 }
 
-test "a GLM slot submitted with a kv4 override is refused by the same name admission uses elsewhere" {
+test "a GLM slot submitted with a kv4 or kv6 override is refused by the same name admission uses elsewhere" {
     const allocator = testing.allocator;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
@@ -11671,8 +11676,10 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
     model.config = &cfg;
     model.transformer = null;
     model.prefix_cache = null;
-    const result = sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = transformer_mod.KVQuantConfig.affine(4) });
-    try expectError(error.GlmKvQuantUnsupported, result);
+    for ([_]u8{ 4, 6 }) |bits| {
+        const result = sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = transformer_mod.KVQuantConfig.affine(bits) });
+        try expectError(error.GlmKvQuantUnsupported, result);
+    }
 }
 
 test "an empty prompt is refused at submit, before any slot reaches the inference thread" {

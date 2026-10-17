@@ -52,7 +52,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--kv-quant` | `8` → KV scheme 8, 4 or 16 (`off` = BF16); also `kv_quant` in settings and per request (main.zig:972) | user | help, usage, engine-kv-cache; 21 tests | keep |
+| `--kv-quant` | `8` → KV scheme 8, 6, 4 or 16 (`off` = BF16); also `kv_quant` in settings and per request (main.zig:972) | user | help, usage, engine-kv-cache; 21 tests | keep |
 | `--qwen-gdn` | `32` → GatedDeltaNet state width in bits, `32` (f32) or `16` (bf16), Qwen only; the decay gate is f32 either way (main.zig:830) | machine | help, usage, engine-kv-cache, quality-kld; 3 tests (parse, config, boot line) | keep: the 32, 48 and 64 GB recipes pass `16` to halve the state per checkpoint (about 54 MB each); against the f32 default the bf16 state (arm b) is about 2% faster on 4-stream aggregate and its KLD is inside the noise ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher), [qwen4-perf](qwen4-perf.md#gdn-f32-cost)) |
 | `--mtp-head-kv-quant` | off → Qwen's MTP head KV follows `--kv-quant`; no effect on MiMo (main.zig:762) | machine | help, usage, README, engine-mtp; 0 tests | keep: the long-context memory bills use it |
 

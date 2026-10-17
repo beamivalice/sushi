@@ -5,7 +5,7 @@
 // reads dense `[B, H, T, head_dim]` tensors via `KVCache.denseView` — what the
 // cache buffers actually hold is decided here.
 //
-// One non-trivial scheme: affine group-wise quantization at 4 or 8 bits,
+// One non-trivial scheme: affine group-wise quantization at 4, 6 or 8 bits,
 // mathematically identical to mlx-c's `mlx_quantize` weight path. The buffers
 // grow to 3 arrays per K and V (q, scales, biases); attention is unchanged
 // because `denseView` calls `dequantizeAffine` before returning.
@@ -28,19 +28,24 @@ pub const Scheme = enum { off, affine };
 /// and switched on at every read/write boundary.
 pub const KVQuantConfig = struct {
     scheme: Scheme,
-    /// Affine: 4 or 8. Ignored when `scheme == .off`.
+    /// Affine: 4, 6 or 8. Ignored when `scheme == .off`.
     bits: u8,
     /// Affine group size — number of consecutive elements that share one
     /// scale+bias pair along the last axis. mlx-c convention is 64 for
-    /// 4-bit and 8-bit weights; we match that.
+    /// 4-, 6- and 8-bit weights; we match that.
     group_size: u32,
 
     pub const dense: KVQuantConfig = .{ .scheme = .off, .bits = 0, .group_size = 0 };
     /// What a load stores at when neither `--kv-quant` nor `model-settings.json` names a scheme.
     pub const engine_default: KVQuantConfig = .{ .scheme = .affine, .bits = 8, .group_size = 64 };
 
+    /// Affine widths the cache stores and every packed reader serves.
+    pub fn supportedBits(bits: u8) bool {
+        return bits == 4 or bits == 6 or bits == 8;
+    }
+
     pub fn affine(bits: u8) KVQuantConfig {
-        std.debug.assert(bits == 4 or bits == 8);
+        std.debug.assert(supportedBits(bits));
         return .{ .scheme = .affine, .bits = bits, .group_size = 64 };
     }
 
@@ -49,18 +54,20 @@ pub const KVQuantConfig = struct {
     }
 
     /// The wire vocabulary shared by the per-request `kv_quant` body field and
-    /// `model-settings.json`: "off"/0/16 (BF16), "4", "8". Null = unrecognized.
+    /// `model-settings.json`: "off"/0/16 (BF16), "4", "6", "8". Null = unrecognized.
     pub fn fromJsonValue(v: std.json.Value) ?KVQuantConfig {
         switch (v) {
             .string => |s| {
                 if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "16")) return dense;
                 if (std.mem.eql(u8, s, "4")) return affine(4);
+                if (std.mem.eql(u8, s, "6")) return affine(6);
                 if (std.mem.eql(u8, s, "8")) return affine(8);
                 return null;
             },
             .integer => |i| {
                 if (i == 0 or i == 16) return dense;
                 if (i == 4) return affine(4);
+                if (i == 6) return affine(6);
                 if (i == 8) return affine(8);
                 return null;
             },
@@ -68,7 +75,7 @@ pub const KVQuantConfig = struct {
         }
     }
 
-    /// GLM's MLA latent bits for this scheme (`glm5_latent.zig`); null = no GLM backend (kv4).
+    /// GLM's MLA latent bits for this scheme (`glm5_latent.zig`); null = no GLM backend (kv4, kv6).
     pub fn glmLatentBits(self: KVQuantConfig) ?u8 {
         return switch (self.scheme) {
             .off => 0,
@@ -80,10 +87,24 @@ pub const KVQuantConfig = struct {
     pub fn wireName(self: KVQuantConfig) []const u8 {
         return switch (self.scheme) {
             .off => "off",
-            .affine => if (self.bits == 4) "4" else "8",
+            .affine => switch (self.bits) {
+                4 => "4",
+                6 => "6",
+                else => "8",
+            },
         };
     }
 };
+
+/// uint32 words one row of `dim` values packs into; a layout that rounds is never a cache's.
+pub fn packedWords(dim: c_int, bits: u8) c_int {
+    return @divTrunc(dim * @as(c_int, bits), 32);
+}
+
+/// Values a packed row of `words` uint32 words holds; the inverse of `packedWords`.
+pub fn unpackedDim(words: c_int, bits: u8) c_int {
+    return @divTrunc(words * 32, @as(c_int, bits));
+}
 
 /// The KV scheme a load stores at, with its provenance: `--kv-quant` > per-model setting >
 /// `KVQuantConfig.engine_default`. `launch` is the flag's value, or the default when unflagged.
@@ -100,7 +121,11 @@ pub const KvCacheChoice = struct {
     pub fn label(self: KvCacheChoice) []const u8 {
         return switch (self.config.scheme) {
             .off => "off",
-            .affine => if (self.config.bits == 4) "kv4" else "kv8",
+            .affine => switch (self.config.bits) {
+                4 => "kv4",
+                6 => "kv6",
+                else => "kv8",
+            },
         };
     }
 
@@ -569,6 +594,61 @@ test "quantizeAffine + dequantizeAffine round-trip at 8 bits" {
     }
     // 8-bit affine: ~256x finer steps than 4-bit; expect < 0.005 on smooth data.
     try testing.expect(max_err < 0.01);
+}
+
+test "kv6 is a first-class wire value: parsed, named and refused by GLM's latent backend" {
+    const t = std.testing;
+    const six = KVQuantConfig.affine(6);
+    try t.expectEqual(six, KVQuantConfig.fromJsonValue(.{ .string = "6" }).?);
+    try t.expectEqual(six, KVQuantConfig.fromJsonValue(.{ .integer = 6 }).?);
+    try t.expectEqual(@as(?KVQuantConfig, null), KVQuantConfig.fromJsonValue(.{ .string = "5" }));
+    try t.expectEqual(@as(?KVQuantConfig, null), KVQuantConfig.fromJsonValue(.{ .integer = 7 }));
+    try t.expectEqualStrings("6", six.wireName());
+    try t.expectEqualStrings("kv6", (KvCacheChoice{ .config = six, .source = .default }).label());
+    try t.expectEqual(@as(?u8, null), six.glmLatentBits());
+    // Every wire name parses back to its own config.
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(4), six, KVQuantConfig.affine(8) }) |c| {
+        try t.expectEqual(c, KVQuantConfig.fromJsonValue(.{ .string = c.wireName() }).?);
+    }
+}
+
+fn roundTripRms(bits: u8) !f64 {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x6b76);
+    const rnd = prng.random();
+    const n = 64 * 256;
+    const host = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(host);
+    for (host) |*v| v.* = rnd.floatNorm(f32) * 3.0;
+    const shape = [_]c_int{ 64, 256 };
+    const f32_arr = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(f32_arr);
+    var src = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(src);
+    try mlx.check(mlx.mlx_astype(&src, f32_arr, .bfloat16, s));
+
+    var qkv = try quantizeAffine(s, src, 64, bits);
+    defer qkv.deinit();
+    try testing.expectEqual(@as(c_int, 8) * bits, mlx.getShape(qkv.q)[1]);
+    const deq = try dequantizeAffine(s, qkv.q, qkv.scales, qkv.biases, 64, bits);
+    defer _ = mlx.mlx_array_free(deq);
+
+    const orig = try readF32Flat(s, src, testing.allocator);
+    defer testing.allocator.free(orig);
+    const got = try readF32Flat(s, deq, testing.allocator);
+    defer testing.allocator.free(got);
+    var sum: f64 = 0;
+    for (orig, got) |o, g| sum += (o - g) * (o - g);
+    return @sqrt(sum / n);
+}
+
+test "kv6 round-trip error sits between kv4 and kv8" {
+    const e4 = try roundTripRms(4);
+    const e6 = try roundTripRms(6);
+    const e8 = try roundTripRms(8);
+    // Step size shrinks 4x per two bits; bf16 scales put a floor under kv8.
+    try testing.expect(e6 < e4 / 3.0);
+    try testing.expect(e6 > e8 * 2.0);
 }
 
 test "a load's KV choice: --kv-quant > setting > the kv8 default, each named by its source" {
@@ -1216,5 +1296,6 @@ test "GLM latent stores BF16 or kv8 and names kv4 unsupported" {
     try std.testing.expectEqual(@as(?u8, 0), KVQuantConfig.dense.glmLatentBits());
     try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.affine(8).glmLatentBits());
     try std.testing.expectEqual(@as(?u8, null), KVQuantConfig.affine(4).glmLatentBits());
+    try std.testing.expectEqual(@as(?u8, null), KVQuantConfig.affine(6).glmLatentBits());
     try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.fromJsonValue(.{ .integer = 8 }).?.glmLatentBits());
 }

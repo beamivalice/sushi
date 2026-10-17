@@ -4604,7 +4604,7 @@ fn manifestQuant(obj: std.json.ObjectMap) ?kv_quant.KVQuantConfig {
     if (scheme == .off) return .{ .scheme = .off, .bits = jsonInt(u8, obj, "bits") orelse 0, .group_size = jsonInt(u32, obj, "group_size") orelse 0 };
     if (scheme != .affine) return null;
     const bits = jsonInt(u8, obj, "bits") orelse return null;
-    if (bits != 4 and bits != 8) return null;
+    if (!kv_quant.KVQuantConfig.supportedBits(bits)) return null;
     const gs = jsonInt(u32, obj, "group_size") orelse return null;
     if (gs == 0) return null;
     var q = kv_quant.KVQuantConfig.affine(bits);
@@ -5207,7 +5207,11 @@ test "DiskTier: a new entry never adopts an existing entry directory" {
     try testing.expectEqualStrings("not ours", kept);
 }
 
-test "DiskTier: affine-quant cache round-trips all six buffers" {
+test "DiskTier: affine-quant cache round-trips all six buffers, each width only into its own width" {
+    for ([_]u8{ 4, 6, 8 }) |bits| try affineDiskRoundTrip(bits);
+}
+
+fn affineDiskRoundTrip(bits: u8) !void {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -5218,7 +5222,7 @@ test "DiskTier: affine-quant cache round-trips all six buffers" {
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-q", 0, 128);
     defer tier.deinit();
 
-    const qcfg = kv_quant.KVQuantConfig.affine(4);
+    const qcfg = kv_quant.KVQuantConfig.affine(bits);
     var cache = try KVCache.initWithConfig(testing.allocator, 2, qcfg);
     defer cache.deinit();
     // head_dim must be a multiple of group_size (64) for affine quant.
@@ -5228,6 +5232,15 @@ test "DiskTier: affine-quant cache round-trips all six buffers" {
     var tokens: [520]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+
+    // The restart path reads the manifest back: it must still name this width.
+    tier.deinit();
+    tier = try DiskTier.init(testing.allocator, io, base, "fp-q", 0, 128);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    for ([_]u8{ 4, 6, 8 }) |other| {
+        if (other != bits) try testing.expect(tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.affine(other), .{}) == null);
+    }
+    try testing.expect(tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, .{}) == null);
 
     var cache2 = try KVCache.initWithConfig(testing.allocator, 2, qcfg);
     defer cache2.deinit();

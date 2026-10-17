@@ -261,7 +261,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
 
 test "model_settings: parse + lookup with and without trailing slash" {
     var s = try parse(std.testing.allocator,
-        \\{"/m/a/": {"ctx_size": 65536, "kv_quant": "8", "mtp": false}, "/m/b": {"kv_quant": 4}}
+        \\{"/m/a/": {"ctx_size": 65536, "kv_quant": "8", "mtp": false}, "/m/b": {"kv_quant": 4}, "/m/c": {"kv_quant": "6"}}
     );
     defer s.deinit();
     const a = s.lookup("/m/a");
@@ -272,7 +272,8 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expectEqual(@as(?u32, null), b.ctx_size);
     try std.testing.expectEqual(@as(u8, 4), b.kv_quant.?.bits);
     try std.testing.expectEqual(@as(?bool, null), b.mtp);
-    try std.testing.expect(s.lookup("/m/c").isEmpty());
+    try std.testing.expectEqual(@as(u8, 6), s.lookup("/m/c").kv_quant.?.bits);
+    try std.testing.expect(s.lookup("/m/d").isEmpty());
 }
 
 test "model_settings: mtp_acceptance names a mode at its default threshold" {

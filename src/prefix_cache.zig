@@ -6081,6 +6081,7 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     // Same Scheme (.affine) but different bits MUST NOT hit — that's the
     // cross-scheme buffer-layout crash this filter guards against.
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(8)));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(6)));
     // Dense query against an affine entry: also null (existing guarantee).
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense));
 }
@@ -11315,6 +11316,7 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
     for ([_]kv_quant.KVQuantConfig{
         kv_quant.KVQuantConfig.dense,
         kv_quant.KVQuantConfig.affine(8),
+        kv_quant.KVQuantConfig.affine(6),
         kv_quant.KVQuantConfig.affine(4),
     }) |cfg| {
         var cache = try KVCache.initWithConfig(testing.allocator, 2, cfg);

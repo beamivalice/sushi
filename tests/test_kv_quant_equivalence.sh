@@ -3,7 +3,7 @@
 # KV-cache quantization equivalence test.
 #
 # Verifies that running the same greedy (temp=0) chat completion request
-# against the server with `--kv-quant 4` or `--kv-quant 8` produces the same
+# against the server with `--kv-quant 4`, `6` or `8` produces the same
 # first-N tokens as `--kv-quant off`. KV quant is mathematically lossy, so we
 # tolerate divergence past a per-bit-width threshold — same approach as the
 # PLD/drafter long-greedy tests at INT4 weights (see docs/engine-kv-cache.md
@@ -11,6 +11,7 @@
 #
 # Thresholds (empirical; override via env vars per architecture):
 #   - 4-bit KV: $KV_QUANT_FIRST_N_4BIT tokens must match (default 30)
+#   - 6-bit KV: $KV_QUANT_FIRST_N_6BIT tokens must match (default 30)
 #   - 8-bit KV: $KV_QUANT_FIRST_N_8BIT tokens must match (default 30)
 #
 # The 30-token bar catches kernel bugs (wrong dequantize, off-by-one in
@@ -173,6 +174,14 @@ echo "  4-bit: $(echo "$Q4_COMPLETION" | wc -c) bytes, $N_Q4 tokens"
 
 sleep 2
 
+Q6_COMPLETION=""
+Q6_TOKENS=""
+run_and_tokenize "6-bit" "--kv-quant 6" Q6_COMPLETION Q6_TOKENS || exit 1
+N_Q6=$(echo "$Q6_TOKENS" | tr ',' '\n' | wc -l | tr -d ' ')
+echo "  6-bit: $(echo "$Q6_COMPLETION" | wc -c) bytes, $N_Q6 tokens"
+
+sleep 2
+
 Q8_COMPLETION=""
 Q8_TOKENS=""
 run_and_tokenize "8-bit" "--kv-quant 8" Q8_COMPLETION Q8_TOKENS || exit 1
@@ -182,16 +191,18 @@ echo "  8-bit: $(echo "$Q8_COMPLETION" | wc -c) bytes, $N_Q8 tokens"
 echo
 
 # Sanity: neither output may be empty or pad-only.
-if [ -z "$Q4_COMPLETION" ] || [ -z "$Q8_COMPLETION" ]; then
+if [ -z "$Q4_COMPLETION" ] || [ -z "$Q6_COMPLETION" ] || [ -z "$Q8_COMPLETION" ]; then
     echo -e "${RED}FAIL${NC} empty completion under quantized KV — likely NaN or kernel error."
     exit 1
 fi
 
 FIRST_N_4BIT="${KV_QUANT_FIRST_N_4BIT:-30}"
+FIRST_N_6BIT="${KV_QUANT_FIRST_N_6BIT:-30}"
 FIRST_N_8BIT="${KV_QUANT_FIRST_N_8BIT:-30}"
 
 FAIL=0
 compare_first_n_tokens "4-bit vs off" "$REF_TOKENS" "$Q4_TOKENS" "$FIRST_N_4BIT" || FAIL=1
+compare_first_n_tokens "6-bit vs off" "$REF_TOKENS" "$Q6_TOKENS" "$FIRST_N_6BIT" || FAIL=1
 compare_first_n_tokens "8-bit vs off" "$REF_TOKENS" "$Q8_TOKENS" "$FIRST_N_8BIT" || FAIL=1
 
 exit $FAIL
