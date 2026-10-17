@@ -825,6 +825,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/embeddings",
     "/v1/load-model",
     "/v1/messages",
+    "/v1/messages/count_tokens",
     "/v1/models",
     "/v1/models/rescan",
     "/v1/responses",
@@ -2067,6 +2068,7 @@ pub fn serve(
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
+    log.info("  POST /v1/messages/count_tokens (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
     log.info("  GET  /v1/responses/{{id}}\n", .{});
@@ -2494,7 +2496,7 @@ fn handleConnection(
         .default => requested_model_id = "",
         .not_found => {
             const msg = "No model is registered at that path; POST /v1/load-model with the absolute path registers it";
-            if (std.mem.eql(u8, path, "/v1/messages")) {
+            if (isAnthropicRoute(path)) {
                 try sendAnthropicError(allocator, stream, "not_found_error", msg, 404);
             } else {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", msg, 404);
@@ -2519,7 +2521,7 @@ fn handleConnection(
         };
         if (target) |t| {
             if (textGenRejectReason(t)) |reason| {
-                if (std.mem.eql(u8, path, "/v1/messages")) {
+                if (isAnthropicRoute(path)) {
                     try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
                 } else {
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -2662,6 +2664,14 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages/count_tokens")) {
+        if (text_gen_reject) |reason| {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            return;
+        }
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleAnthropicCountTokens(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -8167,6 +8177,11 @@ fn isStatusRoute(method: []const u8, path: []const u8) bool {
     return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props");
 }
 
+/// The routes whose errors take Anthropic's shape.
+fn isAnthropicRoute(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/v1/messages") or std.mem.eql(u8, path, "/v1/messages/count_tokens");
+}
+
 /// True for the routes textGenRejectReason protects — used for the
 /// pre-load peek so naming an encoder in a chat request doesn't
 /// cold-load gigabytes just to earn its 400.
@@ -8174,7 +8189,7 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     if (std.mem.eql(u8, method, "POST")) {
         const routes = [_][]const u8{
             "/v1/chat/completions", "/v1/completions", "/v1/messages",
-            "/v1/responses",
+            "/v1/messages/count_tokens", "/v1/responses",
         };
         for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
         return false;
@@ -15356,6 +15371,22 @@ const PreparedMedia = struct {
 
 const MediaOutcome = union(enum) { ready: PreparedMedia, refused: MediaFault };
 
+/// The CPU half of `prepareRequestMedia`: the request-shape refusals and the placeholder
+/// expansion, so count_tokens counts the rows a prefill would hold without running the tower.
+fn placeRequestMedia(allocator: std.mem.Allocator, lm: *LoadedModel, messages: []const chat_mod.Message, flat: FlatMedia, ids: []const u32) !union(enum) { placed: MediaPlacement, refused: MediaFault } {
+    const config = lm.config.?;
+    if (mediaKindRefusal(messages, flat, lm.vision_encoder != null, streamedTowerOffByDefault(config))) |fault| return .{ .refused = fault };
+    const found = countMediaPlaceholders(ids, config);
+    if (found.images != flat.images.len or found.videos != flat.videos.len) {
+        return .{ .refused = MediaFault.init(false, "the rendered prompt holds {d} image and {d} video placeholders for {d} images and {d} videos (media in a system message, or placeholder text in the content)", .{ found.images, found.videos, flat.images.len, flat.videos.len }) };
+    }
+    const placed = placeMedia(allocator, ids, config, flat.images, flat.videos, lm.tokenizer.?) catch |err| switch (err) {
+        error.MediaLayoutUnsupported => return .{ .refused = MediaFault.init(false, "this model's vision tower cannot place images inside a conversation", .{}) },
+        else => return err,
+    };
+    return .{ .placed = placed };
+}
+
 /// Place every message's media at its template placeholder, refuse by name
 /// what cannot be served and key it for the prefix cache. The slot encodes it
 /// once the prefix restore says which blocks it still needs. On `.ready`,
@@ -15371,15 +15402,9 @@ fn prepareRequestMedia(
     defer flat.deinit(allocator);
     if (flat.images.len == 0 and flat.videos.len == 0 and !flat.has_audio) return .{ .ready = .{} };
     const config = lm.config.?;
-    if (mediaKindRefusal(messages, flat, lm.vision_encoder != null, streamedTowerOffByDefault(config))) |fault| return .{ .refused = fault };
-
-    const found = countMediaPlaceholders(ids.*, config);
-    if (found.images != flat.images.len or found.videos != flat.videos.len) {
-        return .{ .refused = MediaFault.init(false, "the rendered prompt holds {d} image and {d} video placeholders for {d} images and {d} videos (media in a system message, or placeholder text in the content)", .{ found.images, found.videos, flat.images.len, flat.videos.len }) };
-    }
-    var placed = placeMedia(allocator, ids.*, config, flat.images, flat.videos, lm.tokenizer.?) catch |err| switch (err) {
-        error.MediaLayoutUnsupported => return .{ .refused = MediaFault.init(false, "this model's vision tower cannot place images inside a conversation", .{}) },
-        else => return err,
+    var placed = switch (try placeRequestMedia(allocator, lm, messages, flat, ids.*)) {
+        .placed => |p| p,
+        .refused => |fault| return .{ .refused = fault },
     };
     defer placed.deinit(allocator);
     if (placed.ids.len > ctx_limit) {
@@ -16820,17 +16845,8 @@ fn handleAnthropicMessages(
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        log.warn("POST /v1/messages -> 400 (invalid JSON)\n", .{});
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "Invalid JSON in request body", 400);
-        return;
-    };
+    const parsed = (try parseAnthropicBody(allocator, stream, body, "/v1/messages")) orelse return;
     defer parsed.deinit();
-    if (parsed.value != .object) {
-        log.warn("POST /v1/messages -> 400 (body is not a JSON object)\n", .{});
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
-        return;
-    }
     const root = parsed.value.object;
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
@@ -16845,32 +16861,6 @@ fn handleAnthropicMessages(
         return;
     }
 
-    // Parse messages array (required)
-    const messages_val = root.get("messages") orelse {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' is required", 400);
-        return;
-    };
-    if (messages_val != .array) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' must be an array", 400);
-        return;
-    }
-
-    var wire = WireMessages.init(allocator);
-    defer wire.deinit();
-    const messages = &wire.messages;
-
-    try readAnthropicConversation(&wire, root.get("system"), messages_val.array.items, visionPreprocFromConfig(config));
-
-    if (wire.media.refusal()) |fault| {
-        log.warn("POST /v1/messages -> 400 ({s})\n", .{fault.text()});
-        try sendAnthropicError(allocator, stream, if (fault.server_error) "api_error" else "invalid_request_error", fault.text(), fault.code());
-        return;
-    }
-    if (messages.items.len == 0) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "No valid messages found in request", 400);
-        return;
-    }
-
     // Sampling parameters. Omitted fields resolve through CLI flags and the
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
@@ -16879,42 +16869,6 @@ fn handleAnthropicMessages(
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
-
-    // Tools
-    var tools_json: ?[]const u8 = null;
-    var tools_json_allocated = false;
-    defer if (tools_json_allocated) allocator.free(tools_json.?);
-    var has_tools = false;
-    var allow_parallel_tools = true;
-    var tool_choice: chat_mod.ToolChoice = .auto;
-    var tool_choice_instruction: ?[]const u8 = null;
-    defer if (tool_choice_instruction) |tci| allocator.free(tci);
-
-    if (root.get("tools")) |tools_val| {
-        if (tools_val == .array and tools_val.array.items.len > 0) {
-            has_tools = true;
-            // Convert Anthropic tools to OpenAI format for chat template
-            tools_json = try buildOpenAIToolsJson(allocator, tools_val.array);
-            tools_json_allocated = true;
-
-            if (root.get("tool_choice")) |tc| {
-                if (tc == .object) {
-                    // Anthropic spelling of the parallel clamp.
-                    if (tc.object.get("disable_parallel_tool_use")) |d| {
-                        if (d == .bool and d.bool) allow_parallel_tools = false;
-                    }
-                }
-            }
-            tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
-            if (tool_choice == .none) has_tools = false;
-            tool_choice_instruction = try tool_choice.instruction(allocator);
-            if (chat_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
-                log.warn("POST /v1/messages -> 400 (tool_choice names an undeclared tool)\n", .{});
-                try sendAnthropicError(allocator, stream, "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
-                return;
-            }
-        }
-    }
 
     // Stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -16927,59 +16881,6 @@ fn handleAnthropicMessages(
         }
     }
 
-    // Thinking config. An absent `thinking` object consults the arch default
-    // (muse+tools delivers its always-on reasoning as thinking blocks rather
-    // than paying for it and discarding it); a PRESENT object decides
-    // explicitly, exactly as before.
-    var enable_thinking = if (root.get("thinking") == null)
-        config.defaultEnableThinking()
-    else
-        false;
-    var reasoning_budget: i32 = model_mod.defaultThinkBudget(config, server_config.default_reasoning_budget);
-    var budget_explicit = false;
-    if (root.get("thinking")) |think_val| {
-        if (think_val == .object) {
-            const think_type = if (think_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-            if (std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive")) {
-                enable_thinking = true;
-            }
-            if (think_val.object.get("budget_tokens")) |bt| {
-                if (bt == .integer) {
-                    reasoning_budget = clampJsonI32(bt.integer);
-                    budget_explicit = true;
-                }
-            }
-        }
-    }
-
-    // `output_config` (Claude Code's spelling; see parseAnthropicOutputConfig).
-    // The effort word is an explicit thinking signal, so it displaces the arch
-    // default and OR's with a present `thinking` object — the OpenAI surface's
-    // resolveEnableThinking rule. An explicit `budget_tokens` outranks the
-    // budget derived from the word; the word itself rides through to templates
-    // that read it (qwen3.8's preamble, dsv4's).
-    const output_cfg = parseAnthropicOutputConfig(root);
-    if (output_cfg.schema_invalid) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
-        return;
-    }
-    var effort_word: ?[]const u8 = model_mod.defaultEffortWord(config);
-    var effort_notice: ?EffortNotice = null;
-    defer if (effort_notice) |n| n.deinit(allocator);
-    defer clearEffortNotice(stream);
-    if (output_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
-            const msg = try effortRefusalFor(allocator, lm, word);
-            defer allocator.free(msg);
-            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
-            return;
-        };
-        effort_word = cfg.effort;
-        effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
-        if (!budget_explicit) reasoning_budget = cfg.budget;
-        enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
-    }
-    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, true)) return;
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
 
@@ -16995,43 +16896,28 @@ fn handleAnthropicMessages(
     if (enable_drafter and lm.dflash == null) enable_drafter = false;
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
-        return;
-    }
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
-    // `output_config.format` json_schema — the same two-layer enforcement as
-    // chat-completions' `response_format`: a schema instruction in the system
-    // prompt (so the model aims at the shape) plus the grammar mask below (so
-    // the shape is guaranteed). Before the render, or the instruction never
-    // reaches the prompt.
-    if (output_cfg.schema != null) {
-        var schema_instruction = std.ArrayList(u8).empty;
-        defer schema_instruction.deinit(allocator);
-        try schema_instruction.appendSlice(allocator, "Respond with valid JSON only. No other text, no markdown, no explanation. ");
-        {
-            var out: std.Io.Writer.Allocating = .init(allocator);
-            defer out.deinit();
-            var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
-            output_cfg.schema.?.jsonStringify(&jws) catch {};
-            try schema_instruction.appendSlice(allocator, "Your response MUST conform to this JSON schema:\n");
-            try schema_instruction.appendSlice(allocator, out.written());
-        }
-        if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
-            const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, schema_instruction.items });
-            try wire.texts.append(allocator, combined);
-            messages.items[0].content = combined;
-        } else {
-            const instruction = try allocator.dupe(u8, schema_instruction.items);
-            try wire.texts.append(allocator, instruction);
-            try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
-        }
+    var prompt: AnthropicPrompt = .{ .wire = WireMessages.init(allocator) };
+    defer prompt.deinit();
+    defer clearEffortNotice(stream);
+    if (!try renderAnthropicPrompt(allocator, stream, lm, root, .messages, &prompt)) return;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+        return;
     }
+    const messages = &prompt.wire.messages;
+    const tools_json = prompt.tools_json;
+    const has_tools = prompt.has_tools;
+    const enable_thinking = prompt.enable_thinking;
+    const reasoning_budget = prompt.reasoning_budget;
+    const output_cfg = prompt.output_cfg;
+    const continue_final = prompt.continue_final;
+    const tokenize_ns = prompt.tokenize_ns;
 
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
@@ -17041,55 +16927,6 @@ fn handleAnthropicMessages(
         if (std.mem.eql(u8, msg.role, "tool")) tool_msg_count += 1;
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
-    // Format chat template. Iteration 1 timing + Iteration 2 cache. The
-    // `effective_tools_json` swap (`null` when has_tools is false) keeps
-    // the cache key consistent with what the encoder actually sees.
-    const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
-    // Anthropic's own contract: a conversation ending in an assistant message
-    // means "continue this", with no flag. Implicit here and explicit on the
-    // OpenAI surface is not an inconsistency — it is each surface's documented
-    // behaviour, so an Anthropic SDK client gets prefill for free.
-    //
-    // And because it is INFERRED, a model that cannot serve one gets an
-    // ordinary turn rather than a 400: the client never asked for a
-    // continuation, so refusing its request would take away an answer this
-    // endpoint has always given.
-    const continue_final = chat_mod.continuationRequested(messages.items);
-    var tokenize_sw = Stopwatch.init(stream.io);
-    // The `thinking` budget object carries no effort string, but
-    // `output_config.effort` does — templates that read the word (dsv4,
-    // qwen3.8) get it; requests without one still render their default.
-    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
-    var schema_proto: rp_mod.Protocol = undefined;
-    var schema_proto_active = false;
-    if (output_cfg.schema != null and !has_tools and enable_thinking and reasoning_budget < 0) {
-        schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, true);
-    }
-    switch (schemaMasksThinking(
-        output_cfg.schema != null,
-        has_tools,
-        enable_thinking,
-        reasoning_budget >= 0,
-        schema_proto_active,
-    )) {
-        .deferred => {},
-        .fallback_thinking_off => {
-            schema_proto_active = false;
-            allocator.free(prompt_ids_raw);
-            enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
-            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
-        },
-        .no_mask, .token_zero => schema_proto_active = false,
-    }
-    if (output_cfg.schema != null and !has_tools and !enable_thinking and lm.transformer != null) {
-        if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, false)) {
-            schema_proto = rp_mod.Protocol.jsonOnly();
-        }
-        schema_proto_active = true;
-    }
-    const tokenize_ns = tokenize_sw.read();
 
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     var system_chars: usize = 0;
@@ -17107,17 +16944,15 @@ fn handleAnthropicMessages(
     const cache_key = requestCacheKey(root);
     var req_media: PreparedMedia = .{};
     defer req_media.deinit(allocator);
-    switch (try prepareRequestMedia(allocator, lm, messages.items, &prompt_ids_raw, getEffectiveContextLength(config))) {
+    switch (try prepareRequestMedia(allocator, lm, messages.items, &prompt.ids, getEffectiveContextLength(config))) {
         .ready => |r| req_media = r,
         .refused => |fault| {
-            allocator.free(prompt_ids_raw);
             log.warn("POST /v1/messages -> {d} ({s})\n", .{ fault.code(), fault.text() });
             try sendAnthropicError(allocator, stream, if (fault.server_error) "api_error" else "invalid_request_error", fault.text(), fault.code());
             return;
         },
     }
-    const prompt_ids = prompt_ids_raw;
-    defer allocator.free(prompt_ids);
+    const prompt_ids = prompt.ids;
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Context size enforcement
@@ -17164,9 +16999,9 @@ fn handleAnthropicMessages(
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
                 var deferred = false;
-                if (schema_proto_active) {
-                    sc.deferWithProtocol(&schema_proto);
-                    deferred = schema_proto.startState().phase != .json_body;
+                if (prompt.schema_proto_active) {
+                    sc.deferWithProtocol(&prompt.schema_proto);
+                    deferred = prompt.schema_proto.startState().phase != .json_body;
                 }
                 sc.constraint.row_masks = rowMaskedDrafter(lm);
                 sampling.constraint = &sc.constraint;
@@ -17187,7 +17022,7 @@ fn handleAnthropicMessages(
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
     var call_force = if (has_tools and lm.transformer != null and !continue_final)
-        armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, tool_choice, tools_json)
+        armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, prompt.tool_choice, tools_json)
     else
         null;
     defer if (call_force) |*cf| cf.deinit(allocator);
@@ -17199,16 +17034,298 @@ fn handleAnthropicMessages(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, prompt.allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, prompt.allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     }
+}
+
+/// A /v1/messages body as a JSON object; null once the 400 is sent.
+fn parseAnthropicBody(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, route: []const u8) !?std.json.Parsed(std.json.Value) {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.warn("POST {s} -> 400 (invalid JSON)\n", .{route});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Invalid JSON in request body", 400);
+        return null;
+    };
+    if (parsed.value != .object) {
+        parsed.deinit();
+        log.warn("POST {s} -> 400 (body is not a JSON object)\n", .{route});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
+        return null;
+    }
+    return parsed;
+}
+
+/// What a /v1/messages body renders to, before media placement; /v1/messages and
+/// count_tokens both build it through `renderAnthropicPrompt`.
+const AnthropicPrompt = struct {
+    wire: WireMessages,
+    /// OpenAI-shape tools; null when the request declares none.
+    tools_json: ?[]const u8 = null,
+    has_tools: bool = false,
+    allow_parallel_tools: bool = true,
+    tool_choice: chat_mod.ToolChoice = .auto,
+    tool_choice_instruction: ?[]const u8 = null,
+    enable_thinking: bool = false,
+    reasoning_budget: i32 = -1,
+    output_cfg: AnthropicOutputConfig = .{},
+    continue_final: bool = false,
+    ids: []u32 = &.{},
+    schema_proto: rp_mod.Protocol = undefined,
+    schema_proto_active: bool = false,
+    tokenize_ns: u64 = 0,
+    /// Armed on the connection when an effort word is served as another; the handler clears it.
+    effort_notice: ?EffortNotice = null,
+
+    fn deinit(p: *AnthropicPrompt) void {
+        const a = p.wire.allocator;
+        if (p.effort_notice) |n| n.deinit(a);
+        if (p.tools_json) |tj| a.free(tj);
+        if (p.tool_choice_instruction) |tci| a.free(tci);
+        a.free(p.ids);
+        p.wire.deinit();
+    }
+};
+
+/// The route a /v1/messages body renders for. Only `.messages` uses the tokenize LRU: a count
+/// changes no cache.
+const AnthropicRoute = enum {
+    messages,
+    count_tokens,
+
+    fn path(r: AnthropicRoute) []const u8 {
+        return switch (r) {
+            .messages => "/v1/messages",
+            .count_tokens => "/v1/messages/count_tokens",
+        };
+    }
+};
+
+/// Renders `root` into `p` exactly as /v1/messages prefills it; false once a 400 is sent.
+fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, root: std.json.ObjectMap, route: AnthropicRoute, p: *AnthropicPrompt) !bool {
+    const tok = lm.tokenizer.?;
+    const chat_config = lm.chat_config.?;
+    const config = lm.config.?;
+
+    const messages_val = root.get("messages") orelse {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' is required", 400);
+        return false;
+    };
+    if (messages_val != .array) {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' must be an array", 400);
+        return false;
+    }
+    const messages = &p.wire.messages;
+    try readAnthropicConversation(&p.wire, root.get("system"), messages_val.array.items, visionPreprocFromConfig(config));
+    if (p.wire.media.refusal()) |fault| {
+        log.warn("POST {s} -> 400 ({s})\n", .{ route.path(), fault.text() });
+        try sendAnthropicError(allocator, stream, if (fault.server_error) "api_error" else "invalid_request_error", fault.text(), fault.code());
+        return false;
+    }
+    if (messages.items.len == 0) {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "No valid messages found in request", 400);
+        return false;
+    }
+
+    if (root.get("tools")) |tools_val| {
+        if (tools_val == .array and tools_val.array.items.len > 0) {
+            p.has_tools = true;
+            // Convert Anthropic tools to OpenAI format for chat template
+            p.tools_json = try buildOpenAIToolsJson(allocator, tools_val.array);
+
+            if (root.get("tool_choice")) |tc| {
+                if (tc == .object) {
+                    // Anthropic spelling of the parallel clamp.
+                    if (tc.object.get("disable_parallel_tool_use")) |d| {
+                        if (d == .bool and d.bool) p.allow_parallel_tools = false;
+                    }
+                }
+            }
+            p.tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
+            if (p.tool_choice == .none) p.has_tools = false;
+            p.tool_choice_instruction = try p.tool_choice.instruction(allocator);
+            if (chat_mod.toolChoiceNamesUndeclared(allocator, p.tool_choice, p.tools_json)) {
+                log.warn("POST {s} -> 400 (tool_choice names an undeclared tool)\n", .{route.path()});
+                try sendAnthropicError(allocator, stream, "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
+                return false;
+            }
+        }
+    }
+
+    // Thinking config. An absent `thinking` object consults the arch default
+    // (muse+tools delivers its always-on reasoning as thinking blocks rather
+    // than paying for it and discarding it); a PRESENT object decides
+    // explicitly, exactly as before.
+    var enable_thinking = if (root.get("thinking") == null)
+        config.defaultEnableThinking()
+    else
+        false;
+    var reasoning_budget: i32 = model_mod.defaultThinkBudget(config, server_config.default_reasoning_budget);
+    var budget_explicit = false;
+    if (root.get("thinking")) |think_val| {
+        if (think_val == .object) {
+            const think_type = if (think_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+            if (std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive")) {
+                enable_thinking = true;
+            }
+            if (think_val.object.get("budget_tokens")) |bt| {
+                if (bt == .integer) {
+                    reasoning_budget = clampJsonI32(bt.integer);
+                    budget_explicit = true;
+                }
+            }
+        }
+    }
+
+    // `output_config` (Claude Code's spelling; see parseAnthropicOutputConfig).
+    // The effort word is an explicit thinking signal, so it displaces the arch
+    // default and OR's with a present `thinking` object — the OpenAI surface's
+    // resolveEnableThinking rule. An explicit `budget_tokens` outranks the
+    // budget derived from the word; the word itself rides through to templates
+    // that read it (qwen3.8's preamble, dsv4's).
+    const output_cfg = parseAnthropicOutputConfig(root);
+    p.output_cfg = output_cfg;
+    if (output_cfg.schema_invalid) {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
+        return false;
+    }
+    var effort_word: ?[]const u8 = model_mod.defaultEffortWord(config);
+    if (output_cfg.effort) |word| {
+        const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
+            const msg = try effortRefusalFor(allocator, lm, word);
+            defer allocator.free(msg);
+            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+            return false;
+        };
+        effort_word = cfg.effort;
+        p.effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
+        if (!budget_explicit) reasoning_budget = cfg.budget;
+        enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
+    }
+    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, true)) return false;
+
+    // `output_config.format` json_schema — the same two-layer enforcement as
+    // chat-completions' `response_format`: a schema instruction in the system
+    // prompt (so the model aims at the shape) plus the grammar mask below (so
+    // the shape is guaranteed). Before the render, or the instruction never
+    // reaches the prompt.
+    if (output_cfg.schema != null) {
+        var schema_instruction = std.ArrayList(u8).empty;
+        defer schema_instruction.deinit(allocator);
+        try schema_instruction.appendSlice(allocator, "Respond with valid JSON only. No other text, no markdown, no explanation. ");
+        {
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+            output_cfg.schema.?.jsonStringify(&jws) catch {};
+            try schema_instruction.appendSlice(allocator, "Your response MUST conform to this JSON schema:\n");
+            try schema_instruction.appendSlice(allocator, out.written());
+        }
+        if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
+            const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, schema_instruction.items });
+            try p.wire.texts.append(allocator, combined);
+            messages.items[0].content = combined;
+        } else {
+            const instruction = try allocator.dupe(u8, schema_instruction.items);
+            try p.wire.texts.append(allocator, instruction);
+            try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
+        }
+    }
+
+    // Format chat template. Iteration 1 timing + Iteration 2 cache. The
+    // `effective_tools_json` swap (`null` when has_tools is false) keeps
+    // the cache key consistent with what the encoder actually sees.
+    const effective_tools_json: ?[]const u8 = if (p.has_tools) p.tools_json else null;
+    // Anthropic's own contract: a conversation ending in an assistant message
+    // means "continue this", with no flag. Implicit here and explicit on the
+    // OpenAI surface is not an inconsistency — it is each surface's documented
+    // behaviour, so an Anthropic SDK client gets prefill for free.
+    //
+    // And because it is INFERRED, a model that cannot serve one gets an
+    // ordinary turn rather than a 400: the client never asked for a
+    // continuation, so refusing its request would take away an answer this
+    // endpoint has always given.
+    p.continue_final = chat_mod.continuationRequested(messages.items);
+    var tokenize_sw = Stopwatch.init(stream.io);
+    // The `thinking` budget object carries no effort string, but
+    // `output_config.effort` does — templates that read the word (dsv4,
+    // qwen3.8) get it; requests without one still render their default.
+    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    p.ids = if (route == .messages)
+        try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, p.tool_choice_instruction, enable_thinking, effort_word, p.continue_final)
+    else
+        try chat_mod.formatChat(allocator, tok, messages.items, &render_config, effective_tools_json, p.tool_choice_instruction, enable_thinking, effort_word, p.continue_final);
+    if (output_cfg.schema != null and !p.has_tools and enable_thinking and reasoning_budget < 0) {
+        p.schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, p.ids, &p.schema_proto, true);
+    }
+    switch (schemaMasksThinking(
+        output_cfg.schema != null,
+        p.has_tools,
+        enable_thinking,
+        reasoning_budget >= 0,
+        p.schema_proto_active,
+    )) {
+        .deferred => {},
+        .fallback_thinking_off => {
+            p.schema_proto_active = false;
+            allocator.free(p.ids);
+            p.ids = &.{};
+            enable_thinking = false;
+            p.ids = if (route == .messages)
+                try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, p.tool_choice_instruction, false, effort_word, p.continue_final)
+            else
+                try chat_mod.formatChat(allocator, tok, messages.items, &render_config, effective_tools_json, p.tool_choice_instruction, false, effort_word, p.continue_final);
+            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
+        },
+        .no_mask, .token_zero => p.schema_proto_active = false,
+    }
+    if (output_cfg.schema != null and !p.has_tools and !enable_thinking and lm.transformer != null) {
+        if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, p.ids, &p.schema_proto, false)) {
+            p.schema_proto = rp_mod.Protocol.jsonOnly();
+        }
+        p.schema_proto_active = true;
+    }
+    p.tokenize_ns = tokenize_sw.read();
+    p.enable_thinking = enable_thinking;
+    p.reasoning_budget = reasoning_budget;
+    return true;
+}
+
+/// POST /v1/messages/count_tokens: the prompt tokens /v1/messages would prefill for the
+/// same body, media rows included, with no generation, queue or cache write.
+fn handleAnthropicCountTokens(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
+    const parsed = (try parseAnthropicBody(allocator, stream, body, "/v1/messages/count_tokens")) orelse return;
+    defer parsed.deinit();
+    var prompt: AnthropicPrompt = .{ .wire = WireMessages.init(allocator) };
+    defer prompt.deinit();
+    defer clearEffortNotice(stream);
+    if (!try renderAnthropicPrompt(allocator, stream, lm, parsed.value.object, .count_tokens, &prompt)) return;
+
+    var input_tokens = prompt.ids.len;
+    var flat = try flattenMedia(allocator, prompt.wire.messages.items);
+    defer flat.deinit(allocator);
+    if (flat.images.len > 0 or flat.videos.len > 0 or flat.has_audio) {
+        var placed = switch (try placeRequestMedia(allocator, lm, prompt.wire.messages.items, flat, prompt.ids)) {
+            .placed => |pl| pl,
+            .refused => |fault| {
+                log.warn("POST /v1/messages/count_tokens -> {d} ({s})\n", .{ fault.code(), fault.text() });
+                try sendAnthropicError(allocator, stream, if (fault.server_error) "api_error" else "invalid_request_error", fault.text(), fault.code());
+                return;
+            },
+        };
+        defer placed.deinit(allocator);
+        input_tokens = placed.ids.len;
+    }
+    log.info("POST /v1/messages/count_tokens -> {d} tokens\n", .{input_tokens});
+    const out = try std.fmt.allocPrint(allocator, "{{\"input_tokens\":{d}}}", .{input_tokens});
+    defer allocator.free(out);
+    try sendResponse(stream, "200 OK", "application/json", out);
 }
 
 fn handleAnthropicNonStreaming(
@@ -28415,4 +28532,265 @@ test "a queued stream gets SSE comments while it waits and its events are the sa
     try t.expectEqual(@as(usize, 0), std.mem.count(u8, raws[1], "queued"));
     try t.expect(std.mem.endsWith(u8, raws[1], ": keepalive\n\n"));
     try t.expectEqualStrings(outs[1], outs[0]);
+}
+
+/// A Qwen3.8-template model on the byte tokenizer: enough to count a /v1/messages body.
+const CountTokensFixture = struct {
+    arena: std.heap.ArenaAllocator,
+    tok: Tokenizer,
+    cfg: model_mod.ModelConfig,
+    chat_cfg: chat_mod.ChatConfig,
+    lm: LoadedModel,
+
+    fn init(f: *CountTokensFixture) !void {
+        const a = std.testing.allocator;
+        f.arena = .init(a);
+        f.tok = try byteTokenizerForTests(a, f.arena.allocator(), &.{ "<|im_start|>", "<|im_end|>", "<think>", "</think>" });
+        // Thinking declared off, so only a test that names a thinking default meets one.
+        f.cfg = .{ .num_hidden_layers = 0, .pinned_context = 4096, .model_type = "qwen4_exp", .gen_enable_thinking = false };
+        f.chat_cfg = .{ .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        f.lm = undefined;
+        f.lm.id = "";
+        f.lm.config = &f.cfg;
+        f.lm.tokenizer = &f.tok;
+        f.lm.chat_config = &f.chat_cfg;
+        f.lm.transformer = null;
+        f.lm.vision_encoder = null;
+        f.lm.dflash = null;
+        f.lm.mtp = null;
+        f.lm.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(a, 4);
+    }
+
+    fn deinit(f: *CountTokensFixture) void {
+        f.lm.tokenize_cache.?.deinit();
+        deinitTestTokenizer(&f.tok);
+        f.arena.deinit();
+    }
+
+    /// The whole HTTP response count_tokens writes for `body`.
+    fn post(f: *CountTokensFixture, body: []const u8) ![]u8 {
+        const t = std.testing;
+        var sv: [2]std.posix.fd_t = undefined;
+        try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0); // AF_UNIX, SOCK_STREAM
+        defer _ = std.c.close(sv[1]);
+        var conn: Conn = undefined;
+        Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+        try handleAnthropicCountTokens(t.allocator, &conn, body, &f.lm);
+        _ = std.c.close(sv[0]);
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(t.allocator);
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = std.c.read(sv[1], &buf, buf.len);
+            if (n <= 0) break;
+            try out.appendSlice(t.allocator, buf[0..@intCast(n)]);
+        }
+        return out.toOwnedSlice(t.allocator);
+    }
+
+    /// `input_tokens` from a 200 count_tokens answer.
+    fn count(f: *CountTokensFixture, body: []const u8) !i64 {
+        const t = std.testing;
+        const response = try f.post(body);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 "));
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, responseBody(response), .{});
+        defer parsed.deinit();
+        try t.expectEqual(@as(usize, 1), parsed.value.object.count());
+        return parsed.value.object.get("input_tokens").?.integer;
+    }
+
+    /// The oracle: `body`'s prompt rendered with the tools and thinking the test names, not resolves.
+    fn rendered(f: *CountTokensFixture, body: []const u8, tools: bool, thinking: bool, effort: ?[]const u8) !i64 {
+        const a = std.testing.allocator;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        var wire = WireMessages.init(a);
+        defer wire.deinit();
+        try readAnthropicConversation(&wire, root.get("system"), root.get("messages").?.array.items, .{});
+        const tools_json: ?[]const u8 = if (tools) try buildOpenAIToolsJson(a, root.get("tools").?.array) else null;
+        defer if (tools_json) |tj| a.free(tj);
+        const ids = try chat_mod.formatChat(a, &f.tok, wire.messages.items, &f.chat_cfg, tools_json, null, thinking, effort, false);
+        defer a.free(ids);
+        return @intCast(ids.len);
+    }
+};
+
+const count_tokens_sample = @embedFile("fixtures/count_tokens_sample.json");
+const count_tokens_tools_body =
+    \\{"model":"sushi","messages":[{"role":"user","content":"What time is it in Paris?"}],
+    \\ "tools":[{"name":"get_time","description":"Get the time","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]}
+;
+const count_tokens_thinking_body =
+    \\{"model":"sushi","max_tokens":16,"thinking":{"type":"enabled","budget_tokens":1024},
+    \\ "messages":[{"role":"user","content":"This is some text that Claude Code wants token count of"}]}
+;
+
+test "count_tokens: the sample counts its /v1/messages prompt, empty tools as no tools, any model name alike" {
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const want = try f.rendered(count_tokens_sample, false, false, null);
+    try std.testing.expectEqual(want, try f.count(count_tokens_sample));
+    // Routing picks the model; an unknown name reaching the default counts the same body the same.
+    const renamed = try std.mem.replaceOwned(u8, std.testing.allocator, count_tokens_sample, "Qwen3.8-Flash-Next-Sushi-2bpw", "gpt-4");
+    defer std.testing.allocator.free(renamed);
+    try std.testing.expectEqual(want, try f.count(renamed));
+}
+
+test "count_tokens: an absent thinking field takes the model's default, as /v1/messages does" {
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // Qwen's own default: thinking on at medium effort.
+    f.cfg.gen_enable_thinking = null;
+    const thinking = try f.rendered(count_tokens_sample, false, true, "medium");
+    try std.testing.expect(thinking != try f.rendered(count_tokens_sample, false, false, null));
+    try std.testing.expectEqual(thinking, try f.count(count_tokens_sample));
+}
+
+test "count_tokens: tools and an enabled thinking block count as /v1/messages renders them" {
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const with_tools = try f.rendered(count_tokens_tools_body, true, false, null);
+    try std.testing.expect(with_tools != try f.rendered(count_tokens_tools_body, false, false, null));
+    try std.testing.expectEqual(with_tools, try f.count(count_tokens_tools_body));
+
+    const thinking = try f.rendered(count_tokens_thinking_body, false, true, null);
+    try std.testing.expect(thinking != try f.rendered(count_tokens_thinking_body, false, false, null));
+    try std.testing.expectEqual(thinking, try f.count(count_tokens_thinking_body));
+}
+
+test "count_tokens: a prompt past the context is still counted" {
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.cfg.pinned_context = 8;
+    const want = try f.rendered(count_tokens_sample, false, false, null);
+    try std.testing.expect(want > 8);
+    try std.testing.expectEqual(want, try f.count(count_tokens_sample));
+}
+
+test "count_tokens: the tokenize LRU is the same before and after, on a hit and on a miss" {
+    const a = std.testing.allocator;
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // Seed the entry /v1/messages leaves for the sample, so counting it would be a hit.
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, count_tokens_sample, .{});
+        defer parsed.deinit();
+        var wire = WireMessages.init(a);
+        defer wire.deinit();
+        try readAnthropicConversation(&wire, null, parsed.value.object.get("messages").?.array.items, .{});
+        const ids = try cachedFormatChat(a, std.testing.io, &f.lm, &f.tok, &f.chat_cfg, wire.messages.items, null, null, false, null, false);
+        a.free(ids);
+    }
+    const cache = &f.lm.tokenize_cache.?;
+    const Snap = struct { key: u64, last_used: u64 };
+    var before: [4]Snap = undefined;
+    const n = cache.entries.items.len;
+    try std.testing.expectEqual(@as(usize, 1), n);
+    for (cache.entries.items, before[0..n]) |e, *s| s.* = .{ .key = e.key, .last_used = e.last_used };
+    const counter = cache.counter;
+
+    _ = try f.count(count_tokens_sample);
+    _ = try f.count(count_tokens_tools_body);
+
+    try std.testing.expectEqual(n, cache.entries.items.len);
+    try std.testing.expectEqual(counter, cache.counter);
+    for (cache.entries.items, before[0..n]) |e, s| {
+        try std.testing.expectEqual(s.key, e.key);
+        try std.testing.expectEqual(s.last_used, e.last_used);
+    }
+}
+
+test "count_tokens: a malformed body is an Anthropic invalid_request_error" {
+    const t = std.testing;
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    for ([_][]const u8{ "{not json", "[]", "{\"model\":\"sushi\"}", "{\"messages\":\"hi\"}" }) |body| {
+        const response = try f.post(body);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 "));
+        try t.expect(std.mem.startsWith(u8, responseBody(response), "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\""));
+    }
+}
+
+test "count_tokens: routed like /v1/messages, with Anthropic-shaped refusals, behind the key" {
+    const t = std.testing;
+    try t.expect(routeExists("/v1/messages/count_tokens"));
+    try t.expect(isTextGenRoute("POST", "/v1/messages/count_tokens"));
+    try t.expect(isAnthropicRoute("/v1/messages/count_tokens"));
+
+    const prev_key = g_api_key;
+    const prev_strict = g_api_key_strict;
+    defer {
+        g_api_key = prev_key;
+        g_api_key_strict = prev_strict;
+    }
+    g_api_key = "s3cret";
+    g_api_key_strict = true;
+    const keyless = try serveOneForTest("POST /v1/messages/count_tokens?beta=true HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
+    defer t.allocator.free(keyless);
+    try t.expect(std.mem.startsWith(u8, keyless, "HTTP/1.1 401 "));
+}
+
+test "count_tokens: a rerouted effort word counts as served and says so, as /v1/messages does" {
+    const t = std.testing;
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"effort\":\"high\"}}";
+    // qwen4_exp has no `high`: /v1/messages serves it as `xhigh`, which renders its own preamble.
+    const want = try f.rendered(body, false, true, "xhigh");
+    try t.expect(want != try f.rendered(body, false, true, null));
+    const response = try f.post(body);
+    defer t.allocator.free(response);
+    try t.expect(std.mem.indexOf(u8, response, "\r\nX-Sushi-Effort-Notice: ") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, responseBody(response), .{});
+    defer parsed.deinit();
+    try t.expectEqual(want, parsed.value.object.get("input_tokens").?.integer);
+    try t.expect(parsed.value.object.get("effort_notice").? == .string);
+}
+
+test "count_tokens: both routes render a body to the same prompt, schema, tools, system blocks and effort included" {
+    const t = std.testing;
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.cfg.gen_enable_thinking = null;
+    const bodies = [_][]const u8{
+        count_tokens_sample,
+        count_tokens_tools_body,
+        count_tokens_thinking_body,
+        "{\"system\":[{\"type\":\"text\",\"text\":\"Be brief.\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"output_config\":{\"effort\":\"high\"}}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"Sure,\"}]}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}",
+    };
+    for (bodies) |body| {
+        var sv: [2]std.posix.fd_t = undefined;
+        try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+        defer _ = std.c.close(sv[0]);
+        defer _ = std.c.close(sv[1]);
+        var conn: Conn = undefined;
+        Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+        defer parsed.deinit();
+        var served: AnthropicPrompt = .{ .wire = WireMessages.init(t.allocator) };
+        defer served.deinit();
+        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, .messages, &served));
+        clearEffortNotice(&conn);
+        var counted: AnthropicPrompt = .{ .wire = WireMessages.init(t.allocator) };
+        defer counted.deinit();
+        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, .count_tokens, &counted));
+        clearEffortNotice(&conn);
+        try t.expect(served.ids.len > 0);
+        try t.expectEqualSlices(u32, served.ids, counted.ids);
+        try t.expectEqual(served.enable_thinking, counted.enable_thinking);
+        try t.expectEqual(served.has_tools, counted.has_tools);
+    }
 }

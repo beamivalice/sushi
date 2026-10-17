@@ -1,0 +1,10 @@
+{
+    "model": "Qwen3.8-Flash-Next-Sushi-2bpw",
+    "messages": [
+      {
+        "role": "user",
+        "content": "This is some text that Claude Code wants token count of"
+      }
+    ],
+    "tools": []
+  }

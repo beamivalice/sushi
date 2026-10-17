@@ -52,6 +52,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (Claude Code's hook output, Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only
   for a template that cannot place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as
   `system` (`canonicalRole`).
+- **`/v1/messages/count_tokens`** takes a `/v1/messages` body (`max_tokens` optional, ignored) and answers
+  `{"input_tokens": N}`: the prompt `/v1/messages` prefills for it, through the same `renderAnthropicPrompt`.
+  Image and video rows count as `placeMedia` expands them, without the tower (`placeRequestMedia`); a body
+  `/v1/messages` refuses for its shape is refused with the same Anthropic error, and the model routes as there.
+  Nothing generates or queues, the prefix cache and the tokenize LRU are untouched, and a prompt past the context
+  is still counted (only `/v1/messages` 400s it). The effort word counts as the word it is served at (the template
+  renders it), and a rerouted one carries the effort notice, header and field, as on `/v1/messages`. The count equals
+  `usage.input_tokens + cache_read_input_tokens`.
 - **`preserve_thinking`** (templates that read it: Qwen3.8), resolved per request as `chat_template_kwargs.preserve_thinking`
   (bool, all three surfaces) > `--preserve-thinking on|off` > `preserve_thinking` in model-settings.json > the template
   default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
