@@ -4,6 +4,11 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **Claude Code can count tokens**: `POST /v1/messages/count_tokens` answers `{"input_tokens": N}`, the prompt a
+  `/v1/messages` request with the same body would prefill, images included, without generating anything.
+
 ## v1.4.0 — DeepSeek-V4.1-Flash, Qwen STQ 2.75bpw, sushi bench
 
 - **DeepSeek-V4.1-Flash on a 128 GB Mac**: the new DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw pack (332 GB with its Engram tables) streams its routed experts from the SSD within `--ssd-budget-gb`, with DSpark speculative decoding, image input on by default, up to 1M tokens of context, DSML tool calls, thinking at high effort by default and `--drop-expert` to trade a few re-routed experts for memory. Greedy DSpark output is the same from run to run on the same Mac (`SUSHI_DSV41_DSPARK_EXACT=0` trades that for a plain step about 0.3 ms faster). On an M5 Max it decodes 80.7 tok/s at 4k on code and 47.0 on prose, and prefills 977 tok/s (sushi bench, `--ssd-budget-gb 108`).
