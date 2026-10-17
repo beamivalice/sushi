@@ -796,6 +796,7 @@ test "routeRequestModel: a path names its own entry, an unknown name the default
 const ROUTE_PATHS = [_][]const u8{
     "/",
     "/chat",
+    "/dashboard",
     "/detokenize",
     "/health",
     "/metrics",
@@ -926,7 +927,7 @@ fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *Conn, root: []const
 }
 
 fn isChatPagePath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/chat");
+    return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/chat") or std.mem.eql(u8, path, "/dashboard");
 }
 
 /// The chat page URL printed at startup. A wildcard bind is shown as loopback,
@@ -12731,6 +12732,55 @@ test "chat page: GET / and GET /chat serve the embedded page as HTML" {
         try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
         try t.expect(std.mem.indexOf(u8, response, "\r\nContent-Type: text/html; charset=utf-8\r\n") != null);
         try t.expectEqualStrings(@embedFile("webui/index.html"), responseBody(response));
+    }
+}
+
+test "dashboard page: GET /dashboard serves the same embedded page as HTML" {
+    const t = std.testing;
+    for ([_][]const u8{ "/dashboard", "/dashboard?x=1" }) |path| {
+        const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{path});
+        defer t.allocator.free(request);
+        const response = try serveOneForTest(request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        try t.expect(std.mem.indexOf(u8, response, "\r\nContent-Type: text/html; charset=utf-8\r\n") != null);
+        try t.expectEqualStrings(@embedFile("webui/index.html"), responseBody(response));
+    }
+}
+
+test "dashboard page: every other method is a 405 and /dashboard/x is not the page" {
+    const t = std.testing;
+    for ([_][]const u8{ "POST", "PUT", "DELETE", "PATCH" }) |method| {
+        const request = try std.fmt.allocPrint(t.allocator, "{s} /dashboard HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{{}}", .{method});
+        defer t.allocator.free(request);
+        const response = try serveOneForTest(request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 405 Method Not Allowed\r\n"));
+    }
+    const response = try serveOneForTest("GET /dashboard/x HTTP/1.1\r\n\r\n");
+    defer t.allocator.free(response);
+    try t.expect(!std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+}
+
+test "dashboard page: --api-key leaves the page open and keeps the metrics feed behind the key" {
+    const t = std.testing;
+    const prev_key = g_api_key;
+    const prev_strict = g_api_key_strict;
+    defer {
+        g_api_key = prev_key;
+        g_api_key_strict = prev_strict;
+    }
+    g_api_key = "s3cret";
+    g_api_key_strict = true;
+    const Case = struct { request: []const u8, status: []const u8 };
+    for ([_]Case{
+        .{ .request = "GET /dashboard HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 200 OK\r\n" },
+        .{ .request = "POST /dashboard HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 401 Unauthorized\r\n" },
+        .{ .request = "GET /metrics.json HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 401 Unauthorized\r\n" },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, c.status));
     }
 }
 

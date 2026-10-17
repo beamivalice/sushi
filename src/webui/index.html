@@ -675,6 +675,140 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 @media (max-width: 560px) {
   .brand .ver { display: none; }
 }
+
+/* ============================================================
+   Dashboard view (scoped under #dashPanel; shares the chat's theme tokens)
+   ============================================================ */
+#viewNav { display: flex; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+#viewNav a { padding: 4px 14px; border-radius: 7px; color: var(--text-2); font-size: 13.5px; font-weight: 600; }
+#viewNav a:hover { color: var(--text); text-decoration: none; }
+#viewNav a[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
+/* Hidden by visibility, not display or removal: the chat keeps its layout, scroll offset and running stream. */
+#appMain[data-view="dashboard"] #chatPanel { visibility: hidden; pointer-events: none; }
+#dashPanel {
+  --d-bg: var(--bg); --d-panel: var(--surface); --d-ink: var(--text); --d-muted: var(--text-2); --d-line: var(--border); --d-grid: var(--surface-2); --d-accent: var(--accent);
+  --d-c1: #d9480f; --d-c2: #1971c2; --d-c3: #2f9e44; --d-c4: #7048e8; --d-ok: #2f9e44; --d-warn: #e8590c; --d-bad: #c92a2a;
+  position: absolute; inset: 0; overflow: auto; background: var(--d-bg); color: var(--d-ink);
+}
+:root[data-theme="night"] #dashPanel { --d-c1: #ff8a4c; --d-c2: #5aa9f0; --d-c3: #63c27a; --d-c4: #a08bf5; --d-ok: #63c27a; --d-warn: #ffa94d; --d-bad: #ff6b6b; }
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] #dashPanel { --d-c1: #ff8a4c; --d-c2: #5aa9f0; --d-c3: #63c27a; --d-c4: #a08bf5; --d-ok: #63c27a; --d-warn: #ffa94d; --d-bad: #ff6b6b; }
+}
+#dashPanel .d-head { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+  padding: 12px 20px; border-bottom: 1px solid var(--d-line); background: var(--d-panel); position: sticky; top: 0; z-index: 2; }
+#dashPanel h1 { font-size: 17px; display: flex; align-items: center; gap: 8px; }
+#dashPanel .d-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--d-muted); }
+#dashPanel .d-dot.ok { background: var(--d-ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--d-ok) 25%, transparent); }
+#dashPanel .d-dot.bad { background: var(--d-bad); }
+#dashStatus { font-size: 13px; color: var(--d-muted); padding: 8px 20px 0; min-height: 22px; }
+#dashStatus.err { color: var(--d-bad); }
+#dashPanel .d-main { padding: 12px 20px 28px; display: grid; gap: 14px; max-width: 1400px; margin: 0 auto; }
+#dashPanel select { width: auto; font: inherit; color: var(--d-ink); border: 1px solid var(--d-line); font-size: inherit; padding: 5px 28px 5px 8px; border-radius: 6px; border-color: var(--d-line); background-color: var(--d-bg); }
+#dashPanel .controls label { display: inline-flex; flex-direction: row; align-items: center; gap: 6px; }
+#dashPanel .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--d-muted); font-size: 13px; }
+#dashPanel input,
+#dashPanel button { font: inherit; color: var(--d-ink); background: var(--d-bg); border: 1px solid var(--d-line);
+    border-radius: 6px; padding: 5px 8px; }
+#dashPanel button { cursor: pointer; }
+#dashPanel button:hover { border-color: var(--d-accent); }
+#dashPanel details > summary { list-style: none; cursor: pointer; }
+#dashPanel details > summary::-webkit-details-marker { display: none; }
+#dashPanel .card details > summary h2 { margin: 0; justify-content: flex-start; align-items: center; gap: 4px; }
+#dashPanel details > summary h2::before { content: '▸'; color: var(--d-muted); width: 12px; display: inline-block; transition: transform .15s; }
+#dashPanel details[open] > summary h2::before { transform: rotate(90deg); }
+#dashPanel details[open] > summary { margin-bottom: 6px; }
+#dashPanel .count { color: var(--d-muted); font-weight: 400; margin-left: 4px; }
+#dashPanel table.models { table-layout: fixed; min-width: 1000px; }
+#dashPanel table.models td,
+#dashPanel table.models th { overflow: hidden; text-overflow: ellipsis; }
+#dashPanel table.models td { white-space: normal; vertical-align: top; line-height: 1.35; }
+#dashPanel table.models tr.loaded td { color: var(--d-ink); }
+#dashPanel table.models tr.idle td { color: var(--d-muted); }
+#dashPanel .sdot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
+#dashPanel .sdot.ready { background: var(--d-ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--d-ok) 25%, transparent); }
+#dashPanel .sdot.loading { background: var(--d-warn); }
+#dashPanel .sdot.unloaded { border: 1.5px solid var(--d-muted); }
+#dashPanel .sdot.other { background: var(--d-bad); }
+#dashPanel .d-spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--d-line); border-top-color: var(--d-muted);
+    border-radius: 50%; animation: dash-spin .8s linear infinite; vertical-align: middle; }
+@keyframes dash-spin { to { transform: rotate(360deg); } }
+#dashPanel .unit { color: var(--d-muted); font-size: 12px; }
+#dashPanel .info { display: inline-grid; place-items: center; width: 15px; height: 15px; margin-left: 6px; border-radius: 50%;
+    border: 1px solid var(--d-muted); color: var(--d-muted); font: italic 600 10px/1 Georgia, serif; vertical-align: 1px; }
+#dashPanel [data-mid]:hover .info { color: var(--d-ink); border-color: var(--d-ink); }
+#dashPanel .foot { text-align: right; color: var(--d-muted); font-size: 12px; padding-top: 8px; }
+#dashPanel .stream { color: var(--d-c2); font-size: 12px; cursor: help; }
+#dashPanel .warnmark { color: var(--d-warn); font-size: 12px; cursor: help; }
+#dashPanel [data-mid] { cursor: help; }
+#dashPanel .d-ver { color: var(--d-muted); font-weight: 500; margin-left: -4px; }
+#dashPanel .d-ver .badge { vertical-align: 2px; margin-left: 4px; }
+#dashPanel .badge { background: var(--d-c2); color: #fff; border-radius: 9px; padding: 0 7px; font-size: 11px; font-weight: 600; }
+#dashPanel .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+@media (min-width: 640px) {
+  #dashPanel .tiles { grid-template-columns: repeat(4, 1fr); }
+}
+@media (min-width: 1200px) {
+  #dashPanel .tiles { grid-template-columns: repeat(8, 1fr); }
+}
+#dashPanel .tile { background: var(--d-panel); border: 1px solid var(--d-line); border-radius: 10px; padding: 12px 14px; }
+#dashPanel [data-tile] { cursor: help; position: relative; }
+#dashPanel .tile-i { position: absolute; top: 10px; right: 10px; margin: 0; }
+#dashPanel [data-tile]:hover .tile-i { color: var(--d-ink); border-color: var(--d-ink); }
+#dashPanel .tile .k { font-size: 12px; color: var(--d-muted); text-transform: uppercase; letter-spacing: .5px; }
+#dashPanel .tile .v { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+#dashPanel .tile .s { font-size: 12px; color: var(--d-muted); font-variant-numeric: tabular-nums; }
+#dashPanel .charts,
+#dashPanel .row2 { display: grid; grid-template-columns: 1fr; gap: 12px; }
+@media (min-width: 900px) {
+  #dashPanel .charts, #dashPanel .row2 { grid-template-columns: 1fr 1fr; }
+}
+#dashPanel .card { background: var(--d-panel); border: 1px solid var(--d-line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+#dashPanel .card h2 { font-size: 13px; margin: 0 0 6px; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
+#dashPanel .legend { display: flex; gap: 12px; font-weight: 400; color: var(--d-muted); font-size: 12px; flex-wrap: wrap; }
+#dashPanel .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+#dashPanel canvas { width: 100%; height: 170px; display: block; }
+#dashPanel table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 13px; }
+#dashPanel th,
+#dashPanel td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--d-line); white-space: nowrap; }
+#dashPanel th { color: var(--d-muted); font-weight: 500; font-size: 12px; }
+#dashPanel .tablewrap { overflow-x: auto; }
+#dashPanel table.sessions { table-layout: fixed; min-width: 1100px; }
+#dashPanel table.sessions td.rid { direction: rtl; text-align: left; font-variant-numeric: tabular-nums; }
+#dashPanel table.sessions td,
+#dashPanel table.sessions th { overflow: hidden; text-overflow: ellipsis; }
+#dashPanel .bar { position: relative; height: 8px; background: var(--d-grid); border-radius: 4px; min-width: 90px; overflow: hidden; }
+#dashPanel .bar > span { position: absolute; top: 0; bottom: 0; left: 0; }
+#dashPanel .bar > span.cached { border-radius: 4px 0 0 4px; }
+#dashPanel .bar > span.used { border-radius: 0 4px 4px 0; }
+#dashPanel .bar > span.cached { background: var(--d-c2); }
+#dashPanel .bar > span.used { background: var(--d-c1); }
+#dashPanel .phase { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; letter-spacing: .2px; text-transform: capitalize; color: #fff; }
+#dashPanel .phase.prefill { background: #0b5ed7; }
+#dashPanel .phase.decode { background: #198754; }
+#dashPanel [data-phase] { cursor: help; }
+#dashPanel .d-left { color: var(--d-c2); font-size: 12px; font-variant-numeric: tabular-nums; margin-left: 4px; }
+#dashPanel .phase.cached { background: #6c757d; }
+#dashPanel .empty { color: var(--d-muted); padding: 10px 2px; }
+#dashPanel #dashTip { position: fixed; display: none; z-index: 10; pointer-events: none; max-width: 280px;
+    background: var(--d-panel); color: var(--d-ink); border: 1px solid var(--d-line); border-radius: 8px;
+    padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-variant-numeric: tabular-nums; }
+#dashPanel #dashTip .t { color: var(--d-muted); margin-bottom: 4px; }
+#dashPanel #dashTip .t span { opacity: .8; }
+#dashPanel #dashTip .r { display: grid; grid-template-columns: 10px 1fr auto; gap: 6px; align-items: center; padding: 1px 0; opacity: .75; }
+#dashPanel #dashTip .r.near { opacity: 1; font-weight: 600; }
+#dashPanel #dashTip .r i { width: 10px; height: 3px; border-radius: 2px; }
+#dashPanel #dashTip .h { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--d-line); color: var(--d-muted); line-height: 1.35; }
+#dashPanel canvas { cursor: crosshair; touch-action: pan-y; }
+#dashPanel .kv { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; font-variant-numeric: tabular-nums; font-size: 13px; }
+#dashPanel .kv span:nth-child(odd) { color: var(--d-muted); }
+#dashPanel .kv span:nth-child(even) { text-align: right; }
+#dashPanel .hist { display: flex; align-items: flex-end; gap: 3px; height: 90px; margin-top: 6px; }
+#dashPanel .hist { cursor: crosshair; }
+#dashPanel .hist div { flex: 1; background: var(--d-c4); border-radius: 3px 3px 0 0; min-height: 1px; position: relative; opacity: .85; }
+#dashPanel .hist div.on { opacity: 1; outline: 2px solid var(--d-ink); outline-offset: 1px; }
+#dashPanel .hist:hover div:not(.on) { opacity: .5; }
+#dashPanel .histlabels { display: flex; gap: 3px; font-size: 10px; color: var(--d-muted); margin-top: 3px; }
+#dashPanel .histlabels span { flex: 1; text-align: center; overflow: hidden; }
 </style>
 </head>
 <body>
@@ -725,6 +859,10 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     <span class="name">sushi</span>
     <span class="ver num" id="brandVersion"></span>
   </div>
+  <nav id="viewNav" aria-label="Views">
+    <a id="navChat" href="/chat" aria-current="page">Chat</a>
+    <a id="navDashboard" href="/dashboard">Dashboard</a>
+  </nav>
   <span class="spacer"></span>
   <div class="topbar-actions">
     <span id="serverDot" title="Server status"><span class="dot" id="serverDotLight"></span><span class="lbl" id="serverDotLabel">Checking…</span></span>
@@ -833,6 +971,69 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
       </div>
     </details>
   </aside>
+</section>
+<section id="dashPanel" aria-label="Dashboard" hidden>
+  <div class="d-head">
+    <h1><span class="d-dot" id="dashDot"></span>Monitor<span class="d-ver" id="dashVer"></span></h1>
+    <div class="controls">
+      <label>Every <select id="dashInterval">
+        <option value="2000" selected>2 s</option><option value="3000">3 s</option>
+        <option value="5000">5 s</option><option value="10000">10 s</option></select></label>
+      <label>Window <select id="dashWindow">
+        <option value="60">1 min</option><option value="300" selected>5 min</option>
+        <option value="900">15 min</option><option value="3600">1 h</option></select></label>
+      <button id="dashPause" type="button">Pause</button>
+    </div>
+  </div>
+  <div id="dashStatus">Connecting...</div>
+  <div class="d-main">
+  <section class="tiles">
+    <div class="tile"><div class="k">Generation</div><div class="v" id="dashTGen">-</div><div class="s">tok/s</div></div>
+    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">tok/s</div></div>
+    <div class="tile"><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
+    <div class="tile"><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s">utilization</div></div>
+    <div class="tile" data-tile="mem"><span class="info tile-i" aria-hidden="true">i</span><div class="k">Memory</div><div class="v" id="dashTMem">-</div><div class="s" id="dashTMemS">process footprint</div></div>
+    <div class="tile"><div class="k">Avg TTFT</div><div class="v" id="dashTTtft">-</div><div class="s" id="dashTTtftS">since start</div></div>
+    <div class="tile" data-tile="cache"><span class="info tile-i" aria-hidden="true">i</span><div class="k">Cache reuse</div><div class="v" id="dashTCache">-</div><div class="s" id="dashTCacheS">of prompt tokens</div></div>
+    <div class="tile"><div class="k">Served</div><div class="v" id="dashTServed">-</div><div class="s" id="dashTServedS">output tokens</div></div>
+  </section>
+
+  <section class="card">
+    <h2>Sessions<span class="legend"><span><i style="background:var(--d-c2)"></i>restored from cache</span><span><i style="background:var(--d-c1)"></i>new this request</span></span></h2>
+    <div class="tablewrap"><table class="sessions">
+      <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"></colgroup>
+      <thead><tr><th>ID</th><th>Model</th><th>Phase</th><th>Context</th><th></th><th>Cached</th><th>Generated</th><th>Elapsed</th><th>Rate</th><th>State</th></tr></thead>
+      <tbody id="dashSessions"></tbody>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <details id="dashModelsBox">
+      <summary><h2><span>Models</span></h2></summary>
+      <div class="tablewrap"><table class="models">
+        <colgroup><col style="width:34px"><col><col style="width:160px"><col style="width:90px"><col style="width:70px"><col style="width:150px"><col style="width:90px"><col style="width:70px"><col style="width:110px"><col style="width:96px"></colgroup>
+        <thead><tr><th></th><th>Model</th><th>Size</th><th>Context</th><th>KV</th><th>Speculation</th><th>Batching</th><th>Vision</th><th>Safe context</th><th>KV in use</th></tr></thead>
+        <tbody id="dashModels"><tr><td colspan="10" class="empty">Loading model list...</td></tr></tbody>
+      </table></div>
+      <div class="foot" id="dashModelsUpdated"></div>
+    </details>
+  </section>
+
+  <section class="charts">
+    <div class="card"><h2>Throughput (tok/s)<span class="legend"><span><i style="background:var(--d-c1)"></i>generation</span><span><i style="background:var(--d-c2)"></i>prefill</span></span></h2><canvas id="dashCTps"></canvas></div>
+    <div class="card"><h2>Requests<span class="legend"><span><i style="background:var(--d-c1)"></i>running</span><span><i style="background:var(--d-c2)"></i>prefilling</span><span><i style="background:var(--d-c3)"></i>waiting</span><span><i style="background:var(--d-c4)"></i>batched</span></span></h2><canvas id="dashCReq"></canvas></div>
+    <div class="card"><h2>GPU utilization (%)<span class="legend"><span><i style="background:var(--d-c3)"></i>gpu</span></span></h2><canvas id="dashCGpu"></canvas></div>
+    <div class="card"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--d-c1)"></i>footprint</span><span><i style="background:var(--d-c2)"></i>MLX active</span><span><i style="background:var(--d-c4)"></i>MLX cache</span></span></h2><canvas id="dashCMem"></canvas></div>
+  </section>
+
+
+  <section class="row2">
+    <div class="card"><h2>Latency (mean since start)</h2><div class="kv" id="dashLat"></div></div>
+    <div class="card"><h2>Request totals</h2><div class="kv" id="dashTotals"></div></div>
+    <div class="card"><h2>Time to first token<span class="legend">requests per bucket</span></h2><div class="hist" id="dashHTtft"></div><div class="histlabels" id="dashHlTtft"></div></div>
+    <div class="card"><h2>End-to-end time per request<span class="legend">requests per bucket</span></h2><div class="hist" id="dashHE2e"></div><div class="histlabels" id="dashHlE2e"></div></div>
+  </section>
+</div>
 </section>
 </main>
 </div>
@@ -2529,6 +2730,616 @@ async function init() {
   $("promptInput").focus();
 }
 init();
+</script>
+<script id="dashboardScript">
+
+(() => {
+  const $ = id => document.getElementById('dash' + id.replace(/(^|-)(\w)/g, (_, __, c) => c.toUpperCase()));
+  const store = {
+    get(k, d) { try { return localStorage.getItem('sushi-dash:' + k) ?? d; } catch { return d; } },
+    set(k, v) { try { localStorage.setItem('sushi-dash:' + k, v); } catch {} }
+  };
+  $('interval').value = store.get('interval', '2000');
+  if (!$('interval').value) $('interval').value = '2000'; // a remembered value from an older option list
+  $('window').value = store.get('window', '300');
+
+  for (const id of ['interval', 'window']) $(id).addEventListener('change', () => { store.set(id, $(id).value); restart(); });
+
+  let paused = false, timer = null, prev = null, inflight = false;
+  let dashActive = false, lastData = null, bgStopped = false, lastPollAt = 0, lastServerAt = 0, failures = 0;
+  let lastCounters = null, restartNote = '';
+  const restarts = []; // times the server was seen restarting, drawn on the charts
+  const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [] };
+  const lastGen = new Map(); // request_id -> {gen, t}
+
+  $('pause').onclick = () => {
+    paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause';
+    if (paused) { clearTimeout(timer); $('status').textContent = 'Paused. Press Resume to continue updating.'; $('status').className = ''; $('dot').className = 'd-dot bad'; $('dot').title = 'Paused'; }
+    else restart();
+  };
+
+  const fmt = (n, d = 0) => n == null || !isFinite(n) ? '-' : n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+  const fmtInt = n => fmt(n, 0);
+  const compact = n => n >= 1e9 ? fmt(n / 1e9, 2) + 'B' : n >= 1e6 ? fmt(n / 1e6, 2) + 'M' : n >= 1e4 ? fmt(n / 1e3, 1) + 'k' : fmtInt(n);
+  const gib = b => b / 1073741824;
+  const bytes = b => b >= 1073741824 ? fmt(gib(b), 2) + ' GiB' : b >= 1048576 ? fmt(b / 1048576, 1) + ' MiB' : fmt(b / 1024, 0) + ' KiB';
+  const secs = s => !isFinite(s) ? '-' : s < 1 ? fmt(s * 1000, 0) + ' ms' : s < 60 ? fmt(s, 2) + ' s' : Math.floor(s / 60) + 'm ' + fmt(s % 60, 0) + 's';
+  const mean = h => h && h.count ? h.sum / h.count : NaN;
+
+  function setStatus(msg, err) { if (paused) return; $('dot').title = err ? 'Not connected' : 'Live'; $('status').textContent = msg; $('status').className = err ? 'err' : ''; $('dot').className = 'd-dot ' + (err ? 'bad' : 'ok'); }
+
+  function restart() { clearTimeout(timer); prev = null; propsAt = 0; if (!paused) tick(); }
+
+  // Switching views and tab visibility ask for an immediate poll; the 2 s minimum still holds across them.
+  function pollSoon() {
+    clearTimeout(timer);
+    const wait = Math.max(0, MIN_GAP - (Date.now() - lastPollAt));
+    if (wait) timer = setTimeout(tick, wait); else tick();
+  }
+
+  async function tick() {
+    clearTimeout(timer);
+    const iv = Math.max(MIN_GAP, +$('interval').value || MIN_GAP);
+    let delay = iv;
+    // A hidden dashboard polls only when the chat is idle, so background polling never competes with a chat request.
+    const quiet = !dashActive && (chatAbort || bgStopped);
+    if (!paused && !document.hidden && !quiet && !inflight) {
+      inflight = true; lastPollAt = Date.now();
+      let permanent = false;
+      try {
+        const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), Math.max(3000, iv * 2));
+        let r;
+        try { r = await api('/metrics.json', { signal: ctl.signal }); } finally { clearTimeout(to); }
+        permanent = r.status === 503 || r.status === 401;
+        if (r.status === 503) throw new Error('Live charts need metrics: restart sushi with --metrics. The Models table works without it.');
+        if (r.status === 401) throw new Error('Server wants an API key (started with --api-key).');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        update(await r.json());
+        failures = 0;
+        setStatus('Live, updated ' + new Date().toLocaleTimeString() + (restartNote ? '. ' + restartNote : ''), false);
+      } catch (e) {
+        const m = e.name === 'AbortError' ? 'Timed out' : (e.message === 'Failed to fetch' || e instanceof TypeError)
+          ? 'Cannot reach the server.' : e.message;
+        setStatus(m, true);
+        // Metrics off or a missing key will not fix itself while hidden; other errors back off and retry.
+        if (permanent) { if (!dashActive) bgStopped = true; } else { failures += 1; delay = Math.max(iv, Math.min(30000, 2000 * 2 ** (failures - 1))); }
+      } finally { inflight = false; }
+    }
+    timer = setTimeout(tick, delay);
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSoon(); });
+
+  function push(k, v) { series[k].push(v); }
+  function trim(now) {
+    const cut = now - (+$('window').value) * 1000;
+    while (restarts.length && restarts[0] < now - 3600000) restarts.shift();
+    while (series.t.length && series.t[0] < cut) for (const k in series) series[k].shift();
+  }
+
+  function update(d) {
+    const now = Date.now(), c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
+    // A restarted server starts its counters from zero: mark it and drop rate state built on the old values.
+    if (lastCounters && Object.keys(c).some(k => (c[k] || 0) < (lastCounters[k] || 0))) {
+      restarts.push(now); prev = null; lastGen.clear(); propsAt = 0;
+      restartNote = 'Server restarted at ' + new Date(now).toLocaleTimeString();
+    }
+    lastCounters = c;
+    // Sushi refreshes these token gauges only every ~2 s (its sampler thread), so between
+    // two fast polls the value often hasn't moved yet. Measure the rate between actual
+    // changes instead of between polls, and only call it 0 once nothing moved for a while.
+    const pollDt = prev ? (now - prev.t) / 1000 : 1;
+    const rate = (st, v, resets) => {
+      if (!st) return { at: now, v, r: 0 };
+      if (v === st.v) return (now - st.at > 3200) ? { ...st, r: 0, idle: true } : st;
+      const added = resets && v < st.v ? v : v - st.v;  // a new prefill restarts its count
+      const dt = Math.min((now - st.at) / 1000, Math.max(SAMPLE_S, pollDt)); // don't spread a burst over idle time
+      return { at: now, v, r: added > 0 && dt > 0 ? added / dt : 0 };
+    };
+    const genSt = rate(prev?.genSt, g.generation_tokens_live || 0, false);
+    const preSt = rate(prev?.preSt, g.prefill_tokens_live || 0, true);
+    const gen = genSt.r, pre = preSt.r;
+    prev = { t: now, g, genSt, preSt };
+
+    push('t', now); push('gen', gen); push('pre', pre);
+    push('run', g.requests_running || 0); push('wait', g.requests_waiting || 0);
+    push('pref', g.requests_prefilling || 0); push('batch', g.batched_group_size || 0);
+    push('gpu', g.gpu_utilization_pct || 0); push('mem', (g.memory_mb || 0) / 1024);
+    push('act', gib(g.mlx_active_bytes || 0)); push('cache', gib(g.mlx_cache_bytes || 0));
+    trim(now);
+    lastData = { d, now, gen, pre };
+    if (dashActive) render(lastData);
+  }
+
+  function render({ d, now, gen, pre }) {
+    const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
+
+    $('t-gen').textContent = fmt(gen, 1);
+    $('t-pre').textContent = fmt(pre, 0);
+    $('t-pre-s').textContent = g.prefill_tokens_expected ? `${compact(g.prefill_tokens_live)} / ${compact(g.prefill_tokens_expected)} tokens` : 'tok/s';
+    $('t-req').textContent = `${g.requests_running || 0} / ${g.requests_waiting || 0}`;
+    $('t-req-s').textContent = g.batched_group_size > 1 ? `running / waiting, ${g.batched_group_size} batched` : 'running / waiting';
+    $('t-gpu').textContent = fmtInt(g.gpu_utilization_pct) + '%';
+    $('t-mem').textContent = fmt((g.memory_mb || 0) / 1024, 1) + ' GiB';
+    lastGauges = g;
+    if (serverInfo.free == null) $('t-mem-s').textContent = `MLX ${fmt(gib(g.mlx_active_bytes || 0), 1)} active, ${fmt(gib(g.mlx_cache_bytes || 0), 1)} cache`;
+    $('t-ttft').textContent = secs(mean(h.time_to_first_token_seconds));
+    $('t-ttft-s').textContent = `over ${fmtInt(h.time_to_first_token_seconds?.count || 0)} requests`;
+    const pt = c.prompt_tokens_total || 0;
+    $('t-cache').textContent = pt ? fmt(100 * (c.prefix_cache_tokens_total || 0) / pt, 0) + '%' : '-';
+    $('t-cache-s').textContent = 'of prompt tokens came from cache';
+    $('t-served').textContent = compact(g.generation_tokens_live || c.generation_tokens_total || 0);
+    $('t-served-s').textContent = `output tokens, ${compact(pt)} input`;
+
+    const kv = (el, rows) => { setHtml(el, rows.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join('')); };
+    const mtp = (h.prefill_time_seconds?.sum || 0), dtp = (h.decode_time_seconds?.sum || 0);
+    kv($('lat'), [
+      ['Time to first token', secs(mean(h.time_to_first_token_seconds))],
+      ['End to end', secs(mean(h.e2e_request_latency_seconds))],
+      ['Prefill phase', secs(mean(h.prefill_time_seconds))],
+      ['Decode phase', secs(mean(h.decode_time_seconds))],
+      ['Avg prefill speed', mtp ? fmt((c.prefill_tokens_total || 0) / mtp, 0) + ' tok/s' : '-'],
+      ['Avg decode speed', dtp ? fmt((c.generation_tokens_total || 0) / dtp, 1) + ' tok/s' : '-'],
+      ['Avg input / output', `${fmtInt(mean(h.prompt_tokens))} / ${fmtInt(mean(h.output_tokens))} tok`],
+    ]);
+    const serial = Object.entries(d.decode_serial || {}).filter(([, v]) => v > 0).map(([k, v]) => [`Serial decode: ${esc(k)}`, fmtInt(v)]);
+    kv($('totals'), [
+      ['Succeeded', fmtInt(c.requests_success_total)],
+      ['Cancelled', fmtInt(c.requests_cancelled_total)],
+      ['Failed', fmtInt(c.requests_failed_total)],
+      ['Rejected', fmtInt(c.requests_rejected_total)],
+      ['Input tokens computed', fmtInt(c.prefill_tokens_total)],
+      ['Input tokens from cache', fmtInt(c.prefix_cache_tokens_total)],
+      ['Requests reusing cache', `${fmtInt(c.prefix_cache_hits_total)} of ${fmtInt(c.prefix_cache_queries_total)}`],
+      ...(g.ngram_warm_bytes ? [['N-gram table warmed', bytes(g.ngram_warm_bytes)]] : []),
+      ...serial,
+    ]);
+
+    hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
+    hist('e2e', h.e2e_request_latency_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
+    sessions(d.sessions || [], now, g);
+    drawAll();
+  }
+
+  const histData = {}, histHover = {};
+  const HIST_META = {
+    ttft: { unit: v => v < 1 ? fmt(v * 1000, 0) + ' ms' : fmt(v, v % 1 ? 1 : 0) + ' s', noun: 'waited',
+      help: 'How long requests waited from arrival to their first output token, including queueing and prompt processing. Successful requests since the server started.' },
+    e2e: { unit: v => v < 1 ? fmt(v * 1000, 0) + ' ms' : fmt(v, v % 1 ? 1 : 0) + ' s', noun: 'finished in',
+      help: 'Total time from arrival to the last token: queueing, reading the prompt and writing the reply. Longer replies take longer, so this mostly tracks reply length. Successful requests since the server started.' },
+  };
+
+  function hist(id, hg, label) {
+    const el = $('h-' + id), lb = $('hl-' + id);
+    if (!hg || !hg.bucket_counts) { setHtml(el, ''); setHtml(lb, ''); delete histData[id]; return; }
+    const cum = hg.bucket_counts, per = cum.map((v, i) => v - (i ? cum[i - 1] : 0));
+    const max = Math.max(1, ...per);
+    const labels = [...hg.bounds.map(b => '≤' + label(b)), '>' + label(hg.bounds[hg.bounds.length - 1])];
+    histData[id] = { hg, per, cum };
+    const on = histHover[id]?.i;
+    setHtml(el, per.map((v, i) => `<div class="${i === on ? 'on' : ''}" style="height:${(100 * v / max).toFixed(1)}%"></div>`).join(''));
+    setHtml(lb, labels.map(l => `<span>${esc(l)}</span>`).join(''));
+    if (histHover[id]) histTip(id);
+  }
+
+  function histTip(id) {
+    const d = histData[id], hv = histHover[id], m = HIST_META[id];
+    if (!d || !hv) return;
+    const { hg, per, cum } = d, i = hv.i, total = cum[cum.length - 1], b = hg.bounds;
+    const range = i === 0 ? `Up to ${m.unit(b[0])}` : i === b.length ? `Over ${m.unit(b[b.length - 1])}` : `${m.unit(b[i - 1])} to ${m.unit(b[i])}`;
+    const pct = v => total ? fmt(100 * v / total, 0) + '%' : '-';
+    const within = i < b.length ? `<div class="r near" style="grid-template-columns:1fr auto"><span>${pct(cum[i])} ${m.noun} at most ${m.unit(b[i])}</span></div>` : '';
+    placeTip(hv.cx, hv.cy, `<div class="t">${range}</div>
+      <div class="r near" style="grid-template-columns:1fr auto"><span>Requests</span><b>${fmtInt(per[i])} (${pct(per[i])})</b></div>
+      ${within}<div class="h">${m.help}</div>`, 'h-' + id);
+  }
+
+  for (const id of ['ttft', 'e2e']) {
+    const el = $('h-' + id);
+    el.addEventListener('pointermove', e => {
+      const d = histData[id]; if (!d) return;
+      const r = el.getBoundingClientRect(), n = d.per.length;
+      const i = Math.max(0, Math.min(n - 1, Math.floor((e.clientX - r.left) / r.width * n)));
+      const changed = histHover[id]?.i !== i;
+      histHover[id] = { i, cx: e.clientX, cy: e.clientY };
+      if (changed) [...el.children].forEach((c, j) => c.classList.toggle('on', j === i));
+      histTip(id);
+    });
+    el.addEventListener('pointerleave', () => { delete histHover[id]; [...el.children].forEach(c => c.classList.remove('on')); hideTip(); });
+  }
+
+  // innerHTML only through DOMPurify; a TBODY is wrapped in a table because a bare <tr> is dropped by the HTML parser.
+  function setHtml(node, html) {
+    if (!window.DOMPurify?.isSupported) { node.textContent = ''; return; }
+    if (node.tagName !== 'TBODY') { node.innerHTML = DOMPurify.sanitize(html); return; }
+    node.innerHTML = DOMPurify.sanitize('<table><tbody>' + html + '</tbody></table>').replace(/^<table><tbody>|<\/tbody><\/table>$/g, '');
+  }
+  const esc = s => String(s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+
+  // Fly-over help for the phase chips and the prefill percentage.
+  const PHASE_HELP = {
+    prefill: ['Prefill', 'The model is reading the prompt before it can answer. Tokens restored from the prefix cache are skipped, so only the new part of the prompt is processed here. The percentage next to the chip shows how much of that work is done.'],
+    decode: ['Decode', 'The model is generating the reply one token at a time. There is no fixed end: it stops when the model finishes or reaches the request\'s max_tokens.'],
+    cached: ['Cached', 'Not a running request. A finished conversation Sushi keeps in memory so a follow-up turn can restore it instead of re-reading the whole prompt. It disappears from this list while a new request is using it.'],
+  };
+  const sess = $('sessions');
+  let phasePtr = null; // last pointer position over the table, to re-check after each re-render
+  function phaseTip(el) {
+    const k = el.dataset.phase, r = el.getBoundingClientRect();
+    let html;
+    if (k === 'progress') html = `<div class="t">Prefill progress</div><div style="line-height:1.4">${fmtInt(+el.dataset.done)} of ${fmtInt(+el.dataset.exp)} prompt tokens processed.</div>`;
+    else if (PHASE_HELP[k]) html = `<div class="t">${PHASE_HELP[k][0]}</div><div style="line-height:1.4">${PHASE_HELP[k][1]}</div>`;
+    else return;
+    placeTip(r.left + r.width / 2, r.top, html, 'phase');
+  }
+  // Called after the table is rebuilt: the hovered chip may have changed or its row may be gone.
+  function refreshPhaseTip() {
+    if (!phasePtr) return;
+    const el = document.elementFromPoint(phasePtr.x, phasePtr.y)?.closest('[data-phase]');
+    if (el && sess.contains(el)) phaseTip(el); else if (tipOwner === 'phase') hideTip();
+  }
+  sess.addEventListener('pointermove', e => { phasePtr = { x: e.clientX, y: e.clientY }; });
+  sess.addEventListener('pointerover', e => { phasePtr = { x: e.clientX, y: e.clientY }; const el = e.target.closest('[data-phase]'); if (el) phaseTip(el); });
+  sess.addEventListener('pointerout', e => { if (e.target.closest('[data-phase]') && !e.relatedTarget?.closest?.('[data-phase]') && tipOwner === 'phase') hideTip(); });
+  sess.addEventListener('pointerleave', () => { phasePtr = null; if (tipOwner === 'phase') hideTip(); });
+
+
+  function sessions(rows, now, g = {}) {
+    // The server tracks one in-flight prefill at a time, as two global gauges, so a
+    // percentage can only be pinned to a row when exactly one row is prefilling.
+    const prefilling = rows.filter(r => r.phase === 'prefill').length;
+    const exp = g.prefill_tokens_expected || 0, done = Math.min(g.prefill_tokens_live || 0, exp);
+    const prefillDone = prefilling === 1 && exp > 0 ? 100 * done / exp : null;
+    const tb = $('sessions');
+    if (!rows.length) { setHtml(tb, '<tr><td colspan="10" class="empty">No live requests or cached conversations.</td></tr>'); lastGen.clear(); refreshPhaseTip(); return; }
+    const seen = new Set();
+    setHtml(tb, rows.map(s => {
+      const len = s.context_length || 0, ctx = s.context_tokens || 0;
+      const usedPct = len ? Math.min(100, 100 * ctx / len) : 0, cachePct = len ? Math.min(100, 100 * (s.cached_tokens || 0) / len) : 0;
+      let rate = '';
+      if (s.phase === 'decode' && s.request_id) {
+        seen.add(s.request_id);
+        const p = lastGen.get(s.request_id);
+        if (p && now > p.t && s.generated_tokens >= p.gen) rate = fmt((s.generated_tokens - p.gen) / ((now - p.t) / 1000), 1) + ' tok/s';
+        lastGen.set(s.request_id, { gen: s.generated_tokens, t: now });
+      }
+      const genTxt = s.phase === 'cached' ? '' : fmtInt(s.generated_tokens) + (s.max_tokens ? ` / ${fmtInt(s.max_tokens)}` : '');
+      return `<tr>
+        <td class="rid"${s.request_id ? ` title="Request ${esc(s.request_id)}"` : ''}>${esc(s.request_id || '')}</td>
+        <td title="${esc(s.model)}">${esc(String(s.model).split('/').pop())}</td>
+        <td><span class="phase ${esc(s.phase)}" data-phase="${esc(s.phase)}">${esc(s.phase)}</span>${s.phase === 'prefill' && prefillDone != null ? ` <span class="d-left" data-phase="progress" data-done="${done}" data-exp="${exp}">${fmt(prefillDone, 0)}%</span>` : ''}</td>
+        <td>${fmtInt(ctx)}${len ? ' / ' + compact(len) : ''}</td>
+        <td><div class="bar"><span class="cached" style="width:${cachePct.toFixed(1)}%"></span><span class="used" style="left:${cachePct.toFixed(1)}%;width:${Math.max(0, usedPct - cachePct).toFixed(1)}%"></span></div></td>
+        <td>${fmtInt(s.cached_tokens)}</td>
+        <td>${genTxt}</td>
+        <td>${s.phase === 'cached' ? '' : secs(s.elapsed_seconds)}</td>
+        <td>${rate}</td>
+        <td>${bytes(s.state_bytes || 0)}</td></tr>`;
+    }).join(''));
+    for (const id of lastGen.keys()) if (!seen.has(id)) lastGen.delete(id);
+    refreshPhaseTip();
+  }
+
+  const css = n => getComputedStyle($('panel')).getPropertyValue(n).trim();
+
+  const hover = {}; // canvas id -> mouse x/y in CSS px while the pointer is over it
+  const charts = {}; // canvas id -> last draw geometry, for hit-testing
+
+  function chart(id, lines, opts = {}) {
+    const cv = $(id), dpr = window.devicePixelRatio || 1, w = cv.clientWidth, hgt = cv.clientHeight;
+    if (cv.width !== w * dpr || cv.height !== hgt * dpr) { cv.width = w * dpr; cv.height = hgt * dpr; }
+    const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, hgt);
+    const t = series.t, n = t.length, padL = 40, padR = 6, padT = 6, padB = 18;
+    const win = (+$('window').value) * 1000, tEnd = n ? t[n - 1] : Date.now(), tStart = tEnd - win;
+    let max = opts.max || 0;
+    if (!opts.max) for (const [k] of lines) for (const v of series[k]) if (v > max) max = v;
+    max = niceMax(max || 1);
+    const X = tm => padL + (w - padL - padR) * (tm - tStart) / win, Y = v => padT + (hgt - padT - padB) * (1 - v / max);
+    ctx.font = '11px ui-sans-serif, system-ui, sans-serif'; ctx.fillStyle = css('--d-muted'); ctx.strokeStyle = css('--d-grid'); ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const v = max * i / 4, y = Math.round(Y(v)) + .5;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(axis(v, opts.dec), padL - 6, y);
+    }
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText('-' + secs(win / 1000).replace(' ', ''), padL, hgt - 4);
+    ctx.textAlign = 'right'; ctx.fillText('now', w - padR, hgt - 4);
+    for (const rt of restarts) { // server restart markers
+      if (rt < tStart) continue;
+      const x = Math.round(X(rt)) + .5;
+      ctx.save(); ctx.strokeStyle = css('--d-warn'); ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, hgt - padB); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = css('--d-warn'); ctx.textAlign = x > w - 60 ? 'right' : 'left'; ctx.textBaseline = 'top';
+      ctx.fillText('restart', x + (x > w - 60 ? -4 : 4), padT); ctx.fillStyle = css('--d-muted');
+    }
+
+    // Nearest sample to the pointer, and the line closest to it vertically.
+    const hv = hover[id];
+    let hi = -1, near = null;
+    if (hv && n && hv.x >= padL - 4) {
+      let best = Infinity;
+      for (let i = 0; i < n; i++) { const dx = Math.abs(X(t[i]) - hv.x); if (dx < best) { best = dx; hi = i; } }
+      if (best > 24) hi = -1;
+      if (hi >= 0) { let bd = Infinity; for (const [k] of lines) { const d = Math.abs(Y(series[k][hi]) - hv.y); if (d < bd) { bd = d; near = k; } } }
+    }
+
+    for (const [k, color, fill] of lines) {
+      const s = series[k]; if (!n) continue;
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) { const x = X(t[i]), y = Y(s[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+      if (fill) {
+        ctx.save(); ctx.lineTo(X(t[n - 1]), Y(0)); ctx.lineTo(X(t[0]), Y(0)); ctx.closePath();
+        ctx.globalAlpha = .12; ctx.fillStyle = css(color); ctx.fill(); ctx.restore();
+        ctx.beginPath(); for (let i = 0; i < n; i++) { const x = X(t[i]), y = Y(s[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+      }
+      ctx.save();
+      if (near && near !== k) ctx.globalAlpha = .45;
+      ctx.strokeStyle = css(color); ctx.lineWidth = near === k ? 3 : 2; ctx.lineJoin = 'round'; ctx.stroke();
+      ctx.restore();
+    }
+
+    if (hi >= 0) {
+      const x = Math.round(X(t[hi])) + .5;
+      ctx.strokeStyle = css('--d-muted'); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, hgt - padB); ctx.stroke(); ctx.setLineDash([]);
+      for (const [k, color] of lines) {
+        ctx.beginPath(); ctx.arc(x, Y(series[k][hi]), near === k ? 4.5 : 3, 0, 2 * Math.PI);
+        ctx.fillStyle = css(color); ctx.fill(); ctx.strokeStyle = css('--d-panel'); ctx.lineWidth = 1.5; ctx.stroke();
+      }
+      showTip(cv, x, hv.y, t[hi], lines, hi, near, opts);
+    } else if (tipOwner === cv.id) hideTip();
+  }
+
+  const tip = document.createElement('div'); tip.id = 'dashTip'; $('panel').appendChild(tip);
+  let tipOwner = null;
+  function showTip(cv, x, y, tm, lines, i, near, opts) {
+    const ago = Math.round((series.t[series.t.length - 1] - tm) / 1000);
+    const rows = [...lines].reverse().map(([k, color]) => {
+      const meta = LABELS[k], v = series[k][i];
+      return `<div class="r${near === k ? ' near' : ''}"><i style="background:var(${color})"></i><span>${meta.name}</span><b>${meta.fmt(v)}</b></div>`;
+    }).join('');
+    const extra = (opts.extra ? opts.extra() : []).map(([k, v]) => `<div class="r"><i></i><span>${k}</span><b>${v}</b></div>`).join('');
+    const help = near && LABELS[near].help ? `<div class="h">${LABELS[near].help}</div>` : '';
+    setHtml(tip, `<div class="t">${new Date(tm).toLocaleTimeString()}${ago ? ` <span>(${ago}s ago)</span>` : ' <span>(latest)</span>'}</div>${rows}${extra}${help}`);
+    tip.style.display = 'block'; tipOwner = cv.id;
+    const r = cv.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = r.left + x + 14; if (left + tw > window.innerWidth - 8) left = r.left + x - tw - 14;
+    let top = r.top + y - th / 2; top = Math.max(8, Math.min(top, window.innerHeight - th - 8));
+    tip.style.left = Math.max(8, left) + 'px'; tip.style.top = top + 'px';
+  }
+  function placeTip(cx, cy, html, owner) {
+    setHtml(tip, html); tip.style.display = 'block'; tipOwner = owner;
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = cx + 14; if (left + tw > window.innerWidth - 8) left = cx - tw - 14;
+    const top = Math.max(8, Math.min(cy - th - 12, window.innerHeight - th - 8));
+    tip.style.left = Math.max(8, left) + 'px'; tip.style.top = top + 'px';
+  }
+  function hideTip() { tip.style.display = 'none'; tipOwner = null; }
+
+  const tps = v => fmt(v, v < 100 ? 1 : 0) + ' tok/s', cnt = v => fmtInt(v), gb = v => fmt(v, 2) + ' GiB';
+  const LABELS = {
+    gen: { name: 'Generation', fmt: tps, help: 'Output tokens produced per second across all requests, measured between polls.' },
+    pre: { name: 'Prefill', fmt: tps, help: 'Prompt tokens processed per second. Tokens restored from the prefix cache are not counted, since they skip computation.' },
+    run: { name: 'Running', fmt: cnt, help: 'Requests that currently own a slot, in prefill or decode.' },
+    pref: { name: 'Prefilling', fmt: cnt, help: 'Requests reading their prompt before producing output.' },
+    wait: { name: 'Waiting', fmt: cnt, help: 'Requests queued for a free slot. Persistent waiting means more traffic than --max-concurrent allows.' },
+    batch: { name: 'Batched', fmt: cnt, help: 'Requests that generated together in one shared pass through the model, at the last step. 0 means nothing was batched.' },
+    gpu: { name: 'GPU', fmt: v => fmtInt(v) + '%', help: 'Apple GPU utilization reported by the system, for the whole GPU (not just Sushi).' },
+    mem: { name: 'Footprint', fmt: gb, help: 'Total physical memory the Sushi process holds, including GPU buffers.' },
+    act: { name: 'MLX active', fmt: gb, help: 'Memory MLX is actively using: weights, KV cache and working buffers.' },
+    cache: { name: 'MLX cache', fmt: gb, help: 'Freed buffers MLX keeps for reuse. Held by the process but not in use; a steady climb here explains footprint growth.' },
+  };
+
+  for (const id of ['c-tps', 'c-req', 'c-gpu', 'c-mem']) {
+    const cv = $(id);
+    cv.addEventListener('pointermove', e => { const r = cv.getBoundingClientRect(); hover[id] = { x: e.clientX - r.left, y: e.clientY - r.top }; drawAll(); });
+    cv.addEventListener('pointerleave', () => { delete hover[id]; hideTip(); drawAll(); });
+  }
+
+  function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p; }
+  function axis(v, dec) { return v >= 1000 ? fmt(v / 1000, v % 1000 ? 1 : 0) + 'k' : fmt(v, dec ?? (v % 1 ? 1 : 0)); }
+
+  function drawAll() {
+    if (!dashActive) return;
+    chart('c-tps', [['pre', '--d-c2', true], ['gen', '--d-c1', true]]);
+    chart('c-req', [['wait', '--d-c3'], ['pref', '--d-c2'], ['batch', '--d-c4'], ['run', '--d-c1']]);
+    chart('c-gpu', [['gpu', '--d-c3', true]], { max: 100 });
+    chart('c-mem', [['cache', '--d-c4'], ['act', '--d-c2'], ['mem', '--d-c1', true]], { dec: 1, extra: () => serverInfo.peak ? [['MLX peak (since start)', bytes(serverInfo.peak)]] : [] });
+  }
+  window.addEventListener('resize', drawAll);
+  matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', drawAll);
+
+
+  /* Server and model details, refreshed every SERVER_EVERY ms (they rarely change).
+   * /v1/models lists every model Sushi knows, loaded or not. /props?model=<id> adds
+   * live details (MTP, batching, safe context, KV in use) but only for a loaded
+   * model: Sushi will not load one just to answer it, so unloaded rows skip it.
+   * Both endpoints work without --metrics. */
+  const SERVER_EVERY = 15000;
+  const MIN_GAP = 2000; // ms: sushi's gauge sampler period
+  const SAMPLE_S = 2; // Sushi's gauge sampler period, seconds
+  var serverInfo = {};
+  let propsAt = 0, polling = false;
+  const modelProps = new Map(); // model id -> props JSON, 'pending' or 'error'
+  let modelList = [];
+
+  async function pollServer() {
+    if (paused || polling || !dashActive || document.hidden || Date.now() - propsAt < SERVER_EVERY || Date.now() - lastServerAt < MIN_GAP) return;
+    propsAt = lastServerAt = Date.now(); polling = true;
+    try {
+      const r = await api('/v1/models');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      modelList = (await r.json()).data || [];
+      const ready = modelList.filter(m => m.state === 'ready');
+      for (const id of modelProps.keys()) if (!ready.some(m => m.id === id)) modelProps.delete(id);
+      for (const m of ready) if (!modelProps.has(m.id)) modelProps.set(m.id, 'pending');
+      renderModels();
+      // With nothing loaded, plain /props still reports version and memory for the strip.
+      const serverProps = ready.length ? null : api('/props').then(x => x.ok ? x.json() : null).catch(() => null);
+      await Promise.all([
+        ...ready.map(m => api('/props?model=' + encodeURIComponent(m.id))
+          .then(x => x.ok ? x.json() : 'error').catch(() => 'error')
+          .then(p => { modelProps.set(m.id, p); renderModels(); })),
+        serverProps && serverProps.then(p => p && renderServer(p)),
+      ]);
+      $('models-updated').textContent = 'Last updated ' + new Date().toLocaleTimeString();
+      const first = ready.map(m => modelProps.get(m.id)).find(p => p && typeof p === 'object');
+      if (first) renderServer(first);
+    } catch { /* the metrics poll already reports connection problems */ }
+    finally { polling = false; }
+  }
+  setInterval(pollServer, 1000);
+
+  const shortName = id => String(id).split('/').pop();
+
+  // Server-wide figures from /props, shown in the Memory tile, Memory chart and Cache reuse fly-over.
+  function renderServer(p) {
+    const st = p.settings || {}, mem = p.memory || {}, pc = st.prefix_cache || {};
+    const ver = st.version || p.update?.current;
+    setHtml($('ver'), (ver ? ` v${esc(ver)}` : '') + (p.update?.available
+      ? ` <span class="badge" title="${esc(p.update.command || 'brew upgrade sushi')}">Update ${esc(p.update.latest || '')} available</span>` : ''));
+    serverInfo = { free: mem.available_bytes, peak: mem.peak_bytes, disk: pc.disk_bytes ? pc : null };
+    if (serverInfo.free != null) $('t-mem-s').textContent = bytes(serverInfo.free) + ' free';
+    drawAll();
+  }
+
+
+  // Fly-over details for a model name: full id, quantization and default sampling.
+  $('models').addEventListener('pointerover', e => {
+    const el = e.target.closest('[data-mid]'); if (!el) return;
+    const m = modelList.find(x => x.id === el.dataset.mid); if (!m) return;
+    const meta = m.meta || {}, v = x => x == null || x === '' ? 'model default' : esc(String(x));
+    const rows = [['Quantization', meta.quantization ? esc(meta.quantization) : '--'],
+      ...(m.state === 'ready' ? [['Default temperature', v(meta.gen_temperature)], ['Default top-p', v(meta.gen_top_p)], ['Default top-k', v(meta.gen_top_k)]] : [])];
+    const r = el.getBoundingClientRect();
+    placeTip(r.left + 40, r.top, `<div class="t">${esc(m.id)}</div>` + rows.map(([k, x]) =>
+      `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${x}</b></div>`).join('')
+      + (m.state === 'ready' ? '<div class="h">Sampling defaults apply when a request does not set its own.</div>' : ''), 'model');
+  });
+  $('models').addEventListener('pointerout', e => { if (e.target.closest('[data-mid]') && tipOwner === 'model') hideTip(); });
+
+  function renderModels() {
+    const rows = [...modelList].sort((a, b) => (b.state === 'ready') - (a.state === 'ready'));
+    if (!rows.length) { setHtml($('models'), '<tr><td colspan="10" class="empty">No models found.</td></tr>'); return; }
+    const spin = '<span class="d-spin" aria-label="loading"></span>', dash = '--';
+    setHtml($('models'), rows.map(m => {
+      const ready = m.state === 'ready', meta = m.meta || {};
+      const dotCls = ready ? 'ready' : m.state === 'loading' ? 'loading' : m.state === 'unloaded' ? 'unloaded' : 'other';
+      const dotTitle = ready ? 'Loaded' : m.state === 'loading' ? 'Loading' : m.state === 'unloaded' ? 'Not loaded' : esc(m.state || 'unknown');
+      let size = ready ? `${bytes(m.bytes_resident || 0)} <span class="unit">in memory</span>`
+        : m.bytes_on_disk ? `${bytes(m.bytes_on_disk)} <span class="unit">on disk</span>` : dash;
+      // Streamed models keep only part of their weights in memory and read the rest from the SSD.
+      if (m.streaming) size += `<br><span class="stream" title="Experts are read from the SSD as needed${m.ssd_budget_gb ? `, within a ${esc(m.ssd_budget_gb)} GiB memory budget` : ''}. Same output, slower.">`
+        + (ready ? 'SSD streamed' : m.streaming_required ? 'needs SSD streaming' : 'will stream')
+        + (m.ssd_budget_gb ? `, ${esc(m.ssd_budget_gb)} GiB budget` : '') + '</span>';
+      let ctx = m.context_length ? compact(m.context_length) : dash, kv = ready && meta.kv_quant ? esc(meta.kv_quant + '-bit') : dash;
+      let mtp = dash, batch = dash, vision = dash, safe = dash, kvUse = dash;
+      if (ready) {
+        const p = modelProps.get(m.id);
+        if (p === 'pending' || p === undefined) { mtp = batch = vision = safe = kvUse = spin; }
+        else if (p && typeof p === 'object') {
+          const st = p.settings || {}, mt = st.mtp || {}, b = p.batching || {}, mem = p.memory || {};
+          const n = p.default_generation_settings?.n_ctx; if (n) ctx = compact(n);
+          // A model speculates with either its MTP head (Qwen, MiMo) or a DFlash2 assistant (GLM).
+          const drafter = meta.drafter_loaded || (st.drafter && st.drafter !== 'none');
+          if (drafter) mtp = 'DFlash2';
+          else if (mt.loaded && mt.default_on) {
+            mtp = `MTP, depth ${esc(mt.depth)}${mt.adaptive ? ' adaptive' : ''}`;
+            if (mt.acceptance && mt.acceptance !== 'exact') mtp += ` <span class="warnmark" title="Approximate acceptance (${esc(mt.acceptance)}): faster, but output can differ from exact decoding.">${esc(mt.acceptance)} ⚠</span>`;
+          } else mtp = mt.loaded ? 'MTP loaded, off' : 'off';
+          batch = b.supported ? `up to ${esc(b.max_group)}` : `off`;
+          vision = st.vision?.loaded ? 'on' : 'off';
+          const sc = mem.max_safe_context || 0;
+          safe = sc ? `<span${n && sc < n ? ' style="color:var(--d-warn)" title="Less than the configured context: longer requests may be refused right now."' : ''}>${compact(sc)}</span>` : dash;
+          kvUse = mem.kv_cache_bytes != null ? bytes(mem.kv_cache_bytes) : dash;
+          if (!b.supported && b.reason) batch = `<span title="${esc(b.reason)}">off</span>`;
+        }
+      }
+      return `<tr class="${ready ? 'loaded' : 'idle'}">
+        <td><span class="sdot ${dotCls}" title="${dotTitle}"></span></td>
+        <td><span data-mid="${esc(m.id)}">${esc(shortName(m.id))}<span class="info" aria-label="Model details">i</span></span></td>
+        <td>${size}</td><td>${ctx}</td><td>${kv}</td><td>${mtp}</td><td>${batch}</td><td>${vision}</td><td>${safe}</td><td>${kvUse}</td></tr>`;
+    }).join(''));
+  }
+
+
+  // Fly-overs on tiles that carry extra detail.
+  var lastGauges = {};
+  const TILE_TIPS = {
+    mem: () => {
+      const g = lastGauges, rows = [
+        ['Process footprint', bytes((g.memory_mb || 0) * 1048576)],
+        ['MLX active', bytes(g.mlx_active_bytes || 0)],
+        ['MLX cache (reusable)', bytes(g.mlx_cache_bytes || 0)],
+        ...(serverInfo.free != null ? [['GPU memory free', bytes(serverInfo.free)]] : []),
+        ...(serverInfo.peak ? [['MLX peak', bytes(serverInfo.peak)]] : []),
+      ];
+      return ['Memory', rows, 'Free is the room left under the GPU memory limit. Running low means long requests may be refused.'];
+    },
+    cache: () => {
+      const d = serverInfo.disk;
+      const rows = d ? [['Disk cache used', `${bytes(d.disk_used_bytes || 0)} of ${bytes(d.disk_bytes)}`], ['Conversations saved', fmtInt(d.disk_entries)]] : [['Disk cache', 'off or not reported']];
+      return ['Prefix cache', rows, 'Saved conversations let follow-up requests skip re-reading their prompt. Older entries are dropped when the disk budget fills.'];
+    },
+  };
+  $('panel').querySelector('.tiles').addEventListener('pointerover', e => {
+    const el = e.target.closest('[data-tile]'); if (!el || !TILE_TIPS[el.dataset.tile]) return;
+    const [title, rows, help] = TILE_TIPS[el.dataset.tile](), r = el.getBoundingClientRect();
+    placeTip(r.left + 20, r.top, `<div class="t">${title}</div>` + rows.map(([k, v]) =>
+      `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`).join('') + `<div class="h">${help}</div>`, 'tile');
+  });
+  $('panel').querySelector('.tiles').addEventListener('pointerout', e => {
+    const el = e.target.closest('[data-tile]'); if (el && !el.contains(e.relatedTarget) && tipOwner === 'tile') hideTip();
+  });
+
+
+  const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard' };
+  const viewOf = p => p === VIEW_PATH.dashboard ? 'dashboard' : 'chat';
+  const chatTitle = document.title;
+  let panelScroll = 0, chatFocus = null, switching = false;
+  // The nav link takes focus when clicked, so the chat's last focused element is tracked as it moves.
+  // Focus lost to a plain click elsewhere, or to the inert switch itself, is not a choice to restore.
+  const chatPanelEl = document.getElementById('chatPanel');
+  if (chatPanelEl.contains(document.activeElement)) chatFocus = document.activeElement;
+  chatPanelEl.addEventListener('focusin', e => { chatFocus = e.target; });
+  chatPanelEl.addEventListener('focusout', e => {
+    if (!switching && !(e.relatedTarget && e.relatedTarget.closest('#viewNav'))) chatFocus = null;
+  });
+  function applyView(view) {
+    const dash = view === 'dashboard';
+    const chatPanel = document.getElementById('chatPanel');
+    switching = true;
+    if (!dash && dashActive) { panelScroll = $('panel').scrollTop; hideTip(); }
+    dashActive = dash;
+    $('panel').hidden = !dash;
+    // inert (with the CSS visibility rule) keeps the hidden chat out of tab order and the accessibility tree.
+    chatPanel.inert = dash;
+    document.getElementById('appMain').dataset.view = view;
+    document.getElementById('navChat').setAttribute('aria-current', dash ? 'false' : 'page');
+    document.getElementById('navDashboard').setAttribute('aria-current', dash ? 'page' : 'false');
+    document.title = dash ? 'sushi · dashboard' : chatTitle;
+    if (dash) {
+      $('panel').scrollTop = panelScroll;
+      bgStopped = false; propsAt = 0;
+      if (lastData) render(lastData);
+      drawAll(); pollServer(); pollSoon();
+    } else if (chatFocus?.isConnected) chatFocus.focus({ preventScroll: true });
+    switching = false;
+  }
+  function goTo(view) {
+    if (viewOf(location.pathname) === view && dashActive === (view === 'dashboard')) return;
+    history.pushState(null, '', VIEW_PATH[view]);
+    applyView(view);
+  }
+  for (const [id, view] of [['navChat', 'chat'], ['navDashboard', 'dashboard']]) {
+    document.getElementById(id).addEventListener('click', e => {
+      if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault(); goTo(view);
+    });
+  }
+  new MutationObserver(drawAll).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  window.addEventListener('popstate', () => applyView(viewOf(location.pathname)));
+  applyView(viewOf(location.pathname));
+  if (!dashActive) tick();
+})();
 </script>
 </body>
 </html>

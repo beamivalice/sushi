@@ -1,6 +1,6 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
-# The browser chat page: `GET /` and `GET /chat` serve the page embedded from
+# The browser chat page: `GET /`, `GET /chat` and `GET /dashboard` serve the page embedded from
 # src/webui/index.html, every other method on those paths is a 405, the API
 # routes beside it answer as before, and `--api-key` leaves the page open while
 # the API it calls stays behind the key.
@@ -70,13 +70,15 @@ echo "Chat page (port $PORT)"
 
 echo "[1/5] the page and its neighbours"
 if boot; then
-    for path in / /chat; do
+    for path in / /chat /dashboard; do
         curl -s -D "$WORK/headers" -o "$WORK/body" "$BASE$path"
         check "GET $path is 200" "$(grep -q '^HTTP/1.1 200' "$WORK/headers" && echo 1 || echo 0)"
         check "GET $path is text/html; charset=utf-8" \
             "$(grep -qi '^Content-Type: text/html; charset=utf-8' "$WORK/headers" && echo 1 || echo 0)"
         check "GET $path body is the embedded page" "$(cmp -s "$WORK/body" "$PAGE" && echo 1 || echo 0)"
     done
+    check "POST /dashboard is 405" "$(is "$(code -X POST "$BASE/dashboard" -d '{}')" 405)"
+    check "GET /dashboard/x is not the page" "$(is "$(code "$BASE/dashboard/x")" 404)"
     check "tools pack is available to the local page" \
         "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{}' | grep -q 'web_search' && echo 1 || echo 0)"
     check "tools reject another page origin" \
@@ -182,6 +184,7 @@ if boot --api-key webui-test-key --api-key-strict; then
         "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Authorization: Bearer webui-test-key' -d '{}')" 200)"
     check "GET / needs no key" "$(is "$(code "$BASE/")" 200)"
     check "GET /chat needs no key" "$(is "$(code "$BASE/chat")" 200)"
+    check "GET /dashboard needs no key" "$(is "$(code "$BASE/dashboard")" 200)"
     check "GET /v1/models without the key is 401" "$(is "$(code "$BASE/v1/models")" 401)"
     check "GET /v1/models with the Bearer key is 200" \
         "$(is "$(code -H 'Authorization: Bearer webui-test-key' "$BASE/v1/models")" 200)"
@@ -195,11 +198,18 @@ check "no external http(s) fetch or CDN in the page" \
     "$(grep -Eq '(src|href)="https?://|@import|fetch\("https?://' "$PAGE" && echo 0 || echo 1)"
 check "the page is under 200 KB" "$([ "$(wc -c < "$PAGE")" -lt 204800 ] && echo 1 || echo 0)"
 
-echo "[5/5] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter"
+echo "[5/5] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter, Chat/Dashboard navigator"
 if command -v node >/dev/null 2>&1; then
     for t in effort tools prefix_cache; do
         check "tests/test_webui_$t.cjs passes" "$(node "tests/test_webui_$t.cjs" >/dev/null 2>&1 && echo 1 || echo 0)"
     done
+    dash_out="$(node tests/test_webui_dashboard.cjs 2>&1)"; dash_rc=$?
+    if echo "$dash_out" | grep -q 'Web UI dashboard: skipped'; then
+        echo "  SKIP tests/test_webui_dashboard.cjs ($(echo "$dash_out" | grep 'skipped' | head -1))"
+    else
+        check "tests/test_webui_dashboard.cjs passes and names its pass" \
+            "$([ "$dash_rc" -eq 0 ] && echo "$dash_out" | grep -q 'Web UI dashboard: passed' && echo 1 || echo 0)"
+    fi
     check "the prefix-cache meter test names its pass" \
         "$(node tests/test_webui_prefix_cache.cjs 2>&1 | grep -q 'prefix-cache meter: passed' && echo 1 || echo 0)"
 else

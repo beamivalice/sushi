@@ -247,11 +247,22 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
   each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
 
-## Chat page (`GET /`, `GET /chat`)
+## Chat page (`GET /`, `GET /chat`, `GET /dashboard`)
 
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
-  `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those two paths is a 405 answered BEFORE
-  model resolution, so it can never cold-load a model. Guards: `tests/test_webui.sh`, the `chat page:` tests.
+  `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
+  model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
+  `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
+- A **Chat | Dashboard** navigator in the top bar switches two views of that one page in place (`history.pushState`,
+  `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
+  conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
+- The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
+  `/v1/models` and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
+  charts need `--metrics` (without it the page says so; the Models table still works). While hidden it polls only
+  `/metrics.json`, and only when no chat request is in flight and the browser tab is visible. Switches and tab
+  returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
+  401 stops the hidden poll until the dashboard is shown again. It follows the chat's
+  theme. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
 - The right sidebar's "Prefix cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
   (`disk_used_bytes / disk_bytes`, "<used> / <budget> GB" and the entry count beside it). It is read after each reply
   and again 2.5 s later (the server stores a turn's entry after answering) and stays hidden while `disk_bytes` is 0.
@@ -374,7 +385,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
   copyable. The upstream minified bundle is inline to keep the page self-contained; its license is in
   `src/webui/DOMPurify.LICENSE`. Updates should use a reviewed upstream release and rerun the renderer checks.
-- Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `node tests/test_webui_prefix_cache.cjs`, `tests/test_webui.sh`, and the
+- Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `node tests/test_webui_prefix_cache.cjs`, `node tests/test_webui_dashboard.cjs`, `tests/test_webui.sh`, and the
   `web tools:` unit test. Generate the
   browser renderer suite with `node tests/test_webui_render.cjs /tmp/sushi-render-tests/index.html`, serve that
   directory locally (or open the HTML), and require **All renderer checks passed**.
