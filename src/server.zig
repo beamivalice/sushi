@@ -9848,7 +9848,7 @@ fn handleNonStreamingCompletion(
     // Spec dispatch: `requestSpecModes` (DFlash > MTP).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
@@ -9936,9 +9936,10 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, logprobs_n);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -10485,7 +10486,7 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
@@ -10973,7 +10974,8 @@ pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 /// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
 /// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
 /// false` hand the round back to MTP. The gemma cross-attention drafter
-/// stays below MTP. logprobs and a grammar constraint disable every mode.
+/// stays below MTP. logprobs and a grammar constraint disable every mode; a repeat or presence
+/// penalty disables only the sidecar and the drafter, since MTP shifts its verify rows for it.
 /// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
 /// already applied at every surface's parse site.
 pub fn requestSpecModes(
@@ -10981,11 +10983,11 @@ pub fn requestSpecModes(
     enable_mtp: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    has_constraint: bool,
+    sampling: generate_mod.SamplingParams,
     logprobs_n: u32,
 ) RequestSpec {
-    const spec_ok = logprobs_n == 0 and !has_constraint;
-    const sidecar = spec_ok and enable_drafter and dflash_loaded;
+    const spec_ok = !generate_mod.mtpUnsupported(sampling, logprobs_n);
+    const sidecar = spec_ok and !generate_mod.penaltyActive(sampling) and enable_drafter and dflash_loaded;
     const use_dflash = sidecar and dflash_loaded;
     const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
     const use_drafter = use_dflash or (!use_mtp and sidecar);
@@ -10995,41 +10997,68 @@ pub fn requestSpecModes(
     };
 }
 
+/// A request that asked for MTP and runs without it says why; the boot line says MTP is on.
+fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: generate_mod.SamplingParams, logprobs_n: u32) void {
+    if (!enable_mtp or !mtp_loaded) return;
+    if (generate_mod.mtpRefusal(sampling, logprobs_n)) |why| log.info("  mtp=disabled ({s})\n", .{why});
+}
+
 fn pickStreamMode(
     enable_drafter: bool,
     enable_mtp: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    has_constraint: bool,
+    sampling: generate_mod.SamplingParams,
     logprobs_n: u32,
 ) StreamMode {
-    const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
+    const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n);
     if (r.use_mtp) return .mtp;
     if (r.use_drafter) return .drafter;
     return .regular;
 }
 
 test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head" {
+    const plain = generate_mod.SamplingParams{};
     // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
-    var r = requestSpecModes(true, true, true, true, false, 0);
+    var r = requestSpecModes(true, true, true, true, plain, 0);
     try std.testing.expect(r.use_drafter and !r.use_mtp);
-    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, false, 0));
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, plain, 0));
     // No sidecar loaded -> MTP keeps its rank.
-    r = requestSpecModes(true, true, false, true, false, 0);
+    r = requestSpecModes(true, true, false, true, plain, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, false, 0));
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, plain, 0));
     // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
-    r = requestSpecModes(false, true, true, true, false, 0);
+    r = requestSpecModes(false, true, true, true, plain, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
     // logprobs / grammar disable every spec mode, dflash included.
-    r = requestSpecModes(true, true, true, true, false, 3);
+    r = requestSpecModes(true, true, true, true, plain, 3);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
-    r = requestSpecModes(true, true, true, true, true, 0);
+    var dummy: generate_mod.Constraint = undefined;
+    r = requestSpecModes(true, true, true, true, .{ .constraint = &dummy }, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
     // Nothing loaded -> regular decode.
-    r = requestSpecModes(true, true, false, false, false, 0);
+    r = requestSpecModes(true, true, false, false, plain, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, false, 0));
+    try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, plain, 0));
+}
+
+test "requestSpecModes: a repeat or presence penalty keeps the sidecar off but MTP on" {
+    const presence = generate_mod.SamplingParams{ .presence_penalty = 1.5 };
+    const repeat = generate_mod.SamplingParams{ .repeat_penalty = 1.1 };
+    for ([_]generate_mod.SamplingParams{ presence, repeat }) |sampling| {
+        // A loaded sidecar cannot take the request, so the round falls to MTP.
+        var r = requestSpecModes(true, true, true, true, sampling, 0);
+        try std.testing.expect(r.use_mtp and !r.use_drafter);
+        try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, sampling, 0));
+        r = requestSpecModes(true, true, false, true, sampling, 0);
+        try std.testing.expect(r.use_mtp and !r.use_drafter);
+        // Without MTP the penalty leaves the sidecar nothing to run.
+        r = requestSpecModes(true, false, true, false, sampling, 0);
+        try std.testing.expect(!r.use_mtp and !r.use_drafter);
+        // logprobs still beat it.
+        r = requestSpecModes(true, true, false, true, sampling, 2);
+        try std.testing.expect(!r.use_mtp and !r.use_drafter);
+    }
 }
 
 fn handleStreamingGeneration(
@@ -11094,9 +11123,10 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, logprobs_n);
 
     // Scheduler's inference thread runs prefill + per-tick decode (regular
     // / PLD / drafter) and pushes generated tokens into the slot's output
@@ -16177,7 +16207,7 @@ fn handleAnthropicNonStreaming(
 
     // Speculative decoding dispatch — same `requestSpecModes` as
     // chat-completions (DFlash > MTP).
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
@@ -16436,9 +16466,10 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, 0);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -17946,9 +17977,10 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
+        const stream_mode = pickStreamMode(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling, 0);
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
+        noteMtpRefused(enable_mtp_resp, lm.mtp != null, sampling, 0);
 
         var slot_handle: ?*scheduler_mod.Slot = null;
         defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -18272,7 +18304,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > drafter) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
+        const spec = requestSpecModes(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling, 0);
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         // Transfer vision ownership into the slot.

@@ -133,8 +133,9 @@ before reading a completed stream and requires clean EOF.
   (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
-- **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no draft
-  path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+- **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
+  drafter path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+  MTP does run: each verify row carries the penalty ([engine-mtp](engine-mtp.md#spec-verify-invariant)).
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
   completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off.
 - **Think penalty** (`think_penalty` request > `--think-penalty` > model-settings.json > off, 0-20; arXiv 2606.00206):

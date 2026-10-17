@@ -47,7 +47,13 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
 - Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active
   rewards and penalties bypass the target head shortlist. The think-penalty preset retains its original arithmetic.
-- logprobs>0, grammar and a repeat/presence penalty disable spec.
+- A repeat/presence penalty shifts every verify block right after `thinkShiftRows` (`penaltyShiftRows`, the same
+  solo, grouped and batched sites): row j is penalised over the committed ids plus the verify ids through j with
+  the serial tick's own arithmetic (`seen_penalty.apply`), so MTP == serial holds. Drafts stay raw: exact
+  acceptance is valid for any proposal, a penalty only lowers acceptance. A plain batched tick samples no penalty,
+  so a penalised slot stays out of the planner's and the crowd's plain ticks and keeps its MTP round.
+- logprobs>0, grammar and a forced call disable spec; DFlash and the drafter also refuse a penalty. A request that
+  asked for MTP and runs without it logs `mtp=disabled (<reason>)`.
 
 ## Cost and acceptance
 

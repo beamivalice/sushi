@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **MTP stays on with `presence_penalty` and `repeat_penalty`**: a penalised request used to fall back to ordinary decoding and now runs MTP like any other, with the penalty applied to every verified token. A request that runs without MTP says why in the log.
 - **Qwen3.8-Flash-Next accepts `high` and `max`**: both are served as `xhigh`, and the server says so in the log and in the response instead of refusing the request.
 - **GLM-5.3-Flash accepts `medium` and `xhigh`**: `medium` is served as `high` and `xhigh` as `max`, with the same notice as Qwen's re-route.
 
