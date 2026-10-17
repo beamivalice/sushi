@@ -54512,7 +54512,7 @@ fn testExpectSameBits(want: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream
     try testing.expectEqualSlices(u32, a, b);
 }
 
-test "mimo decode qkv prep: bit-identical to partial rope + kv8 quantize at every verify width" {
+test "mimo decode qkv prep: bit-identical to partial rope + kv8 and kv6 quantize at every verify width" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -54570,23 +54570,24 @@ test "mimo decode qkv prep: bit-identical to partial rope + kv8 quantize at ever
             defer for (want) |a| {
                 _ = mlx.mlx_array_free(a);
             };
-            var want_k = try kv_quant.quantizeAffine(s, want[1], 64, 8);
-            defer want_k.deinit();
-            var want_v = try kv_quant.quantizeAffine(s, want[2], 64, 8);
-            defer want_v.deinit();
-
             const angles = try ropeAngleRows(s, rd, base, .{ .ctx = null }, offset, rows, allocator, 1.0);
             defer _ = mlx.mlx_array_free(angles);
-            var got = (try mimoDecodeQkvPrep(s, parts[0], parts[1], parts[2], angles, hq, layer.hk, rd, rows)) orelse return error.TestExpectedKernel;
-            defer got.deinit();
+            for ([_]u8{ 8, 6 }) |bits| {
+                var want_k = try kv_quant.quantizeAffine(s, want[1], 64, bits);
+                defer want_k.deinit();
+                var want_v = try kv_quant.quantizeAffine(s, want[2], 64, bits);
+                defer want_v.deinit();
+                var got = (try mimoDecodeQkvPrep(s, parts[0], parts[1], parts[2], angles, hq, layer.hk, rd, rows, bits)) orelse return error.TestExpectedKernel;
+                defer got.deinit();
 
-            try testExpectSameBits(want[0], got.q, s);
-            try testExpectSameBits(want_k.q, got.k.q, s);
-            try testExpectSameBits(want_k.scales, got.k.scales, s);
-            try testExpectSameBits(want_k.biases, got.k.biases, s);
-            try testExpectSameBits(want_v.q, got.v.q, s);
-            try testExpectSameBits(want_v.scales, got.v.scales, s);
-            try testExpectSameBits(want_v.biases, got.v.biases, s);
+                try testExpectSameBits(want[0], got.q, s);
+                try testExpectSameBits(want_k.q, got.k.q, s);
+                try testExpectSameBits(want_k.scales, got.k.scales, s);
+                try testExpectSameBits(want_k.biases, got.k.biases, s);
+                try testExpectSameBits(want_v.q, got.v.q, s);
+                try testExpectSameBits(want_v.scales, got.v.scales, s);
+                try testExpectSameBits(want_v.biases, got.v.biases, s);
+            }
         }
     };
 }

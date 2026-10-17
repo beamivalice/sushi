@@ -36,8 +36,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   a value can straddle two of them: every custom reader unpacks it bytewise (`sushi_kv_unpack8`) or in three-word
   units (matmul2d), and each is pinned against its dense oracle at 6 bits. The memory bill is the generic
   `(2 * bits + 1) / 32` of the dense row, so no bill changed. The batched affine append serves kv6 and kv8 (kv4 stays
-  per slot). The fused MiMo QKV prep stays kv8-only, so a MiMo kv6 slot composes `quantizeAffine` like kv4, and the MTP
-  round-cost profiles are measured at kv8 only, so a kv6 load runs the generic one.
+  per slot). The fused MiMo QKV prep serves kv6 as it does kv8 (the six-bit pack writes four values as three bytes, two
+  lanes per three bytes; bit-identical to the composed rope + `quantizeAffine`), and the MTP round-cost profiles are
+  measured at kv8 only, so a kv6 load runs the generic one.
 - Packed reads are kernel-or-DENSE: MiMo's global layers read packed at t_q==1 (`packedDecodeServesFrom`, from a
   4096-key floor) and Flash-Next's QSA arms read packed (next bullet); every other path reads the dense view.
 - Arch-specific packed readers: QSA on qwen4_exp ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)); the
