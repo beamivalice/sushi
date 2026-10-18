@@ -39,6 +39,10 @@ Capture refuses any kv-quant; `kld compare --kv-quant 8` or `6` scores a GLM stu
 A GLM pack (not `bf16_individual`) captures through the generic path instead: a student self-reference of its served
 forward at a BF16 latent (kv4/kv6/kv8 refused), `reference_numerics` off. Generic GLM capture and compare prefill
 prompts in 2048-token chunks, so 128K-token prompts fit and both sides chunk alike.
+Every architecture prefills a prompt in its serving start width (`prefillStartWidth`: Flash-Next 4096, MiMo and GLM 2048),
+in capture and compare alike and on any box; a prompt within one chunk is one forward, so short fixtures keep their numbers.
+A whole-prompt forward peaked at 57 GB at 32K and 77 GB at 64K on Flash-Next 2bpw, and a 128K teacher died on Metal OOM.
+A hidden capture (`SUSHI_HIDDEN_OUT`) on MiMo or Flash-Next still takes its prompt whole.
 All requested greedy full-vocabulary rows are captured through EOS, with native logits dtype recorded and exact
 F32 export. Output first stays in `<out>.partial`; only a full capture publishes a completed baseline and native
 identity atomically, without replacing existing output. A one-prompt study is not the standard release verdict.

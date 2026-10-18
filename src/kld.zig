@@ -1029,12 +1029,15 @@ fn renderPrompt(allocator: std.mem.Allocator, l: *Loaded, opts: Options, p: Prom
     return chat_mod.renderChatTemplate(allocator, &messages, &l.chat_config, null, null, false, null, false);
 }
 
-/// GLM prefills in serving-width chunks, identically at capture and compare: the chunk width is
-/// part of GLM's numerics, and a 128K-token prompt does not fit one forward.
-const glm_prompt_chunk: usize = @import("glm5_forward.zig").prefill_chunk;
+/// Prompts prefill in serving-width chunks, identically at capture and compare: the chunk width is part of
+/// the numerics, and a long prompt's whole-prompt forward outgrows memory. A prompt within one chunk is one forward.
+/// The width is the architecture's serving start width, so no box and no prompt length changes it.
+fn promptChunk(config: *const model_mod.ModelConfig) usize {
+    return config.prefillStartWidth();
+}
 
 fn forwardPrompt(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
-    return forwardPromptChunks(allocator, l, ctx, ids, if (l.config.isGlm5()) glm_prompt_chunk else ids.len);
+    return forwardPromptChunks(allocator, l, ctx, ids, promptChunk(&l.config));
 }
 
 fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, chunk: usize) !mlx.mlx_array {
@@ -1094,7 +1097,7 @@ fn captureGlmPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *transf
 /// The prompt forward; with `hidden`, every block boundary of it is appended there.
 fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, hidden: ?*hidden_capture.Writer) !mlx.mlx_array {
     const w = hidden orelse return forwardPrompt(allocator, l, ctx, ids);
-    if (l.config.isGlm5()) return captureGlmPromptChunks(allocator, l, ctx, ids, w, glm_prompt_chunk);
+    if (l.config.isGlm5()) return captureGlmPromptChunks(allocator, l, ctx, ids, w, promptChunk(&l.config));
     const layers = l.config.num_hidden_layers;
     const layer_ids = try allocator.alloc(u32, layers);
     defer allocator.free(layer_ids);
@@ -1108,7 +1111,8 @@ fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transfor
     var cl: transformer_mod.CaptureLayers = .{ .ids = layer_ids, .out = rows[1..], .input = &rows[0] };
     ctx.capture_layers = &cl;
     defer ctx.capture_layers = null;
-    const logits = try forwardPrompt(allocator, l, ctx, ids);
+    // Boundary rows are captured from one forward, so a hidden capture takes the prompt whole.
+    const logits = try forwardPromptChunks(allocator, l, ctx, ids, ids.len);
     errdefer _ = mlx.mlx_array_free(logits);
     try w.append(l.xfm.s, ids, rows);
     return logits;
@@ -1210,12 +1214,15 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         .top_k = opts.top_k,
         .elapsed_secs = elapsed_secs,
     }, records.items);
-    out.print("[kld] captured {d} prompts x {d} tokens into {s} in {d:.1}s (mean strict NLL {d:.9})\n", .{
+    var peak_bytes: usize = 0;
+    try mlx.check(mlx.mlx_get_peak_memory(&peak_bytes));
+    out.print("[kld] captured {d} prompts x {d} tokens into {s} in {d:.1}s (mean strict NLL {d:.9}, peak active {d:.2} GB)\n", .{
         records.items.len,
         opts.tokens,
         opts.out_dir,
         elapsed_secs,
         mean_nll,
+        @as(f64, @floatFromInt(peak_bytes)) / 1e9,
     });
 }
 
@@ -2385,6 +2392,58 @@ test "kld: a resident mimo_v2 load takes the source trunk and its logits follow 
         for (rows[arm]) |v| try testing.expect(std.math.isFinite(v));
     }
     try testing.expect(!std.mem.eql(f32, &rows[0], &rows[1]));
+}
+
+test "kld: every served architecture prefills a prompt in its serving start width, whatever the box" {
+    var qwen: model_mod.ModelConfig = .{ .model_type = "qwen4_exp" };
+    var glm: model_mod.ModelConfig = .{ .model_type = "glm5_next" };
+    var mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
+    try testing.expectEqual(@as(usize, 4096), promptChunk(&qwen));
+    try testing.expectEqual(@as(usize, 2048), promptChunk(&glm));
+    try testing.expectEqual(@as(usize, 2048), promptChunk(&mimo));
+}
+
+test "kld: a prompt longer than the chunk is forwarded chunk by chunk, a shorter one in one forward" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var metal: bool = false;
+    mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;
+    if (!metal) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "pack");
+    var dir = try tmp.dir.openDir(io, "pack", .{});
+    defer dir.close(io);
+    try writeTinyMimoResidentPack(io, arena, dir, 1);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try dir.realPath(io, &path_buf);
+    const loaded = try loadModel(io, allocator, .{ .model_dir = path_buf[0..path_len] });
+    defer loaded.deinit();
+
+    const chunk = promptChunk(&loaded.config);
+    const ids = try allocator.alloc(u32, 2 * chunk);
+    defer allocator.free(ids);
+    for (ids, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % TinyMimo.vocab);
+    for ([_]usize{ chunk, 2 * chunk }) |len| {
+        try loaded.xfm.resetCache();
+        var ctx = loaded.xfm.defaultCtx();
+        const got = try forwardPrompt(allocator, loaded, &ctx, ids[0..len]);
+        defer _ = mlx.mlx_array_free(got);
+        try loaded.xfm.resetCache();
+        var ref_ctx = loaded.xfm.defaultCtx();
+        const expected = try forwardPromptChunks(allocator, loaded, &ref_ctx, ids[0..len], chunk);
+        defer _ = mlx.mlx_array_free(expected);
+        var same = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(same);
+        try mlx.check(mlx.mlx_array_equal(&same, got, expected, true, loaded.xfm.s));
+        var equal = false;
+        try mlx.check(mlx.mlx_array_item_bool(&equal, same));
+        try testing.expect(equal);
+    }
 }
 
 test "kld: an imatrix capture records every mimo_v2 o_proj input and the lm_head input the forward read" {
