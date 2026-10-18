@@ -1023,7 +1023,7 @@ test "GLM KLD capture sends a pack to the generic student reference, at a BF16 l
     const kv = @import("kv_quant.zig").KVQuantConfig;
     var opts = kld.Options{ .command = .capture, .no_template = true, .tokens = 256 };
     try std.testing.expect(!(try accepts(&cfg, opts)));
-    for ([_]kv{ kv.affine(4), kv.affine(8) }) |quant| {
+    for ([_]kv{ kv.affine(4), kv.affine(6), kv.affine(8) }) |quant| {
         opts.kv_quant_config = quant;
         try std.testing.expectError(error.GlmStudentReferenceNeedsBf16Latent, accepts(&cfg, opts));
     }

@@ -586,10 +586,15 @@ test "GLM kv8 latent overlay verifier commits independent serial ancestry" {
     try verifierCommitCase(8, 3);
 }
 
+test "GLM kv6 latent overlay verifier commits independent serial ancestry" {
+    try verifierCommitCase(6, 3);
+}
+
 test "GLM overlay verifier past the sparse threshold on a reserved request commits serial ancestry" {
     // 2050 committed rows: the tree's later rows select pools, and their paths complete pool 512.
     try verifierCommitCase(0, 2050);
     try verifierCommitCase(8, 2050);
+    try verifierCommitCase(6, 2050);
 }
 
 fn verifierCommitCase(latent_bits: u8, prompt: usize) !void {
@@ -665,9 +670,14 @@ test "GLM consuming commit appends kv8 MLA rows in place with the copying commit
     try consumingCommitCase(8, false);
 }
 
+test "GLM consuming commit appends kv6 MLA rows in place with the copying commit's bits" {
+    try consumingCommitCase(6, false);
+}
+
 test "GLM consuming commit appends in place while a command buffer still reads the old rows" {
     try consumingCommitCase(0, true);
     try consumingCommitCase(8, true);
+    try consumingCommitCase(6, true);
 }
 
 /// Queues one long GPU job that reads every MLA buffer: its command buffer holds them until it completes.
@@ -781,7 +791,7 @@ test "GLM grouped verification gives every request exactly what it gets alone" {
     var requests: [3]forward.Request = undefined;
     for (&requests, prompts, 0..) |*request, prompt, i| {
         request.* = try forward.Request.init(a, target.layers.len);
-        try request.setLatentBits(if (i == 1) 8 else 0);
+        try request.setLatentBits((&[_]u8{ 0, 8, 6 })[i]);
         const ids = mlx.mlx_array_new_data(prompt.ptr, &.{ 1, @intCast(prompt.len) }, 2, .uint32);
         defer _ = mlx.mlx_array_free(ids);
         const logits = try target.forwardLast(request, ids, true);
@@ -831,7 +841,7 @@ test "GLM one verified row and its commit equal a serial decode step" {
     const cfg = try randomizedFixture(&weights, s);
     var target = try forward.Model.load(a, cfg, &weights, s);
     defer target.deinit();
-    for ([_]u8{ 0, 8 }) |bits| {
+    for ([_]u8{ 0, 8, 6 }) |bits| {
         var request = try forward.Request.initServing(a, target.layers.len);
         defer request.deinit();
         try request.setLatentBits(bits);
@@ -881,7 +891,7 @@ test "GLM plain rows of several requests advance each exactly as its serial deco
         row.* = try forward.Request.initServing(a, target.layers.len);
         ref.* = try forward.Request.initServing(a, target.layers.len);
         for ([_]*forward.Request{ row, ref }) |request| {
-            try request.setLatentBits(if (i == 1) 8 else 0);
+            try request.setLatentBits((&[_]u8{ 0, 8, 6 })[i]);
             const ids = mlx.mlx_array_new_data(prompt.ptr, &.{ 1, @intCast(prompt.len) }, 2, .uint32);
             defer _ = mlx.mlx_array_free(ids);
             const logits = try target.forwardLast(request, ids, true);

@@ -108,6 +108,11 @@ against a different binary and flag set, which is why the delta is quoted rather
 Sushi-2.6bpw (4-bit n-gram table, binary `ad5e6be8`, same settings): `--kv-quant 4` scores 0.145841 / top-1 88.84% /
 NLL 0.465802 against kv8's 0.135508 / 89.08% / 0.454090, +7.63% KLD and -0.24 pp.
 
+kv6 (Sushi-2.6bpw, the f32-GDN raw teacher `qwen38-flash-next-bf16-gdnf32-v1`, binary `84d3ed8f`, `--qwen-gdn 32 --no-mtp`, 7539
+positions to first EOS, `taskpolicy -a`, GPU lock): kv8 0.114252 / 90.79% / NLL 0.376931, kv6 0.115611 / 91.07% / 0.377234
+(+1.19% KLD, at the rounding-flip floor), kv4 0.123894 / 90.53% / 0.387879 (+8.44%). kv6 keeps 77% of the cache's bytes
+against kv8 (6.5 against 8.5 bits per element) for a cost the floor can hide.
+
 <a id="gdn-f32-teacher"></a>
 ## The f32 GDN teacher (gate and state)
 

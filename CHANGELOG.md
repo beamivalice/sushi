@@ -10,6 +10,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Web UI Dashboard**: a Chat | Dashboard navigator in the page's top bar, with live throughput, requests, GPU and memory charts plus sessions and models tables (needs `--metrics`; switching never interrupts a chat). Dashboard by @cosmic-quokka (#55).
 - **Qwen3.8-Flash-Next accepts `high` and `max`**: both are served as `xhigh`, and the server says so in the log and in the response instead of refusing the request.
 - **GLM-5.3-Flash accepts `medium` and `xhigh`**: `medium` is served as `high` and `xhigh` as `max`, with the same notice as Qwen's re-route.
+- **`--kv-quant 6`**: a 6-bit KV cache between kv4 and kv8, with `kv_quant` 6 in `model-settings.json` and per request, on Qwen, MiMo and GLM (GLM stores its MLA latent at 6 bits and keeps DFlash2 and prefix reuse).
 
 ## v1.2.4 — Faster Qwen3.8-Flash-Next, more context admission, image cache
 

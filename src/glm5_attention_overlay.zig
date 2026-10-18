@@ -13,7 +13,7 @@ pub fn tailBytes(width: usize, rows: usize, bytes: usize) !usize {
     if (width == 0 or rows == 0 or rows > max_rows or (bytes != 2 and bytes != 4)) return error.InvalidGlmOverlay;
     return std.math.mul(usize, try std.math.mul(usize, rows, width), bytes);
 }
-/// `tail` holds rows as attention reads them: under kv8, their quantize-dequantize round trip.
+/// `tail` holds rows as attention reads them: under kv8 or kv6, their quantize-dequantize round trip.
 pub const View = struct {
     prefix: Latent,
     prefix_rows: usize,
@@ -68,7 +68,7 @@ const shader_source: [:0]const u8 =
     \\}
     \\const uint base=((row*uint(H)+head)*uint(SPLITS)+part);
 ;
-var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+var kernels: [latent_store.variants]?mlx.mlx_fast_metal_kernel = @splat(null);
 pub const Partials = struct {
     partial: Arr,
     stats: Arr,
@@ -91,7 +91,8 @@ pub fn partials(q: Arr, view: View, ids: Arr, offset: Arr, length: Arr, scale: A
     for ([_][*:0]const u8{ "H", "D", "SPLITS", "SELECTED" }, [_]c_int{ sh[1], sh[2], splits, @intFromBool(selected) }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name, value));
     const cache = view.storage();
     const quantized = cache.quantized();
-    const slot = &kernels[@intFromBool(quantized)];
+    const bits = cache.bits();
+    const slot = &kernels[latent_store.variant(bits)];
     if (slot.* == null) {
         const names: []const [*:0]const u8 = if (quantized)
             &.{ "q", "cache", "cache_scales", "cache_biases", "tail", "selected", "offset", "length", "scale", "prefix_length" }
@@ -101,7 +102,7 @@ pub fn partials(q: Arr, view: View, ids: Arr, offset: Arr, length: Arr, scale: A
         defer _ = mlx.mlx_vector_string_free(ins);
         const outs = mlx.mlx_vector_string_new_data(&.{ "partial", "stats" }, 2);
         defer _ = mlx.mlx_vector_string_free(outs);
-        const kernel = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_verify_latent8_overlay" else "sushi_glm_verify_latent_overlay", ins, outs, shader_source ++ @import("glm5_attention_prefill.zig").partial_tail, latent_store.header(quantized), false, false);
+        const kernel = mlx.mlx_fast_metal_kernel_new(latent_store.kernelName("sushi_glm_verify_latent_overlay", bits), ins, outs, shader_source ++ @import("glm5_attention_prefill.zig").partial_tail, latent_store.header(bits), false, false);
         if (kernel.ctx == null) return error.MetalKernelCompileFailed;
         slot.* = kernel;
     }
@@ -216,21 +217,24 @@ test "GLM latent overlay branch outputs index state and commit match full append
     _ = a;
 }
 
+test "GLM kv8 and kv6 latent overlay reads round-tripped tails exactly as the committed append" {
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try overlayTailCase(bits);
+}
 
-test "GLM kv8 latent overlay reads round-tripped tails exactly as the committed kv8 append" {
+fn overlayTailCase(bits: u8) !void {
     const attention = @import("glm5_attention.zig");
     const s = mlx.gpuStream();
     const Case = struct { prefix: usize, heads: c_int, width: c_int };
     for ([_]Case{ .{ .prefix = 1, .heads = 2, .width = 64 }, .{ .prefix = 255, .heads = 2, .width = 64 }, .{ .prefix = 2052, .heads = 2, .width = 64 }, .{ .prefix = 2052, .heads = 64, .width = 512 } }) |case| {
         var ops = Ops{ .s = s };
         defer ops.deinit();
-        var source = attention.State{ .latent_bits = latent_store.kv8_bits };
+        var source = attention.State{ .latent_bits = bits };
         defer source.deinit();
         const ape = try ops.zeros(&.{ 4, 8 }, .bfloat16);
         _ = try source.append(try normal(&ops, &.{ @intCast(case.prefix), case.width }, .bfloat16, 51), try normal(&ops, &.{ @intCast(case.prefix), 8 }, .bfloat16, 52), try ops.zeros(&.{ @intCast(case.prefix), 8 }, .bfloat16), ape, s);
         try source.evaluate();
         const latents = try normal(&ops, &.{ 3, case.width }, .bfloat16, 53);
-        const readable = try ops.own(try latent_store.readable(latents, latent_store.kv8_bits, s));
+        const readable = try ops.own(try latent_store.readable(latents, bits, s));
         const keys = try normal(&ops, &.{ 3, 8 }, .bfloat16, 54);
         const gates = try ops.zeros(&.{ 3, 8 }, .bfloat16);
         const queries = try normal(&ops, &.{ 3, case.heads, case.width }, .bfloat16, 55);
@@ -263,7 +267,7 @@ test "GLM kv8 latent overlay reads round-tripped tails exactly as the committed 
 test "GLM overlay branch completing a pool reads a reserved pooled buffer without copying it" {
     const attention = @import("glm5_attention.zig");
     const s = mlx.gpuStream();
-    for ([_]u8{ 0, latent_store.kv8_bits }) |bits| {
+    for ([_]u8{ 0, latent_store.kv8_bits, 6 }) |bits| {
         var ops = Ops{ .s = s };
         defer ops.deinit();
         var source = attention.State{ .latent_bits = bits };

@@ -856,7 +856,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
 // ── DiffusionGemma bidirectional canvas decoder ──
 
-/// MiMo decode or verify rows whose FP8 QKV left V scaled, on a kv8 g64 cache: Q/K rope and
+/// MiMo decode or verify rows whose FP8 QKV left V scaled, on a kv8 or kv6 g64 cache: Q/K rope and
 /// the K/V quantize run as one dispatch and K/V append already quantized. Null = composed path.
 pub fn mimoDecodePrep(
     self: *Transformer,
@@ -874,10 +874,10 @@ pub fn mimoDecodePrep(
     q_out: *mlx.mlx_array,
 ) !?DenseKVView {
     const kvc = ctx.cache.config;
-    if (kvc.scheme != .affine or kvc.bits != 8 or kvc.group_size != 64) return null;
+    if (kvc.scheme != .affine or (kvc.bits != 8 and kvc.bits != 6) or kvc.group_size != 64) return null;
     if (mimo_qkv_prep_override == false) return null;
     const angles = try self.qkAngleRowsFor(if (is_global) 0 else 1, rope_dims, rope_base, .{ .ctx = null }, offset, rows, 1.0);
-    var prep = (try mimoDecodeQkvPrep(self.s, proj[0], proj[1], proj[2], angles, h_count, kv_h, rope_dims, rows)) orelse return null;
+    var prep = (try mimoDecodeQkvPrep(self.s, proj[0], proj[1], proj[2], angles, h_count, kv_h, rope_dims, rows, kvc.bits)) orelse return null;
     errdefer _ = mlx.mlx_array_free(prep.q);
     defer {
         prep.k.deinit();
@@ -1160,7 +1160,8 @@ pub fn mimoRoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array
 // One dispatch per layer and forward does the work of two partial ropes (each a whole-input copy
 // plus the rotation) and two `affine_quantize` dispatches. The rotation mirrors `rope_single_impl`
 // against the `ropeAngleRow` probe's floats; each 64-wide group is one simdgroup running
-// `affine_quantize<T, 64, 8>` line for line. Bit-identical to the composed ops.
+// `affine_quantize<T, 64, BITS>` line for line (BITS 8 or 6; 6 packs four values into three bytes, two lanes
+// per three bytes). Bit-identical to the composed ops.
 pub const MIMO_QKV_PREP_HEADER =
     \\template <typename T, int RD>
     \\inline T sushi_rope_elem(const device T* src, uint j, const device float* angles) {
@@ -1177,10 +1178,10 @@ pub const MIMO_QKV_PREP_HEADER =
     \\    }
     \\    return src[j];
     \\}
-    \\template <typename T>
-    \\inline void sushi_q8_group(thread float* w, uint lane, device uint8_t* out, device T* scale_out, device T* bias_out) {
+    \\template <typename T, int BITS>
+    \\inline void sushi_q_group(thread float* w, uint lane, device uint8_t* out, device T* scale_out, device T* bias_out) {
     \\    constexpr float eps = 1e-7;
-    \\    constexpr float n_bins = 255;
+    \\    constexpr float n_bins = float((1u << BITS) - 1u);
     \\    float w_min = Limits<T>::max;
     \\    float w_max = 0;
     \\    for (int i = 0; i < 2; i++) {
@@ -1201,9 +1202,24 @@ pub const MIMO_QKV_PREP_HEADER =
     \\        *scale_out = static_cast<T>(scale);
     \\        *bias_out = static_cast<T>(bias);
     \\    }
+    \\    uint val[2];
     \\    for (int i = 0; i < 2; i++) {
-    \\        uint8_t val = min(round((w[i] - bias) / scale), n_bins);
-    \\        out[i] = val;
+    \\        val[i] = uint(min(round((w[i] - bias) / scale), n_bins));
+    \\    }
+    \\    if (BITS == 8) {
+    \\        out[lane * 2] = uint8_t(val[0]);
+    \\        out[lane * 2 + 1] = uint8_t(val[1]);
+    \\    } else {
+    \\        // Four 6-bit values make three bytes (a little-endian bitstream): an even lane writes its pair and the next lane's.
+    \\        uint pair = val[0] | (val[1] << 6);
+    \\        uint next = simd_shuffle_down(pair, 1);
+    \\        if ((lane & 1u) == 0) {
+    \\            uint x = pair | (next << 12);
+    \\            device uint8_t* o = out + (lane >> 1) * 3;
+    \\            o[0] = uint8_t(x & 255u);
+    \\            o[1] = uint8_t((x >> 8) & 255u);
+    \\            o[2] = uint8_t((x >> 16) & 255u);
+    \\        }
     \\    }
     \\}
 ;
@@ -1237,7 +1253,7 @@ pub const MIMO_QKV_PREP_SOURCE =
     \\        w[i] = float(sushi_rope_elem<T, RD>(k + (r * uint(HK) + head) * HD, j + i, row_angles));
     \\    }
     \\    uint slot = (head * NR + r) * (HD / 64) + kg % (HD / 64);
-    \\    qout = (device uint8_t*)kq + (head * NR + r) * HD + j;
+    \\    qout = (device uint8_t*)kq + (head * NR + r) * (HD * BITS / 8) + (kg % (HD / 64)) * (8 * BITS);
     \\    sc = ks + slot;
     \\    bi = kb + slot;
     \\} else {
@@ -1248,28 +1264,28 @@ pub const MIMO_QKV_PREP_SOURCE =
     \\        w[i] = float(v[(r * uint(HK) + head) * VD + j + i]);
     \\    }
     \\    uint slot = (head * NR + r) * (VD / 64) + vg % (VD / 64);
-    \\    qout = (device uint8_t*)vq + (head * NR + r) * VD + j;
+    \\    qout = (device uint8_t*)vq + (head * NR + r) * (VD * BITS / 8) + (vg % (VD / 64)) * (8 * BITS);
     \\    sc = vs + slot;
     \\    bi = vb + slot;
     \\}
-    \\sushi_q8_group<T>(w, lane, qout, sc, bi);
+    \\sushi_q_group<T, BITS>(w, lane, qout, sc, bi);
 ;
 
 pub var mimo_qkv_prep_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub var mimo_qkv_prep_engaged: bool = false;
 
-pub const MimoQkvPrepKey = struct { hq: c_int, hk: c_int, rd: c_int, rows: c_int };
+pub const MimoQkvPrepKey = struct { hq: c_int, hk: c_int, rd: c_int, rows: c_int, bits: u8 };
 
-/// Two layer geometries (global, sliding) at every verify width.
-pub var mimo_qkv_prep_cfgs: [2 * MIMO_VERIFY_ROWS_MAX]?struct { key: MimoQkvPrepKey, cfg: mlx.mlx_fast_metal_kernel_config } = @splat(null);
+/// Two layer geometries (global, sliding) at every verify width, for each of the two cache widths.
+pub var mimo_qkv_prep_cfgs: [4 * MIMO_VERIFY_ROWS_MAX]?struct { key: MimoQkvPrepKey, cfg: mlx.mlx_fast_metal_kernel_config } = @splat(null);
 
 /// Test and fwd-meter seam: false keeps the composed rope + quantize.
 pub var mimo_qkv_prep_override: ?bool = null;
 
 pub const MimoQkvPrep = struct {
     q: mlx.mlx_array, // [1, HQ, rows, 192], roped
-    k: kv_quant.QuantizedKV, // roped K, affine-8 g64, [1, HK, rows, *]
+    k: kv_quant.QuantizedKV, // roped K, affine-8 or -6 g64, [1, HK, rows, *]
     v: kv_quant.QuantizedKV,
 
     pub fn deinit(self: *MimoQkvPrep) void {
@@ -1291,10 +1307,10 @@ pub fn mimoQkvPrepConfig(key: MimoQkvPrepKey, dt: mlx.mlx_dtype) !mlx.mlx_fast_m
             const rows = key.rows;
             const shapes = [_][4]c_int{
                 .{ 1, hq, rows, 192 },
-                .{ 1, hk, rows, 48 },
+                .{ 1, hk, rows, @divTrunc(192 * @as(c_int, key.bits), 32) },
                 .{ 1, hk, rows, 3 },
                 .{ 1, hk, rows, 3 },
-                .{ 1, hk, rows, 32 },
+                .{ 1, hk, rows, @divTrunc(128 * @as(c_int, key.bits), 32) },
                 .{ 1, hk, rows, 2 },
                 .{ 1, hk, rows, 2 },
             };
@@ -1308,6 +1324,7 @@ pub fn mimoQkvPrepConfig(key: MimoQkvPrepKey, dt: mlx.mlx_dtype) !mlx.mlx_fast_m
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HK", hk));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RD", key.rd));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NR", rows));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", key.bits));
             slot.* = .{ .key = key, .cfg = config };
             return config;
         }
@@ -1315,7 +1332,7 @@ pub fn mimoQkvPrepConfig(key: MimoQkvPrepKey, dt: mlx.mlx_dtype) !mlx.mlx_fast_m
     return error.MimoQkvPrepConfigsFull;
 }
 
-/// Up to `MIMO_VERIFY_ROWS_MAX` rows of a MiMo layer's Q/K/V on a kv8 (g64) cache: `q_flat`
+/// Up to `MIMO_VERIFY_ROWS_MAX` rows of a MiMo layer's Q/K/V on a kv8 or kv6 (g64) cache: `q_flat`
 /// [1,R,HQ*192], `k_flat` [1,R,HK*192], `v_flat` [1,R,HK*128] (already value-scaled), `angles`
 /// the [R, rd] `ropeAngleRows` from the first row's position. Null = geometry the kernel does
 /// not cover.
@@ -1329,7 +1346,9 @@ pub fn mimoDecodeQkvPrep(
     hk: c_int,
     rd: c_int,
     rows: c_int,
+    bits: u8,
 ) !?MimoQkvPrep {
+    if (bits != 8 and bits != 6) return null;
     const dt = mlx.mlx_array_dtype(q_flat);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_flat) != .bfloat16 or mlx.mlx_array_dtype(v_flat) != .bfloat16) return null;
     if (rd != 64 or rows < 1 or rows > MIMO_VERIFY_ROWS_MAX) return null;
@@ -1337,7 +1356,7 @@ pub fn mimoDecodeQkvPrep(
         mlx.mlx_array_size(k_flat) != @as(usize, @intCast(rows * hk * 192)) or
         mlx.mlx_array_size(v_flat) != @as(usize, @intCast(rows * hk * 128))) return null;
 
-    const config = mimoQkvPrepConfig(.{ .hq = hq, .hk = hk, .rd = rd, .rows = rows }, dt) catch |err| {
+    const config = mimoQkvPrepConfig(.{ .hq = hq, .hk = hk, .rd = rd, .rows = rows, .bits = bits }, dt) catch |err| {
         if (err == error.MimoQkvPrepConfigsFull) return null;
         return err;
     };
@@ -1368,7 +1387,7 @@ pub fn mimoDecodeQkvPrep(
     }
     if (!mimo_qkv_prep_engaged) {
         mimo_qkv_prep_engaged = true;
-        log.info("[attn] MiMo decode QKV prep engaged: hq={d} hk={d} rd={d} rows={d} (partial rope + kv8 quantize, one dispatch)\n", .{ hq, hk, rd, rows });
+        log.info("[attn] MiMo decode QKV prep engaged: hq={d} hk={d} rd={d} rows={d} (partial rope + kv{d} quantize, one dispatch)\n", .{ hq, hk, rd, rows, bits });
     }
     return .{
         .q = outs[0],

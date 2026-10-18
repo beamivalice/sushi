@@ -1,5 +1,5 @@
 //! Request-local IndexPool and NoPE latent attention. IndexPool state is lossless; the
-//! latent is BF16, or kv8 when the request asks for it (`State.latent_bits`).
+//! latent is BF16, kv8 or kv6 as the request asks (`State.latent_bits`).
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const latent_store = @import("glm5_latent.zig");
@@ -137,7 +137,7 @@ fn compress(scope: *Scope, keys: Arr, gates: Arr, ape: Arr, ready: c_int) !Arr {
 }
 
 pub const State = struct {
-    /// BF16 rows, or kv8 u32 codes with `latent_scales` and `latent_biases` beside them.
+    /// BF16 rows, or kv8/kv6 u32 codes with `latent_scales` and `latent_biases` beside them.
     latent: Arr = nil,
     latent_scales: Arr = nil,
     latent_biases: Arr = nil,
@@ -148,7 +148,7 @@ pub const State = struct {
     /// reserved buffer, so writing it would copy it whole for every branch.
     pool_tail: Arr = nil,
     processed: usize = 0,
-    /// 0 stores BF16 latent rows, 8 stores kv8; kept across reset.
+    /// 0 stores BF16 latent rows, 8 stores kv8, 6 stores kv6; kept across reset.
     latent_bits: u8 = 0,
 
     pub fn init() State {
@@ -209,7 +209,7 @@ pub const State = struct {
             !std.mem.eql(c_int, ks, mlx.getShape(gates)) or !std.mem.eql(c_int, &.{ 4, ks[1] }, mlx.getShape(ape)) or
             !supported(mlx.mlx_array_dtype(latent)) or !supported(mlx.mlx_array_dtype(keys)) or
             mlx.mlx_array_dtype(gates) != mlx.mlx_array_dtype(keys) or mlx.mlx_array_dtype(ape) != mlx.mlx_array_dtype(keys)) return error.InvalidGlmAttentionShape;
-        if (self.latent_bits != 0 and (self.latent_bits != latent_store.kv8_bits or mlx.mlx_array_dtype(latent) != .bfloat16 or
+        if (self.latent_bits != 0 and (!latent_store.storable(self.latent_bits) or mlx.mlx_array_dtype(latent) != .bfloat16 or
             @mod(ls[1], @as(c_int, latent_store.group_size)) != 0)) return error.InvalidGlmAttentionShape;
         if (self.processed != 0 and (self.latentView().width() != ls[1] or self.latentView().dtype() != mlx.mlx_array_dtype(latent))) return error.InvalidGlmAttentionShape;
         if (self.tail_keys.ctx != null and (mlx.getShape(self.tail_keys)[1] != ks[1] or mlx.mlx_array_dtype(self.tail_keys) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
@@ -223,7 +223,7 @@ pub const State = struct {
         var l_biases = self.latent_biases;
         if (store_latent and self.latent_bits == 0) l = try scope.appendRows(self.latent, self.processed, latent);
         if (store_latent and self.latent_bits != 0) {
-            var q = try latent_store.quantize(latent, s);
+            var q = try latent_store.quantize(latent, self.latent_bits, s);
             defer q.deinit();
             l = try scope.appendRows(self.latent, self.processed, q.q);
             l_scales = try scope.appendRows(self.latent_scales, self.processed, q.scales);
@@ -256,7 +256,7 @@ pub const State = struct {
 var score_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var score_tail_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var attention_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+var attention_kernels: [latent_store.variants]?mlx.mlx_fast_metal_kernel = @splat(null);
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn kernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, inputs: []const [*:0]const u8, outputs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -661,10 +661,12 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
         stats = try scope.own(try scope.result(result.stats));
     } else {
         const cache = state.latentView();
+        const bits = cache.bits();
+        const slot = &attention_kernels[latent_store.variant(bits)];
         const k = if (cache.quantized())
-            try kernelWithHeader(&attention_kernels[1], "sushi_glm_latent8_partial", &.{ "q", "cache", "cache_scales", "cache_biases", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION, latent_store.header(true))
+            try kernelWithHeader(slot, latent_store.kernelName("sushi_glm_latent_partial", bits), &.{ "q", "cache", "cache_scales", "cache_biases", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION, latent_store.header(bits))
         else
-            try kernelWithHeader(&attention_kernels[0], "sushi_glm_latent_partial", &.{ "q", "cache", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION, latent_store.header(false));
+            try kernelWithHeader(slot, latent_store.kernelName("sushi_glm_latent_partial", bits), &.{ "q", "cache", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION, latent_store.header(bits));
         const ov = if (cache.quantized())
             try apply(k, &.{ q, cache.data, cache.scales, cache.biases, indices, off, length, scaling }, cfg, scope.s)
         else
@@ -1320,7 +1322,7 @@ test "GLM packed prefill keeps 32-row tiles at long history and equals 16-row ti
     defer scope.deinit();
     // Past 65536 rows the 2 MiB score plane used to cap a tile below 32 rows.
     const n = 70000;
-    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 40, 1), try normal(&scope, &.{ n, 128 }, 41, 1), &.{ 32768, 32768, n - 65536 });
+    var twins = try kvTwins(latent_store.kv8_bits, &scope, try normal(&scope, &.{ n, 512 }, 40, 1), try normal(&scope, &.{ n, 128 }, 41, 1), &.{ 32768, 32768, n - 65536 });
     defer for (&twins) |*st| st.deinit();
     const rows = 64;
     const offset: usize = n - rows;
@@ -1342,7 +1344,7 @@ test "GLM a 32-row selection equals two 16-row selections at tree and NAX index 
     var scope = Scope{ .s = s };
     defer scope.deinit();
     const n = 32768;
-    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 60, 1), try normal(&scope, &.{ n, 128 }, 61, 1), &.{ 16384, 16384 });
+    var twins = try kvTwins(latent_store.kv8_bits, &scope, try normal(&scope, &.{ n, 512 }, 60, 1), try normal(&scope, &.{ n, 128 }, 61, 1), &.{ 16384, 16384 });
     defer for (&twins) |*st| st.deinit();
     const iq = try normal(&scope, &.{ n, 32, 128 }, 62, 1);
     const w = try normal(&scope, &.{ n, 32 }, 63, 0.1);
@@ -1399,7 +1401,7 @@ test "GLM in-flight packed tiles equal serial tiles bit for bit at every tile co
     var scope = Scope{ .s = s };
     defer scope.deinit();
     const n = 16384;
-    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 50, 1), try normal(&scope, &.{ n, 128 }, 51, 1), &.{ 8192, 8192 });
+    var twins = try kvTwins(latent_store.kv8_bits, &scope, try normal(&scope, &.{ n, 512 }, 50, 1), try normal(&scope, &.{ n, 128 }, 51, 1), &.{ 8192, 8192 });
     defer for (&twins) |*st| st.deinit();
     for ([_]c_int{ 16, 32, 48, 80, 96, 112 }) |rows| for ([_]usize{ packed_nax.max_rows, packed_nax.wide_rows }) |width| {
         var round = Scope{ .s = s };
@@ -1437,17 +1439,17 @@ fn normal(scope: *Scope, shape: []const c_int, seed: u64, deviation: f32) !Arr {
     return out.*;
 }
 
-/// A kv8 state and its BF16 twin fed the kv8 round trip of the same rows, in the same chunks.
-fn kv8Twins(scope: *Scope, latent: Arr, keys: Arr, chunks: []const c_int) ![2]State {
+/// A quantized state and its BF16 twin fed the round trip of the same rows, in the same chunks.
+fn kvTwins(bits: u8, scope: *Scope, latent: Arr, keys: Arr, chunks: []const c_int) ![2]State {
     const ape = try scope.zeros(&.{ 4, mlx.getShape(keys)[1] }, .bfloat16);
-    var states = [2]State{ .{ .latent_bits = latent_store.kv8_bits }, .{} };
+    var states = [2]State{ .{ .latent_bits = bits }, .{} };
     errdefer for (&states) |*st| st.deinit();
     var start: c_int = 0;
     for (chunks) |len| {
         const rows = try scope.cut(latent, start, start + len);
         const k = try scope.cut(keys, start, start + len);
         _ = try states[0].append(rows, k, k, ape, scope.s);
-        _ = try states[1].append(try scope.own(try latent_store.readable(rows, latent_store.kv8_bits, scope.s)), k, k, ape, scope.s);
+        _ = try states[1].append(try scope.own(try latent_store.readable(rows, bits, scope.s)), k, k, ape, scope.s);
         start += len;
     }
     return states;
@@ -1468,32 +1470,40 @@ pub fn expectSameBits(a: Arr, b: Arr) !void {
     try std.testing.expectEqualSlices(u8, left[0..n], right[0..n]);
 }
 
-test "GLM kv8 latent append quantizes each row once across prefill chunks and decode rows" {
+test "GLM kv8 and kv6 latent append quantizes each row once across prefill chunks and decode rows" {
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try appendOnceCase(bits);
+}
+
+fn appendOnceCase(bits: u8) !void {
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
     defer scope.deinit();
     const n = 600;
     const latent = try scope.own(try latent_store.randomRows(n, 512, 3, s));
-    var twins = try kv8Twins(&scope, latent, try normal(&scope, &.{ n, 8 }, 4, 1), &.{ 1, 255, 1, 300, 3, 40 });
+    var twins = try kvTwins(bits, &scope, latent, try normal(&scope, &.{ n, 8 }, 4, 1), &.{ 1, 255, 1, 300, 3, 40 });
     defer for (&twins) |*st| st.deinit();
     const kv8 = twins[0].latentView();
     try std.testing.expect(kv8.quantized() and kv8.rowMajor());
     try std.testing.expectEqual(mlx.getShape(twins[1].latent)[0], kv8.rows());
     try expectSameBits(try scope.own(try kv8.dense(0, n, s)), try scope.cut(twins[1].latent, 0, n));
-    var whole = try latent_store.quantize(latent, s);
+    var whole = try latent_store.quantize(latent, bits, s);
     defer whole.deinit();
     for ([_]Arr{ whole.q, whole.scales, whole.biases }, [_]Arr{ kv8.data, kv8.scales, kv8.biases }) |want, got| try expectSameBits(want, try scope.cut(got, 0, n));
     twins[0].reset();
-    try std.testing.expectEqual(latent_store.kv8_bits, twins[0].latent_bits);
+    try std.testing.expectEqual(bits, twins[0].latent_bits);
     for (twins[0].arrays()) |a| try std.testing.expect(a.ctx == null);
 }
 
-test "GLM kv8 scalar latent attention matches BF16 attention over the round-tripped rows" {
+test "GLM kv8 and kv6 scalar latent attention matches BF16 attention over the round-tripped rows" {
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try scalarAttentionCase(bits);
+}
+
+fn scalarAttentionCase(bits: u8) !void {
     const s = mlx.gpuStream();
     for ([_]c_int{ 40, 2055 }) |n| {
         var scope = Scope{ .s = s };
         defer scope.deinit();
-        var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 64 }, 5, 1), try normal(&scope, &.{ n, 8 }, 6, 1), &.{ n - 8, 8 });
+        var twins = try kvTwins(bits, &scope, try normal(&scope, &.{ n, 64 }, 5, 1), try normal(&scope, &.{ n, 8 }, 6, 1), &.{ n - 8, 8 });
         defer for (&twins) |*st| st.deinit();
         for ([_]c_int{ 1, 8, 12 }) |rows| {
             const offset: usize = @intCast(n - rows);
@@ -1507,13 +1517,17 @@ test "GLM kv8 scalar latent attention matches BF16 attention over the round-trip
     }
 }
 
-test "GLM kv8 native decode and packed prefill attention match BF16 over the round-tripped rows" {
+test "GLM kv8 and kv6 native decode and packed prefill attention match BF16 over the round-tripped rows" {
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try nativeDecodeCase(bits);
+}
+
+fn nativeDecodeCase(bits: u8) !void {
     const native = @import("glm5_attention_decode_batch.zig");
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
     defer scope.deinit();
     const n = 2100;
-    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 10, 1), try normal(&scope, &.{ n, 8 }, 11, 1), &.{ 2048, n - 2048 });
+    var twins = try kvTwins(bits, &scope, try normal(&scope, &.{ n, 512 }, 10, 1), try normal(&scope, &.{ n, 8 }, 11, 1), &.{ 2048, n - 2048 });
     defer for (&twins) |*st| st.deinit();
     native.resetCalls();
     packed_nax.resetDispatchCount();
@@ -1530,14 +1544,18 @@ test "GLM kv8 native decode and packed prefill attention match BF16 over the rou
     try std.testing.expectEqual(@as(usize, if (@import("glm5_model.zig").naxArms()) 2 * 2 else 2 * (2 + 4)), packed_nax.dispatchCount());
 }
 
-test "GLM serial decode row equals the B1 tail-tape path bit for bit on kv8 and BF16 latents" {
+test "GLM serial decode row equals the B1 tail-tape path bit for bit on kv8, kv6 and BF16 latents" {
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try serialRowCase(bits);
+}
+
+fn serialRowCase(bits: u8) !void {
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     const native = @import("glm5_attention_decode_batch.zig");
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
     defer scope.deinit();
     const n = 9000;
-    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 70, 1), try normal(&scope, &.{ n, 128 }, 71, 1), &.{ 4000, 1500, 3500 });
+    var twins = try kvTwins(bits, &scope, try normal(&scope, &.{ n, 512 }, 70, 1), try normal(&scope, &.{ n, 128 }, 71, 1), &.{ 4000, 1500, 3500 });
     defer for (&twins) |*st| st.deinit();
     const calls = native.rowCalls();
     // 1500 rows sit in the dense window, 2052 is its first sparse row, 9000 selects among 2250 pools.

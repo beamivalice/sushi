@@ -428,7 +428,7 @@ pub const Request = struct {
     capture: ?*Capture = null,
     boundaries: ?BoundarySink = null,
     stream_owner: ?*Stream = null,
-    /// MLA latent storage of every layer: 0 = BF16, 8 = kv8 (`glm5_latent.zig`).
+    /// MLA latent storage of every layer: 0 = BF16, 8 = kv8, 6 = kv6 (`glm5_latent.zig`).
     latent_bits: u8 = 0,
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
@@ -468,7 +468,7 @@ pub const Request = struct {
 
     /// Picks the latent storage before the first token; the lossless teacher stays BF16.
     pub fn setLatentBits(self: *Request, bits: u8) !void {
-        if (bits != 0 and bits != @import("glm5_latent.zig").kv8_bits) return error.GlmKvQuantUnsupported;
+        if (!@import("glm5_latent.zig").storable(bits)) return error.GlmKvQuantUnsupported;
         if (bits != 0 and base.teacher) return error.GlmTeacherLatentMustBeBf16;
         if (bits == self.latent_bits) return;
         if (self.offset != 0) return error.GlmLatentBitsAfterStart;
@@ -1596,7 +1596,7 @@ test "GLM stream GPU native forward binds BF16 experts and releases request admi
     try std.testing.expectError(error.GlmStreamRequestBudgetExceeded, store.admit(7, 3));
 }
 
-test "GLM kv8 dense prefill expands the stored latent exactly as BF16 over the round-tripped rows" {
+test "GLM kv8 and kv6 dense prefill expands the stored latent exactly as BF16 over the round-tripped rows" {
     const s = mlx.gpuStream();
     const latent_store = @import("glm5_latent.zig");
     const attention = @import("glm5_attention.zig");
@@ -1607,17 +1607,19 @@ test "GLM kv8 dense prefill expands the stored latent exactly as BF16 over the r
     defer layer.deinit();
     var ops = Ops{ .s = s };
     defer ops.deinit();
-    const latent = try ops.own(try latent_store.randomRows(40, 128, 71, s));
-    const keys = try ops.zeros(&.{ 40, 4 }, .bfloat16);
-    const ape = try ops.zeros(&.{ 4, 4 }, .bfloat16);
-    var kv8 = attention.State{ .latent_bits = latent_store.kv8_bits };
-    defer kv8.deinit();
-    var twin = attention.State{};
-    defer twin.deinit();
-    _ = try kv8.append(latent, keys, keys, ape, s);
-    _ = try twin.append(try ops.own(try latent_store.readable(latent, latent_store.kv8_bits, s)), keys, keys, ape, s);
-    const q = try ops.reshape(try ops.own(try latent_store.randomRows(24, 128, 72, s)), &.{ 12, 2, 1, 128 });
-    try expectArrayBits(try layer.densePrefill(&ops, q, &cfg, &twin), try layer.densePrefill(&ops, q, &cfg, &kv8));
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| {
+        const latent = try ops.own(try latent_store.randomRows(40, 128, 71, s));
+        const keys = try ops.zeros(&.{ 40, 4 }, .bfloat16);
+        const ape = try ops.zeros(&.{ 4, 4 }, .bfloat16);
+        var kv8 = attention.State{ .latent_bits = bits };
+        defer kv8.deinit();
+        var twin = attention.State{};
+        defer twin.deinit();
+        _ = try kv8.append(latent, keys, keys, ape, s);
+        _ = try twin.append(try ops.own(try latent_store.readable(latent, bits, s)), keys, keys, ape, s);
+        const q = try ops.reshape(try ops.own(try latent_store.randomRows(24, 128, 72, s)), &.{ 12, 2, 1, 128 });
+        try expectArrayBits(try layer.densePrefill(&ops, q, &cfg, &twin), try layer.densePrefill(&ops, q, &cfg, &kv8));
+    }
 }
 
 test "GLM request picks its latent storage before the first token and keeps the teacher BF16" {
@@ -1625,6 +1627,9 @@ test "GLM request picks its latent storage before the first token and keeps the 
     defer req.deinit();
     try req.setLatentBits(8);
     for (req.layers) |layer| try std.testing.expectEqual(@as(u8, 8), layer.attention.latent_bits);
+    try req.setLatentBits(6);
+    for (req.layers) |layer| try std.testing.expectEqual(@as(u8, 6), layer.attention.latent_bits);
+    try req.setLatentBits(8);
     try std.testing.expectError(error.GlmKvQuantUnsupported, req.setLatentBits(4));
     req.offset = 3;
     try std.testing.expectError(error.GlmLatentBitsAfterStart, req.setLatentBits(0));

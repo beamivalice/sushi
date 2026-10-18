@@ -79,7 +79,7 @@ const gather_source: [:0]const u8 =
     \\const device bfloat* values=tape+size_t(paths[row*4u+uint(id)-uint(prefix_length)])*512u;
     \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=values[d+j];
 ;
-var gather_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+var gather_kernels: [latent_store.variants]?mlx.mlx_fast_metal_kernel = @splat(null);
 var configs: [max_tail]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, branches: []const Branch, selected: Arr, scale: f32) !?Arr {
     if (!mlx.streamIsGpu(ops.s) or !std.math.isFinite(scale) or scale <= 0) return null;
@@ -124,7 +124,8 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
         break :blk c;
     };
     const quantized = prefix.quantized();
-    const kernel = &gather_kernels[@intFromBool(quantized)];
+    const bits = prefix.bits();
+    const kernel = &gather_kernels[latent_store.variant(bits)];
     if (kernel.* == null) {
         const names: []const [*:0]const u8 = if (quantized)
             &.{ "prefix", "prefix_scales", "prefix_biases", "tape", "selected", "offsets", "lengths", "paths", "prefix_length", "batch_count" }
@@ -135,7 +136,7 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
         const outputs = mlx.mlx_vector_string_new_data(&.{ "kv", "mask" }, 2);
         defer _ = mlx.mlx_vector_string_free(outputs);
         // Admitted strides avoid wrapper copies of the immutable full prefix.
-        const k = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_decode_batch_gather8" else "sushi_glm_decode_batch_gather", inputs, outputs, gather_source, latent_store.header(quantized), false, false);
+        const k = mlx.mlx_fast_metal_kernel_new(latent_store.kernelName("sushi_glm_decode_batch_gather", bits), inputs, outputs, gather_source, latent_store.header(bits), false, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         kernel.* = k;
     }
@@ -200,7 +201,7 @@ const row_gather_source: [:0]const u8 =
     \\if(d==0u) mask[slot]=valid;
     \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=valid?float(SUSHI_LATENT(cache,uint(id),d+j,512u)):0.0f;
 ;
-var row_gather_kernels: [2][2]?mlx.mlx_fast_metal_kernel = @splat(.{ null, null });
+var row_gather_kernels: [2][latent_store.variants]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
 var row_gather_configs: [2]?mlx.mlx_fast_metal_kernel_config = .{ null, null };
 var row_calls: usize = 0;
 var block_masks: [2]Arr = .{ .{ .ctx = null }, .{ .ctx = null } };
@@ -264,7 +265,8 @@ pub fn runRow(ops: *Ops, q: Arr, cache: Latent, offset: usize, selection: RowSel
         break :blk c;
     };
     const quantized = cache.quantized();
-    const kernel = &row_gather_kernels[mode][@intFromBool(quantized)];
+    const bits = cache.bits();
+    const kernel = &row_gather_kernels[mode][latent_store.variant(bits)];
     if (kernel.* == null) {
         const names: []const [*:0]const u8 = if (quantized)
             &.{ "cache", "cache_scales", "cache_biases", "selected", "offset", "q", "qscale" }
@@ -274,7 +276,7 @@ pub fn runRow(ops: *Ops, q: Arr, cache: Latent, offset: usize, selection: RowSel
         defer _ = mlx.mlx_vector_string_free(inputs);
         const outputs = mlx.mlx_vector_string_new_data(&.{ "kv", "mask", "qs" }, 3);
         defer _ = mlx.mlx_vector_string_free(outputs);
-        const k = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_decode_row_gather8" else "sushi_glm_decode_row_gather", inputs, outputs, row_gather_source, latent_store.header(quantized), false, false);
+        const k = mlx.mlx_fast_metal_kernel_new(latent_store.kernelName("sushi_glm_decode_row_gather", bits), inputs, outputs, row_gather_source, latent_store.header(bits), false, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         kernel.* = k;
     }
@@ -328,21 +330,21 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(4));
 }
 
-test "GLM kv8 decode batches match BF16 and independent B1 branches" {
-    for ([_]usize{ 3, 4 }) |rows| for ([_]usize{ 5, 3000 }) |prefix_rows| for ([_]bool{ false, true }) |chain| {
-        try decodeBatchParity(rows, prefix_rows, chain);
+test "GLM kv8 and kv6 decode batches match BF16 and independent B1 branches" {
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| for ([_]usize{ 3, 4 }) |rows| for ([_]usize{ 5, 3000 }) |prefix_rows| for ([_]bool{ false, true }) |chain| {
+        try decodeBatchParity(bits, rows, prefix_rows, chain);
     };
 }
 
-fn decodeBatchParity(rows: usize, prefix_rows: usize, chain: bool) !void {
+fn decodeBatchParity(bits: u8, rows: usize, prefix_rows: usize, chain: bool) !void {
     const s = mlx.gpuStream();
     var ops = Ops{ .s = s };
     defer ops.deinit();
-    var q = try latent_store.quantize(try ops.own(try latent_store.randomRows(@intCast(prefix_rows), 512, 61, s)), s);
+    var q = try latent_store.quantize(try ops.own(try latent_store.randomRows(@intCast(prefix_rows), 512, 61, s)), bits, s);
     defer q.deinit();
     const kv8 = Latent{ .data = q.q, .scales = q.scales, .biases = q.biases };
     const bf16 = Latent{ .data = try ops.own(try kv8.dense(0, @intCast(prefix_rows), s)) };
-    const tape = try ops.own(try latent_store.readable(try ops.own(try latent_store.randomRows(@intCast(rows), 512, 62, s)), latent_store.kv8_bits, s));
+    const tape = try ops.own(try latent_store.readable(try ops.own(try latent_store.randomRows(@intCast(rows), 512, 62, s)), bits, s));
     var branches: [max_tail]Branch = undefined;
     for (branches[0..rows], 0..) |*branch, row| {
         const depth = if (chain) row + 1 else if (row == 0) @as(usize, 1) else 2;

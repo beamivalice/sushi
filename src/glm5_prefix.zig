@@ -100,7 +100,7 @@ pub fn restore(request: *forward.Request, rows: *const MlaRows, cp: *const trans
     try restoreKda(request, cp);
 }
 
-/// MLA rows [0, len) of every layer: latent (BF16, or kv8 codes with scales and biases) and
+/// MLA rows [0, len) of every layer: latent (BF16, or kv8/kv6 codes with scales and biases) and
 /// pooled index keys, plus empty IndexPool tails of the right width.
 pub const MlaRows = struct {
     allocator: std.mem.Allocator,
@@ -260,8 +260,8 @@ pub const MlaRows = struct {
 };
 
 /// The SSD tier keeps MLA rows as a dense pseudo-cache of two entries per layer: entry 2i holds
-/// the latent (BF16, or kv8 codes) as keys and the pooled keys, one pool per four rows, as values;
-/// entry 2i+1 holds the kv8 scales and biases. Its quant key keeps the two latent widths apart.
+/// the latent (BF16, or kv8/kv6 codes) as keys and the pooled keys, one pool per four rows, as values;
+/// entry 2i+1 holds the quantized scales and biases. Its quant key keeps the latent widths apart.
 pub fn diskQuant(bits: u8) KVQuantConfig {
     return if (bits == 0) KVQuantConfig.dense else .{ .scheme = .off, .bits = bits, .group_size = 64 };
 }
@@ -447,7 +447,7 @@ test "GLM prefix restore at a chunk-aligned checkpoint continues exactly like a 
     // The committed turn and the next one share 18 tokens; the stale rows past the checkpoint differ.
     const first = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0, 0 };
     const next = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 2, 1, 3, 1, 0, 2 };
-    for ([_]u8{ 0, 8 }) |bits| {
+    for ([_]u8{ 0, 8, 6 }) |bits| {
         var turn = try servedRequest(bits);
         defer turn.deinit();
         _ = mlx.mlx_array_free(try prefill(&net, &turn, &first, &.{8}));
@@ -481,7 +481,7 @@ test "GLM prefix rows bill exactly their rows and trim to a pool boundary" {
     var net = try forward.Model.load(testing.allocator, cfg, &weights, mlx.gpuStream());
     defer net.deinit();
     const tokens = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0 };
-    for ([_]u8{ 0, 8 }) |bits| {
+    for ([_]u8{ 0, 8, 6 }) |bits| {
         var req = try servedRequest(bits);
         defer req.deinit();
         _ = mlx.mlx_array_free(try prefill(&net, &req, &tokens, &.{ 16, 3 }));
@@ -522,7 +522,7 @@ test "GLM live rows for the SSD flush share the request's buffers and outlive it
     defer net.deinit();
     const s = mlx.gpuStream();
     const tokens = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0 };
-    for ([_]u8{ 0, 8 }) |bits| {
+    for ([_]u8{ 0, 8, 6 }) |bits| {
         var req = try servedRequest(bits);
         defer req.deinit();
         _ = mlx.mlx_array_free(try prefill(&net, &req, &tokens, &.{ 16, 3 }));

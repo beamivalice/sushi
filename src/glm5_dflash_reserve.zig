@@ -23,7 +23,7 @@ fn inFlight(old: usize, target: usize, row_bytes: usize) !usize {
     if (target == old) return 0;
     return mul(try add(target, target - old), row_bytes);
 }
-/// `latent_row_bytes` is one stored row: BF16 1024 or kv8 544 at width 512 (`glm5_latent.rowBytes`).
+/// `latent_row_bytes` is one stored row: BF16 1024, kv8 544 or kv6 416 at width 512 (`glm5_latent.rowBytes`).
 pub fn plan(processed: usize, lc: usize, pc: usize, latent_row_bytes: usize, iw: usize, ib: usize, total: usize) !Plan {
     if (latent_row_bytes == 0 or iw == 0 or lc < processed or pc < processed / 4 or total < processed or
         (ib != 2 and ib != 4)) return error.InvalidGlmReserveShape;
@@ -241,18 +241,24 @@ test "GLM reserve preserves cache bits and subsequent append and attention on BF
     };
 }
 
-test "GLM reserve grows kv8 codes scales and biases together and bills 544-byte rows" {
+test "GLM reserve grows kv8 and kv6 codes scales and biases together and bills 544 and 416-byte rows" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    for ([_]u8{ 8, 6 }) |bits| try reserveQuantizedCase(bits);
+}
+
+fn reserveQuantizedCase(bits: u8) !void {
     const latent_store = @import("glm5_latent.zig");
+    const row = latent_store.rowBytes(512, bits);
     const stream = mlx.gpuStream();
     var ops = Ops{ .s = stream };
     defer ops.deinit();
     const n = 1023;
-    const Layer = struct { attention: attention.State = .{ .latent_bits = 8 } };
+    const Layer = struct { attention: attention.State = .{} };
     var layers: [1]Layer = .{.{}};
+    layers[0].attention.latent_bits = bits;
     defer layers[0].attention.deinit();
     var request = struct { layers: []Layer, offset: usize, failed: bool = false }{ .layers = &layers, .offset = n };
-    var baseline = attention.State{ .latent_bits = 8 };
+    var baseline = attention.State{ .latent_bits = bits };
     defer baseline.deinit();
     const source = try ops.own(try latent_store.randomRows(n + 6, 512, 81, stream));
     const keys = try ops.zeros(&.{ n + 6, 4 }, .bfloat16);
@@ -264,8 +270,8 @@ test "GLM reserve grows kv8 codes scales and biases together and bills 544-byte 
     const total = n + 33;
     const p = try statePlan(&layers[0].attention, total);
     try std.testing.expectEqual(@as(usize, 1280), p.latent_capacity);
-    try std.testing.expectEqual(256 * 544 + 256 * 4 * 2, p.growth_bytes);
-    try std.testing.expectEqual((1280 + 256) * 544, p.peak_bytes);
+    try std.testing.expectEqual(256 * row + 256 * 4 * 2, p.growth_bytes);
+    try std.testing.expectEqual((1280 + 256) * row, p.peak_bytes);
     try std.testing.expectError(error.GlmReserveMemoryLimit, reserve(&request, total, p.peak_bytes - 1, stream));
     try std.testing.expectEqual(p.peak_bytes, try reserve(&request, total, p.peak_bytes, stream));
     const view = layers[0].attention.latentView();

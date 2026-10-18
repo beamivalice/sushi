@@ -54,7 +54,7 @@ const gather_source: [:0]const u8 =
     \\if(!valid) {for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=OutT(0);return;}
     \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=SUSHI_LATENT(cache,uint(id),d+j,512u);
 ;
-var gather_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+var gather_kernels: [latent_store.variants]?mlx.mlx_fast_metal_kernel = @splat(null);
 var gather_configs: [wide_rows]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 fn gather(ops: *Ops, cache: Latent, ids: Arr, offset: usize, history: usize) !struct { kv: Arr, mask: Arr } {
     const rows = mlx.getShape(ids)[0];
@@ -72,7 +72,8 @@ fn gather(ops: *Ops, cache: Latent, ids: Arr, offset: usize, history: usize) !st
         break :blk c;
     };
     const quantized = cache.quantized();
-    const kernel = &gather_kernels[@intFromBool(quantized)];
+    const bits = cache.bits();
+    const kernel = &gather_kernels[latent_store.variant(bits)];
     if (kernel.* == null) {
         const names: []const [*:0]const u8 = if (quantized) &.{ "cache", "cache_scales", "cache_biases", "selected", "offset", "length" } else &.{ "cache", "selected", "offset", "length" };
         const ins = mlx.mlx_vector_string_new_data(names.ptr, names.len);
@@ -81,7 +82,7 @@ fn gather(ops: *Ops, cache: Latent, ids: Arr, offset: usize, history: usize) !st
         defer _ = mlx.mlx_vector_string_free(outs);
         // Strides are explicitly admitted below; disable the wrapper's flag-
         // based copies so false row-contiguous flags cannot copy full history.
-        const k = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_sparse_head_gather8" else "sushi_glm_sparse_head_gather", ins, outs, gather_source, latent_store.header(quantized), false, false);
+        const k = mlx.mlx_fast_metal_kernel_new(latent_store.kernelName("sushi_glm_sparse_head_gather", bits), ins, outs, gather_source, latent_store.header(bits), false, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         kernel.* = k;
     }

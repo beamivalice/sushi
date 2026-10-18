@@ -111,6 +111,8 @@ sleep 1
 fire "request #3 (kv_quant: \"off\" — explicit dense)" '"off"' || FAIL=1
 sleep 1
 fire "request #4 (kv_quant: 8 — per-request 8-bit)" "8" || FAIL=1
+sleep 1
+fire "request #5 (kv_quant: 6 — per-request 6-bit)" "6" || FAIL=1
 
 # Hot-cache scheme isolation: server log MUST contain a kv-quant override log
 # line for each non-default request — that's how we know the parse hit the
@@ -123,6 +125,12 @@ if ! grep -q "kv-quant override: affine 4-bit" "$LOGFILE"; then
     FAIL=1
 else
     echo -e "${GREEN}PASS${NC} per-request 4-bit override observed in server log"
+fi
+if ! grep -q "kv-quant override: affine 6-bit" "$LOGFILE"; then
+    echo -e "${RED}FAIL${NC} expected '  kv-quant override: affine 6-bit' line in server log"
+    FAIL=1
+else
+    echo -e "${GREEN}PASS${NC} per-request 6-bit override observed in server log"
 fi
 if ! grep -q "kv-quant override: affine 8-bit" "$LOGFILE"; then
     echo -e "${RED}FAIL${NC} expected '  kv-quant override: affine 8-bit' line in server log"

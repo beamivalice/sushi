@@ -14868,6 +14868,18 @@ test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where 
     try testing.expect(Generator.mtpEvPlanFor(&prose, 3, Generator.MTP_EV_DEFAULT_COSTS, 3).m_lo > 1);
 }
 
+test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and other layouts stay generic" {
+    var xfm: Transformer = undefined;
+    const head = MtpHeadRef{ .mimo = undefined };
+    const kv = transformer_mod.KVQuantConfig;
+    xfm.config = .{ .expert_layout = .exl3_k4 };
+    for ([_]kv{ kv.dense, kv.affine(4), kv.affine(6), kv.affine(8) }) |width| {
+        try testing.expectEqual(mtp_mod.MtpCostProfile.mimo_exl3, head.costProfile(&xfm, width));
+    }
+    xfm.config = .{ .expert_layout = .quantized_split };
+    try testing.expectEqual(mtp_mod.MtpCostProfile.generic, head.costProfile(&xfm, kv.affine(6)));
+}
+
 test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
     const p = Generator.MTP_EV_PRIOR;
     const a = [_]f32{ 0.97, 0.89, p, p, p, p, p, p };
@@ -17346,7 +17358,7 @@ test "a warm prefill grows its restored layers to the reservation before the fir
     try mlx.check(mlx.mlx_zeros(&one, &[_]c_int{ 1, 2, 1, 64 }, 4, .bfloat16, s));
     for ([_]*const model_mod.ModelConfig{ &qwen4, &mimo }) |cfg| {
         const ring: u32 = if (cfg.swaRingTokens() > 0) cfg.sliding_window else 0;
-        for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8) }) |kvq| {
+        for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8), .affine(6) }) |kvq| {
             for ([_]bool{ true, false }) |donate| {
                 // The previous turn's cache: it reserved C and holds the matched rows. Layer 1 rings on MiMo.
                 var donor = try KVC.initWithConfig(t.allocator, 2, kvq);

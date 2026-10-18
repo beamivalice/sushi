@@ -40,6 +40,11 @@ The rows above were scored against the first teacher, so they do not rank agains
 K2.5 experts cut KLD 22.5% from K2.25 on the same A6 trunk (byte-identical trunk tensors). The three trunks sit within 2% of each other under two numerical profiles; this four-prompt screen does not rank them
 and is not the 16x512 release reading. Code scores about 3x lower than prose on every pack.
 
+GLM kv6 latent (Sushi-2.4bpw, the same 4x512 native teacher, binary `84d3ed8f`, `sushi kld compare`, `taskpolicy -a`, GPU lock),
+KLD / top-1 / NLL / code / prose: BF16 latent 0.073302 / 89.94% / 0.4098 / 0.0350 / 0.1116; kv8 0.074699 / 89.89% / 0.4108 / 0.0356 /
+0.1138; kv6 0.073922 / 89.79% / 0.4103 / 0.0352 / 0.1126. kv8 reads +1.9% and kv6 +0.8% against the BF16 latent, both inside what a one-ulp flip pattern
+leaves; peak active 95.91 GB at all three.
+
 GLM kv8 latent (`--kv-quant 8`, Sushi-2.5bpw, binary `694e36a3`, `taskpolicy -a`, GPU lock):
 - Same 4x512 teacher: KLD 0.071762 / top-1 89.70% against the BF16 latent's 0.072071 / 89.94% (-0.43%, inside the
   noise floor); peak active unchanged at 103.59 GB.

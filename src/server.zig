@@ -4104,6 +4104,7 @@ test "diskBytesPerToken: the serialized geometry, whatever the QSA execution swi
     var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
     glm.glm_dflash_loaded = false;
     try t.expectEqual(@as(u64, 6_688), diskBytesPerToken(&glm, 8));
+    try t.expectEqual(@as(u64, 5_280), diskBytesPerToken(&glm, 6));
     try t.expectEqual(@as(u64, 11_968), diskBytesPerToken(&glm, 16));
     glm.glm_dflash_loaded = true;
     glm.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
@@ -6329,7 +6330,7 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
     const pending = 2; // glm5_forward.Request.prefill_sync_layers
     const mla_pending = glmMlaLayersPending(config, pending);
     const n = std.math.cast(usize, rows) orelse return std.math.maxInt(u64);
-    const kv8: u64 = if (kv_bits < 16) @import("glm5_latent.zig").kv8ScratchBytes(config.mla_kv_lora_rank, n, mla_pending) else 0;
+    const quant_scratch: u64 = if (kv_bits < 16) @import("glm5_latent.zig").scratchBytes(config.mla_kv_lora_rank, n, mla_pending, @intCast(kv_bits)) else 0;
     const native = (@import("glm5_a6_dense_once.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_mla_prefill_batch.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_attention_nax_packed.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
@@ -6341,7 +6342,7 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
     const attention = @import("glm5_attention.zig");
     const history = std.math.cast(usize, seq) orelse return std.math.maxInt(u64);
     const selection = @max(attention.score_scratch_bytes, attention.selectionScratchBytes(history) catch return std.math.maxInt(u64));
-    return rows *| per_row +| grow +| kv8 +| slotRingBytes(config, 16) +| native +| dflash +| glmFp8DequantScratchBytes(config, rows, pending) +|
+    return rows *| per_row +| grow +| quant_scratch +| slotRingBytes(config, 16) +| native +| dflash +| glmFp8DequantScratchBytes(config, rows, pending) +|
         selection +| attention.attention_scratch_bytes +| PREFILL_RUNTIME_FLOOR_BYTES;
 }
 
@@ -7142,7 +7143,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
     if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).glmLatentBits() == null) {
-        const msg = "GLM native MLA cache supports kv_quant 8 or off.";
+        const msg = "GLM native MLA cache supports kv_quant 8, 6 or off.";
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -8155,7 +8156,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const disk = lm.disk_stats.snapshot();
     return .{
         .engine = "mlx",
-        .kv_quant = if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
+        .kv_quant = kv.wireName(),
         .kv_cache = kv_cache,
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
@@ -13783,8 +13784,8 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
 }
 
 /// Wave 1.A — parse the optional per-request `kv_quant` body field. Accepts
-/// the string forms `"off"`, `"0"`, `"4"`, `"8"` and the integer forms `0`,
-/// `4`, `8`. Returns null when the field is absent or unrecognized (the
+/// the string forms `"off"`, `"0"`, `"4"`, `"6"`, `"8"` and the integer forms `0`,
+/// `4`, `6`, `8`. Returns null when the field is absent or unrecognized (the
 /// caller falls back to the process-level `--kv-quant` default carried on
 /// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
 fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
@@ -20294,7 +20295,13 @@ test "kvBytesPerTokenAtBits: the KV bill follows the CONFIGURED quant width" {
     // SAME expression prefillMemoryNeeded bills — the sizer and the admission
     // guard must not disagree about what one token costs.
     try t.expectEqual(dense * 9 / 32, kvBytesPerTokenAtBits(dense, 4)); // 18432
+    try t.expectEqual(dense * 13 / 32, kvBytesPerTokenAtBits(dense, 6));
     try t.expectEqual(dense * 17 / 32, kvBytesPerTokenAtBits(dense, 8));
+    // The bill is what the cache stores: `bits` per element plus a bf16 scale and bias per group of 64.
+    for ([_]u64{ 4, 6, 8 }) |bits| {
+        const elems = dense / 2;
+        try t.expectEqual(elems * bits / 8 + elems / 64 * 4, kvBytesPerTokenAtBits(dense, bits));
+    }
     // 4-bit is what makes the 16 GB tier reachable: under a third of dense.
     try t.expect(kvBytesPerTokenAtBits(dense, 4) * 3 < dense);
 }
@@ -26465,8 +26472,8 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
     const shapes = [_][2]u64{ .{ 16, std.math.maxInt(u32) }, .{ 18, 32 }, .{ 100, 920 }, .{ 1000, 24 }, .{ 1022, 2 }, .{ 2008, 2400 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 2008, std.math.maxInt(u32) }, .{ 500000, std.math.maxInt(u32) } };
     for ([_]u32{ 1024, 8192, 65536, 1048576 }) |ctx| {
         cfg.pinned_context = ctx;
-        for ([_]u64{ 16, 8 }) |kv_bits| {
-            const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
+        for ([_]u64{ 16, 8, 6 }) |kv_bits| {
+            const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(kv_bits));
             for (shapes) |shape| {
                 const seq: usize = @intCast(shape[0]);
                 if (seq >= ctx) continue;
@@ -26481,6 +26488,16 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
     }
 }
 
+test "GLM prefill transient bill follows the latent width: kv6 sheds 128 bytes per latent row against kv8" {
+    const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const seq: u64 = 4096;
+    const chunk: u64 = 2048;
+    const kv8 = glm5TransientBytes(&cfg, seq, chunk, 8);
+    const kv6 = glm5TransientBytes(&cfg, seq, chunk, 6);
+    const pending: u64 = glmMlaLayersPending(&cfg, 2);
+    try std.testing.expectEqual(seq * 128 + pending * chunk * 128, kv8 - kv6);
+}
+
 test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context" {
     const reserve = @import("glm5_dflash_reserve.zig");
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
@@ -26488,9 +26505,9 @@ test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the adve
     var mla_layers: usize = 0;
     for (0..cfg.num_hidden_layers) |l| mla_layers += @intFromBool(!cfg.isLinearLayer(@intCast(l)));
     const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
-    for ([_]struct { bits: u64, ctx: u32 }{ .{ .bits = 8, .ctx = 1048576 }, .{ .bits = 16, .ctx = 524288 } }) |arm| {
+    for ([_]struct { bits: u64, ctx: u32 }{ .{ .bits = 8, .ctx = 1048576 }, .{ .bits = 6, .ctx = 1048576 }, .{ .bits = 16, .ctx = 524288 } }) |arm| {
         cfg.pinned_context = arm.ctx;
-        const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
+        const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(arm.bits));
         for ([_]usize{ 16, 2008, 100000 }) |seq| {
             const max_tokens: u32 = @intCast(arm.ctx - seq);
             const lc = try reserve.capacity(seq);

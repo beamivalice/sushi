@@ -1,4 +1,4 @@
-//! GLM MLA latent rows: BF16, or kv8 (affine 8-bit, group 64, BF16 scales and biases).
+//! GLM MLA latent rows: BF16, or kv8 / kv6 (affine 8 or 6-bit, group 64, BF16 scales and biases).
 //! Kernels read either form through `SUSHI_LATENT` from `header`; host code through `Latent.dense`.
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -8,6 +8,30 @@ const nil = Arr{ .ctx = null };
 
 pub const group_size: u32 = 64;
 pub const kv8_bits: u8 = 8;
+pub const kv6_bits: u8 = 6;
+
+pub fn storable(bits: u8) bool {
+    return bits == 0 or bits == kv8_bits or bits == kv6_bits;
+}
+
+pub const variants = 3;
+pub fn variant(bits: u8) usize {
+    return switch (bits) {
+        0 => 0,
+        kv8_bits => 1,
+        kv6_bits => 2,
+        else => unreachable,
+    };
+}
+
+pub fn kernelName(comptime base: []const u8, bits: u8) [*:0]const u8 {
+    return switch (bits) {
+        0 => std.fmt.comptimePrint("{s}", .{base}),
+        kv8_bits => std.fmt.comptimePrint("{s}8", .{base}),
+        kv6_bits => std.fmt.comptimePrint("{s}6", .{base}),
+        else => unreachable,
+    };
+}
 
 /// Bytes one stored latent row of `width` values occupies at `bits` (0 = BF16).
 pub fn rowBytes(width: usize, bits: u8) usize {
@@ -15,13 +39,13 @@ pub fn rowBytes(width: usize, bits: u8) usize {
     return width * bits / 8 + width / group_size * 4;
 }
 
-/// kv8 scratch over `pending` layers: dense prefill dequantizes at most 2051 history rows, and
+/// Quantized-latent scratch over `pending` layers: dense prefill dequantizes at most 2051 history rows, and
 /// one chunk's quantizer output lives beside the stored rows.
-pub fn kv8ScratchBytes(width: usize, chunk: usize, pending: usize) usize {
-    return pending * (2051 * rowBytes(width, 0) + chunk * rowBytes(width, kv8_bits));
+pub fn scratchBytes(width: usize, chunk: usize, pending: usize, bits: u8) usize {
+    return pending * (2051 * rowBytes(width, 0) + chunk * rowBytes(width, bits));
 }
 
-/// Borrowed storage: BF16 `data [rows, D]`, or kv8 `data [rows, D/4]` u32 codes with
+/// Borrowed storage: BF16 `data [rows, D]`, or quantized `data [rows, D*bits/32]` u32 codes with
 /// `[rows, D/64]` BF16 scales and biases.
 pub const Latent = struct {
     data: Arr,
@@ -35,8 +59,11 @@ pub const Latent = struct {
         return mlx.getShape(self.data)[0];
     }
     pub fn width(self: Latent) c_int {
-        const w = mlx.getShape(self.data)[1];
-        return if (self.quantized()) w * 4 else w;
+        return if (self.quantized()) mlx.getShape(self.scales)[1] * @as(c_int, group_size) else mlx.getShape(self.data)[1];
+    }
+    pub fn bits(self: Latent) u8 {
+        if (!self.quantized()) return 0;
+        return @intCast(@divTrunc(mlx.getShape(self.data)[1] * 32, @max(self.width(), 1)));
     }
     pub fn dtype(self: Latent) mlx.mlx_dtype {
         return mlx.mlx_array_dtype(if (self.quantized()) self.scales else self.data);
@@ -52,10 +79,10 @@ pub const Latent = struct {
         }
         if (!self.quantized()) return true;
         return mlx.mlx_array_dtype(self.data) == .uint32 and mlx.mlx_array_dtype(self.biases) == self.dtype() and
-            mlx.getShape(self.scales)[1] * @as(c_int, group_size) == self.width() and
+            storable(self.bits()) and mlx.getShape(self.data)[1] * 32 == self.width() * self.bits() and
             mlx.getShape(self.biases)[1] == mlx.getShape(self.scales)[1];
     }
-    /// Dense rows `[start, end)`; kv8 runs MLX's affine dequantizer, the reference every kernel matches.
+    /// Dense rows `[start, end)`; a quantized latent runs MLX's affine dequantizer, the reference every kernel matches.
     pub fn dense(self: Latent, start: c_int, end: c_int, s: mlx.mlx_stream) !Arr {
         var parts: [3]Arr = .{ nil, nil, nil };
         defer for (&parts) |*p| if (p.ctx != null) {
@@ -73,25 +100,25 @@ pub const Latent = struct {
             parts[0] = nil;
             return out;
         }
-        return kv_quant.dequantizeAffine(s, parts[0], parts[1], parts[2], group_size, kv8_bits);
+        return kv_quant.dequantizeAffine(s, parts[0], parts[1], parts[2], group_size, self.bits());
     }
 };
 
 /// Quantizes new rows once, at append.
-pub fn quantize(rows: Arr, s: mlx.mlx_stream) !kv_quant.QuantizedKV {
-    return kv_quant.quantizeAffine(s, rows, group_size, kv8_bits);
+pub fn quantize(rows: Arr, bits: u8, s: mlx.mlx_stream) !kv_quant.QuantizedKV {
+    return kv_quant.quantizeAffine(s, rows, group_size, bits);
 }
 
-/// What attention reads for rows not yet stored: their kv8 round trip, or the rows themselves.
+/// What attention reads for rows not yet stored: their quantize-dequantize round trip at `bits`, or the rows themselves.
 pub fn readable(rows: Arr, bits: u8, s: mlx.mlx_stream) !Arr {
     if (bits == 0) {
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&out, rows));
         return out;
     }
-    var q = try quantize(rows, s);
+    var q = try quantize(rows, bits, s);
     defer q.deinit();
-    return kv_quant.dequantizeAffine(s, q.q, q.scales, q.biases, group_size, kv8_bits);
+    return kv_quant.dequantizeAffine(s, q.q, q.scales, q.biases, group_size, bits);
 }
 
 const bf16_header: [:0]const u8 = "#define SUSHI_LATENT(src,row,d,width) (src[size_t(row)*size_t(width)+size_t(d)])\n";
@@ -108,10 +135,33 @@ const kv8_header: [:0]const u8 =
     \\#define SUSHI_LATENT(src,row,d,width) sushi_latent8(src, src##_scales, src##_biases, size_t(row), uint(d), uint(width))
     \\
 ;
-/// Kernel header defining `SUSHI_LATENT(src, row, d, width)`; a kv8 source `src` also takes
+const kv6_header: [:0]const u8 =
+    \\template <typename T>
+    \\inline T sushi_latent6(const device uint32_t* codes, const device T* scales, const device T* biases, size_t row, uint d, uint width) {
+    \\  const device uint8_t* p = reinterpret_cast<const device uint8_t*>(codes) + row*size_t(width/4u*3u);
+    \\  const uint bit = d*6u;
+    \\  const uint at = bit>>3;
+    \\  const uint sh = bit&7u;
+    \\  uint v = uint(p[at])>>sh;
+    \\  if (sh>2u) v |= uint(p[at+1u])<<(8u-sh);
+    \\  const uint8_t q = uint8_t(v&63u);
+    \\  const size_t g = row*(width/64u)+d/64u;
+    \\  const T scale = scales[g];
+    \\  const T bias = biases[g];
+    \\  return scale * q + bias;
+    \\}
+    \\#define SUSHI_LATENT(src,row,d,width) sushi_latent6(src, src##_scales, src##_biases, size_t(row), uint(d), uint(width))
+    \\
+;
+/// Kernel header defining `SUSHI_LATENT(src, row, d, width)`; a quantized source `src` also takes
 /// inputs `src_scales` and `src_biases`.
-pub fn header(quantized: bool) [:0]const u8 {
-    return if (quantized) kv8_header else bf16_header;
+pub fn header(bits: u8) [:0]const u8 {
+    return switch (bits) {
+        0 => bf16_header,
+        kv8_bits => kv8_header,
+        kv6_bits => kv6_header,
+        else => unreachable,
+    };
 }
 
 pub fn randomRows(rows: c_int, cols: c_int, seed: u64, s: mlx.mlx_stream) !Arr {
@@ -141,10 +191,11 @@ pub fn randomRows(rows: c_int, cols: c_int, seed: u64, s: mlx.mlx_stream) !Arr {
     return out;
 }
 
-var probe_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+var probe_kernels: [variants]?mlx.mlx_fast_metal_kernel = @splat(null);
 fn probe(latent: Latent, s: mlx.mlx_stream) !Arr {
     const quantized = latent.quantized();
-    const slot = &probe_kernels[@intFromBool(quantized)];
+    const bits = latent.bits();
+    const slot = &probe_kernels[variant(bits)];
     if (slot.* == null) {
         const names: []const [*:0]const u8 = if (quantized) &.{ "cache", "cache_scales", "cache_biases" } else &.{"cache"};
         const ins = mlx.mlx_vector_string_new_data(names.ptr, names.len);
@@ -156,7 +207,7 @@ fn probe(latent: Latent, s: mlx.mlx_stream) !Arr {
             \\if(i>=uint(ROWS)*uint(W)) return;
             \\out[i]=SUSHI_LATENT(cache,i/uint(W),i%uint(W),uint(W));
         ;
-        const k = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_latent8_probe" else "sushi_glm_latent_probe", ins, outs, source, header(quantized), false, false);
+        const k = mlx.mlx_fast_metal_kernel_new(kernelName("sushi_glm_latent_probe", bits), ins, outs, source, header(bits), false, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         slot.* = k;
     }
@@ -187,7 +238,11 @@ fn expectBits(a: Arr, b: Arr) !void {
     try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(a).?[0..n], mlx.mlx_array_data_bfloat16(b).?[0..n]);
 }
 
-test "GLM kv8 latent kernel helper matches MLX affine dequantization bit for bit" {
+test "GLM kv8 and kv6 latent kernel helper matches MLX affine dequantization bit for bit" {
+    for ([_]u8{ 8, 6 }) |bits| try kernelHelperCase(bits);
+}
+
+fn kernelHelperCase(bits: u8) !void {
     const s = mlx.gpuStream();
     const random = try randomRows(4094, 512, 7, s);
     defer _ = mlx.mlx_array_free(random);
@@ -204,7 +259,7 @@ test "GLM kv8 latent kernel helper matches MLX affine dequantization bit for bit
     const vec = mlx.mlx_vector_array_new_data(&parts, 3);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_concatenate_axis(&source, vec, 0, s));
-    var q = try quantize(source, s);
+    var q = try quantize(source, bits, s);
     defer q.deinit();
     const latent = Latent{ .data = q.q, .scales = q.scales, .biases = q.biases };
     try std.testing.expect(latent.rowMajor());
@@ -219,7 +274,28 @@ test "GLM kv8 latent kernel helper matches MLX affine dequantization bit for bit
     try expectBits(want, plain);
 }
 
-test "GLM latent row bytes bill kv8 at 544 bytes per 512-wide row" {
+test "GLM latent row bytes bill kv8 at 544 and kv6 at 416 bytes per 512-wide row" {
     try std.testing.expectEqual(@as(usize, 1024), rowBytes(512, 0));
     try std.testing.expectEqual(@as(usize, 544), rowBytes(512, 8));
+    try std.testing.expectEqual(@as(usize, 416), rowBytes(512, 6));
+}
+
+fn storedHash(q: kv_quant.QuantizedKV) !u64 {
+    var hash: u64 = 0xcbf29ce484222325;
+    for ([_]Arr{ q.q, q.scales, q.biases }) |part| {
+        try mlx.check(mlx.mlx_array_eval(part));
+        const n = mlx.mlx_array_size(part) * mlx.mlx_array_itemsize(part);
+        const bytes: [*]const u8 = @ptrCast(mlx.mlx_array_data_uint8(part) orelse return error.MlxArrayDataNull);
+        for (bytes[0..n]) |b| hash = (hash ^ b) *% 0x100000001b3;
+    }
+    return hash;
+}
+
+test "GLM kv8 latent storage bytes are pinned" {
+    const s = mlx.gpuStream();
+    const rows = try randomRows(64, 512, 9, s);
+    defer _ = mlx.mlx_array_free(rows);
+    var q = try quantize(rows, kv8_bits, s);
+    defer q.deinit();
+    try std.testing.expectEqual(@as(u64, 11607763619722039699), try storedHash(q));
 }

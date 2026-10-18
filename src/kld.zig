@@ -219,7 +219,7 @@ pub const USAGE =
     \\  --no-template         feed the raw prompt text, no chat template
     \\  --json <file>         compare: write the numbers as JSON
     \\  --ctx-size <n>        context length override
-    \\  --kv-quant <16|8|4>   KV cache quantization (16 = BF16, also off)
+    \\  --kv-quant <16|8|6|4> KV cache quantization (16 = BF16, also off)
     \\  --qwen-gdn <32|16>    Qwen only: bits of the GatedDeltaNet recurrent state (default 32 =
     \\                        f32; 16 = bf16, the decay gate is f32 either way). A student at 16 is
     \\                        scored against the f32 teacher. A GLM pack has no GDN arm and refuses it.
@@ -866,6 +866,7 @@ pub fn kvCacheFormat(cfg: transformer_mod.KVQuantConfig) []const u8 {
         .off => "bf16",
         .affine => switch (cfg.bits) {
             4 => "affine4",
+            6 => "affine6",
             8 => "affine8",
             else => "affine",
         },
@@ -2079,6 +2080,7 @@ test "kld: the recorded strict NLL is the teacher's own log-softmax, as the capt
 test "kld: kvCacheFormat names the effective KV width" {
     try testing.expectEqualStrings("bf16", kvCacheFormat(transformer_mod.KVQuantConfig.dense));
     try testing.expectEqualStrings("affine4", kvCacheFormat(transformer_mod.KVQuantConfig.affine(4)));
+    try testing.expectEqualStrings("affine6", kvCacheFormat(transformer_mod.KVQuantConfig.affine(6)));
     try testing.expectEqualStrings("affine8", kvCacheFormat(transformer_mod.KVQuantConfig.affine(8)));
 }
 
@@ -2732,7 +2734,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
     var quiet: Out = .{ .silent = true };
     const fixture = try std.fmt.allocPrint(arena, "{s}/reference", .{root});
     try runCapture(io, allocator, &loaded, .{ .model_dir = root, .prompts = try std.fmt.allocPrint(arena, "{s}/prompts.jsonl", .{root}), .out_dir = fixture, .tokens = 4, .no_template = true }, &quiet);
-    for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8) }) |kv| {
+    for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8), .affine(6) }) |kv| {
         // As `loadModel` applies the flag to the loaded cache.
         if (kv.isQuant()) try loaded.xfm.cache.reinit(cfg.num_hidden_layers, kv);
         const json_path = try std.fmt.allocPrint(arena, "{s}/compare-{s}.json", .{ root, kvCacheFormat(kv) });
@@ -2743,7 +2745,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
         try testing.expectEqual(@as(f64, 8), try jsonNumber(parsed.value.object.get("positions").?));
         try testing.expect(std.math.isFinite(kld));
         if (!kv.isQuant()) try testing.expectEqual(@as(f64, 0), kld);
-        try testing.expectEqual(@as(u8, if (kv.isQuant()) 8 else 0), loaded.xfm.glm5_request.?.latent_bits);
+        try testing.expectEqual(@as(u8, if (kv.isQuant()) kv.bits else 0), loaded.xfm.glm5_request.?.latent_bits);
     }
 }
 

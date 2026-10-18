@@ -10,6 +10,10 @@ MiMo KLD tables, split out of [quality-kld](quality-kld.md); everything shared b
 |---|---|---|---|---|
 | MiMo-V2.6-Flash-Sushi-2.3bpw | 0.0860 | 91.95% | 8067 | 83dc9b6c (v1.1.0 gate) |
 
+KV width on the same pack and teacher (binary `84d3ed8f`, `taskpolicy -a`, GPU lock, `--tokens 512 --top-k 10 --ctx-size 8192`,
+8067 positions to first EOS): kv8 0.086035 / 91.95% / NLL 0.357721, kv6 0.088832 / 91.62% / 0.362622 (+3.25% KLD), kv4 0.113654 /
+90.42% / 0.397358 (+32.1%).
+
 Against the 2026-09-30 MOPD teacher. Readings against an earlier teacher capture generate different continuations and
 are not comparable.
 

@@ -6081,6 +6081,7 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     // Same Scheme (.affine) but different bits MUST NOT hit — that's the
     // cross-scheme buffer-layout crash this filter guards against.
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(8)));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(6)));
     // Dense query against an affine entry: also null (existing guarantee).
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense));
 }
@@ -11315,6 +11316,7 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
     for ([_]kv_quant.KVQuantConfig{
         kv_quant.KVQuantConfig.dense,
         kv_quant.KVQuantConfig.affine(8),
+        kv_quant.KVQuantConfig.affine(6),
         kv_quant.KVQuantConfig.affine(4),
     }) |cfg| {
         var cache = try KVCache.initWithConfig(testing.allocator, 2, cfg);
@@ -12400,7 +12402,7 @@ const GlmTurn = struct {
 };
 
 fn glmKvConfig(bits: u8) kv_quant.KVQuantConfig {
-    return if (bits == 0) kv_quant.KVQuantConfig.dense else kv_quant.KVQuantConfig.affine(8);
+    return if (bits == 0) kv_quant.KVQuantConfig.dense else kv_quant.KVQuantConfig.affine(bits);
 }
 
 const glm_first = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0, 0 };
@@ -12622,8 +12624,9 @@ test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continue
     var next: [750]u32 = undefined;
     @memcpy(next[0..650], first[0..650]);
     for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    for ([_]u8{ 0, 8 }) |bits| {
-        const fp: []const u8 = if (bits == 0) "fp-glm-bf16" else "fp-glm-kv8";
+    for ([_]u8{ 0, 8, 6 }) |bits| {
+        var fp_buf: [32]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fp_buf, "fp-glm-{d}", .{bits});
         {
             var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
             hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
@@ -12650,10 +12653,50 @@ test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continue
         defer _ = mlx.mlx_array_free(want);
         try glm5_forward.expectArrayBits(want, got);
         try glm5_prefix.expectSameLogicalState(&cold, &warm);
-        // The other latent width finds nothing on disk.
-        var other = try glm5_prefix.servedRequest(if (bits == 0) 8 else 0);
-        defer other.deinit();
-        try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &other, if (bits == 0) 8 else 0, &next, 0, null, &.{})).matched);
+        for ([_]u8{ 0, 8, 6 }) |other_bits| {
+            if (other_bits == bits) continue;
+            var other = try glm5_prefix.servedRequest(other_bits);
+            defer other.deinit();
+            try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &other, other_bits, &next, 0, null, &.{})).matched);
+        }
+    }
+}
+
+test "GLM SSD tier: one fingerprint dir serves each latent width its own entry, and a lookup at another width misses" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var next: [750]u32 = undefined;
+    @memcpy(next[0..650], first[0..650]);
+    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    for ([_]u8{ 6, 8, 0 }) |written| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = buf[0..try tmp.dir.realPath(io, &buf)];
+        {
+            var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-glm-shared", 0, 128);
+            defer hc.deinit();
+            var turn = try GlmTurn.run(&fx.net, written, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
+            _ = try turn.commit(&hc, &first, 0, null);
+            hc.flushPendingDisk(s);
+            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        }
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-glm-shared", 0, 128);
+        defer hc.deinit();
+        for ([_]u8{ 0, 8, 6 }) |asked| {
+            var req = try glm5_prefix.servedRequest(asked);
+            defer req.deinit();
+            const want: usize = if (asked == written) 512 else 0;
+            try testing.expectEqual(want, (try glmLookup(&hc, &req, asked, &next, 0, null, &.{})).matched);
+        }
     }
 }
 
@@ -12735,8 +12778,9 @@ test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart 
     var window = try KVCache.init(testing.allocator, 2);
     defer window.deinit();
     try testFillCache(&window, s, 2, 300);
-    for ([_]u8{ 0, 8 }) |bits| {
-        const fp: []const u8 = if (bits == 0) "glm-ssd-only-bf16" else "glm-ssd-only-kv8";
+    for ([_]u8{ 0, 8, 6 }) |bits| {
+        var fp_buf: [32]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fp_buf, "glm-ssd-only-{d}", .{bits});
         {
             var hc = try glmSsdOnlyCache(io, base, fp, 0, true);
             defer hc.deinit();

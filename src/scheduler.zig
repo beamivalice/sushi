@@ -3960,7 +3960,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.config.isGlm5()) {
         const kv = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
         if (kv.config.glmLatentBits() == null) {
-            log.err("[glm] native MLA cache supports --kv-quant 8 or off\n", .{});
+            log.err("[glm] native MLA cache supports --kv-quant 8, 6 or off\n", .{});
             return error.GlmKvQuantUnsupported;
         }
     }
@@ -4192,7 +4192,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5();
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
-        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (kv_quant_config.isQuant()) "kv8" else "BF16", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
+        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints at every prefill chunk and the prompt end (<= {d} per entry, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
@@ -10992,6 +10992,8 @@ test "group cost geometry rejects partial rounds and keeps complete cache format
     b.group_size = 128;
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
+    try testing.expect(cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
 }
 
 test "scheduler prices each shared execution once and preserves row sampling geometry" {
@@ -11603,7 +11605,7 @@ test "every GLM slot owns its native request and hands it to its forward context
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
 }
 
-test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted slot's cache as that scheme" {
+test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitted slot's cache as that scheme" {
     const allocator = testing.allocator;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
@@ -11635,6 +11637,8 @@ test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted s
         .{ .body = .{ .integer = 16 }, .want = transformer_mod.KVQuantConfig.dense },
         .{ .body = .{ .string = "16" }, .want = transformer_mod.KVQuantConfig.dense },
         .{ .body = .{ .integer = 8 }, .want = transformer_mod.KVQuantConfig.affine(8) },
+        .{ .body = .{ .integer = 6 }, .want = transformer_mod.KVQuantConfig.affine(6) },
+        .{ .body = .{ .string = "6" }, .want = transformer_mod.KVQuantConfig.affine(6) },
         .{ .body = .{ .integer = 4 }, .want = transformer_mod.KVQuantConfig.affine(4) },
     }) |c| {
         const override = transformer_mod.KVQuantConfig.fromJsonValue(c.body).?;
