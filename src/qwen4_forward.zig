@@ -1908,20 +1908,24 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
 
     // Vision rows splice into the `hidden`-wide embeddings BEFORE the
     // hyper-connection tile (the reference masked_scatters, then repeats).
-    var emb = try self.embedding(token_ids);
-    {
+    var emb = if (ctx.stream_in == null) try self.embedding(token_ids) else mlx.mlx_array_new();
+    if (ctx.stream_in == null) {
         errdefer _ = mlx.mlx_array_free(emb);
         emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
     }
     defer _ = mlx.mlx_array_free(emb);
-    const x_shape = mlx.getShape(emb);
+    const x_shape = if (ctx.stream_in == null) mlx.getShape(emb) else mlx.getShape(token_ids);
     const batch: c_int = x_shape[0];
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1;
 
     const reps = [_]c_int{ 1, 1, hc };
     var h = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
+    if (ctx.stream_in) |stream| {
+        try mlx.check(mlx.mlx_array_set(&h, stream));
+    } else {
+        try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
+    }
     errdefer _ = mlx.mlx_array_free(h);
     if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
         var h32 = mlx.mlx_array_new();
@@ -1979,7 +1983,8 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         var submitted: ?Transformer.StreamMoe = null;
         defer if (submitted) |*work| work.deinit();
 
-        if (lw.ple) |*pw| {
+        if (lw.ple != null and !ctx.skip_ple) {
+            const pw = &lw.ple.?;
             try self.hcFlush(&h, batch, seq_len, &pending);
             const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
             defer _ = mlx.mlx_array_free(add);

@@ -4,11 +4,11 @@ A flag exists for a setting a user picks: a real tradeoff (`--kv-quant 4` for co
 
 Precedence: an explicit flag outranks `model-settings.json`, which outranks the default ([server-lifecycle](server-lifecycle.md#settings)). A flag that mirrors a settings key adds the precedence and nothing else; that is not bloat by itself.
 
-The map is the code's: every argument the parsers accept, at `main` 393228b9 less the flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update` and `kld` parse their own. `pull` and `list` take no flags and reject extra arguments.
+The map is the code's: every argument the parsers accept, at `main` 393228b9 less the flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update`, `kld` and `convert` parse their own. `pull` and `list` take no flags and reject extra arguments.
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 93 rows: 57 shared by `run`, `serve` and the bare form, 36 in `run`, `launch`, `update` and `kld`. By who: user 24, operator 26, machine 17, dev 25, dead 1. By recommendation: keep 87, cut 4, owner call 2. Among the 57 shared rows: keep 51, cut 4, owner call 2.
+**Summary.** 104 rows: 57 shared by `run`, `serve` and the bare form, 47 in `run`, `launch`, `update`, `kld` and `convert`. By who: user 32, operator 28, machine 17, dev 26, dead 1. By recommendation: keep 96, cut 4, owner call 4. Among the 57 shared rows: keep 51, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -144,6 +144,18 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--batch-windows` | from the budget → windows per layer-major batch (kld.zig:115) | dev | help, quality-kld | keep |
 | `kld`: `--imatrix-windows` | all → layer-major imatrix covers the first n windows (kld.zig:116) | dev | help, engine-expert-streaming | keep |
 | `kld`: `--pause-file` | none → layer-major idles while the file exists (kld.zig:117) | dev | help, quality-kld | keep |
+| `convert exl3`: `--model` | required → source checkpoint directory (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--out` | required → new pack directory, refused when non-empty unless `--resume` (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--experts-k` | `2.5` → routed-expert rate, 1.5 to 8 in steps of 0.125 (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--codebook` | `mcg` → `mcg` or `mul1` (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--window` | `15` → trellis search window, 12 to 16 (encoder/cli.zig) | dev | help, encoder | keep: the window is part of the pack's stamp |
+| `convert exl3`: `--calib` | built-in 64k mix → calibration text file (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--calib-tokens` | `65536` → calibration tokens, at least 2048 (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--resume` | off → continue an interrupted conversion in `--out` (encoder/cli.zig) | operator | help, encoder | keep |
+| `convert exl3`: `--batch` | `16` → routed experts quantized together per bank, 1 to 64; the pack bytes do not depend on it (encoder/cli.zig) | operator | help, encoder | keep |
+| `convert exl3`: `--factor-precision` | `64` → Hessian factor on the CPU in float64 (`64`) or on the GPU in float32 (`32`, changes the pack bytes; encoder/cli.zig) | operator | help, encoder | owner call |
+| `convert exl3`: `--trunk-bits` | the model's served width (Qwen and MiMo 8, GLM 6) → trunk affine bits 2, 3, 4, 5, 6 or 8 (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--trunk-group` | the model's served group (Qwen and MiMo 64, GLM 128) → trunk affine group 32, 64 or 128 (encoder/cli.zig) | user | help, encoder | keep |
 
 ## Cut list
 

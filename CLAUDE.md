@@ -38,6 +38,8 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`); `engine-`, `serve
 | [docs/glm5-prefix-cache.md](docs/glm5-prefix-cache.md) | GLM cache keys, latent and KDA state, restore, spec state |
 | [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
+| [docs/encoder.md](docs/encoder.md) | `sushi convert exl3`: flags, what a pack holds, trunk rules, calibration, Hessians, resume, stamps |
+| [docs/engine-exl3-encoder.md](docs/engine-exl3-encoder.md) | EXL3 encoder core: trellis search, LDLQ, signs, shard writer, Qwen BF16 reader |
 | [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | mlx-serve's pin of `sushi_exl3`, the API it calls, handoff |
 | [docs/mlx-serve-sync.md](docs/mlx-serve-sync.md) | upstream mlx-serve review ledger: cursor, verdicts, how to run the next pass |
 | [docs/engine-expert-streaming.md](docs/engine-expert-streaming.md) | SSD budget ledger, per-layer LRU, slab I/O, imatrix capture, discovery |
@@ -86,7 +88,7 @@ Box: M5 Max 128 GB, macOS 27.
 
 | File | Role | Doc |
 |---|---|---|
-| `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld`); pull, `run` REPL | server-lifecycle |
+| `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld/convert`); pull, `run` REPL | server-lifecycle |
 | `repl_tools.zig` | `run` REPL client-side tools (web, confined files, images; write needs `/edit`) | server-http-apis |
 | `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` | all HTTP: `/v1/*`, `/metrics(.json)`, WS, `--api-key`; Responses store | server-http-apis |
 | `chat.zig` | chat templates (Jinja2 + fallback), thinking tags, tool-call parse/repair/coercion | server-tool-calling |
@@ -102,6 +104,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
 | `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, shard-stamp check | mimo2-arch |
 | `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3 decoders and kernels | engine-exl3-experts |
+| `encoder/` | `sushi convert exl3`: Metal and CPU trellis search, source readers, trunk and shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, round-cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |

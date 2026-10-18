@@ -12942,6 +12942,8 @@ pub const ForwardCtx = struct {
     /// and by the LTX text encoder (which wants the residual stream, not a
     /// next token).
     skip_lm_head: bool = false,
+    stream_in: ?mlx.mlx_array = null,
+    skip_ple: bool = false,
     /// Set by the Generator when this request consumes ONLY the argmax of
     /// the logits (greedy or top-1 sampling, no logit-modifying penalties,
     /// no per-token logprobs, no grammar mask). Gates the certified lm_head
@@ -19223,6 +19225,10 @@ pub const Transformer = struct {
             moeDumpTensor(self.s, "w", moe_dump_layer, norm_scores);
         }
         if (cfg.expert_layout == .exl3_k4) {
+            if (routing_override) |given| if (given.imatrix) |tap| {
+                const xs = mlx.getShape(expert_x);
+                try tap.observeInput(self.s, expert_x, xs[0] * xs[1], xs[xs.len - 1]);
+            };
             const shared = if (routing_override) |given| given.shared_gated else null;
             const fold_shared = shared != null and mw.exl3_group_count == 0 and moeDumpDir() == null;
             const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
@@ -27298,6 +27304,51 @@ test "mimo_v2 EXL3 sliced real scales and outliers match the f32 oracle" {
             std.debug.print("mimo sliced real rows={d} max row relative RMS={d:.8}\n", .{ rows, maximum });
         try t.expect(maximum < 0.01);
     }
+}
+
+test "exl3 MoE taps the layer's input rows and routing for a calibration capture" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const rows: usize = 6;
+    var h = try Exl3MoeHarness.init(arena.allocator(), s, rows, 61);
+    defer h.deinit();
+    const prev_st = qwen4_forward.qwen4_standin_override;
+    defer qwen4_forward.qwen4_standin_override = prev_st;
+    qwen4_forward.qwen4_standin_override = .{};
+    const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 1, Exl3MoeHarness.E, .qwen4_exp);
+    defer col.deinit();
+    col.armRows(0);
+
+    var ids_host: [rows * Exl3MoeHarness.E]i32 = undefined;
+    var w_host: [rows * Exl3MoeHarness.E]u16 = undefined;
+    for (0..rows) |r| for (0..Exl3MoeHarness.E) |k| {
+        ids_host[r * Exl3MoeHarness.E + k] = @intCast((r + k) % Exl3MoeHarness.E);
+        w_host[r * Exl3MoeHarness.E + k] = expert_exl3.f32ToF16Bits(0.25);
+    };
+    const shape3 = [_]c_int{ 1, rows, Exl3MoeHarness.E };
+    const inds = mlx.mlx_array_new_data(&ids_host, &shape3, 3, .int32);
+    defer _ = mlx.mlx_array_free(inds);
+    const globals = mlx.mlx_array_new_data(&ids_host, &[_]c_int{ rows, Exl3MoeHarness.E }, 2, .int32);
+    defer _ = mlx.mlx_array_free(globals);
+    const scores = mlx.mlx_array_new_data(&w_host, &shape3, 3, .float16);
+    defer _ = mlx.mlx_array_free(scores);
+    const y = try h.xfm.moeMLP2WithRouter(h.x, h.x, &h.mw, null, true, null, .{
+        .inds = inds,
+        .norm_scores = scores,
+        .imatrix = .{ .collector = col, .layer = 0, .global_ids = globals },
+    });
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+
+    const taken = try col.takeRows();
+    defer _ = mlx.mlx_array_free(taken.x);
+    defer t.allocator.free(taken.ids);
+    try t.expectEqualSlices(c_int, &[_]c_int{ rows, Exl3MoeHarness.dim }, mlx.getShape(taken.x));
+    try t.expectEqual(@as(usize, Exl3MoeHarness.E), taken.topk);
+    try t.expectEqualSlices(i32, &ids_host, taken.ids);
 }
 
 test "exl3 MoE answers the shared-expert standin with the routed sum" {

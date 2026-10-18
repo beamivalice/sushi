@@ -1,11 +1,12 @@
 # Pack format — the consumer contract
 
-What this engine reads out of an EXL3 pack. The conversion side lives in the
-private converter repo; this document is the interface between them, and a
-converter change that changes any line here is a format change.
+What this engine reads out of an EXL3 pack, and what `src/encoder/` writes back.
+`sushi convert exl3` ([encoder](encoder.md)) writes a whole pack; the numerical core and the shard writer are
+[engine-exl3-encoder](engine-exl3-encoder.md).
+A change to any line here is a format change.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
-[engine-exl3-experts](engine-exl3-experts.md), [quality-kld](quality-kld.md),
+[encoder](encoder.md), [engine-exl3-experts](engine-exl3-experts.md), [quality-kld](quality-kld.md),
 [qwen4-arch](qwen4-arch.md), [mimo2-arch](mimo2-arch.md).
 
 Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
@@ -140,7 +141,8 @@ string, because that is all safetensors stores. The engine reads these keys:
 | `window` | the codeword width, e.g. `12` |
 
 A converter adds its own provenance keys beside them; the engine reads none of
-those, and they are documented in the private converter repo.
+those. `sushi convert exl3` writes `encoder`, `quantizer`, `global_scale_search`, `calib_sha256`, `calib_tokens` and
+`hessian_min_rows` ([encoder](encoder.md#what-is-written)).
 
 A stored-affine trunk shard stamps `format: affine` with its `bits` and
 `group_size`, and carries no `k`, `codebook` or `window`, so the load check

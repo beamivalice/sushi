@@ -1,0 +1,3502 @@
+// ==== src/regex.zig ====
+//! Minimal regex engine for JSON Schema `pattern` constraints.
+//!
+//! Supports the subset most commonly seen in JSON Schemas:
+//!   * literal characters (escaped with `\` for metachars)
+//!   * `.` — any byte except newline
+//!   * `[abc]` `[^abc]` `[a-z]` — character classes (with negation, ranges, escapes)
+//!   * `\d` `\D` `\w` `\W` `\s` `\S` — built-in classes
+//!   * `\n` `\t` `\r` `\\` `\/` `\"` — escape sequences
+//!   * `*` `+` `?` `{n}` `{n,m}` — quantifiers (greedy; greedy/lazy doesn't matter for matching membership)
+//!   * `|` — alternation
+//!   * `(...)` — non-capturing groups (we never capture)
+//!   * `^` `$` — anchors (we always full-match the whole string, so these are no-ops)
+//!
+//! NOT supported (errors out): backreferences, lookaround, named groups, Unicode property classes.
+//!
+//! The compiled form is a Thompson NFA. Matching is performed via simultaneous-states
+//! simulation (no backtracking) so `step()` is O(states × bytes) per byte.
+//!
+//! Lifetime: the NFA borrows the arena passed to `compile`. Free the arena to free the NFA.
+
+const std = @import("std");
+
+pub const Error = error{
+    InvalidPattern,
+    UnsupportedConstruct,
+    OutOfMemory,
+};
+
+const StateIndex = u32;
+
+/// Counted-quantifier bound and NFA size cap: a pattern is untrusted input and each repeat clones its atom.
+const max_repeat: u32 = 1000;
+const max_states: usize = 1 << 15;
+
+const Transition = union(enum) {
+    /// Matches a specific byte.
+    byte: u8,
+    /// Matches any byte where bitset[byte/8] & (1 << byte%8) != 0.
+    class: ByteClass,
+    /// Matches without consuming input (epsilon).
+    epsilon,
+};
+
+const ByteClass = struct {
+    /// 256-bit set; one bit per byte value.
+    bits: [32]u8,
+
+    fn empty() ByteClass {
+        return .{ .bits = @splat(0) };
+    }
+
+    pub fn contains(self: *const ByteClass, b: u8) bool {
+        return (self.bits[b >> 3] >> @intCast(b & 7)) & 1 == 1;
+    }
+
+    fn add(self: *ByteClass, b: u8) void {
+        self.bits[b >> 3] |= @as(u8, 1) << @intCast(b & 7);
+    }
+
+    fn addRange(self: *ByteClass, lo: u8, hi: u8) void {
+        var b: u16 = lo;
+        while (b <= hi) : (b += 1) self.add(@intCast(b));
+    }
+
+    fn invert(self: *ByteClass) void {
+        for (&self.bits) |*byte| byte.* = ~byte.*;
+    }
+};
+
+const State = struct {
+    /// Outgoing transitions. Index 0 is "primary"; additional indices are alternatives.
+    out: []Edge,
+    /// True if this state is an accepting state.
+    accept: bool,
+};
+
+const Edge = struct {
+    transition: Transition,
+    /// Target state index.
+    target: StateIndex,
+};
+
+pub const Nfa = struct {
+    states: []State,
+    start: StateIndex,
+
+    /// Initial state set (after applying epsilon-closure).
+    pub fn startStates(self: *const Nfa, arena: std.mem.Allocator) Error!StateSet {
+        var ss: StateSet = try .initEmpty(arena, self.states.len);
+        try addClosure(self, &ss, arena, self.start);
+        return ss;
+    }
+
+    pub fn isAccepting(self: *const Nfa, states: *const StateSet) bool {
+        var it = states.iterator();
+        while (it.next()) |s| {
+            if (self.states[s].accept) return true;
+        }
+        return false;
+    }
+
+    /// Step the state set by one input byte. Returns a new (allocated) state set.
+    /// Caller frees with `set.deinit(arena)`.
+    pub fn step(self: *const Nfa, current: *const StateSet, byte: u8, arena: std.mem.Allocator) Error!StateSet {
+        var next: StateSet = try .initEmpty(arena, self.states.len);
+        var it = current.iterator();
+        while (it.next()) |s_idx| {
+            for (self.states[s_idx].out) |edge| {
+                const matched = switch (edge.transition) {
+                    .byte => |b| b == byte,
+                    .class => |c| c.contains(byte),
+                    .epsilon => false,
+                };
+                if (matched) try addClosure(self, &next, arena, edge.target);
+            }
+        }
+        return next;
+    }
+};
+
+fn addClosure(nfa: *const Nfa, set: *StateSet, arena: std.mem.Allocator, state: StateIndex) Error!void {
+    if (set.contains(state)) return;
+    try set.add(arena, state);
+    for (nfa.states[state].out) |edge| {
+        if (edge.transition == .epsilon) {
+            try addClosure(nfa, set, arena, edge.target);
+        }
+    }
+}
+
+/// A set of NFA states. Backed by a dynamic bit set.
+pub const StateSet = struct {
+    bits: std.DynamicBitSetUnmanaged,
+
+    pub fn initEmpty(arena: std.mem.Allocator, capacity: usize) Error!StateSet {
+        return .{ .bits = try .initEmpty(arena, capacity) };
+    }
+
+    pub fn deinit(self: *StateSet, arena: std.mem.Allocator) void {
+        self.bits.deinit(arena);
+    }
+
+    pub fn contains(self: *const StateSet, idx: StateIndex) bool {
+        return self.bits.isSet(idx);
+    }
+
+    pub fn add(self: *StateSet, arena: std.mem.Allocator, idx: StateIndex) Error!void {
+        _ = arena;
+        self.bits.set(idx);
+    }
+
+    pub fn count(self: *const StateSet) usize {
+        return self.bits.count();
+    }
+
+    pub fn isEmpty(self: *const StateSet) bool {
+        return self.count() == 0;
+    }
+
+    pub fn iterator(self: *const StateSet) std.DynamicBitSetUnmanaged.Iterator(.{}) {
+        return self.bits.iterator(.{});
+    }
+};
+
+// ── Compiler ──────────────────────────────────────────────────────────────────
+
+const Frag = struct {
+    start: StateIndex,
+    accept: StateIndex,
+};
+
+const Builder = struct {
+    arena: std.mem.Allocator,
+    states: std.ArrayListUnmanaged(State) = .empty,
+
+    fn newState(self: *Builder) Error!StateIndex {
+        if (self.states.items.len >= max_states) return error.InvalidPattern;
+        try self.states.append(self.arena, .{ .out = &.{}, .accept = false });
+        return @intCast(self.states.items.len - 1);
+    }
+
+    fn addEdge(self: *Builder, from: StateIndex, t: Transition, to: StateIndex) Error!void {
+        const old = self.states.items[from].out;
+        var new = try self.arena.alloc(Edge, old.len + 1);
+        @memcpy(new[0..old.len], old);
+        new[old.len] = .{ .transition = t, .target = to };
+        self.states.items[from].out = new;
+    }
+
+    fn lit(self: *Builder, b: u8) Error!Frag {
+        const s0 = try self.newState();
+        const s1 = try self.newState();
+        try self.addEdge(s0, .{ .byte = b }, s1);
+        return .{ .start = s0, .accept = s1 };
+    }
+
+    fn class(self: *Builder, c: ByteClass) Error!Frag {
+        const s0 = try self.newState();
+        const s1 = try self.newState();
+        try self.addEdge(s0, .{ .class = c }, s1);
+        return .{ .start = s0, .accept = s1 };
+    }
+
+    fn concat(self: *Builder, a: Frag, b: Frag) Error!Frag {
+        try self.addEdge(a.accept, .epsilon, b.start);
+        return .{ .start = a.start, .accept = b.accept };
+    }
+
+    fn alt(self: *Builder, a: Frag, b: Frag) Error!Frag {
+        const s = try self.newState();
+        const e = try self.newState();
+        try self.addEdge(s, .epsilon, a.start);
+        try self.addEdge(s, .epsilon, b.start);
+        try self.addEdge(a.accept, .epsilon, e);
+        try self.addEdge(b.accept, .epsilon, e);
+        return .{ .start = s, .accept = e };
+    }
+
+    fn star(self: *Builder, a: Frag) Error!Frag {
+        const s = try self.newState();
+        const e = try self.newState();
+        try self.addEdge(s, .epsilon, a.start);
+        try self.addEdge(s, .epsilon, e);
+        try self.addEdge(a.accept, .epsilon, a.start);
+        try self.addEdge(a.accept, .epsilon, e);
+        return .{ .start = s, .accept = e };
+    }
+
+    fn plus(self: *Builder, a: Frag) Error!Frag {
+        const s = try self.newState();
+        const e = try self.newState();
+        try self.addEdge(s, .epsilon, a.start);
+        try self.addEdge(a.accept, .epsilon, a.start);
+        try self.addEdge(a.accept, .epsilon, e);
+        return .{ .start = s, .accept = e };
+    }
+
+    fn opt(self: *Builder, a: Frag) Error!Frag {
+        const s = try self.newState();
+        const e = try self.newState();
+        try self.addEdge(s, .epsilon, a.start);
+        try self.addEdge(s, .epsilon, e);
+        try self.addEdge(a.accept, .epsilon, e);
+        return .{ .start = s, .accept = e };
+    }
+
+    fn empty(self: *Builder) Error!Frag {
+        const s = try self.newState();
+        return .{ .start = s, .accept = s };
+    }
+};
+
+const Parser = struct {
+    src: []const u8,
+    pos: usize = 0,
+    b: *Builder,
+
+    fn peek(self: *Parser) ?u8 {
+        if (self.pos >= self.src.len) return null;
+        return self.src[self.pos];
+    }
+
+    fn next(self: *Parser) ?u8 {
+        if (self.pos >= self.src.len) return null;
+        const c = self.src[self.pos];
+        self.pos += 1;
+        return c;
+    }
+
+    fn parseExpr(self: *Parser) Error!Frag {
+        var left = try self.parseConcat();
+        while (self.peek()) |c| {
+            if (c != '|') break;
+            _ = self.next();
+            const right = try self.parseConcat();
+            left = try self.b.alt(left, right);
+        }
+        return left;
+    }
+
+    fn parseConcat(self: *Parser) Error!Frag {
+        var result: ?Frag = null;
+        while (self.peek()) |c| {
+            if (c == '|' or c == ')') break;
+            const atom = try self.parseAtomQuantified();
+            result = if (result) |r| try self.b.concat(r, atom) else atom;
+        }
+        return result orelse try self.b.empty();
+    }
+
+    fn parseAtomQuantified(self: *Parser) Error!Frag {
+        const atom_start = self.pos;
+        const atom = try self.parseAtom();
+        const atom_end = self.pos;
+        if (self.peek()) |c| {
+            switch (c) {
+                '*' => {
+                    _ = self.next();
+                    self.consumeLazyOrPossessive();
+                    return try self.b.star(atom);
+                },
+                '+' => {
+                    _ = self.next();
+                    self.consumeLazyOrPossessive();
+                    return try self.b.plus(atom);
+                },
+                '?' => {
+                    _ = self.next();
+                    self.consumeLazyOrPossessive();
+                    return try self.b.opt(atom);
+                },
+                '{' => return try self.parseCounted(atom, atom_start, atom_end),
+                else => {},
+            }
+        }
+        return atom;
+    }
+
+    fn consumeLazyOrPossessive(self: *Parser) void {
+        // Greedy/lazy makes no difference for membership; just accept and ignore.
+        if (self.peek()) |c| if (c == '?' or c == '+') {
+            _ = self.next();
+        };
+    }
+
+    /// Re-parse the atom span to produce a fresh, independent NFA fragment.
+    /// We use a sub-parser over the saved span — atoms are self-contained
+    /// (groups balance their own parens), so this is safe.
+    fn cloneAtom(self: *Parser, atom_start: usize, atom_end: usize) Error!Frag {
+        var sub: Parser = .{ .src = self.src[atom_start..atom_end], .pos = 0, .b = self.b };
+        return try sub.parseAtom();
+    }
+
+    fn parseCounted(self: *Parser, atom: Frag, atom_start: usize, atom_end: usize) Error!Frag {
+        _ = self.next(); // consume '{'
+        const n_start = self.pos;
+        while (self.peek()) |c| {
+            if (c >= '0' and c <= '9') _ = self.next() else break;
+        }
+        const n_str = self.src[n_start..self.pos];
+        if (n_str.len == 0) return error.InvalidPattern;
+        const n = std.fmt.parseInt(u32, n_str, 10) catch return error.InvalidPattern;
+
+        var m: ?u32 = n;
+        if (self.peek() == @as(?u8, ',')) {
+            _ = self.next();
+            const m_start = self.pos;
+            while (self.peek()) |cc| {
+                if (cc >= '0' and cc <= '9') _ = self.next() else break;
+            }
+            const m_str = self.src[m_start..self.pos];
+            m = if (m_str.len == 0) null else (std.fmt.parseInt(u32, m_str, 10) catch return error.InvalidPattern);
+        }
+        if (self.next() != '}') return error.InvalidPattern;
+        self.consumeLazyOrPossessive();
+        if (n > max_repeat or (m orelse 0) > max_repeat) return error.InvalidPattern;
+
+        // Build n required copies (the first one is the already-parsed atom).
+        var result = if (n == 0) try self.b.empty() else atom;
+        var i: u32 = 1;
+        while (i < n) : (i += 1) {
+            const cloned = try self.cloneAtom(atom_start, atom_end);
+            result = try self.b.concat(result, cloned);
+        }
+
+        if (m) |max| {
+            if (max < n) return error.InvalidPattern;
+            const optional_count = max - n;
+            var j: u32 = 0;
+            while (j < optional_count) : (j += 1) {
+                const cloned = try self.cloneAtom(atom_start, atom_end);
+                const opt_frag = try self.b.opt(cloned);
+                result = try self.b.concat(result, opt_frag);
+            }
+        } else {
+            const tail = try self.cloneAtom(atom_start, atom_end);
+            const star_frag = try self.b.star(tail);
+            result = try self.b.concat(result, star_frag);
+        }
+        return result;
+    }
+
+    fn parseAtom(self: *Parser) Error!Frag {
+        const c = self.next() orelse return error.InvalidPattern;
+        switch (c) {
+            '(' => {
+                // Optional non-capturing prefix `?:` is allowed and ignored.
+                if (self.peek() == @as(?u8, '?')) {
+                    _ = self.next();
+                    if (self.next() != ':') return error.UnsupportedConstruct;
+                }
+                const inner = try self.parseExpr();
+                if (self.next() != ')') return error.InvalidPattern;
+                return inner;
+            },
+            '[' => return try self.parseClass(),
+            '.' => {
+                var cls = ByteClass.empty();
+                cls.invert();
+                cls.bits['\n' >> 3] &= ~(@as(u8, 1) << @intCast('\n' & 7));
+                return try self.b.class(cls);
+            },
+            '^', '$' => {
+                // Anchors — treat as no-op since we always full-match.
+                return try self.b.empty();
+            },
+            '\\' => {
+                return try self.b.class(try parseEscape(self));
+            },
+            ')', '|', '*', '+', '?', '{', '}' => return error.InvalidPattern,
+            else => {
+                return try self.b.lit(c);
+            },
+        }
+    }
+
+    fn parseClass(self: *Parser) Error!Frag {
+        var cls = ByteClass.empty();
+        var negate = false;
+        if (self.peek() == @as(?u8, '^')) {
+            _ = self.next();
+            negate = true;
+        }
+        var first = true;
+        while (self.peek()) |c| {
+            if (c == ']' and !first) break;
+            first = false;
+            const lo = try self.parseClassChar();
+            // Range?
+            if (self.peek() == @as(?u8, '-')) {
+                // Look ahead — `-` followed by `]` is a literal dash
+                if (self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') {
+                    _ = self.next(); // consume '-'
+                    const hi = try self.parseClassChar();
+                    if (lo.kind == .single and hi.kind == .single) {
+                        const a = lo.byte;
+                        const b = hi.byte;
+                        if (b < a) return error.InvalidPattern;
+                        cls.addRange(a, b);
+                        continue;
+                    }
+                    return error.InvalidPattern;
+                }
+            }
+            switch (lo.kind) {
+                .single => cls.add(lo.byte),
+                .class => {
+                    for (lo.class.bits, 0..) |bit_byte, idx| {
+                        cls.bits[idx] |= bit_byte;
+                    }
+                },
+            }
+        }
+        if (self.next() != ']') return error.InvalidPattern;
+        if (negate) cls.invert();
+        return try self.b.class(cls);
+    }
+
+    const ClassChar = struct {
+        kind: enum { single, class },
+        byte: u8 = 0,
+        class: ByteClass = ByteClass.empty(),
+    };
+
+    fn parseClassChar(self: *Parser) Error!ClassChar {
+        const c = self.next() orelse return error.InvalidPattern;
+        if (c == '\\') {
+            // Escape inside class
+            const esc = self.next() orelse return error.InvalidPattern;
+            return switch (esc) {
+                'd', 'D', 'w', 'W', 's', 'S' => blk: {
+                    var cls = ByteClass.empty();
+                    fillBuiltinClass(esc, &cls);
+                    break :blk .{ .kind = .class, .class = cls };
+                },
+                'n' => .{ .kind = .single, .byte = '\n' },
+                't' => .{ .kind = .single, .byte = '\t' },
+                'r' => .{ .kind = .single, .byte = '\r' },
+                else => .{ .kind = .single, .byte = esc },
+            };
+        }
+        return .{ .kind = .single, .byte = c };
+    }
+};
+
+fn parseEscape(p: *Parser) Error!ByteClass {
+    const c = p.next() orelse return error.InvalidPattern;
+    var cls = ByteClass.empty();
+    switch (c) {
+        'd', 'D', 'w', 'W', 's', 'S' => fillBuiltinClass(c, &cls),
+        'n' => cls.add('\n'),
+        't' => cls.add('\t'),
+        'r' => cls.add('\r'),
+        else => cls.add(c),
+    }
+    return cls;
+}
+
+fn fillBuiltinClass(c: u8, cls: *ByteClass) void {
+    switch (c) {
+        'd' => cls.addRange('0', '9'),
+        'D' => {
+            cls.addRange('0', '9');
+            cls.invert();
+        },
+        'w' => {
+            cls.addRange('a', 'z');
+            cls.addRange('A', 'Z');
+            cls.addRange('0', '9');
+            cls.add('_');
+        },
+        'W' => {
+            cls.addRange('a', 'z');
+            cls.addRange('A', 'Z');
+            cls.addRange('0', '9');
+            cls.add('_');
+            cls.invert();
+        },
+        's' => {
+            cls.add(' ');
+            cls.add('\t');
+            cls.add('\n');
+            cls.add('\r');
+            cls.add(0x0C);
+            cls.add(0x0B);
+        },
+        'S' => {
+            cls.add(' ');
+            cls.add('\t');
+            cls.add('\n');
+            cls.add('\r');
+            cls.add(0x0C);
+            cls.add(0x0B);
+            cls.invert();
+        },
+        else => unreachable,
+    }
+}
+
+/// Compile a regex pattern. Returns an NFA owned by `arena`.
+pub fn compile(arena: std.mem.Allocator, pattern: []const u8) Error!*const Nfa {
+    var b: Builder = .{ .arena = arena };
+    var p: Parser = .{ .src = pattern, .b = &b };
+    const frag = try p.parseExpr();
+    if (p.peek() != null) return error.InvalidPattern;
+    b.states.items[frag.accept].accept = true;
+
+    const nfa = try arena.create(Nfa);
+    nfa.* = .{
+        .states = try b.states.toOwnedSlice(arena),
+        .start = frag.start,
+    };
+    return nfa;
+}
+
+/// Convenience: full-match a complete string against a pattern.
+pub fn match(arena: std.mem.Allocator, nfa: *const Nfa, input: []const u8) Error!bool {
+    var states = try nfa.startStates(arena);
+    defer states.deinit(arena);
+    for (input) |c| {
+        const next = try nfa.step(&states, c, arena);
+        states.deinit(arena);
+        states = next;
+        if (states.isEmpty()) return false;
+    }
+    return nfa.isAccepting(&states);
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn matchTest(pattern: []const u8, input: []const u8) !bool {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nfa = try compile(a, pattern);
+    return try match(a, nfa, input);
+}
+
+test "literal match" {
+    try testing.expect(try matchTest("hello", "hello"));
+    try testing.expect(!try matchTest("hello", "world"));
+    try testing.expect(!try matchTest("hello", "hell"));
+    try testing.expect(!try matchTest("hello", "hello!"));
+}
+
+test "alternation" {
+    try testing.expect(try matchTest("cat|dog", "cat"));
+    try testing.expect(try matchTest("cat|dog", "dog"));
+    try testing.expect(!try matchTest("cat|dog", "fox"));
+}
+
+test "star quantifier" {
+    try testing.expect(try matchTest("a*", ""));
+    try testing.expect(try matchTest("a*", "aaa"));
+    try testing.expect(!try matchTest("a*", "ab"));
+}
+
+test "plus quantifier" {
+    try testing.expect(!try matchTest("a+", ""));
+    try testing.expect(try matchTest("a+", "a"));
+    try testing.expect(try matchTest("a+", "aaaa"));
+}
+
+test "optional quantifier" {
+    try testing.expect(try matchTest("ab?c", "ac"));
+    try testing.expect(try matchTest("ab?c", "abc"));
+    try testing.expect(!try matchTest("ab?c", "abbc"));
+}
+
+test "char classes" {
+    try testing.expect(try matchTest("[abc]", "a"));
+    try testing.expect(try matchTest("[abc]", "b"));
+    try testing.expect(!try matchTest("[abc]", "d"));
+    try testing.expect(try matchTest("[a-z]+", "hello"));
+    try testing.expect(!try matchTest("[a-z]+", "Hello"));
+}
+
+test "negated char class" {
+    try testing.expect(try matchTest("[^abc]", "d"));
+    try testing.expect(!try matchTest("[^abc]", "a"));
+}
+
+test "builtin classes" {
+    try testing.expect(try matchTest("\\d+", "123"));
+    try testing.expect(!try matchTest("\\d+", "abc"));
+    try testing.expect(try matchTest("\\w+", "hello_world1"));
+    try testing.expect(try matchTest("\\s+", "  \t"));
+}
+
+test "anchors are no-ops" {
+    try testing.expect(try matchTest("^abc$", "abc"));
+}
+
+test "groups" {
+    try testing.expect(try matchTest("(ab)+", "ababab"));
+    try testing.expect(!try matchTest("(ab)+", "aba"));
+    try testing.expect(try matchTest("(?:cat|dog)s?", "cats"));
+}
+
+test "dot doesn't match newline" {
+    try testing.expect(try matchTest("a.b", "axb"));
+    try testing.expect(!try matchTest("a.b", "a\nb"));
+}
+
+test "escape sequences" {
+    try testing.expect(try matchTest("\\.", "."));
+    try testing.expect(!try matchTest("\\.", "x"));
+    try testing.expect(try matchTest("\\\\", "\\"));
+}
+
+test "counted quantifier exact" {
+    try testing.expect(try matchTest("a{3}", "aaa"));
+    try testing.expect(!try matchTest("a{3}", "aa"));
+    try testing.expect(!try matchTest("a{3}", "aaaa"));
+}
+
+test "counted quantifier range" {
+    try testing.expect(!try matchTest("a{2,4}", "a"));
+    try testing.expect(try matchTest("a{2,4}", "aa"));
+    try testing.expect(try matchTest("a{2,4}", "aaa"));
+    try testing.expect(try matchTest("a{2,4}", "aaaa"));
+    try testing.expect(!try matchTest("a{2,4}", "aaaaa"));
+}
+
+test "counted quantifier unbounded" {
+    try testing.expect(try matchTest("a{2,}", "aa"));
+    try testing.expect(try matchTest("a{2,}", "aaaaaaaa"));
+    try testing.expect(!try matchTest("a{2,}", "a"));
+}
+
+test "common json schema patterns" {
+    // Date-like
+    try testing.expect(try matchTest("\\d{4}-\\d{2}-\\d{2}", "2025-04-24"));
+    try testing.expect(!try matchTest("\\d{4}-\\d{2}-\\d{2}", "25-04-24"));
+    // Email-ish
+    try testing.expect(try matchTest("[a-z]+@[a-z]+\\.[a-z]+", "user@example.com"));
+}
+
+test "step-by-step matching tracks dead state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nfa = try compile(a, "abc");
+
+    var ss = try nfa.startStates(a);
+    defer ss.deinit(a);
+    try testing.expect(!ss.isEmpty());
+    try testing.expect(!nfa.isAccepting(&ss));
+
+    var s2 = try nfa.step(&ss, 'a', a);
+    defer s2.deinit(a);
+    try testing.expect(!s2.isEmpty());
+    try testing.expect(!nfa.isAccepting(&s2));
+
+    var s3 = try nfa.step(&s2, 'x', a);
+    defer s3.deinit(a);
+    try testing.expect(s3.isEmpty()); // dead
+}
+
+test "repeat counts and NFA size are capped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.InvalidPattern, compile(a, "a{1001}"));
+    try testing.expectError(error.InvalidPattern, compile(a, "a{1,1001}"));
+    try testing.expectError(error.InvalidPattern, compile(a, "a{4000000}"));
+    try testing.expectError(error.InvalidPattern, compile(a, "(((a{100}){100}){100})"));
+    _ = try compile(a, "a{1000}");
+}
+// ==== src/json_grammar.zig ====
+//! Streaming JSON grammar state machine constrained by a `json_schema.Schema`.
+//!
+//! Architecture
+//! ============
+//! The grammar holds a single Config = a stack of Frames. Each Frame represents
+//! an in-progress JSON value being parsed against a schema node. Bytes are fed in
+//! one-at-a-time via `acceptByte`. The `allowedBytes` query enumerates which next
+//! bytes would not be rejected — this is what the token-mask layer uses to filter
+//! the LLM's vocabulary.
+//!
+//! Snapshots support speculative lookahead: the token-mask builder simulates each
+//! candidate token's bytes through the grammar from a snapshot, accepting/rejecting
+//! the token without permanently advancing real state.
+//!
+//! Schema construct support
+//! ========================
+//! Enforced strictly:
+//!   * JSON syntax (RFC 8259), including \uXXXX escapes and control-char rejection
+//!   * `type`: object/array/string/number/integer/boolean/null
+//!   * `properties` + `required` + `additionalProperties: false`
+//!   * `items` (homogeneous arrays)
+//!   * `enum` / `const` (prefix-matched against canonical JSON encoding)
+//!   * `minItems` / `maxItems`
+//!   * `minLength` / `maxLength` on strings
+//!   * `$ref` to a local pointer (resolved in json_schema.zig; others relax to any)
+//! Best-effort (relaxed) — accept any valid JSON value, rely on prompt for shape:
+//!   * `anyOf` / `oneOf` — treated as "any JSON value" inside the union
+//!   * `pattern`, `minimum`, `maximum`, `exclusiveMinimum/Maximum` — soft prompt-only
+//!
+//! Why anyOf is relaxed
+//! --------------------
+//! Tagged-union anyOf (e.g., `{type:"text",content}` vs `{type:"cruise_cards",query}`)
+//! requires multi-config parallel parsing or eager discriminator resolution. Either
+//! adds significant complexity and is the most common cause of grammar bugs. We
+//! accept the relaxation: the model still sees the schema in its system prompt and
+//! produces structurally-valid JSON for the union; the grammar guarantees the
+//! surrounding object/array is well-formed and that all *non-anyOf* parts of the
+//! response strictly conform.
+
+const std = @import("std");
+const schema_mod = @import("json_schema.zig");
+
+pub const Schema = schema_mod.Schema;
+pub const Node = schema_mod.Node;
+pub const Kind = schema_mod.Kind;
+
+// ── ByteMask ──────────────────────────────────────────────────────────────────
+
+pub const ByteMask = struct {
+    bits: [4]u64 = @splat(0),
+
+    pub fn empty() ByteMask {
+        return .{};
+    }
+
+    pub fn full() ByteMask {
+        return .{ .bits = .{ ~@as(u64, 0), ~@as(u64, 0), ~@as(u64, 0), ~@as(u64, 0) } };
+    }
+
+    pub fn add(self: *ByteMask, b: u8) void {
+        self.bits[b >> 6] |= (@as(u64, 1) << @intCast(b & 63));
+    }
+
+    pub fn addRange(self: *ByteMask, lo: u8, hi: u8) void {
+        var b: u16 = lo;
+        while (b <= hi) : (b += 1) self.add(@intCast(b));
+    }
+
+    pub fn contains(self: *const ByteMask, b: u8) bool {
+        return (self.bits[b >> 6] >> @intCast(b & 63)) & 1 == 1;
+    }
+
+    pub fn isEmpty(self: *const ByteMask) bool {
+        return self.bits[0] == 0 and self.bits[1] == 0 and self.bits[2] == 0 and self.bits[3] == 0;
+    }
+};
+
+fn isWs(b: u8) bool {
+    return b == ' ' or b == '\t' or b == '\n' or b == '\r';
+}
+
+// ── Frame state types ─────────────────────────────────────────────────────────
+
+const StringPhase = enum { content, after_backslash, unicode_hex };
+
+const StringState = struct {
+    byte_count: u32 = 0,
+    phase: StringPhase = .content,
+    hex_remaining: u3 = 0,
+};
+
+const NumberPhase = enum {
+    after_minus,
+    leading_zero,
+    int_digits,
+    after_dot,
+    frac_digits,
+    after_exp,
+    after_exp_sign,
+    exp_digits,
+};
+
+const NumberState = struct {
+    phase: NumberPhase,
+};
+
+const ObjectPhase = enum {
+    expect_first_key_or_close,
+    expect_key, // after `,`
+    in_key,
+    after_key,
+    expect_value,
+    after_value,
+};
+
+const ObjectState = struct {
+    phase: ObjectPhase,
+    /// Bitset of property indices already seen (max 64 properties).
+    seen: u64 = 0,
+    /// Buffered key being typed.
+    key_buf: [256]u8 = undefined,
+    key_len: u32 = 0,
+    /// Resolved during `:` handling: index of property whose value we're about to read,
+    /// or null for an additional-property (free-form key).
+    current_prop: ?u32 = null,
+};
+
+const ArrayPhase = enum {
+    expect_first_value_or_close,
+    expect_value,
+    after_value,
+};
+
+const ArrayState = struct {
+    phase: ArrayPhase,
+    count: u32 = 0,
+};
+
+const EnumState = struct {
+    /// Bitset of enum_values still alive after the prefix typed so far (max 64).
+    alive: u64,
+    byte_count: u32 = 0,
+};
+
+const KeywordState = struct {
+    target: []const u8,
+    pos: u8,
+};
+
+const FrameSub = union(enum) {
+    expect_value,
+    in_string: StringState,
+    in_number: NumberState,
+    in_object: ObjectState,
+    in_array: ArrayState,
+    in_enum: EnumState,
+    in_keyword: KeywordState,
+    accepted,
+};
+
+const Frame = struct {
+    schema: *const Node,
+    sub: FrameSub,
+};
+
+// ── Grammar ───────────────────────────────────────────────────────────────────
+
+const MAX_STACK = 64;
+/// Consecutive free-whitespace bytes the grammar admits between tokens.
+pub const MAX_FREE_WS = 16;
+
+pub const Grammar = struct {
+    gpa: std.mem.Allocator,
+    schema: *const Schema,
+    stack: std.ArrayListUnmanaged(Frame),
+    /// Set true once all configurations have rejected and recovery is impossible.
+    dead: bool = false,
+    ws_run: u16 = 0,
+
+    pub fn init(gpa: std.mem.Allocator, schema: *const Schema) std.mem.Allocator.Error!Grammar {
+        var g: Grammar = .{
+            .gpa = gpa,
+            .schema = schema,
+            .stack = .empty,
+        };
+        // anyOf at the root is relaxed to "any JSON" (see header doc).
+        const root = if (schema.root.kind == .any_of) anyNode() else schema.root;
+        try g.stack.append(gpa, .{ .schema = root, .sub = .expect_value });
+        return g;
+    }
+
+    pub fn deinit(self: *Grammar) void {
+        self.stack.deinit(self.gpa);
+    }
+
+    pub fn isDead(self: *const Grammar) bool {
+        return self.dead;
+    }
+
+    /// True once the root value has been fully parsed. A root number has no
+    /// closing byte, so it is complete as soon as it could end.
+    pub fn isComplete(self: *const Grammar) bool {
+        if (self.stack.items.len != 1) return false;
+        return switch (self.stack.items[0].sub) {
+            .accepted => true,
+            .in_number => |n| switch (n.phase) {
+                .leading_zero, .int_digits, .frac_digits, .exp_digits => true,
+                .after_minus, .after_dot, .after_exp, .after_exp_sign => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Bytes still admissible in the string body the next byte lands in
+    /// (content phase, no escape in flight): `maxLength` minus what was typed,
+    /// or `maxInt` when unbounded. Null in every other state.
+    pub fn stringBodyRoom(self: *const Grammar) ?u32 {
+        if (self.dead) return null;
+        const frame = self.topConst();
+        const s = switch (frame.sub) {
+            .in_string => |st| st,
+            else => return null,
+        };
+        if (s.phase != .content) return null;
+        const max = frame.schema.str_max_len orelse return std.math.maxInt(u32);
+        return max -| s.byte_count;
+    }
+
+    /// Bitset of bytes that would be accepted by the grammar in its current state.
+    /// Implemented by speculative trial: snapshot, try each byte, restore.
+    pub fn allowedBytes(self: *Grammar) std.mem.Allocator.Error!ByteMask {
+        var mask = ByteMask.empty();
+        if (self.dead) return mask;
+
+        const snap = try self.snapshot();
+        defer self.discardSnapshot(snap);
+
+        var b: u16 = 0;
+        while (b < 256) : (b += 1) {
+            const byte: u8 = @intCast(b);
+            try self.restoreFrom(snap);
+            if (try self.tryAdvance(byte)) {
+                mask.add(byte);
+            }
+        }
+        try self.restoreFrom(snap);
+        return mask;
+    }
+
+    /// Try to consume one byte. Returns true if accepted (state advanced),
+    /// false if rejected (state unchanged).
+    pub fn acceptByte(self: *Grammar, byte: u8) std.mem.Allocator.Error!bool {
+        if (self.dead) return false;
+        const snap = try self.snapshot();
+        defer self.discardSnapshot(snap);
+        const ok = try self.tryAdvance(byte);
+        if (!ok) try self.restoreFrom(snap);
+        return ok;
+    }
+
+    /// Speculative variant of `acceptByte` that does NOT take an internal snapshot.
+    /// On rejection, the grammar may be left in an indeterminate state — the caller
+    /// MUST hold an outer snapshot and restore it. Used by the token-mask builder
+    /// to amortise away ~100k redundant per-byte heap allocs.
+    pub fn acceptByteFast(self: *Grammar, byte: u8) std.mem.Allocator.Error!bool {
+        if (self.dead) return false;
+        return try self.tryAdvance(byte);
+    }
+
+    /// Internal: advance state by one byte. May replay (e.g., when a number ends
+    /// before its actual terminator byte). Returns true on success, false on reject.
+    fn tryAdvance(self: *Grammar, byte: u8) std.mem.Allocator.Error!bool {
+        var b: u8 = byte;
+        // Bounded replay loop: consume at most a few replays per input byte.
+        var iter: u32 = 0;
+        while (iter < 8) : (iter += 1) {
+            const r = try advanceOne(self, b);
+            switch (r) {
+                .consumed, .consumed_ws => return true,
+                .replay => |nb| b = nb,
+                .reject => return false,
+            }
+        }
+        return false;
+    }
+
+    // ── Snapshot / restore ────────────────────────────────────────────────────
+    // A snapshot is a deep copy of the stack. We use it for both speculative
+    // byte trials (in allowedBytes) and for token-mask probes by external callers.
+
+    pub const Snapshot = struct {
+        stack: []Frame, // owned
+        dead: bool,
+        ws_run: u16,
+    };
+
+    pub fn snapshot(self: *const Grammar) std.mem.Allocator.Error!Snapshot {
+        const copy = try self.gpa.dupe(Frame, self.stack.items);
+        return .{ .stack = copy, .dead = self.dead, .ws_run = self.ws_run };
+    }
+
+    pub fn restoreFrom(self: *Grammar, snap: Snapshot) std.mem.Allocator.Error!void {
+        self.stack.clearRetainingCapacity();
+        try self.stack.appendSlice(self.gpa, snap.stack);
+        self.dead = snap.dead;
+        self.ws_run = snap.ws_run;
+    }
+
+    pub fn discardSnapshot(self: *const Grammar, snap: Snapshot) void {
+        self.gpa.free(snap.stack);
+    }
+
+    fn top(self: *Grammar) *Frame {
+        return &self.stack.items[self.stack.items.len - 1];
+    }
+
+    fn topConst(self: *const Grammar) *const Frame {
+        return &self.stack.items[self.stack.items.len - 1];
+    }
+};
+
+// ── Advance result ────────────────────────────────────────────────────────────
+
+const StepResult = union(enum) {
+    consumed,
+    consumed_ws,
+    replay: u8,
+    reject,
+};
+
+fn advanceOne(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    const r = try advanceOneInner(g, byte);
+    if (r == .consumed) g.ws_run = 0;
+    return r;
+}
+
+/// Free whitespace is capped per run: a masked model whose real argmax is
+/// off-schema otherwise idles on whitespace until the loop guard cuts it.
+fn freeWhitespace(g: *Grammar) StepResult {
+    if (g.ws_run >= MAX_FREE_WS) return .reject;
+    g.ws_run += 1;
+    return .consumed_ws;
+}
+
+fn advanceOneInner(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    // Nothing outside the root value: whitespace there is a greedy near-tie
+    // the model pads with (`\r   \r   \r  {`) or idles on, and it carries no
+    // formatting the model prefers. Inside the root its own layout stays.
+    if (g.stack.items.len == 0) return .reject;
+    if (g.stack.items.len == 1 and g.topConst().sub == .accepted) return .reject;
+    const before_root = g.stack.items.len == 1 and g.topConst().sub == .expect_value;
+
+    // Free whitespace handling for between-token positions.
+    if (isWs(byte) and !before_root and canAcceptFreeWhitespace(g.topConst())) {
+        return freeWhitespace(g);
+    }
+
+    if (g.stack.items.len > MAX_STACK) {
+        g.dead = true;
+        return .reject;
+    }
+
+    const frame = g.top();
+    return switch (frame.sub) {
+        .expect_value => try stepExpectValue(g, byte),
+        .in_string => try stepString(g, byte),
+        .in_number => try stepNumber(g, byte),
+        .in_object => try stepObject(g, byte),
+        .in_array => try stepArray(g, byte),
+        .in_enum => try stepEnum(g, byte),
+        .in_keyword => try stepKeyword(g, byte),
+        .accepted => .reject,
+    };
+}
+
+fn canAcceptFreeWhitespace(frame: *const Frame) bool {
+    return switch (frame.sub) {
+        .expect_value, .accepted => true,
+        .in_string, .in_keyword, .in_enum => false,
+        .in_number => false,
+        .in_object => |o| switch (o.phase) {
+            .expect_first_key_or_close, .expect_key, .after_key, .expect_value, .after_value => true,
+            .in_key => false,
+        },
+        .in_array => |a| switch (a.phase) {
+            .expect_first_value_or_close, .expect_value, .after_value => true,
+        },
+    };
+}
+
+// ── expect_value dispatch ─────────────────────────────────────────────────────
+
+fn stepExpectValue(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    const schema = g.top().schema;
+    return switch (schema.kind) {
+        .null_ => try startKeyword(g, byte, "null"),
+        .boolean => switch (byte) {
+            't' => try startKeyword(g, byte, "true"),
+            'f' => try startKeyword(g, byte, "false"),
+            else => .reject,
+        },
+        .integer, .number => startNumber(g, byte),
+        .string => startString(g, byte),
+        .array => startArray(g, byte),
+        .object => startObject(g, byte),
+        .enum_ => startEnum(g, byte),
+        .any, .any_of => blk: {
+            // Relaxed: accept any valid JSON value here. A parsed `any` node allows
+            // no extra keys, so swap in the free-form one and re-dispatch.
+            g.top().schema = anyNode();
+            break :blk try startAnyValue(g, byte);
+        },
+    };
+}
+
+fn startAnyValue(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    return switch (byte) {
+        '"' => startString(g, byte),
+        '{' => startObject(g, byte),
+        '[' => startArray(g, byte),
+        't' => try startKeyword(g, byte, "true"),
+        'f' => try startKeyword(g, byte, "false"),
+        'n' => try startKeyword(g, byte, "null"),
+        '-', '0'...'9' => startNumber(g, byte),
+        else => .reject,
+    };
+}
+
+// ── keyword (true/false/null) ─────────────────────────────────────────────────
+
+fn startKeyword(g: *Grammar, byte: u8, target: []const u8) std.mem.Allocator.Error!StepResult {
+    if (target.len == 0 or target[0] != byte) return .reject;
+    g.top().sub = .{ .in_keyword = .{ .target = target, .pos = 1 } };
+    if (target.len == 1) try popAccepted(g);
+    return .consumed;
+}
+
+fn stepKeyword(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    var k = g.top().sub.in_keyword;
+    if (k.pos >= k.target.len) return .reject;
+    if (k.target[k.pos] != byte) return .reject;
+    k.pos += 1;
+    g.top().sub = .{ .in_keyword = k };
+    if (k.pos == k.target.len) try popAccepted(g);
+    return .consumed;
+}
+
+// ── string ────────────────────────────────────────────────────────────────────
+
+fn startString(g: *Grammar, byte: u8) StepResult {
+    if (byte != '"') return .reject;
+    g.top().sub = .{ .in_string = .{} };
+    return .consumed;
+}
+
+fn stepString(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    var s = g.top().sub.in_string;
+    const schema = g.top().schema;
+
+    switch (s.phase) {
+        .content => {
+            if (byte == '"') {
+                if (schema.str_min_len) |min| if (s.byte_count < min) return .reject;
+                try popAccepted(g);
+                return .consumed;
+            }
+            if (byte == '\\') {
+                // An escape counts as one byte: none fits once the body is full.
+                if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
+                s.phase = .after_backslash;
+                g.top().sub = .{ .in_string = s };
+                return .consumed;
+            }
+            if (byte < 0x20) return .reject;
+            if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
+            s.byte_count += 1;
+            g.top().sub = .{ .in_string = s };
+            return .consumed;
+        },
+        .after_backslash => {
+            switch (byte) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {
+                    if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
+                    s.byte_count += 1;
+                    s.phase = .content;
+                    g.top().sub = .{ .in_string = s };
+                    return .consumed;
+                },
+                'u' => {
+                    s.phase = .unicode_hex;
+                    s.hex_remaining = 4;
+                    g.top().sub = .{ .in_string = s };
+                    return .consumed;
+                },
+                else => return .reject,
+            }
+        },
+        .unicode_hex => {
+            const ok = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F');
+            if (!ok) return .reject;
+            s.hex_remaining -= 1;
+            if (s.hex_remaining == 0) {
+                if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
+                s.byte_count += 1;
+                s.phase = .content;
+            }
+            g.top().sub = .{ .in_string = s };
+            return .consumed;
+        },
+    }
+}
+
+// ── number ────────────────────────────────────────────────────────────────────
+
+fn startNumber(g: *Grammar, byte: u8) StepResult {
+    var phase: NumberPhase = undefined;
+    switch (byte) {
+        '-' => phase = .after_minus,
+        '0' => phase = .leading_zero,
+        '1'...'9' => phase = .int_digits,
+        else => return .reject,
+    }
+    g.top().sub = .{ .in_number = .{ .phase = phase } };
+    return .consumed;
+}
+
+fn stepNumber(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    var n = g.top().sub.in_number;
+    const integer_only = g.top().schema.kind == .integer;
+
+    switch (n.phase) {
+        .after_minus => switch (byte) {
+            '0' => n.phase = .leading_zero,
+            '1'...'9' => n.phase = .int_digits,
+            else => return .reject,
+        },
+        .leading_zero => switch (byte) {
+            '.' => {
+                if (integer_only) return try numberEndAndReplay(g, byte);
+                n.phase = .after_dot;
+            },
+            'e', 'E' => {
+                if (integer_only) return try numberEndAndReplay(g, byte);
+                n.phase = .after_exp;
+            },
+            else => return try numberEndAndReplay(g, byte),
+        },
+        .int_digits => switch (byte) {
+            '0'...'9' => {},
+            '.' => {
+                if (integer_only) return try numberEndAndReplay(g, byte);
+                n.phase = .after_dot;
+            },
+            'e', 'E' => {
+                if (integer_only) return try numberEndAndReplay(g, byte);
+                n.phase = .after_exp;
+            },
+            else => return try numberEndAndReplay(g, byte),
+        },
+        .after_dot => switch (byte) {
+            '0'...'9' => n.phase = .frac_digits,
+            else => return .reject,
+        },
+        .frac_digits => switch (byte) {
+            '0'...'9' => {},
+            'e', 'E' => n.phase = .after_exp,
+            else => return try numberEndAndReplay(g, byte),
+        },
+        .after_exp => switch (byte) {
+            '+', '-' => n.phase = .after_exp_sign,
+            '0'...'9' => n.phase = .exp_digits,
+            else => return .reject,
+        },
+        .after_exp_sign => switch (byte) {
+            '0'...'9' => n.phase = .exp_digits,
+            else => return .reject,
+        },
+        .exp_digits => switch (byte) {
+            '0'...'9' => {},
+            else => return try numberEndAndReplay(g, byte),
+        },
+    }
+    g.top().sub = .{ .in_number = n };
+    return .consumed;
+}
+
+fn numberEndAndReplay(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    const phase = g.top().sub.in_number.phase;
+    switch (phase) {
+        .after_minus, .after_dot, .after_exp, .after_exp_sign => return .reject,
+        else => {},
+    }
+    try popAccepted(g);
+    return .{ .replay = byte };
+}
+
+// ── enum ──────────────────────────────────────────────────────────────────────
+
+fn startEnum(g: *Grammar, byte: u8) StepResult {
+    const schema = g.top().schema;
+    var alive: u64 = 0;
+    var i: u32 = 0;
+    while (i < 64 and i < schema.enum_values.len) : (i += 1) {
+        const ev = schema.enum_values[i].json;
+        if (ev.len > 0 and ev[0] == byte) alive |= (@as(u64, 1) << @intCast(i));
+    }
+    if (alive == 0) return .reject;
+    g.top().sub = .{ .in_enum = .{ .alive = alive, .byte_count = 1 } };
+    maybeCompleteEnum(g) catch unreachable;
+    return .consumed;
+}
+
+fn stepEnum(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    var e = g.top().sub.in_enum;
+    const schema = g.top().schema;
+    var new_alive: u64 = 0;
+    var i: u32 = 0;
+    while (i < 64 and i < schema.enum_values.len) : (i += 1) {
+        if ((e.alive >> @intCast(i)) & 1 == 0) continue;
+        const ev = schema.enum_values[i].json;
+        if (ev.len > e.byte_count and ev[e.byte_count] == byte) {
+            new_alive |= (@as(u64, 1) << @intCast(i));
+        }
+    }
+    if (new_alive == 0) return .reject;
+    e.alive = new_alive;
+    e.byte_count += 1;
+    g.top().sub = .{ .in_enum = e };
+    try maybeCompleteEnum(g);
+    return .consumed;
+}
+
+fn maybeCompleteEnum(g: *Grammar) std.mem.Allocator.Error!void {
+    if (g.top().sub != .in_enum) return;
+    const e = g.top().sub.in_enum;
+    const schema = g.top().schema;
+    var i: u32 = 0;
+    while (i < 64 and i < schema.enum_values.len) : (i += 1) {
+        if ((e.alive >> @intCast(i)) & 1 == 0) continue;
+        if (schema.enum_values[i].json.len == e.byte_count) {
+            try popAccepted(g);
+            return;
+        }
+    }
+}
+
+// ── object ────────────────────────────────────────────────────────────────────
+
+fn startObject(g: *Grammar, byte: u8) StepResult {
+    if (byte != '{') return .reject;
+    g.top().sub = .{ .in_object = .{ .phase = .expect_first_key_or_close } };
+    return .consumed;
+}
+
+fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    var o = g.top().sub.in_object;
+    const schema = g.top().schema;
+
+    switch (o.phase) {
+        .expect_first_key_or_close, .expect_key => |phase| {
+            if (phase == .expect_first_key_or_close and byte == '}') {
+                if (!requiredAllSeen(schema, o.seen)) return .reject;
+                try popAccepted(g);
+                return .consumed;
+            }
+            if (byte != '"') return .reject;
+            // A key with no property left to match and no free-form keys is a dead end.
+            if (!schema.obj_additional and allPropertiesSeen(schema, o.seen)) return .reject;
+            o.phase = .in_key;
+            o.key_len = 0;
+            g.top().sub = .{ .in_object = o };
+            return .consumed;
+        },
+        .in_key => {
+            if (byte == '"') {
+                const matched = matchPropertyName(schema, o.key_buf[0..o.key_len], o.seen);
+                if (matched.matched_index == null and !schema.obj_additional) return .reject;
+                o.current_prop = matched.matched_index;
+                o.phase = .after_key;
+                g.top().sub = .{ .in_object = o };
+                return .consumed;
+            }
+            if (byte < 0x20) return .reject;
+            // Any byte may extend the key if (a) it could match an unseen property's
+            // next char OR (b) additionalProperties is allowed (free-form key).
+            const matches_property = keyByteMatchesProperty(schema, o.key_buf[0..o.key_len], o.seen, byte);
+            if (!matches_property and !schema.obj_additional) return .reject;
+            if (o.key_len >= o.key_buf.len) return .reject;
+            o.key_buf[o.key_len] = byte;
+            o.key_len += 1;
+            g.top().sub = .{ .in_object = o };
+            return .consumed;
+        },
+        .after_key => {
+            if (byte != ':') return .reject;
+            o.phase = .expect_value;
+            g.top().sub = .{ .in_object = o };
+            return .consumed;
+        },
+        .expect_value => {
+            const child_schema = if (o.current_prop) |idx|
+                schema.obj_properties[idx].schema
+            else
+                anyNode();
+            if (o.current_prop) |idx| {
+                o.seen |= (@as(u64, 1) << @intCast(idx));
+            }
+            o.phase = .after_value;
+            g.top().sub = .{ .in_object = o };
+            try g.stack.append(g.gpa, .{ .schema = child_schema, .sub = .expect_value });
+            return .{ .replay = byte };
+        },
+        .after_value => {
+            if (byte == ',') {
+                // A comma promises another key. With additionalProperties off
+                // and every declared property seen there is none, and the
+                // expect_key state it leads to has no legal byte at all — an
+                // empty mask, which the sampler cannot express. Reject here so
+                // `}` stays the only way out.
+                if (!schema.obj_additional and allPropertiesSeen(schema, o.seen)) return .reject;
+                o.phase = .expect_key;
+                g.top().sub = .{ .in_object = o };
+                return .consumed;
+            }
+            if (byte == '}') {
+                if (!requiredAllSeen(schema, o.seen)) return .reject;
+                try popAccepted(g);
+                return .consumed;
+            }
+            return .reject;
+        },
+    }
+}
+
+/// Every declared property already used. With `additionalProperties:false`
+/// this is the point where no further key can be opened. Bitmask compare, not
+/// a loop: `stepObject` runs once per candidate TOKEN per generated token
+/// inside `buildMask`, so anything here is on the mask-build hot path.
+fn allPropertiesSeen(schema: *const Node, seen: u64) bool {
+    const n = @min(schema.obj_properties.len, 64);
+    const all: u64 = if (n == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
+    return (seen & all) == all;
+}
+
+const PropertyMatchResult = struct {
+    matched_index: ?u32,
+};
+
+fn matchPropertyName(schema: *const Node, name: []const u8, seen: u64) PropertyMatchResult {
+    for (schema.obj_properties, 0..) |p, i| {
+        if (i >= 64) break;
+        if (((seen >> @intCast(i)) & 1) != 0) continue;
+        if (std.mem.eql(u8, p.name, name)) return .{ .matched_index = @intCast(i) };
+    }
+    return .{ .matched_index = null };
+}
+
+fn keyByteMatchesProperty(schema: *const Node, prefix: []const u8, seen: u64, byte: u8) bool {
+    for (schema.obj_properties, 0..) |p, i| {
+        if (i >= 64) break;
+        if (((seen >> @intCast(i)) & 1) != 0) continue;
+        if (p.name.len <= prefix.len) continue;
+        if (!std.mem.startsWith(u8, p.name, prefix)) continue;
+        if (p.name[prefix.len] == byte) return true;
+    }
+    return false;
+}
+
+fn requiredAllSeen(schema: *const Node, seen: u64) bool {
+    for (schema.obj_properties, 0..) |p, i| {
+        if (i >= 64) break;
+        if (!p.required) continue;
+        if (((seen >> @intCast(i)) & 1) == 0) return false;
+    }
+    return true;
+}
+
+// ── array ─────────────────────────────────────────────────────────────────────
+
+fn startArray(g: *Grammar, byte: u8) StepResult {
+    if (byte != '[') return .reject;
+    g.top().sub = .{ .in_array = .{ .phase = .expect_first_value_or_close } };
+    return .consumed;
+}
+
+fn stepArray(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    var a = g.top().sub.in_array;
+    const schema = g.top().schema;
+
+    switch (a.phase) {
+        .expect_first_value_or_close => {
+            if (byte == ']') {
+                if (schema.arr_min_items) |min| if (a.count < min) return .reject;
+                try popAccepted(g);
+                return .consumed;
+            }
+            if (schema.arr_max_items) |max| if (a.count >= max) return .reject;
+            a.phase = .after_value;
+            a.count += 1;
+            g.top().sub = .{ .in_array = a };
+            const child = schema.arr_items orelse anyNode();
+            try g.stack.append(g.gpa, .{ .schema = child, .sub = .expect_value });
+            return .{ .replay = byte };
+        },
+        .expect_value => {
+            if (schema.arr_max_items) |max| if (a.count >= max) return .reject;
+            a.phase = .after_value;
+            a.count += 1;
+            g.top().sub = .{ .in_array = a };
+            const child = schema.arr_items orelse anyNode();
+            try g.stack.append(g.gpa, .{ .schema = child, .sub = .expect_value });
+            return .{ .replay = byte };
+        },
+        .after_value => {
+            if (byte == ',') {
+                if (schema.arr_max_items) |max| if (a.count >= max) return .reject;
+                a.phase = .expect_value;
+                g.top().sub = .{ .in_array = a };
+                return .consumed;
+            }
+            if (byte == ']') {
+                if (schema.arr_min_items) |min| if (a.count < min) return .reject;
+                try popAccepted(g);
+                return .consumed;
+            }
+            return .reject;
+        },
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn popAccepted(g: *Grammar) std.mem.Allocator.Error!void {
+    g.top().sub = .accepted;
+    if (g.stack.items.len <= 1) return; // root accepted, leave on stack
+    _ = g.stack.pop();
+    // Parent state is already in its post-value phase (e.g., object.after_value);
+    // it'll naturally handle the next byte.
+}
+
+/// A "no-constraints" schema node. Used when a sub-tree is unconstrained:
+///   * inside `anyOf` (relaxed branch — see header doc)
+///   * for objects with no `properties`
+///   * for arrays with no `items`
+///   * for additional-property values when `additionalProperties: true`
+///
+/// `obj_additional = true` so any property name is accepted; `arr_items = null`
+/// so any items kind is accepted (recurses to `any` automatically).
+fn anyNode() *const Node {
+    const S = struct {
+        const node: Node = .{ .kind = .any, .obj_additional = true };
+    };
+    return &S.node;
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn parseSchema(gpa: std.mem.Allocator, src: []const u8) !Schema {
+    const v = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+    defer v.deinit();
+    return schema_mod.parse(gpa, v.value);
+}
+
+fn feed(g: *Grammar, input: []const u8) !void {
+    for (input) |c| {
+        const ok = try g.acceptByte(c);
+        if (!ok) return error.GrammarRejected;
+    }
+}
+
+test "grammar accepts simple object matching schema" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    try feed(&g, "{\"name\":\"alice\"}");
+    try testing.expect(g.isComplete());
+}
+
+test "grammar rejects missing required" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    // Empty object is missing required `name`
+    try testing.expectError(error.GrammarRejected, feed(&g, "{}"));
+}
+
+test "grammar rejects unknown property when additional=false" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"}},"additionalProperties":false}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    // After typing "age" through the prefix-match phase, `e"` tries to close the key — but `age`
+    // isn't a known property and additional is false, so it should reject when matching.
+    // (Our grammar rejects sooner — when the second char doesn't extend `name`.)
+    try testing.expectError(error.GrammarRejected, feed(&g, "{\"a"));
+}
+
+test "grammar enforces enum values" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"role":{"enum":["admin","user"]}},"required":["role"]}
+    );
+    defer schema.deinit();
+
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, "{\"role\":\"admin\"}");
+        try testing.expect(g.isComplete());
+    }
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try testing.expectError(error.GrammarRejected, feed(&g, "{\"role\":\"guest"));
+    }
+}
+
+test "grammar accepts array of integers" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"array","items":{"type":"integer"}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    try feed(&g, "[1, 2, 30, -7]");
+    try testing.expect(g.isComplete());
+}
+
+test "grammar rejects float in integer array" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"array","items":{"type":"integer"}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    try testing.expectError(error.GrammarRejected, feed(&g, "[1.5"));
+}
+
+test "grammar handles string escapes and unicode" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"string\"}");
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "\"hi\\n\\u00e9!\"");
+    try testing.expect(g.isComplete());
+}
+
+test "grammar rejects unescaped control char in string" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"string\"}");
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try testing.expectError(error.GrammarRejected, feed(&g, "\"hi\nthere\""));
+}
+
+test "grammar respects minLength and maxLength" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"string","minLength":2,"maxLength":3}
+    );
+    defer schema.deinit();
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try testing.expectError(error.GrammarRejected, feed(&g, "\"a\""));
+    }
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, "\"abc\"");
+        try testing.expect(g.isComplete());
+    }
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try testing.expectError(error.GrammarRejected, feed(&g, "\"abcd"));
+    }
+}
+
+test "grammar respects minItems and maxItems" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":3}
+    );
+    defer schema.deinit();
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try testing.expectError(error.GrammarRejected, feed(&g, "[1]"));
+    }
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, "[1,2,3]");
+        try testing.expect(g.isComplete());
+    }
+    {
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try testing.expectError(error.GrammarRejected, feed(&g, "[1,2,3,4"));
+    }
+}
+
+// The model keeps its own layout inside the root; outside it nothing is admitted.
+test "grammar admits free whitespace inside the root value only" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    for (" \t\n\r") |ws| try testing.expect(!(try g.allowedBytes()).contains(ws));
+    try testing.expect(!try g.acceptByte('\n'));
+    try feed(&g, "{\n  \"x\" : 42\n}");
+    try testing.expect(g.isComplete());
+    for (" \t\n\r") |ws| try testing.expect(!(try g.allowedBytes()).contains(ws));
+    try testing.expect(!try g.acceptByte(' '));
+}
+
+test "grammar relaxes anyOf to any-json" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"anyOf":[{"type":"string"},{"type":"object"}]}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "[1,2,3]"); // an array — also accepted under "any"
+    try testing.expect(g.isComplete());
+}
+
+test "allowedBytes initial returns object opener" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"}}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    const mask = try g.allowedBytes();
+    try testing.expect(mask.contains('{'));
+    try testing.expect(!mask.contains('['));
+    try testing.expect(!mask.contains('"'));
+}
+
+test "allowedBytes after { restricts to property prefixes" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"additionalProperties":false}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    _ = try g.acceptByte('{');
+    _ = try g.acceptByte('"');
+    const mask = try g.allowedBytes();
+    try testing.expect(mask.contains('n')); // start of "name"
+    try testing.expect(mask.contains('a')); // start of "age"
+    try testing.expect(!mask.contains('z'));
+}
+
+test "no comma after the last property when additionalProperties is false" {
+    // The mask is the only thing standing between the model and off-schema
+    // output, so a state it can enter must always have a legal next byte. With
+    // every declared property seen and `additionalProperties:false`, a comma
+    // leads to expect_key where NOTHING is legal — the mask comes back empty,
+    // argmax over an all-(-inf) row picks id 0, and the resulting byte kills
+    // the grammar (live 2026-08-11: `"!__employee_id__"` spliced into an
+    // otherwise conforming object once enforcement switched off).
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    for ("{\"name\":\"a\",\"age\":1") |b| try testing.expect(try g.acceptByte(b));
+
+    const mask = try g.allowedBytes();
+    try testing.expect(mask.contains('}'));
+    try testing.expect(!mask.contains(','));
+    try testing.expect(!try g.acceptByte(','));
+}
+
+test "comma still allowed while a property remains unseen" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    for ("{\"name\":\"a\"") |b| try testing.expect(try g.acceptByte(b));
+
+    const mask = try g.allowedBytes();
+    try testing.expect(mask.contains(','));
+    // `}` is not: `age` is required and still unseen.
+    try testing.expect(!mask.contains('}'));
+}
+
+test "snapshot/restore roundtrip" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    _ = try g.acceptByte('{');
+    const snap = try g.snapshot();
+    defer g.discardSnapshot(snap);
+
+    _ = try g.acceptByte('"');
+    _ = try g.acceptByte('a');
+    _ = try g.acceptByte('"');
+    try g.restoreFrom(snap);
+
+    // After restore we're back at expect_first_key_or_close. `"` is allowed
+    // (start the required key); `}` is NOT allowed because required `a` is unseen.
+    const mask = try g.allowedBytes();
+    try testing.expect(mask.contains('"'));
+    try testing.expect(!mask.contains('}'));
+}
+
+test "cruise-app-style nested schema parses sample response" {
+    const src =
+        \\{
+        \\  "type":"object",
+        \\  "properties":{
+        \\    "blocks":{
+        \\      "type":"array",
+        \\      "items":{
+        \\        "anyOf":[
+        \\          {"type":"object","properties":{"type":{"enum":["text"]},"content":{"type":"string"}},"required":["type","content"],"additionalProperties":false}
+        \\        ]
+        \\      }
+        \\    }
+        \\  },
+        \\  "required":["blocks"],
+        \\  "additionalProperties":false
+        \\}
+    ;
+    var schema = try parseSchema(testing.allocator, src);
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    try feed(&g, "{\"blocks\":[{\"type\":\"text\",\"content\":\"hi\"}]}");
+    try testing.expect(g.isComplete());
+}
+
+// A masked model whose real argmax is off-schema falls back to whitespace,
+// which the grammar admitted forever; the bar is that a free-whitespace run
+// ends and structure is forced.
+test "free whitespace is capped so a masked model cannot idle forever" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
+    );
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    try testing.expect(try g.acceptByte('{'));
+    var i: usize = 0;
+    while (i < MAX_FREE_WS) : (i += 1) try testing.expect(try g.acceptByte('\n'));
+    try testing.expect(!try g.acceptByte('\n'));
+    const capped = try g.allowedBytes();
+    try testing.expect(!capped.contains(' '));
+    try testing.expect(capped.contains('"'));
+
+    // A snapshot carries the run; a structural byte resets it.
+    const snap = try g.snapshot();
+    defer g.discardSnapshot(snap);
+    try feed(&g, "\"x\":");
+    try testing.expect(try g.acceptByte(' '));
+    try g.restoreFrom(snap);
+    try testing.expect(!try g.acceptByte(' '));
+
+    try feed(&g, "\"x\":1}");
+    try testing.expect(g.isComplete());
+}
+
+fn expectLegal(g: *Grammar, byte: u8, legal: bool) !void {
+    const mask = try g.allowedBytes();
+    try testing.expectEqual(legal, mask.contains(byte));
+}
+
+// A number has no closing byte: its end is the stream's end, so a terminable
+// root number must accept EOS or the mask leaves only more digits.
+test "a terminable root number is complete" {
+    var integer = try parseSchema(testing.allocator, "{\"type\":\"integer\"}");
+    defer integer.deinit();
+    var g = try Grammar.init(testing.allocator, &integer);
+    defer g.deinit();
+    try testing.expect(!g.isComplete());
+    try feed(&g, "-");
+    try testing.expect(!g.isComplete());
+    try feed(&g, "4");
+    try testing.expect(g.isComplete());
+    try feed(&g, "2");
+    try testing.expect(g.isComplete());
+    try expectLegal(&g, '.', false);
+
+    var number = try parseSchema(testing.allocator, "{\"type\":\"number\"}");
+    defer number.deinit();
+    inline for (.{ "0", "12", "1.5", "-1.5e3", "2E+10" }) |text| {
+        var n = try Grammar.init(testing.allocator, &number);
+        defer n.deinit();
+        try feed(&n, text);
+        try testing.expect(n.isComplete());
+    }
+    inline for (.{ "-", "1.", "1e", "1e+" }) |text| {
+        var n = try Grammar.init(testing.allocator, &number);
+        defer n.deinit();
+        try feed(&n, text);
+        try testing.expect(!n.isComplete());
+    }
+}
+
+test "a nested number is not complete before its parent closes" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"array\",\"items\":{\"type\":\"integer\"}}");
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "[42");
+    try testing.expect(!g.isComplete());
+    try feed(&g, "]");
+    try testing.expect(g.isComplete());
+}
+
+test "root keyword and string values complete on their last byte" {
+    inline for (.{
+        .{ "{\"type\":\"boolean\"}", "true" },
+        .{ "{\"type\":\"boolean\"}", "false" },
+        .{ "{\"type\":\"null\"}", "null" },
+        .{ "{\"type\":\"string\"}", "\"hi\"" },
+    }) |case| {
+        var schema = try parseSchema(testing.allocator, case[0]);
+        defer schema.deinit();
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, case[1]);
+        try testing.expect(g.isComplete());
+    }
+}
+
+test "a full array offers only its closing bracket" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"array","items":{"type":"integer"},"maxItems":3}
+    );
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "[1,2,3");
+    try expectLegal(&g, ',', false);
+    try feed(&g, "]");
+    try testing.expect(g.isComplete());
+}
+
+test "an object with no admissible key offers only its closing brace" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{");
+    try expectLegal(&g, '"', false);
+    try feed(&g, "}");
+    try testing.expect(g.isComplete());
+}
+
+test "a string at maxLength offers only its closing quote" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"string","maxLength":2}
+    );
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "\"a\\n");
+    try expectLegal(&g, '\\', false);
+    try expectLegal(&g, 'b', false);
+    try feed(&g, "\"");
+    try testing.expect(g.isComplete());
+}
+
+// Every state the grammar can reach has a legal byte or is a finished root.
+test "no reachable grammar state is a dead end" {
+    const schemas = [_][]const u8{
+        "{\"type\":\"integer\"}",
+        "{\"type\":\"number\"}",
+        "{\"type\":\"object\"}",
+        "{\"type\":\"object\",\"additionalProperties\":true}",
+        "{\"type\":\"array\",\"maxItems\":2}",
+        "{\"type\":\"array\",\"items\":{\"type\":\"object\"},\"minItems\":1,\"maxItems\":2}",
+        "{\"type\":\"string\",\"minLength\":1,\"maxLength\":3}",
+        "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"maxLength\":2},\"b\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"maxItems\":2}},\"required\":[\"a\"]}",
+        "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"object\"},\"b\":{\"type\":\"boolean\"}},\"required\":[\"a\",\"b\"]}",
+        "{\"type\":\"array\",\"items\":{\"enum\":[\"x\",\"yz\",3]},\"maxItems\":3}",
+        "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"},\"ab\":{\"type\":\"null\"}},\"required\":[\"a\",\"ab\"]}",
+        "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"maxLength\":1},\"maxItems\":1},\"minItems\":1}",
+        "{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}",
+    };
+    for (schemas) |src| {
+        var schema = try parseSchema(testing.allocator, src);
+        defer schema.deinit();
+        var seed: u64 = 0;
+        while (seed < 200) : (seed += 1) {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            var g = try Grammar.init(testing.allocator, &schema);
+            defer g.deinit();
+            var steps: usize = 0;
+            while (steps < 300 and !g.isComplete()) : (steps += 1) {
+                const mask = try g.allowedBytes();
+                var legal: [256]u8 = undefined;
+                var n: usize = 0;
+                for (0..256) |b| {
+                    if (mask.contains(@intCast(b)) and !isWs(@intCast(b))) {
+                        legal[n] = @intCast(b);
+                        n += 1;
+                    }
+                }
+                if (n == 0) {
+                    std.debug.print("dead end: schema {s} seed {d} step {d}\n", .{ src, seed, steps });
+                    return error.GrammarDeadEnd;
+                }
+                try testing.expect(try g.acceptByte(legal[rnd.uintLessThan(usize, n)]));
+            }
+        }
+    }
+}
+
+test "a value whose schema names no type accepts any object" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","required":["meta"],"properties":{"meta":{"description":"free-form"}}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{\"meta\":{\"k\":[1,{\"x\":null}]}}");
+    try testing.expect(g.isComplete());
+}
+
+test "grammar enforces a $ref into $defs like the inlined schema" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","additionalProperties":false,"required":["facts"],
+        \\ "properties":{"facts":{"type":"array","items":{"$ref":"#/$defs/Fact"}}},
+        \\ "$defs":{"Fact":{"type":"object","additionalProperties":false,"required":["kind"],
+        \\   "properties":{"kind":{"enum":["fact"]}}}}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{\"facts\":[{\"kind\":\"fact\"}]}");
+    try testing.expect(g.isComplete());
+
+    var bad = try Grammar.init(testing.allocator, &schema);
+    defer bad.deinit();
+    try testing.expectError(error.GrammarRejected, feed(&bad, "{\"facts\":[false"));
+}
+
+test "grammar enforces a recursive $ref at every depth" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","additionalProperties":false,"required":["name"],
+        \\ "properties":{"name":{"type":"string"},"children":{"type":"array","items":{"$ref":"#"}}}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{\"name\":\"a\",\"children\":[{\"name\":\"b\",\"children\":[{\"name\":\"c\"}]}]}");
+    try testing.expect(g.isComplete());
+
+    var bad = try Grammar.init(testing.allocator, &schema);
+    defer bad.deinit();
+    try testing.expectError(error.GrammarRejected, feed(&bad, "{\"name\":\"a\",\"children\":[{\"x"));
+}
+// ==== src/json_schema.zig ====
+//! JSON Schema → internal IR for grammar-constrained decoding.
+//!
+//! Supports the "common" subset:
+//!   * type (single string or array, incl. null/integer/number/string/boolean/object/array)
+//!   * properties / required / additionalProperties
+//!   * items (homogeneous array)
+//!   * anyOf / oneOf (treated identically for grammar purposes)
+//!   * enum / const (treated as a 1-element enum)
+//!   * minLength / maxLength
+//!   * minItems / maxItems
+//!   * minimum / maximum / exclusiveMinimum / exclusiveMaximum
+//!   * pattern (regex; see regex.zig)
+//!   * $ref to a local JSON pointer (`#`, `#/$defs/Name`, `#/definitions/Name`),
+//!     recursive refs included; any other ref stays `any`
+//!
+//! Strict OpenAI mode: when `additionalProperties` is unspecified, defaults to `false`.
+//!
+//! A `Schema` owns an arena allocator; freeing the schema frees every node, string,
+//! property name, and compiled regex in one shot.
+
+const std = @import("std");
+const regex = @import("regex.zig");
+
+pub const Kind = enum {
+    any,
+    null_,
+    boolean,
+    integer,
+    number,
+    string,
+    array,
+    object,
+    enum_,
+    any_of,
+};
+
+pub const Property = struct {
+    name: []const u8,
+    schema: *const Node,
+    required: bool,
+};
+
+pub const Node = struct {
+    kind: Kind,
+
+    // string
+    str_min_len: ?u32 = null,
+    str_max_len: ?u32 = null,
+    str_pattern: ?*const regex.Nfa = null,
+
+    // number / integer
+    num_min: ?f64 = null,
+    num_max: ?f64 = null,
+    num_excl_min: ?f64 = null,
+    num_excl_max: ?f64 = null,
+
+    // array
+    arr_items: ?*const Node = null,
+    arr_min_items: ?u32 = null,
+    arr_max_items: ?u32 = null,
+
+    // object
+    obj_properties: []const Property = &.{}, // sorted alphabetically by name
+    obj_additional: bool = false,
+
+    // enum / const
+    enum_values: []const EnumValue = &.{},
+
+    // any_of (and one_of)
+    any_of_options: []const *const Node = &.{},
+};
+
+/// A single enum/const value rendered as canonical JSON text.
+/// Keeping the textual form lets the grammar prefix-match incrementally.
+pub const EnumValue = struct {
+    /// Canonical JSON encoding, e.g. `"text"`, `42`, `true`, `null`, `{"a":1}`.
+    json: []const u8,
+};
+
+pub const Schema = struct {
+    arena: std.heap.ArenaAllocator,
+    root: *const Node,
+
+    pub fn deinit(self: *Schema) void {
+        self.arena.deinit();
+    }
+};
+
+/// Deepest schema-within-schema nesting `parse` accepts.
+pub const max_schema_depth: usize = 64;
+
+pub const ParseError = error{
+    InvalidSchema,
+    UnsupportedConstruct,
+    OutOfMemory,
+    InvalidPattern,
+};
+
+/// Parse a `std.json.Value` into a `Schema`. The returned schema owns its memory.
+pub fn parse(gpa: std.mem.Allocator, value: std.json.Value) ParseError!Schema {
+    var schema: Schema = .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .root = undefined,
+    };
+    errdefer schema.arena.deinit();
+
+    var ctx: Ctx = .{ .arena = schema.arena.allocator(), .root = value };
+    // The root is the `#` ref, so a recursive ref back to it lands on this node.
+    schema.root = try parseRef(&ctx, "#", 0);
+    return schema;
+}
+
+const Ctx = struct {
+    arena: std.mem.Allocator,
+    root: std.json.Value,
+    refs: std.StringHashMapUnmanaged(*Node) = .empty,
+};
+
+/// The slot is memoised before its target parses, so a recursive ref points back at it;
+/// the grammar only follows a child when it descends into it.
+fn parseRef(ctx: *Ctx, ref: []const u8, depth: usize) ParseError!*const Node {
+    if (ctx.refs.get(ref)) |slot| return slot;
+    var target = resolvePointer(ctx.root, ref) orelse return anyLeaf(ctx.arena);
+    var hops: u8 = 0;
+    while (target == .object) : (hops += 1) {
+        const next = target.object.get("$ref") orelse break;
+        if (next != .string) break;
+        if (hops == 16) return anyLeaf(ctx.arena); // a ref chain that never reaches a schema
+        target = resolvePointer(ctx.root, next.string) orelse return anyLeaf(ctx.arena);
+    }
+    const slot = try ctx.arena.create(Node);
+    try ctx.refs.put(ctx.arena, ref, slot);
+    slot.* = (try parseNode(ctx, target, depth)).*;
+    return slot;
+}
+
+/// A local JSON pointer into the root's objects; anything else is unresolved.
+fn resolvePointer(root: std.json.Value, ref: []const u8) ?std.json.Value {
+    if (ref.len == 0 or ref[0] != '#') return null;
+    var node = root;
+    var it = std.mem.tokenizeScalar(u8, ref[1..], '/');
+    while (it.next()) |escaped| {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        var i: usize = 0;
+        while (i < escaped.len) : (i += 1) {
+            if (len == buf.len) return null;
+            buf[len] = escaped[i];
+            if (escaped[i] == '~' and i + 1 < escaped.len and (escaped[i + 1] == '0' or escaped[i + 1] == '1')) {
+                buf[len] = if (escaped[i + 1] == '1') '/' else '~';
+                i += 1;
+            }
+            len += 1;
+        }
+        if (node != .object) return null;
+        node = node.object.get(buf[0..len]) orelse return null;
+    }
+    return node;
+}
+
+fn anyLeaf(arena: std.mem.Allocator) ParseError!*const Node {
+    const node = try arena.create(Node);
+    node.* = .{ .kind = .any };
+    return node;
+}
+
+fn parseNode(ctx: *Ctx, value: std.json.Value, depth: usize) ParseError!*const Node {
+    const arena = ctx.arena;
+    if (depth > max_schema_depth) return error.InvalidSchema;
+    if (value != .object) {
+        // Boolean schema: `true` (any), `false` (none — we don't model "none").
+        if (value == .bool) {
+            const node = try arena.create(Node);
+            node.* = .{ .kind = .any };
+            return node;
+        }
+        return error.InvalidSchema;
+    }
+    const obj = value.object;
+
+    if (obj.get("$ref")) |r| {
+        if (r == .string) return parseRef(ctx, r.string, depth);
+    }
+
+    // anyOf / oneOf — branching schemas. Both compile to a Kind.any_of node.
+    if (obj.get("anyOf")) |v| return try parseAnyOf(ctx, v, depth);
+    if (obj.get("oneOf")) |v| return try parseAnyOf(ctx, v, depth);
+
+    // enum / const — one or more allowed literal values.
+    if (obj.get("const")) |v| {
+        const node = try arena.create(Node);
+        node.* = .{
+            .kind = .enum_,
+            .enum_values = try makeEnumValues(arena, &.{v}),
+        };
+        return node;
+    }
+    if (obj.get("enum")) |v| {
+        if (v != .array) return error.InvalidSchema;
+        const node = try arena.create(Node);
+        node.* = .{
+            .kind = .enum_,
+            .enum_values = try makeEnumValues(arena, v.array.items),
+        };
+        return node;
+    }
+
+    // type — may be a string or an array of strings. Array form compiles to anyOf.
+    const type_val = obj.get("type") orelse {
+        // Unspecified type — treat as `any`. Consumers will allow any JSON value.
+        const node = try arena.create(Node);
+        node.* = .{ .kind = .any };
+        return node;
+    };
+
+    if (type_val == .array) {
+        var options = try arena.alloc(*const Node, type_val.array.items.len);
+        for (type_val.array.items, 0..) |t, i| {
+            if (t != .string) return error.InvalidSchema;
+            // Synthesize a single-type schema by cloning `obj` minus the `type` array.
+            options[i] = try parseSingleType(ctx, obj, t.string, depth);
+        }
+        const node = try arena.create(Node);
+        node.* = .{ .kind = .any_of, .any_of_options = options };
+        return node;
+    }
+    if (type_val != .string) return error.InvalidSchema;
+    return try parseSingleType(ctx, obj, type_val.string, depth);
+}
+
+fn parseAnyOf(ctx: *Ctx, v: std.json.Value, depth: usize) ParseError!*const Node {
+    const arena = ctx.arena;
+    if (v != .array) return error.InvalidSchema;
+    if (v.array.items.len == 0) return error.InvalidSchema;
+    var options = try arena.alloc(*const Node, v.array.items.len);
+    for (v.array.items, 0..) |item, i| {
+        options[i] = try parseNode(ctx, item, depth + 1);
+    }
+    const node = try arena.create(Node);
+    node.* = .{ .kind = .any_of, .any_of_options = options };
+    return node;
+}
+
+fn parseSingleType(ctx: *Ctx, obj: std.json.ObjectMap, t: []const u8, depth: usize) ParseError!*const Node {
+    const arena = ctx.arena;
+    const node = try arena.create(Node);
+
+    if (std.mem.eql(u8, t, "null")) {
+        node.* = .{ .kind = .null_ };
+    } else if (std.mem.eql(u8, t, "boolean")) {
+        node.* = .{ .kind = .boolean };
+    } else if (std.mem.eql(u8, t, "integer")) {
+        node.* = .{
+            .kind = .integer,
+            .num_min = readF64(obj, "minimum"),
+            .num_max = readF64(obj, "maximum"),
+            .num_excl_min = readF64(obj, "exclusiveMinimum"),
+            .num_excl_max = readF64(obj, "exclusiveMaximum"),
+        };
+    } else if (std.mem.eql(u8, t, "number")) {
+        node.* = .{
+            .kind = .number,
+            .num_min = readF64(obj, "minimum"),
+            .num_max = readF64(obj, "maximum"),
+            .num_excl_min = readF64(obj, "exclusiveMinimum"),
+            .num_excl_max = readF64(obj, "exclusiveMaximum"),
+        };
+    } else if (std.mem.eql(u8, t, "string")) {
+        var pattern_nfa: ?*const regex.Nfa = null;
+        if (obj.get("pattern")) |pv| {
+            if (pv != .string) return error.InvalidSchema;
+            pattern_nfa = regex.compile(arena, pv.string) catch return error.InvalidPattern;
+        }
+        node.* = .{
+            .kind = .string,
+            .str_min_len = readU32(obj, "minLength"),
+            .str_max_len = readU32(obj, "maxLength"),
+            .str_pattern = pattern_nfa,
+        };
+    } else if (std.mem.eql(u8, t, "array")) {
+        var items_node: ?*const Node = null;
+        if (obj.get("items")) |iv| {
+            // Tuple form (`items: [a, b]`) is not in our subset.
+            if (iv == .array) return error.UnsupportedConstruct;
+            items_node = try parseNode(ctx, iv, depth + 1);
+        }
+        node.* = .{
+            .kind = .array,
+            .arr_items = items_node,
+            .arr_min_items = readU32(obj, "minItems"),
+            .arr_max_items = readU32(obj, "maxItems"),
+        };
+    } else if (std.mem.eql(u8, t, "object")) {
+        // additionalProperties defaults to `false` (OpenAI strict semantics).
+        var additional: bool = false;
+        if (obj.get("additionalProperties")) |ap| {
+            if (ap == .bool) additional = ap.bool
+            // `additionalProperties: <schema>` would constrain extra keys; we don't
+            // model that yet, so treat any non-bool form as "allow any extra".
+            else additional = true;
+        }
+        const props = if (obj.get("properties")) |pv|
+            try parseProperties(ctx, pv, obj.get("required"), depth)
+        else
+            &[_]Property{};
+        node.* = .{
+            .kind = .object,
+            .obj_properties = props,
+            .obj_additional = additional,
+        };
+    } else {
+        return error.UnsupportedConstruct;
+    }
+
+    return node;
+}
+
+fn parseProperties(
+    ctx: *Ctx,
+    properties: std.json.Value,
+    required: ?std.json.Value,
+    depth: usize,
+) ParseError![]Property {
+    const arena = ctx.arena;
+    if (properties != .object) return error.InvalidSchema;
+    const map = properties.object;
+
+    // Build required set
+    var req_set: std.StringHashMapUnmanaged(void) = .empty;
+    if (required) |r| {
+        if (r != .array) return error.InvalidSchema;
+        for (r.array.items) |item| {
+            if (item != .string) return error.InvalidSchema;
+            try req_set.put(arena, item.string, {});
+        }
+    }
+
+    var props = try arena.alloc(Property, map.count());
+    var i: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        const name_owned = try arena.dupe(u8, entry.key_ptr.*);
+        const child = try parseNode(ctx, entry.value_ptr.*, depth + 1);
+        props[i] = .{
+            .name = name_owned,
+            .schema = child,
+            .required = req_set.contains(name_owned),
+        };
+    }
+    // Sort alphabetically — keeps prefix-matching deterministic regardless of
+    // the JSON parser's internal map order.
+    std.mem.sort(Property, props, {}, lessThanProperty);
+    return props;
+}
+
+fn lessThanProperty(_: void, a: Property, b: Property) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn makeEnumValues(arena: std.mem.Allocator, items: []const std.json.Value) ParseError![]EnumValue {
+    var out = try arena.alloc(EnumValue, items.len);
+    for (items, 0..) |v, i| {
+        out[i] = .{ .json = try canonicalJson(arena, v) };
+    }
+    return out;
+}
+
+/// Render a `std.json.Value` to canonical JSON text (no extraneous whitespace).
+/// Used so the grammar can prefix-match against allowed enum/const literals byte-by-byte.
+fn canonicalJson(arena: std.mem.Allocator, value: std.json.Value) ParseError![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(arena);
+    try writeCanonical(arena, &buf, value, 0);
+    return try buf.toOwnedSlice(arena);
+}
+
+fn writeCanonical(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), value: std.json.Value, depth: usize) ParseError!void {
+    if (depth > max_schema_depth) return error.InvalidSchema;
+    switch (value) {
+        .null => try buf.appendSlice(arena, "null"),
+        .bool => |b| try buf.appendSlice(arena, if (b) "true" else "false"),
+        .integer => |i| {
+            try buf.print(arena, "{d}", .{i});
+        },
+        .number_string => |s| try buf.appendSlice(arena, s),
+        .float => |f| {
+            try buf.print(arena, "{d}", .{f});
+        },
+        .string => |s| try writeJsonString(arena, buf, s),
+        .array => |arr| {
+            try buf.append(arena, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try buf.append(arena, ',');
+                try writeCanonical(arena, buf, item, depth + 1);
+            }
+            try buf.append(arena, ']');
+        },
+        .object => |o| {
+            try buf.append(arena, '{');
+            // Sorted keys for deterministic output
+            var keys = arena.alloc([]const u8, o.count()) catch return error.OutOfMemory;
+            defer arena.free(keys);
+            var it = o.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) keys[i] = entry.key_ptr.*;
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+            for (keys, 0..) |k, j| {
+                if (j > 0) try buf.append(arena, ',');
+                try writeJsonString(arena, buf, k);
+                try buf.append(arena, ':');
+                try writeCanonical(arena, buf, o.get(k).?, depth + 1);
+            }
+            try buf.append(arena, '}');
+        },
+    }
+}
+
+fn writeJsonString(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) ParseError!void {
+    try buf.append(arena, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(arena, "\\\""),
+            '\\' => try buf.appendSlice(arena, "\\\\"),
+            '\n' => try buf.appendSlice(arena, "\\n"),
+            '\r' => try buf.appendSlice(arena, "\\r"),
+            '\t' => try buf.appendSlice(arena, "\\t"),
+            0...8, 0x0B, 0x0C, 0x0E...0x1F => {
+                var esc: [6]u8 = undefined;
+                const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+                try buf.appendSlice(arena, n);
+            },
+            else => try buf.append(arena, c),
+        }
+    }
+    try buf.append(arena, '"');
+}
+
+fn readU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| if (i < 0) null else @intCast(i),
+        else => null,
+    };
+}
+
+fn readF64(obj: std.json.ObjectMap, key: []const u8) ?f64 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch null,
+        else => null,
+    };
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn parseStr(gpa: std.mem.Allocator, src: []const u8) !Schema {
+    const v = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+    defer v.deinit();
+    return parse(gpa, v.value);
+}
+
+test "parse simple object schema with required" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.object, s.root.kind);
+    try testing.expectEqual(@as(usize, 1), s.root.obj_properties.len);
+    try testing.expectEqualStrings("name", s.root.obj_properties[0].name);
+    try testing.expect(s.root.obj_properties[0].required);
+    try testing.expectEqual(Kind.string, s.root.obj_properties[0].schema.kind);
+    try testing.expect(!s.root.obj_additional);
+}
+
+test "additionalProperties defaults to false (OpenAI strict)" {
+    var s = try parseStr(testing.allocator, "{\"type\":\"object\"}");
+    defer s.deinit();
+    try testing.expect(!s.root.obj_additional);
+}
+
+test "additionalProperties:true is honored" {
+    var s = try parseStr(testing.allocator, "{\"type\":\"object\",\"additionalProperties\":true}");
+    defer s.deinit();
+    try testing.expect(s.root.obj_additional);
+}
+
+test "anyOf becomes any_of node" {
+    var s = try parseStr(testing.allocator,
+        \\{"anyOf":[{"type":"string"},{"type":"null"}]}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.any_of, s.root.kind);
+    try testing.expectEqual(@as(usize, 2), s.root.any_of_options.len);
+    try testing.expectEqual(Kind.string, s.root.any_of_options[0].kind);
+    try testing.expectEqual(Kind.null_, s.root.any_of_options[1].kind);
+}
+
+test "type as array compiles to any_of" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":["string","null"]}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.any_of, s.root.kind);
+    try testing.expectEqual(@as(usize, 2), s.root.any_of_options.len);
+}
+
+test "enum values render to canonical JSON" {
+    var s = try parseStr(testing.allocator,
+        \\{"enum":["text","cruise_cards",42,true,null]}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.enum_, s.root.kind);
+    try testing.expectEqual(@as(usize, 5), s.root.enum_values.len);
+    try testing.expectEqualStrings("\"text\"", s.root.enum_values[0].json);
+    try testing.expectEqualStrings("\"cruise_cards\"", s.root.enum_values[1].json);
+    try testing.expectEqualStrings("42", s.root.enum_values[2].json);
+    try testing.expectEqualStrings("true", s.root.enum_values[3].json);
+    try testing.expectEqualStrings("null", s.root.enum_values[4].json);
+}
+
+test "const collapses to single-element enum" {
+    var s = try parseStr(testing.allocator, "{\"const\":\"hello\"}");
+    defer s.deinit();
+    try testing.expectEqual(Kind.enum_, s.root.kind);
+    try testing.expectEqual(@as(usize, 1), s.root.enum_values.len);
+    try testing.expectEqualStrings("\"hello\"", s.root.enum_values[0].json);
+}
+
+test "string constraints are captured" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"string","minLength":2,"maxLength":10}
+    );
+    defer s.deinit();
+    try testing.expectEqual(@as(?u32, 2), s.root.str_min_len);
+    try testing.expectEqual(@as(?u32, 10), s.root.str_max_len);
+}
+
+test "number constraints are captured" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"number","minimum":0,"exclusiveMaximum":1}
+    );
+    defer s.deinit();
+    try testing.expectEqual(@as(?f64, 0), s.root.num_min);
+    try testing.expectEqual(@as(?f64, 1), s.root.num_excl_max);
+}
+
+test "array with items schema" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":3}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.array, s.root.kind);
+    try testing.expect(s.root.arr_items != null);
+    try testing.expectEqual(Kind.integer, s.root.arr_items.?.kind);
+    try testing.expectEqual(@as(?u32, 1), s.root.arr_min_items);
+    try testing.expectEqual(@as(?u32, 3), s.root.arr_max_items);
+}
+
+test "properties are sorted alphabetically" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"},"m":{"type":"boolean"}}}
+    );
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 3), s.root.obj_properties.len);
+    try testing.expectEqualStrings("a", s.root.obj_properties[0].name);
+    try testing.expectEqualStrings("m", s.root.obj_properties[1].name);
+    try testing.expectEqualStrings("z", s.root.obj_properties[2].name);
+}
+
+test "nested cruise-app-style schema" {
+    const src =
+        \\{
+        \\  "type":"object",
+        \\  "properties":{
+        \\    "blocks":{
+        \\      "type":"array",
+        \\      "items":{
+        \\        "anyOf":[
+        \\          {"type":"object","properties":{"type":{"enum":["text"]},"content":{"type":"string"}},"required":["type","content"],"additionalProperties":false}
+        \\        ]
+        \\      }
+        \\    }
+        \\  },
+        \\  "required":["blocks"],
+        \\  "additionalProperties":false
+        \\}
+    ;
+    var s = try parseStr(testing.allocator, src);
+    defer s.deinit();
+    try testing.expectEqual(Kind.object, s.root.kind);
+    try testing.expectEqual(@as(usize, 1), s.root.obj_properties.len);
+    const blocks = s.root.obj_properties[0].schema;
+    try testing.expectEqual(Kind.array, blocks.kind);
+    const item = blocks.arr_items.?;
+    try testing.expectEqual(Kind.any_of, item.kind);
+    try testing.expectEqual(@as(usize, 1), item.any_of_options.len);
+    const text_opt = item.any_of_options[0];
+    try testing.expectEqual(Kind.object, text_opt.kind);
+    // Type discriminator should be an enum
+    var found_type = false;
+    for (text_opt.obj_properties) |p| {
+        if (std.mem.eql(u8, p.name, "type")) {
+            found_type = true;
+            try testing.expectEqual(Kind.enum_, p.schema.kind);
+            try testing.expectEqualStrings("\"text\"", p.schema.enum_values[0].json);
+        }
+    }
+    try testing.expect(found_type);
+}
+
+test "boolean schema true => any" {
+    const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, "true", .{});
+    defer v.deinit();
+    var s = try parse(testing.allocator, v.value);
+    defer s.deinit();
+    try testing.expectEqual(Kind.any, s.root.kind);
+}
+
+test "unsupported tuple-form items returns error" {
+    const result = parseStr(testing.allocator,
+        \\{"type":"array","items":[{"type":"string"},{"type":"number"}]}
+    );
+    try testing.expectError(error.UnsupportedConstruct, result);
+}
+
+test "schema nesting beyond the depth limit is refused, ordinary depth parses" {
+    const a = testing.allocator;
+    const deep = max_schema_depth + 8;
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(a);
+    for (0..deep) |_| try src.appendSlice(a, "{\"type\":\"array\",\"items\":");
+    try src.appendSlice(a, "{\"type\":\"string\"}");
+    for (0..deep) |_| try src.append(a, '}');
+    try testing.expectError(error.InvalidSchema, parseStr(a, src.items));
+
+    var ok: std.ArrayListUnmanaged(u8) = .empty;
+    defer ok.deinit(a);
+    for (0..16) |_| try ok.appendSlice(a, "{\"type\":\"array\",\"items\":");
+    try ok.appendSlice(a, "{\"type\":\"string\"}");
+    for (0..16) |_| try ok.append(a, '}');
+    var s = try parseStr(a, ok.items);
+    s.deinit();
+}
+
+test "$ref resolves through $defs and definitions; a recursive ref points back at its target" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{
+        \\  "a":{"$ref":"#/$defs/A"},"b":{"$ref":"#/definitions/B"},"self":{"$ref":"#"},
+        \\  "remote":{"$ref":"https://example.com/x.json"}},
+        \\ "$defs":{"A":{"type":"string"}},"definitions":{"B":{"type":"integer"}}}
+    );
+    defer s.deinit();
+    const props = s.root.obj_properties; // sorted: a, b, remote, self
+    try testing.expectEqual(Kind.string, props[0].schema.kind);
+    try testing.expectEqual(Kind.integer, props[1].schema.kind);
+    try testing.expectEqual(Kind.any, props[2].schema.kind);
+    try testing.expectEqual(s.root, props[3].schema);
+}
+
+test "a $ref chain that never reaches a schema relaxes to any" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{"loop":{"$ref":"#/$defs/A"}},"$defs":{"A":{"$ref":"#/$defs/A"}}}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.any, s.root.obj_properties[0].schema.kind);
+}
+
+test "a JSON pointer keeps an unknown ~ escape and decodes ~0 and ~1" {
+    var s = try parseStr(testing.allocator,
+        \\{"type":"object","properties":{"a":{"$ref":"#/$defs/a~1b"},"c":{"$ref":"#/$defs/t~0"},"d":{"$ref":"#/$defs/x~2"}},
+        \\ "$defs":{"a/b":{"type":"string"},"t~":{"type":"integer"},"x~2":{"type":"boolean"}}}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.string, s.root.obj_properties[0].schema.kind);
+    try testing.expectEqual(Kind.integer, s.root.obj_properties[1].schema.kind);
+    try testing.expectEqual(Kind.boolean, s.root.obj_properties[2].schema.kind);
+}
+// ==== src/stop_sequences.zig ====
+//! Client stop sequences: ONE definition of which stop fires and where the text is cut, shared by
+//! every non-streaming surface (`earliest`) and every streaming surface (`Gate`), so a stream and a
+//! non-stream answer are the same bytes.
+//!
+//! The rule: the earliest occurrence in the generated text wins, whatever order the client listed
+//! the stops in; at the same start the SHORTEST stop wins, because it is the one a stream sees
+//! complete first (a stream cannot know a longer stop is coming).
+
+const std = @import("std");
+
+pub const Hit = struct { index: usize, stop: []const u8 };
+
+pub fn earliest(text: []const u8, stops: []const []const u8) ?Hit {
+    var best: ?Hit = null;
+    for (stops) |stop| {
+        if (stop.len == 0) continue;
+        const idx = std.mem.indexOf(u8, text, stop) orelse continue;
+        if (best) |b| if (b.index < idx or (b.index == idx and b.stop.len <= stop.len)) continue;
+        best = .{ .index = idx, .stop = stop };
+    }
+    return best;
+}
+
+/// Start of the longest suffix of `text` that is a proper prefix of some stop (`text.len` if none):
+/// the bytes a later token could still turn into a match.
+fn pendingStart(text: []const u8, stops: []const []const u8) usize {
+    var start: usize = 0;
+    while (start < text.len) : (start += 1) {
+        const tail = text[start..];
+        for (stops) |stop| {
+            if (stop.len > tail.len and std.mem.startsWith(u8, stop, tail)) return start;
+        }
+    }
+    return text.len;
+}
+
+/// Number of trailing bytes of `s` that start a UTF-8 sequence the string ends before completing
+/// (0 when it ends on a character boundary or in bytes no continuation can repair).
+pub fn utf8TrailingIncomplete(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    var i: usize = s.len;
+    var cont: usize = 0;
+    while (cont < 3 and i > 0) {
+        i -= 1;
+        if (s[i] & 0xC0 != 0x80) break;
+        cont += 1;
+    }
+    if (i >= s.len) return 0;
+    const lead = s[i];
+    const expected: usize = if (lead & 0x80 == 0) 1 else if (lead & 0xE0 == 0xC0) 2 else if (lead & 0xF0 == 0xE0) 3 else if (lead & 0xF8 == 0xF0) 4 else return 0;
+    const actual = s.len - i;
+    return if (actual < expected) actual else 0;
+}
+
+/// Sits between the decoded token text and every delivery path (reasoning, content, tool buffer):
+/// bytes that may still become part of a stop are held back until resolved, so a streamed delta is
+/// never retracted by a stop that completes a token later. A token may also end inside a
+/// character: those bytes wait in `carry` for the next token, so no delta ends mid-character.
+pub const Gate = struct {
+    stops: []const []const u8,
+    held: std.ArrayList(u8) = .empty,
+    carry: [3]u8 = undefined,
+    carry_len: u8 = 0,
+    /// Set once a stop fired; nothing is pushed after that.
+    matched: ?[]const u8 = null,
+
+    pub fn deinit(self: *Gate, allocator: std.mem.Allocator) void {
+        self.held.deinit(allocator);
+    }
+
+    pub fn hasHeld(self: *const Gate) bool {
+        return self.held.items.len > 0 or self.carry_len > 0;
+    }
+
+    /// Feed one token's decoded bytes; the result is the text safe to deliver now (caller frees).
+    pub fn push(self: *Gate, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        try self.held.appendSlice(allocator, self.carry[0..self.carry_len]);
+        self.carry_len = 0;
+        try self.held.appendSlice(allocator, text);
+        const tail = utf8TrailingIncomplete(self.held.items);
+        @memcpy(self.carry[0..tail], self.held.items[self.held.items.len - tail ..]);
+        self.carry_len = @intCast(tail);
+        self.held.shrinkRetainingCapacity(self.held.items.len - tail);
+        return self.release(allocator, false);
+    }
+
+    /// The generation ended: resolve what is held (a stop that completed, else the plain tail) with
+    /// the unfinished character after it, delivered as the bytes the model produced.
+    pub fn finish(self: *Gate, allocator: std.mem.Allocator) ![]u8 {
+        try self.held.appendSlice(allocator, self.carry[0..self.carry_len]);
+        self.carry_len = 0;
+        return self.release(allocator, true);
+    }
+
+    fn release(self: *Gate, allocator: std.mem.Allocator, final: bool) ![]u8 {
+        const buf = self.held.items;
+        const wait_from = if (final) buf.len else pendingStart(buf, self.stops);
+        var n = wait_from;
+        // A completed stop waits for a held prefix that starts EARLIER: it could still complete as the earlier match.
+        if (earliest(buf, self.stops)) |hit| if (hit.index <= wait_from) {
+            n = hit.index;
+            self.matched = hit.stop;
+        };
+        const out = try allocator.dupe(u8, buf[0..n]);
+        if (self.matched != null) {
+            self.held.clearRetainingCapacity();
+        } else {
+            std.mem.copyForwards(u8, buf[0 .. buf.len - n], buf[n..]);
+            self.held.shrinkRetainingCapacity(buf.len - n);
+        }
+        return out;
+    }
+};
+
+/// Test driver: what a streaming surface delivers for `fragments` (the decoded token texts, in
+/// order), and which stop fired. Returns the concatenated delivered bytes (caller frees).
+pub fn streamDelivered(allocator: std.mem.Allocator, fragments: []const []const u8, stops: []const []const u8, matched: *?[]const u8) ![]u8 {
+    var gate = Gate{ .stops = stops };
+    defer gate.deinit(allocator);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (fragments) |f| {
+        const piece = try gate.push(allocator, f);
+        defer allocator.free(piece);
+        try out.appendSlice(allocator, piece);
+        if (gate.matched != null) break;
+    }
+    if (gate.matched == null and gate.hasHeld()) {
+        const tail = try gate.finish(allocator);
+        defer allocator.free(tail);
+        try out.appendSlice(allocator, tail);
+    }
+    matched.* = gate.matched;
+    return out.toOwnedSlice(allocator);
+}
+
+/// Test oracle for the non-streaming surfaces: the same cut they apply to the whole text.
+pub fn nonStreamDelivered(text: []const u8, stops: []const []const u8, matched: *?[]const u8) []const u8 {
+    const hit = earliest(text, stops) orelse {
+        matched.* = null;
+        return text;
+    };
+    matched.* = hit.stop;
+    return text[0..hit.index];
+}
+
+fn expectParity(fragments: []const []const u8, stops: []const []const u8) !void {
+    const t = std.testing;
+    const whole = try std.mem.concat(t.allocator, u8, fragments);
+    defer t.allocator.free(whole);
+    var want_stop: ?[]const u8 = null;
+    const want = nonStreamDelivered(whole, stops, &want_stop);
+    var got_stop: ?[]const u8 = null;
+    const got = try streamDelivered(t.allocator, fragments, stops, &got_stop);
+    defer t.allocator.free(got);
+    try t.expectEqualStrings(want, got);
+    try t.expectEqual(want_stop != null, got_stop != null);
+    if (want_stop) |w| try t.expectEqualStrings(w, got_stop.?);
+}
+
+/// Every way to cut `text` into two and into three consecutive fragments.
+fn expectParityAtEverySplit(text: []const u8, stops: []const []const u8) !void {
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        try expectParity(&.{ text[0..i], text[i..] }, stops);
+        var j: usize = i;
+        while (j <= text.len) : (j += 1) try expectParity(&.{ text[0..i], text[i..j], text[j..] }, stops);
+    }
+}
+
+test "a stop prefix is held until the stop completes, never delivered" {
+    const t = std.testing;
+    var matched: ?[]const u8 = null;
+    const got = try streamDelivered(t.allocator, &.{ "alpha", "ST", "OP", "beta" }, &.{"STOP"}, &matched);
+    defer t.allocator.free(got);
+    try t.expectEqualStrings("alpha", got);
+    try t.expectEqualStrings("STOP", matched.?);
+}
+
+test "a held prefix that never completes is delivered at the end of the generation" {
+    const t = std.testing;
+    var matched: ?[]const u8 = null;
+    const got = try streamDelivered(t.allocator, &.{ "alpha", "ST", "O" }, &.{"STOP"}, &matched);
+    defer t.allocator.free(got);
+    try t.expectEqualStrings("alphaSTO", got);
+    try t.expectEqual(@as(?[]const u8, null), matched);
+    const wrong = try streamDelivered(t.allocator, &.{ "a", "ST", "X", "b" }, &.{"STOP"}, &matched);
+    defer t.allocator.free(wrong);
+    try t.expectEqualStrings("aSTXb", wrong);
+}
+
+test "the earliest occurrence wins, not the first listed stop" {
+    const t = std.testing;
+    const text = "alphaSTOPbetaEND";
+    const hit = earliest(text, &.{ "END", "STOP" }).?;
+    try t.expectEqual(@as(usize, 5), hit.index);
+    try t.expectEqualStrings("STOP", hit.stop);
+    // Same start: the shortest stop, whatever the request order.
+    try t.expectEqualStrings("ST", earliest("xSTOP", &.{ "STOP", "ST" }).?.stop);
+    try t.expectEqualStrings("ST", earliest("xSTOP", &.{ "ST", "STOP" }).?.stop);
+    try t.expectEqual(@as(?Hit, null), earliest("all clear", &.{"STOP"}));
+}
+
+test "a completed stop waits for a held prefix that could complete earlier" {
+    try expectParityAtEverySplit("ABCD", &.{ "ABCD", "BC" });
+    try expectParityAtEverySplit("xABCXy", &.{ "ABCD", "BC" });
+    try expectParityAtEverySplit("xABCD", &.{ "BC", "ABCD" });
+}
+
+test "stream and non-stream agree at every split of a multi-token stop" {
+    try expectParityAtEverySplit("alpha STOP beta", &.{"STOP"});
+    try expectParityAtEverySplit("alpha\n\nHuman: beta", &.{"\n\nHuman:"});
+    try expectParityAtEverySplit("alpha STO beta", &.{"STOP"});
+    try expectParityAtEverySplit("alpha ST", &.{"STOP"});
+    try expectParityAtEverySplit("naïve STÖP tail", &.{"STÖP"});
+}
+
+test "stream and non-stream agree for every order of several stops" {
+    const a = "END";
+    const b = "STOP";
+    const c = "ta ST";
+    const text = "alphaSTOPbetaENDgammaST";
+    const perms = [_][3][]const u8{
+        .{ a, b, c }, .{ a, c, b }, .{ b, a, c }, .{ b, c, a }, .{ c, a, b }, .{ c, b, a },
+    };
+    for (perms) |p| try expectParityAtEverySplit(text, &p);
+    for (perms) |p| try expectParityAtEverySplit("xENDySTOP", &p);
+}
+
+test "a stop inside reasoning cuts the raw stream where it falls" {
+    try expectParityAtEverySplit("<think>weigh STOP more</think>answer", &.{"STOP"});
+    try expectParityAtEverySplit("<think>weigh it</think>answer END", &.{ "END", "</think>ans" });
+}
+
+test "a stop that overlaps itself resolves at its first occurrence" {
+    try expectParityAtEverySplit("aaab", &.{"aab"});
+    try expectParityAtEverySplit("ababab", &.{"abab"});
+}
+
+test "utf8TrailingIncomplete reports only a sequence the string ends before completing" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+    try t.expectEqual(@as(usize, 0), utf8TrailingIncomplete("hello"));
+    try t.expectEqual(@as(usize, 0), utf8TrailingIncomplete("\xF0\x9F\x8E\x89"));
+    try t.expectEqual(@as(usize, 3), utf8TrailingIncomplete("\xF0\x9F\x8E"));
+    try t.expectEqual(@as(usize, 2), utf8TrailingIncomplete("\xF0\x9F"));
+    try t.expectEqual(@as(usize, 1), utf8TrailingIncomplete("\xF0"));
+    try t.expectEqual(@as(usize, 2), utf8TrailingIncomplete("hi\xF0\x9F"));
+}
+
+// Chat, Anthropic, Responses and completions all deliver through this Gate, so one parity run
+// covers the four streaming loops.
+test "a stream that ends inside a character delivers the same bytes as the non-stream text" {
+    const tails = [_][]const u8{ "\xC3", "\xE2\x82", "\xE2", "\xF0\x9F\x8E", "\xF0\x9F", "\xF0" };
+    for (tails) |tail| {
+        for ([_][]const u8{ "alpha", "alphaST", "alphaSTO", "" }) |head| {
+            const text = try std.mem.concat(std.testing.allocator, u8, &.{ head, tail });
+            defer std.testing.allocator.free(text);
+            try expectParityAtEverySplit(text, &.{"STOP"});
+            try expectParityAtEverySplit(text, &.{});
+        }
+    }
+}
+
+test "an incomplete character completed by the next token is delivered whole, around a held stop prefix" {
+    try expectParityAtEverySplit("alphaST\xC3\xA9tail", &.{"STOP"});
+    try expectParityAtEverySplit("alpha\xF0\x9F\x8E\x89STO", &.{"STOP"});
+    try expectParityAtEverySplit("alpha\xF0\x9F\x8E\x89STOP", &.{"STOP"});
+}
+// ==== src/token_mask.zig ====
+//! Token-level mask for grammar-constrained sampling.
+//!
+//! Given a `Grammar` (current state) and a `TokenBytes` table (decoded bytes for
+//! every vocab id), `buildMask` simulates feeding each token's bytes through the
+//! grammar and records which tokens would be accepted. The result is a
+//! `[vocab_size]bool` slice the sampler uses to mask invalid logits.
+//!
+//! Performance
+//! -----------
+//! A step probes only tokens whose first two bytes the grammar can accept
+//! (`by_first` + `second_off` under `allowedBytes`), and inside a string body
+//! every quote-free token is admitted without a walk. The naive full-vocab
+//! walk cost up to a second per generated token on a 248k vocabulary.
+
+const std = @import("std");
+const grammar_mod = @import("json_grammar.zig");
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
+
+pub const Grammar = grammar_mod.Grammar;
+
+/// Decoded byte sequence for every token id in a tokenizer's vocabulary.
+/// Built once per server load and reused across all requests.
+pub const TokenBytes = struct {
+    /// `bytes[id]` is the byte sequence the model would emit when sampling token
+    /// `id`. `null` for tokens that have no plain-byte interpretation (special
+    /// tokens like BOS/EOS, padding, and chat template tags). The grammar should
+    /// never sample a `null`-bytes token while constrained — except for EOS,
+    /// which is allowed only when the grammar is complete.
+    bytes: []const ?[]const u8,
+    /// EOS token id, if known. Allowed only when the grammar's root value is fully parsed.
+    eos_id: ?u32,
+    /// Probe-able token ids (non-null, non-empty, not EOS) grouped by first
+    /// byte, each bucket ordered by `secondClass`.
+    by_first: [256][]const u32,
+    /// `by_first[b][second_off[b][k]..second_off[b][k+1]]` is the run of
+    /// second-byte class `k` inside bucket `b`.
+    second_off: [256][SECOND_CLASSES + 1]u32,
+    /// Probe-able tokens legal anywhere in a JSON string body: no quote,
+    /// backslash or control byte.
+    string_plain: []const u32,
+    /// The remaining probe-able tokens, walked individually inside a string.
+    string_other: []const u32,
+    arena: std.heap.ArenaAllocator,
+
+    /// Index `bytes` (which must live in `arena`); takes ownership of the arena.
+    pub fn init(arena: std.heap.ArenaAllocator, bytes: []const ?[]const u8, eos_id: ?u32) BuildError!TokenBytes {
+        var self: TokenBytes = .{ .bytes = bytes, .eos_id = eos_id, .by_first = undefined, .second_off = undefined, .string_plain = &.{}, .string_other = &.{}, .arena = arena };
+        errdefer self.arena.deinit();
+        const a = self.arena.allocator();
+
+        var counts: [256]u32 = @splat(0);
+        var n_plain: usize = 0;
+        var n_other: usize = 0;
+        for (bytes, 0..) |maybe, id| {
+            const b = probeable(maybe, id, eos_id) orelse continue;
+            counts[b[0]] += 1;
+            if (isStringPlain(b)) n_plain += 1 else n_other += 1;
+        }
+        var buckets: [256][]u32 = undefined;
+        for (&buckets, counts) |*bucket, n| bucket.* = try a.alloc(u32, n);
+        const plain = try a.alloc(u32, n_plain);
+        const other = try a.alloc(u32, n_other);
+        var fill: [256]usize = @splat(0);
+        n_plain = 0;
+        n_other = 0;
+        for (bytes, 0..) |maybe, id| {
+            const b = probeable(maybe, id, eos_id) orelse continue;
+            const id32: u32 = @intCast(id);
+            buckets[b[0]][fill[b[0]]] = id32;
+            fill[b[0]] += 1;
+            if (isStringPlain(b)) {
+                plain[n_plain] = id32;
+                n_plain += 1;
+            } else {
+                other[n_other] = id32;
+                n_other += 1;
+            }
+        }
+        for (buckets, 0..) |ids, b| {
+            std.mem.sort(u32, ids, bytes, struct {
+                fn lt(ctx: []const ?[]const u8, x: u32, y: u32) bool {
+                    return secondClass(ctx[x].?) < secondClass(ctx[y].?);
+                }
+            }.lt);
+            var i: u32 = 0;
+            for (&self.second_off[b], 0..) |*off, k| {
+                while (i < ids.len and secondClass(bytes[ids[i]].?) < k) i += 1;
+                off.* = i;
+            }
+            self.by_first[b] = ids;
+        }
+        self.string_plain = plain;
+        self.string_other = other;
+        return self;
+    }
+
+    pub fn deinit(self: *TokenBytes) void {
+        self.arena.deinit();
+    }
+};
+
+/// Class 0 = single-byte token, 1 + c = second byte c.
+const SECOND_CLASSES = 257;
+
+fn probeable(maybe: ?[]const u8, id: usize, eos_id: ?u32) ?[]const u8 {
+    const b = maybe orelse return null;
+    if (b.len == 0 or (eos_id != null and id == eos_id.?)) return null;
+    return b;
+}
+
+fn secondClass(b: []const u8) usize {
+    return if (b.len == 1) 0 else 1 + @as(usize, b[1]);
+}
+
+fn isStringPlain(b: []const u8) bool {
+    for (b) |c| if (c == '"' or c == '\\' or c < 0x20) return false;
+    return true;
+}
+
+pub const BuildError = error{OutOfMemory};
+
+/// Precompute the byte sequence for every token id in `tokenizer`.
+///
+/// For byte-level BPE, this reverses the GPT-2 byte→unicode mapping. For
+/// SentencePiece, this swaps `▁` (U+2581) for spaces. Special tokens
+/// (BOS/EOS/PAD/chat-template tags) decode to `null`.
+pub fn build(gpa: std.mem.Allocator, tokenizer: *const Tokenizer) BuildError!TokenBytes {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    var arena_owned = true;
+    errdefer if (arena_owned) arena.deinit();
+    const a = arena.allocator();
+
+    // Vocab size = max id + 1 (id_to_token may have gaps; treat missing ids as null).
+    var max_id: u32 = 0;
+    var it = tokenizer.id_to_token.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.* > max_id) max_id = entry.key_ptr.*;
+    }
+    var sit = tokenizer.special_tokens.iterator();
+    while (sit.next()) |entry| {
+        if (entry.value_ptr.* > max_id) max_id = entry.value_ptr.*;
+    }
+    const vocab_size: usize = @as(usize, max_id) + 1;
+
+    var bytes = try a.alloc(?[]const u8, vocab_size);
+    @memset(bytes, null);
+
+    // Build a set of special-token ids (always null bytes).
+    var special_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer special_ids.deinit(gpa);
+    var sit2 = tokenizer.special_tokens.iterator();
+    while (sit2.next()) |entry| {
+        try special_ids.put(gpa, entry.value_ptr.*, {});
+    }
+
+    var tit = tokenizer.id_to_token.iterator();
+    while (tit.next()) |entry| {
+        const id = entry.key_ptr.*;
+        if (special_ids.contains(id)) continue;
+        const decoded = decodeSingle(a, tokenizer, id) catch continue;
+        bytes[id] = decoded;
+    }
+
+    arena_owned = false;
+    return TokenBytes.init(arena, bytes, tokenizer.eos_id);
+}
+
+fn decodeSingle(arena: std.mem.Allocator, tokenizer: *const Tokenizer, id: u32) ![]const u8 {
+    const ids: [1]u32 = .{id};
+    // The tokenizer's existing decode handles all three tokenizer types,
+    // including byte-level unicode→byte reversal and SentencePiece ▁→space.
+    return try tokenizer.decode(arena, &ids, false);
+}
+
+pub const MaskResult = struct { allowed: u32, probed: u32 };
+
+/// Build the mask of allowed token ids given the grammar's current state.
+///
+/// `mask` must be `vocab_size` long; written entries are `true` (allowed) or
+/// `false` (forbidden). Returns the allowed count and how many tokens were
+/// walked through the grammar to get there.
+///
+/// Special handling:
+///   * EOS token is allowed iff `grammar.isComplete()`.
+///   * If `grammar.isDead()`, the entire vocab is permitted (graceful fallback,
+///     matching the user-selected `ignore_mask` policy).
+pub fn buildMask(
+    grammar: *Grammar,
+    token_bytes: *const TokenBytes,
+    mask: []bool,
+) std.mem.Allocator.Error!MaskResult {
+    std.debug.assert(mask.len == token_bytes.bytes.len);
+
+    if (grammar.isDead()) {
+        @memset(mask, true);
+        return .{ .allowed = @intCast(mask.len), .probed = 0 };
+    }
+
+    @memset(mask, false);
+    var count: u32 = 0;
+
+    if (token_bytes.eos_id) |eos| {
+        if (eos < mask.len and grammar.isComplete()) {
+            mask[eos] = true;
+            count += 1;
+        }
+    }
+
+    // Outer snapshot — the per-token loop restores from this each iteration so
+    // we don't pay for per-byte snap/restore inside the grammar.
+    const snap = try grammar.snapshot();
+    defer grammar.discardSnapshot(snap);
+
+    var probed: u32 = 0;
+    if (grammar.stringBodyRoom()) |room| {
+        for (token_bytes.string_plain) |id| {
+            if (token_bytes.bytes[id].?.len <= room) {
+                mask[id] = true;
+                count += 1;
+            }
+        }
+        for (token_bytes.string_other) |id| {
+            probed += 1;
+            if (try probeToken(grammar, snap, token_bytes.bytes[id].?)) {
+                mask[id] = true;
+                count += 1;
+            }
+        }
+    } else {
+        // Two-level trie walk: a token is legal only if its first byte is,
+        // and then only if its second byte is legal in the state the first
+        // byte leaves behind. Single-byte tokens are decided by the first
+        // level alone.
+        const first = try grammar.allowedBytes();
+        for (token_bytes.by_first, 0..) |bucket, b| {
+            if (!first.contains(@intCast(b))) continue;
+            const off = token_bytes.second_off[b];
+            for (bucket[off[0]..off[1]]) |id| {
+                mask[id] = true;
+                count += 1;
+            }
+            try grammar.restoreFrom(snap);
+            _ = try grammar.acceptByteFast(@intCast(b));
+            const second = try grammar.allowedBytes();
+            for (1..SECOND_CLASSES) |k| {
+                if (!second.contains(@intCast(k - 1))) continue;
+                for (bucket[off[k]..off[k + 1]]) |id| {
+                    probed += 1;
+                    if (try probeToken(grammar, snap, token_bytes.bytes[id].?)) {
+                        mask[id] = true;
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    try grammar.restoreFrom(snap);
+    return .{ .allowed = count, .probed = probed };
+}
+
+fn probeToken(grammar: *Grammar, snap: Grammar.Snapshot, bytes: []const u8) !bool {
+    try grammar.restoreFrom(snap);
+    for (bytes) |b| {
+        if (!try grammar.acceptByteFast(b)) return false;
+    }
+    return true;
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const schema_mod = @import("json_schema.zig");
+
+fn parseSchema(gpa: std.mem.Allocator, src: []const u8) !grammar_mod.Schema {
+    const v = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+    defer v.deinit();
+    return schema_mod.parse(gpa, v.value);
+}
+
+test "buildMask: only valid first bytes are allowed for object schema" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const a = arena.allocator();
+
+    // Vocab: 0={, 1=[, 2="hello", 3=" ", 4=EOS
+    const vocab: [5]?[]const u8 = .{
+        try a.dupe(u8, "{"),
+        try a.dupe(u8, "["),
+        try a.dupe(u8, "\"hello\""),
+        try a.dupe(u8, " "),
+        null, // EOS
+    };
+    var tb = try TokenBytes.init(arena, &vocab, 4);
+    defer tb.deinit();
+
+    var mask: [5]bool = undefined;
+    const count = (try buildMask(&g, &tb, &mask)).allowed;
+
+    try testing.expect(mask[0]); // `{` is the start of the object
+    try testing.expect(!mask[1]); // `[` not allowed
+    try testing.expect(!mask[2]); // `"hello"` not allowed (string, but root is object)
+    try testing.expect(!mask[3]); // no whitespace before value
+    try testing.expect(!mask[4]); // EOS not allowed; grammar is incomplete
+    try testing.expectEqual(@as(u32, 1), count);
+}
+
+test "buildMask: EOS is allowed when grammar is complete" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"boolean\"}");
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    _ = try g.acceptByte('t');
+    _ = try g.acceptByte('r');
+    _ = try g.acceptByte('u');
+    _ = try g.acceptByte('e');
+    try testing.expect(g.isComplete());
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const a = arena.allocator();
+
+    const vocab: [3]?[]const u8 = .{
+        try a.dupe(u8, "x"),
+        try a.dupe(u8, " "),
+        null, // EOS
+    };
+    var tb = try TokenBytes.init(arena, &vocab, 2);
+    defer tb.deinit();
+
+    var mask: [3]bool = undefined;
+    _ = try buildMask(&g, &tb, &mask);
+
+    try testing.expect(!mask[0]); // garbage byte rejected
+    try testing.expect(!mask[1]); // no trailing whitespace
+    try testing.expect(mask[2]); // EOS allowed because root is accepted
+}
+
+test "buildMask: rejects multi-byte tokens that violate schema" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    _ = try g.acceptByte('{');
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const a = arena.allocator();
+
+    const vocab: [3]?[]const u8 = .{
+        try a.dupe(u8, "\"name"), // valid: starts the only key
+        try a.dupe(u8, "\"foo"), // invalid: `f` doesn't start any property
+        try a.dupe(u8, "}"), // invalid: required `name` not yet seen
+    };
+    var tb = try TokenBytes.init(arena, &vocab, null);
+    defer tb.deinit();
+
+    var mask: [3]bool = undefined;
+    _ = try buildMask(&g, &tb, &mask);
+
+    try testing.expect(mask[0]);
+    try testing.expect(!mask[1]);
+    try testing.expect(!mask[2]);
+}
+
+test "buildMask: dead grammar permits everything (graceful fallback)" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"boolean\"}");
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    // Force a dead state by feeding garbage that doesn't match.
+    g.dead = true;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const a = arena.allocator();
+
+    const vocab: [3]?[]const u8 = .{
+        try a.dupe(u8, "anything"),
+        try a.dupe(u8, "[]"),
+        try a.dupe(u8, "garbage"),
+    };
+    var tb = try TokenBytes.init(arena, &vocab, null);
+    defer tb.deinit();
+
+    var mask: [3]bool = undefined;
+    const count = (try buildMask(&g, &tb, &mask)).allowed;
+
+    try testing.expect(mask[0]);
+    try testing.expect(mask[1]);
+    try testing.expect(mask[2]);
+    try testing.expectEqual(@as(u32, 3), count);
+}
+
+/// Reference: the naive full-vocabulary walk the fast path must agree with.
+fn bruteMask(grammar: *Grammar, tb: *const TokenBytes, mask: []bool) !void {
+    @memset(mask, false);
+    if (grammar.isDead()) {
+        @memset(mask, true);
+        return;
+    }
+    if (tb.eos_id) |eos| mask[eos] = grammar.isComplete();
+    const snap = try grammar.snapshot();
+    defer grammar.discardSnapshot(snap);
+    for (tb.bytes, 0..) |maybe, id| {
+        const bytes = maybe orelse continue;
+        if (bytes.len == 0) continue;
+        if (tb.eos_id) |eos| if (id == eos) continue;
+        try grammar.restoreFrom(snap);
+        var ok = true;
+        for (bytes) |b| {
+            if (!try grammar.acceptByteFast(b)) {
+                ok = false;
+                break;
+            }
+        }
+        mask[id] = ok;
+    }
+    try grammar.restoreFrom(snap);
+}
+

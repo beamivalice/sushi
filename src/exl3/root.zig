@@ -198,6 +198,28 @@ pub fn parseExpertQuant(obj: std.json.ObjectMap) !Spec {
     return .{ .rate = rate, .codebook = codebook, .window = window };
 }
 
+pub fn shardStampAgrees(spec: Spec, k: ?[]const u8, codebook: ?[]const u8, window: ?[]const u8) !void {
+    if (codebook) |name| {
+        const cb = format.Codebook.fromName(name) orelse return error.Exl3ShardStampMismatch;
+        if (cb != spec.codebook) return error.Exl3ShardStampMismatch;
+    }
+    if (window) |bits| {
+        const parsed = std.fmt.parseInt(i64, bits, 10) catch return error.Exl3ShardStampMismatch;
+        const w = format.Window.fromBits(parsed) orelse return error.Exl3ShardStampMismatch;
+        if (w != spec.window) return error.Exl3ShardStampMismatch;
+    }
+    if (k) |text| {
+        const rate_k = std.fmt.parseFloat(f64, text) catch return error.Exl3ShardStampMismatch;
+        if (!std.math.isFinite(rate_k)) return error.Exl3ShardStampMismatch;
+        const scaled = @round(rate_k * 16.0);
+        if (@abs(rate_k * 16.0 - scaled) > 1e-6) return error.Exl3ShardStampMismatch;
+        if (scaled < format.Rate.min_n or scaled > format.Rate.max_n) return error.Exl3ShardStampMismatch;
+        const rate = format.kFromPackedDim(@intFromFloat(scaled)) orelse return error.Exl3ShardStampMismatch;
+        // A narrower k is over-billed, not wrong; only a wider stamp refuses.
+        if (rate.n > spec.rate.n) return error.Exl3ShardStampMismatch;
+    }
+}
+
 fn specFromConfigJson(allocator: std.mem.Allocator, raw: []const u8) !Spec {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();

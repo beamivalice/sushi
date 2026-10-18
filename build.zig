@@ -88,7 +88,8 @@ pub fn build(b: *std.Build) void {
 
     // The staged MLX library path must precede Homebrew's.
     addMlxLib(b, mod);
-    _ = addExl3Module(b, mod, target, optimize);
+    const exl3_mod = addExl3Module(b, mod, target, optimize);
+    mod.addImport("sushi_encoder", addEncoderModule(b, mod, exl3_mod, target, optimize));
     // webp include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -190,6 +191,15 @@ pub fn build(b: *std.Build) void {
     });
     test_build.dependOn(&b.addInstallArtifact(exl3_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
     test_step.dependOn(&b.addRunArtifact(exl3_tests).step);
+
+    const encoder_mod = addEncoderModule(b, test_mod, exl3_test_mod, target, optimize);
+    const encoder_tests = b.addTest(.{
+        .name = "encoder-test",
+        .root_module = encoder_mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+    test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+    test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
 }
 
 /// The unit tests compile as several binaries in parallel: one LLVM module is single-threaded.
@@ -286,6 +296,21 @@ fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.Resol
     });
     host.addImport("sushi_exl3", exl3);
     return exl3;
+}
+
+/// The encoder behind `sushi convert exl3`, also tested alone as `encoder-test`.
+fn addEncoderModule(b: *std.Build, host: *std.Build.Module, exl3: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const encoder = b.createModule(.{
+        .root_source_file = b.path("src/encoder/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "mlx_host", .module = host },
+            .{ .name = "sushi_exl3", .module = exl3 },
+        },
+    });
+    return encoder;
 }
 
 /// Link the NAX-enabled libraries staged by scripts/build-mlx.sh.

@@ -57,6 +57,8 @@ pub const Arch = enum {
     }
 };
 
+pub var rows_request: ?usize = null;
+
 /// Absolute output path from the environment, or null when capture is off.
 pub fn envPath() ?[]const u8 {
     const raw = std.c.getenv(ENV_VAR) orelse return null;
@@ -94,6 +96,26 @@ const Dense = struct {
     }
 };
 
+pub const CapturedRows = struct {
+    x: mlx.mlx_array,
+    ids: []i32,
+    topk: usize,
+};
+
+const RowTap = struct {
+    layer: usize,
+    x: std.ArrayList(mlx.mlx_array) = .empty,
+    ids: std.ArrayList(i32) = .empty,
+    topk: usize = 0,
+
+    fn clear(self: *RowTap, allocator: std.mem.Allocator) void {
+        for (self.x.items) |a| _ = mlx.mlx_array_free(a);
+        self.x.clearAndFree(allocator);
+        self.ids.clearAndFree(allocator);
+        self.topk = 0;
+    }
+};
+
 pub const Collector = struct {
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
@@ -105,6 +127,7 @@ pub const Collector = struct {
     layers: []Layer,
     o_proj: []Dense,
     lm_head: Dense = .{},
+    rows_tap: ?RowTap = null,
 
     pub fn init(allocator: std.mem.Allocator, s: mlx.mlx_stream, path: []const u8, num_layers: usize, experts: c_int, arch: Arch) !*Collector {
         if (experts <= 0 or num_layers == 0) return error.ImatrixBadGeometry;
@@ -141,17 +164,59 @@ pub const Collector = struct {
     /// `init` from the environment; null when capture is off or the model type
     /// has no expert-naming contract.
     pub fn forModel(allocator: std.mem.Allocator, s: mlx.mlx_stream, model_type: []const u8, num_layers: usize, experts: c_int) !?*Collector {
-        const path = envPath() orelse return null;
+        const path = envPath() orelse (if (rows_request != null) "" else return null);
         const arch = Arch.fromModelType(model_type) orelse {
             log.warn("[imatrix] no expert naming contract for model_type {s}: capture off\n", .{model_type});
             return null;
         };
         const self = try init(allocator, s, path, num_layers, experts, arch);
+        if (rows_request) |layer| self.armRows(layer);
         log.info("[imatrix] expert activation capture armed: {s} ({s}, {d} layers, {d} experts)\n", .{ path, @tagName(arch), num_layers, experts });
         return self;
     }
 
+    pub fn armRows(self: *Collector, layer: usize) void {
+        if (self.rows_tap) |*tap| tap.clear(self.allocator);
+        self.rows_tap = .{ .layer = layer };
+    }
+
+    pub fn takeRows(self: *Collector) !CapturedRows {
+        const tap = &(self.rows_tap orelse return error.ImatrixNoRows);
+        if (tap.x.items.len == 0) return error.ImatrixNoRows;
+        const parts = mlx.mlx_vector_array_new_data(tap.x.items.ptr, tap.x.items.len);
+        defer _ = mlx.mlx_vector_array_free(parts);
+        var joined = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(joined);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, parts, 0, self.s));
+        try mlx.check(mlx.mlx_array_eval(joined));
+        const ids = try tap.ids.toOwnedSlice(self.allocator);
+        const topk = tap.topk;
+        tap.clear(self.allocator);
+        return .{ .x = joined, .ids = ids, .topk = topk };
+    }
+
+    fn keepRows(self: *Collector, tap: *RowTap, x_rows: mlx.mlx_array, ids: mlx.mlx_array) !void {
+        const is = mlx.getShape(ids);
+        const k: usize = @intCast(is[1]);
+        if (tap.topk != 0 and tap.topk != k) return error.ImatrixBadShape;
+        var x32 = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(x32);
+        try mlx.check(mlx.mlx_astype(&x32, x_rows, .float32, self.s));
+        try mlx.check(mlx.mlx_array_eval(x32));
+        var i32s = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(i32s);
+        try mlx.check(mlx.mlx_astype(&i32s, ids, .int32, self.s));
+        try mlx.check(mlx.mlx_array_eval(i32s));
+        const host = mlx.mlx_array_data_int32(i32s) orelse return error.ImatrixBadShape;
+        const count: usize = @as(usize, @intCast(is[0])) * k;
+        try tap.ids.appendSlice(self.allocator, host[0..count]);
+        errdefer tap.ids.shrinkRetainingCapacity(tap.ids.items.len - count);
+        try tap.x.append(self.allocator, x32);
+        tap.topk = k;
+    }
+
     pub fn deinit(self: *Collector) void {
+        if (self.rows_tap) |*tap| tap.clear(self.allocator);
         for (self.layers) |*l| l.deinit();
         self.allocator.free(self.layers);
         for (self.o_proj) |*d| d.deinit();
@@ -236,6 +301,7 @@ pub const Collector = struct {
         const xs = mlx.getShape(x_rows);
         const is = mlx.getShape(ids);
         if (xs.len != 2 or is.len != 2 or is[0] != xs[0] or xs[0] <= 0 or is[1] <= 0) return error.ImatrixBadShape;
+        if (self.rows_tap) |*tap| if (tap.layer == layer) try self.keepRows(tap, x_rows, ids);
         const cnt = try self.counts(ids, is[0], is[1]);
         defer _ = mlx.mlx_array_free(cnt);
         const slot = &self.layers[layer];
@@ -388,6 +454,7 @@ pub const Collector = struct {
 
     /// Write the safetensors file. Returns its byte count.
     pub fn flush(self: *Collector) !u64 {
+        if (self.path.len == 0) return 0;
         const map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(map);
         var held: std.ArrayList(mlx.mlx_array) = .empty;
@@ -710,4 +777,68 @@ test "imatrix records a dense linear's input rows under its source weight name" 
     defer _ = mlx.mlx_array_free(absent);
     try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, "model.layers.0.self_attn.o_proj.weight") != 0);
     try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, "model.layers.1.mlp.experts.gate_up_proj") != 0);
+}
+
+test "imatrix keeps the armed layer's MLP input rows and routing ids for the encoder" {
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    const col = try Collector.init(alloc, s, "/dev/null", 3, 4, .qwen4_exp);
+    defer col.deinit();
+    try testing.expectError(error.ImatrixNoRows, col.takeRows());
+    col.armRows(1);
+
+    const x0 = [_]f32{ 1, 2, 3, 4 };
+    const x1 = [_]f32{ 5, 6 };
+    const x_other = [_]f32{ 9, 9 };
+    const ids0 = [_]i32{ 0, 3, 2, 1 };
+    const ids1 = [_]i32{ 1, 2 };
+    const a0 = mlx.mlx_array_new_data(&x0, &[_]c_int{ 2, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(a0);
+    const a1 = mlx.mlx_array_new_data(&x1, &[_]c_int{ 1, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(a1);
+    const ao = mlx.mlx_array_new_data(&x_other, &[_]c_int{ 1, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(ao);
+    const ia0 = mlx.mlx_array_new_data(&ids0, &[_]c_int{ 2, 2 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ia0);
+    const ia1 = mlx.mlx_array_new_data(&ids1, &[_]c_int{ 1, 2 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ia1);
+    try col.observeGateUp(1, a0, ia0);
+    try col.observeGateUp(0, ao, ia1);
+    try col.observeGateUp(1, a1, ia1);
+
+    const got = try col.takeRows();
+    defer _ = mlx.mlx_array_free(got.x);
+    defer alloc.free(got.ids);
+    try testing.expectEqual(@as(usize, 2), got.topk);
+    try testing.expectEqualSlices(i32, &.{ 0, 3, 2, 1, 1, 2 }, got.ids);
+    try testing.expectEqualSlices(c_int, &.{ 3, 2 }, mlx.getShape(got.x));
+    try mlx.check(mlx.mlx_array_eval(got.x));
+    const data = mlx.mlx_array_data_float32(got.x).?;
+    try testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, data[0..6]);
+    try testing.expectError(error.ImatrixNoRows, col.takeRows());
+}
+
+test "an encoder request arms the rows tap without the environment variable, and only for a known architecture" {
+    const alloc = testing.allocator;
+    defer rows_request = null;
+    rows_request = 2;
+    const col = (try Collector.forModel(alloc, mlx.gpuStream(), "qwen4_exp", 3, 4)) orelse return error.TestExpectedCollector;
+    defer col.deinit();
+    try testing.expectEqual(@as(usize, 2), col.rows_tap.?.layer);
+    try testing.expectEqual(@as(usize, 0), col.path.len);
+    try testing.expect((try Collector.forModel(alloc, mlx.gpuStream(), "lfm2", 3, 4)) == null);
+}
+
+test "a collector armed only for rows has no file to flush" {
+    const alloc = testing.allocator;
+    const col = try Collector.init(alloc, mlx.gpuStream(), "", 1, 2, .qwen4_exp);
+    defer col.deinit();
+    const x = [_]f32{ 1, 2 };
+    const ids = [_]i32{ 0, 1 };
+    const xa = mlx.mlx_array_new_data(&x, &[_]c_int{ 1, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(xa);
+    const ia = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, 2 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ia);
+    try col.observeGateUp(0, xa, ia);
+    try testing.expectEqual(@as(u64, 0), try col.flush());
 }

@@ -565,14 +565,21 @@ and they are listed because they made that work possible.
   * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
     checkpoints (Apache-2.0), the reference and parity oracle for
     `inkling_mm_model`.
-  * turboderp/exllamav3 (MIT), the EXL3 weight format served for routed
-    experts (`src/exl3/`): the 16x16
-    trellis tile packing, the MCG and MUL1 codebook decodes, the tensor-core
-    permutation and the suh/svh Hadamard transforms are re-implemented from its
-    reference; no exllamav3 code is shipped.
+  * turboderp/exllamav3 (MIT), the EXL3 format. `src/exl3/` re-implements the
+    16x16 trellis packing, the MCG and MUL1 decodes, the tensor-core permutation
+    and the suh/svh Hadamard from that reference. `src/encoder/` re-implements
+    the quantizer procedure in `modules/quant/exl3_lib/quantize.py`: block-RMS
+    regularize, the 0.025 diagonal damping, 16-row block LDL, reverse LDLQ and
+    the golden-section global scale folded into suh. The tile search is our own
+    Viterbi over the same trellis, a CPU reference and a Metal kernel, not their
+    CUDA kernel, and the output-Hessian sensitivity path is not implemented. No
+    exllamav3 code is shipped.
 
 Model weights downloaded at runtime carry their own licenses from their
 publishers. sushi does not redistribute them.
+
+WikiText-103 (Merity et al., CC BY-SA 3.0) is downloaded at runtime by
+`sushi convert exl3` as calibration text. sushi does not redistribute it.
 
 --------------------------------------------------------------------------------
 DOMPurify 3.4.16

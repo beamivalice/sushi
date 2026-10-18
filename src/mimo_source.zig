@@ -488,32 +488,14 @@ fn readShardStamp(allocator: Allocator, header: std.json.ObjectMap) !ShardStamp 
 
 fn validateShardStamps(source: *const SourceIndex, config: *const model.ModelConfig) !void {
     if (config.expert_layout != .exl3_k4) return;
+    const spec = @import("sushi_exl3").Spec{
+        .rate = config.expert_quant_rate,
+        .codebook = config.expert_quant_codebook,
+        .window = config.expert_quant_window,
+    };
     var it = source.stamps.valueIterator();
     while (it.next()) |stamp| {
-        if (stamp.codebook) |name| {
-            const cb = expert_exl3.Codebook.fromName(name) orelse return error.Exl3ShardStampMismatch;
-            if (cb != config.expert_quant_codebook) return error.Exl3ShardStampMismatch;
-        }
-        if (stamp.window) |bits| {
-            const parsed = std.fmt.parseInt(i64, bits, 10) catch return error.Exl3ShardStampMismatch;
-            const w = expert_exl3.Window.fromBits(parsed) orelse return error.Exl3ShardStampMismatch;
-            if (w != config.expert_quant_window) return error.Exl3ShardStampMismatch;
-        }
-        if (stamp.k) |text| {
-            // The stamp spells a rate ("2.5", "4"); the engine keys on the
-            // halfwords per tile it implies. The relation is the trellis
-            // shape's (`exl3TrellisAdmitted`): the config names the widest rate
-            // a layer packs and bills it, so a shard at or below it is
-            // over-billed rather than wrong, and only a wider one refuses.
-            const k = std.fmt.parseFloat(f64, text) catch return error.Exl3ShardStampMismatch;
-            if (!std.math.isFinite(k)) return error.Exl3ShardStampMismatch;
-            const scaled = @round(k * 16.0);
-            if (@abs(k * 16.0 - scaled) > 1e-6) return error.Exl3ShardStampMismatch;
-            if (scaled < expert_exl3.Rate.min_n or scaled > expert_exl3.Rate.max_n) return error.Exl3ShardStampMismatch;
-            const rate = expert_exl3.kFromPackedDim(@intFromFloat(scaled)) orelse return error.Exl3ShardStampMismatch;
-            if (rate.n > config.expert_quant_rate.n)
-                return error.Exl3ShardStampMismatch;
-        }
+        try @import("sushi_exl3").shardStampAgrees(spec, stamp.k, stamp.codebook, stamp.window);
     }
 }
 
