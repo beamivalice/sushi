@@ -43,6 +43,12 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A load-time constant table in the WRONG DTYPE silently widens every read (`constTableAs`).
 - Dtype-gate any `mlx_array_data_float32` load-time read.
 
+## Custom kernels
+
+- **MLX binds a `metal_kernel` input of fewer than 8 elements in the `constant` address space**: a kernel source never
+  declares `const device T*` from an input (`auto p = in + off`); the FP8 tile kernel's scales did, and a tiny linear
+  failed to build at 9..128 rows. Guard: the fp8_block small-scales test.
+
 ## Laziness and barriers
 
 - **A host read inside a layer loop is a GPU BARRIER**: defer non-consumed reads into ONE batched eval.

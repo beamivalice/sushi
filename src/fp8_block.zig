@@ -277,7 +277,7 @@ const TILE_BODY = GEOMETRY ++
     \\uint o_read = metal::min(n0 + lane, NROWS - 1u);
     \\uint rank_read = o_read / RPR;
     \\const device uint4* wrow = (const device uint4*)(w + (size_t)o_read * (size_t)K);
-    \\const device float* srow = scales + (rank_read * uint(BPR) + (o_read - rank_read * RPR) / 128u) * KB;
+    \\auto srow = scales + (rank_read * uint(BPR) + (o_read - rank_read * RPR) / 128u) * KB;
     \\for (uint k0 = sg * KCH; k0 < (sg + 1u) * KCH; k0 += 16u) {
     \\  uint4 wr = wrow[k0 >> 4];
     \\  float sc = srow[k0 >> 7];
@@ -1032,6 +1032,37 @@ test "fp8 block serving tile stays within bf16 rounding plus an f32 sum over the
                     try expectTileWithinBar(&tw, x, m, p, got);
                 }
             }
+        }
+    }
+}
+
+test "fp8 block serving builds at every width when the scales array is small enough for MLX's constant space" {
+    if (!naxForTest()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const armed = tile_nax;
+    defer tile_nax = armed;
+    tile_nax = true;
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC0457);
+    const rnd = prng.random();
+    // MLX binds an input of fewer than 8 elements as `constant`; K = 128 gives one scale per 128-row block.
+    for ([_]u32{ 128, 128 * 7, 128 * 8 }) |rows| {
+        var tw = try TestWeight.init(alloc, rnd, RowSplit.dense(rows), 128);
+        defer tw.deinit(alloc);
+        for ([_]usize{ 1, 8, 9, 20, 64, 100, 128, 129 }) |m| {
+            const x = try mimoX(alloc, rnd, m, tw.k);
+            defer alloc.free(x);
+            const xb = try uploadX(s, x, m, tw.k, .bfloat16);
+            defer _ = mlx.mlx_array_free(xb);
+            var out: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+            try projectServing(s, xb, tw.w, tw.sc, tw.split, &out);
+            defer _ = mlx.mlx_array_free(out[0]);
+            const got = try readAs32(alloc, s, out[0]);
+            defer alloc.free(got);
+            const st = errStats(&tw, x, m, 0, got);
+            // A bf16 weight rounding and a bf16 output rounding per term, whichever route the width takes.
+            try testing.expect(st.finite);
+            try testing.expect(st.max_rel_summands <= std.math.pow(f64, 2, -7));
         }
     }
 }
