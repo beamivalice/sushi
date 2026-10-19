@@ -156,6 +156,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **Metal caps each compiled kernel's threads per threadgroup by its register use**; MLX throws at a dispatch above it.
   M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
   A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
+  mlx-c exposes no per-pipeline limit; the encoder's launches read it off that throw and retry below it ([engine-exl3-encoder](engine-exl3-encoder.md#search)).
 - **A custom kernel whose source fails to compile kills the process** at its first eval (mlx-c `array.cpp:352`, exit
   255). The JIT probe declines only kernels that build. Compile a new source offline first: wrap it in MLX's
   custom-kernel template (inputs, their `_strides`, the attribute arguments, one instantiation per template set) and

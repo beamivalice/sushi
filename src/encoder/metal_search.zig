@@ -49,15 +49,23 @@ const Plan = struct {
 
 const single_cost_bytes = 16 * 1024;
 const single_prev_regs = 32;
-const single_threads = 1024;
+// The most a threadgroup can hold on any Apple GPU; a pipeline may allow fewer.
+const device_threads = 1024;
+const single_threads = device_threads;
 const plain_threads = 256;
+// The smallest pipeline limit MLX has reported so far; a launch never asks for more.
+var learned_threads: u32 = std.math.maxInt(u32);
 
 /// Wide windows keep one cost row in threadgroup memory, read a decode table and run 1024 threads per tile
 /// when every phase's predecessor costs fit in registers; other plans keep both rows and hash every codeword.
-fn buildPlan(rate: format.Rate, dec: format.Decode) Error!Plan {
-    const wide = try planFor(rate, dec, single_threads);
+fn buildPlan(rate: format.Rate, dec: format.Decode, max_threads: u32) Error!Plan {
+    const wide = try planFor(rate, dec, @min(single_threads, floorPow2(max_threads)));
     if (wide.single_costs) return wide;
-    return planFor(rate, dec, plain_threads);
+    return planFor(rate, dec, @min(plain_threads, floorPow2(max_threads)));
+}
+
+fn floorPow2(x: u32) u32 {
+    return if (x == 0) 0 else @as(u32, 1) << @intCast(31 - @clz(x));
 }
 
 fn planFor(rate: format.Rate, dec: format.Decode, max_threads: u32) Error!Plan {
@@ -588,7 +596,7 @@ pub fn encodeTiles(
     recon: ?[]f32,
 ) Error!void {
     if (packed_out.len != tiles.len / tile_len * rate.n) {
-        _ = try buildPlan(rate, dec);
+        _ = try buildPlan(rate, dec, device_threads);
         return if (tiles.len == 0) error.EmptyTensor else error.ShapeMismatch;
     }
     var search = try Search.submit(allocator, s, null, rate, dec, tiles, recon != null);
@@ -607,7 +615,25 @@ pub const Search = struct {
     launches: []Pending,
 
     pub fn submit(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool) Error!Search {
-        const plan = try buildPlan(rate, dec);
+        return submitCapped(allocator, s, pool, rate, dec, tiles, want_recon, device_threads);
+    }
+
+    /// Asks for `max_threads` per threadgroup, or for the pipeline limit MLX reports when a kernel cannot take that many.
+    pub fn submitCapped(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, max_threads: u32) Error!Search {
+        var cap = @min(max_threads, learned_threads);
+        while (true) {
+            return submitAt(allocator, s, pool, rate, dec, tiles, want_recon, cap) catch |e| {
+                const limit = (if (e == error.MlxError) mlx.takeThreadgroupLimit() else null) orelse return e;
+                learned_threads = @min(learned_threads, limit);
+                if (limit == 0 or limit >= cap) return e;
+                cap = limit;
+                continue;
+            };
+        }
+    }
+
+    fn submitAt(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, cap: u32) Error!Search {
+        const plan = try buildPlan(rate, dec, cap);
         if (tiles.len == 0) return error.EmptyTensor;
         if (tiles.len % tile_len != 0) return error.ShapeMismatch;
         const n_tiles = tiles.len / tile_len;
@@ -805,7 +831,7 @@ pub fn globalScaleBatch(
     if (rows % 128 != 0 or cols % 128 != 0) return error.GeometryUnsupported;
     if (out.len != inners.len) return error.ShapeMismatch;
     for (inners) |inner| if (inner.len != rows * cols) return error.ShapeMismatch;
-    _ = try buildPlan(rate, dec);
+    _ = try buildPlan(rate, dec, device_threads);
     const count = inners.len;
     if (count == 0) return;
 
@@ -1242,7 +1268,7 @@ pub fn finishBatch(
 ) anyerror!void {
     const count = prepared.reg.len;
     if (results.len != count) return error.ShapeMismatch;
-    _ = try buildPlan(rate, dec);
+    _ = try buildPlan(rate, dec, device_threads);
     if (count == 0) return;
     const in = prepared.in;
     const out = prepared.out;
@@ -1308,7 +1334,7 @@ pub fn quantizeBatch(
     results: []quantize.Quantized,
 ) Error!void {
     if (results.len != jobs.len) return error.ShapeMismatch;
-    _ = try buildPlan(rate, dec);
+    _ = try buildPlan(rate, dec, device_threads);
     var lap = stages_mod.Lap.start(stages);
     var prepared = try prepareBatch(allocator, null, jobs, in, out, mode, .f64);
     defer prepared.deinit();
@@ -1463,7 +1489,7 @@ pub fn quantizeNamed(
     if (in == 0 or out == 0) return error.EmptyTensor;
     if (in % 128 != 0 or out % 128 != 0) return error.GeometryUnsupported;
     if (w.len != in * out or h.len != in * in) return error.ShapeMismatch;
-    _ = try buildPlan(rate, dec);
+    _ = try buildPlan(rate, dec, device_threads);
     const both = try quantize.signs(allocator, seed, name, in + out);
     defer allocator.free(both);
     return quantizeTensor(allocator, s, w, h, in, out, both[0..in], both[in..], rate, dec, mode, stages);
@@ -1527,6 +1553,60 @@ test "metal_search: every admitted rate and window matches the CPU search code f
             }
         }
     }
+}
+
+test "metal_search: the 1024-thread single-cost plan needs 1024 threads and a lower pipeline limit plans another" {
+    const t = std.testing;
+    const rate = format.Rate{ .n = 32 };
+    const dec = format.Decode{ .codebook = .mcg, .window = .w15 };
+    const wide = try buildPlan(rate, dec, 1024);
+    try t.expect(wide.single_costs);
+    try t.expectEqual(@as(u32, 1024), wide.threads);
+    for ([_]u32{ 832, 640, 384, 256 }) |limit| {
+        const plan = try buildPlan(rate, dec, limit);
+        try t.expect(!plan.single_costs);
+        try t.expect(plan.threads <= limit);
+    }
+}
+
+test "metal_search: a pipeline limit below the launch size searches the same codes at a smaller threadgroup" {
+    mlx.installErrorHandler();
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(20261019);
+    const r = prng.random();
+    const n_tiles = 3;
+    var tiles: [n_tiles * tile_len]f32 = undefined;
+    for (&tiles) |*v| v.* = r.floatNorm(f32);
+    const cases = [_]struct { n: u32, cb: format.Codebook, win: format.Window }{
+        .{ .n = 32, .cb = .mcg, .win = .w15 },
+        .{ .n = 40, .cb = .mul1, .win = .w15 },
+        .{ .n = 32, .cb = .mcg, .win = .w12 },
+    };
+    // 832 and 384 are limits an M2 Pro reports. An M5 never refuses a plan, so the retry itself runs in the gpu_factor test.
+    for (cases) |c| {
+        const rate = format.Rate{ .n = c.n };
+        const dec = format.Decode{ .codebook = c.cb, .window = c.win };
+        var enc = try encode.Encoder.init(t.allocator, rate, dec);
+        defer enc.deinit();
+        for ([_]u32{ 2048, 832, 384, 128 }) |cap| {
+            const got_packed = try t.allocator.alloc(u16, n_tiles * c.n);
+            defer t.allocator.free(got_packed);
+            const got_recon = try t.allocator.alloc(f32, n_tiles * tile_len);
+            defer t.allocator.free(got_recon);
+            var search = try Search.submitCapped(t.allocator, s, null, rate, dec, &tiles, true, cap);
+            defer search.deinit();
+            try search.collect(null, got_packed, got_recon);
+            for (0..n_tiles) |ti| {
+                var want_packed: [128]u16 = undefined;
+                var want_recon: [tile_len]f32 = undefined;
+                _ = try enc.encodeTile(tiles[ti * tile_len ..][0..tile_len], want_packed[0..c.n], &want_recon);
+                try t.expectEqualSlices(u16, want_packed[0..c.n], got_packed[ti * c.n ..][0..c.n]);
+                try t.expectEqualSlices(f32, &want_recon, got_recon[ti * tile_len ..][0..tile_len]);
+            }
+        }
+    }
+    try t.expect(!mlx.errorPending());
 }
 
 test "metal_search: full tensor LDLQ and global scale match the CPU quantizer code for code" {

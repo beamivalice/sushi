@@ -27,11 +27,18 @@ pub const Stats = struct {
 pub const Options = struct {
     gpu_retries: usize = quantize.max_cholesky_retries,
     chunk_elems: usize = 40 * 2560 * 2560,
+    max_threads: u32 = device_threads,
 };
 
 const block = 16;
-const threads = 1024;
 const k_chunk = 256;
+// The most a threadgroup can hold on any Apple GPU; a pipeline may allow fewer.
+const device_threads = 1024;
+const simd_width = 32;
+// The kernel loads a 16x16 tile with one thread per element.
+const min_threads = 256;
+// The smallest pipeline limit MLX has reported so far; a launch never asks for more.
+var learned_threads: u32 = std.math.maxInt(u32);
 
 /// Float32 helpers of the kernel. The Cholesky factor of a 16x16 tile and its inverse run on one thread; a
 /// pivot that is not positive clears the matrix's flag and is replaced by 1 so the later steps stay finite.
@@ -153,15 +160,16 @@ const kernel_body =
 
 const max_kernels = 4;
 var kernel_ns: [max_kernels]usize = @splat(0);
+var kernel_threads: [max_kernels]u32 = @splat(0);
 var kernels: [max_kernels]mlx.mlx_fast_metal_kernel = undefined;
 var kernel_count: usize = 0;
 
-fn getKernel(allocator: std.mem.Allocator, n: usize) Error!mlx.mlx_fast_metal_kernel {
-    for (kernel_ns[0..kernel_count], kernels[0..kernel_count]) |kn, k| if (kn == n) return k;
+fn getKernel(allocator: std.mem.Allocator, n: usize, threads: u32) Error!mlx.mlx_fast_metal_kernel {
+    for (kernel_ns[0..kernel_count], kernel_threads[0..kernel_count], kernels[0..kernel_count]) |kn, kt, k| if (kn == n and kt == threads) return k;
     const body = try std.fmt.allocPrintSentinel(allocator, "const int N = {d};\nconst int KC = {d};\nconst int T = {d};\n{s}", .{ n, k_chunk, threads, kernel_body }, 0);
     defer allocator.free(body);
     var name_buf: [64]u8 = undefined;
-    const name = std.fmt.bufPrintSentinel(&name_buf, "sushi_encoder_ldl_factor_n{d}", .{n}, 0) catch unreachable;
+    const name = std.fmt.bufPrintSentinel(&name_buf, "sushi_encoder_ldl_factor_n{d}_t{d}", .{ n, threads }, 0) catch unreachable;
     const ins = [_][*:0]const u8{"a"};
     const outs = [_][*:0]const u8{ "l", "w", "good_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
@@ -173,10 +181,12 @@ fn getKernel(allocator: std.mem.Allocator, n: usize) Error!mlx.mlx_fast_metal_ke
     if (kernel_count == max_kernels) {
         _ = mlx.mlx_fast_metal_kernel_free(kernels[0]);
         kernel_ns[0] = n;
+        kernel_threads[0] = threads;
         kernels[0] = kernel;
         return kernel;
     }
     kernel_ns[kernel_count] = n;
+    kernel_threads[kernel_count] = threads;
     kernels[kernel_count] = kernel;
     kernel_count += 1;
     return kernel;
@@ -200,8 +210,8 @@ const Chunk = struct {
     }
 };
 
-fn factorChunk(allocator: std.mem.Allocator, s: mlx.mlx_stream, host: []const f32, count: usize, n: usize) Error!Chunk {
-    const kernel = try getKernel(allocator, n);
+fn factorChunk(allocator: std.mem.Allocator, s: mlx.mlx_stream, host: []const f32, count: usize, n: usize, threads: u32) Error!Chunk {
+    const kernel = try getKernel(allocator, n, threads);
     const b: c_int = @intCast(count);
     const nn: c_int = @intCast(n);
     const a = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ b, nn, nn }, 3, .float32);
@@ -211,8 +221,8 @@ fn factorChunk(allocator: std.mem.Allocator, s: mlx.mlx_stream, host: []const f3
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ b, nn, nn }, 3, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ b, nn, nn }, 3, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{b}, 1, .uint32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, b * threads, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, threads, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, b * @as(c_int, @intCast(threads)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(threads), 1, 1));
     const inputs = [_]Arr{a};
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -239,6 +249,20 @@ fn factorChunk(allocator: std.mem.Allocator, s: mlx.mlx_stream, host: []const f3
     try mlx.check(mlx.mlx_vector_array_append_value(evals, total));
     try mlx.check(mlx.mlx_eval(evals));
     return .{ .l = l, .good = good, .sum = total };
+}
+
+/// Runs the kernel at `want` threads, or at the pipeline limit MLX reports when the pipeline cannot take that many.
+fn factorChunkFit(allocator: std.mem.Allocator, s: mlx.mlx_stream, host: []const f32, count: usize, n: usize, want: u32) Error!Chunk {
+    var threads = @min(want, learned_threads) / simd_width * simd_width;
+    while (threads >= min_threads) {
+        return factorChunk(allocator, s, host, count, n, threads) catch |e| {
+            const limit = (if (e == error.MlxError) mlx.takeThreadgroupLimit() else null) orelse return e;
+            learned_threads = @min(learned_threads, limit);
+            threads = @min(threads - simd_width, limit / simd_width * simd_width);
+            continue;
+        };
+    }
+    return error.MlxError;
 }
 
 /// Factors every Hessian of `damped` (each `n` x `n`, already through `quantize.dampDiagonal`, whose mean is in
@@ -286,7 +310,7 @@ pub fn factorBatch(
                     dst[i * n + i] += bump;
                 };
             }
-            var chunk = try factorChunk(allocator, s, staging[0 .. batch.len * n * n], batch.len, n);
+            var chunk = try factorChunkFit(allocator, s, staging[0 .. batch.len * n * n], batch.len, n, opts.max_threads);
             defer chunk.deinit();
             const good = mlx.mlx_array_data_uint32(chunk.good).?;
             const sums = mlx.mlx_array_data_float32(chunk.sum).?;
@@ -570,6 +594,26 @@ test "gpu_factor: the chunk size does not change a byte" {
     defer small.deinit();
     try factorBatch(t.allocator, s, small.view(), small.means, n, .{ .chunk_elems = 2 * n * n }, &stats, small.ls);
     for (bank.ls, small.ls) |a, b| try t.expectEqualSlices(f32, a, b);
+}
+
+test "gpu_factor: a pipeline limit below the launch size lowers the threadgroup and not a byte of the factor" {
+    mlx.installErrorHandler();
+    const t = std.testing;
+    const n = 128;
+    const s = mlx.gpuStream();
+    var base = try Bank.init(t.allocator, 51, 4, n, 16, 0);
+    defer base.deinit();
+    var stats = Stats{};
+    try factorBatch(t.allocator, s, base.view(), base.means, n, .{}, &stats, base.ls);
+    // 2048 is refused by every pipeline (the device caps a threadgroup at 1024); 384 is a limit an M2 Pro reports.
+    for ([_]u32{ 2048, 384, 256 }) |cap| {
+        var bank = try Bank.init(t.allocator, 51, 4, n, 16, 0);
+        defer bank.deinit();
+        try factorBatch(t.allocator, s, bank.view(), bank.means, n, .{ .max_threads = cap }, &stats, bank.ls);
+        try t.expectEqual(@as(usize, 0), stats.fallbacks);
+        for (base.ls, bank.ls) |a, b| try t.expectEqualSlices(f32, a, b);
+    }
+    try t.expect(!mlx.errorPending());
 }
 
 test "gpu_factor: shapes and geometry are refused by name" {

@@ -12,6 +12,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **GLM-5.3-Flash accepts `medium` and `xhigh`**: `medium` is served as `high` and `xhigh` as `max`, with the same notice as Qwen's re-route.
 - **`--kv-quant 6`**: a 6-bit KV cache between kv4 and kv8, with `kv_quant` 6 in `model-settings.json` and per request, on Qwen, MiMo and GLM (GLM stores its MLA latent at 6 bits and keeps DFlash2 and prefix reuse).
 - **`sushi convert exl3` writes a Sushi pack from a source checkpoint**: Qwen3.8-Flash-Next routed experts as EXL3 at a rate you pick, with the trunk in the format its packs serve, resumable, then checkable with `sushi kld`.
+- **`sushi convert exl3` fits its Metal threadgroups to the GPU**: the encoder's kernels use the threads per threadgroup MLX reports each one can take instead of assuming 1024, which crashed it on an M2 Pro. Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the report (#57).
 
 ## v1.2.4 — Faster Qwen3.8-Flash-Next, more context admission, image cache
 

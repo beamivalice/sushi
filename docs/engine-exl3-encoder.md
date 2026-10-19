@@ -21,6 +21,11 @@ the same candidates in the same order either way, so the codes do not change. Ra
 even halfword counts the loader admits (`n` 16..128, K1 to K8), windows 12..16, codebooks MCG and MUL1. A bad rate, window
 or packed length is a named error.
 
+A launch starts at 1024 threads per threadgroup and never assumes a pipeline accepts them: MLX refuses a launch above the
+compiled kernel's own limit (384 to 832 on an M2 Pro) and names it, so `gpu_factor` and `metal_search` read the limit from
+that refusal and relaunch at the largest count they support below it. The factor's output does not depend on the count; the
+search drops the 1024-thread single-cost plan for the 256-thread plan, which picks the same codes.
+
 ## Quantizer
 
 `quantize.zig` turns a public weight `[in, out]` and its input Hessian into the packed tiles, `suh` and `svh`. `in` and `out`

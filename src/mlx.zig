@@ -751,6 +751,27 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// The limit MLX names when it refuses a custom-kernel launch that asks for more threads per threadgroup than
+/// the compiled pipeline allows; it varies with the kernel's register and threadgroup-memory use.
+pub fn threadgroupLimit(msg: []const u8) ?u32 {
+    const marker = "maximum allowed threads per threadgroup (";
+    const at = std.mem.indexOf(u8, msg, marker) orelse return null;
+    const digits = msg[at + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, digits, ')') orelse return null;
+    return std.fmt.parseInt(u32, digits[0..end], 10) catch null;
+}
+
+/// Consume the latch and return its limit when it is a threadgroup-size refusal; any other error stays latched.
+pub fn takeThreadgroupLimit() ?u32 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const limit = threadgroupLimit(mlx_error_buf[0..mlx_error_len]) orelse return null;
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return limit;
+}
+
 /// Consume the latch only when its message contains `needle`; any other error stays latched.
 pub fn takeErrorIf(needle: []const u8) bool {
     if (!mlx_error_latched.load(.acquire)) return false;
@@ -845,6 +866,24 @@ pub fn resetFaultChunkForTest() void {
     fault_step.reset();
     var buf: [512]u8 = undefined;
     _ = takeError(&buf);
+}
+
+test "a threadgroup-size refusal names the pipeline limit and only it is consumed" {
+    const t = std.testing;
+    const refusal = "Thread group size (1024) is greater than  the maximum allowed threads per threadgroup (832).";
+    try t.expectEqual(@as(?u32, 832), threadgroupLimit(refusal));
+    try t.expectEqual(@as(?u32, null), threadgroupLimit("[slice_update] Invalid slice sizes."));
+    try t.expectEqual(@as(?u32, null), threadgroupLimit("maximum allowed threads per threadgroup (x)"));
+
+    try t.expectEqual(@as(?u32, null), takeThreadgroupLimit());
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqual(@as(?u32, null), takeThreadgroupLimit());
+    try t.expect(errorPending());
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+    latchErrorForTest(refusal);
+    try t.expectEqual(@as(?u32, 832), takeThreadgroupLimit());
+    try t.expect(!errorPending());
 }
 
 test "an MLX memory failure is classified as a memory error, an argument error is not" {
