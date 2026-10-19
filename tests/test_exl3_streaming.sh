@@ -36,7 +36,7 @@ python3 - "$PACK" "$RUN/pack" <<'PY'
 import json, pathlib, sys
 source = pathlib.Path(sys.argv[1]).resolve(strict=True)
 config = json.loads((source / 'config.json').read_text())
-assert config.get('expert_quant', {}).get('format') == 'exl3', 'expected an EXL3 pack'
+assert config.get('expert_quant', {}).get('format') in ('exl3', 'stq'), 'expected an EXL3 or STQ pack'
 dest = pathlib.Path(sys.argv[2])
 dest.mkdir()
 for child in source.iterdir():

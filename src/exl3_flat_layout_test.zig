@@ -330,6 +330,50 @@ test "Sushi quant memory bills resident routed banks and enabled vision and MTP 
     try std.testing.expectEqual(all, duplicate);
 }
 
+const BankGroup = struct { experts: u64, n: u64, group: ?u32 };
+
+/// The nine tensors of one layer's routed banks; a group is named `.g<N>`, a null group is the uniform bank.
+fn appendBankSpecs(aa: std.mem.Allocator, specs: *std.ArrayList(TensorSpec), entries: *std.ArrayList(IndexSpec), layer: u32, groups: []const BankGroup, hidden: u64, inter: u64) !void {
+    const proj = [3][]const u8{ "gate", "up", "down" };
+    const part = [3][]const u8{ "trellis", "suh", "svh" };
+    for (groups) |g| for (0..9) |ci| {
+        const pi = ci / 3;
+        const input: u64 = if (pi == 2) inter else hidden;
+        const output: u64 = if (pi == 2) hidden else inter;
+        const weight = ci % 3 == 0;
+        const shape = try aa.alloc(u64, if (weight) 4 else 2);
+        if (weight) @memcpy(shape, &[_]u64{ g.experts, input / 16, output / 16, g.n }) else @memcpy(shape, &[_]u64{ g.experts, if (ci % 3 == 1) input else output });
+        var elements: u64 = 1;
+        for (shape) |d| elements *= d;
+        const key = if (g.group) |gi|
+            try std.fmt.allocPrint(aa, "language_model.model.layers.{d}.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ layer, proj[pi], gi, part[ci % 3] })
+        else
+            try std.fmt.allocPrint(aa, "language_model.model.layers.{d}.mlp.switch_mlp.{s}_proj.{s}", .{ layer, proj[pi], part[ci % 3] });
+        try specs.append(aa, .{ .key = key, .dtype = if (weight) "U16" else "F16", .shape = shape, .bytes = @intCast(elements * 2) });
+        try entries.append(aa, .{ .key = key, .file = "experts.safetensors" });
+    };
+}
+
+test "Sushi quant memory bills a rate-grouped layer's per-expert table" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var specs: std.ArrayList(TensorSpec) = .empty;
+    var entries: std.ArrayList(IndexSpec) = .empty;
+    try appendBankSpecs(arena.allocator(), &specs, &entries, 0, &.{ .{ .experts = 2, .n = 32, .group = 0 }, .{ .experts = 4, .n = 48, .group = 1 } }, 128, 256);
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs.items);
+    try writeIndex(io, a, tmp.dir, entries.items);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var stored: u64 = 0;
+    for (specs.items) |spec| stored += spec.bytes;
+    const bill = try model.qwenResidentWeightBytes(io, a, path, false, false);
+    try std.testing.expectEqual(stored + 6 * @import("sushi_exl3").rate_groups.META_WORDS * 4, bill.trunk);
+}
+
 test "flat EXL3 routed-key filtering is independent of shard filename" {
     var key_buf: [256]u8 = undefined;
     for (EXL3_SPECS) |spec| {
@@ -393,6 +437,22 @@ test "EXL3 streaming CPU store spans all nine tensors with exact source bytes" {
         }
         offset += spec.bytes;
     }
+}
+
+test "EXL3 streaming CPU admits a table bank only at a rate its codebook table has a row for" {
+    const stream = @import("expert_stream.zig");
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try createFixture(io, a, &tmp);
+    defer a.free(path);
+    const geometry: stream.Geometry = .{ .layers = 1, .experts = 2, .hidden = 16, .intermediate = 16, .exl3_rates = @as(u128, 1) << 16 };
+    try std.testing.expectError(error.Exl3CodebookTableRateMissing, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+    var named = geometry;
+    named.exl3_rates.? |= @as(u128, 1) << 32;
+    var store = try stream.ExpertStore.openLayout(a, path, named, .exl3_k4);
+    store.deinit();
 }
 
 test "EXL3 streaming CPU Sushi geometry ledger at 20 GiB bills every bank" {

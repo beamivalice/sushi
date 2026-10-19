@@ -39,6 +39,8 @@ pub const Layout = struct {
     hidden: u32,
     intermediate: u32,
     ceiling: format.Rate,
+    /// The bank rates the pack's codebook table has a row for (`Spec.rates`); null admits any up to `ceiling`.
+    rates: ?u128 = null,
     groups: [max_groups]Group = @splat(.{}),
     count: usize = 0,
     grouped: ?bool = null,
@@ -64,6 +66,7 @@ pub const Layout = struct {
             if (shape[1] != input / 16 or shape[2] != output / 16) return error.Exl3GroupGeometry;
             rate = format.kFromPackedDim(shape[3]) orelse return error.Exl3TrellisGeometry;
             if (rate.n > self.ceiling.n) return error.Exl3TrellisGeometry;
+            if (!rate.in(self.rates)) return error.Exl3CodebookTableRateMissing;
         } else if (shape[1] != (if (name.part == 1) input else output)) return error.Exl3GroupGeometry;
         const bit = @as(u16, 1) << @intCast(name.projection * 3 + name.part);
         if (group.mask & bit != 0) return error.Exl3GroupNameInvalid;

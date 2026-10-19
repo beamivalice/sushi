@@ -32,9 +32,8 @@ pub fn writeGuestManifest(w: *std.Io.Writer, allocator: std.mem.Allocator, pins:
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var codebooks: [expert_exl3.Codebook.count][]const u8 = undefined;
-    for (std.enums.values(expert_exl3.Codebook), &codebooks) |cb, *name| name.* = @tagName(cb);
-    std.mem.sort([]const u8, &codebooks, {}, lessThan);
+    const exl3_codebooks = try codebooksOf(arena, false);
+    const stq_codebooks = try codebooksOf(arena, true);
 
     const v = pins.min_macos;
     const manifest = .{
@@ -50,12 +49,23 @@ pub fn writeGuestManifest(w: *std.Io.Writer, allocator: std.mem.Allocator, pins:
         .model_types = &guest_model_types,
         .expert_quant = .{
             .format = "exl3",
-            .codebooks = &codebooks,
+            .codebooks = exl3_codebooks,
             .windows = [2]u32{ expert_exl3.Window.min_bits, 16 },
+            .stq_codebooks = stq_codebooks,
         },
     };
     try std.json.Stringify.value(manifest, .{ .whitespace = .indent_2 }, w);
     try w.writeByte('\n');
+}
+
+/// The codebooks `parseExpertQuant` admits under format `stq` or, when `stq` is false, `exl3`: STQ is the ones that name a table.
+fn codebooksOf(arena: std.mem.Allocator, stq: bool) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (std.enums.values(expert_exl3.Codebook)) |cb| {
+        if (cb.hasTable() == stq) try names.append(arena, @tagName(cb));
+    }
+    std.mem.sort([]const u8, names.items, {}, lessThan);
+    return names.items;
 }
 
 fn shortSha(sha: []const u8) []const u8 {
@@ -180,6 +190,11 @@ test "version: the guest manifest names the build's pins and the pack contract i
         \\    "windows": [
         \\      8,
         \\      16
+        \\    ],
+        \\    "stq_codebooks": [
+        \\      "pair1",
+        \\      "spec1",
+        \\      "std1"
         \\    ]
         \\  }
         \\}
@@ -209,4 +224,34 @@ test "version: every guest model type is one the loader serves" {
         } else false;
         try std.testing.expect(found);
     }
+}
+
+test "version: the guest manifest lists exactly the (format, codebook) pairs the pack parser admits" {
+    const t = std.testing;
+    const s = try guestManifestFor(.{
+        .version = "1.0.0",
+        .commit = "",
+        .mlx = "0.32.2",
+        .mlx_sha = "1f8e74e3f12f",
+        .mlx_c_sha = "56b2d39fc831",
+        .min_macos = .{ .major = 26, .minor = 2, .patch = 0 },
+    });
+    defer t.allocator.free(s);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, s, .{});
+    defer parsed.deinit();
+    const block = parsed.value.object.get("expert_quant").?.object;
+    const listed = [_]struct { format: []const u8, key: []const u8 }{ .{ .format = "exl3", .key = "codebooks" }, .{ .format = "stq", .key = "stq_codebooks" } };
+    for (listed) |entry| for (std.enums.values(expert_exl3.Codebook)) |cb| {
+        var buf: [128]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"{s}\",\"k\":2,\"codebook\":\"{s}\"}}}}", .{ entry.format, @tagName(cb) });
+        const config = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
+        defer config.deinit();
+        // A table-keyed config without its table is still refused, but past the format gate.
+        const admitted = if (@import("sushi_exl3").parseExpertQuant(config.value.object)) |_| true else |err| err != error.ExpertLayoutUnsupported;
+        var in_manifest = false;
+        if (block.get(entry.key)) |list| for (list.array.items) |name| {
+            if (std.mem.eql(u8, name.string, @tagName(cb))) in_manifest = true;
+        };
+        try t.expectEqual(admitted, in_manifest);
+    };
 }

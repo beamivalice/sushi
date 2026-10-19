@@ -2,6 +2,13 @@ const std = @import("std");
 const io_mod = @import("expert_io.zig");
 pub const expert_exl3 = @import("sushi_exl3").format;
 
+/// The per-expert rate and offset table a rate-grouped layer keeps beside its stored banks. A group's gate trellis
+/// carries it, with the group's expert count as its leading dimension.
+pub fn rateGroupMetaBytes(key: []const u8, experts: u64) u64 {
+    if (std.mem.indexOf(u8, key, "gate_proj.g") == null or !std.mem.endsWith(u8, key, ".trellis")) return 0;
+    return experts * @import("sushi_exl3").rate_groups.META_WORDS * 4;
+}
+
 pub const Geometry = struct {
     layers: u16,
     experts: u16,
@@ -12,6 +19,8 @@ pub const Geometry = struct {
     first_moe_layer: u16 = 0,
     /// EXL3 halfwords per packed tile (K = n/16); ignored by every other layout.
     exl3_n: u32 = 64,
+    /// The bank rates the config names decoders for (`Spec.rates`); null admits any up to `exl3_n`.
+    exl3_rates: ?u128 = null,
 };
 
 pub const SourceSpan = struct {
@@ -983,6 +992,7 @@ pub const QuantStore = struct {
                             if (region.rank != 4 or region.dtype != .u16 or region.shape[1] != in_dim / 16 or
                                 region.shape[2] != out_dim / 16 or rate.n > geometry.exl3_n)
                                 return error.Exl3TrellisGeometry;
+                            if (!rate.in(geometry.exl3_rates)) return error.Exl3CodebookTableRateMissing;
                             store.packed_n[ci] = @max(store.packed_n[ci], rate.n);
                             region.shape[2] *= rate.n;
                             region.shape[3] = 0;
@@ -1444,6 +1454,20 @@ test "routed expert layout is read off the weight map" {
     try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.switch_mlp.gate_proj.trellis"));
     try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.suh"));
     try t.expect(!isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.shared_expert.down_proj.weight"));
+}
+
+// An STQ pack's constants live in the codebook table config.json's expert_quant names (`parseExpertQuant`), never as
+// per-tensor keys: the index lists only trellis/suh/svh, and a projection with other parts is no EXL3 bank.
+test "an EXL3 index is the EXL3 layout when the codebook table is named in config only" {
+    const t = std.testing;
+    const served =
+        \\{"weight_map":{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.svh":"a"}}
+    ;
+    const per_tensor =
+        \\{"weight_map":{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.s1":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.beta_mask":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.s1":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.beta_mask":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.s1":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.beta_mask":"a"}}
+    ;
+    try t.expectEqual(Layout.exl3_k4, layoutFromIndexJson(t.allocator, "qwen4_exp", served, 1).?);
+    try t.expect(layoutFromIndexJson(t.allocator, "qwen4_exp", per_tensor, 1) != Layout.exl3_k4);
 }
 
 test "exl3 kFromPackedDim maps last dim to n" {

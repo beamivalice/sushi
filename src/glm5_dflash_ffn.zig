@@ -67,9 +67,9 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
                 const count: usize = @intCast(shape[1]);
                 break :blk_route .{ .indices = try ops.concat(ids[0..count], 1), .scores = try ops.concat(scores[0..count], 1) };
             };
-            const dec = api.format.Decode{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window };
+            const dec = target.cfg.expertDecode();
             const gs = mlx.getShape(layer.bank.gate.trellis);
-            const lane_rows = shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]);
+            const lane_rows = shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook.servesGlmFastPaths() and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]);
             if (lane_rows) if (layer.shared) |shared| {
                 const y = try dense(shared, ops, x, target.cfg.glm_swiglu_limit);
                 if (try api.glm_group2.moeLayoutShared(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane, y)) |joined| {
@@ -200,10 +200,10 @@ test "GLM DFlash FFN batch matches each target FFN row" {
 }
 
 fn expectGroup2Rows(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int) !void {
-    return expectGroup2RowsAt(allocator, rate, down_rate, .w12);
+    return expectGroup2RowsAt(allocator, rate, down_rate, .{ .codebook = .mcg, .window = .w12 });
 }
 
-fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int, window: api.format.Window) !void {
+fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int, dec: api.format.Decode) !void {
     const stream = mlx.gpuStream();
     var fixtures = Ops{ .s = stream };
     defer fixtures.deinit();
@@ -221,8 +221,9 @@ fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_in
     target.layers[3].ffn.moe.weight = w;
     target.layers[3].ffn.moe.correction = bias;
     target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 2048, rate, down_rate);
-    target.cfg.expert_quant_codebook = .mcg;
-    target.cfg.expert_quant_window = window;
+    target.cfg.expert_quant_codebook = dec.codebook;
+    target.cfg.expert_quant_window = dec.window;
+    target.cfg.expert_quant_table = dec.table;
     target.cfg.glm_swiglu_limit = 10;
     target.layers[3].ffn.moe.shared = null;
     try mlx.check(mlx.mlx_array_eval(w));
@@ -253,5 +254,11 @@ test "GLM DFlash FFN integrates production-width batched routing at every group-
 }
 
 test "GLM DFlash FFN batches expert rows at every pack window" {
-    for ([_]api.format.Window{ .w14, .w16 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, window);
+    for ([_]api.format.Window{ .w14, .w16 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, .{ .codebook = .mcg, .window = window });
+}
+
+test "GLM serves std1 and spec1 on DFlash FFN batched expert rows" {
+    for ([_]api.format.Window{ .w14, .w15 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, api.format.Decode.tabled(.std1, window));
+    try expectGroup2RowsAt(std.testing.allocator, 40, 36, api.format.Decode.tabled(.std1, .w15));
+    try expectGroup2RowsAt(std.testing.allocator, 36, 36, api.format.Decode.tabled(.spec1, .w15));
 }

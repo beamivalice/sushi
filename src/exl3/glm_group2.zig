@@ -54,7 +54,7 @@ const EPILOGUE =
     \\   float sum=0.0f;
     \\   for(uint r=0u;r<16u;++r) for(uint g=0u;g<SGS;++g) sum+=partial[g*256u+r*16u+lid];
     \\   const uint member=j==0u?first:partner;
-    \\   y[size_t(member)*uint(ODIM)+ot*TILE+lid]=half(sum);
+    \\   y[size_t(member)*uint(ODIM)+ot*TILE+lid]=half(exl3_out(sum));
     \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\ }
@@ -66,7 +66,7 @@ const EPILOGUE =
     \\  float sum=0.0f;
     \\  for(uint r=0u;r<16u;++r) for(uint g=0u;g<SGS;++g) sum+=partial[j*1024u+g*256u+r*16u+col];
     \\  const uint member=j==0u?first:partner;
-    \\  y[size_t(member)*uint(ODIM)+ot*TILE+col]=half(sum);
+    \\  y[size_t(member)*uint(ODIM)+ot*TILE+col]=half(exl3_out(sum));
     \\ }
     \\ threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
@@ -247,6 +247,7 @@ pub fn pairLayout(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Ar
 }
 
 pub const Down = enum { baseline, grouped };
+var fused_middle_down_calls: usize = 0;
 /// Full routed chain; unsupported inputs return null so the caller falls back to moeClamped.
 pub fn moe(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: Arr, scores: Arr, dec: @import("expert_exl3.zig").Decode, reduction: Reduction, down: Down) !?Arr {
     return moeLayout(s, x, bank, indices, scores, dec, reduction, down, .natural);
@@ -300,8 +301,11 @@ pub fn moeLayoutShared(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank
             defer _ = mlx.mlx_array_free(middle);
             break :blk if (down == .grouped) (try projectLayout(s, middle, bank.down.trellis, ids, reduction, .lane)) orelse return null else try support.lane_down(s, middle, bank.down.trellis, ids);
         }
-        if (down == .baseline and h == 4096 and inter == 2048 and gs[3] == 36 and dec.codebook == .mcg and dec.window == .w12)
-            if (try support.fused_middle_down(s, gu[0], gu[1], bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, ids, 10, 8)) |v| break :blk v;
+        if (down == .baseline and h == 4096 and inter == 2048 and gs[3] == 36 and dec.codebook.servesGlmFastPaths() and dec.window == .w12)
+            if (try support.fused_middle_down(s, gu[0], gu[1], bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, ids, 10, 8)) |v| {
+                fused_middle_down_calls += 1;
+                break :blk v;
+            };
         const middle = try support.middle(s, gu[0], gu[1], bank.gate.svh, bank.up.svh, bank.down.suh, ids, inter, nslots, 10);
         defer _ = mlx.mlx_array_free(middle);
         break :blk if (down == .grouped) (try project(s, middle, bank.down.trellis, ids, reduction)) orelse return null else try base.indexedGemvCoopF16(s, middle, bank.down.trellis, ids);
@@ -547,6 +551,117 @@ test "GLM group2 serves every admitted rate, exact to the cooperative reader" {
         defer _ = mlx.mlx_array_free(got);
         try exact(try owned.own(try base.indexedGemvCoopF16(s, x, bank, ids)), got);
     }
+}
+
+test "GLM group2 keeps the cooperative reader's bytes under PAIR1" {
+    const s = mlx.gpuStream();
+    base.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    defer base.setDecodeParams(.mul1);
+    var owned: Owned = .{};
+    defer owned.deinit();
+    const xg = try owned.floats(&.{ 7, 128 }, .float16, 5, 0.3, s);
+    const xu = try owned.floats(&.{ 7, 128 }, .float16, 7, 0.5, s);
+    const ids = try owned.own(mlx.mlx_array_new_data(&[_]u32{ 0, 1, 1, 2, 0, 3, 1 }, &.{7}, 1, .uint32));
+    for ([_]c_int{ 24, 32, 42, 64 }) |rate| {
+        const g = try owned.weights(4, 128, 128, rate, 41);
+        const u = try owned.weights(4, 128, 128, rate, 43);
+        const rg = try owned.own(try base.indexedGemvCoopF16(s, xg, g, ids));
+        const ru = try owned.own(try base.indexedGemvCoopF16(s, xu, u, ids));
+        for ([_]Reduction{ .parallel, .serial }) |reduction| {
+            const got = (try project(s, xg, g, ids, reduction)) orelse return error.TestExpectedGroup2;
+            defer _ = mlx.mlx_array_free(got);
+            try exact(rg, got);
+            const both = (try pair(s, xg, xu, g, u, ids, reduction)) orelse return error.TestExpectedGroup2;
+            defer for (both) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            try exact(rg, both[0]);
+            try exact(ru, both[1]);
+        }
+    }
+}
+
+// Group2 needs two rows; DFlash verify sends three or four.
+test "GLM serves spec1 and std1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included" {
+    const s = mlx.gpuStream();
+    defer base.setDecodeParams(.mul1);
+    defer base.unfolded_for_test = false;
+    const e: c_int = 12;
+    for ([_]@import("expert_exl3.zig").Codebook{ .spec1, .std1 }) |codebook| for ([_]@import("expert_exl3.zig").Window{ .w12, .w15 }) |window| for ([_]c_int{ 36, 40 }) |rate| for ([_]c_int{ 2, 3, 4 }) |rows| {
+        var owned: Owned = .{};
+        defer owned.deinit();
+        var projections: [3]@import("root.zig").Proj = undefined;
+        for (&projections, 0..) |*p, i| {
+            const k: c_int = if (i == 2) 2048 else 4096;
+            const n: c_int = if (i == 2) 4096 else 2048;
+            p.* = .{ .trellis = try owned.weights(e, k, n, rate, 800 + i), .suh = try owned.floats(&.{ e, k }, .float16, 810 + i, 0.4, s), .svh = try owned.floats(&.{ e, n }, .float16, 820 + i, 0.1, s) };
+        }
+        const bank = @import("root.zig").Bank{ .gate = projections[0], .up = projections[1], .down = projections[2] };
+        var id_data: [32]u32 = undefined;
+        var score_data: [32]f32 = undefined;
+        for (&id_data, &score_data, 0..) |*id, *sc, i| {
+            id.* = @intCast((i / 8 + (i % 8) * 5) % 12);
+            sc.* = 0.05 * @as(f32, @floatFromInt(i % 8 + 1));
+        }
+        const ids = try owned.own(mlx.mlx_array_new_data(&id_data, &.{ 1, rows, 8 }, 3, .uint32));
+        const scores = try owned.own(mlx.mlx_array_new_data(&score_data, &.{ 1, rows, 8 }, 3, .float32));
+        const dec = @import("expert_exl3.zig").Decode.tabled(codebook, window);
+        const fuses = rate == 36 and window == .w12;
+        for ([_]f32{ 0.01, 2 }) |x_scale| {
+            const x = try owned.floats(&.{ 1, rows, 4096 }, .bfloat16, 831, x_scale, s);
+            for ([_]Layout{ .natural, .lane }) |layout| for ([_]Down{ .baseline, .grouped }) |down| {
+                var got: [2]Arr = undefined;
+                for (&got, 0..) |*y, unfolded| {
+                    base.unfolded_for_test = unfolded == 1;
+                    const fused = fused_middle_down_calls;
+                    y.* = try owned.own((try moeLayout(s, x, bank, ids, scores, dec, .serial, down, layout)) orelse return error.TestExpectedGroup2);
+                    try std.testing.expectEqual(fused + @intFromBool(fuses and layout == .natural and down == .baseline), fused_middle_down_calls);
+                }
+                try exact(got[1], got[0]);
+            };
+        }
+    };
+}
+
+test "GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included" {
+    const s = mlx.gpuStream();
+    defer base.setDecodeParams(.mul1);
+    defer base.unfolded_for_test = false;
+    const e: c_int = 12;
+    for ([_]@import("expert_exl3.zig").Codebook{.pair1}) |codebook| for ([_]@import("expert_exl3.zig").Window{.w16}) |window| for ([_]c_int{ 24, 36, 40 }) |rate| for ([_]c_int{ 2, 3, 4 }) |rows| {
+        var owned: Owned = .{};
+        defer owned.deinit();
+        var projections: [3]@import("root.zig").Proj = undefined;
+        for (&projections, 0..) |*p, i| {
+            const k: c_int = if (i == 2) 2048 else 4096;
+            const n: c_int = if (i == 2) 4096 else 2048;
+            p.* = .{ .trellis = try owned.weights(e, k, n, rate, 800 + i), .suh = try owned.floats(&.{ e, k }, .float16, 810 + i, 0.4, s), .svh = try owned.floats(&.{ e, n }, .float16, 820 + i, 0.1, s) };
+        }
+        const bank = @import("root.zig").Bank{ .gate = projections[0], .up = projections[1], .down = projections[2] };
+        var id_data: [32]u32 = undefined;
+        var score_data: [32]f32 = undefined;
+        for (&id_data, &score_data, 0..) |*id, *sc, i| {
+            id.* = @intCast((i / 8 + (i % 8) * 5) % 12);
+            sc.* = 0.05 * @as(f32, @floatFromInt(i % 8 + 1));
+        }
+        const ids = try owned.own(mlx.mlx_array_new_data(&id_data, &.{ 1, rows, 8 }, 3, .uint32));
+        const scores = try owned.own(mlx.mlx_array_new_data(&score_data, &.{ 1, rows, 8 }, 3, .float32));
+        const dec = @import("expert_exl3.zig").Decode.tabled(codebook, window);
+        const fuses = false;
+        for ([_]f32{ 0.01, 2 }) |x_scale| {
+            const x = try owned.floats(&.{ 1, rows, 4096 }, .bfloat16, 831, x_scale, s);
+            for ([_]Layout{ .natural, .lane }) |layout| for ([_]Down{ .baseline, .grouped }) |down| {
+                var got: [2]Arr = undefined;
+                for (&got, 0..) |*y, unfolded| {
+                    base.unfolded_for_test = unfolded == 1;
+                    const fused = fused_middle_down_calls;
+                    y.* = try owned.own((try moeLayout(s, x, bank, ids, scores, dec, .serial, down, layout)) orelse return error.TestExpectedGroup2);
+                    try std.testing.expectEqual(fused + @intFromBool(fuses and layout == .natural and down == .baseline), fused_middle_down_calls);
+                }
+                try exact(got[1], got[0]);
+            };
+        }
+    };
 }
 
 test "GLM group2 shared expert joined in the reduce equals the separate BF16 add" {

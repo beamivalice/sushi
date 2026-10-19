@@ -27,8 +27,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   process; in the serve loop it is the ordinary graceful shutdown. Test: `tests/test_parent_pid.sh`.
 - **`sushi --guest-manifest`** prints the JSON such a host checks before routing (`version.writeGuestManifest`):
   version, commit, `guest_api`, the mlx/mlx-c pins, `min_macos` from the binary's own target, `model_types`
-  (`version.guest_model_types`, a subset of the served types) and the EXL3 codebooks and window range the decoder
-  accepts. The release tarball ships it as `guest.json`, next to a `.sha256` of the tarball.
+  (`version.guest_model_types`, a subset of the served types) and the codebooks and window range the decoder
+  accepts: `codebooks` under format `exl3`, `stq_codebooks` under format `stq` (the pairs `parseExpertQuant` admits).
+  The release tarball ships it as `guest.json`, next to a `.sha256` of the tarball.
 
 <a id="self-update"></a>
 ## Self-update

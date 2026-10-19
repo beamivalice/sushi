@@ -43,6 +43,19 @@ meaning:
 | `moeGroups` | the routed SwiGLU over a layer stored as rate groups: one `moe` pass per group, summed in f32 | 4ca5ece4 |
 | `moeWithShared` | `moe` plus an already gated shared expert; at one row the add folds into the decode reduction, rounded as the separate add | 698c4ae8 |
 
+STQ support is additive too: `Spec` gains `rates` and `table`, `format.Decode` gains `table` (null for MCG and MUL1, so
+existing struct literals keep working), `format.Codebook` gains `std1`, `spec1` and `pair1`, and these names are new:
+
+| name | what it does |
+|---|---|
+| `codebook_tables` | the named STQ tables, their digests and rate ranges |
+| `Ragged`, `moeRagged` | a rate-grouped layer as one ragged bank and its routed SwiGLU dispatch, one decode dispatch per stage |
+
+`parseExpertQuant` now admits `format: stq`, so a host must either refuse an STQ `Spec` or pass `Spec.table` in
+`Decode.table` to every `moe` call and check each bank with `trellisAdmitted` against `Spec.rates` as well (`Rate.in`).
+A `Decode` that names std1 or spec1 without its table is refused by name (`Exl3CodebookTableUnknown`) at the dispatch, never
+decoded. A host that only ever sees MCG and MUL1 packs needs no change.
+
 The module's tests run as their own artifact (`exl3-test`) on `zig build test`; a change that
 passes them and keeps the names above is safe to hand over.
 

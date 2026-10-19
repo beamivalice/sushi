@@ -400,6 +400,7 @@ pub fn gScaleBracket(codebook: format.Codebook) [2]f32 {
     return switch (codebook) {
         .mul1 => .{ 0.4, 1.2 },
         .mcg => .{ 0.5, 1.5 },
+        .spec1, .pair1, .std1 => unreachable,
     };
 }
 

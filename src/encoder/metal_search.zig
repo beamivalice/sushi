@@ -158,6 +158,7 @@ fn appendDecodeExpr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cb: f
             \\                float {s} = float(fma(dq_h, dq_k_inv, dq_k_bias));
             \\
         , .{ cw_in, dst }),
+        .spec1, .pair1, .std1 => unreachable,
     }
 }
 

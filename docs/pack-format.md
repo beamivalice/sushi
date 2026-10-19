@@ -10,7 +10,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
 [qwen4-arch](qwen4-arch.md), [mimo2-arch](mimo2-arch.md).
 
 Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
-(`expert_quant` parse), `src/exl3/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),
+(`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),
 `src/model.zig` (weight loading).
 
 ## Routed-expert tensors
@@ -73,8 +73,11 @@ stacked bank per projection with its own rate, read from its own trellis shape.
 - No new config field: `expert_quant.k` stays the ceiling every group's rate must fit under.
 - Refused by name: `Exl3GroupNameInvalid`, `Exl3GroupMissing`, `Exl3GroupGeometry`, `Exl3GroupDtype`,
   `Exl3MixedGroupLayout`, `Exl3TrellisGeometry` (a rate this build cannot decode), `Exl3RouterWidthMismatch`,
-  `Exl3TopKExceedsExperts`, and `Exl3RaggedStreamingUnsupported` (SSD streaming serves uniform banks only).
-- Each group is one decode pass per layer (3 kernel calls, 4 when gate and up differ); keep a layer to 1-2 groups.
+  `Exl3TopKExceedsExperts`, `Exl3RaggedStreamingUnsupported` (SSD streaming serves uniform banks only) and
+  `Exl3RateGroupsUnsupported` (a GLM layer cannot be grouped: Qwen and MiMo serve groups resident).
+- A group's rates are checked against the pack's codebook table like any bank (`Exl3CodebookTableRateMissing`).
+- The engine serves any group count with one decode dispatch per projection stage and each GEMM once per group at
+  prefill ([engine-exl3-experts](engine-exl3-experts.md#rate-groups)): the decode cost is the rate mix, not the count.
 
 ## `config.json`
 
@@ -82,11 +85,12 @@ stacked bank per projection with its own rate, read from its own trellis shape.
 "expert_quant": { "format": "exl3", "k": 3, "codebook": "mcg", "window": 15 }
 ```
 
-- `format` — must be the string `exl3`; anything else is `ExpertLayoutUnsupported`.
+- `format` — `exl3` for the `mul1` and `mcg` codebooks, `stq` for the ones that name a table (`std1`, `spec1`,
+  `pair1`; see [STQ](#stq)). Any other string, or a codebook under the other format, is `ExpertLayoutUnsupported`.
 - `k` — the rate, a JSON number and possibly fractional. It names the WIDEST
   rate a layer packs and is what the engine bills.
-- `codebook` — `mul1` or `mcg`. MCG is the codebook for new packs; MUL1 serves
-  turboderp's packs; any other name is `ExpertLayoutUnsupported` (in a shard
+- `codebook` — `mul1` or `mcg` under `exl3`; MCG is the codebook for new packs; MUL1 serves
+  turboderp's packs. `std1`, `spec1` and `pair1` go under `stq`. Any other name is `ExpertLayoutUnsupported` (in a shard
   stamp, `Exl3ShardStampMismatch`). The codebook and window follow the MODEL: `exl3.moe` sets them
   (`expert_exl3_kernels.setDecodeParams`) before every dispatch, so packs with
   different codebooks can be resident together, and every weight kernel
@@ -97,6 +101,43 @@ stacked bank per projection with its own rate, read from its own trellis shape.
 
 `num_experts_per_tok` must be ≤ 32 (the decode reduce bank,
 `Exl3TopKExceedsReduceBank`).
+
+<a id="stq"></a>
+### STQ: codebooks that name a table
+
+```json
+"expert_quant": { "format": "stq", "k": 3, "codebook": "std1", "window": 15,
+                  "codebook_table": "std1", "codebook_digest": "c5dba171" }
+```
+
+`format: stq` carries `std1`, `spec1` or `pair1`. The config names the codebook table whose constants every bank
+decodes with and that table's digest; `src/exl3/codebook_tables.zig` holds the tables, and a pack names one the build
+holds or is refused. Other keys in the block (provenance) are not read. `k` is the ceiling every bank's rate fits
+under, as for `exl3`, and must itself be a rate the table has a row for.
+
+| table | codebook | window | rates (n) | digest |
+|---|---|---|---|---|
+| `std1` | `std1` | any 8..16 | 24..64 | `c5dba171` |
+| `spec1-w15` | `spec1` | any 8..16 | 16..128 (K1 to K8) | `37f72431` |
+| `spec1-w16` | `spec1` | any 8..16 | 24..64 | `753ffa03` |
+| `pair1-w16-v1` | `pair1` | 16 only | 24..64 | `c089b4eb` |
+
+- A table holds one row of constants per even n of its own range; a bank at a rate outside it is
+  `Exl3CodebookTableRateMissing`. The digest is the first 8 hex digits of sha256 over one text line per row, ascending
+  n: `<n decimal>` then each constant as `,` and 8 lowercase hex digits, then a newline (`digestOf`).
+- `std1` and `spec1` decode one codeword to one weight: `p = cw * mult`, the two f16 halves of `p & mask` are added
+  in f16, and the sum is scaled by 4096 (exact). A row is `(mult, mask)`; `std1` has the one pair `0x840C1F37` /
+  `0x8FFE8FD0` at every rate. The table's window is where its rows were tuned and nothing more: these two decode at
+  any window, masked as for MCG.
+- `pair1` decodes the pair of weights 2j and 2j+1 from the window of weight 2j+1 with its rate's row
+  `(mult, rot, mask0, mask1)`; it reads the whole 16-bit window, so it holds at window 16 only
+  (`Exl3CodebookTableWindowMismatch` otherwise).
+- Refused by name at load: `Exl3CodebookTableUnknown` (no table, or a name this build does not hold),
+  `Exl3CodebookTableDigestMismatch`, `Exl3CodebookTableWindowMismatch`, `Exl3CodebookTableCodebookMismatch` (the table
+  is for another codebook), `Exl3CodebookTableRateMissing`, `Exl3CodebookTableUndecodable` (a PAIR1 table whose
+  rows the kernels have not compiled), and `Exl3CodebookTableLegacyConfig`: a digest this build retired. `spec1-w15`
+  held n24..64 under digest `2ac2594d` before it grew to n16..128; its rows at n24..64 are unchanged, and only the
+  config's digest field changes for a pack to load.
 
 The parser trusts no field: a wrong JSON type or a value outside its field's range is `InvalidConfigField`
 (`cfgField`/`cfgInt`/`cfgF32`), a JSON `null` leaves the default (`sliding_window: null` still disables), and a
@@ -135,9 +176,9 @@ string, because that is all safetensors stores. The engine reads these keys:
 
 | key | value |
 |---|---|
-| `format` | `exl3` |
+| `format` | `exl3`, or `stq` for `std1`, `spec1` and `pair1` |
 | `k` | the rate as written, e.g. `2.25` or `4` |
-| `codebook` | `mul1` \| `mcg` |
+| `codebook` | `mul1` \| `mcg` \| `std1` \| `spec1` \| `pair1` |
 | `window` | the codeword width, e.g. `12` |
 
 A converter adds its own provenance keys beside them; the engine reads none of

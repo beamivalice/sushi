@@ -13190,6 +13190,13 @@ test "every load refusal the registry preserves answers under its own name" {
         "Exl3TrellisGeometry",
         "Exl3WindowUnsupported",
         "Exl3ShardStampMismatch",
+        "Exl3CodebookTableUnknown",
+        "Exl3CodebookTableDigestMismatch",
+        "Exl3CodebookTableWindowMismatch",
+        "Exl3CodebookTableCodebookMismatch",
+        "Exl3CodebookTableRateMissing",
+        "Exl3CodebookTableLegacyConfig",
+        "Exl3CodebookTableUndecodable",
     };
     for (names) |name| {
         const refusal = loadRefusalFor(model_registry_mod.ModelRegistry.loadErrorFromName(name)) orelse {
@@ -13208,6 +13215,13 @@ test "every load refusal the registry preserves answers under its own name" {
     try t.expectEqualStrings("exl3_trellis_geometry", loadRefusalFor(error.Exl3TrellisGeometry).?.type);
     try t.expectEqualStrings("exl3_window_unsupported", loadRefusalFor(error.Exl3WindowUnsupported).?.type);
     try t.expectEqualStrings("exl3_shard_stamp_mismatch", loadRefusalFor(error.Exl3ShardStampMismatch).?.type);
+    try t.expectEqualStrings("exl3_codebook_table_unknown", loadRefusalFor(error.Exl3CodebookTableUnknown).?.type);
+    try t.expectEqualStrings("exl3_codebook_table_digest_mismatch", loadRefusalFor(error.Exl3CodebookTableDigestMismatch).?.type);
+    try t.expectEqualStrings("exl3_codebook_table_window_mismatch", loadRefusalFor(error.Exl3CodebookTableWindowMismatch).?.type);
+    try t.expectEqualStrings("exl3_codebook_table_codebook_mismatch", loadRefusalFor(error.Exl3CodebookTableCodebookMismatch).?.type);
+    try t.expectEqualStrings("exl3_codebook_table_rate_missing", loadRefusalFor(error.Exl3CodebookTableRateMissing).?.type);
+    try t.expectEqualStrings("exl3_codebook_table_legacy_config", loadRefusalFor(error.Exl3CodebookTableLegacyConfig).?.type);
+    try t.expectEqualStrings("exl3_codebook_table_undecodable", loadRefusalFor(error.Exl3CodebookTableUndecodable).?.type);
     try t.expectEqualStrings("ssd_budget_below_vision", loadRefusalFor(error.SsdBudgetBelowVision).?.type);
     try t.expect(std.mem.indexOf(u8, loadRefusalFor(error.SsdBudgetBelowVision).?.message, "--vision") != null);
     try t.expect(loadRefusalFor(error.LoadFailed) == null);
@@ -13235,7 +13249,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = "This checkpoint streams its experts from SSD and needs a resident budget: set this model's \"ssd_budget_gb\" in model-settings.json, or launch with --ssd-budget-gb <n>." },
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards. For MiMo, repack the checkpoint first; raw per-expert HF shards cannot be streamed directly." },
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
-        error.ExpertLayoutUnsupported => .{ .type = "expert_layout_unsupported", .message = "This checkpoint's routed experts are not a pack layout this build can load. An EXL3 pack's expert_quant names format exl3, a k, and codebook mcg or mul1; re-convert the pack." },
+        error.ExpertLayoutUnsupported => .{ .type = "expert_layout_unsupported", .message = "This checkpoint's routed experts are not a pack layout this build can load. An EXL3 pack's expert_quant names format exl3, a k, and codebook mcg or mul1, or format stq and codebook std1, spec1 or pair1 (with their codebook_table and codebook_digest); re-convert the pack." },
         error.Exl3GroupMissing => .{ .type = "exl3_group_missing", .message = "An EXL3 rate group or projection tensor is missing." },
         error.Exl3GroupNameInvalid => .{ .type = "exl3_group_name_invalid", .message = "EXL3 rate groups must use contiguous g0 through g31 names." },
         error.Exl3MixedGroupLayout => .{ .type = "exl3_mixed_group_layout", .message = "A layer mixes grouped and ungrouped EXL3 tensors." },
@@ -13244,6 +13258,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3RouterWidthMismatch => .{ .type = "exl3_router_width_mismatch", .message = "The router width must equal the sum of its layer expert group sizes." },
         error.Exl3TopKExceedsExperts => .{ .type = "exl3_topk_exceeds_experts", .message = "The routed top-k exceeds this layer expert count." },
         error.Exl3RaggedStreamingUnsupported => .{ .type = "exl3_ragged_streaming_unsupported", .message = "EXL3 rate groups and pruned expert layers require resident loading." },
+        error.Exl3RateGroupsUnsupported => .{ .type = "exl3_rate_groups_unsupported", .message = "GLM-5.3-Flash packs serve one rate per layer; a rate-grouped layer loads on Qwen3.8-Flash-Next and MiMo-V2.6-Flash only." },
         error.Exl3RouterGroupsUnsupported => .{ .type = "exl3_router_groups_unsupported", .message = "Reordered or pruned EXL3 experts require n_group=1 routing." },
         error.Exl3TopKExceedsReduceBank => .{ .type = "exl3_topk_exceeds_reduce_bank", .message = "This EXL3 pack's num_experts_per_tok exceeds the decode reduce-bank (32). Re-convert with top-k <= 32." },
         error.Exl3RateGroupsStreamingUnsupported => .{ .type = "exl3_rate_groups_streaming_unsupported", .message = "SSD streaming does not support EXL3 rate-group (.gN) packs. Use uniform leading-index expert banks." },
@@ -13251,6 +13266,13 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3TrellisGeometry => .{ .type = "exl3_trellis_geometry", .message = "This EXL3 pack has a routed-expert trellis this build cannot decode, or one that disagrees with the expert count, shape or k its config.json names. Re-convert the pack." },
         error.Exl3WindowUnsupported => .{ .type = "exl3_window_unsupported", .message = "This EXL3 pack names a codeword window this build cannot decode: expert_quant.window must be an integer from 8 to 16, or absent for 16." },
         error.Exl3ShardStampMismatch => .{ .type = "exl3_shard_stamp_mismatch", .message = "An EXL3 shard in this pack was written for a different decoder than config.json's expert_quant names (k, codebook or window). Re-convert the pack, or fix expert_quant to match the shards." },
+        error.Exl3CodebookTableUnknown => .{ .type = "exl3_codebook_table_unknown", .message = "This STQ pack names no codebook table this build holds: expert_quant.codebook_table must be one of std1, spec1-w15, spec1-w16 or pair1-w16-v1. A pack that names no table is reconverted." },
+        error.Exl3CodebookTableDigestMismatch => .{ .type = "exl3_codebook_table_digest_mismatch", .message = "This STQ pack's expert_quant.codebook_digest is not its codebook table's digest in this build. Re-convert the pack." },
+        error.Exl3CodebookTableWindowMismatch => .{ .type = "exl3_codebook_table_window_mismatch", .message = "The PAIR1 codebook table this STQ pack names decodes only at its own window (pair1-w16-v1: 16), not at expert_quant.window." },
+        error.Exl3CodebookTableCodebookMismatch => .{ .type = "exl3_codebook_table_codebook_mismatch", .message = "The codebook table this STQ pack names is for another codebook than expert_quant.codebook." },
+        error.Exl3CodebookTableRateMissing => .{ .type = "exl3_codebook_table_rate_missing", .message = "This STQ pack has a routed bank at a rate its codebook table has no row for (each table covers the even n it lists: spec1-w15 n16 to n128, the others n24 to n64)." },
+        error.Exl3CodebookTableLegacyConfig => .{ .type = "exl3_codebook_table_legacy_config", .message = "This pack's expert_quant names a codebook table by a digest from before the table grew (spec1-w15 2ac2594d, now 37f72431). Re-convert the pack." },
+        error.Exl3CodebookTableUndecodable => .{ .type = "exl3_codebook_table_undecodable", .message = "This STQ pack's codebook table holds PAIR1 constants this build's kernels have not compiled." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
         error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = "--ssd-budget-gb cannot hold the vision tower that --vision asks for beside the minimum expert cache. Raise the budget or drop --vision." },
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache (and, under --vision, the largest image encode) exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
@@ -25985,7 +26007,7 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
 }
 
 test "sushi coder load refusals retain named group errors" {
-    for ([_]anyerror{ error.Exl3GroupMissing, error.Exl3GroupNameInvalid, error.Exl3MixedGroupLayout, error.Exl3GroupGeometry, error.Exl3GroupDtype, error.Exl3RouterWidthMismatch, error.Exl3TopKExceedsExperts, error.Exl3RaggedStreamingUnsupported, error.Exl3RouterGroupsUnsupported }) |err| {
+    for ([_]anyerror{ error.Exl3GroupMissing, error.Exl3GroupNameInvalid, error.Exl3MixedGroupLayout, error.Exl3GroupGeometry, error.Exl3GroupDtype, error.Exl3RouterWidthMismatch, error.Exl3TopKExceedsExperts, error.Exl3RaggedStreamingUnsupported, error.Exl3RouterGroupsUnsupported, error.Exl3RateGroupsUnsupported }) |err| {
         try std.testing.expect(loadRefusalFor(err) != null);
     }
 }

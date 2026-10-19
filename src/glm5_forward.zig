@@ -252,7 +252,7 @@ const Moe = struct {
         if (self.shared) |shared| if (self.streamed == null and isDecodeRow(x)) {
             const mid = try shared.apply(ops, x, cfg.glm_swiglu_limit);
             if (mlx.mlx_array_dtype(mid) == .bfloat16 and std.mem.eql(c_int, mlx.getShape(mid), mlx.getShape(x))) {
-                const dec = exl3.format.Decode{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window };
+                const dec = cfg.expertDecode();
                 return ops.own(try exl3.moeClampedWithShared(ops.s, x, self.bank, routing.indices, routing.scores, dec, @intFromFloat(cfg.glm_swiglu_limit), mid));
             }
             return ops.binary(.add, try routedExl3(ops, x, self.bank, routing.indices, routing.scores, cfg), mid);
@@ -273,7 +273,7 @@ fn isDecodeRow(x: Arr) bool {
 
 /// The resident bank and a streamed slab bank run this one dispatch; slab ids are slot ids.
 pub fn routedExl3(ops: *Ops, x: Arr, bank: exl3.Bank, ids: Arr, scores: Arr, cfg: *const model.ModelConfig) !Arr {
-    const dec = exl3.format.Decode{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window };
+    const dec = cfg.expertDecode();
     const limit: c_int = @intFromFloat(cfg.glm_swiglu_limit);
     if (cfg.glm_swiglu_limit == 10) if (try exl3.glm_prefill_grid.tryMoe(ops.s, x, bank, ids, scores, dec, limit)) |candidate| return ops.own(candidate);
     return ops.own(try exl3.moeClamped(ops.s, x, bank, ids, scores, dec, limit));

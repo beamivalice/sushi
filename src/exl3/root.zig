@@ -8,12 +8,15 @@ pub const format = @import("expert_exl3.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
 pub const glm_group2 = @import("glm_group2.zig");
 pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
+pub const codebook_tables = @import("codebook_tables.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],
 /// `suh` F16 [E, in], `svh` F16 [E, out].
 pub const Proj = struct { trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array };
 pub const group_layout = @import("layout.zig");
 pub const GroupLayout = group_layout.Layout;
+pub const rate_groups = @import("rate_groups.zig");
+pub const Ragged = rate_groups.Ragged;
 pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K],
@@ -104,6 +107,7 @@ pub fn validateClampedProjection(p: Proj, experts: c_int, input: c_int, output: 
 }
 
 fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, shared_gate: ?mlx.mlx_array, limit: c_int) !mlx.mlx_array {
+    try dec.requireTable();
     // Which kernel a dispatch picks is read off ONE process-global codebook,
     // and several EXL3 packs can be resident at once: set it per call.
     kernels.setDecodeParams(dec);
@@ -159,6 +163,10 @@ pub const Spec = struct {
     rate: format.Rate,
     codebook: format.Codebook,
     window: format.Window = .w16,
+    /// The bank rates the pack's codebook table has a row for (bit n/2); null admits every rate.
+    rates: ?u128 = null,
+    /// The pack's STD1 or SPEC1 table (`Decode.table`); null for every other codebook.
+    table: ?u8 = null,
 };
 
 /// `k` is a rate, integer or fractional: admitted only when 16k is an even
@@ -188,20 +196,29 @@ pub fn parseExpertQuant(obj: std.json.ObjectMap) !Spec {
     const block = obj.get("expert_quant") orelse return error.ExpertLayoutUnsupported;
     if (block != .object) return error.ExpertLayoutUnsupported;
     const fmt_v = block.object.get("format") orelse return error.ExpertLayoutUnsupported;
-    if (fmt_v != .string or !std.mem.eql(u8, fmt_v.string, "exl3")) return error.ExpertLayoutUnsupported;
+    if (fmt_v != .string) return error.ExpertLayoutUnsupported;
+    const stq = std.mem.eql(u8, fmt_v.string, "stq");
+    if (!stq and !std.mem.eql(u8, fmt_v.string, "exl3")) return error.ExpertLayoutUnsupported;
     const k_v = block.object.get("k") orelse return error.ExpertLayoutUnsupported;
     const rate = rateFromConfigK(k_v) orelse return error.ExpertLayoutUnsupported;
     const cb_v = block.object.get("codebook") orelse return error.ExpertLayoutUnsupported;
     if (cb_v != .string) return error.ExpertLayoutUnsupported;
     const codebook = format.Codebook.fromName(cb_v.string) orelse return error.ExpertLayoutUnsupported;
+    const tabled = codebook.hasTable();
+    if (tabled != stq) return error.ExpertLayoutUnsupported;
     const window = windowFromConfig(block.object.get("window")) orelse return error.Exl3WindowUnsupported;
-    return .{ .rate = rate, .codebook = codebook, .window = window };
+    if (!tabled) {
+        if (block.object.contains("codebook_table")) return error.Exl3CodebookTableCodebookMismatch;
+        return .{ .rate = rate, .codebook = codebook, .window = window };
+    }
+    const table = try codebook_tables.resolve(block.object, codebook, window);
+    if (!rate.in(table.rates())) return error.Exl3CodebookTableRateMissing;
+    return .{ .rate = rate, .codebook = codebook, .window = window, .rates = table.rates(), .table = codebook_tables.index(table) };
 }
 
 pub fn shardStampAgrees(spec: Spec, k: ?[]const u8, codebook: ?[]const u8, window: ?[]const u8) !void {
     if (codebook) |name| {
-        const cb = format.Codebook.fromName(name) orelse return error.Exl3ShardStampMismatch;
-        if (cb != spec.codebook) return error.Exl3ShardStampMismatch;
+        if (format.Codebook.fromName(name) != spec.codebook) return error.Exl3ShardStampMismatch;
     }
     if (window) |bits| {
         const parsed = std.fmt.parseInt(i64, bits, 10) catch return error.Exl3ShardStampMismatch;
@@ -249,6 +266,98 @@ test "an EXL3 pack naming a codebook this build does not decode is refused" {
     ));
 }
 
+const SPEC1_TABLE = ",\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"";
+const PAIR1_TABLE = ",\"codebook_table\":\"pair1-w16-v1\",\"codebook_digest\":\"c089b4eb\"";
+const STD1_TABLE = ",\"codebook_table\":\"std1\",\"codebook_digest\":\"c5dba171\"";
+
+test "an STQ pack names its table, and every rate the table has a row for is its own" {
+    const t = std.testing;
+    const spec1 = try specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"spec1\",\"window\":15" ++ SPEC1_TABLE ++ "}}");
+    try t.expectEqual(format.Codebook.spec1, spec1.codebook);
+    try t.expectEqual(@as(u32, 40), spec1.rate.n);
+    const pair1 = try specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":3,\"codebook\":\"pair1\",\"window\":16" ++ PAIR1_TABLE ++ "}}");
+    try t.expectEqual(format.Codebook.pair1, pair1.codebook);
+    for ([_]u32{ 24, 32, 36, 48, 64 }) |n| try t.expect((format.Rate{ .n = n }).in(pair1.rates));
+    for ([_]u32{ 16, 22, 66, 128 }) |n| try t.expect(!(format.Rate{ .n = n }).in(pair1.rates));
+    for ([_]u32{ 16, 22, 66, 128 }) |n| try t.expect((format.Rate{ .n = n }).in(spec1.rates));
+    try t.expect(!(format.Rate{ .n = 14 }).in(spec1.rates) and !(format.Rate{ .n = 130 }).in(spec1.rates));
+    // Another codebook's spec names no rate set: every rate up to the ceiling is its own.
+    try t.expect((format.Rate{ .n = 36 }).in((try specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"exl3\",\"k\":3,\"codebook\":\"mcg\"}}")).rates));
+}
+
+test "an STQ spec1 pack decodes its table at every window the engine admits for MCG, pair1 only at its own" {
+    const t = std.testing;
+    for (std.enums.values(format.Window)) |w| {
+        var buf: [256]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"spec1\",\"window\":{d}{s}}}}}", .{ w.bits(), SPEC1_TABLE });
+        const spec = try specFromConfigJson(t.allocator, raw);
+        try t.expectEqual(w, spec.window);
+        try t.expectEqual(@as(?u8, codebook_tables.indexOf("spec1-w15")), spec.table);
+    }
+    const absent = try specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":2,\"codebook\":\"spec1\"" ++ SPEC1_TABLE ++ "}}");
+    try t.expectEqual(format.Window.w16, absent.window);
+    const test_table = ",\"codebook_table\":\"spec1-test-per-rate\",\"codebook_digest\":\"a2f2fe40\"";
+    const named = try specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":3,\"codebook\":\"spec1\",\"window\":8" ++ test_table ++ "}}");
+    try t.expectEqual(@as(?u8, codebook_tables.indexOf("spec1-test-per-rate")), named.table);
+    try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":2,\"codebook\":\"spec1\",\"window\":7" ++ SPEC1_TABLE ++ "}}"));
+    try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":2,\"codebook\":\"spec1\",\"window\":17" ++ SPEC1_TABLE ++ "}}"));
+    try t.expectError(error.Exl3CodebookTableWindowMismatch, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":2,\"codebook\":\"pair1\",\"window\":15" ++ PAIR1_TABLE ++ "}}"));
+    try t.expectEqual(@as(?u8, null), (try specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"exl3\",\"k\":3,\"codebook\":\"mcg\"}}")).table);
+}
+
+test "an STQ std1 pack names the std1 table and decodes it at every window" {
+    const t = std.testing;
+    for (std.enums.values(format.Window)) |w| {
+        var buf: [256]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"std1\",\"window\":{d}{s}}}}}", .{ w.bits(), STD1_TABLE });
+        const spec = try specFromConfigJson(t.allocator, raw);
+        try t.expectEqual(format.Codebook.std1, spec.codebook);
+        try t.expectEqual(w, spec.window);
+        try t.expectEqual(@as(?u8, codebook_tables.indexOf("std1")), spec.table);
+    }
+}
+
+test "an STQ pack with a missing, foreign or legacy table is refused by name" {
+    const t = std.testing;
+    const spec1_head = "{\"expert_quant\":{\"format\":\"stq\",\"k\":2,\"codebook\":\"spec1\",\"window\":15";
+    const pair1_head = "{\"expert_quant\":{\"format\":\"stq\",\"k\":2,\"codebook\":\"pair1\"";
+    const D = ",\"codebook_digest\":";
+    for ([_]struct { raw: []const u8, want: anyerror }{
+        .{ .raw = spec1_head ++ "}}", .want = error.Exl3CodebookTableUnknown },
+        .{ .raw = spec1_head ++ ",\"codebook_table\":\"spec1-w15-v2\"" ++ D ++ "\"c5dba171\"}}", .want = error.Exl3CodebookTableUnknown },
+        .{ .raw = spec1_head ++ ",\"codebook_table\":\"spec1-w15\"" ++ D ++ "\"00000000\"}}", .want = error.Exl3CodebookTableDigestMismatch },
+        .{ .raw = spec1_head ++ STD1_TABLE ++ "}}", .want = error.Exl3CodebookTableCodebookMismatch },
+        .{ .raw = spec1_head ++ PAIR1_TABLE ++ "}}", .want = error.Exl3CodebookTableCodebookMismatch },
+        .{ .raw = pair1_head ++ ",\"window\":15" ++ PAIR1_TABLE ++ "}}", .want = error.Exl3CodebookTableWindowMismatch },
+        .{ .raw = spec1_head ++ ",\"codebook_table\":\"spec1-w15\"" ++ D ++ "\"2ac2594d\"}}", .want = error.Exl3CodebookTableLegacyConfig },
+        .{ .raw = "{\"expert_quant\":{\"format\":\"stq\",\"k\":1,\"codebook\":\"pair1\"" ++ PAIR1_TABLE ++ "}}", .want = error.Exl3CodebookTableRateMissing },
+        .{ .raw = "{\"expert_quant\":{\"format\":\"stq\",\"k\":4.5,\"codebook\":\"std1\",\"window\":15" ++ STD1_TABLE ++ "}}", .want = error.Exl3CodebookTableRateMissing },
+        .{ .raw = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mcg\"" ++ SPEC1_TABLE ++ "}}", .want = error.Exl3CodebookTableCodebookMismatch },
+    }) |c| try t.expectError(c.want, specFromConfigJson(t.allocator, c.raw));
+}
+
+test "the stq format is for the codebooks that name a table, and exl3 is for the rest" {
+    const t = std.testing;
+    try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"mcg\"}}"));
+    try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"std1\",\"window\":15" ++ STD1_TABLE ++ "}}"));
+    try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"exq\",\"k\":2.5,\"codebook\":\"mcg\"}}"));
+}
+
+test "a table layer whose bank rate the table has no row for is refused at load" {
+    const t = std.testing;
+    var plan = GroupLayout.init(128, 128, .{ .n = 48 });
+    plan.rates = codebook_tables.lookup("std1").?.rates();
+    _ = try plan.add("gate_proj.trellis", &.{ 1, 8, 8, 32 }, .u16);
+    _ = try plan.add("up_proj.trellis", &.{ 1, 8, 8, 48 }, .u16);
+    try t.expectError(error.Exl3CodebookTableRateMissing, plan.add("down_proj.trellis", &.{ 1, 8, 8, 16 }, .u16));
+    // Each rate group's banks are checked against the table on their own.
+    var grouped = GroupLayout.init(128, 128, .{ .n = 48 });
+    grouped.rates = codebook_tables.lookup("std1").?.rates();
+    _ = try grouped.add("gate_proj.g0.trellis", &.{ 1, 8, 8, 32 }, .u16);
+    _ = try grouped.add("gate_proj.g1.trellis", &.{ 2, 8, 8, 48 }, .u16);
+    try t.expectError(error.Exl3CodebookTableRateMissing, grouped.add("up_proj.g1.trellis", &.{ 2, 8, 8, 16 }, .u16));
+}
+
 pub fn admitTopK(topk: u32) !void {
     if (topk > kernels.REDUCE_MAX_TOPK) return error.Exl3TopKExceedsReduceBank;
 }
@@ -282,9 +391,16 @@ test "exl3 expert_quant admits integer and fractional K under every served codeb
         .{ .text = "4", .n = 64 },
     };
     for (cases) |c| {
-        for ([_]format.Codebook{ .mul1, .mcg }) |cb| {
-            var buf: [96]u8 = undefined;
-            const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"exl3\",\"k\":{s},\"codebook\":\"{s}\"}}}}", .{ c.text, @tagName(cb) });
+        for (std.enums.values(format.Codebook)) |cb| {
+            var buf: [256]u8 = undefined;
+            const keys = switch (cb) {
+                .spec1 => ",\"window\":15" ++ SPEC1_TABLE,
+                .std1 => ",\"window\":15" ++ STD1_TABLE,
+                .pair1 => PAIR1_TABLE,
+                else => "",
+            };
+            const fmt = if (cb.hasTable()) "stq" else "exl3";
+            const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"{s}\",\"k\":{s},\"codebook\":\"{s}\"{s}}}}}", .{ fmt, c.text, @tagName(cb), keys });
             const ok = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
             defer ok.deinit();
             const spec = try parseExpertQuant(ok.value.object);
@@ -333,6 +449,7 @@ test "exl3 a layer may pack below the rate the config bills, never above it" {
 test {
     _ = format;
     _ = kernels;
+    _ = codebook_tables;
 }
 
 test "exl3 Sushi CPU config and packed shapes admit K1 through K8" {
@@ -450,6 +567,64 @@ test "sushi coder GPU two groups equal independently routed uniform banks" {
     const a = mlx.mlx_array_data_float32(actual).?;
     const e = mlx.mlx_array_data_float32(expected).?;
     for (0..128) |i| try t.expectApproxEqAbs(e[i], a[i], 0.0001 + @abs(e[i]) * 0.01);
+}
+
+/// Routed SwiGLU of a rate-grouped layer, in `moe`'s shapes and dtype. Decode and verify rows fold
+/// `shared` (with `shared_gate`: the bf16 `sigmoid(gate) * shared`) into the finish reduce where the
+/// uniform chain does (one row); otherwise the tail runs as separate ops.
+pub fn moeRagged(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, shared: ?mlx.mlx_array, shared_gate: ?mlx.mlx_array) !mlx.mlx_array {
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    const xsh = mlx.getShape(x);
+    const xd = mlx.mlx_array_dtype(x);
+    const D = xsh[xsh.len - 1];
+    const rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(D))));
+    const K = mlx.getShape(inds)[mlx.getShape(inds).len - 1];
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows, D }, 2, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, inds, &[_]c_int{rows * K}, 1, s));
+    var slots = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(slots);
+    try mlx.check(mlx.mlx_astype(&slots, flat, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{rows * K}, 1, s));
+    const decode = rows <= kernels.DECODE_ROWS_MAX or verify_rows;
+    const one = decode and rows == 1 and if (shared) |v| mlx.mlx_array_size(v) == mlx.mlx_array_size(x) else false;
+    const fold = if (shared_gate) |g| one and xd == .bfloat16 and mlx.mlx_array_dtype(shared.?) == .bfloat16 and
+        mlx.mlx_array_dtype(g) == .bfloat16 and mlx.mlx_array_size(g) == 1 else one and mlx.mlx_array_dtype(shared.?) == xd;
+    const y = if (decode)
+        try rate_groups.moeDecode(s, x2, rb, slots, sc, K, xd, if (fold) shared else null, if (fold) shared_gate else null)
+    else
+        try rate_groups.moePrefill(s, x2, rb, slots, sc, K);
+    defer _ = mlx.mlx_array_free(y);
+    var routed = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(routed);
+    try mlx.check(mlx.mlx_reshape(&routed, y, xsh.ptr, xsh.len, s));
+    if (mlx.mlx_array_dtype(routed) != xd) {
+        var c = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&c, routed, xd, s));
+        _ = mlx.mlx_array_free(routed);
+        routed = c;
+    }
+    const value = shared orelse return routed;
+    if (fold) return routed;
+    defer _ = mlx.mlx_array_free(routed);
+    var gated = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gated);
+    if (shared_gate) |logit| {
+        var sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sig);
+        try mlx.check(mlx.mlx_sigmoid(&sig, logit, s));
+        try mlx.check(mlx.mlx_multiply(&gated, sig, value, s));
+    } else try mlx.check(mlx.mlx_array_set(&gated, value));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_add(&out, routed, gated, s));
+    return out;
 }
 
 pub fn moeGroups(s: mlx.mlx_stream, x: mlx.mlx_array, banks: []const Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool) !mlx.mlx_array {
@@ -591,5 +766,39 @@ test "GLM clamped EXL3 rejects malformed banks before kernel dispatch" {
 test { _ = glm_group2; }
 
 test {
+    _ = rate_groups;
+}
+
+test {
     _ = glm_prefill_grid;
+}
+
+test "a host Decode that names std1 without its table is refused by name" {
+    const E = 4;
+    const D = 128;
+    const n = 32;
+    var words: [E * (D / 16) * (D / 16) * n]u16 = @splat(0);
+    var scale: [E * D]u16 = @splat(format.f32ToF16Bits(0.5));
+    const trellis = mlx.mlx_array_new_data(&words, &[_]c_int{ E, D / 16, D / 16, n }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(trellis);
+    const suh = mlx.mlx_array_new_data(&scale, &[_]c_int{ E, D }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh);
+    const proj: Proj = .{ .trellis = trellis, .suh = suh, .svh = suh };
+    const bank: Bank = .{ .gate = proj, .up = proj, .down = proj };
+    var xh: [D]u16 = @splat(format.f32ToF16Bits(0.1));
+    const x = mlx.mlx_array_new_data(&xh, &[_]c_int{ 1, 1, D }, 3, .float16);
+    defer _ = mlx.mlx_array_free(x);
+    const ids_h = [_]u32{ 1, 3 };
+    const sc_h = [_]f32{ 0.6, 0.4 };
+    const ids = mlx.mlx_array_new_data(&ids_h, &[_]c_int{ 1, 1, 2 }, 3, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const sc = mlx.mlx_array_new_data(&sc_h, &[_]c_int{ 1, 1, 2 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(sc);
+    const s = mlx.gpuStream();
+    // mlx-serve builds Decode{ .codebook, .window } from the Spec, without the table.
+    for ([_]format.Codebook{ .std1, .spec1 }) |cb| {
+        const host: format.Decode = .{ .codebook = cb, .window = .w15 };
+        try std.testing.expectError(error.Exl3CodebookTableUnknown, moe(s, x, bank, ids, sc, host, false));
+        try std.testing.expectError(error.Exl3CodebookTableUnknown, moeClamped(s, x, bank, ids, sc, host, 10));
+    }
 }

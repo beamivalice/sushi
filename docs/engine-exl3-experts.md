@@ -13,8 +13,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 | File | Role |
 |---|---|
 | `src/expert_quant.zig` | Expert layout detection from PACKED shapes: `.quantized_split` (affine banks) vs `.exl3_k4` (trellis); affine (bits, group_size) solved from geometry |
-| `src/exl3/root.zig` | The `sushi_exl3` module's host API: `expert_quant` parse (`parseExpertQuant`), `admitTopK`, `trellisAdmitted`, `moe` (the one dispatch) |
-| `src/exl3/expert_exl3.zig` | Host reference decoders (MUL1, MCG), `Rate`, `Window`, `Decode`, fixtures |
+| `src/exl3/root.zig` | The `sushi_exl3` module's host API: `expert_quant` parse (`parseExpertQuant`), `admitTopK`, `trellisAdmitted`, `moe` (the one dispatch), `moeRagged` (a rate-grouped layer) |
+| `src/exl3/codebook_tables.zig` | STQ's named codebook tables: rows, pinned digests, per-table rate range, `resolve` and its refusals |
+| `src/exl3/rate_groups.zig` | Rate-grouped layers: the ragged bank (`Ragged`), the one-dispatch mixed-rate decode kernels, the per-group prefill GEMMs |
+| `src/exl3/expert_exl3.zig` | Host reference decoders (MUL1, MCG, STD1, SPEC1, PAIR1), `Rate`, `Window`, `Decode`, fixtures |
 | `src/exl3/expert_exl3_kernels.zig` | Prefill run-aligned 32-row window GEMM (NAX body, K4 fast branch; simdgroup-matrix body off NAX; scalar body), decode chain (`moeSwigluFused`), `DECODE_ROWS_MAX` (16), `usesPrefillArm` |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab (`gateUpSwiglu`; `downReduce`) for the unquantized HF checkpoint |
 
@@ -32,7 +34,8 @@ kernel on supported hardware.
 
 - Routed experts are stacked per layer as `[E, ...]` so gather kernels index expert e on axis 0; 16x16 tiles,
   `suh`/`svh` with the H128 Hadamard; `config.json` carries `expert_quant = {format: exl3, k, codebook: mul1|mcg}`
-  (plus `window`); per-tensor rate read from the trellis shape. Every other module stays the affine pack's.
+  (plus `window`), or `format: stq` with `codebook: std1|spec1|pair1` and a named table; per-tensor rate read from the
+  trellis shape. Every other module stays the affine pack's.
 - **A rate is K = n/16**, n the packed halfwords per 256-weight tile (36 = K2.25, 48 = K3, 64 = K4): weight t's
   codeword is the 16-bit window ending at `((t+1)*n)>>4`, so its fresh bits follow from n and the pattern is never
   stored. Even n in [16, 128] admits (K1 to K8); `expert_quant.k` may be fractional JSON.
@@ -60,6 +63,27 @@ kernel on supported hardware.
   inlines `exl3_pairh` from `codebookHelpers`, built per (codebook, window). A codebook name this build does not decode is refused at load
   ([pack-format](pack-format.md#configjson)). A/B lever:
   `SUSHI_EXL3_CODEBOOK_AB=1` on the `codebook A/B` test.
+- **`std1` and `spec1` decode through a (multiplier, mask) row of the pack's table** (`Decode.table`;
+  [pack-format](pack-format.md#stq)). The kernels take the row as `exl3_hash_row_at(N)`, a constexpr lookup on the
+  kernel's rate `N` placed ahead of the helpers, so each row is an immediate of its own pipeline and a new table needs
+  no kernel change. A kernel's name and slot row spell the table, since MLX keys a library by name. No pair is built
+  in: a decode without a table row panics on the host and a pack naming no table is refused at load.
+  - The 2^12 scale is folded out of the GEMV decode: `exl3_decode2` is the weight over `foldScale`, and every kernel
+    that reads it passes each stored f32 sum through `exl3_out`. A power of two, so the bytes are the unfolded ones
+    (`unfolded_for_test` is the reference). Never fold after an f16 store (into `svh` or `suh`): the unscaled inner
+    sum underflows f16. `exl3_pairh`, the MMA operand, keeps the 2^12, so the matrix units never see a subnormal weight.
+  - The halves are often subnormal and the half sum rounds on some codewords, the same way on the host and in Metal
+    (held over every codeword).
+  - The test-only `spec1-test-per-rate` (a different pair at every rate) holds every reader to its own row.
+- **`pair1` decodes a pair from one window.** Weights 2j and 2j+1 both come from the window of weight 2j+1 (`cw.y`;
+  `cw.x` is never read), so the bitstream and every reader's codeword reads are the scalar ones. The constants are one
+  row per rate (`exl3.pair1Pair`); the kernel header is generated from those rows and the kernel's own `N` picks one at
+  compile time (the `exl3_pairh`, `exl3_decode2` and `exl3_slot` macros hand `N` to templates), so a rate has no
+  kernel copy of its own and a rate with no row fails to compile. A reader must hand `exl3_pairh` a trellis-adjacent
+  (even, odd) pair, which every reader does, and the generic one-tile reader decodes a weight through `exl3_slot`,
+  which reads its partner's window. The 2^12 folds like STD1's. Window 16 only.
+- **GLM's lane, one-row, group2 and prefill-grid kernels serve the codebooks `Codebook.servesGlmFastPaths` names**
+  (MCG, std1, spec1, pair1), each held to its own bytes.
 - **A shard's `__metadata__` stamp is CHECKED against `expert_quant` before upload**
   (`mimo_source.validateShardStamps`): see [pack-format](pack-format.md#the-shard-stamp).
 - `num_experts_per_tok` above 32 refuses by name (`Exl3TopKExceedsReduceBank`).
@@ -129,10 +153,24 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **A reader change is timed on every served pack's decode before it lands** (forward meter, against its parent): the
   byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K1.5 to K4, the
   range the converters write: the test `every K1.5 to K4 rate decodes within a margin of n48` holds each even n from
-  24 to 64 within 1.12x of n48's GEMV steps. Rates below K1.5 and above K4 stay admitted and tested for correctness,
-  never timed. `SUSHI_EXL3_LOWK_UBENCH=1` on the exl3 test binary prints n24..n48's decode chain and sorted prefill
+  24 to 64 within 1.12x of n48's GEMV steps. Rates below K1.5 and above K4 stay admitted and tested for correctness
+  (SPEC1 at every reader, GEMM, chain and f32-truth bar on `spec1-w15`'s rows); `SUSHI_EXL3_WIDE_UBENCH=1` times
+  K4.5/5/6/7/8 against K4 (decode, verify rows 3 and 4, prefill GEMM). `SUSHI_EXL3_LOWK_UBENCH=1` on the exl3 test binary prints n24..n48's decode chain and sorted prefill
   GEMMs over n32's at Flash-Next geometry (w8, w12, w15), interleaved in one process; `SUSHI_EXL3_CHAIN_UBENCH=1`
   times the one-row chain at every even n from 24 to 64, the lane funnel against the 64-bit merge.
+- **Rates above K4 on the M5 Max** (pre-port tree, GPU lock, QUIET, fans max, AC, `taskpolicy -a`). The one-row chain,
+  SPEC1 over SPEC1's K2, median of 7 repeats: K4.5 1.10, K5 1.13, K6 1.22, K6.5 1.27, K7 1.52, K7.5 1.73, K8 1.52.
+  - There are two reader cliffs, the same on MCG: n110-112 (about 70 us against 61 at n108) and n114-126 (about 80 us,
+    above n128's 70).
+  - `SUSHI_EXL3_WIDE_UBENCH`, at 512 experts, ratios over K4 in one process:
+
+    | rate | decode, 1 row | verify, 3-4 rows | prefill GEMM |
+    |---|---|---|---|
+    | K4.5 | 1.11 | 1.14-1.15 | 1.19-1.29 |
+    | K5 | 1.09 | 1.20-1.24 | 1.19-1.23 |
+    | K6 | 1.21 | 1.15-1.23 | 1.27-1.29 |
+    | K7 | 1.56 | 1.55-1.61 | 1.26-1.27 |
+    | K8 | 1.56 | 1.29-1.60 | 1.06-1.17 |
 - **MiMo verify rows share an expert's weight reads** (`PAIR_GEMV_GROUPED_SOURCE`, `DOWN_PREPARED_GROUPED_SOURCE`;
   prepared-mid geometry, 2+ rows): among an expert's slots, each even-ranked slot leads itself and the next one,
   decodes each weight once and feeds both members in the single-slot order, so every row's bytes are its one-row
@@ -161,6 +199,40 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   `SUSHI_EXL3_LAYER_UBENCH`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_EXL3_SWIGLU_MAXABS`, `SUSHI_EXL3_GEMM_ARMS` (served vs
   reference NAX body, interleaved, at MiMo geometry; `SUSHI_EXL3_GEMM_COUNTS` replays the per-layer `[exl3-counts]`
   lines `SUSHI_EXL3_UNION_HIST` logs on a prefill).
+
+<a id="rate-groups"></a>
+## Rate-grouped layers (`.gN`)
+
+- **The load builds a ragged bank from the pack's `.gN` tensors** (`Ragged`, in `loadSwitchMlpBank`; the pack format
+  is unchanged). Each projection's group trellises are concatenated into one flat U16 bank and the six scale planes
+  over all experts. A per-expert u32 table holds the gate, up and down n, the group, the three word offsets and the
+  index in the group. The `.gN` tensors become views of that storage, so the stored bytes stay resident once, plus 32
+  bytes per expert, which the Qwen and MiMo bills count. A layer without `.gN` names never builds one: every uniform
+  pack is served as before. GLM's loader binds one bank per layer and does not serve groups
+  (`Exl3RateGroupsUnsupported`, at preflight).
+- **Decode and verify rows are ONE pair GEMV and ONE fused-mid down** over the layer's rate classes. Each is the
+  served body with N constant per `case`, the rate read per threadgroup from the table. The served finish reduce
+  follows, folding the shared tail where a uniform layer does.
+  - Every slot's planes are the served kernels' bytes at its own rate.
+  - So a layer whose groups share one rate is the uniform layer to the byte.
+  - The served body is taken verbatim apart from N and the trellis offset, and the layout comes from `gemvLayout`,
+    so a change to the uniform decode GEMVs (e.g. K4 onto the lane funnel) reaches every class with no edit here.
+- **The pair kernel switches ONCE, on the expert's (gate n, up n) class, with both projections unrolled in a case.**
+  A switch inside its projection loop kept the loop rolled: +40% at 21 rates. The class switch costs 1.5-3% at 12-21
+  classes ([perf-baselines](perf-baselines.md#exl3-rate-groups)).
+- **A pass per group lost at every group count**: a dispatch costs a fixed ~10 us in the chain however few of its
+  threadgroups work, and it lost even with host-compacted slot lists (1.10x the one dispatch at 2 groups, 4.4x at 20).
+- **Prefill runs each GEMM once per group** over the group's bank view at local expert ids and its own segment of a
+  GPU-built window table (`C + E_g` windows from `g * C + base_g`, C = ceil(rows * topk / WIN)). A combine dispatch
+  (24 planes at most) joins the planes. N stays compile-time in the NAX body. Prepare, mid and the inverse-indexed
+  finish run once over the concatenated scales. Bytes equal the uniform prefill when the groups share one rate. Up to
+  512 experts (one window threadgroup).
+- **`moeGroups` is the test reference, not a served path**: it decodes every out-of-group slot at local expert 0
+  with weight 0, sums each group's slots in f32 and adds the group totals in f32. Its output differs from the
+  served path by at most one rounding of the output dtype; a KLD gate judges that.
+- **SSD streaming refuses grouped packs** (`Exl3RaggedStreamingUnsupported`). Serving them needs per-expert slab
+  sizes (a byte-budgeted LRU or one slot pool per rate) and the per-expert table in the slab index.
+- Timing: `SUSHI_EXL3_RG_UBENCH=1` (decode) and `SUSHI_EXL3_RG_PREFILL_UBENCH=1` (prefill) on the exl3 test binary.
 
 ## Parity bars
 

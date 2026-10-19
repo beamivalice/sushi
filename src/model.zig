@@ -189,6 +189,9 @@ pub const ModelConfig = struct {
     expert_quant_rate: expert_exl3.Rate = .{ .n = 64 },
     expert_quant_codebook: expert_exl3.Codebook = .mul1,
     expert_quant_window: expert_exl3.Window = .w16,
+    expert_quant_table: ?u8 = null,
+    /// The bank rates the pack's codebook table has a row for (bit n/2); null admits every rate.
+    expert_quant_rates: ?u128 = null,
     expert_source_dir: ?[]u8 = null,
     /// `SUSHI_NGRAM_BF16_DIR`: serve the PLE n-gram table from the ORIGINAL bf16
     /// shards in this HF checkpoint dir instead of the pack's quantized `ngram_table.bin`
@@ -885,6 +888,7 @@ pub const ModelConfig = struct {
             .intermediate = self.moe_intermediate_size,
             .first_moe_layer = @intCast(self.first_k_dense_replace),
             .exl3_n = self.expert_quant_rate.n,
+            .exl3_rates = self.expert_quant_rates,
         };
     }
 
@@ -903,6 +907,10 @@ pub const ModelConfig = struct {
 
     /// A MiMo checkpoint keeps its trunk in the source FP8 layout beside source
     /// MXFP4 or EXL3 experts, so both take the source loader.
+    pub fn expertDecode(self: *const ModelConfig) expert_exl3.Decode {
+        return .{ .codebook = self.expert_quant_codebook, .window = self.expert_quant_window, .table = self.expert_quant_table };
+    }
+
     pub fn usesMimoSourceTrunk(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "mimo_v2") and
             (self.expert_layout == .mxfp4_individual or self.expert_layout == .exl3_k4);
@@ -1214,6 +1222,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 config.expert_quant_rate = spec.rate;
                 config.expert_quant_codebook = spec.codebook;
                 config.expert_quant_window = spec.window;
+                config.expert_quant_table = spec.table;
+                config.expert_quant_rates = spec.rates;
                 var k_buf: [8]u8 = undefined;
                 log.info("[expert-exl3] engaged K={s} codebook={s} window={d}\n", .{ spec.rate.kText(&k_buf), @tagName(spec.codebook), spec.window.bits() });
             }
@@ -2610,7 +2620,10 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
             const start = offsets.array.items[0].integer;
             const end = offsets.array.items[1].integer;
             if (start < 0 or end < start or @as(u64, @intCast(end)) > stat.size -| header_len -| 8) return error.InvalidSafetensorsHeader;
-            const size: u64 = @intCast(end - start);
+            var size: u64 = @intCast(end - start);
+            if (tensor.value_ptr.object.get("shape")) |shape| if (shape == .array and shape.array.items.len != 0 and shape.array.items[0] == .integer) {
+                size += expert_quant.rateGroupMetaBytes(canonical, std.math.cast(u64, shape.array.items[0].integer) orelse 0);
+            };
             const bucket = if (is_mtp) &mtp else if (is_vision) &tower else &total;
             bucket.* = std.math.add(u64, bucket.*, size) catch return error.InvalidSafetensorsHeader;
             found += 1;

@@ -12410,8 +12410,8 @@ const DenseMlpWeights = struct {
 };
 
 pub const MoeMlpWeights = struct {
-    exl3_groups: [sushi_exl3.group_layout.max_groups]sushi_exl3.Bank = undefined,
-    exl3_group_count: usize = 0,
+    /// A rate-grouped EXL3 layer's banks; its handles are the transformer's to free.
+    exl3_ragged: ?sushi_exl3.Ragged = null,
     router_w: mlx.mlx_array,
     router_s: mlx.mlx_array,
     router_b: mlx.mlx_array,
@@ -19078,19 +19078,13 @@ pub const Transformer = struct {
     /// expert_x: input for expert computation (possibly normalized).
     fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool, shared: ?mlx.mlx_array, shared_gate: ?mlx.mlx_array) !mlx.mlx_array {
         if (verify_rows) mtp_verify_expert_rows_calls +%= 1;
-        if (mw.exl3_group_count > 0) return sushi_exl3.moeGroups(self.s, expert_x, mw.exl3_groups[0..mw.exl3_group_count], inds, scores, .{
-            .codebook = self.config.expert_quant_codebook,
-            .window = self.config.expert_quant_window,
-        }, verify_rows);
+        if (mw.exl3_ragged) |*rb| return sushi_exl3.moeRagged(self.s, expert_x, rb, inds, scores, self.config.expertDecode(), verify_rows, shared, shared_gate);
         const bank = sushi_exl3.Bank{
             .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
             .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
             .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
         };
-        const dec = sushi_exl3.format.Decode{
-            .codebook = self.config.expert_quant_codebook,
-            .window = self.config.expert_quant_window,
-        };
+        const dec = self.config.expertDecode();
         if (shared) |value| {
             if (shared_gate) |logit| return sushi_exl3.moeWithGatedShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value, logit);
             return sushi_exl3.moeWithShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value);
@@ -19230,9 +19224,9 @@ pub const Transformer = struct {
                 try tap.observeInput(self.s, expert_x, xs[0] * xs[1], xs[xs.len - 1]);
             };
             const shared = if (routing_override) |given| given.shared_gated else null;
-            const fold_shared = shared != null and mw.exl3_group_count == 0 and moeDumpDir() == null;
+            const fold_shared = shared != null and moeDumpDir() == null;
             const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
-            if (tail_shared and mw.exl3_group_count == 0 and moeDumpDir() == null) {
+            if (tail_shared and moeDumpDir() == null) {
                 const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
                 defer _ = mlx.mlx_array_free(down);
                 const own_logit = routed.gate_logit.ctx == null;
@@ -20017,12 +20011,12 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 .down_s = mlx.mlx_array_new(),
                 .down_b = mlx.mlx_array_new(),
             } else try loadSwitchMlpBank(weights, name_buf, prefix, li, exl3, &config);
+            if (switch_bank.ragged) |*rb| try rb.handOff(allocator, &owned_bf16);
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                .exl3_groups = switch_bank.groups,
-                .exl3_group_count = switch_bank.group_count,
+                .exl3_ragged = switch_bank.ragged,
                 .switch_gate_w = switch_bank.gate_w,
                 .switch_gate_s = switch_bank.gate_s,
                 .switch_gate_b = switch_bank.gate_b,
@@ -20090,12 +20084,12 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 .down_s = mlx.mlx_array_new(),
                 .down_b = mlx.mlx_array_new(),
             } else try loadSwitchMlpBank(weights, name_buf, prefix, li, exl3, &config);
+            if (switch_bank.ragged) |*rb| try rb.handOff(allocator, &owned_bf16);
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                .exl3_groups = switch_bank.groups,
-                .exl3_group_count = switch_bank.group_count,
+                .exl3_ragged = switch_bank.ragged,
                 .switch_gate_w = switch_bank.gate_w,
                 .switch_gate_s = switch_bank.gate_s,
                 .switch_gate_b = switch_bank.gate_b,
@@ -20226,9 +20220,12 @@ pub fn appendHybridMlpWeights(vec: mlx.mlx_vector_array, hw: *const HybridMlpWei
     // so they don't pollute the eval batch. Mirrors `appendLinearAttnWeights`.
     switch (hw.*) {
         .moe => |*mw| {
-            for (mw.exl3_groups[0..mw.exl3_group_count]) |bank| {
-                for ([_]sushi_exl3.Proj{ bank.gate, bank.up, bank.down }) |proj| {
-                    for ([_]mlx.mlx_array{ proj.trellis, proj.suh, proj.svh }) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            if (mw.exl3_ragged) |*rb| {
+                for (rb.storage()) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+                for (rb.views[0..rb.count]) |bank| {
+                    for ([_]sushi_exl3.Proj{ bank.gate, bank.up, bank.down }) |proj| {
+                        for ([_]mlx.mlx_array{ proj.trellis, proj.suh, proj.svh }) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+                    }
                 }
             }
             inline for (comptime structFields(MoeMlpWeights)) |field| {
@@ -26886,6 +26883,7 @@ const MimoExl3MoeHarness = struct {
             .expert_quant_rate = rate,
             .expert_quant_codebook = dec.codebook,
             .expert_quant_window = dec.window,
+            .expert_quant_table = dec.table,
             .num_experts = @intCast(E),
             .num_experts_per_tok = 2,
             .hidden_size = @intCast(hidden),
@@ -27457,8 +27455,7 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
 }
 
 const SwitchMlpBank = struct {
-    groups: [sushi_exl3.group_layout.max_groups]sushi_exl3.Bank = undefined,
-    group_count: usize = 0,
+    ragged: ?sushi_exl3.Ragged = null,
     gate_w: mlx.mlx_array,
     gate_s: mlx.mlx_array,
     gate_b: mlx.mlx_array,
@@ -27477,8 +27474,10 @@ const SwitchMlpBank = struct {
 fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool, config: *const ModelConfig) !SwitchMlpBank {
     if (exl3) {
         var plan = sushi_exl3.GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
+        plan.rates = config.expert_quant_rates;
         var groups: [sushi_exl3.group_layout.max_groups]sushi_exl3.Bank = undefined;
-        const start = try std.fmt.bufPrint(buf, "{s}.layers.{d}.mlp.switch_mlp.", .{ prefix, layer });
+        var start_buf: [256]u8 = undefined;
+        const start = try std.fmt.bufPrint(&start_buf, "{s}.layers.{d}.mlp.switch_mlp.", .{ prefix, layer });
         var it = weights.map.iterator();
         while (it.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key_ptr.*, start)) continue;
@@ -27519,7 +27518,33 @@ fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8,
         }
         try plan.finish(experts, config.num_experts_per_tok, config.expert_streaming, config.num_experts);
         if (config.moe_n_group > 1 and (plan.grouped.? or experts != config.num_experts)) return error.Exl3RouterGroupsUnsupported;
-        const g = groups[0];
+        var ragged: ?sushi_exl3.Ragged = null;
+        if (plan.grouped.?) {
+            ragged = try sushi_exl3.Ragged.init(mlx.gpuStream(), groups[0..plan.count]);
+            errdefer ragged.?.deinit();
+            // The pack's group tensors become views of the ragged storage, so the loaded originals
+            // are freed once it is evaluated and the layer's bytes stay resident once.
+            var views = weights.map.iterator();
+            while (views.next()) |entry| {
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, start)) continue;
+                const name = try sushi_exl3.group_layout.Name.parse(entry.key_ptr.*[start.len..]);
+                const bank = ragged.?.views[name.group];
+                const proj = switch (name.projection) {
+                    0 => bank.gate,
+                    1 => bank.up,
+                    else => bank.down,
+                };
+                var view = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&view, switch (name.part) {
+                    0 => proj.trellis,
+                    1 => proj.suh,
+                    else => proj.svh,
+                }));
+                _ = mlx.mlx_array_free(entry.value_ptr.*);
+                entry.value_ptr.* = view;
+            }
+        }
+        const g = if (ragged) |rb| rb.views[0] else groups[0];
         return .{
             .gate_w = g.gate.trellis,
             .gate_s = g.gate.suh,
@@ -27530,8 +27555,7 @@ fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8,
             .down_w = g.down.trellis,
             .down_s = g.down.suh,
             .down_b = g.down.svh,
-            .groups = groups,
-            .group_count = if (plan.grouped.?) plan.count else 0,
+            .ragged = ragged,
         };
     }
     return .{
@@ -55714,13 +55738,59 @@ test "sushi coder GPU grouped binders cover qwen mimo and MTP" {
         var cfg = exl3SwitchBankConfig(.{ .n = 64 });
         cfg.num_experts = 512;
         cfg.num_experts_per_tok = 2;
-        const bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
-        try t.expectEqual(@as(usize, 2), bank.group_count);
-        try t.expectEqual(@as(c_int, 2), mlx.getShape(bank.groups[1].up.trellis)[0]);
-        try t.expectEqual(@as(c_int, 64), mlx.getShape(bank.groups[1].up.trellis)[3]);
+        var bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
+        defer bank.ragged.?.deinit();
+        try t.expectEqual(@as(usize, 2), bank.ragged.?.count);
+        try t.expectEqual(@as(c_int, 2), mlx.getShape(bank.ragged.?.views[1].up.trellis)[0]);
+        try t.expectEqual(@as(c_int, 64), mlx.getShape(bank.ragged.?.views[1].up.trellis)[3]);
+        // The pack's tensors now share the ragged storage.
+        const key = try std.fmt.bufPrint(&buf, "{s}.layers.0.mlp.switch_mlp.down_proj.g1.trellis", .{prefix});
+        try t.expectEqualSlices(c_int, &.{ 2, 8, 8, 32 }, mlx.getShape(w.get(key).?));
         cfg.num_experts_per_tok = 4;
         try t.expectError(error.Exl3TopKExceedsExperts, loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg));
     }
+}
+
+test "sushi coder GPU a loaded grouped layer keeps its stored bytes resident once" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const prefix = "language_model.model";
+    var w = Weights.init(t.allocator);
+    defer w.deinit();
+    var buf: [256]u8 = undefined;
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    var stored: usize = 0;
+    for (0..2) |group| {
+        for ([_][]const u8{ "gate", "up", "down" }, 0..) |proj, p| {
+            const n: c_int = if ((group + p) % 2 == 0) 24 else 48;
+            for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
+                const shape: []const c_int = if (i == 0) &.{ 64, 16, 16, n } else &.{ 64, 256 };
+                var arr = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_ones(&arr, shape.ptr, shape.len, if (i == 0) .uint16 else .float16, s));
+                try mlx.check(mlx.mlx_array_eval(arr));
+                stored += mlx.mlx_array_size(arr) * mlx.mlx_array_itemsize(arr);
+                try w.map.put(try std.fmt.allocPrint(t.allocator, "{s}.layers.0.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ prefix, proj, group, part }), arr);
+            }
+        }
+    }
+    var cfg = exl3SwitchBankConfig(.{ .n = 64 });
+    cfg.hidden_size = 256;
+    cfg.moe_intermediate_size = 256;
+    cfg.num_experts = 128;
+    cfg.num_experts_per_tok = 8;
+    var bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
+    defer bank.ragged.?.deinit();
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var hw: HybridMlpWeights = .{ .moe = std.mem.zeroInit(MoeMlpWeights, .{ .exl3_ragged = bank.ragged }) };
+    appendHybridMlpWeights(vec, &hw);
+    try mlx.check(mlx.mlx_eval(vec));
+    try mlx.check(mlx.mlx_synchronize(s));
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    // The stored bytes once, plus the per-expert table; the loaded originals are gone.
+    try t.expectEqual(stored + 128 * sushi_exl3.rate_groups.META_WORDS * 4, after - before);
 }
 
 test "sushi coder GPU grouped layer matches the original uniform bank" {
@@ -55739,8 +55809,9 @@ test "sushi coder GPU grouped layer matches the original uniform bank" {
     defer for (slices[0..built]) |a| {
         _ = mlx.mlx_array_free(a);
     };
+    var banks: [2]sushi_exl3.Bank = undefined;
     for (0..2) |group| {
-        const bank = &h.mw.exl3_groups[group];
+        const bank = &banks[group];
         for ([_]*sushi_exl3.Proj{ &bank.gate, &bank.up, &bank.down }) |proj| {
             for ([_]mlx.mlx_array{ h.mw.switch_gate_w, h.mw.switch_gate_s, h.mw.switch_gate_b }, 0..) |a, part| {
                 const sh = mlx.getShape(a);
@@ -55762,9 +55833,11 @@ test "sushi coder GPU grouped layer matches the original uniform bank" {
             }
         }
     }
-    h.mw.exl3_group_count = 2;
+    h.mw.exl3_ragged = try sushi_exl3.Ragged.init(s, &banks);
+    defer h.mw.exl3_ragged.?.deinit();
     const grouped = try h.xfm.moeMLP(h.x, &h.mw);
     defer _ = mlx.mlx_array_free(grouped);
+    // Both groups carry the uniform bank's rate, so the grouped layer is the uniform one to the byte.
     var a = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(a);
     var b = mlx.mlx_array_new();
@@ -55773,9 +55846,7 @@ test "sushi coder GPU grouped layer matches the original uniform bank" {
     try mlx.check(mlx.mlx_astype(&b, grouped, .float32, s));
     try mlx.check(mlx.mlx_array_eval(a));
     try mlx.check(mlx.mlx_array_eval(b));
-    const av = mlx.mlx_array_data_float32(a).?;
-    const bv = mlx.mlx_array_data_float32(b).?;
-    for (0..128) |i| try t.expectApproxEqAbs(av[i], bv[i], 0.002 + @abs(av[i]) * 0.002);
+    try t.expectEqualSlices(f32, mlx.mlx_array_data_float32(a).?[0..128], mlx.mlx_array_data_float32(b).?[0..128]);
 }
 
 test "argmax-only shortlist rows hold the exact logits at their ids and argmax to the lowest tied id" {
@@ -56489,11 +56560,21 @@ fn writeGlmExl3Bank(dir: std.Io.Dir, path: []const u8, weights: *const Weights) 
 }
 
 test "GLM serving streams EXL3 experts through eviction and the union, bit-identical to resident at BF16 and kv8 latents" {
+    try glmStreamedExl3MatchesResident(expert_exl3.Decode.mcg);
+}
+
+test "GLM serving streams std1 EXL3 experts bit-identical to resident" {
+    try glmStreamedExl3MatchesResident(expert_exl3.Decode.tabled(.std1, .w15));
+}
+
+fn glmStreamedExl3MatchesResident(dec: expert_exl3.Decode) !void {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     var weights = Weights.init(a);
     defer weights.deinit();
-    const cfg = try glm5_mod.routedFixture(&weights, 4);
+    var cfg = try glm5_mod.routedFixture(&weights, 4);
+    cfg.expert_quant_codebook = dec.codebook;
+    cfg.expert_quant_table = dec.table;
     var trunk = Weights.init(a);
     defer trunk.deinit();
     _ = try glm5_mod.routedFixture(&trunk, 4);

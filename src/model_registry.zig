@@ -1240,7 +1240,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
@@ -1261,6 +1261,13 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "Exl3GateUpRateMismatch")) return error.Exl3GateUpRateMismatch;
             if (std.mem.eql(u8, n, "Exl3WindowUnsupported")) return error.Exl3WindowUnsupported;
             if (std.mem.eql(u8, n, "Exl3ShardStampMismatch")) return error.Exl3ShardStampMismatch;
+            if (std.mem.eql(u8, n, "Exl3CodebookTableUnknown")) return error.Exl3CodebookTableUnknown;
+            if (std.mem.eql(u8, n, "Exl3CodebookTableDigestMismatch")) return error.Exl3CodebookTableDigestMismatch;
+            if (std.mem.eql(u8, n, "Exl3CodebookTableWindowMismatch")) return error.Exl3CodebookTableWindowMismatch;
+            if (std.mem.eql(u8, n, "Exl3CodebookTableCodebookMismatch")) return error.Exl3CodebookTableCodebookMismatch;
+            if (std.mem.eql(u8, n, "Exl3CodebookTableRateMissing")) return error.Exl3CodebookTableRateMissing;
+            if (std.mem.eql(u8, n, "Exl3CodebookTableLegacyConfig")) return error.Exl3CodebookTableLegacyConfig;
+            if (std.mem.eql(u8, n, "Exl3CodebookTableUndecodable")) return error.Exl3CodebookTableUndecodable;
         }
         return error.LoadFailed;
     }
@@ -1287,6 +1294,13 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.Exl3TrellisGeometry, loadErrorFromName("Exl3TrellisGeometry"));
         try std.testing.expectEqual(error.Exl3WindowUnsupported, loadErrorFromName("Exl3WindowUnsupported"));
         try std.testing.expectEqual(error.Exl3ShardStampMismatch, loadErrorFromName("Exl3ShardStampMismatch"));
+        try std.testing.expectEqual(error.Exl3CodebookTableUnknown, loadErrorFromName("Exl3CodebookTableUnknown"));
+        try std.testing.expectEqual(error.Exl3CodebookTableDigestMismatch, loadErrorFromName("Exl3CodebookTableDigestMismatch"));
+        try std.testing.expectEqual(error.Exl3CodebookTableWindowMismatch, loadErrorFromName("Exl3CodebookTableWindowMismatch"));
+        try std.testing.expectEqual(error.Exl3CodebookTableCodebookMismatch, loadErrorFromName("Exl3CodebookTableCodebookMismatch"));
+        try std.testing.expectEqual(error.Exl3CodebookTableRateMissing, loadErrorFromName("Exl3CodebookTableRateMissing"));
+        try std.testing.expectEqual(error.Exl3CodebookTableLegacyConfig, loadErrorFromName("Exl3CodebookTableLegacyConfig"));
+        try std.testing.expectEqual(error.Exl3CodebookTableUndecodable, loadErrorFromName("Exl3CodebookTableUndecodable"));
         // Everything else stays a load failure — guessing a diagnosis is worse
         // than reporting the honest generic one.
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
