@@ -73,8 +73,9 @@ stacked bank per projection with its own rate, read from its own trellis shape.
 - No new config field: `expert_quant.k` stays the ceiling every group's rate must fit under.
 - Refused by name: `Exl3GroupNameInvalid`, `Exl3GroupMissing`, `Exl3GroupGeometry`, `Exl3GroupDtype`,
   `Exl3MixedGroupLayout`, `Exl3TrellisGeometry` (a rate this build cannot decode), `Exl3RouterWidthMismatch`,
-  `Exl3TopKExceedsExperts`, `Exl3RaggedStreamingUnsupported` (SSD streaming serves uniform banks only) and
-  `Exl3RateGroupsUnsupported` (a GLM layer cannot be grouped: Qwen and MiMo serve groups resident).
+  `Exl3TopKExceedsExperts`, `Exl3RaggedStreamingUnsupported` (SSD streaming of a rate-grouped layer is Flash-Next only,
+  [engine-expert-streaming](engine-expert-streaming.md#rate-groups)) and `Exl3RateGroupsUnsupported` (a GLM layer cannot
+  be grouped: Qwen and MiMo serve groups resident).
 - A group's rates are checked against the pack's codebook table like any bank (`Exl3CodebookTableRateMissing`).
 - The engine serves any group count with one decode dispatch per projection stage and each GEMM once per group at
   prefill ([engine-exl3-experts](engine-exl3-experts.md#rate-groups)): the decode cost is the rate mix, not the count.

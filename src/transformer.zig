@@ -18787,7 +18787,20 @@ pub const Transformer = struct {
         if (prepared.quantized) {
             const slab_inds = mlx.mlx_array_new_data(remapped_host.ptr, inds_shape.ptr, @intCast(inds_shape.len), .int32);
             defer _ = mlx.mlx_array_free(slab_inds);
-            const mw_slab = slabMoeWeights(mw, &prepared.quant_raw);
+            var mw_slab = slabMoeWeights(mw, &prepared.quant_raw);
+            if (prepared.ragged) |bank| {
+                const first = bank.views[0];
+                mw_slab.exl3_ragged = bank.*;
+                mw_slab.switch_gate_w = first.gate.trellis;
+                mw_slab.switch_gate_s = first.gate.suh;
+                mw_slab.switch_gate_b = first.gate.svh;
+                mw_slab.switch_up_w = first.up.trellis;
+                mw_slab.switch_up_s = first.up.suh;
+                mw_slab.switch_up_b = first.up.svh;
+                mw_slab.switch_down_w = first.down.trellis;
+                mw_slab.switch_down_s = first.down.suh;
+                mw_slab.switch_down_b = first.down.svh;
+            }
             const slab_result = try self.moeMLP2WithRouter(expert_x, expert_x, &mw_slab, null, false, null, .{
                 .inds = slab_inds,
                 .norm_scores = norm_scores,

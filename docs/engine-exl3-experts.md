@@ -230,8 +230,8 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **`moeGroups` is the test reference, not a served path**: it decodes every out-of-group slot at local expert 0
   with weight 0, sums each group's slots in f32 and adds the group totals in f32. Its output differs from the
   served path by at most one rounding of the output dtype; a KLD gate judges that.
-- **SSD streaming refuses grouped packs** (`Exl3RaggedStreamingUnsupported`). Serving them needs per-expert slab
-  sizes (a byte-budgeted LRU or one slot pool per rate) and the per-expert table in the slab index.
+- **SSD streaming of a grouped layer** (Flash-Next) keeps one slot pool per rate group and builds this `Ragged` bank
+  over the slabs (`Ragged.initPools`); MiMo and GLM refuse it ([engine-expert-streaming](engine-expert-streaming.md#rate-groups)).
 - Timing: `SUSHI_EXL3_RG_UBENCH=1` (decode) and `SUSHI_EXL3_RG_PREFILL_UBENCH=1` (prefill) on the exl3 test binary.
 
 ## Parity bars

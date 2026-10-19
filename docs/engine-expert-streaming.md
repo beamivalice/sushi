@@ -12,7 +12,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 | File | Role |
 |---|---|
-| `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
+| `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `GroupedLayer` (a rate-grouped layer's pools), `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
 | `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab |
 | `src/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
@@ -37,8 +37,9 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 | GLM-5.3-Flash | BF16 source (643 GB) | `bf16_individual` | streams; required | native streamed teacher |
 | GLM-5.3-Flash | FP8 release | `fp8_individual` beside its FP8 trunk | streams (hermetic proof only) | refused |
 
-- Rate-group (`.gN`) and pruned EXL3 packs are refused by name (`Exl3RateGroupsStreamingUnsupported`,
-  `Exl3RaggedStreamingUnsupported`) and serve resident: an open gap, not the design.
+- Rate-group (`.gN`) EXL3 packs stream on Flash-Next ([below](#rate-groups)); on MiMo, and for pruned layers, they are
+  refused by name (`Exl3RateGroupsStreamingUnsupported`, `Exl3RaggedStreamingUnsupported`) and serve resident. GLM
+  serves no rate groups at all (`Exl3RateGroupsUnsupported`).
 - Vision is off under streaming unless asked for ([below](#vision)); a streamed model then serves text only.
 - GLM's routed experts go through `glm5_stream.Stream`: BF16 source experts through the clamped `gather_mm`
   composite, EXL3 banks through the resident `routedExl3` dispatch; router ids become slot ids, scores, clamps and
@@ -88,7 +89,8 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 - `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident
   target of N GiB = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
-  bounce; the remainder is a uniform per-layer LRU.
+  bounce; the remainder is a uniform per-layer LRU. The ledger refuses a budget under two slots per layer, and under
+  one expert of every rate group of a grouped layer (`SsdBudgetBelowResident`, `StoreShape.layer_floor_bytes`).
 - Precedence: `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming both.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
@@ -118,6 +120,34 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - **Load-time cache warm**: preload the lowest expert IDs into `floor(0.8 * slots_per_layer)` slots per MoE layer
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
   routes; dense prefix layers are skipped.
+
+<a id="rate-groups"></a>
+## Rate groups under streaming (Flash-Next)
+
+A layer whose experts carry several rates ([pack-format](pack-format.md#rate-groups-per-expert-rates-uneven-expert-counts))
+has no single slot size, so it keeps one slot pool per rate group instead of one uniform LRU.
+
+- **Pools.** Each group owns a `GroupCache` over its own experts and a slab region sized in its own rate; the layer's
+  nine slabs hold the pools back to back (trellis flat per projection, one scale row per slot). The cache plan and the
+  ledger are shared: a layer is billed `slots_per_layer` average experts (`QuantStore.expertBytes`, the pack's mean
+  expert), and `GroupedLayer.sizePools` spends exactly that bill, never more, caching the same fraction of every
+  group. A group too small to afford one expert of its share is pinned at one slot, paid first; a budget below one
+  slot per group is refused by the ledger before the engine opens. The union workspace is one set sized for the widest
+  grouped layer, billed as every expert at the mean; a pack that also has uniform streamed layers keeps a second set
+  for them and bills both (`StoreShape.union_sets`). The ledger bills each slot's `Ragged` meta row and each grouped
+  layer's union meta table (32 bytes per expert).
+- **Compute.** The resident `Ragged` bank is rebuilt over the slabs (`Ragged.initPools`), so a streamed forward runs
+  `moeRagged` on global slot ids: pool g's slots follow pool g-1's, and its meta table depends only on the pool
+  structure, never on what is cached. The kernels, the zero-copy import and the epoch leases are the uniform
+  path's; a streamed forward is bit-identical to the resident `Ragged` forward.
+- **Resolve.** A route resolves against each group's cache separately (hits touched before admits, as in a uniform
+  layer). One group overflowing its pool sends the whole layer through the union workspace: every group's experts are
+  read into it at their group position, misses that fit are admitted into their pool, and the bank over the
+  workspace serves the forward.
+- **Off for grouped layers**: the speculative expert queue (`specRoute`) and the lossy pick
+  (`--expert-pick-tolerance`) run on a uniform cache map only; a grouped layer takes the exact, non-speculative
+  path. The load-time warm preloads the lowest expert ids, which fill group 0 first.
+- Rate groups on MiMo stay resident-only; GLM serves none.
 
 ## Decode schedule
 

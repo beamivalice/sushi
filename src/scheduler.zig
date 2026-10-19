@@ -2858,8 +2858,10 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry);
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
-    const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
-    const picked = resolveStreamedVision(budget_bytes, config, split, per_expert, vision) catch |err| {
+    const bill = try expert_stream_mod.expertBillFor(allocator, model_dir, geometry, streamed.expert_layout);
+    const per_expert = bill.expert_bytes;
+    streamed.expert_shape = bill.shape;
+    const picked = resolveStreamedVision(budget_bytes, &streamed, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
             budget_bytes >> 30,
             @as(f64, @floatFromInt(split.vision)) / 1e9,
@@ -2867,7 +2869,7 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
         return err;
     };
     if (!picked.cost.on) split.vision = 0;
-    const cache = try expert_stream_mod.cachePlanBytesForGeometry(picked.resolved.cache_bytes, geometry, per_expert);
+    const cache = try expert_stream_mod.cachePlanBytesForGeometry(picked.resolved.cache_bytes, streamed.expertGeometry(), per_expert);
     return .{ .layout = streamed.expert_layout, .split = split, .resolved = picked.resolved, .cache = cache, .vision = picked.cost };
 }
 
@@ -2966,6 +2968,7 @@ pub fn resolveExpertCache(
         @intCast(config.num_experts_per_tok),
         per_expert,
         expert_stream_mod.BOUNCE_BYTES,
+        config.expert_shape,
     );
     return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger };
 }

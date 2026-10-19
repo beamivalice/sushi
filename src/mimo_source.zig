@@ -859,6 +859,7 @@ fn validateRequired(
 fn validateExl3Layer(source: *const SourceIndex, allocator: Allocator, config: *const model.ModelConfig, layer_prefix: []const u8) !@import("sushi_exl3").GroupLayout {
     var plan = @import("sushi_exl3").GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
     plan.rates = config.expert_quant_rates;
+    plan.streams_groups = std.mem.eql(u8, config.model_type, "qwen4_exp");
     const prefix = try std.fmt.allocPrint(allocator, "{s}.mlp.switch_mlp.", .{layer_prefix});
     const router = source.tensors.get(try std.fmt.allocPrint(allocator, "{s}.mlp.gate.weight", .{layer_prefix})) orelse return error.MissingMimoRequiredTensor;
     if (router.shape.len != 2 or router.shape[0] > std.math.maxInt(u32)) return error.Exl3RouterWidthMismatch;
@@ -2111,17 +2112,12 @@ test "sushi coder incomplete grouped EXL3 index refuses instead of guessing a la
     try expectError(error.ExpertLayoutUnsupported, model.parseConfig(t.io, alloc, buf[0..len]));
 }
 
-test "sushi coder qwen trunk and MTP preflight use each router width" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
+/// A two-group Flash-Next pack: trunk layers 0 and 1, then the MTP head, with a router `layer_experts[i]` wide each.
+fn writeRaggedQwenFixture(io: std.Io, alloc: Allocator, dir: std.Io.Dir, layer_experts: [3]u64) !void {
     var tensors: std.ArrayList(TestTensor) = .empty;
     var entries: std.ArrayList(TestIndexEntry) = .empty;
     for ([_][]const u8{ "language_model.model.layers.0", "language_model.model.layers.1", "language_model.mtp.layers.0" }, 0..) |base, layer| {
-        const e: u64 = if (layer == 1) 2 else 3;
+        const e = layer_experts[layer];
         try tensors.append(alloc, .{
             .key = try std.fmt.allocPrint(alloc, "{s}.mlp.gate.weight", .{base}),
             .dtype = "BF16",
@@ -2144,8 +2140,18 @@ test "sushi coder qwen trunk and MTP preflight use each router width" {
         }
     }
     for (tensors.items) |tensor| try entries.append(alloc, .{ .key = tensor.key, .file = "ragged.safetensors" });
-    try writeTestShard(t.io, alloc, tmp.dir, "ragged.safetensors", tensors.items);
-    try writeTestIndex(t.io, alloc, tmp.dir, entries.items);
+    try writeTestShard(io, alloc, dir, "ragged.safetensors", tensors.items);
+    try writeTestIndex(io, alloc, dir, entries.items);
+}
+
+test "sushi coder qwen trunk and MTP preflight use each router width" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeRaggedQwenFixture(t.io, alloc, tmp.dir, .{ 3, 2, 3 });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(t.io, &buf);
     var cfg = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .num_hidden_layers = 2, .num_experts = 512, .num_experts_per_tok = 2, .hidden_size = 128, .moe_intermediate_size = 128 };
@@ -2154,6 +2160,22 @@ test "sushi coder qwen trunk and MTP preflight use each router width" {
     try t.expectError(error.Exl3TopKExceedsExperts, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
     cfg.num_experts_per_tok = 2;
     cfg.expert_streaming = true;
+    try t.expectError(error.Exl3RaggedStreamingUnsupported, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
+}
+
+test "sushi coder a rate-grouped Flash-Next pack passes the streaming preflight, a pruned one does not" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeRaggedQwenFixture(t.io, alloc, tmp.dir, .{ 3, 3, 3 });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    var cfg = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .num_hidden_layers = 2, .num_experts = 3, .num_experts_per_tok = 2, .hidden_size = 128, .moe_intermediate_size = 128, .expert_streaming = true };
+    try validateExl3Pack(t.io, alloc, buf[0..len], &cfg);
+    cfg.num_experts = 512;
     try t.expectError(error.Exl3RaggedStreamingUnsupported, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
 }
 

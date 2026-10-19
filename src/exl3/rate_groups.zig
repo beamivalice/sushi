@@ -18,6 +18,9 @@ const max_groups = group_layout.max_groups;
 /// offsets into the ragged trellis in u32 words, and the expert's index inside its group.
 pub const META_WORDS: usize = 8;
 
+/// One rate group's slots in a streamed layer: `slots` slots at the group's gate, up and down rates.
+pub const Pool = struct { slots: u32, rates: [3]u32 };
+
 /// A grouped layer's banks as one ragged trellis per projection (groups in order, each expert's
 /// tiles contiguous) and scales concatenated over all experts, so every kernel indexes the router's
 /// expert id. `views` are each group's banks over the same storage.
@@ -110,6 +113,68 @@ pub const Ragged = struct {
                 dst.trellis = try rowsView(s, self.trellis[pi], at[pi], at[pi] + len, mlx.getShape(p.trellis));
                 dst.suh = try rowsView(s, self.suh[pi], @intCast(self.base[g]), @intCast(self.base[g] + self.experts_of[g]), mlx.getShape(p.suh));
                 dst.svh = try rowsView(s, self.svh[pi], @intCast(self.base[g]), @intCast(self.base[g] + self.experts_of[g]), mlx.getShape(p.svh));
+                at[pi] += len;
+            }
+            self.views[g] = view;
+            self.view_count += 1;
+        }
+        return self;
+    }
+
+    /// A ragged bank over storage the caller owns, for a streamed layer: each pool's slots are the experts of its
+    /// group, so a router id remapped to a global slot id indexes the meta table the way an expert id does in
+    /// `init`. `trellis[p]` is the flat U16 storage of projection p (pools back to back), `suh[p]` and `svh[p]` hold
+    /// one row per slot over all pools. The handles are retained; the storage stays the caller's.
+    pub fn initPools(s: mlx.mlx_stream, hidden: u32, inter: u32, pools: []const Pool, trellis: [3]mlx.mlx_array, suh: [3]mlx.mlx_array, svh: [3]mlx.mlx_array) !Ragged {
+        if (pools.len == 0 or pools.len > max_groups) return error.Exl3GroupMissing;
+        var self: Ragged = .{};
+        errdefer self.deinit();
+        self.hidden = @intCast(hidden);
+        self.inter = @intCast(inter);
+        self.count = pools.len;
+        for (0..3) |pi| {
+            self.trellis[pi] = mlx.mlx_array_new();
+            self.suh[pi] = mlx.mlx_array_new();
+            self.svh[pi] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&self.trellis[pi], trellis[pi]));
+            try mlx.check(mlx.mlx_array_set(&self.suh[pi], suh[pi]));
+            try mlx.check(mlx.mlx_array_set(&self.svh[pi], svh[pi]));
+        }
+        const tiles: u64 = @as(u64, hidden / 16) * (inter / 16);
+        var meta: std.ArrayList(u32) = .empty;
+        defer meta.deinit(std.heap.page_allocator);
+        var words: [3]u64 = @splat(0);
+        for (pools, 0..) |pool, g| {
+            self.rates[g] = pool.rates;
+            self.base[g] = self.experts;
+            self.experts_of[g] = pool.slots;
+            for (0..pool.slots) |local| {
+                try meta.appendSlice(std.heap.page_allocator, &.{ pool.rates[0], pool.rates[1], pool.rates[2], @intCast(g) });
+                for (0..3) |pi| {
+                    const at = words[pi] + local * tiles * pool.rates[pi] / 2;
+                    if (at > std.math.maxInt(u32)) return error.ResidentBytesOverflow;
+                    try meta.append(std.heap.page_allocator, @intCast(at));
+                }
+                try meta.append(std.heap.page_allocator, @intCast(local));
+            }
+            for (0..3) |pi| words[pi] += @as(u64, pool.slots) * tiles * pool.rates[pi] / 2;
+            self.experts += pool.slots;
+        }
+        self.meta = mlx.mlx_array_new_data(meta.items.ptr, &[_]c_int{@intCast(meta.items.len)}, 1, .uint32);
+        var at: [3]c_int = @splat(0);
+        for (pools, 0..) |pool, g| {
+            var view: root.Bank = undefined;
+            const slots: c_int = @intCast(pool.slots);
+            for (0..3) |pi| {
+                const in_dim: c_int = @intCast(if (pi == 2) inter else hidden);
+                const out_dim: c_int = @intCast(if (pi == 2) hidden else inter);
+                const n: c_int = @intCast(pool.rates[pi]);
+                const len: c_int = slots * @divExact(in_dim, 16) * @divExact(out_dim, 16) * n;
+                const dst = projPtr(&view, pi);
+                dst.* = .{ .trellis = .{ .ctx = null }, .suh = .{ .ctx = null }, .svh = .{ .ctx = null } };
+                dst.trellis = try rowsView(s, self.trellis[pi], at[pi], at[pi] + len, &[_]c_int{ slots, @divExact(in_dim, 16), @divExact(out_dim, 16), n });
+                dst.suh = try rowsView(s, self.suh[pi], @intCast(self.base[g]), @intCast(self.base[g] + pool.slots), &[_]c_int{ slots, in_dim });
+                dst.svh = try rowsView(s, self.svh[pi], @intCast(self.base[g]), @intCast(self.base[g] + pool.slots), &[_]c_int{ slots, out_dim });
                 at[pi] += len;
             }
             self.views[g] = view;

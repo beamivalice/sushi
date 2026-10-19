@@ -44,6 +44,8 @@ pub const Layout = struct {
     groups: [max_groups]Group = @splat(.{}),
     count: usize = 0,
     grouped: ?bool = null,
+    /// The streaming engine serves rate groups (pruned layers still refuse it).
+    streams_groups: bool = false,
     bytes: u64 = 0,
 
     pub fn init(hidden: u32, intermediate: u32, ceiling: format.Rate) Layout {
@@ -91,7 +93,7 @@ pub const Layout = struct {
         if (total != router_experts or total > std.math.maxInt(c_int)) return error.Exl3RouterWidthMismatch;
         if (topk > router_experts) return error.Exl3TopKExceedsExperts;
         if (topk > 32) return error.Exl3TopKExceedsReduceBank;
-        if (streaming and (self.grouped.? or router_experts != configured_experts)) return error.Exl3RaggedStreamingUnsupported;
+        if (streaming and ((self.grouped.? and !self.streams_groups) or router_experts != configured_experts)) return error.Exl3RaggedStreamingUnsupported;
     }
 
     pub fn locate(self: *const Layout, expert: u32) !struct { group: u32, local: u32 } {

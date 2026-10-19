@@ -4,6 +4,8 @@ const log = @import("log.zig");
 const io_mod = @import("expert_io.zig");
 const kernels = @import("expert_bf16_kernels.zig");
 pub const quant = @import("expert_quant.zig");
+const sushi_exl3 = @import("sushi_exl3");
+const Ragged = sushi_exl3.Ragged;
 
 pub const Span = struct {
     offset: u64,
@@ -77,12 +79,19 @@ pub fn mxfp4ExpertBytes(hidden: u32, intermediate: u32) !u64 {
 /// Per-expert bytes of whichever routed-expert layout this checkpoint ships:
 /// the fused bf16 pair, or the sum of the nine quantized slices the pack stores.
 pub fn expertBytesFor(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: quant.Layout) !u64 {
+    return (try expertBillFor(allocator, model_dir, geometry, layout)).expert_bytes;
+}
+
+pub const ExpertBill = struct { expert_bytes: u64, shape: quant.StoreShape = .{} };
+
+/// `expertBytesFor` with the rest of what the store bills, read from the store the engine will open.
+pub fn expertBillFor(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: quant.Layout) !ExpertBill {
     switch (layout) {
-        .bf16_fused => return expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate),
+        .bf16_fused => return .{ .expert_bytes = try expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate) },
         .bf16_individual, .fp8_individual, .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
             var store = try quant.QuantStore.openForLayout(allocator, model_dir, geometry, layout);
             defer store.deinit();
-            return store.expertBytes();
+            return .{ .expert_bytes = store.expertBytes(), .shape = store.shape() };
         },
     }
 }
@@ -99,13 +108,13 @@ pub fn exl3ExpertBytes(geometry: Geometry) !u64 {
     return std.math.add(u64, both, down) catch return error.InvalidExpertGeometry;
 }
 
-pub fn cachePlanBytes(requested_bytes: u64, layers: u16, experts: u16, expert_bytes: u64) !CachePlan {
+pub fn cachePlanBytes(requested_bytes: u64, layers: u16, experts: u16, expert_bytes: u64, shape: quant.StoreShape) !CachePlan {
     if (layers == 0 or experts == 0 or expert_bytes == 0) return error.InvalidExpertGeometry;
     const per_slot_all_layers = std.math.mul(u64, layers, expert_bytes) catch return error.InvalidExpertGeometry;
     const slots_u64 = @min(requested_bytes / per_slot_all_layers, experts);
     if (slots_u64 == 0) return error.ExpertCacheTooSmall;
     const slots: u16 = @intCast(slots_u64);
-    const workspace_bytes = std.math.mul(u64, experts, expert_bytes) catch return error.InvalidExpertGeometry;
+    const workspace_bytes = workspaceBytes(experts, expert_bytes, shape) catch return error.InvalidExpertGeometry;
     const bounce_bytes: u64 = BOUNCE_BYTES;
     const layer_bytes = std.math.mul(u64, slots, expert_bytes) catch return error.InvalidExpertGeometry;
     return .{
@@ -120,7 +129,13 @@ pub fn cachePlanBytes(requested_bytes: u64, layers: u16, experts: u16, expert_by
 }
 
 pub fn cachePlanBytesForGeometry(requested_bytes: u64, geometry: Geometry, expert_bytes: u64) !CachePlan {
-    return cachePlanBytes(requested_bytes, moeLayerCount(geometry), geometry.experts, expert_bytes);
+    return cachePlanBytes(requested_bytes, moeLayerCount(geometry), geometry.experts, expert_bytes, geometry.shape);
+}
+
+/// Every expert at the mean, once per union workspace the store keeps, plus its grouped layers' union meta tables.
+fn workspaceBytes(experts: u16, expert_bytes: u64, shape: quant.StoreShape) !u64 {
+    const one = try std.math.mul(u64, experts, expert_bytes);
+    return std.math.add(u64, try std.math.mul(u64, one, shape.union_sets), shape.union_meta_bytes);
 }
 
 pub const MTP_UNSUPPORTED: []const u8 = "MTP under expert streaming needs --mtp on a Sushi EXL3 Qwen3.8-Flash-Next pack";
@@ -184,15 +199,17 @@ pub fn budgetLedger(
     top_k: u16,
     expert_bytes: u64,
     bounce_bytes: u64,
+    shape: quant.StoreShape,
 ) !BudgetLedger {
     if (layers == 0 or experts == 0 or top_k == 0 or expert_bytes == 0) return error.InvalidExpertGeometry;
-    const workspace_bytes = @as(u64, experts) *| expert_bytes;
+    const workspace_bytes = workspaceBytes(experts, expert_bytes, shape) catch return error.InvalidExpertGeometry;
     const selected_bytes = @as(u64, @min(top_k, experts)) *| expert_bytes;
     const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes;
     if (fixed >= budget_bytes) return error.SsdBudgetBelowResident;
     const per_slot = @as(u64, layers) *| expert_bytes;
     const slots_u64 = @min((budget_bytes - fixed) / per_slot, experts);
-    if (slots_u64 <= 1) return error.SsdBudgetBelowResident;
+    // A layer's cache needs two slots, and a grouped layer one expert of every rate group.
+    if (slots_u64 < @max(2, std.math.divCeil(u64, shape.layer_floor_bytes, expert_bytes) catch unreachable)) return error.SsdBudgetBelowResident;
     const slots: u16 = @intCast(slots_u64);
     return .{
         .budget_bytes = budget_bytes,
@@ -972,6 +989,23 @@ const SlabOperand = struct {
         return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
     }
 
+    /// One flat axis of `elems` elements: a rate-grouped layer's trellis storage, pools back to back.
+    fn createFlat(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+        if (elems == 0 or elems > std.math.maxInt(c_int) or elem_bytes == 0) return error.InvalidExpertGeometry;
+        const stride = elems * elem_bytes;
+        const slab = try io_mod.PageSlab.create(allocator, stride);
+        errdefer slab.destroy();
+        const payload = try allocator.create(io_mod.ImportPayload);
+        errdefer allocator.destroy(payload);
+        payload.* = .{};
+        const operand = try io_mod.importSlab(slab, &.{@intCast(elems)}, dtype, payload, .{});
+        if (!operand.aliased) {
+            _ = mlx.mlx_array_free(operand.array);
+            return error.ExpertSlabImportCopied;
+        }
+        return .{ .present = true, .slab = slab, .payload = payload, .array = operand.array, .stride = stride, .count = 1 };
+    }
+
     fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
         if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
         var stride: usize = elem_bytes;
@@ -1128,8 +1162,157 @@ const LayerStats = struct {
     compute_ns: u64 = 0,
 };
 
+/// A rate-grouped layer under streaming: one slot pool per rate group, each with its own cache over the group's
+/// experts. The layer's nine slabs hold the pools back to back (trellis flat per projection, scale rows per slot),
+/// and a `Ragged` bank over them serves the layer's routed experts by GLOBAL slot id: pool g's slots follow pool
+/// g-1's, so the bank's meta table is a function of the pool structure alone. The union workspace has the same
+/// structure with every expert of a group as a slot.
+const GroupedLayer = struct {
+    groups: quant.LayerGroups,
+    hidden: u32,
+    inter: u32,
+    slots: [quant.rate_group_limit]u32 = @splat(0),
+    slot_base: [quant.rate_group_limit]u32 = @splat(0),
+    cache_slots: u32 = 0,
+    cache_off: [quant.rate_group_limit][3]u64 = @splat(@splat(0)),
+    union_off: [quant.rate_group_limit][3]u64 = @splat(@splat(0)),
+    caches: [quant.rate_group_limit]GroupCache = undefined,
+    caches_made: usize = 0,
+    cache_ragged: Ragged = .{},
+    union_ragged: Ragged = .{},
+
+    fn init(allocator: std.mem.Allocator, groups: quant.LayerGroups, hidden: u32, inter: u32, allot_bytes: u64) !GroupedLayer {
+        var self: GroupedLayer = .{ .groups = groups, .hidden = hidden, .inter = inter };
+        errdefer self.deinitCaches();
+        try self.sizePools(allot_bytes);
+        var union_at: [3]u64 = @splat(0);
+        var cache_at: [3]u64 = @splat(0);
+        for (0..groups.count) |g| {
+            self.slot_base[g] = self.cache_slots;
+            self.cache_slots += self.slots[g];
+            for (0..3) |pi| {
+                self.cache_off[g][pi] = cache_at[pi];
+                self.union_off[g][pi] = union_at[pi];
+                cache_at[pi] += self.slots[g] * self.trellisBytes(g, pi);
+                union_at[pi] += @as(u64, groups.experts[g]) * self.trellisBytes(g, pi);
+            }
+            self.caches[g] = try GroupCache.init(allocator, @intCast(self.slots[g]), groups.experts[g]);
+            self.caches_made += 1;
+        }
+        return self;
+    }
+
+    fn expertBytes(self: *const GroupedLayer, g: usize) u64 {
+        return self.groups.expertBytes(g, self.hidden, self.inter);
+    }
+
+    /// Splits `allot_bytes` (the ledger's bill for the layer) so every pool caches the same fraction of its experts and
+    /// the pools never hold more than was billed. A group that cannot afford one expert of its share is pinned at one
+    /// slot, paid first; `ExpertCacheTooSmall` when one slot per group does not fit.
+    fn sizePools(self: *GroupedLayer, allot_bytes: u64) !void {
+        const count: usize = self.groups.count;
+        var pinned: [quant.rate_group_limit]bool = @splat(false);
+        while (true) {
+            var spare = allot_bytes;
+            var free_bytes: u64 = 0;
+            for (0..count) |g| {
+                if (!pinned[g]) {
+                    free_bytes += @as(u64, self.groups.experts[g]) * self.expertBytes(g);
+                    continue;
+                }
+                self.slots[g] = 1;
+                spare = std.math.sub(u64, spare, self.expertBytes(g)) catch return error.ExpertCacheTooSmall;
+            }
+            var changed = false;
+            for (0..count) |g| {
+                if (pinned[g]) continue;
+                const fit = spare * self.groups.experts[g] / free_bytes;
+                if (fit == 0) {
+                    pinned[g] = true;
+                    changed = true;
+                } else self.slots[g] = @intCast(@min(fit, self.groups.experts[g]));
+            }
+            if (!changed) return;
+        }
+    }
+
+    fn deinitCaches(self: *GroupedLayer) void {
+        for (self.caches[0..self.caches_made]) |*cache| cache.deinit();
+        self.caches_made = 0;
+    }
+
+    fn deinitBanks(self: *GroupedLayer) void {
+        self.cache_ragged.deinit();
+        self.union_ragged.deinit();
+    }
+
+    fn tiles(self: *const GroupedLayer) u64 {
+        return @as(u64, self.hidden / 16) * (self.inter / 16);
+    }
+
+    fn trellisBytes(self: *const GroupedLayer, g: usize, pi: usize) u64 {
+        return self.tiles() * self.groups.n[g][pi] * 2;
+    }
+
+    /// Elements of projection pi's flat trellis storage holding `per_group[g]` slots of every group.
+    fn trellisElems(self: *const GroupedLayer, pi: usize, per_group: []const u32) usize {
+        var total: u64 = 0;
+        for (0..self.groups.count) |g| total += @as(u64, per_group[g]) * self.trellisBytes(g, pi) / 2;
+        return @intCast(total);
+    }
+
+    /// Bytes of one slot's piece of component `ci` in group g.
+    fn pieceBytes(self: *const GroupedLayer, g: usize, ci: usize) u64 {
+        const pi = ci / 3;
+        return switch (ci % 3) {
+            0 => self.trellisBytes(g, pi),
+            1 => @as(u64, if (pi == 2) self.inter else self.hidden) * 2,
+            else => @as(u64, if (pi == 2) self.hidden else self.inter) * 2,
+        };
+    }
+
+    fn region(self: *const GroupedLayer, operand: *const SlabOperand, g: usize, ci: usize, row: u64, in_cache: bool) []u8 {
+        const bytes = operand.slab.?.bytes;
+        const len = self.pieceBytes(g, ci);
+        const at = if (ci % 3 == 0)
+            (if (in_cache) self.cache_off[g][ci / 3] else self.union_off[g][ci / 3]) + row * len
+        else
+            ((if (in_cache) self.slot_base[g] else self.groups.base[g]) + row) * len;
+        return bytes[@intCast(at)..][0..@intCast(len)];
+    }
+
+    fn cacheRegion(self: *const GroupedLayer, operand: *const SlabOperand, g: usize, ci: usize, slot: u64) []u8 {
+        return self.region(operand, g, ci, slot, true);
+    }
+
+    fn unionRegion(self: *const GroupedLayer, operand: *const SlabOperand, g: usize, ci: usize, position: u64) []u8 {
+        return self.region(operand, g, ci, position, false);
+    }
+
+    fn pools(self: *const GroupedLayer, in_union: bool, out: *[quant.rate_group_limit]rate_groups_pool) []const rate_groups_pool {
+        for (0..self.groups.count) |g| out[g] = .{ .slots = if (in_union) self.groups.experts[g] else self.slots[g], .rates = self.groups.n[g] };
+        return out[0..self.groups.count];
+    }
+
+    fn buildBanks(self: *GroupedLayer, s: mlx.mlx_stream, cache: []const SlabOperand, union_set: []const SlabOperand) !void {
+        var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
+        self.cache_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(false, &pool_buf), slabTriple(cache, 0), slabTriple(cache, 1), slabTriple(cache, 2));
+        errdefer self.cache_ragged.deinit();
+        self.union_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(true, &pool_buf), slabTriple(union_set, 0), slabTriple(union_set, 1), slabTriple(union_set, 2));
+    }
+};
+
+const rate_groups_pool = sushi_exl3.rate_groups.Pool;
+
+/// The arrays of part `part` (0 trellis, 1 suh, 2 svh) of the three projections.
+fn slabTriple(set: []const SlabOperand, part: usize) [3]mlx.mlx_array {
+    return .{ set[part].array, set[3 + part].array, set[6 + part].array };
+}
+
 const LayerState = struct {
     cache: GroupCache,
+    /// Set for a rate-grouped layer: its pools replace `cache`.
+    grouped: ?*GroupedLayer = null,
     active: bool = false,
     slabs: []SlabOperand = &.{},
     stats: LayerStats = .{},
@@ -1227,6 +1410,25 @@ fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, laye
     return slabs;
 }
 
+/// The nine slabs of a rate-grouped layer's cache (`slots` per group) or, with `slots` null, of the union workspace
+/// (`elems` trellis elements per projection): trellis flat per projection, `rows` scale rows. Scale widths and
+/// dtypes come from `layer`.
+fn createGroupedSlabs(allocator: std.mem.Allocator, layer: *const GroupedLayer, slots: ?[]const u32, rows: u32, s: mlx.mlx_stream, elems: ?[3]usize) ![]SlabOperand {
+    const n = quant.component_count;
+    const slabs = try allocator.alloc(SlabOperand, n);
+    errdefer allocator.free(slabs);
+    var made: usize = 0;
+    errdefer for (slabs[0..made]) |*operand| operand.destroy(allocator, s);
+    while (made < n) : (made += 1) {
+        const pi = made / 3;
+        slabs[made] = if (made % 3 == 0)
+            try SlabOperand.createFlat(allocator, if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi], .uint16, 2)
+        else
+            try SlabOperand.createShaped(allocator, rows, &.{@intCast(layer.pieceBytes(0, made) / 2)}, .float16, 2);
+    }
+    return slabs;
+}
+
 fn presentSlabCount(slabs: []const SlabOperand) u64 {
     var count: u64 = 0;
     for (slabs) |operand| {
@@ -1247,6 +1449,8 @@ pub const Prepared = struct {
     quantized: bool = false,
     owns_quant_views: bool = false,
     workspace: bool = false,
+    /// A rate-grouped layer's bank over the slabs, indexed by the global slot ids in `remapped`.
+    ragged: ?*const Ragged = null,
     held: [quant.component_count]?HeldLease = @splat(null),
     defer_to: ?*Engine = null,
 
@@ -1293,6 +1497,8 @@ pub const Engine = struct {
     io_pool: ?*io_mod.FillPool = null,
     fds: []std.c.fd_t = &.{},
     union_slabs: []SlabOperand = &.{},
+    /// The union workspace of the rate-grouped layers: sized for the largest of them.
+    grouped_union: []SlabOperand = &.{},
     slab_imports: u64 = 0,
     fallback_imports: u64 = 0,
     fill_experts_total: u64 = 0,
@@ -1333,7 +1539,9 @@ pub const Engine = struct {
     pub fn initWithOptions(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, requested_bytes: u64, s: mlx.mlx_stream, opts: Options) !Engine {
         var store = try ExpertStore.openLayout(allocator, model_dir, geometry, opts.layout);
         errdefer store.deinit();
-        const plan = try cachePlanBytesForGeometry(requested_bytes, geometry, store.perExpertBytes());
+        var sized = geometry;
+        if (store.quantized) |*q| sized.shape = q.shape();
+        const plan = try cachePlanBytesForGeometry(requested_bytes, sized, store.perExpertBytes());
         var engine = Engine{
             .allocator = allocator,
             .geometry = geometry,
@@ -1364,15 +1572,46 @@ pub const Engine = struct {
             engine.layers = &.{};
             allocator.free(layers);
         }
+        var any_uniform = false;
         for (layers, 0..) |*layer, layer_index| {
             initialized += 1;
             if (!engine.store.hasExpertLayer(@intCast(layer_index))) continue;
+            if (engine.store.quantized) |*q| if (q.groupsOf(@intCast(layer_index))) |groups| {
+                const grouped = try allocator.create(GroupedLayer);
+                grouped.* = GroupedLayer.init(allocator, groups.*, geometry.hidden, geometry.intermediate, @as(u64, plan.slots_per_layer) * plan.expert_bytes) catch |err| {
+                    allocator.destroy(grouped);
+                    return err;
+                };
+                layer.* = .{ .cache = GroupCache.empty(allocator), .grouped = grouped, .active = true };
+                var per_group: [quant.rate_group_limit]u32 = undefined;
+                @memcpy(per_group[0..groups.count], grouped.slots[0..groups.count]);
+                layer.slabs = try createGroupedSlabs(allocator, grouped, per_group[0..groups.count], grouped.cache_slots, s, null);
+                engine.slab_imports += presentSlabCount(layer.slabs);
+                continue;
+            };
+            any_uniform = true;
             layer.* = .{ .cache = try GroupCache.init(allocator, plan.slots_per_layer, geometry.experts), .active = true };
             layer.slabs = try createSlabSetAt(allocator, &engine.store, @intCast(layer_index), plan.slots_per_layer, s);
             engine.slab_imports += presentSlabCount(layer.slabs);
         }
-        engine.union_slabs = try createSlabSet(allocator, &engine.store, geometry.experts, s);
-        engine.slab_imports += presentSlabCount(engine.union_slabs);
+        // The grouped layers share one union workspace, each projection sized for the layer that needs most of it.
+        var widest: ?*const GroupedLayer = null;
+        var union_elems: [3]usize = @splat(0);
+        for (layers) |*layer| if (layer.grouped) |g| {
+            widest = g;
+            var every: [quant.rate_group_limit]u32 = undefined;
+            for (every[0..g.groups.count], g.groups.experts[0..g.groups.count]) |*dst, experts| dst.* = experts;
+            for (0..3) |pi| union_elems[pi] = @max(union_elems[pi], g.trellisElems(pi, every[0..g.groups.count]));
+        };
+        if (any_uniform or widest == null) {
+            engine.union_slabs = try createSlabSet(allocator, &engine.store, geometry.experts, s);
+            engine.slab_imports += presentSlabCount(engine.union_slabs);
+        }
+        if (widest) |shape| {
+            engine.grouped_union = try createGroupedSlabs(allocator, shape, null, geometry.experts, s, union_elems);
+            engine.slab_imports += presentSlabCount(engine.grouped_union);
+            for (layers) |*layer| if (layer.grouped) |g| try g.buildBanks(s, layer.slabs, engine.grouped_union);
+        }
         engine.fallback_imports = io_mod.fallback_imports.load(.monotonic) - before_fallback;
         log.info("[expert-stream] cache {d:.3} GB, {d} slots/layer, workspace {d:.3} GB, bounce {d:.3} GB, fallback_imports={d}\n", .{
             @as(f64, @floatFromInt(plan.cache_bytes)) / 1e9,
@@ -1385,6 +1624,13 @@ pub const Engine = struct {
     }
 
     fn releaseSlabs(self: *Engine) void {
+        // A bank's arrays alias the slabs, so they go first.
+        for (self.layers) |*layer| if (layer.grouped) |grouped| {
+            grouped.deinitBanks();
+            grouped.deinitCaches();
+            self.allocator.destroy(grouped);
+            layer.grouped = null;
+        };
         for (self.layers) |*layer| {
             if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
             layer.spec_slots = .{ .ctx = null };
@@ -1399,6 +1645,9 @@ pub const Engine = struct {
         for (self.union_slabs) |*operand| operand.destroy(self.allocator, self.s);
         if (self.union_slabs.len != 0) self.allocator.free(self.union_slabs);
         self.union_slabs = &.{};
+        for (self.grouped_union) |*operand| operand.destroy(self.allocator, self.s);
+        if (self.grouped_union.len != 0) self.allocator.free(self.grouped_union);
+        self.grouped_union = &.{};
         if (self.io_pool) |pool| pool.destroy();
         self.io_pool = null;
         if (self.fds.len != 0) self.allocator.free(self.fds);
@@ -1419,7 +1668,7 @@ pub const Engine = struct {
     }
 
     pub fn cacheSlotBytesAt(self: *const Engine, layer: u16, slot: u16, ci: usize) []u8 {
-        if (layer >= self.layers.len or !self.layers[layer].active or ci >= self.layers[layer].slabs.len)
+        if (layer >= self.layers.len or !self.layers[layer].active or self.layers[layer].grouped != null or ci >= self.layers[layer].slabs.len)
             return &.{};
         return self.layers[layer].slabs[ci].slotBytes(slot);
     }
@@ -1433,7 +1682,7 @@ pub const Engine = struct {
     }
 
     pub fn slotReady(self: *const Engine, layer: u16, slot: u16) bool {
-        return layer < self.layers.len and self.layers[layer].active and self.layers[layer].cache.ready[slot];
+        return layer < self.layers.len and self.layers[layer].active and self.layers[layer].grouped == null and self.layers[layer].cache.ready[slot];
     }
 
     pub fn warmSlotsPerLayer(self: *const Engine) u16 {
@@ -1455,7 +1704,7 @@ pub const Engine = struct {
     }
 
     pub fn pickState(self: *Engine, layer: u16, cached_out: []bool) ?[]u8 {
-        if (layer >= self.layers.len) return null;
+        if (layer >= self.layers.len or self.layers[layer].grouped != null) return null;
         const cache = &self.layers[layer].cache;
         cache.cachedMask(cached_out);
         return cache.swap_starved;
@@ -1575,7 +1824,7 @@ pub const Engine = struct {
     pub fn specRoute(self: *Engine, layer_index: u16) !?SpecRoute {
         if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
         const layer = &self.layers[layer_index];
-        if (!layer.active or layer.slabs.len != self.store.componentCount()) return null;
+        if (!layer.active or layer.grouped != null or layer.slabs.len != self.store.componentCount()) return null;
         try layer.refreshSpec(self.allocator);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
@@ -1639,9 +1888,159 @@ pub const Engine = struct {
         }
     }
 
+    /// `prepareSlab` for a rate-grouped layer: each group resolves against its own pool, and one group overflowing
+    /// its pool sends the whole layer through the union workspace. Ids in `remapped` are global slot ids of the
+    /// layer's `Ragged` bank: pool g's slots, or its union positions, follow those of group g-1.
+    fn prepareGrouped(self: *Engine, layer_index: u16, gl: *GroupedLayer, occurrences: []const u16) !Prepared {
+        const layer = &self.layers[layer_index];
+        const n = quant.component_count;
+        const count: usize = gl.groups.count;
+        if (layer.slabs.len != n or self.grouped_union.len != n) return error.MissingExpertSlab;
+
+        var snapshots: [quant.rate_group_limit]CacheSnapshot = undefined;
+        var snapshotted: usize = 0;
+        defer for (snapshots[0..snapshotted]) |*snapshot| snapshot.deinit(self.allocator);
+        while (snapshotted < count) : (snapshotted += 1) snapshots[snapshotted] = try self.snapshotCache(&gl.caches[snapshotted]);
+        var committed = false;
+        var wrote_cache = false;
+        errdefer if (!committed) for (0..count) |g| {
+            if (wrote_cache) gl.caches[g].invalidateUnready() else snapshots[g].restore(&gl.caches[g]);
+        };
+
+        var resolutions: [quant.rate_group_limit]GroupResolution = undefined;
+        var resolved: usize = 0;
+        defer for (resolutions[0..resolved]) |*resolution| resolution.deinit(self.allocator);
+        var use_union = false;
+        {
+            var local: std.ArrayList(u16) = .empty;
+            defer local.deinit(self.allocator);
+            while (resolved < count) {
+                local.clearRetainingCapacity();
+                for (occurrences) |expert| {
+                    if (gl.groups.groupOf(expert) == resolved) try local.append(self.allocator, expert - gl.groups.base[resolved]);
+                }
+                resolutions[resolved] = try gl.caches[resolved].resolve(self.allocator, local.items);
+                use_union = use_union or resolutions[resolved].workspace;
+                resolved += 1;
+            }
+        }
+        const read_set = if (use_union) self.grouped_union else layer.slabs;
+
+        var read_begun: usize = 0;
+        errdefer if (!committed) for (read_set[0..read_begun]) |*operand| abortFill(operand);
+        while (read_begun < n) : (read_begun += 1) {
+            const slab = read_set[read_begun].slab orelse return error.MissingExpertSlab;
+            _ = try slab.tryBeginFill();
+        }
+        var cache_begun: usize = 0;
+        errdefer if (!committed) for (layer.slabs[0..cache_begun]) |*operand| abortFill(operand);
+        if (use_union) {
+            while (cache_begun < n) : (cache_begun += 1) {
+                const slab = layer.slabs[cache_begun].slab orelse return error.MissingExpertSlab;
+                _ = try slab.tryBeginFill();
+            }
+        }
+
+        var spans: std.ArrayList(io_mod.FillSpan) = .empty;
+        defer spans.deinit(self.allocator);
+        var misses: u64 = 0;
+        for (resolutions[0..count], 0..) |resolution, g| {
+            for (resolution.bindings, 0..) |binding, position| {
+                if (binding.hit and use_union) {
+                    const slot = binding.slot orelse return error.ExpertBindingMissing;
+                    for (0..n) |ci| @memcpy(gl.unionRegion(&read_set[ci], g, ci, position), gl.cacheRegion(&layer.slabs[ci], g, ci, slot));
+                    continue;
+                }
+                if (binding.hit) continue;
+                misses += 1;
+                for (0..n) |ci| {
+                    const source = self.store.spanAt(layer_index, gl.groups.base[g] + binding.expert, ci);
+                    const dst = if (use_union)
+                        gl.unionRegion(&read_set[ci], g, ci, position)
+                    else
+                        gl.cacheRegion(&layer.slabs[ci], g, ci, binding.slot orelse return error.ExpertBindingMissing);
+                    try spans.append(self.allocator, .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr });
+                }
+            }
+        }
+        if (!use_union and spans.items.len > 0) wrote_cache = true;
+        try self.runFill(layer_index, spans.items);
+        self.fill_experts_total += misses;
+
+        if (use_union) {
+            for (resolutions[0..count], 0..) |resolution, g| {
+                for (resolution.bindings, 0..) |binding, position| {
+                    if (binding.hit) continue;
+                    const slot = binding.slot orelse continue;
+                    wrote_cache = true;
+                    for (0..n) |ci| @memcpy(gl.cacheRegion(&layer.slabs[ci], g, ci, slot), gl.unionRegion(&read_set[ci], g, ci, position));
+                    gl.caches[g].markReady(slot);
+                }
+            }
+            for (layer.slabs) |*operand| {
+                const slab = operand.slab orelse return error.MissingExpertSlab;
+                _ = try slab.publish();
+                try slab.retire();
+            }
+        } else for (resolutions[0..count], 0..) |resolution, g| {
+            for (resolution.bindings) |binding| {
+                if (!binding.hit) gl.caches[g].markReady(binding.slot.?);
+            }
+        }
+
+        var held: [quant.component_count]?HeldLease = @splat(null);
+        var leased: usize = 0;
+        errdefer for (held[0..leased]) |entry| {
+            const taken = entry orelse continue;
+            taken.slab.release(taken.lease) catch {};
+            taken.slab.retire() catch {};
+        };
+        while (leased < n) : (leased += 1) {
+            const slab = read_set[leased].slab orelse return error.MissingExpertSlab;
+            _ = try slab.publish();
+            held[leased] = .{ .slab = slab, .lease = try slab.lease() };
+        }
+
+        const remapped = try self.allocator.alloc(u16, occurrences.len);
+        errdefer self.allocator.free(remapped);
+        var next_local: [quant.rate_group_limit]usize = @splat(0);
+        for (occurrences, 0..) |expert, i| {
+            const g = gl.groups.groupOf(expert);
+            const local = expert - gl.groups.base[g];
+            if (use_union) {
+                const resolution = resolutions[g];
+                remapped[i] = @intCast(gl.groups.base[g] + resolution.remapped[next_local[g]]);
+                next_local[g] += 1;
+            } else {
+                const raw = gl.caches[g].expert_to_slot[local];
+                if (raw < 0) return error.ExpertBindingMissing;
+                remapped[i] = @intCast(gl.slot_base[g] + @as(u32, @intCast(raw)));
+            }
+        }
+
+        for (resolutions[0..count]) |resolution| {
+            layer.stats.union_members += resolution.union_ids.len;
+            layer.stats.hits += resolution.hits;
+            layer.stats.misses += resolution.misses;
+        }
+        layer.stats.groups += 1;
+        for (spans.items) |span_value| layer.stats.fill_bytes += span_value.len;
+        committed = true;
+        return .{
+            .allocator = self.allocator,
+            .remapped = remapped,
+            .quantized = true,
+            .workspace = use_union,
+            .ragged = if (use_union) &gl.union_ragged else &gl.cache_ragged,
+            .held = held,
+            .defer_to = self,
+        };
+    }
+
     fn prepareSlab(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
         const layer = &self.layers[layer_index];
         if (!layer.active) return error.ExpertLayerAbsent;
+        if (layer.grouped) |grouped| return self.prepareGrouped(layer_index, grouped, occurrences);
         const n = self.store.componentCount();
         if (layer.slabs.len != n) return error.MissingExpertSlab;
         var snapshot = try self.snapshotCache(&layer.cache);
@@ -1881,7 +2280,7 @@ test "expert stream union orders experts by last occurrence and remaps rows" {
 
 test "expert stream cache plan uses decimal gigabytes and reserves full workspace" {
     const t = std.testing;
-    const p = try cachePlanBytes(60_000_000_000, 48, 512, try expertBytes(1280, 2560, 640));
+    const p = try cachePlanBytes(60_000_000_000, 48, 512, try expertBytes(1280, 2560, 640), .{});
     try t.expectEqual(@as(u16, 127), p.slots_per_layer);
     try t.expectEqual(@as(u64, 9_830_400), p.expert_bytes);
     try t.expectEqual(@as(u64, 48 * 127 * 9_830_400), p.cache_bytes);
@@ -1905,6 +2304,39 @@ test "expert stream MXFP4 byte plan and dense prefix use absolute layers" {
     try t.expectEqual(@as(u64, 47 * 95 * 13_369_344), plan.cache_bytes);
     try t.expectError(error.InvalidExpertGeometry, mxfp4ExpertBytes(4096, 2050));
     try t.expectError(error.ExpertCacheTooSmall, cachePlanBytesForGeometry(47 * 13_369_344 - 1, geometry, 13_369_344));
+}
+
+test "expert stream rate-grouped pools stay within the layer's bill and pin a group that cannot afford its share at one slot" {
+    const t = std.testing;
+    var groups: quant.LayerGroups = .{ .count = 3 };
+    groups.experts[0..3].* = .{ 1, 40, 200 };
+    groups.n[0] = .{ 48, 48, 48 };
+    groups.n[1] = .{ 32, 32, 40 };
+    groups.n[2] = .{ 24, 24, 24 };
+    var layer: GroupedLayer = .{ .groups = groups, .hidden = 2560, .inter = 640 };
+    var all: u64 = 0;
+    var minimum: u64 = 0;
+    for (0..3) |g| {
+        all += @as(u64, groups.experts[g]) * layer.expertBytes(g);
+        minimum += layer.expertBytes(g);
+    }
+    const average = (all + 240) / 241;
+
+    for ([_]u64{ 16, 40, 120, 240 }) |slots| {
+        try layer.sizePools(slots * average);
+        var held: u64 = 0;
+        for (0..3) |g| {
+            try t.expect(layer.slots[g] >= 1 and layer.slots[g] <= groups.experts[g]);
+            held += @as(u64, layer.slots[g]) * layer.expertBytes(g);
+        }
+        try t.expect(held <= slots * average);
+    }
+    try layer.sizePools(241 * average);
+    try t.expectEqualSlices(u32, &.{ 1, 40, 200 }, layer.slots[0..3]);
+
+    try layer.sizePools(minimum);
+    try t.expectEqualSlices(u32, &.{ 1, 1, 1 }, layer.slots[0..3]);
+    try t.expectError(error.ExpertCacheTooSmall, layer.sizePools(minimum - 1));
 }
 
 test "exl3 expert bytes bill the pack's own halfwords per tile" {
@@ -1973,7 +2405,7 @@ test "expert stream ssd budget ledger derives the cache and refuses by name" {
     const bounce: u64 = 8 * 64 * 1024 * 1024;
     const trunk: u64 = 9_900_000_000;
 
-    const led = try budgetLedger(100 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce);
+    const led = try budgetLedger(100 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, .{});
     try t.expectEqual(@as(u64, 512 * expert_bytes), led.workspace_bytes);
     try t.expectEqual(@as(u64, 10 * expert_bytes), led.selected_bytes);
     try t.expectEqual(@as(u64, 0), led.mtp_bytes);
@@ -1982,26 +2414,51 @@ test "expert stream ssd budget ledger derives the cache and refuses by name" {
     try t.expectEqual(@as(u16, 194), led.slots_per_layer);
     try t.expectEqual(@as(u64, 194) * 48 * expert_bytes, led.cache_bytes);
 
-    const with_mtp = try budgetLedger(100 * GiB, trunk, 5_200_000_000, 0, 48, 512, 10, expert_bytes, bounce);
+    const with_mtp = try budgetLedger(100 * GiB, trunk, 5_200_000_000, 0, 48, 512, 10, expert_bytes, bounce, .{});
     try t.expectEqual(@as(u16, 183), with_mtp.slots_per_layer);
 
     // The vision tower and its encode reserve come out of the budget before the expert slots.
-    const with_vision = try budgetLedger(100 * GiB, trunk, 0, 5_200_000_000, 48, 512, 10, expert_bytes, bounce);
+    const with_vision = try budgetLedger(100 * GiB, trunk, 0, 5_200_000_000, 48, 512, 10, expert_bytes, bounce, .{});
     try t.expectEqual(@as(u64, 5_200_000_000), with_vision.vision_bytes);
     try t.expectEqual(@as(u16, 183), with_vision.slots_per_layer);
 
-    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(14 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce));
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(14 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, .{}));
     const fixed = trunk + 512 * expert_bytes + 10 * expert_bytes + bounce;
     const per_slot = 48 * expert_bytes;
-    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot - 1, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce));
-    const two = try budgetLedger(fixed + 2 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce);
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot - 1, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, .{}));
+    const two = try budgetLedger(fixed + 2 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, .{});
     try t.expectEqual(@as(u16, 2), two.slots_per_layer);
-    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot, trunk, 0, 1, 48, 512, 10, expert_bytes, bounce));
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot, trunk, 0, 1, 48, 512, 10, expert_bytes, bounce, .{}));
+}
+
+test "expert stream ssd budget ledger refuses a grouped store below one expert of every rate group" {
+    const t = std.testing;
+    const expert_bytes: u64 = 1_380_000;
+    const bounce: u64 = BOUNCE_BYTES;
+    const trunk: u64 = 5_250_000_000;
+    // 13 rate groups, each expert wider than the mean: the layer's floor is 17.96 MB, 14 billed slots.
+    const shape: quant.StoreShape = .{ .layer_floor_bytes = 17_960_000, .union_sets = 1 };
+    const fixed = trunk + 512 * expert_bytes + 10 * expert_bytes + bounce;
+    const per_slot = 48 * expert_bytes;
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 13 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, shape));
+    const at_floor = try budgetLedger(fixed + 14 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, shape);
+    try t.expectEqual(@as(u16, 14), at_floor.slots_per_layer);
+    // A uniform store has no floor beyond its two slots.
+    const uniform = try budgetLedger(fixed + 13 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, .{});
+    try t.expectEqual(@as(u16, 13), uniform.slots_per_layer);
+}
+
+test "expert stream ssd budget ledger bills each union workspace set" {
+    const t = std.testing;
+    const expert_bytes: u64 = 9_830_400;
+    const one = try budgetLedger(100 << 30, 0, 0, 0, 48, 512, 10, expert_bytes, BOUNCE_BYTES, .{});
+    const two = try budgetLedger(100 << 30, 0, 0, 0, 48, 512, 10, expert_bytes, BOUNCE_BYTES, .{ .union_sets = 2, .union_meta_bytes = 1000 });
+    try t.expectEqual(2 * one.workspace_bytes + 1000, two.workspace_bytes);
 }
 
 test "expert stream prefill peak bill covers a 501 expert union and k127 cache layer" {
     const t = std.testing;
-    const p = try cachePlanBytes(60_000_000_000, 48, 512, try expertBytes(1280, 2560, 640));
+    const p = try cachePlanBytes(60_000_000_000, 48, 512, try expertBytes(1280, 2560, 640), .{});
     const peak = fillPeakBytes(p.expert_bytes, 501, p.slots_per_layer, p.bounce_bytes);
     try t.expectEqual(@as(u64, 127 * 9_830_400), p.layer_bytes);
     try t.expect(p.prefill_peak_bytes >= peak);
@@ -3262,7 +3719,7 @@ fn checkMimoExl3Streaming(runtime: bool) !void {
     const per = try expertBytesFor(t.allocator, path, geometry, .exl3_k4);
     try t.expectEqual(try exl3ExpertBytes(geometry), per);
     const fixed = (1 << 20) + 4 * per + 2 * per + BOUNCE_BYTES;
-    const ledger = try budgetLedger(fixed + 4 * per, 1 << 20, 0, 0, moeLayerCount(geometry), 4, 2, per, BOUNCE_BYTES);
+    const ledger = try budgetLedger(fixed + 4 * per, 1 << 20, 0, 0, moeLayerCount(geometry), 4, 2, per, BOUNCE_BYTES, .{});
     try t.expectEqual(@as(u16, 2), ledger.slots_per_layer);
     try t.expectEqual(fixed + ledger.cache_bytes, ledger.budget_bytes);
     var store = try ExpertStore.openLayout(t.allocator, path, geometry, .exl3_k4);

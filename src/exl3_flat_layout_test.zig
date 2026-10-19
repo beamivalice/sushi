@@ -460,7 +460,7 @@ test "EXL3 streaming CPU Sushi geometry ledger at 20 GiB bills every bank" {
     for ([_]u32{ 32, 42, 48, 64 }) |n| {
         const per = try stream.exl3ExpertBytes(.{ .layers = 48, .experts = 512, .hidden = 2560, .intermediate = 640, .exl3_n = n });
         try std.testing.expectEqual(@as(u64, 38400) * n + 19200, per);
-        const ledger = try stream.budgetLedger(20 << 30, 6 << 30, 0, 0, 48, 512, 10, per, stream.BOUNCE_BYTES);
+        const ledger = try stream.budgetLedger(20 << 30, 6 << 30, 0, 0, 48, 512, 10, per, stream.BOUNCE_BYTES, .{});
         const fixed = (6 << 30) + 512 * per + 10 * per + stream.BOUNCE_BYTES;
         try std.testing.expectEqual(@min(512, ((20 << 30) - fixed) / (48 * per)), ledger.slots_per_layer);
         try std.testing.expect(fixed + ledger.cache_bytes <= 20 << 30);
@@ -476,7 +476,7 @@ test "EXL3 streaming CPU Sushi geometry ledger at 20 GiB bills every bank" {
     }
 }
 
-test "EXL3 streaming CPU refuses grouped banks and invalid trellis geometry" {
+test "EXL3 streaming CPU refuses invalid trellis geometry, and grouped banks outside Flash-Next" {
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -487,13 +487,129 @@ test "EXL3 streaming CPU refuses grouped banks and invalid trellis geometry" {
     const geometry: stream.Geometry = .{ .layers = 1, .experts = 2, .hidden = 16, .intermediate = 16, .exl3_n = 32 };
     const grouped = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.g0.trellis";
     try writeIndex(std.testing.io, a, tmp.dir, &.{.{ .key = grouped, .file = "experts.safetensors" }});
-    try std.testing.expectError(error.Exl3RateGroupsStreamingUnsupported, expert_quant.streamingLayoutOfDir(a, std.testing.io, "qwen4_exp", path, 1, 0));
-    try std.testing.expectError(error.Exl3RateGroupsStreamingUnsupported, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+    try std.testing.expectError(error.Exl3RateGroupsStreamingUnsupported, expert_quant.streamingLayoutOfDir(a, std.testing.io, "mimo_v2", path, 1, 0));
     var entries: [9]IndexSpec = undefined;
     for (EXL3_SPECS, 0..) |spec, ci| entries[ci] = .{ .key = spec.key, .file = "experts.safetensors" };
     try writeIndex(std.testing.io, a, tmp.dir, &entries);
     try writeSafetensors(std.testing.io, a, tmp.dir, "experts.safetensors", &EXL3_SPECS);
     try std.testing.expectError(error.Exl3TrellisGeometry, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+}
+
+const GroupSpec = struct { experts: u32, n: [3]u32 };
+
+const GroupedPack = struct {
+    allocator: std.mem.Allocator,
+    /// Every tensor's words, group-major then component (trellis, suh, svh per projection).
+    words: [][]u16,
+
+    fn deinit(self: *GroupedPack) void {
+        for (self.words) |w| self.allocator.free(w);
+        self.allocator.free(self.words);
+    }
+};
+
+/// Layer 0 of a rate-grouped pack with deterministic, distinct words per tensor.
+fn writeGroupedPack(dir: std.Io.Dir, a: std.mem.Allocator, hidden: u32, inter: u32, groups: []const GroupSpec) !GroupedPack {
+    const io = std.testing.io;
+    const proj = [3][]const u8{ "gate", "up", "down" };
+    const part = [3][]const u8{ "trellis", "suh", "svh" };
+    var pack: GroupedPack = .{ .allocator = a, .words = try a.alloc([]u16, groups.len * 9) };
+    var made: usize = 0;
+    errdefer {
+        for (pack.words[0..made]) |w| a.free(w);
+        a.free(pack.words);
+    }
+    const specs = try a.alloc(TensorSpec, groups.len * 9);
+    defer a.free(specs);
+    const entries = try a.alloc(IndexSpec, groups.len * 9);
+    defer a.free(entries);
+    const shapes = try a.alloc([4]u64, groups.len * 9);
+    defer a.free(shapes);
+    const keys = try a.alloc([128]u8, groups.len * 9);
+    defer a.free(keys);
+    var total: usize = 0;
+    for (groups, 0..) |group, g| for (0..9) |ci| {
+        const pi = ci / 3;
+        const input: u64 = if (pi == 2) inter else hidden;
+        const output: u64 = if (pi == 2) hidden else inter;
+        const at = g * 9 + ci;
+        const weight = ci % 3 == 0;
+        shapes[at] = if (weight) .{ group.experts, input / 16, output / 16, group.n[pi] } else .{ group.experts, if (ci % 3 == 1) input else output, 0, 0 };
+        const rank: usize = if (weight) 4 else 2;
+        var elements: usize = 1;
+        for (shapes[at][0..rank]) |d| elements *= @intCast(d);
+        const key = try std.fmt.bufPrint(&keys[at], "language_model.model.layers.0.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ proj[pi], g, part[ci % 3] });
+        specs[at] = .{ .key = key, .dtype = if (weight) "U16" else "F16", .shape = shapes[at][0..rank], .bytes = elements * 2 };
+        entries[at] = .{ .key = key, .file = "experts.safetensors" };
+        pack.words[at] = try a.alloc(u16, elements);
+        made += 1;
+        for (pack.words[at], 0..) |*word, j| {
+            word.* = if (weight) @truncate(j *% 3571 +% ci *% 997 +% g *% 131 +% group.n[pi]) else @import("sushi_exl3").format.f32ToF16Bits(if ((j + ci + g) % 3 == 0) -0.25 else 0.375);
+        }
+        total += elements * 2;
+    };
+    try writeSafetensors(io, a, dir, "experts.safetensors", specs);
+    try writeIndex(io, a, dir, entries);
+    const file = try dir.readFileAlloc(io, "experts.safetensors", a, .limited(1 << 26));
+    defer a.free(file);
+    var at: usize = 8 + @as(usize, @intCast(std.mem.readInt(u64, file[0..8], .little)));
+    for (pack.words) |words| {
+        for (words, 0..) |word, j| std.mem.writeInt(u16, file[at + j * 2 ..][0..2], word, .little);
+        at += words.len * 2;
+    }
+    try dir.writeFile(io, .{ .sub_path = "experts.safetensors", .data = file });
+    return pack;
+}
+
+test "EXL3 streaming CPU reads a rate-grouped layer as per-expert spans and bills its average expert" {
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const hidden = 128;
+    const inter = 256;
+    const groups = [_]GroupSpec{ .{ .experts = 2, .n = .{ 32, 32, 32 } }, .{ .experts = 4, .n = .{ 48, 48, 64 } } };
+    var pack = try writeGroupedPack(tmp.dir, a, hidden, inter, &groups);
+    defer pack.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    try std.testing.expectEqual(expert_quant.Layout.exl3_k4, try expert_quant.streamingLayoutOfDir(a, std.testing.io, "qwen4_exp", path, 1, 0));
+    try std.testing.expectError(error.Exl3RateGroupsStreamingUnsupported, expert_quant.streamingLayoutOfDir(a, std.testing.io, "glm5_next", path, 1, 0));
+    const geometry: stream.Geometry = .{ .layers = 1, .experts = 6, .hidden = hidden, .intermediate = inter, .exl3_n = 64 };
+    var store = try stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4);
+    defer store.deinit();
+
+    const layer_groups = store.quantized.?.groupsOf(0) orelse return error.TestExpectedGroups;
+    try std.testing.expectEqual(@as(u8, 2), layer_groups.count);
+    try std.testing.expectEqualSlices(u16, &.{ 2, 4 }, layer_groups.experts[0..2]);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 2 }, layer_groups.base[0..2]);
+    try std.testing.expectEqualSlices(u32, &.{ 48, 48, 64 }, &layer_groups.n[1]);
+    try std.testing.expectEqual(@as(u8, 1), layer_groups.groupOf(2));
+
+    for (0..6) |expert| {
+        const g: usize = if (expert < 2) 0 else 1;
+        const local = expert - layer_groups.base[g];
+        for (0..9) |ci| {
+            const words = pack.words[g * 9 + ci];
+            const per = words.len / groups[g].experts;
+            const span = store.spanAt(0, @intCast(expert), ci);
+            try std.testing.expectEqual(@as(u64, per * 2), span.len);
+            const bytes = try a.alloc(u8, @intCast(span.len));
+            defer a.free(bytes);
+            try stream.readExact(store.fdAt(span.file), bytes, span.offset);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(words[local * per ..][0..per]), bytes);
+        }
+    }
+
+    // Plus the slot's `Ragged` meta row.
+    var expected: u64 = @import("sushi_exl3").rate_groups.META_WORDS * 4;
+    for (0..3) |pi| {
+        const tiles: u64 = (hidden / 16) * (inter / 16);
+        var total: u64 = 0;
+        for (groups) |group| total += group.experts * tiles * group.n[pi] * 2;
+        expected += (total + 5) / 6 + 2 * (hidden + inter);
+    }
+    try std.testing.expectEqual(expected, store.perExpertBytes());
 }
 
 fn gpuExl3Bank(arrays: [9]@import("mlx.zig").mlx_array) @import("sushi_exl3").Bank {
@@ -625,6 +741,119 @@ test "EXL3 streaming GPU slab matches resident decode prefill hits misses and un
     }
 }
 
+test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank across hits misses and union" {
+    const mlx = @import("mlx.zig");
+    const exl3 = @import("sushi_exl3");
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const hidden = 128;
+    const inter = 256;
+    const experts = 6;
+    const groups = [_]GroupSpec{ .{ .experts = 2, .n = .{ 32, 32, 32 } }, .{ .experts = 4, .n = .{ 48, 40, 64 } } };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pack = try writeGroupedPack(tmp.dir, a, hidden, inter, &groups);
+    defer pack.deinit();
+
+    var arrays: [groups.len * 9]mlx.mlx_array = @splat(.{});
+    defer for (arrays) |arr| {
+        if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+    };
+    var banks: [groups.len]exl3.Bank = undefined;
+    for (groups, 0..) |group, g| {
+        for (0..9) |ci| {
+            const pi = ci / 3;
+            const input: c_int = if (pi == 2) inter else hidden;
+            const output: c_int = if (pi == 2) hidden else inter;
+            const e: c_int = @intCast(group.experts);
+            const shape4 = [_]c_int{ e, @divExact(input, 16), @divExact(output, 16), @intCast(group.n[pi]) };
+            const shape2 = [_]c_int{ e, if (ci % 3 == 1) input else output };
+            const words = pack.words[g * 9 + ci];
+            arrays[g * 9 + ci] = if (ci % 3 == 0)
+                mlx.mlx_array_new_data(words.ptr, &shape4, 4, .uint16)
+            else
+                mlx.mlx_array_new_data(words.ptr, &shape2, 2, .float16);
+        }
+        banks[g] = gpuExl3Bank(arrays[g * 9 ..][0..9].*);
+    }
+    var resident = try exl3.Ragged.init(s, &banks);
+    defer resident.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const geom: stream.Geometry = .{ .layers = 1, .experts = experts, .hidden = hidden, .intermediate = inter, .exl3_n = 64 };
+    const per = try stream.expertBytesFor(a, path, geom, .exl3_k4);
+    for ([_]u64{ 3, 6 }) |layer_slots| {
+        var engine = try stream.Engine.initWithOptions(a, path, geom, layer_slots * per, s, .{ .layout = .exl3_k4, .bounce_size = 1 << 20 });
+        defer engine.deinit();
+        try engine.warmCache();
+        try std.testing.expectEqual(@as(u64, 0), engine.fallback_imports);
+        const grouped = engine.layers[0].grouped orelse return error.TestExpectedGroupedLayer;
+        var saw_union = false;
+        var saw_cache = false;
+        for ([_]usize{ 1, 1, 2, 33, 65, 1, 1 }) |rows| {
+            const topk: usize = 2;
+            const routes = try a.alloc(u16, rows * topk);
+            defer a.free(routes);
+            for (routes, 0..) |*id, j| id.* = if (rows <= 2) ([_]u16{ 5, 1, 4, 1, 0, 2 })[(j + rows) % 6] else @intCast((j * 5 + 2) % experts);
+
+            var seen: [experts]bool = @splat(false);
+            var distinct: [groups.len]u32 = @splat(0);
+            var expected_misses: u64 = 0;
+            for (routes) |id| {
+                if (seen[id]) continue;
+                seen[id] = true;
+                const g = grouped.groups.groupOf(id);
+                distinct[g] += 1;
+                const slot = grouped.caches[g].expert_to_slot[id - grouped.groups.base[g]];
+                if (slot < 0 or !grouped.caches[g].ready[@intCast(slot)]) expected_misses += 1;
+            }
+            var expect_union = false;
+            for (distinct, grouped.slots[0..groups.len]) |count, slots| expect_union = expect_union or count > slots;
+
+            const before = engine.fill_experts_total;
+            var prepared = try engine.prepareHost(0, routes);
+            defer prepared.deinit();
+            try std.testing.expectEqual(expected_misses, engine.fill_experts_total - before);
+            try std.testing.expectEqual(expect_union, prepared.workspace);
+            saw_union = saw_union or expect_union;
+            saw_cache = saw_cache or !expect_union;
+            const bank = prepared.ragged orelse return error.TestExpectedRaggedBank;
+
+            const xh = try a.alloc(u16, rows * hidden);
+            defer a.free(xh);
+            for (xh, 0..) |*v, j| v.* = exl3.format.f32ToF16Bits(@as(f32, @floatFromInt(@as(i32, @intCast(j % 31)) - 15)) / 32);
+            const scores = try a.alloc(f32, routes.len);
+            defer a.free(scores);
+            for (scores, 0..) |*v, j| v.* = @as(f32, @floatFromInt(j % topk + 1)) / 16;
+            const route_shape = [_]c_int{ 1, @intCast(rows), @intCast(topk) };
+            const x = mlx.mlx_array_new_data(xh.ptr, &.{ 1, @intCast(rows), hidden }, 3, .float16);
+            defer _ = mlx.mlx_array_free(x);
+            const weights = mlx.mlx_array_new_data(scores.ptr, &route_shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(weights);
+            const ids = mlx.mlx_array_new_data(routes.ptr, &route_shape, 3, .uint16);
+            defer _ = mlx.mlx_array_free(ids);
+            const local = mlx.mlx_array_new_data(prepared.remapped.ptr, &route_shape, 3, .uint16);
+            defer _ = mlx.mlx_array_free(local);
+            const dec: exl3.format.Decode = .{ .codebook = .mcg, .window = .w12 };
+            const reference = try exl3.moeRagged(s, x, &resident, ids, weights, dec, false, null, null);
+            defer _ = mlx.mlx_array_free(reference);
+            const actual = try exl3.moeRagged(s, x, bank, local, weights, dec, false, null, null);
+            defer _ = mlx.mlx_array_free(actual);
+            try mlx.check(mlx.mlx_array_eval(reference));
+            try mlx.check(mlx.mlx_array_eval(actual));
+            const ref_words: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(reference) orelse return error.UnreadableExl3Output);
+            const actual_words: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(actual) orelse return error.UnreadableExl3Output);
+            for (ref_words[0 .. rows * hidden]) |word| try std.testing.expect(std.math.isFinite(exl3.format.f16BitsToF32(word)));
+            try std.testing.expectEqualSlices(u16, ref_words[0 .. rows * hidden], actual_words[0 .. rows * hidden]);
+        }
+        try std.testing.expect(saw_cache);
+        try std.testing.expectEqual(layer_slots < experts, saw_union);
+    }
+}
+
 test "EXL3 streaming CPU refusals survive the registry and HTTP boundary" {
     const registry = @import("model_registry.zig").ModelRegistry;
     const server = @import("server.zig");
@@ -675,4 +904,56 @@ test "EXL3 streaming CPU rejects malformed banks and per-layer gate up rate mism
     specs[9].bytes = 128;
     try writeSafetensors(io, a, tmp.dir, "experts.safetensors", &specs);
     try std.testing.expectError(error.Exl3GateUpRateMismatch, stream.ExpertStore.openLayout(a, path, two, .exl3_k4));
+}
+
+test "EXL3 streaming GPU mixed grouped and uniform layers stay within the workspaces the ledger bills" {
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const mlx = @import("mlx.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var specs: std.ArrayList(TensorSpec) = .empty;
+    var entries: std.ArrayList(IndexSpec) = .empty;
+    try appendBankSpecs(arena.allocator(), &specs, &entries, 0, &.{ .{ .experts = 2, .n = 32, .group = 0 }, .{ .experts = 4, .n = 48, .group = 1 } }, 128, 256);
+    try appendBankSpecs(arena.allocator(), &specs, &entries, 1, &.{.{ .experts = 6, .n = 48, .group = null }}, 128, 256);
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs.items);
+    try writeIndex(io, a, tmp.dir, entries.items);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const geom: stream.Geometry = .{ .layers = 2, .experts = 6, .hidden = 128, .intermediate = 256, .exl3_n = 64 };
+    const bill = try stream.expertBillFor(a, path, geom, .exl3_k4);
+    try std.testing.expectEqual(@as(u8, 2), bill.shape.union_sets);
+    const ledger = try stream.budgetLedger(1 << 30, 0, 0, 0, 2, 6, 2, bill.expert_bytes, stream.BOUNCE_BYTES, bill.shape);
+    var engine = try stream.Engine.initWithOptions(a, path, geom, 2 * 3 * bill.expert_bytes, mlx.gpuStream(), .{ .layout = .exl3_k4, .bounce_size = 1 << 20 });
+    defer engine.deinit();
+    var held: u64 = 0;
+    for (engine.union_slabs) |op| held += @as(u64, op.stride) * op.count;
+    for (engine.grouped_union) |op| held += @as(u64, op.stride) * op.count;
+    try std.testing.expect(held <= ledger.workspace_bytes);
+    try std.testing.expectEqual(ledger.workspace_bytes, engine.plan.workspace_bytes);
+}
+
+test "EXL3 streaming CPU bills a grouped store's floor, one expert of every rate group, and one workspace set per layer kind" {
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var specs: std.ArrayList(TensorSpec) = .empty;
+    var entries: std.ArrayList(IndexSpec) = .empty;
+    try appendBankSpecs(arena.allocator(), &specs, &entries, 0, &.{ .{ .experts = 2, .n = 32, .group = 0 }, .{ .experts = 4, .n = 48, .group = 1 } }, 128, 256);
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs.items);
+    try writeIndex(io, a, tmp.dir, entries.items);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const bill = try stream.expertBillFor(a, path, .{ .layers = 1, .experts = 6, .hidden = 128, .intermediate = 256, .exl3_n = 64 }, .exl3_k4);
+    // Per group: three trellises of 128 tiles at the group's n, and three pairs of scale rows.
+    try std.testing.expectEqual(@as(u64, 3 * 128 * 2 * (32 + 48) + 2 * 3 * (128 + 256) * 2), bill.shape.layer_floor_bytes);
+    try std.testing.expectEqual(@as(u8, 1), bill.shape.union_sets);
+    try std.testing.expectEqual(@as(u64, 6 * 32), bill.shape.union_meta_bytes);
 }

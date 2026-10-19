@@ -6,8 +6,18 @@ pub const expert_exl3 = @import("sushi_exl3").format;
 /// carries it, with the group's expert count as its leading dimension.
 pub fn rateGroupMetaBytes(key: []const u8, experts: u64) u64 {
     if (std.mem.indexOf(u8, key, "gate_proj.g") == null or !std.mem.endsWith(u8, key, ".trellis")) return 0;
-    return experts * @import("sushi_exl3").rate_groups.META_WORDS * 4;
+    return experts * rate_group_meta_bytes;
 }
+
+/// What a streamed store bills beyond its mean expert.
+pub const StoreShape = struct {
+    /// The least a layer's cache can hold: one expert of every rate group, in the widest grouped layer.
+    layer_floor_bytes: u64 = 0,
+    /// The engine keeps one union workspace for the grouped layers and one for the uniform ones.
+    union_sets: u8 = 1,
+    /// Each grouped layer's union `Ragged` meta table.
+    union_meta_bytes: u64 = 0,
+};
 
 pub const Geometry = struct {
     layers: u16,
@@ -21,6 +31,7 @@ pub const Geometry = struct {
     exl3_n: u32 = 64,
     /// The bank rates the config names decoders for (`Spec.rates`); null admits any up to `exl3_n`.
     exl3_rates: ?u128 = null,
+    shape: StoreShape = .{},
 };
 
 pub const SourceSpan = struct {
@@ -194,7 +205,7 @@ pub fn streamingLayoutOfDir(allocator: std.mem.Allocator, io: std.Io, model_type
     if (parsed.value != .object) return error.InvalidSafetensorsIndex;
     const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
     if (map != .object) return error.InvalidSafetensorsIndex;
-    try rejectExl3RateGroups(map.object);
+    if (!std.mem.eql(u8, model_type, "qwen4_exp")) try rejectExl3RateGroups(map.object);
     return layoutFromIndexJsonWithFirstMoe(allocator, model_type, raw, layers, first_moe_layer) orelse error.ExpertStreamingUnsupportedLayout;
 }
 
@@ -806,6 +817,38 @@ pub fn moeLayerCount(geometry: Geometry) u16 {
 /// The nine leading-index banks of a streamed quantized expert pack, resolved
 /// to per-expert byte spans. Per-tensor geometry comes from PACKED shapes and
 /// dtypes against the activation dim, never from a model-wide quantization hint.
+pub const rate_group_limit = @import("sushi_exl3").group_layout.max_groups;
+const rate_group_meta_bytes: u64 = @import("sushi_exl3").rate_groups.META_WORDS * 4;
+
+/// A rate-grouped layer's experts: contiguous runs, each at its own gate, up and down rate.
+pub const LayerGroups = struct {
+    count: u8 = 0,
+    experts: [rate_group_limit]u16 = @splat(0),
+    base: [rate_group_limit]u16 = @splat(0),
+    n: [rate_group_limit][3]u32 = @splat(@splat(0)),
+
+    pub fn groupOf(self: *const LayerGroups, expert: u16) u8 {
+        var g: u8 = 0;
+        while (g + 1 < self.count and expert >= self.base[g + 1]) g += 1;
+        return g;
+    }
+
+    /// Bytes of one expert of group g: its trellises and scale planes.
+    pub fn expertBytes(self: *const LayerGroups, g: usize, hidden: u32, inter: u32) u64 {
+        const tiles = @as(u64, hidden / 16) * (inter / 16);
+        var total: u64 = 0;
+        for (0..3) |pi| total += tiles * self.n[g][pi] * 2 + (@as(u64, hidden) + inter) * 2;
+        return total;
+    }
+
+    /// One expert of every group: the least a cache of this layer can hold.
+    pub fn floorBytes(self: *const LayerGroups, hidden: u32, inter: u32) u64 {
+        var total: u64 = 0;
+        for (0..self.count) |g| total += self.expertBytes(g, hidden, inter);
+        return total;
+    }
+};
+
 pub const QuantStore = struct {
     allocator: std.mem.Allocator,
     geometry: Geometry,
@@ -818,6 +861,13 @@ pub const QuantStore = struct {
     dtypes: [component_count]io_mod.Dtype,
     geoms: [component_count]QuantGeom,
     packed_n: [component_count]u32 = @splat(0),
+    /// One entry per layer; `count` 0 is a uniform layer.
+    layer_groups: []LayerGroups = &.{},
+
+    pub fn groupsOf(self: *const QuantStore, layer: u16) ?*const LayerGroups {
+        if (layer >= self.layer_groups.len or self.layer_groups[layer].count == 0) return null;
+        return &self.layer_groups[layer];
+    }
 
     fn sourceIndex(self: *const QuantStore, layer: u16, expert: u16, c: Component) usize {
         return ((@as(usize, layer) * self.geometry.experts) + expert) * component_count + @backingInt(c);
@@ -858,10 +908,28 @@ pub const QuantStore = struct {
         return self.dtypes[@backingInt(c)];
     }
 
+    /// The mean expert a cache slot is billed at; a grouped store adds the slot's `Ragged` meta row.
     pub fn expertBytes(self: *const QuantStore) u64 {
-        var total: u64 = 0;
+        var total: u64 = if (self.layer_groups.len != 0) rate_group_meta_bytes else 0;
         for (self.slot_bytes) |b| total +|= b;
         return total;
+    }
+
+    pub fn shape(self: *const QuantStore) StoreShape {
+        var out: StoreShape = .{};
+        var grouped = false;
+        var uniform = false;
+        for (self.geometry.first_moe_layer..self.geometry.layers) |layer| {
+            const lg = self.groupsOf(@intCast(layer)) orelse {
+                uniform = true;
+                continue;
+            };
+            grouped = true;
+            out.layer_floor_bytes = @max(out.layer_floor_bytes, lg.floorBytes(self.geometry.hidden, self.geometry.intermediate));
+            out.union_meta_bytes += @as(u64, self.geometry.experts) * rate_group_meta_bytes;
+        }
+        if (grouped and uniform) out.union_sets = 2;
+        return out;
     }
 
     pub fn open(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry) !QuantStore {
@@ -893,7 +961,6 @@ pub const QuantStore = struct {
         const weight_map_value = index_parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
         if (weight_map_value != .object) return error.InvalidSafetensorsIndex;
         const weight_map = weight_map_value.object;
-        if (chosen == .exl3_k4) try rejectExl3RateGroups(weight_map);
 
         var files_list: std.ArrayList(SourceFile) = .empty;
         errdefer {
@@ -918,6 +985,8 @@ pub const QuantStore = struct {
             .dtypes = @splat(.other),
             .geoms = @splat(.{ .bits = 0, .group_size = 0 }),
         };
+
+        errdefer if (store.layer_groups.len != 0) allocator.free(store.layer_groups);
 
         var key_buf: [192]u8 = undefined;
         const first_layer = geometry.first_moe_layer;
@@ -958,6 +1027,15 @@ pub const QuantStore = struct {
             var metadata_ready = false;
             for (first_layer..geometry.layers) |layer_usize| {
                 const layer: u16 = @intCast(layer_usize);
+                if (chosen == .exl3_k4 and exl3LayerGrouped(weight_map, exl3_prefix, layer)) {
+                    if (store.layer_groups.len == 0) {
+                        store.layer_groups = try allocator.alloc(LayerGroups, geometry.layers);
+                        @memset(store.layer_groups, .{});
+                    }
+                    try populateExl3GroupedLayer(allocator, model_dir, weight_map, &files_list, &store, exl3_prefix, layer, metadata_ready);
+                    metadata_ready = true;
+                    continue;
+                }
                 for (0..component_count) |ci| {
                     const c: Component = @fromBackingInt(@intCast(ci));
                     if (chosen == .mxfp4_split and partOf(c) == .biases) {
@@ -1091,6 +1169,7 @@ pub const QuantStore = struct {
 
         if (chosen == .exl3_k4) {
             for (first_layer..geometry.layers) |layer| {
+                if (store.groupsOf(@intCast(layer)) != null) continue;
                 if (store.span(@intCast(layer), 0, .gate_w).len != store.span(@intCast(layer), 0, .up_w).len)
                     return error.Exl3GateUpRateMismatch;
             }
@@ -1106,6 +1185,7 @@ pub const QuantStore = struct {
     }
 
     pub fn deinit(self: *QuantStore) void {
+        if (self.layer_groups.len != 0) self.allocator.free(self.layer_groups);
         for (self.files) |*file| deinitSourceFile(self.allocator, file);
         self.allocator.free(self.files);
         self.allocator.free(self.spans);
@@ -1135,6 +1215,123 @@ pub const QuantStore = struct {
         }
     }
 };
+
+fn exl3LayerGrouped(map: std.json.ObjectMap, prefix: []const u8, layer: u16) bool {
+    var buf: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}{d}.mlp.switch_mlp.gate_proj.g0.trellis", .{ prefix, layer }) catch return false;
+    return map.get(key) != null;
+}
+
+/// A rate-grouped layer's tensors (`<proj>_proj.gN.<trellis|suh|svh>`) as one span per expert and component, the
+/// groups in order. The component metadata is the widest rate's and the average expert's bytes, which is what the
+/// ledger bills; a grouped layer is cut into per-group slot pools by `LayerGroups`, never by `slot_bytes`.
+fn populateExl3GroupedLayer(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    weight_map: std.json.ObjectMap,
+    files_list: *std.ArrayList(SourceFile),
+    store: *QuantStore,
+    prefix: []const u8,
+    layer: u16,
+    metadata_ready: bool,
+) !void {
+    const geometry = store.geometry;
+    const gl = @import("sushi_exl3").group_layout;
+    var plan = gl.Layout.init(geometry.hidden, geometry.intermediate, .{ .n = geometry.exl3_n });
+    plan.rates = geometry.exl3_rates;
+    const Piece = struct { file: u16 = 0, base: u64 = 0, per_expert: u64 = 0, experts: u32 = 0 };
+    var pieces: [gl.max_groups][component_count]Piece = @splat(@splat(.{}));
+    var start_buf: [192]u8 = undefined;
+    const start = std.fmt.bufPrint(&start_buf, "{s}{d}.mlp.switch_mlp.", .{ prefix, layer }) catch return error.InvalidExpertGeometry;
+    var it = weight_map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, key, start)) continue;
+        if (entry.value_ptr.* != .string) return error.InvalidSafetensorsIndex;
+        const name = try gl.Name.parse(key[start.len..]);
+        const file = try openSource(allocator, files_list, model_dir, entry.value_ptr.string);
+        const region = io_mod.tensorRegion(allocator, files_list.items[file].fd, key) catch |err| return switch (err) {
+            error.MissingSafetensorsTensor => error.MissingExpertTensor,
+            error.SafetensorsTensorOutOfBounds => error.ExpertTensorOutOfBounds,
+            else => error.InvalidExpertTensor,
+        };
+        const dtype: gl.Dtype = switch (region.dtype) {
+            .u16 => .u16,
+            .f16 => .f16,
+            else => .other,
+        };
+        _ = try plan.add(key[start.len..], region.shape[0..region.rank], dtype);
+        if (region.shape[0] == 0 or region.tensor_bytes % region.shape[0] != 0) return error.InvalidExpertTensor;
+        // Components run (weight, scales, biases) per projection, as (trellis, suh, svh) do here.
+        pieces[name.group][name.projection * 3 + name.part] = .{
+            .file = file,
+            .base = std.math.add(u64, region.data_offset, region.tensor_offset) catch return error.InvalidExpertTensor,
+            .per_expert = region.tensor_bytes / region.shape[0],
+            .experts = @intCast(region.shape[0]),
+        };
+    }
+    try plan.finish(geometry.experts, 1, false, geometry.experts);
+    var lg: LayerGroups = .{ .count = @intCast(plan.count) };
+    var at: u32 = 0;
+    var weight_total: [3]u64 = @splat(0);
+    const tiles: u64 = (@as(u64, geometry.hidden) / 16) * (geometry.intermediate / 16);
+    for (0..plan.count) |g| {
+        lg.experts[g] = @intCast(plan.groups[g].experts);
+        lg.base[g] = @intCast(at);
+        for (0..3) |pi| {
+            lg.n[g][pi] = plan.groups[g].rates[pi].n;
+            weight_total[pi] += @as(u64, plan.groups[g].experts) * tiles * lg.n[g][pi] * 2;
+        }
+        for (0..component_count) |ci| {
+            const piece = pieces[g][ci];
+            if (piece.experts != plan.groups[g].experts) return error.Exl3GroupGeometry;
+            for (0..piece.experts) |local| {
+                store.spans[((@as(usize, layer) * geometry.experts) + at + local) * component_count + ci] = .{
+                    .file = piece.file,
+                    .offset = std.math.add(u64, piece.base, @as(u64, @intCast(local)) * piece.per_expert) catch return error.InvalidExpertTensor,
+                    .len = piece.per_expert,
+                };
+            }
+        }
+        at += plan.groups[g].experts;
+    }
+    store.layer_groups[layer] = lg;
+
+    for (0..component_count) |ci| {
+        const c: Component = @fromBackingInt(@intCast(ci));
+        const pi: usize = @backingInt(projectionOf(c));
+        const in_dim: u32 = if (pi == 2) geometry.intermediate else geometry.hidden;
+        const out_dim: u32 = if (pi == 2) geometry.hidden else geometry.intermediate;
+        switch (partOf(c)) {
+            .weight => {
+                var widest: u32 = 0;
+                for (0..plan.count) |g| widest = @max(widest, lg.n[g][pi]);
+                const average = (weight_total[pi] + geometry.experts - 1) / geometry.experts;
+                if (!metadata_ready) {
+                    store.rows[ci] = in_dim / 16;
+                    store.cols[ci] = out_dim / 16 * widest;
+                    store.dtypes[ci] = .u16;
+                    store.slot_bytes[ci] = average;
+                } else {
+                    store.cols[ci] = @max(store.cols[ci], out_dim / 16 * widest);
+                    store.slot_bytes[ci] = @max(store.slot_bytes[ci], average);
+                }
+                store.packed_n[ci] = @max(store.packed_n[ci], widest);
+            },
+            .scales, .biases => {
+                const width: u32 = if (partOf(c) == .scales) in_dim else out_dim;
+                if (!metadata_ready) {
+                    store.rows[ci] = 1;
+                    store.cols[ci] = width;
+                    store.dtypes[ci] = .f16;
+                    store.slot_bytes[ci] = @as(u64, width) * 2;
+                } else if (store.rows[ci] != 1 or store.cols[ci] != width or store.dtypes[ci] != .f16) {
+                    return error.MixedExpertBankGeometry;
+                }
+            },
+        }
+    }
+}
 
 pub fn biasesOf(p: Projection) Component {
     return switch (p) {

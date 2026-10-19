@@ -200,6 +200,8 @@ pub const ModelConfig = struct {
     expert_cache_bytes: u64 = 0,
     expert_ssd_budget_bytes: u64 = 0,
     expert_workspace_bytes: u64 = 0,
+    /// What the streamed store bills beyond its mean expert, set by the streaming plan.
+    expert_shape: expert_quant.StoreShape = .{},
     expert_bounce_bytes: u64 = 0,
     expert_fill_peak_bytes: u64 = 0,
     /// A streamed load's resident vision tower (in the ssd budget) and its largest single-image
@@ -889,6 +891,7 @@ pub const ModelConfig = struct {
             .first_moe_layer = @intCast(self.first_k_dense_replace),
             .exl3_n = self.expert_quant_rate.n,
             .exl3_rates = self.expert_quant_rates,
+            .shape = self.expert_shape,
         };
     }
 
