@@ -597,7 +597,6 @@ test "gpu_factor: the chunk size does not change a byte" {
 }
 
 test "gpu_factor: a pipeline limit below the launch size lowers the threadgroup and not a byte of the factor" {
-    mlx.installErrorHandler();
     const t = std.testing;
     const n = 128;
     const s = mlx.gpuStream();

@@ -439,7 +439,12 @@ pub fn noGpuBackend() bool {
     return no_gpu_backend_cache.?;
 }
 
+var test_error_handler_installed = std.atomic.Value(bool).init(false);
+
+/// A test reaches the GPU through this stream, so it latches MLX's errors like `main()` does instead of mlx-c's
+/// exiting the process: a retry that reads a refusal must not depend on which test ran first.
 pub fn gpuStream() mlx_stream {
+    if (builtin.is_test and !test_error_handler_installed.swap(true, .acq_rel)) installErrorHandler();
     return if (noGpuBackend()) mlx_default_cpu_stream_new() else mlx_default_gpu_stream_new();
 }
 

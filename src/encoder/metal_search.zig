@@ -1570,7 +1570,6 @@ test "metal_search: the 1024-thread single-cost plan needs 1024 threads and a lo
 }
 
 test "metal_search: a pipeline limit below the launch size searches the same codes at a smaller threadgroup" {
-    mlx.installErrorHandler();
     const t = std.testing;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(20261019);
