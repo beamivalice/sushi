@@ -121,11 +121,37 @@ subset. This four-prompt screen is not the sixteen-prompt release reading.
   recorded, never treated as a regression or a reason to hold a NAX kernel back, and never "fixed" toward SIMD.
   A NAX arm still has to pass its fp32 parity test; this policy covers only the model-level KLD difference.
 
+<a id="eight-category"></a>
+## Eight-category reading (Flash-Next)
+
+The standard reading is prose only. The 8-category fixture keeps its size, 16 prompts x 512 tokens, and spends it on
+two prompts per category: code, math, reasoning, design, wikitext, multilingual, story, stem.
+
+- A category's mean comes from 2 prompts, at most 1024 positions: a coarse reading. Rank packs on the `all` row, and
+  read a category for where the loss sits, not to rank packs whose difference is small.
+- Every prompt is `prompt_ids`, so one capture holds three formats and compare needs no flag:
+  - math, reasoning and stem: chat template with thinking on, at the effort a request that names none gets (low).
+    The chain of thought is the content.
+  - code, design, multilingual and story: chat template with thinking off, the served default. The 512 rows are the
+    code, the page or brief, the story, or the non-English text itself.
+  - multilingual covers 8 languages in 8 scripts: one original passage translated into Thai, Chinese, Japanese and
+    Arabic, and an original birthday song (not the copyrighted lyrics) in Hindi, Russian, Spanish and Korean.
+  - wikitext: two WikiText-2 test articles outside the standard 16, raw, in the standard layout.
+- The non-wikitext prompts are original text written for the fixture. None shares a word 13-gram, a char 32-gram or a
+  token 13-gram with any calibration or tune corpus, or with the source pools they were drawn from, and none shares a
+  word 8-gram or a non-Latin char 16-gram either.
+- The prompt id's prefix before the first `-` is its category. `tests/kld_by_category.py [--csv-dir DIR]
+  <compare.json>...` prints one table per pack and a model x category KLD matrix (`--csv-dir`: `matrix.csv` and
+  `matrix-top1.csv`), position-weighted to the first EOS, so its `all` column is the compare's own number.
+- The teacher is the bf16 checkpoint with an f32 GDN state and gate ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher)). Score
+  students with `--qwen-gdn 32` and bf16 KV. These numbers are not comparable with any other fixture.
+
 ## Teacher fixtures
 
 | fixture | model | notes |
 |---|---|---|
 | Flash-Next 16x512 raw | Flash-Next | the bf16 checkpoint, bf16 stream, raw text; the standard |
+| Flash-Next 8-category 16x512 | Flash-Next | the bf16 checkpoint, f32 GDN state and gate, 2 prompts per category ([above](#eight-category)) |
 | Flash-Next 16x512 raw, f32 stream | Flash-Next | the same with an f32 residual stream |
 | Flash-Next 60x64 | Flash-Next | the 60x64 screen |
 | MiMo 16x512 raw | MiMo | the MOPD checkpoint as stored (FP8 trunk: bf16 weights in prefill, FP8 code x f32 block scale in decode), dense KV; captured 2026-09-30 by 83dc9b6c; mean strict NLL 0.2664; 652 s capture |
