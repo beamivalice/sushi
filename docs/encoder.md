@@ -55,7 +55,7 @@ Every expert shard carries the engine's stamp (`format`, `k`, `codebook`, `windo
 The pack is built in `--out` directly. Every file is written under a temp name and renamed, and `config.json` and the index
 come last, so an interrupted pack has no `config.json` and does not load. `convert-progress.json` records the policy (encoder
 version, rate, codebook, window, trunk, calibration, minimum rows, a float32 factor) and which phases are done; `--resume` refuses a directory
-whose policy differs, and skips every layer whose shard is complete. The file is deleted when the pack is complete.
+whose policy differs, and skips every layer whose shard is complete (a shard is complete when its header and its size agree, at any size). The file is deleted when the pack is complete, before the scratch files, and `--resume` into a directory that already holds `config.json` stops with `ResumePackComplete` and touches nothing.
 
 ## Calibration
 

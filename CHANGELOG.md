@@ -15,6 +15,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **`--kv-quant 6`**: a 6-bit KV cache between kv4 and kv8, with `kv_quant` 6 in `model-settings.json` and per request, on Qwen, MiMo and GLM (GLM stores its MLA latent at 6 bits and keeps DFlash2 and prefix reuse).
 - **`sushi convert exl3` writes a Sushi pack from a source checkpoint**: Qwen3.8-Flash-Next routed experts as EXL3 at a rate you pick, with the trunk in the format its packs serve, resumable, then checkable with `sushi kld`.
 - **`sushi convert exl3` fits its Metal threadgroups to the GPU**: the encoder's kernels use the threads per threadgroup MLX reports each one can take instead of assuming 1024, which crashed it on an M2 Pro. Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the report (#57).
+- **`sushi convert exl3 --resume` keeps finished layers and finished packs**: a layer shard over 1 GiB (a rate above about 3.4 bits) is no longer deleted and redone, and a resume into a pack that is already complete stops instead of rebuilding it.
 
 ## v1.2.4 — Faster Qwen3.8-Flash-Next, more context admission, image cache
 

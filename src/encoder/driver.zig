@@ -14,6 +14,7 @@ pub const Error = error{
     OutputNotEmpty,
     ResumeNothingToResume,
     ResumePolicyMismatch,
+    ResumePackComplete,
     ArchitectureNotConvertible,
     SourceConfigInvalid,
     SourceHasNoExperts,
@@ -173,12 +174,17 @@ fn readGeometry(allocator: std.mem.Allocator, config_json: []const u8, src: *con
 }
 
 fn layerShardComplete(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8, prefix: []const u8, layer: u32) bool {
-    const raw = dir.readFileAlloc(io, name, allocator, .limited(1 << 30)) catch return false;
-    defer allocator.free(raw);
-    if (raw.len < 8) return false;
-    const header_len = std.mem.readInt(u64, raw[0..8], .little);
-    if (8 + header_len > raw.len) return false;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw[8 .. 8 + header_len], .{}) catch return false;
+    var f = dir.openFile(io, name, .{}) catch return false;
+    defer f.close(io);
+    const size = (f.stat(io) catch return false).size;
+    var len_buf: [8]u8 = undefined;
+    if ((f.readPositionalAll(io, &len_buf, 0) catch return false) != 8) return false;
+    const header_len = std.mem.readInt(u64, &len_buf, .little);
+    if (header_len > size - 8) return false;
+    const header = allocator.alloc(u8, header_len) catch return false;
+    defer allocator.free(header);
+    if ((f.readPositionalAll(io, header, 8) catch return false) != header_len) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, header, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     var key: [160]u8 = undefined;
@@ -186,8 +192,8 @@ fn layerShardComplete(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir,
     const entry = parsed.value.object.get(probe) orelse return false;
     if (entry != .object) return false;
     const offsets = entry.object.get("data_offsets") orelse return false;
-    if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[1] != .integer) return false;
-    return @as(u64, @intCast(offsets.array.items[1].integer)) + 8 + header_len == raw.len;
+    if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[1] != .integer or offsets.array.items[1].integer < 0) return false;
+    return @as(u64, @intCast(offsets.array.items[1].integer)) + 8 + header_len == size;
 }
 
 fn writeProgress(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, p: Progress) !void {
@@ -296,6 +302,7 @@ pub fn run(
     var stored_overrides: ?std.json.Parsed(Progress) = null;
     defer if (stored_overrides) |p| p.deinit();
     if (!fresh) {
+        if (out.access(io, "config.json", .{})) |_| return error.ResumePackComplete else |_| {}
         const raw = out.readFileAlloc(io, progress_name, allocator, .limited(16 << 20)) catch return error.ResumeNothingToResume;
         defer allocator.free(raw);
         const parsed = std.json.parseFromSlice(Progress, allocator, raw, .{ .allocate = .alloc_always }) catch return error.ResumeNothingToResume;
@@ -464,8 +471,8 @@ pub fn run(
     try out.writeFile(io, .{ .sub_path = ".config.json.tmp", .data = config });
     try out.rename(".config.json.tmp", out, "config.json", io);
     if (calibrator) |c| c.finish(c.ctx);
-    out.deleteTree(io, ".capture") catch {};
     out.deleteFile(io, progress_name) catch {};
+    out.deleteTree(io, ".capture") catch {};
     say(sink, "pack complete", .{});
     return summary;
 }
@@ -693,4 +700,73 @@ test "driver: the layer kinds a calibrator reads from Info outlive the call that
     defer fake.deinit();
     _ = try run(poison.allocator(), io, mlx.gpuStream(), tinyOptions(model, out_path, false), fake.calibrator(), null);
     try t.expectEqualSlices(bool, &.{ true, false }, fake.kinds.items);
+}
+
+test "driver: a finished layer shard over 1 GiB counts as complete on resume" {
+    const t = std.testing;
+    const io = t.io;
+    var work = t.tmpDir(.{});
+    defer work.cleanup();
+    // A sparse file stands in for a 4-bit Qwen layer, which is larger than 1 GiB.
+    const payload: u64 = (1 << 30) + (64 << 20);
+    var header = std.ArrayList(u8).empty;
+    defer header.deinit(t.allocator);
+    try header.appendSlice(t.allocator, "{");
+    const parts = [_][]const u8{ "trellis", "suh", "svh" };
+    var at: u64 = 0;
+    var i: usize = 0;
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| for (parts) |part| {
+        const len: u64 = if (i == 8) payload - at else 64;
+        if (i != 0) try header.appendSlice(t.allocator, ",");
+        try header.print(t.allocator, "\"language_model.model.layers.3.mlp.switch_mlp.{s}.{s}\":{{\"dtype\":\"U16\",\"shape\":[{d}],\"data_offsets\":[{d},{d}]}}", .{ proj, part, len / 2, at, at + len });
+        at += len;
+        i += 1;
+    };
+    try header.appendSlice(t.allocator, "}");
+    while (header.items.len % 8 != 0) try header.append(t.allocator, ' ');
+    var f = try work.dir.createFile(io, "layer-3.safetensors", .{});
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, header.items.len, .little);
+    try f.writePositionalAll(io, &len_buf, 0);
+    try f.writePositionalAll(io, header.items, 8);
+    try f.writePositionalAll(io, &[_]u8{0}, 8 + header.items.len + payload - 1);
+    f.close(io);
+    try t.expect(layerShardComplete(t.allocator, io, work.dir, "layer-3.safetensors", shard.trunk_prefix, 3));
+    try t.expect(!layerShardComplete(t.allocator, io, work.dir, "layer-3.safetensors", shard.trunk_prefix, 4));
+
+    try work.dir.rename("layer-3.safetensors", work.dir, "layer-5.safetensors", io);
+    var g = try work.dir.openFile(io, "layer-5.safetensors", .{ .mode = .read_write });
+    defer g.close(io);
+    try g.setLength(io, 8 + header.items.len + payload - 1);
+    try t.expect(!layerShardComplete(t.allocator, io, work.dir, "layer-5.safetensors", shard.trunk_prefix, 3));
+}
+
+test "driver: a resume into a finished pack stops, whether or not its progress file or capture is left" {
+    const t = std.testing;
+    const io = t.io;
+    var work = t.tmpDir(.{});
+    defer work.cleanup();
+    try work.dir.createDirPath(io, "src");
+    var src_dir = try work.dir.openDir(io, "src", .{});
+    defer src_dir.close(io);
+    try writeTinySource(t.allocator, io, src_dir);
+    const model = try tmpPath(t.allocator, &work, "src");
+    defer t.allocator.free(model);
+    const out_path = try tmpPath(t.allocator, &work, "pack");
+    defer t.allocator.free(out_path);
+    _ = try run(t.allocator, io, mlx.gpuStream(), tinyOptions(model, out_path, false), null, null);
+
+    var pack_dir = try work.dir.openDir(io, "pack", .{ .iterate = true });
+    defer pack_dir.close(io);
+    const layer_before = try pack_dir.readFileAlloc(io, "layer-0.safetensors", t.allocator, .limited(1 << 24));
+    defer t.allocator.free(layer_before);
+
+    try t.expectError(error.ResumePackComplete, run(t.allocator, io, mlx.gpuStream(), tinyOptions(model, out_path, true), null, null));
+    try pack_dir.writeFile(io, .{ .sub_path = progress_name, .data = "{\"policy\":\"x\"}" });
+    try t.expectError(error.ResumePackComplete, run(t.allocator, io, mlx.gpuStream(), tinyOptions(model, out_path, true), null, null));
+
+    const layer_after = try pack_dir.readFileAlloc(io, "layer-0.safetensors", t.allocator, .limited(1 << 24));
+    defer t.allocator.free(layer_after);
+    try t.expectEqualSlices(u8, layer_before, layer_after);
+    try pack_dir.access(io, progress_name, .{});
 }
