@@ -15,7 +15,7 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 | 2 | **Perf gate** | the `docs/bench/<ver>/` run (below) on Qwen3.8-Flash-Next-Sushi-2.6bpw, Sushi-4bpw, MiMo-V2.6-Flash-Sushi-2.3bpw and GLM-5.3-Flash-Sushi-2.4bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on one Sushi pack and MiMo | within ~1% of its row in `docs/quality-kld.md` |
 | 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh`, plus the live test of each area the release changed (no `llmprobe --quick`: step 2's full bench covers it) | all pass |
-| 5 | CI | `gh workflow run ci.yml --ref main` on the release commit | green (the macOS 26.2 build gate) |
+| 5 | CI | none to dispatch: `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft. To check a tree without cutting: `gh workflow run release.yml -f dry_run=true` | green (the macOS 26.2 build gate) |
 | 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
 | 7 | Cross-engine (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
 

@@ -28,6 +28,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: No local paths in tracked files
+        run: bash tests/test_no_local_paths.sh
+
       - name: Select Xcode (Metal toolchain for the MLX kernels)
         uses: maxim-lobanov/setup-xcode@v1
         with:
