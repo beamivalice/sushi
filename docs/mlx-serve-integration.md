@@ -86,7 +86,7 @@ mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does
 
 ## Recommended pin
 
-sushi v1.2.4 (0bc61aa6), proposed in ddalcu/mlx-serve#864; mlx-serve main pins v1.2.3 (2c602b9e) until it merges.
+sushi v1.3.0 (8e4c0af1), proposed in ddalcu/mlx-serve#933; mlx-serve main pins v1.2.4 (0bc61aa6) until it merges.
 mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#768. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
@@ -96,6 +96,8 @@ mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#76
   `moeClamped` is unchanged, so the bump needs no mlx-serve source change.
 - v1.2.4 adds `moeWithGatedShared`, which folds a gated shared expert into the routed finish reduce on a decode
   row, and a decode lane that reads its third word through two 32-bit funnels; both bit-identical and additive.
+- v1.3.0 adds `moeRagged` over a `Ragged` bank, the STQ format's experts split into rate groups with their own
+  bit rates, and `shardStampAgrees` for the named codebook table; additive, mlx-serve calls none of them yet.
 
 ## Handing a new engine to mlx-serve
 
