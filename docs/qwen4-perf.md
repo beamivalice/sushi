@@ -659,3 +659,38 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
 - The llmprobe cells swing 5-10% within an arm, as tokens per round varies. The server's own round log, summed over
   every request in the boot, puts the branch 0.9% faster: no regression.
 - `tests/test_mtp_equivalence.sh` on the branch binary: 18 passed, 0 failed.
+
+<a id="dflash2"></a>
+## Flash-Next DFlash2 (`--drafter`) against MTP
+
+Opt-in: MTP is the default and DFlash2 runs only when `--drafter <path>` names the assistant ([qwen4-arch](qwen4-arch.md#dflash2)).
+M5 Max on AC, fans max, llmprobe 0.6.15 `--bench-only --rungs 4k,16k,64k,128k --runs 3`, kv8, prefix cache off, `taskpolicy -a`,
+GPU lock per arm, 180 s idle before each arm (300 s before the first of a session that followed a GPU load), arms adjacent.
+llmprobe prints one median per context rung. Decode tok/s:
+
+| rung | Sushi-2.6bpw MTP | 2.6bpw DFlash2 fixed 4 rows | 2.6bpw DFlash2 adaptive 2..8 | Sushi-4bpw MTP | 4bpw DFlash2 adaptive 2..8 |
+|---|---|---|---|---|---|
+| 4k | 92.0 | 89.1 | 97.9 (+6.4%) | 95.8 | 98.7 (+3.0%) |
+| 16k | 88.3 | 90.7 | 106.0 (+20.0%) | 94.2 | 93.8 (-0.4%) |
+| 64k | 79.4 | 79.8 | 87.3 (+9.9%) | 80.6 | 83.6 (+3.7%) |
+| 128k | 71.3 | 69.4 | 76.0 (+6.6%) | 73.0 | 71.0 (-2.7%) |
+| headline | 101 (96.2-102.8) | 100 (87.7-103) | 96.2 (94.8-98.8) | 100.8 (100.8-105.7) | 102.1 (99.8-102.6) |
+| novel prose | 81.4 | 73.6 | 83.4 | 87.0 | 77.8 (-11%) |
+| predictable text | 135.3 | 124.5 | 157.4 | 146.3 | 147.9 |
+
+- Binaries: 2.6bpw MTP and fixed 4 rows are bench-26e on f9393ba6, the 2.6bpw adaptive arm is 43d2fe98 (before the gate below
+  was fixed), the 4bpw pair is e2912d04. Each pair's baseline is its own same-session MTP arm, inherited, not rerun.
+- The 2.6bpw win is real at every context rung; 4bpw ties MTP within run-to-run noise (1-3%) and loses on novel prose.
+- Mean rows per round 4.8-5.2 (4bpw 5.0-5.3); accepted drafts per round 3.3-3.7 against MTP's 2.2-3.6 (verify rows 3.7-5.6).
+- Novel prose loses on 4bpw because a DFlash2 round carries a fixed price on top of its verify (drafter forward 1.45 ms,
+  head and selector 1.5, context append 0.4-0.7: about 4-5 ms of a 25-40 ms round), while MTP's head drafts inside the
+  verify. At about 1.2 accepted drafts per round that price is the whole difference. Follow-up: price it into the row
+  ladder and hand low-yield requests to MTP (needs both heads resident).
+- A verify row costs about 3.3 ms on 2.6bpw (2 rows 20.6 ms, 3 rows 23.0, 4 rows 26.3, 8 rows 41.7; a serial token 13.3).
+- The gate that stops DFlash2 for a request judges ms per token against the serial price after 8 rounds. Without a serial
+  sample in the request's context bucket it asks for the break-even yield at the rows the request really verified (it
+  used the block's 8 rows, which disabled winning requests at 16k and above in the first 2.6bpw adaptive arm). 7 of 54
+  requests in the 4bpw arm were still stopped early by first-round one-time costs in the 8-round warm-up.
+- Streamed (`--ssd-budget-gb 32`, Sushi-2.6bpw, a 3.7k-token prompt, untimed, two requests each): DFlash2 27.9 and 30.4
+  tok/s, MTP (`--mtp`) 22.8 and 29.0.
+

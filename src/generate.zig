@@ -37,6 +37,7 @@ const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const glm5_forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const dflash_mod = @import("dflash.zig");
+const dflash_policy = @import("dflash_policy.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
 pub const ThinkPenalty = think_penalty.ThinkPenalty;
@@ -1759,10 +1760,11 @@ pub const Generator = struct {
     /// Effective block size (assistant config, capped by the machine's verify lanes).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
-    /// Request-class break-even yield, normalized by the scheduler to the
-    /// effective draft width. Thinking requests use the lower calibration
-    /// because their less-predictable reasoning preamble pays back later.
-    dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+    /// Wall ms of this request's DFlash rounds, for the cost gate.
+    dflash_wall_ms: f64 = 0,
+    /// Drafts the verifies of this request carried, and the selector-confidence calibration that picks rows.
+    dflash_drafts_verified: u64 = 0,
+    dflash_calib: dflash_policy.Calibration = .{},
     /// Drafts this round ran (0 = serial), read by the table feed.
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
@@ -1999,19 +2001,41 @@ pub const Generator = struct {
     // (llmprobe's 16k rung: 0/3, drafter off for the whole request at 25
     // tok/s; the same prompt restored from cache decoded at 73).
     pub const DFLASH_GATE_WARMUP: u64 = 8;
-    pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
-    pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
-    /// Absolute floor for a SPARSE target, applied after the width scaling.
-    /// See `scheduler.dflashGateMinimum` for the measurement it comes from —
-    /// a MoE verify reads every expert its block's positions route to, so its
-    /// break-even acceptance is several times a dense trunk's.
-    pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
+    /// A DFlash round that costs more per emitted token than this multiple of a serial step is dropped.
+    pub const DFLASH_GATE_MARGIN: f32 = 0.05;
 
-    pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {
+    /// Accepted drafts per round at which a round of `rows` verifier rows costs one serial step per
+    /// token, used until a serial sample exists. A round costs about 0.25 + 0.28 serial steps per
+    /// row (Sushi-2.6bpw, M5 Max: 24.1, 30.6 and 46.7 ms at 2, 4 and 8 rows against a 13.3 ms token).
+    pub fn dflashBreakEvenAccepted(rows: f32) f32 {
+        return 0.25 + 0.28 * rows;
+    }
+
+    /// Does the request's DFlash yield lose to serial decoding? With a measured serial price (the
+    /// round-cost table's cell) the test is ms per emitted token; without one it is the ladder's
+    /// break-even yield. Never decided before the warmup rounds.
+    pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
         if (attempted < DFLASH_GATE_WARMUP) return false;
-        const avg = @as(f32, @floatFromInt(accepted)) /
-            @as(f32, @floatFromInt(attempted));
-        return avg < min_avg;
+        if (serial_ms_tok) |serial| {
+            if (std.math.isFinite(serial) and serial > 0) {
+                const emitted: f64 = @floatFromInt(attempted + accepted);
+                return wall_ms / emitted > @as(f64, serial) * (1.0 + DFLASH_GATE_MARGIN);
+            }
+        }
+        const avg = @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(attempted));
+        return avg < dflashBreakEvenAccepted(rows);
+    }
+
+    /// Verifier rows a round of this request carried on average: the block's until a round has run.
+    fn dflashMeanRows(self: *const Generator) f32 {
+        if (self.dflash_attempted == 0 or self.dflash_drafts_verified == 0) return @floatFromInt(self.dflash_block_size);
+        return 1 + @as(f32, @floatFromInt(self.dflash_drafts_verified)) / @as(f32, @floatFromInt(self.dflash_attempted));
+    }
+
+    /// The serial price a DFlash request is held to: the plain-tick cell at width 0, which this
+    /// path's own fallback ticks feed, else the serial row MTP's adaptive serial feeds.
+    pub fn dflashSerialPrice(t: *const round_cost.Table, bucket: usize) ?f32 {
+        return t.msPerTok(0, bucket) orelse t.serialMsPerTok(bucket);
     }
 
     /// Emit a stable, easy-to-grep one-line summary of spec-decode acceptance
@@ -2117,19 +2141,25 @@ pub const Generator = struct {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dflash_attempted));
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
-            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else self.dflash_attempted * @as(u64, drafts_per_round);
+            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else (if (self.dflash_drafts_verified > 0) self.dflash_drafts_verified else self.dflash_attempted * @as(u64, drafts_per_round));
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
             else
                 0.0;
+            // GLM's native path keeps its historical line: it has no yield gate and prints the old generic bar.
+            var gate_buf: [16]u8 = undefined;
+            var serial_buf: [32]u8 = undefined;
+            const gate_txt = std.fmt.bufPrint(&gate_buf, "{d:.2}", .{if (self.glm_dflash_native) 1.80 else dflashBreakEvenAccepted(self.dflashMeanRows())}) catch "";
+            const serial_txt = if (self.glm_dflash_native) "" else std.fmt.bufPrint(&serial_buf, " serial_ms={d:.2}", .{dflashSerialPrice(&self.xfm.round_cost, table_bucket) orelse 0.0}) catch "";
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={s}{s} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
                     avg_per_round,
-                    self.dflash_min_accepted_per_round,
+                    gate_txt,
+                    serial_txt,
                     per_draft_pct,
                     self.dflash_block_size,
                     self.partial_rounds,
@@ -2228,10 +2258,6 @@ pub const Generator = struct {
         /// Effective DFlash block size (loader-resolved: assistant config
         /// capped by the machine's verify lanes). 0 → the assistant config's value.
         dflash_block_size: u32 = 0,
-        /// Accepted drafts/round required after warmup. Scheduler scales the
-        /// M5/block-16 calibration to the effective draft width and lowers it
-        /// for requests whose resolved mode has thinking enabled.
-        dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
         /// Enable the Qwen native MTP head. When set, `mtp` must be non-null
         /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
         /// history KV cache chunk-by-chunk (full-hidden capture) and the
@@ -2598,7 +2624,7 @@ pub const Generator = struct {
         var dfl_cl: transformer_mod.CaptureLayers = undefined;
         if (dflash_active) {
             dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
-            dfl_cl = .{ .ids = options.dflash.?.config.target_layer_ids, .out = dfl_out_buf };
+            dfl_cl = .{ .ids = options.dflash.?.config.target_layer_ids, .out = dfl_out_buf, .hc_mean = xfm.config.hc_count };
         }
 
         // Start of the final (logits) forward's token span. Without SSM
@@ -3260,7 +3286,6 @@ pub const Generator = struct {
                 .glm_dflash_native = glm_dflash_native,
                 .glm_prefill_window = glm_window,
                 .dflash_block_size = dflash_bs,
-                .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_accept_graph = accept_route.graph,
                 .mtp_accept_prefix = accept_route.prefix,
@@ -4055,7 +4080,7 @@ pub const Generator = struct {
         defer schedule.restore();
         var timer = io_util.Stopwatch.init(self.timer.io);
         const lookup = try self.glmLookupChain(allocator);
-        const proposal = lookup orelse try self.glmPropose(@min(@max(self.dflash_block_size, 2) - 1, 2));
+        const proposal = lookup orelse try self.glmPropose(dflash_mod.glmMaxNodes(self.dflash_block_size, dflash_mod.drafterDepthExplicit()));
         const draft_ns = timer.read();
         timer.reset();
         const request = self.ctx.glm5_request.?;
@@ -4184,6 +4209,7 @@ pub const Generator = struct {
             const post_warmup = dflash_rounds_before >= DFLASH_GATE_WARMUP;
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
             self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
+            if (self.dflash_round_width > 0) self.dflash_wall_ms += wall;
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
@@ -4214,7 +4240,9 @@ pub const Generator = struct {
         const model = self.dflash.?;
         const dctx = &self.dflash_ctx.?;
         const bs: u32 = round_width + 1;
-        const m: u32 = bs - 1;
+        const m_full: u32 = bs - 1;
+        // Drafts this round verifies: all of the block's, or the policy's rows - 1 once the selector has spoken.
+        var m: u32 = m_full;
         const t1: u32 = self.next_token_id;
         // Positions come from moe_seq_offset (cache.step is a bookkeeping
         // counter the model never reads — same rule as nextMtp).
@@ -4235,7 +4263,7 @@ pub const Generator = struct {
         // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
         // ALL rows starting at the anchor — so DSpark needs only m noise rows
         // for the same m drafts and the same verify width.
-        const noise_rows: u32 = if (model.config.anchor_row_drafts) m else bs;
+        const noise_rows: u32 = if (model.config.anchor_row_drafts) m_full else bs;
         const noise_ids = try allocator.alloc(i32, noise_rows);
         defer allocator.free(noise_ids);
         noise_ids[0] = @intCast(t1);
@@ -4265,7 +4293,7 @@ pub const Generator = struct {
         {
             const row0: c_int = if (model.config.anchor_row_drafts) 0 else 1;
             const start = [_]c_int{ 0, row0, 0 };
-            const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m)), dl_shape[2] };
+            const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m_full)), dl_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
         }
@@ -4381,9 +4409,13 @@ pub const Generator = struct {
                 self.prng.random(),
                 s,
             );
+            if (self.dflashAdaptiveRows()) {
+                m = dflash_policy.pickRows(&self.dflash_calib, sel_path.?.conf, dflash_mod.qwenMinRows(), self.dflash_block_size) - 1;
+                self.dflash_round_width = m;
+            }
             const ids_i32 = try allocator.alloc(i32, m);
             defer allocator.free(ids_i32);
-            for (sel_path.?.ids, ids_i32) |v, *d| d.* = @intCast(v);
+            for (sel_path.?.ids[0..m], ids_i32) |v, *d| d.* = @intCast(v);
             const row_shape = [_]c_int{ 1, @intCast(m) };
             const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(host_arr);
@@ -4423,7 +4455,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out, .hc_mean = xfm.config.hc_count };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         // Per-position SSM capture on a GDN trunk so partial accept can roll
@@ -4458,7 +4490,7 @@ pub const Generator = struct {
             allocator.free(slots);
         };
         if (stochastic) {
-            const slots = try allocator.alloc(mlx.mlx_array, bs);
+            const slots = try allocator.alloc(mlx.mlx_array, m + 1);
             per_pos_logits = slots;
             const slice_strides = [_]c_int{ 1, 1, 1 };
             for (slots, 0..) |*slot, idx| {
@@ -4491,7 +4523,7 @@ pub const Generator = struct {
         var drafts = try allocator.alloc(u32, m);
         errdefer allocator.free(drafts);
         if (sel_path) |*sp| {
-            @memcpy(drafts, sp.ids);
+            @memcpy(drafts, sp.ids[0..m]);
         } else {
             try mlx.check(mlx.mlx_array_eval(draft_ids));
             const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
@@ -4513,7 +4545,7 @@ pub const Generator = struct {
                 } else if (sel_path) |*sp| blk: {
                     // Selector-sampled draft: q is the traced step's own
                     // candidate softmax — exact, no GPU read.
-                    const kk = sp.cand_ids.len / @as(usize, m);
+                    const kk = sp.cand_ids.len / @as(usize, m_full);
                     break :blk specAcceptProb(p_draft, sp.q.?[@as(usize, k) * kk + sp.chosen_idx[k]]);
                 } else @min(1.0, p_draft);
                 const u: f32 = self.prng.random().float(f32);
@@ -4528,6 +4560,9 @@ pub const Generator = struct {
                 accepted += 1;
             }
         }
+
+        self.dflash_drafts_verified += m;
+        if (sel_path) |*sp| self.dflash_calib.observeRound(sp.conf, m, accepted);
 
         // A speculative verify may accept the whole block even when only a
         // few output positions remain. Cap the accepted prefix BEFORE cache
@@ -4552,7 +4587,7 @@ pub const Generator = struct {
                     const q_row = if (draft_q.ctx != null)
                         try sliceProbRow(draft_q, accepted, s)
                     else if (sel_path) |*sp|
-                        try selectorQRow(sp, accepted, m, vl_shape[2], s)
+                        try selectorQRow(sp, accepted, m_full, vl_shape[2], s)
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
@@ -4651,6 +4686,12 @@ pub const Generator = struct {
         };
     }
 
+    /// Rows are chosen per round on Flash-Next, whose verify rows are bytes; every other target
+    /// verifies the whole block.
+    fn dflashAdaptiveRows(self: *const Generator) bool {
+        return self.xfm.qwen4 != null and self.dflash_block_size > dflash_mod.qwenMinRows();
+    }
+
     /// DFlash runtime economics gate. Sticky within the request: once a
     /// `DFLASH_GATE_WARMUP`-round sample proves the block-parallel path yields
     /// less than its width-normalized request-class threshold, subsequent
@@ -4658,16 +4699,13 @@ pub const Generator = struct {
     /// fallback.
     fn checkDflashRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
-        if (!dflashGateShouldDisable(
-            self.dflash_attempted,
-            self.dflash_accepted_tokens,
-            self.dflash_min_accepted_per_round,
-        )) return;
+        const serial = dflashSerialPrice(&self.xfm.round_cost, self.xfm.round_cost.bucketOf(self.mtpKvLen()));
+        if (!dflashGateShouldDisable(self.dflash_attempted, self.dflash_accepted_tokens, self.dflash_wall_ms, self.dflashMeanRows(), serial)) return;
         const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
             @as(f32, @floatFromInt(self.dflash_attempted));
         log.info(
-            "  dflash=disabled (runtime yield {d:.2} accepted/round < {d:.2} after {d} attempts)\n",
-            .{ avg, self.dflash_min_accepted_per_round, self.dflash_attempted },
+            "  dflash=disabled (runtime yield {d:.2} accepted/round, {d:.2} ms/token against {d:.2} serial, after {d} attempts)\n",
+            .{ avg, self.dflash_wall_ms / @as(f64, @floatFromInt(self.dflash_attempted + self.dflash_accepted_tokens)), serial orelse 0.0, self.dflash_attempted },
         );
         self.spec_disabled_runtime = true;
     }
@@ -12976,31 +13014,40 @@ test "sampleToken from prefill logits (seq_len > 1)" {
     try testing.expectEqual(@as(u32, 0), result.token_id); // pos 2, index 0 = 9.0
 }
 
-test "Generator.dflashGateShouldDisable uses accepted yield across block widths" {
-    // Never decide from fewer than the DFlash warmup number of paid verifies.
-    try testing.expect(!Generator.dflashGateShouldDisable(
-        Generator.DFLASH_GATE_WARMUP - 1,
-        0,
-        Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
-    ));
+test "Generator.dflashGateShouldDisable: a serial price decides by ms per token, the ladder break-even decides without one" {
+    const G = Generator;
+    const w = G.DFLASH_GATE_WARMUP;
+    const round_ms: f64 = 30.6; // a 4-row round, Sushi-2.6bpw M5 Max
+    // Never decided before the warmup rounds.
+    try testing.expect(!G.dflashGateShouldDisable(w - 1, 0, round_ms * @as(f64, @floatFromInt(w - 1)), 4.0, 13.3));
+    // Against a 13.3 ms serial token: one accepted draft per round costs 15.3 ms per token and loses,
+    // one and a half costs 12.2 and wins.
+    try testing.expect(G.dflashGateShouldDisable(w, w, round_ms * @as(f64, @floatFromInt(w)), 4.0, 13.3));
+    try testing.expect(!G.dflashGateShouldDisable(w, w + w / 2, round_ms * @as(f64, @floatFromInt(w)), 4.0, 13.3));
+    // A slower serial token (a larger pack) keeps rounds the 13.3 ms one would drop.
+    try testing.expect(!G.dflashGateShouldDisable(w, w, round_ms * @as(f64, @floatFromInt(w)), 4.0, 20.0));
+    // No serial sample: the ladder's break-even yield, 1.37 accepted drafts at 4 rows.
+    try testing.expectApproxEqAbs(@as(f32, 1.37), G.dflashBreakEvenAccepted(4.0), 0.001);
+    try testing.expect(G.dflashGateShouldDisable(w, w + w / 5, 0, 4.0, null));
+    try testing.expect(!G.dflashGateShouldDisable(w, w + w / 2, 0, 4.0, null));
+    // A round never offers fewer accepted drafts than its break-even asks for, up to eight rows.
+    for ([_]f32{ 3, 4, 5, 6, 8 }) |rows| try testing.expect(G.dflashBreakEvenAccepted(rows) < rows - 1);
+    // Rows the policy left out of a round are not a cost: 2.5 accepted per round at five rows on average
+    // clears the bar the eight-row block would set at 2.49.
+    const rounds = 3 * w;
+    const acc = rounds * 5 / 2;
+    try testing.expect(!G.dflashGateShouldDisable(rounds, acc, 0, 5.0, null));
+    try testing.expect(G.dflashGateShouldDisable(rounds, acc - rounds / 20, 0, 8.0, null));
+}
 
-    // Muse prose/vision measured 1.0-1.5 accepted drafts per round at both
-    // block 8 and block 16: that class loses to serial and must fall back.
-    const w = Generator.DFLASH_GATE_WARMUP;
-    try testing.expect(Generator.dflashGateShouldDisable(w, w * 1, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(Generator.dflashGateShouldDisable(w, w * 2 - 1, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-
-    // Exactly two is the strict break-even boundary; code/tool traffic at
-    // 4.4+ and echo traffic near a full block remain on DFlash.
-    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 2, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 5, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-
-    // Thinking preambles recovered from ~1.4 early to 4.4 whole-request; the
-    // resolved-mode threshold keeps that path alive while still cutting off
-    // a truly non-yielding reasoning request.
-    try testing.expect(!Generator.dflashGateShouldDisable(w, w + w / 3, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(Generator.dflashGateShouldDisable(w, w - w / 3, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
+test "Generator.dflashSerialPrice reads the width-0 cell the DFlash fallback feeds, then the serial row" {
+    var t = round_cost.Table{ .layout = .long };
+    try testing.expect(Generator.dflashSerialPrice(&t, 0) == null);
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(0, 1000, 13.4, 1, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 13.4), Generator.dflashSerialPrice(&t, 0).?, 1e-3);
+    var row = round_cost.Table{ .layout = .long };
+    for (0..round_cost.MIN_SAMPLES) |_| _ = row.observeSerial(1000, 15.0, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 15.0), Generator.dflashSerialPrice(&row, 0).?, 1e-3);
 }
 
 test "InitOptions.lookup_prompt overrides prompt_ids_owned source" {

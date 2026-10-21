@@ -13,6 +13,10 @@ The source comments at each site name their upstream too.
 MIT-licensed tree construction
 ================================================================================
 
+The confidence calibration and row choice in src/dflash_policy.zig follow
+mlx-serve src/dflash_policy.zig (https://github.com/ddalcu/mlx-serve),
+Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE.
+
 The lattice and best-first draft tree in src/glm5_dflash_tree.zig are adapted
 from mlx-serve src/dflash.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE. Its tree policy

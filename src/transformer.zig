@@ -12841,6 +12841,9 @@ pub const CaptureLayers = struct {
     /// The residual entering the first layer (`hidden_states[0]`), same
     /// ownership as `out`. Honored by `forwardMoeWith` only.
     input: ?*mlx.mlx_array = null,
+    /// qwen4_exp: average the layer output over this many hyper-connection
+    /// streams, giving `[B, L, H]` taps (0 = the raw `[B, L, hc*H]` stream).
+    hc_mean: u32 = 0,
 };
 
 pub const ForwardCtx = struct {
@@ -46322,6 +46325,62 @@ const Qwen4TestSlot = struct {
 
 fn qwen4Rows(arr: mlx.mlx_array) c_int {
     return if (arr.ctx != null) mlx.getShape(arr)[1] else -1;
+}
+
+test "qwen4 hc_mean capture is the mean of the four HC streams at the layer output (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+
+    const hc: usize = 4;
+    const hidden: usize = @intCast(config.hidden_size);
+    const prompt = [_]i32{ 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000 };
+    const layer_ids = [_]u32{ 5, 15 };
+    var raw_out = [_]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    var mean_out = [_]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (raw_out ++ mean_out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    inline for (.{ &raw_out, &mean_out }, .{ 0, hc }) |outs, mean_streams| {
+        const slot = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        defer slot.deinit(allocator);
+        var cl: CaptureLayers = .{ .ids = &layer_ids, .out = outs, .hc_mean = mean_streams };
+        slot.ctx.capture_layers = &cl;
+        const logits = try slot.forward(&xfm, &prompt);
+        _ = mlx.mlx_array_free(logits);
+    }
+    for (raw_out, mean_out) |raw_arr, mean_arr| {
+        const raw = try qwen4ReadF32(allocator, raw_arr, s);
+        defer allocator.free(raw);
+        const got = try qwen4ReadF32(allocator, mean_arr, s);
+        defer allocator.free(got);
+        try testing.expectEqual(prompt.len * hc * hidden, raw.len);
+        try testing.expectEqual(prompt.len * hidden, got.len);
+        var worst: f32 = 0;
+        for (0..prompt.len) |row| {
+            for (0..hidden) |c| {
+                var acc: f32 = 0;
+                for (0..hc) |k| acc += raw[(row * hc + k) * hidden + c];
+                const want = acc / @as(f32, hc);
+                const err = @abs(got[row * hidden + c] - want) / @max(1.0, @abs(want));
+                worst = @max(worst, err);
+            }
+        }
+        // bf16 output of an f32-accumulated mean of bf16 streams.
+        try testing.expect(worst < 0.01);
+    }
 }
 
 test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks (GDN + PLE history + QSA keys/mask)" {

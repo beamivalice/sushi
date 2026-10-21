@@ -17,6 +17,7 @@ const model_discovery = @import("model_discovery.zig");
 const model_registry_mod = @import("model_registry.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
+const dflash_mod = @import("dflash.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -192,8 +193,20 @@ fn printUsage(io: std.Io) void {
         \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
         \\                        default, GLM does not; an SSD-streamed pack
         \\                        that cannot stream its head refuses --mtp.
-        \\  --drafter <dir>     GLM only: use the DFlash2 assistant stored in
-        \\                        <dir> (default: the pack's own dflash2/ folder).
+        \\  --drafter <dir>     Use the DFlash2 assistant stored in <dir>. GLM
+        \\                        finds the pack's own dflash2/ folder or the
+        \\                        released assistant folder beside the weights
+        \\                        by itself; Qwen3.8-Flash-Next decodes with MTP
+        \\                        unless this flag names the assistant.
+        \\  --drafter-min-depth <n> Fewest verifier rows (t1 plus drafts) a DFlash2
+        \\                        round carries, 2..16 (default 2). On
+        \\                        Qwen3.8-Flash-Next the round picks its rows
+        \\                        within --drafter-min-depth..--drafter-max-depth
+        \\                        from the drafter's confidence; equal values
+        \\                        pin one count. GLM only checks it.
+        \\  --drafter-max-depth <n> Most verifier rows a DFlash2 round carries
+        \\                        (default: 8 on Qwen3.8-Flash-Next, at most 8;
+        \\                        3 on GLM, at most 4).
         \\  --no-drafter        Never load the DFlash2 assistant (saves its memory).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
@@ -671,6 +684,15 @@ pub fn main(init: std.process.Init) !void {
                     if (key.len > 0) server_mod.g_api_key = key;
                 }
             }
+        } else if (std.mem.eql(u8, args[i], "--drafter-min-depth") or std.mem.eql(u8, args[i], "--drafter-max-depth")) {
+            const is_min = std.mem.eql(u8, args[i], "--drafter-min-depth");
+            i += 1;
+            const text: []const u8 = if (i < args.len) args[i] else "";
+            const n = dflash_mod.parseDrafterDepth(text) catch {
+                log.err("{s}: expected an integer in {d}..{d}; got '{s}'\n", .{ args[i - 1], dflash_mod.QWEN_MIN_ROWS, dflash_mod.DRAFTER_DEPTH_MAX, text });
+                std.process.exit(1);
+            };
+            if (is_min) dflash_mod.drafter_min_depth = n else dflash_mod.drafter_max_depth = n;
         } else if (std.mem.eql(u8, args[i], "--no-drafter")) {
             no_drafter = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
@@ -909,6 +931,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
+        log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
+        std.process.exit(1);
+    };
     depth_bounds.validate(depth_bounds.active) catch {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);

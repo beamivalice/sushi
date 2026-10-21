@@ -405,6 +405,93 @@ pub fn blockCapForMachine(chip: []const u8) BlockCap {
     return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "no wide verify lane" };
 }
 
+/// `--drafter-min-depth` / `--drafter-max-depth`: the verifier rows (t1 plus drafts) a drafter round may
+/// carry; null = the model's default.
+pub var drafter_min_depth: ?u32 = null;
+pub var drafter_max_depth: ?u32 = null;
+pub const DRAFTER_DEPTH_MAX: u32 = 16;
+/// Fewest rows a Flash-Next round verifies: a round with no draft is not a DFlash round.
+pub const QWEN_MIN_ROWS: u32 = 2;
+/// The widest verify whose rows are decode-tick identical on qwen4 (`mtp.MAX_DEPTH` drafts + t1).
+pub const QWEN_MAX_ROWS: u32 = 9;
+pub const GLM_DEFAULT_ROWS: u32 = 3;
+/// The widest tree the GLM planner carries.
+pub const GLM_MAX_ROWS: u32 = 4;
+
+pub fn qwenMinRows() u32 {
+    return drafter_min_depth orelse QWEN_MIN_ROWS;
+}
+
+pub fn drafterDepthExplicit() bool {
+    return drafter_min_depth != null or drafter_max_depth != null;
+}
+
+pub fn parseDrafterDepth(text: []const u8) error{InvalidDrafterDepth}!u32 {
+    const n = std.fmt.parseInt(u32, text, 10) catch return error.InvalidDrafterDepth;
+    if (n < QWEN_MIN_ROWS or n > DRAFTER_DEPTH_MAX) return error.InvalidDrafterDepth;
+    return n;
+}
+
+pub const RowBounds = struct { min: u32, max: u32 };
+
+/// Qwen3.8-Flash-Next: the rows a round may verify, from the flags or the defaults; the drafter's own
+/// block and the verify path bound them.
+pub fn qwenRowBounds(min: ?u32, max: ?u32, config_block: u32) error{DrafterDepthUnsupported}!RowBounds {
+    const hi = max orelse @min(config_block, QWEN_MAX_ROWS);
+    const lo = min orelse @min(QWEN_MIN_ROWS, hi);
+    if (hi > @min(config_block, QWEN_MAX_ROWS) or lo > hi or lo < QWEN_MIN_ROWS) return error.DrafterDepthUnsupported;
+    return .{ .min = lo, .max = hi };
+}
+
+/// GLM-5.3-Flash serves one tree shape: null keeps the engine's own default (two nodes, three rows), an
+/// explicit max sets the rows, and a min is only checked against them.
+pub fn glmRows(min: ?u32, max: ?u32) error{DrafterDepthUnsupported}!?u32 {
+    if (min == null and max == null) return null;
+    const rows = max orelse GLM_DEFAULT_ROWS;
+    if (rows > GLM_MAX_ROWS or (min orelse 0) > rows) return error.DrafterDepthUnsupported;
+    return rows;
+}
+
+/// Draft nodes a GLM round proposes: the block bound, then the two-node default or the flags' rows - 1.
+pub fn glmMaxNodes(block_size: u32, explicit: bool) usize {
+    const cap: u32 = if (explicit) GLM_MAX_ROWS - 1 else GLM_DEFAULT_ROWS - 1;
+    return @min(@max(block_size, 2) - 1, cap);
+}
+
+test "dflash: a drafter depth parses an integer in 2..16 and names everything else" {
+    try testing.expectEqual(@as(u32, 4), try parseDrafterDepth("4"));
+    try testing.expectEqual(@as(u32, 2), try parseDrafterDepth("2"));
+    try testing.expectEqual(@as(u32, 16), try parseDrafterDepth("16"));
+    for ([_][]const u8{ "", "1", "0", "17", "-3", "four", "4.5", " 4" }) |bad| {
+        try testing.expectError(error.InvalidDrafterDepth, parseDrafterDepth(bad));
+    }
+}
+
+test "dflash: Qwen rows default to 2..block and are bounded by the drafter block and the verify path" {
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 8 }, try qwenRowBounds(null, null, 8));
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 3 }, try qwenRowBounds(null, 3, 8));
+    try testing.expectEqual(RowBounds{ .min = 4, .max = 8 }, try qwenRowBounds(4, null, 8));
+    try testing.expectEqual(RowBounds{ .min = 4, .max = 4 }, try qwenRowBounds(4, 4, 8));
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 3 }, try qwenRowBounds(null, null, 3));
+    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(null, 10, 16));
+    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(null, 6, 5));
+    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(5, 3, 8));
+    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(9, null, 8));
+}
+
+test "dflash: GLM keeps its own default unless asked, and an explicit 3 is that default" {
+    try testing.expectEqual(@as(?u32, null), try glmRows(null, null));
+    try testing.expectEqual(@as(?u32, 4), try glmRows(null, 4));
+    try testing.expectEqual(@as(?u32, 3), try glmRows(2, null));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRows(null, 5));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRows(4, 3));
+    // unset: the loader's block (8 on the released drafter); explicit 3: block 3.
+    try testing.expectEqual(glmMaxNodes(8, false), glmMaxNodes(3, true));
+    try testing.expectEqual(@as(usize, 2), glmMaxNodes(8, false));
+    try testing.expectEqual(@as(usize, 3), glmMaxNodes(4, true));
+    try testing.expectEqual(@as(usize, 1), glmMaxNodes(2, true));
+}
+
 /// Resolve the effective block size: the config's value, capped by what the
 /// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
 /// when there is no wide lane). Floor 2 (1 draft + t1).
@@ -661,7 +748,9 @@ pub const DflashLayer = struct {
 };
 
 pub const DflashModel = struct {
-    native_glm_serving: bool = false,
+    /// All-sliding DFlash2 assistant (GLM, Qwen3.8-Flash-Next) served with a physical window trim,
+    /// a bounded block tail and a cached mask.
+    sliding_serving: bool = false,
     config: DflashConfig,
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
@@ -1448,11 +1537,15 @@ pub const SelectedPath = struct {
     /// density q over the candidate set (zero everywhere else). Null on the
     /// greedy trace.
     q: ?[]f32,
+    /// [m] the selector's confidence in each step: the chosen candidate's softmax share
+    /// (the sampled arm's own q for it), what the round policy calibrates acceptance on.
+    conf: []f32,
 
     pub fn deinit(self: *SelectedPath, allocator: std.mem.Allocator) void {
         allocator.free(self.ids);
         allocator.free(self.chosen_idx);
         allocator.free(self.cand_ids);
+        allocator.free(self.conf);
         if (self.q) |qv| allocator.free(qv);
     }
 };
@@ -1662,12 +1755,15 @@ pub fn selectPath(
         .chosen_idx = undefined,
         .cand_ids = undefined,
         .q = null,
+        .conf = undefined,
     };
     errdefer allocator.free(out.ids);
     out.chosen_idx = try allocator.alloc(u32, m);
     errdefer allocator.free(out.chosen_idx);
     out.cand_ids = try allocator.alloc(i32, m * k);
     errdefer allocator.free(out.cand_ids);
+    out.conf = try allocator.alloc(f32, m);
+    errdefer allocator.free(out.conf);
     @memcpy(out.cand_ids, cand_data[0 .. m * k]);
     if (stochastic) out.q = try allocator.alloc(f32, m * k);
 
@@ -1711,9 +1807,19 @@ pub fn selectPath(
         }
         out.ids[t] = @intCast(cand_data[t * k + choice]);
         out.chosen_idx[t] = @intCast(choice);
+        out.conf[t] = if (stochastic) out.q.?[t * k + choice] else softmaxShare(scores, choice);
         prev_idx = choice;
     }
     return out;
+}
+
+/// Softmax of `scores` at the chosen index.
+fn softmaxShare(scores: []const f32, choice: usize) f32 {
+    var mx: f32 = -std.math.inf(f32);
+    for (scores) |sc| mx = @max(mx, sc);
+    var total: f32 = 0;
+    for (scores) |sc| total += @exp(sc - mx);
+    return @exp(scores[choice] - mx) / total;
 }
 
 // ── Context append + block forward ──
@@ -1743,10 +1849,10 @@ pub fn appendContext(
         defer _ = mlx.mlx_array_free(v);
         _ = try ctx.cache.update(@intCast(li), k, v, s, 0);
     }
-    if (model.native_glm_serving) try trimGlmServingContext(model, ctx);
+    if (model.sliding_serving) try trimGlmServingContext(model, ctx);
 }
 
-/// The GLM serving assistant is entirely sliding attention. Materialize the
+/// A sliding-serving assistant is entirely sliding attention. Materialize the
 /// retained window after every prefill chunk, so an old view cannot pin the
 /// complete prompt allocation. Absolute RoPE positions live in base_pos.
 pub fn trimGlmServingContext(model: *const DflashModel, ctx: *DflashCtx) !void {
@@ -1859,7 +1965,7 @@ fn tailMask(q_len: u32, ctx_len: usize, relative: usize, window: u32, s: mlx.mlx
 }
 
 fn blockTailEligible(model: *const DflashModel, ctx: *const DflashCtx, noise: mlx.mlx_array) bool {
-    if (!model.native_glm_serving or model.layers.len != 5 or model.config.block_size != 8 or model.config.sliding_window != 2048 or ctx.cache.config.scheme != .off or ctx.cache.step < 2048 or mlx.getShape(noise)[1] != 8) return false;
+    if (!model.sliding_serving or model.layers.len != 5 or model.config.block_size != 8 or model.config.sliding_window != 2048 or ctx.cache.config.scheme != .off or ctx.cache.step < 2048 or mlx.getShape(noise)[1] != 8) return false;
     for (model.layers, ctx.cache.entries) |layer, entry| {
         if (layer.layer_type != .sliding_attention or !entry.initialized or entry.base != 0 or entry.offset != ctx.cache.step or mlx.mlx_array_dtype(entry.keys) != .bfloat16 or mlx.mlx_array_dtype(entry.values) != .bfloat16) return false;
     }
@@ -1880,7 +1986,7 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         _ = mlx.mlx_array_free(mask);
     };
     for (model.layers) |layer| if (layer.layer_type == .sliding_attention) {
-        sliding_mask = if (model.native_glm_serving)
+        sliding_mask = if (model.sliding_serving)
             try tailMask(q_len, tail_len, anchor_pos - (ctx.base_pos + dropped), cfg.sliding_window, s)
         else
             try buildBlockMask(.sliding_attention, ctx.base_pos + dropped, tail_len, anchor_pos, q_len, cfg.sliding_window, s);
@@ -1988,7 +2094,7 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         _ = mlx.mlx_array_free(x);
         x = h_next;
         // The GPU runs each finished layer while the host builds the next one.
-        if (model.native_glm_serving and li + 1 < model.layers.len) {
+        if (model.sliding_serving and li + 1 < model.layers.len) {
             const pending = mlx.mlx_vector_array_new_value(x);
             defer _ = mlx.mlx_vector_array_free(pending);
             try mlx.check(mlx.mlx_async_eval(pending));
@@ -3106,6 +3212,10 @@ test "dflash2: selectPath traces the pairwise-scored path, edges outvote unary l
     // token 1 → 5+1=6, token 6 → 4+6=10 — the EDGE flips the unary order.
     try testing.expectEqual(@as(u32, 6), path.ids[1]);
     try testing.expect(path.q == null);
+    // The selector's confidence in each step is the chosen candidate's softmax share:
+    // scores (12, 11) pick 12, scores (6, 10) pick 10.
+    try testing.expectApproxEqAbs(@as(f32, 0.7311), path.conf[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.9820), path.conf[1], 1e-3);
 
     // Sampled arm: q is a proper distribution over each candidate row and
     // the drawn token's q is positive (the acceptance ratio's denominator).
@@ -3575,7 +3685,7 @@ test "DFlash block tail engages only for the native GLM drafter" {
     defer _ = mlx.mlx_array_free(noise);
     try mlx.check(mlx.mlx_zeros(&noise, &.{ 1, 8, 128 }, 3, .bfloat16, mlx.gpuStream()));
     try testing.expect(!blockTailEligible(&model, &ctx, noise));
-    model.native_glm_serving = true;
+    model.sliding_serving = true;
     try testing.expect(blockTailEligible(&model, &ctx, noise));
 }
 

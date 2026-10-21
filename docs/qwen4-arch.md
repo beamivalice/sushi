@@ -84,6 +84,44 @@ hidden 2560, expert intermediate 640.
 - `SUSHI_NGRAM_BF16_DIR=<hf checkpoint>` serves any pack with the ORIGINAL bf16 n-gram table, so `kld compare`
   isolates the PLE table's cost.
 
+<a id="dflash2"></a>
+## DFlash2 drafter (opt-in)
+
+`incoai/Qwen3.8-Flash-Next-DFlash2` (Apache-2.0, 5 layers, block 8) drafts a block per round from five trunk taps; the
+trunk verifies it in one forward. MTP is the default. The drafter runs only when `--drafter <dir>` names it and the
+request does not opt out (`--no-drafter`, `enable_drafter:false`); a drafter beside the pack is never loaded and costs no
+memory. The boot log says which decodes (`[spec] Qwen3.8-Flash-Next decodes with MTP (DFlash2: --drafter <path>)` or
+`... with DFlash2 (2..8 rows per round; ...)`). Fetch it with
+`hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir <dir>`. It is the generic `Generator.nextDflash` path, not GLM's
+native tree.
+
+- **Taps**: the COMPLETED outputs of layers 5, 15, 25, 35 and 45 (zero-based), each the mean over the four hyper-connection
+  streams (`CaptureLayers.hc_mean`), 5 x 2560 features. The raw four-stream tensor is the wrong tap (4x the width).
+- **Memory**: the drafter loads A8 (8-bit affine) at load; there is no on-disk cache (A4 saved 1.3% of a round). On a
+  streamed load its bytes join the trunk in the ledger, so the expert cache is cut from what remains.
+- **Serving**: all-sliding drafter (`sliding_serving`: window trim, block tail, cached mask), the path GLM serves. The
+  drafter's context grows by the committed taps only.
+- **Verify**: ONE batched forward of `[t1, drafts]` with per-position GDN capture; a partial accept rolls GDN, PLE and
+  QSA state back through `ssmRollbackFromCapture`, shared with the MTP verify (rows are decode-identical up to 9).
+  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/test_dflash2_qwen.sh`: six prompts, stream ==
+  non-stream, opt-out, and that a drafter beside the pack is ignored; run on Sushi-2bpw, 2.6bpw, 4bpw and an STQ SPEC1
+  pack, and streamed at `--ssd-budget-gb 32` on 2.6bpw).
+- **Rows**: a verify row is bytes, not dispatches (about 3.3 ms per row on Sushi-2.6bpw). The drafter drafts a block of
+  `--drafter-max-depth` - 1 (default 8 rows) and the round verifies only as many rows as `dflash_policy.zig` finds worth
+  their cost: acceptance of each draft is learned online from the selector's confidence, and the rows are the argmax of
+  expected tokens per ladder cost, never below `--drafter-min-depth` (default 2). Prose and thinking settle near 2-3 rows,
+  code, JSON and copy take 8. Equal min and max pin one row count.
+- **Yield gate**: a request whose DFlash rounds cost more per token than its serial decode (5% margin, after 8 rounds)
+  falls back to plain ticks for the rest of the request. The serial price is the round-cost table's width-0 cell of the
+  request's context bucket; without a sample the gate asks for the ladder's break-even yield at the request's MEAN
+  verified rows, never the block's.
+- **Bill**: `dflashRequestBytes` (window x 4 + tap and encoder rows of one prefill chunk + 64 MiB) joins the request
+  bill in the commit that loads the drafter; the weights join the load bill.
+- **Lessons**: an accepted-per-round floor that is right for a dense 27B target disabled rounds that beat serial here
+  (1.8 drafts against 1.37 needed at 4 rows): gates compare ms per token. A fixed 4-row block lost to MTP at 4k and 128k;
+  adaptive rows won 6-20% on Sushi-2.6bpw at every rung and tie on Sushi-4bpw, where novel prose runs 11% under MTP
+  (numbers and settings: [qwen4-perf](qwen4-perf.md#dflash2)). That is why MTP stays the default.
+
 ## Oracle and fixtures
 
 - `tests/dump_qwen4_exp_fixtures.py` is the oracle dumper. HF `hidden_states[i]` is the INPUT of layer i: compare

@@ -90,6 +90,14 @@ Every 32 GB, 48 GB and 64 GB Qwen recipe passes `--qwen-gdn 16` (the 32 GB one i
 cache checkpoint (about 54 MB each on Flash-Next), the memory these recipes are sized to. The 96 GB and larger recipes
 keep the f32 default.
 
+**DFlash2 on Qwen3.8-Flash-Next (opt-in).** The recipes above decode with MTP, which stays the default. Inco.ai's
+[DFlash2 assistant](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (Apache-2.0, 1.2 GB, loaded at 8 bits) is used only
+when `--drafter <dir>` names it; a copy beside the pack is ignored. Download it with
+`hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-DFlash2`. Its rounds verify
+between `--drafter-min-depth` (default 2) and `--drafter-max-depth` (default 8) rows, as many as the drafter's confidence
+pays for; greedy output equals the MTP and serial output byte for byte. It is faster than MTP on Sushi-2.6bpw and level
+on Sushi-4bpw ([qwen4-perf](qwen4-perf.md#dflash2)); `--no-drafter` or `enable_drafter:false` keeps MTP.
+
 **64 GB Mac, Sushi-2.6bpw**
 
 Set the GPU memory limit first (it resets at reboot). 59,000 MB is the ceiling for this box: above it macOS runs out

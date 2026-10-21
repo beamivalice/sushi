@@ -52,6 +52,9 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   the serial tick's own arithmetic (`seen_penalty.apply`), so MTP == serial holds. Drafts stay raw: exact
   acceptance is valid for any proposal, a penalty only lowers acceptance. A plain batched tick samples no penalty,
   so a penalised slot stays out of the planner's and the crowd's plain ticks and keeps its MTP round.
+- Qwen3.8-Flash-Next's DFlash2 drafter verifies through the same forward, per-position capture and `ssmRollbackFromCapture`
+  (GDN, PLE and QSA state), so the invariant above holds for it unchanged; a drafter named with `--drafter` outranks the head (MTP is the default)
+  ([qwen4-arch](qwen4-arch.md#dflash2)).
 - logprobs>0, grammar and a forced call disable spec; DFlash and the drafter also refuse a penalty. A request that
   asked for MTP and runs without it logs `mtp=disabled (<reason>)`.
 

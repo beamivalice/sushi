@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen3.8-Flash-Next serves the DFlash2 drafter, opt-in**: `--drafter <dir>` replaces MTP for the run and each round verifies as many rows as the drafter's confidence pays for; MTP stays the default and greedy output equals serial decoding. `--drafter-min-depth` / `--drafter-max-depth` bound the rows (on GLM `--drafter-max-depth` sets its tree's rows, unset is unchanged). Thanks to [@1RAFAL](https://github.com/1RAFAL) for the request (#59).
 - **STQ packs**: the engine serves packs in the STQ format, which name an STD1, SPEC1 or PAIR1 codebook table and may split a layer's experts into rate groups with their own bit rates.
 - **Qwen3.8-Flash-Next STQ packs stream from the SSD**: `--ssd-budget-gb` serves packs whose experts have mixed bit rates, keeping a cache pool per rate.
 - **MTP stays on with `presence_penalty` and `repeat_penalty`**: a penalised request used to fall back to ordinary decoding and now runs MTP like any other, with the penalty applied to every verified token. A request that runs without MTP says why in the log.

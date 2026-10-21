@@ -99,6 +99,7 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **Stored formats**: BF16, or one uniform affine format per assistant: A4 g64, A6 g128 or A8 g128 (anything else is
   `UnsupportedGlmDraftStorage`). A4 g64 is the first-load default (774.5 MB vs A6's 1013.1 MB; drafts ~11% faster, decode within drift, target
   output exact); an A6 cache from the earlier policy is regenerated.
+- **Rows**: `--drafter-max-depth <n>` (2..4) sets the verifier rows per round, root plus n-1 nodes; unset is the two-node tree (3 rows), and an explicit 3 is the same tree. `--drafter-min-depth` is only checked against it.
 - **Tree**: two draft nodes plus the root, up to four children per node; the verifier runs all rows layerwise.
   KDA replays only the accepted path from a prework tape; IndexPool builds branch-local pools from the committed prefix
   plus each node's ancestry (pooling flattened tree rows would pool siblings together), held beside the reserved
@@ -125,7 +126,7 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
   a request without max_tokens reserves its whole context window (946K rows: 11.3 GB BF16, 6.3 GB kv8).
   The reserve gate's budget sizes the cache from the request's own clamped rows, never from the generator's config
   copy (unpinned, it resolves a smaller auto context and under-budgets the reservation).
-- **No yield gate**: `[spec-stats] gate_min` is the generic DFlash bar (1.80 here) and is never evaluated on the
+- **No yield gate**: `[spec-stats] gate_min` is the generic DFlash bar (the ladder's break-even for the block) and is never evaluated on the
   native path. N2 beats a serial step above ~1.1 accepted drafts per round at 1K–30K; measured requests ran 1.31–1.90.
 
 Wider trees lost: N3 with every four-row kernel optimized measured 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`,

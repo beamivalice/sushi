@@ -4102,12 +4102,12 @@ test "diskBytesPerToken: the serialized geometry, whatever the QSA execution swi
 
     // GLM: the latent rows (6,688 at kv8, 11,968 BF16) and the pooled index; DFlash2's window is fixed per entry.
     var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
-    glm.glm_dflash_loaded = false;
+    glm.dflash_loaded = false;
     try t.expectEqual(@as(u64, 6_688), diskBytesPerToken(&glm, 8));
     try t.expectEqual(@as(u64, 5_280), diskBytesPerToken(&glm, 6));
     try t.expectEqual(@as(u64, 11_968), diskBytesPerToken(&glm, 16));
-    glm.glm_dflash_loaded = true;
-    glm.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    glm.dflash_loaded = true;
+    glm.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     try t.expectEqual(@as(u64, 6_688), diskBytesPerToken(&glm, 8));
 }
 
@@ -4127,8 +4127,8 @@ test "diskContextForLoad pins the served context, so the Allocating line names w
 test "a model whose SSD tier did not come up bills and budgets as with --prefix-cache-disk off" {
     const t = std.testing;
     var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
-    glm.glm_dflash_loaded = true;
-    glm.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    glm.dflash_loaded = true;
+    glm.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max };
     defer {
         prefix_cache_capacity = saved[0];
@@ -6057,6 +6057,8 @@ pub const PrefillRequestTerms = struct {
     grow_coexist_bytes: u64 = 0,
     qsa_ring_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
+    /// The DFlash2 assistant's window and capture rows (`dflashRequestBytes`).
+    dflash_bytes: u64 = 0,
     /// The bill's net over the summed terms, in sixteenths (20 = the historical quarter).
     uplift_16ths: u64 = 20,
     /// The dense rebuild ONE quantized-KV layer really makes at this prompt
@@ -6095,7 +6097,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // already dominates.
     const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
     return (gross -| req.shared_resident_bytes) * req.uplift_16ths / 16;
 }
@@ -6236,7 +6238,7 @@ fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureS
 fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix) u64 {
     if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config)) == 0) return 0;
     if (warm.checkpoints == 0) return 0;
-    const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
+    const window: u64 = if (config.dflash_loaded) config.dflash_window_bytes else 0;
     const peak = glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints).peak;
     const held = @as(u64, if (warm.released) @min(peak, glm5_prefix.checkpoint_ram_held) else peak) * config.ssmCheckpointBytes();
     return held +| window;
@@ -6251,7 +6253,7 @@ fn glmCommitStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: War
     const rows = @as(u64, sched.newest) * sessionBytesPerToken(config, kv_bits);
     const bound = resolvedPrefixCacheMem();
     const copied: u64 = if (!prefix_cache_ram_enabled) 0 else if (bound == 0) rows else @min(rows, bound);
-    const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
+    const window: u64 = if (config.dflash_loaded) config.dflash_window_bytes else 0;
     const listed = @min(sched.events, warm.checkpoints);
     const kept = @as(u64, if (warm.released) @min(listed, glm5_prefix.checkpoint_ram_held) else listed) * config.ssmCheckpointBytes();
     return copied +| kept +| window;
@@ -6338,7 +6340,7 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
         (@import("glm5_indexpool_nax.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
-    const dflash = if (config.glm_dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
+    const dflash = if (config.dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
     const attention = @import("glm5_attention.zig");
     const history = std.math.cast(usize, seq) orelse return std.math.maxInt(u64);
     const selection = @max(attention.score_scratch_bytes, attention.selectionScratchBytes(history) catch return std.math.maxInt(u64));
@@ -6362,11 +6364,18 @@ pub fn glmFp8DequantScratchBytes(config: *const model_mod.ModelConfig, rows: u64
 /// replay states and the native verifier's bounded MLA work. Model weights
 /// are already resident and are never charged again per request.
 pub fn glmDflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u64 {
-    if (!config.glm_dflash_loaded) return 0;
-    return config.glm_dflash_window_bytes *| 4 +|
-        config.glm_dflash_capture_bytes_per_token *| chunk +|
+    if (!config.dflash_loaded) return 0;
+    return config.dflash_window_bytes *| 4 +|
+        config.dflash_capture_bytes_per_token *| chunk +|
         config.ssmCheckpointBytes() *| 3 +|
         @import("glm5_dflash_memory.zig").limit_bytes +| 64 * 1024 * 1024;
+}
+
+/// The sliding DFlash2 assistant's per-request bytes on a non-GLM target: the physical window and
+/// its trim copies, plus the tap and encoder rows of one prefill chunk.
+pub fn dflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u64 {
+    if (!config.dflash_loaded or config.isGlm5()) return 0;
+    return config.dflash_window_bytes *| 4 +| config.dflash_capture_bytes_per_token *| chunk +| 64 * 1024 * 1024;
 }
 
 /// What a GLM DFlash2 request may still allocate when it reserves its verifier capacity right after
@@ -6416,6 +6425,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
+        .dflash_bytes = dflashRequestBytes(config, @min(chunk, @max(seq, 1))),
         .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
         .uplift_16ths = billUplift16ths(config, seq),
     };
@@ -24458,6 +24468,25 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
     try t.expect(gated.shared_resident_bytes > 0);
 }
 
+test "prefillRequestTerms: a loaded DFlash2 assistant bills its window and chunk rows on qwen4 only" {
+    const t = std.testing;
+    var cfg = qwen4ExpOomConfig();
+    const seq: u64 = 200_000;
+    const chunk: u64 = 2048;
+    const before = prefillRequestTerms(&cfg, seq, 8192, 8, chunk, .{});
+    try t.expectEqual(@as(u64, 0), before.dflash_bytes);
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_capture_bytes_per_token = (5 * 2560 + 2 * 2560) * 2 + 5 * 8 * 128 * 4;
+    const on = prefillRequestTerms(&cfg, seq, 8192, 8, chunk, .{});
+    try t.expectEqual(cfg.dflash_window_bytes * 4 + cfg.dflash_capture_bytes_per_token * chunk + 64 * 1024 * 1024, on.dflash_bytes);
+    const short = prefillRequestTerms(&cfg, 100, 8192, 8, chunk, .{});
+    try t.expectEqual(cfg.dflash_window_bytes * 4 + cfg.dflash_capture_bytes_per_token * 100 + 64 * 1024 * 1024, short.dflash_bytes);
+    var other = cfg;
+    other.model_type = "qwen3_5_moe";
+    try t.expectEqual(@as(u64, 0), prefillRequestTerms(&other, seq, 8192, 8, chunk, .{}).dflash_bytes);
+}
+
 test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero when off" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
@@ -26371,9 +26400,9 @@ test "thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo
 
 fn glmAssistantFixture() !model_mod.ModelConfig {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
-    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
-    cfg.glm_dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
     return cfg;
 }
 
@@ -26453,7 +26482,7 @@ test "GLM prefill chunk never widens past the width its numerics are built for" 
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const roomy: u64 = 1 << 40;
     for ([_]bool{ false, true }) |assistant| {
-        cfg.glm_dflash_loaded = assistant;
+        cfg.dflash_loaded = assistant;
         for ([_]u64{ 16, 8 }) |kv_bits| try std.testing.expectEqual(@as(u32, 2048), resolvePrefillChunk(&cfg, kv_bits, roomy, 0, 0, 0));
     }
 }
@@ -26461,11 +26490,11 @@ test "GLM prefill chunk never widens past the width its numerics are built for" 
 test "GLM serving DFlash2 bill includes the bounded window captures replay and scratch" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     try std.testing.expectEqual(@as(u64, 0), glmDflashRequestBytes(&cfg, 2048));
-    cfg.glm_dflash_loaded = true;
-    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
-    cfg.glm_dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
     const needed = glmDflashRequestBytes(&cfg, 2048);
-    try std.testing.expect(needed >= cfg.glm_dflash_window_bytes * 4 + 256 * 1024 * 1024);
+    try std.testing.expect(needed >= cfg.dflash_window_bytes * 4 + 256 * 1024 * 1024);
     try std.testing.expect(needed >= cfg.ssmCheckpointBytes() * 3);
     try std.testing.expect(needed < 2 * 1024 * 1024 * 1024);
     try std.testing.expect(glmDflashRequestBytes(&cfg, 1024) < needed);
@@ -26488,7 +26517,7 @@ test "the concurrency verdict: a resident GLM and qwen4 batch, an exclusive mode
 test "GLM DFlash2 reserve at prefill end fits the admission bill at every request shape" {
     const reserve = @import("glm5_dflash_reserve.zig");
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
+    cfg.dflash_loaded = true;
     const mla_layers: usize = cfg.num_hidden_layers / cfg.full_attention_interval;
     const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
     const shapes = [_][2]u64{ .{ 16, std.math.maxInt(u32) }, .{ 18, 32 }, .{ 100, 920 }, .{ 1000, 24 }, .{ 1022, 2 }, .{ 2008, 2400 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 2008, std.math.maxInt(u32) }, .{ 500000, std.math.maxInt(u32) } };
@@ -26523,7 +26552,7 @@ test "GLM prefill transient bill follows the latent width: kv6 sheds 128 bytes p
 test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context" {
     const reserve = @import("glm5_dflash_reserve.zig");
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
+    cfg.dflash_loaded = true;
     var mla_layers: usize = 0;
     for (0..cfg.num_hidden_layers) |l| mla_layers += @intFromBool(!cfg.isLinearLayer(@intCast(l)));
     const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
@@ -26597,9 +26626,9 @@ test "GLM raw FP8 honors the declared wired limit with the same reserve as MiMo"
 
 test "GLM admission bills the checkpoints and assistant window a request keeps; the context sizer reserves none of them" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
-    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
-    cfg.glm_dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max };
     const tiers = TierGuard.pin(true, 0);
     defer tiers.restore();
@@ -26621,12 +26650,12 @@ test "GLM admission bills the checkpoints and assistant window a request keeps; 
     prefix_cache_capacity = 32;
     // Every 2048-token chunk boundary and the prompt end, thinned to the GLM cap; the newest
     // copy exists before each thin.
-    const held = (@as(u64, cap) + 1) * per_cp + cfg.glm_dflash_window_bytes;
+    const held = (@as(u64, cap) + 1) * per_cp + cfg.dflash_window_bytes;
     try std.testing.expectEqual(held, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = cap }));
     const on = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{ .checkpoints = cap });
     try std.testing.expect(on - off >= held * 5 / 4 - 1 and on - off <= held * 5 / 4 + 1);
     // Fewer checkpoints hold fewer copies; none hold no window either.
-    try std.testing.expectEqual(2 * per_cp + cfg.glm_dflash_window_bytes, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = 1 }));
+    try std.testing.expectEqual(2 * per_cp + cfg.dflash_window_bytes, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = 1 }));
     try std.testing.expectEqual(off, prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{}));
     // The advertised context and the RAM tier's clamp are sized as with the cache off.
     try std.testing.expectEqual(sizer_off, prefillTransientReserve(&cfg, 8, 2048));
@@ -26639,7 +26668,7 @@ test "GLM admission bills the checkpoints and assistant window a request keeps; 
 
 test "GLM billed checkpoint peak equals the checkpoints its prefill captures, whatever stride is configured" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = false;
+    cfg.dflash_loaded = false;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, prefix_cache_disk_bytes, prefix_cache_ram_enabled };
     defer {
         prefix_cache_capacity = saved[0];
@@ -26678,8 +26707,8 @@ test "GLM billed checkpoint peak equals the checkpoints its prefill captures, wh
 
 test "GLM admission bills the commit's row copy, so a long generation cannot commit above the ceiling, and the copy never costs a long prompt its checkpoints" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
-    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, prefix_cache_disk_bytes, prefix_cache_ram_enabled, prefix_cache_mem_bytes };
     defer {
         prefix_cache_capacity = saved[0];
@@ -26716,11 +26745,11 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
                 false,
                 oracle.newest,
                 row_bytes,
-                cfg.glm_dflash_window_bytes,
+                cfg.dflash_window_bytes,
                 positions[8 - kept ..],
                 bytes[8 - kept ..],
             ) orelse 0;
-            const commit_peak = glmCacheBytes(&cfg, seq, max_tokens, 8) + copied_len * row_bytes + @as(u64, @intCast(kept)) * per_cp + cfg.glm_dflash_window_bytes + staged;
+            const commit_peak = glmCacheBytes(&cfg, seq, max_tokens, 8) + copied_len * row_bytes + @as(u64, @intCast(kept)) * per_cp + cfg.dflash_window_bytes + staged;
             const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, 8, 2048, .{ .checkpoints = cap });
             std.testing.expect(needed >= commit_peak) catch |e| {
                 std.debug.print("ram={any} seq {d}: admitted {d} bytes, commit peaks at {d}\n", .{ ram, seq, needed, commit_peak });
@@ -26730,7 +26759,7 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
             const warm = WarmPrefix{ .checkpoints = cap };
             try std.testing.expect(glmCommitStateBytes(&cfg, seq, warm, 8) <= glm5TransientBytes(&cfg, seq, 2048, 8) +| glmPrefixStateBytes(&cfg, seq, warm));
             // SSD-only: checkpoints, window and the writer's staged bytes, no rows at any length.
-            if (!ram) try std.testing.expectEqual(@as(u64, @min(oracle.events, cap)) * per_cp + cfg.glm_dflash_window_bytes + staged, glmCommitStateBytes(&cfg, seq, warm, 8));
+            if (!ram) try std.testing.expectEqual(@as(u64, @min(oracle.events, cap)) * per_cp + cfg.dflash_window_bytes + staged, glmCommitStateBytes(&cfg, seq, warm, 8));
             // Both tiers: the RAM tier's copy; the disk tier adds no term of its own here.
             if (ram and arm.disk > 0) {
                 prefix_cache_disk_bytes = 0;
@@ -26744,8 +26773,8 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
 
 test "GLM SSD-only bills its checkpoints and window, no writer term (the shared admission headroom has it), and sizes no cache" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
-    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max, prefix_cache_disk_bytes, prefix_cache_ram_enabled };
     defer {
         prefix_cache_capacity = saved[0];
@@ -26761,7 +26790,7 @@ test "GLM SSD-only bills its checkpoints and window, no writer term (the shared 
     prefix_cache_capacity = 32;
     prefix_cache_disk_bytes = 12 << 30;
     prefix_cache_ram_enabled = false;
-    const held = (@as(u64, glm5_prefix.checkpointMax(16)) + 1) * cfg.ssmCheckpointBytes() + cfg.glm_dflash_window_bytes;
+    const held = (@as(u64, glm5_prefix.checkpointMax(16)) + 1) * cfg.ssmCheckpointBytes() + cfg.dflash_window_bytes;
     try std.testing.expectEqual(held, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = glm5_prefix.checkpointMax(16) }));
     try std.testing.expectEqual(@as(u64, 0), glmPrefixStateBytes(&cfg, 65536, .{}));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
@@ -26771,8 +26800,8 @@ test "GLM SSD-only bills its checkpoints and window, no writer term (the shared 
 
 test "GLM bills two KDA states, not nine, while its prefill moves each to SSD and frees the RAM copy" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
-    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max, prefix_cache_disk_bytes, prefix_cache_ram_enabled };
     defer {
         prefix_cache_capacity = saved[0];
@@ -26787,7 +26816,7 @@ test "GLM bills two KDA states, not nine, while its prefill moves each to SSD an
     prefix_cache_disk_bytes = 12 << 30;
     prefix_cache_ram_enabled = false;
     const per_cp = cfg.ssmCheckpointBytes();
-    const window = cfg.glm_dflash_window_bytes;
+    const window = cfg.dflash_window_bytes;
     const cap = glm5_prefix.checkpointMax(16);
     const keeps = WarmPrefix{ .checkpoints = cap };
     const releases = WarmPrefix{ .checkpoints = cap, .released = true };
@@ -26807,8 +26836,8 @@ test "GLM bills two KDA states, not nine, while its prefill moves each to SSD an
 
 test "GLM near the top of its context keeps fewer checkpoints at the start width instead of being refused" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    cfg.glm_dflash_loaded = true;
-    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.dflash_loaded = true;
+    cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max };
     defer {
         prefix_cache_capacity = saved[0];

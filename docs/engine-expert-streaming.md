@@ -117,6 +117,9 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   without it (`[mtp] off`). Any other streamed model or layout refuses an explicit `--mtp`
   (`ExpertStreamingMtpUnsupported`), drops a settings `mtp: true` with a warning and resolves the default off;
   grouped multi-request verify stays resident-only; `enable_mtp:true` without a loaded head is a named 400.
+- **DFlash2 on a streamed Flash-Next**: a drafter named with `--drafter` loads resident and its bytes join the trunk in the ledger, so the expert
+  cache is cut from the budget that remains (`planExpertStreamingWith`; Sushi-2.6bpw at 32 GiB: 342 -> 326 slots/layer). Its 2..8-row
+  verify rides the same streamed decode path as an MTP verify (greedy bank byte-equal to serial, stream == non-stream).
 - **Load-time cache warm**: preload the lowest expert IDs into `floor(0.8 * slots_per_layer)` slots per MoE layer
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
   routes; dense prefix layers are skipped.

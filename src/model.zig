@@ -429,11 +429,11 @@ pub const ModelConfig = struct {
     // thinking preference; an explicit request value still outranks it.
     gen_enable_thinking: ?bool = null,
 
-    /// Native GLM DFlash2 request terms, stamped from the selected assistant's
-    /// config before load. Its stored weights are in the resident load bill.
-    glm_dflash_loaded: bool = false,
-    glm_dflash_window_bytes: u64 = 0,
-    glm_dflash_capture_bytes_per_token: u64 = 0,
+    /// DFlash2 request terms (GLM, Qwen3.8-Flash-Next), stamped from the selected
+    /// assistant's config before load. Its stored weights are in the resident load bill.
+    dflash_loaded: bool = false,
+    dflash_window_bytes: u64 = 0,
+    dflash_capture_bytes_per_token: u64 = 0,
 
     /// Set at load when this model's SSD prefix tier was wanted and did not come up (no room on the
     /// volume, an unreadable fingerprint, a failed init): every bill and budget then runs as without a disk.

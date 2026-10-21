@@ -2087,7 +2087,13 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             for (cl.ids, cl.out) |cid, *slot| {
                 if (cid == li) {
                     try self.hcFlush(&h, batch, seq_len, &pending);
-                    _ = mlx.mlx_array_set(slot, h);
+                    if (cl.hc_mean == 0) {
+                        _ = mlx.mlx_array_set(slot, h);
+                    } else {
+                        const tap = try hcStreamMean(self.s, h, cl.hc_mean);
+                        _ = mlx.mlx_array_free(slot.*);
+                        slot.* = tap;
+                    }
                 }
             }
         }
@@ -2132,6 +2138,22 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     _ = mlx.mlx_array_free(final);
     if (self.expert_stream) |engine| engine.finishForward(@intCast(batch * seq_len));
     return logits;
+}
+
+/// Average `[B, L, hc*H]` over its `hc` streams into a bf16 `[B, L, H]` tap.
+fn hcStreamMean(s: mlx.mlx_stream, h: mlx.mlx_array, hc: u32) !mlx.mlx_array {
+    const shape = mlx.getShape(h);
+    const split = [_]c_int{ shape[0], shape[1], @intCast(hc), @divExact(shape[2], @as(c_int, @intCast(hc))) };
+    var streams = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(streams);
+    try mlx.check(mlx.mlx_reshape(&streams, h, &split, 4, s));
+    var mean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mean);
+    try mlx.check(mlx.mlx_mean_axis(&mean, streams, 2, false, s));
+    var tap = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(tap);
+    try mlx.check(mlx.mlx_astype(&tap, mean, .bfloat16, s));
+    return tap;
 }
 
 pub fn gatedFullAttnProjected(
