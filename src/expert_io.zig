@@ -1197,9 +1197,17 @@ test "expert io fill keeps a worker fed while it is reading" {
     try t.expectEqual(@as(usize, 2), plan.jobs.len);
     const pool = try FillPool.create(t.allocator, .{ .workers = 1, .queue_capacity = 1 });
     defer pool.destroy();
-    try pool.run(&.{fd}, &plan);
-    try t.expectEqualSlices(u8, file.bytes, dst[0 .. chunk * 2]);
-    try t.expectEqual(@as(usize, 2), pool.maxQueueDepth());
+    // Whether the second job is queued before a cached 32 MiB read finishes depends on the scheduler, so
+    // the test asks for it within a few fills; a pool that never queues ahead fails them all.
+    var depth: usize = 0;
+    for (0..20) |_| {
+        @memset(dst, 0);
+        try pool.run(&.{fd}, &plan);
+        try t.expectEqualSlices(u8, file.bytes, dst[0 .. chunk * 2]);
+        depth = pool.maxQueueDepth();
+        if (depth == 2) break;
+    }
+    try t.expectEqual(@as(usize, 2), depth);
 }
 
 /// Process CPU time (user + system) in nanoseconds.
