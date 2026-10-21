@@ -40,7 +40,7 @@ check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo
 # --max-concurrent 4: [8]-[10] batch plain slots; --prefix-cache-entries 0: the
 # serial reruns those arms compare against must not restore (hybrid restore
 # class 0.14-0.30 nats > the near-tie bar).
-"$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
+"$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --max-concurrent 4 --prefix-cache-entries 0 --metrics > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 for _ in $(seq 1 600); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
@@ -134,20 +134,30 @@ if grep -qE '"(vision_tower|model\.visual)\.' "$MODEL/model.safetensors.index.js
 else
   echo "  SKIP: pack has no vision tower"
 fi
+# Widest batched decode group the scheduler reports while $c1 and $c2 run.
+peak_group() {
+  local m=0 g
+  while kill -0 $c1 2>/dev/null || kill -0 $c2 2>/dev/null; do
+    g=$(curl -s -m 2 "$U/metrics.json" | grep -o '"batched_group_size":[0-9]*' | cut -d: -f2)
+    [ -n "$g" ] && [ "$g" -gt "$m" ] && m=$g
+    sleep 0.05
+  done
+  echo "$m"
+}
 echo "[8] two concurrent plain requests batch-decode (one forward for both slots)"
-nb0=$(grep -c 'gdn batched decode engaged' "$LOG")
 pa='{"messages":[{"role":"user","content":"Write a short story about a lighthouse keeper who finds a message in a bottle."}],"max_tokens":400,"temperature":0,"enable_thinking":false,"enable_mtp":false}'
 pb='{"messages":[{"role":"user","content":"Explain how a bicycle stays upright while moving, step by step."}],"max_tokens":400,"temperature":0,"enable_thinking":false,"enable_mtp":false}'
 curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$pa" > "$LOG.8a" &
 c1=$!
 curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$pb" > "$LOG.8b" &
 c2=$!
+g8=$(peak_group)
 wait $c1 $c2
 ta=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.8a")
 tb=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.8b")
 echo "  A: $(echo "$ta" | tr '\n' ' ' | cut -c1-70)"
 echo "  B: $(echo "$tb" | tr '\n' ' ' | cut -c1-70)"
-check "batched decode engaged (slots=2)" "$(grep -c 'gdn batched decode engaged (slots=2)' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
+check "batched decode engaged (slots=2)" "$g8" "2"
 check "A == serial (30 tokens, tie-aware)" "$(same_or_tie "$pa" "$ta")" "1"
 check "B == serial (30 tokens, tie-aware)" "$(same_or_tie "$pb" "$tb")" "1"
 echo "[9] two concurrent long prompts: batched decode under the QSA mask"
@@ -161,13 +171,14 @@ curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d 
 c1=$!
 curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$lb9" > "$LOG.9b" &
 c2=$!
+g9=$(peak_group)
 wait $c1 $c2
 ta=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.9a")
 tb=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.9b")
 echo "  A: $(echo "$ta" | tr '\n' ' ' | cut -c1-60)  B: $(echo "$tb" | tr '\n' ' ' | cut -c1-60)"
 check "needle A" "$(echo "$ta" | grep -c 'HERON-77')" "1"
 check "needle B" "$(echo "$tb" | grep -c 'OTTER-31')" "1"
-check "batched decode engaged again past the budget" "$(python3 -c "print(1 if $(grep -c 'gdn batched decode engaged' "$LOG") > $nb0 else 0)")" "1"
+check "batched decode engaged again past the budget" "$g9" "2"
 check "A == serial (tie-aware)" "$(same_or_tie "$la9" "$ta")" "1"
 check "B == serial (tie-aware)" "$(same_or_tie "$lb9" "$tb")" "1"
 echo "[10] an MTP slot stays exclusive while a plain slot decodes beside it"
