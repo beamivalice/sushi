@@ -140,12 +140,6 @@ jobs:
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create tag (manual dispatch)
-        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
-        run: |
-          git tag v${{ steps.version.outputs.version }}
-          git push origin v${{ steps.version.outputs.version }}
-
       - name: Build sushi (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
 
@@ -163,6 +157,13 @@ jobs:
 
       - name: Run Zig tests
         run: zig build test -Doptimize=ReleaseFast --summary all
+
+      # Tagged only once the suite is green, so a failed test leaves no tag behind.
+      - name: Create tag (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+        run: |
+          git tag v${{ steps.version.outputs.version }}
+          git push origin v${{ steps.version.outputs.version }}
 
       # ── CLI tarball (standalone binary + libs) ──
       - name: Package CLI binary
