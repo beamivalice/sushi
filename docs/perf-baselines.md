@@ -289,6 +289,15 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## v1.3.0 release context ladder
+
+[Version summary and per-model reports](bench/v1.3.0/summary.md), 2026-10-21, Apple M5 Max 128 GB. llmprobe 0.6.15,
+`--bench-only`, AC power, `iogpu.wired_limit_mb=120000`, `taskpolicy -a`, per-model GPU lock, 3 minutes idle before each server.
+- MiMo 2K–128K, 2 runs, release candidate `dc93b43f` (SHA `607c6eb0`). It started hot after the full suite and prefilled
+  18–24% under 1.2.4; a 2K rerun after fans-max idle read 1,239–1,248 tok/s per request (1.2.4: 1,285–1,353).
+- Qwen 2.6bpw and 4bpw are the MTP arms of the DFlash2 ladders (4K/16K/64K/128K, 3 runs, `--prefix-cache-entries 0`),
+  branch builds `f9393ba6` and `e2912d04`. GLM was not rerun.
+
 ## v1.2.4 release context ladder
 
 [Version summary and per-model reports](bench/v1.2.4/summary.md), 2026-10-15, Apple M5 Max 128 GB. llmprobe 0.6.15,
