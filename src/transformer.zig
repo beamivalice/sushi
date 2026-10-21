@@ -55830,6 +55830,15 @@ test "sushi coder GPU a loaded grouped layer keeps its stored bytes resident onc
     var w = Weights.init(t.allocator);
     defer w.deinit();
     var buf: [256]u8 = undefined;
+    // A cached buffer up to two pages larger can serve an allocation, which would count its slack as resident;
+    // with no cache every buffer is fresh and the count is exact.
+    var cache_limit: usize = 0;
+    try mlx.check(mlx.mlx_set_cache_limit(&cache_limit, 0));
+    defer {
+        var unused: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&unused, cache_limit);
+    }
+    try mlx.check(mlx.mlx_clear_cache());
     var before: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&before));
     var stored: usize = 0;
