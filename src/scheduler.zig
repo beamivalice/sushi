@@ -5528,8 +5528,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             qsa_gap_retried = true;
                             continue :prefill;
                         }
-                        log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
-                        slot.markError(@errorName(err));
+                        const name = mlx.settledErrorName(err);
+                        log.err("[scheduler] prefill failed for slot: {s}\n", .{name});
+                        slot.markError(name);
                         releaseNativeState(slot);
                         break :prefill;
                     };
@@ -5579,8 +5580,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (active.items.len > 0) {
             var decode_sw = io_util.Stopwatch.init(sch.io);
             runDecodeTick(sch, active.items) catch |err| {
-                log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
-                for (active.items) |s| s.markError(@errorName(err));
+                const name = mlx.settledErrorName(err);
+                log.err("[scheduler] decode tick failed: {s}\n", .{name});
+                for (active.items) |s| s.markError(name);
             };
             const tick_ns = decode_sw.read();
             for (active.items) |s| s.decode_ns +|= tick_ns;
@@ -6929,8 +6931,9 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     }
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
-        log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
-        for (buf[0..n]) |s| s.markError(@errorName(err));
+        const name = mlx.settledErrorName(err);
+        log.err("[interleave] decode tick failed: {s}\n", .{name});
+        for (buf[0..n]) |s| s.markError(name);
     };
     const tick_ns = sw.read();
     for (buf[0..n]) |s| s.decode_ns +|= tick_ns;

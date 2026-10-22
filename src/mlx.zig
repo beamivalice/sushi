@@ -849,6 +849,16 @@ fn consumeLatch() !void {
     return error.MlxFailure;
 }
 
+/// The name a caught failure is reported under. `check` returns `MlxError` and leaves the mlx-c
+/// latch set; settling it here keeps the next request's first checkpoint from failing on it, and
+/// a Metal out-of-memory behind it is reported as the memory failure it is.
+pub fn settledErrorName(err: anyerror) []const u8 {
+    if (err != error.MlxError) return @errorName(err);
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return @errorName(err);
+    return if (mlxErrorIsMemory(msg)) "OutOfMemory" else @errorName(err);
+}
+
 /// Prefill checkpoint: once per chunk plus once after the last.
 pub fn checkError() !void {
     fault_chunk.maybeFire();
@@ -984,6 +994,55 @@ test "a DECODE-time MLX failure is attributed to the decoding request, not the n
     try t.expect(!errorPending());
 }
 
+
+test "a failure caught as MlxError settles the latch, so the next request's first checkpoint is clean" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+    installErrorHandler();
+
+    // The real route: an mlx-c call raises, the handler latches, `check` returns MlxError.
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    const shape = [_]c_int{4};
+    const data = [_]f32{ 1, 2, 3, 4 };
+    const a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(a);
+    const bad = [_]c_int{ 3, 3 };
+    var out = mlx_array_new();
+    defer _ = mlx_array_free(out);
+    try t.expectError(error.MlxError, check(mlx_reshape(&out, a, &bad, 2, s)));
+    try t.expect(errorPending());
+
+    try t.expectEqualStrings("MlxError", settledErrorName(error.MlxError));
+    try t.expect(!errorPending());
+    try checkError();
+}
+
+test "a Metal out-of-memory behind an MlxError is a memory failure and leaves no latch" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory). at transforms.cpp:73");
+    try t.expectEqualStrings("OutOfMemory", settledErrorName(error.MlxError));
+    try t.expect(!errorPending());
+    try checkError();
+    try checkErrorDecode();
+}
+
+test "settledErrorName leaves other errors and an unlatched MlxError alone" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try t.expectEqualStrings("MlxError", settledErrorName(error.MlxError));
+    try t.expectEqualStrings("Cancelled", settledErrorName(error.Cancelled));
+    // A latch that is not this failure's stays for its owner.
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqualStrings("Cancelled", settledErrorName(error.Cancelled));
+    try t.expect(errorPending());
+}
 
 test "takeErrorIf leaves unrelated errors latched" {
     var buf: [512]u8 = undefined;

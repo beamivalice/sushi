@@ -32,6 +32,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   latched error never 200s; streaming shares `mapGenerationError`.
 - A swallowed failure must DROP the latch it raised (`dropLatchedErrorUnless(had_error)`, passing the
   `errorPending()` read BEFORE the op). Guard: `tests/test_mlx_error_recovery.sh`.
+- **A failure caught as `error.MlxError` leaves the latch SET**: the next request's first `checkError` consumed it and
+  failed at once as `OutOfMemory`. Name it with `mlx.settledErrorName(err)` where it is caught: that consumes the latch
+  and reports a Metal out-of-memory behind it as one.
 - A client-supplied PATH is proven on OUR side of the mlx boundary (stat → 400; an MLX error there latches).
 - In the unit-test binary a failing test's MLX error stays latched for the next test: a decode tick consumes it and
   errors its slot. A test that runs a tick asserts `!mlx.errorPending()` first.
