@@ -570,6 +570,8 @@ fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
 /// (`sessionBytesPerToken`) price its KV whenever it does, the request-time bill per request.
 fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
     if (config.isGlm5()) return false;
+    // A loaded DFlash2 drafter outranks the head: the default round never builds its cache.
+    if (config.dflash_loaded) return false;
     const choice = mtpChoiceFor(config);
     if (choice.forced()) return true;
     return choice.on and model_mod.isServedArch(config.model_type) and (!config.expert_streaming or config.stream_mtp_head);
@@ -6408,7 +6410,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the headroom is new here: the prompt's own rows are already billed.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
-    const mtp_on = warm.mtp_on or forceMtpFor(config);
+    const mtp_on = warm.mtp_on or (forceMtpFor(config) and !config.dflash_loaded);
     const head_per_tok: u64 = if (mtp_on) mtpHeadKvBytesPerToken(config) else 0;
     const head_qsa_ring: u64 = if (mtp_on) mtpHeadQsaRingBytes(config) else 0;
     const head_state_per_tok: u64 = if (mtp_on) mtpHeadStateBytesPerToken(config) else 0;
@@ -9546,7 +9548,8 @@ fn handleChatCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), enable_mtp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty }, logprobs_n);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -9804,7 +9807,8 @@ fn handleCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, enable_mtp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty_c }, logprobs_n);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, root);
     var sampling = generate_mod.SamplingParams{
@@ -11009,6 +11013,19 @@ pub fn requestSpecModes(
     };
 }
 
+/// Will this request build the MTP head's cache? The admission bill prices the head's KV, state and QSA ring
+/// only then: a request a DFlash2 drafter serves never allocates them.
+pub fn requestBillsMtpHead(
+    enable_drafter: bool,
+    enable_mtp: bool,
+    dflash_loaded: bool,
+    mtp_loaded: bool,
+    sampling: generate_mod.SamplingParams,
+    logprobs_n: u32,
+) bool {
+    return requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n).use_mtp;
+}
+
 /// A request that asked for MTP and runs without it says why; the boot line says MTP is on.
 fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: generate_mod.SamplingParams, logprobs_n: u32) void {
     if (!enable_mtp or !mtp_loaded) return;
@@ -11052,6 +11069,31 @@ test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP he
     r = requestSpecModes(true, true, false, false, plain, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
     try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, plain, 0));
+}
+
+test "the bill prices the MTP head only for a request that runs it: a DFlash2 request never builds the head's cache" {
+    const t = std.testing;
+    const saved_force = server_config.default_force_mtp;
+    defer server_config.default_force_mtp = saved_force;
+    server_config.default_force_mtp = false;
+    const plain = generate_mod.SamplingParams{};
+    // A loaded drafter outranks the head; `enable_drafter:false` hands the request back to it.
+    try t.expect(!requestBillsMtpHead(true, true, true, true, plain, 0));
+    try t.expect(requestBillsMtpHead(false, true, true, true, plain, 0));
+    // A penalty keeps the drafter off, so the head runs.
+    try t.expect(requestBillsMtpHead(true, true, true, true, .{ .presence_penalty = 1.5 }, 0));
+    try t.expect(requestBillsMtpHead(true, true, false, true, plain, 0));
+    try t.expect(!requestBillsMtpHead(true, false, false, true, plain, 0));
+    var cfg = qwen4ExpOomConfig();
+    cfg.mtp_override = null;
+    cfg.dflash_loaded = true;
+    const seq: u64 = 100_000;
+    const dflash = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(true, true, true, true, plain, 0) });
+    const head = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(false, true, true, true, plain, 0) });
+    try t.expectEqual(@as(u64, 0), dflash.mtp_head_kv_bytes);
+    try t.expect(head.mtp_head_kv_bytes > 0);
+    try t.expect(head.state_bytes > dflash.state_bytes);
+    try t.expect(head.qsa_ring_bytes > dflash.qsa_ring_bytes);
 }
 
 test "requestSpecModes: a repeat or presence penalty keeps the sidecar off but MTP on" {
@@ -16172,7 +16214,8 @@ fn handleAnthropicMessages(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), enable_mtp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -17893,8 +17936,19 @@ fn handleResponsesInner(
     if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
+    // Drafter (Responses-side parsing). Same disable rules as the chat
+    // and Anthropic parse sites.
+    const lm_default_enable_drafter_resp: bool = lm.dflash != null;
+    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
+        (v == .bool and v.bool)
+    else
+        lm_default_enable_drafter_resp;
+    if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
+    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
+
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), enable_mtp_resp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty }, 0);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -18046,16 +18100,6 @@ fn handleResponsesInner(
     defer if (streamed_message_id) |id| allocator.free(id);
 
     // Wave 1.A: per-request KV-quant override (Responses path mirror).
-
-    // Drafter (Responses-side parsing). Same disable rules as the chat
-    // and Anthropic parse sites.
-    const lm_default_enable_drafter_resp: bool = lm.dflash != null;
-    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter_resp;
-    if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
 
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
@@ -22960,6 +23004,31 @@ test "the load-time bill prices the MTP head a served pack runs by default" {
     streamed.stream_mtp_head = true;
     try t.expect(mtpHeadDefaultOn(&streamed));
     try t.expectEqual(sessionBytesPerToken(&off, 8) + head, sessionBytesPerToken(&streamed, 8));
+}
+
+test "the load-time bill drops the MTP head when Qwen's default round is DFlash2" {
+    const t = std.testing;
+    const saved_force = server_config.default_force_mtp;
+    defer server_config.default_force_mtp = saved_force;
+    server_config.default_force_mtp = false;
+    var cfg = qwen4ExpOomConfig();
+    cfg.mtp_override = null;
+    const head = mtpHeadKvBytesPerToken(&cfg) + mtpHeadStateBytesPerToken(&cfg);
+    const with_head = sessionBytesPerToken(&cfg, 8);
+    var dflash = cfg;
+    dflash.dflash_loaded = true;
+    try t.expect(!mtpHeadDefaultOn(&dflash));
+    try t.expectEqual(with_head - head, sessionBytesPerToken(&dflash, 8));
+    // The auto-context bill reads the same default: no head terms at the rung it prices.
+    const a = sushiContextBytesAt(&cfg, 100_000, 8).bytes;
+    const b = sushiContextBytesAt(&dflash, 100_000, 8).bytes;
+    try t.expect(b + 100_000 * head <= a + dflashRequestBytes(&dflash, 4096));
+    try t.expect(b < a + dflashRequestBytes(&dflash, 8192));
+    // A forced head still yields to the drafter by default, and `enable_drafter:false` bills it again.
+    server_config.default_force_mtp = true;
+    try t.expectEqual(@as(u64, 0), prefillRequestTerms(&dflash, 100_000, 4096, 8, 4096, .{}).mtp_head_kv_bytes);
+    try t.expect(prefillRequestTerms(&dflash, 100_000, 4096, 8, 4096, .{ .mtp_on = true }).mtp_head_kv_bytes > 0);
+    try t.expect(prefillRequestTerms(&cfg, 100_000, 4096, 8, 4096, .{}).mtp_head_kv_bytes > 0);
 }
 
 test "chat stream tool-call delta escapes the function name" {

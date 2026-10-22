@@ -539,6 +539,86 @@ pub fn quantGroupFor(in_features: u32) ?u32 {
     return null;
 }
 
+/// Bytes an assistant holds, and what its load holds above them while it runs.
+pub const AssistantBytes = struct {
+    /// Resident once loaded: the linears at `bits`, every other tensor as stored.
+    resident: u64,
+    /// The stored-precision copies of the quantized linears, which the weight map keeps until the load ends.
+    transient: u64,
+};
+
+/// The linears `loadLinear` quantizes (and, for the codebooks, the tensors it leaves dense).
+fn isAssistantLinear(key: []const u8) bool {
+    const suffixes = [_][]const u8{ ".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight", ".gate_proj.weight", ".up_proj.weight", ".down_proj.weight", ".kernel_projection.weight", ".hidden_projection.weight", ".markov_w2.weight" };
+    if (std.mem.eql(u8, key, "fc.weight") or std.mem.eql(u8, key, "encoder.fc.weight")) return true;
+    for (suffixes) |suffix| if (std.mem.endsWith(u8, key, suffix)) return true;
+    return false;
+}
+
+fn allocationBytes(n: u64) u64 {
+    return (n + 16383) / 16384 * 16384;
+}
+
+/// What loading the assistant in `dir` at `bits` (0 = dense) holds, from the safetensors headers alone.
+/// Each array is billed at its allocation granule so the bill is never under what the allocator holds.
+pub fn assistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, bits: u32) !AssistantBytes {
+    const discovery = @import("model_discovery.zig");
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var referenced = discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| discovery.freeShardSet(r);
+    var out = AssistantBytes{ .resident = 0, .transient = 0 };
+    var files = dir.iterate();
+    while (try files.next(io)) |entry| {
+        if ((entry.kind != .file and entry.kind != .sym_link) or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        const file = try dir.openFile(io, entry.name, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        var buffer: [8192]u8 = undefined;
+        var reader = file.reader(io, &buffer);
+        const header_len = try reader.interface.takeInt(u64, .little);
+        if (header_len == 0 or header_len > 128 * 1024 * 1024 or header_len > stat.size -| 8) return error.InvalidSafetensorsHeader;
+        const header = try allocator.alloc(u8, @intCast(header_len));
+        defer allocator.free(header);
+        try reader.interface.readSliceAll(header);
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, header, .{}) catch return error.InvalidSafetensorsHeader;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSafetensorsHeader;
+        var it = parsed.value.object.iterator();
+        while (it.next()) |tensor| {
+            const key = tensor.key_ptr.*;
+            if (std.mem.eql(u8, key, "__metadata__")) continue;
+            if (tensor.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
+            const offsets = tensor.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader;
+            if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[0] != .integer or offsets.array.items[1] != .integer) return error.InvalidSafetensorsHeader;
+            const start = offsets.array.items[0].integer;
+            const end = offsets.array.items[1].integer;
+            if (start < 0 or end < start or @as(u64, @intCast(end)) > stat.size -| header_len -| 8) return error.InvalidSafetensorsHeader;
+            const stored: u64 = @intCast(end - start);
+            const shape = tensor.value_ptr.object.get("shape");
+            // A weight that ships packed (`.scales` beside it) is served as stored.
+            var packed_buf: [512]u8 = undefined;
+            const shipped_packed = key.len > ".weight".len and std.mem.endsWith(u8, key, ".weight") and
+                parsed.value.object.contains(std.fmt.bufPrint(&packed_buf, "{s}.scales", .{key[0 .. key.len - ".weight".len]}) catch "");
+            if (bits != 0 and !shipped_packed and isAssistantLinear(key) and shape != null and shape.? == .array and shape.?.array.items.len == 2 and
+                shape.?.array.items[0] == .integer and shape.?.array.items[1] == .integer)
+            {
+                const rows: u64 = @intCast(shape.?.array.items[0].integer);
+                const cols: u64 = @intCast(shape.?.array.items[1].integer);
+                if (quantGroupFor(@intCast(cols))) |group| {
+                    out.resident += allocationBytes(rows * cols * bits / 8) + 2 * allocationBytes(rows * (cols / group) * 2);
+                    out.transient += stored;
+                    continue;
+                }
+            }
+            out.resident += allocationBytes(stored);
+        }
+    }
+    if (out.resident == 0) return error.MissingAssistantWeights;
+    return out;
+}
+
 /// One assistant linear. Dense weights are pre-transposed to `[in, out]` and
 /// contracted with a plain matmul; quantized ones
 /// keep the checkpoint's `[out, in]` packing and ride `mlx_quantized_matmul`
@@ -3727,4 +3807,58 @@ test "dflash2: prefix outputs preserve full block attention and causal convoluti
         try testing.expectError(error.InvalidDflashPrefix, forwardBlockPrefix(&m, &ctx, noise, 10, 0));
         try testing.expectError(error.InvalidDflashPrefix, forwardBlockPrefix(&m, &ctx, noise, 10, TinyFix.BLOCK + 1));
     }
+}
+
+test "assistantLoadBytes: a quantizing load bills the packed linears, the dense rest, and the stored copies as its transient" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // fc [1024, 2048] bf16 quantizes (gs 64); a codebook and a norm stay dense; a [8, 30] linear has no group.
+    const header =
+        \\{"fc.weight":{"dtype":"BF16","shape":[1024,2048],"data_offsets":[0,4194304]},
+        \\"candidate_selector.predecessor_codebook":{"dtype":"BF16","shape":[256,128],"data_offsets":[4194304,4259840]},
+        \\"layers.0.self_attn.q_proj.weight":{"dtype":"BF16","shape":[8,30],"data_offsets":[4259840,4260320]},
+        \\"norm.weight":{"dtype":"BF16","shape":[2048],"data_offsets":[4260320,4264416]}}
+    ;
+    const body = try testing.allocator.alloc(u8, 8 + header.len + 4264416);
+    defer testing.allocator.free(body);
+    @memset(body, 0);
+    std.mem.writeInt(u64, body[0..8], header.len, .little);
+    @memcpy(body[8 .. 8 + header.len], header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+
+    const g: u64 = 16384;
+    const q = try assistantLoadBytes(io, testing.allocator, dir_path, 8);
+    const packed_fc: u64 = 1024 * 2048 + 2 * 65536; // codes, then scales and biases of [1024, 32] bf16
+    try testing.expectEqual(packed_fc + 65536 + g + g, q.resident);
+    try testing.expectEqual(@as(u64, 4194304), q.transient);
+    const dense = try assistantLoadBytes(io, testing.allocator, dir_path, 0);
+    try testing.expectEqual(@as(u64, 4194304 + 65536 + g + g), dense.resident);
+    try testing.expectEqual(@as(u64, 0), dense.transient);
+}
+
+test "assistantLoadBytes: a tiny assistant's bill is never under what its load keeps or peaks at" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s);
+    const bill = try assistantLoadBytes(io, allocator, dir_path, 8);
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    _ = mlx.mlx_reset_peak_memory();
+    var m = try loadDflashQuant(io, allocator, s, dir_path, 8);
+    var after: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    m.deinit();
+    try testing.expect(bill.resident >= after - before);
+    try testing.expect(bill.resident + bill.transient >= peak - before);
 }

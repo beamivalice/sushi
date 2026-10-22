@@ -3300,9 +3300,10 @@ pub const LoadServingBill = struct {
 };
 pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?LoadServingBill = null;
 
+/// The drafter is quantized at load, so it stays resident at its quantized bytes, not its file bytes.
 fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !u64 {
     if (directory.len == 0) return 0;
-    return @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
+    return (try dflash_mod.assistantLoadBytes(io, allocator, directory, dflash_mod.quantBitsFromEnv())).resident;
 }
 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
@@ -3371,6 +3372,14 @@ fn streamedAssistantBytes(io: std.Io, allocator: std.mem.Allocator, config: *con
     return sushiAssistantLoadBytes(io, allocator, found.dir);
 }
 
+/// The serving bill a cold load reserves, read on the config the load will stamp with the drafter's request terms.
+fn coldServingBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, drafter_dir: []const u8) u64 {
+    const bill = load_serving_bill orelse return 0;
+    var stamped = config.*;
+    if (config.isQwen4() and drafter_dir.len > 0) stampDflashRequestTerms(io, allocator, &stamped, drafter_dir) catch {};
+    return if (bill(&stamped, std.math.maxInt(u64))) |b| b.needed else 0;
+}
+
 /// What a resident cold load reserves in the registry: the requirement its load preflight
 /// compares with free memory, so the gate and the preflight read one bill.
 fn residentColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, load_vision: bool, mtp_on: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
@@ -3383,9 +3392,7 @@ fn residentColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *
     var context: u64 = 0;
     if (model_mod.usesSushiQuantMemoryBill(config)) {
         weights +|= try sushiAssistantLoadBytes(io, allocator, drafter.dir);
-        if (load_serving_bill) |bill| if (bill(config, std.math.maxInt(u64))) |b| {
-            context = b.needed;
-        };
+        context = coldServingBillBytes(io, allocator, config, drafter.dir);
     }
     return loadRequirementBytes(config, weights, mtp_on, context);
 }
@@ -3848,8 +3855,9 @@ fn loadWarmupBytes(config: *const ModelConfig, mtp_on: bool) u64 {
     if (config.isGlm5()) return config.ssmCheckpointBytes() +| config.qsaRingBytes() +|
         (config.kvBytesPerToken() +| config.qsaHistoryBytesPerToken()) *| 1024 +| gib * 3 / 8;
     if (config.isMimo()) return gib / 4;
-    // Flash-Next: reading the MTP head peaks about a GiB above its resident bytes.
-    return gib / 8 +| (if (mtp_on) gib * 9 / 8 else 0);
+    // Flash-Next: reading the MTP head peaks about a GiB above its resident bytes, and quantizing the
+    // drafter holds its dense linears beside the quantized ones until the load ends.
+    return gib / 8 +| (if (mtp_on) gib * 9 / 8 else 0) +| config.dflash_load_transient_bytes;
 }
 
 /// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk.
@@ -3878,6 +3886,7 @@ fn stampDflashRequestTerms(io: std.Io, allocator: std.mem.Allocator, config: *Mo
     if (!cfg.isDflash2() or cfg.hidden_size != config.hidden_size or cfg.sliding_window < 2) return error.DflashTargetMismatch;
     for (cfg.layer_types) |kind| if (kind != .sliding_attention) return error.GlmDflashWindowUnsupported;
     config.dflash_loaded = true;
+    if (config.isQwen4()) config.dflash_load_transient_bytes = (try dflash_mod.assistantLoadBytes(io, allocator, directory, dflash_mod.quantBitsFromEnv())).transient;
     const per_token = @as(u64, cfg.num_hidden_layers) * cfg.num_key_value_heads * cfg.head_dim * 4;
     // A draft block grows a 2047-row window to the next 256-row allocation.
     config.dflash_window_bytes = per_token * ((@as(u64, cfg.sliding_window) + cfg.block_size + 255) / 256 * 256);
@@ -3942,6 +3951,78 @@ const LoadBillFixtures = struct {
         self.glm.deinit(testing.allocator);
     }
 };
+
+test "the drafter is billed at its quantized resident bytes and its load transient joins the warmup" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const gib: u64 = 1 << 30;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // fc [1024, 2048] bf16 quantizes at gs 64; the codebook and the norm stay dense.
+    const header =
+        \\{"fc.weight":{"dtype":"BF16","shape":[1024,2048],"data_offsets":[0,4194304]},
+        \\"candidate_selector.predecessor_codebook":{"dtype":"BF16","shape":[256,128],"data_offsets":[4194304,4259840]},
+        \\"norm.weight":{"dtype":"BF16","shape":[2048],"data_offsets":[4259840,4263936]}}
+    ;
+    const body = try a.alloc(u8, 8 + header.len + 4263936);
+    defer a.free(body);
+    @memset(body, 0);
+    std.mem.writeInt(u64, body[0..8], header.len, .little);
+    @memcpy(body[8 .. 8 + header.len], header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+    var path_buf: [512]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+
+    const stored = try @import("glm5_diagnostic.zig").assistantResidentBytes(io, a, dir);
+    const billed = try sushiAssistantLoadBytes(io, a, dir);
+    try testing.expect(billed < stored);
+    try testing.expectEqual((try dflash_mod.assistantLoadBytes(io, a, dir, dflash_mod.quantBitsFromEnv())).resident, billed);
+
+    var f = try LoadBillFixtures.init();
+    defer f.deinit();
+    const bare = loadRequirementBytes(&f.qwen, 44 * gib, false, 0);
+    f.qwen.dflash_load_transient_bytes = gib / 2;
+    try testing.expectEqual(bare + gib / 2, loadRequirementBytes(&f.qwen, 44 * gib, false, 0));
+    // An MTP-on load pays both peaks, and a context bill still replaces them.
+    try testing.expectEqual(44 * gib + gib * 5 / 4 + gib / 2 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 0));
+    try testing.expectEqual(44 * gib + 6 * gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
+}
+
+test "a cold load reads the serving bill on the config the load stamps with the drafter's request terms" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const gib: u64 = 1 << 30;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f = try LoadBillFixtures.init();
+    defer f.deinit();
+    const Hook = struct {
+        fn bill(config: *const ModelConfig, _: u64) ?LoadServingBill {
+            return .{ .requested_context = 0, .needed = if (config.dflash_loaded) 9 * (1 << 30) else 8 * (1 << 30), .max_context = 0, .kv_bits = 8, .chunk = 0 };
+        }
+    };
+    const saved = load_serving_bill;
+    defer load_serving_bill = saved;
+    load_serving_bill = Hook.bill;
+    var cfg = f.qwen;
+    cfg.hidden_size = 64;
+    try testing.expectEqual(8 * gib, coldServingBillBytes(io, a, &cfg, ""));
+
+    try tmp.dir.createDirPath(io, "drafter");
+    var dd = try tmp.dir.openDir(io, "drafter", .{});
+    defer dd.close(io);
+    var path_buf: [512]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const drafter = try std.fmt.allocPrint(a, "{s}/drafter", .{root});
+    defer a.free(drafter);
+    try dflash_mod.TinyFix.writeAssistant2(io, dd, drafter, mlx.gpuStream());
+    // The stamp refuses a full-attention layer; the fixture's config ships one.
+    const sliding = try std.mem.replaceOwned(u8, a, dflash_mod.TinyFix.ASSISTANT2_CONFIG, "\"full_attention\"", "\"sliding_attention\"");
+    defer a.free(sliding);
+    try dd.writeFile(io, .{ .sub_path = "config.json", .data = sliding });
+    try testing.expectEqual(9 * gib, coldServingBillBytes(io, a, &cfg, drafter));
+    try testing.expect(!cfg.dflash_loaded);
+}
 
 test "a load bills weights, then the larger of the measured warmup plus a 1 GiB net and the context bill" {
     const gib: u64 = 1 << 30;

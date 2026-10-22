@@ -433,6 +433,7 @@ pub const ModelConfig = struct {
     /// assistant's config before load. Its stored weights are in the resident load bill.
     dflash_loaded: bool = false,
     dflash_window_bytes: u64 = 0,
+    dflash_load_transient_bytes: u64 = 0,
     dflash_capture_bytes_per_token: u64 = 0,
 
     /// Set at load when this model's SSD prefix tier was wanted and did not come up (no room on the

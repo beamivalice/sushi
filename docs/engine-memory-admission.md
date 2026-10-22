@@ -46,6 +46,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **The warmup transient is measured per arch** (`loadWarmupBytes`, [Load warmup](#load-warmup)): Flash-Next 0.125 GiB
   plus 1.125 GiB while MTP is on, MiMo 0.25 GiB, GLM its fixed KDA state, pool rings and first 1024 latent rows plus
   0.375 GiB. A new arch or layout adds its own measured figure here, never a percentage of its weights.
+- **Flash-Next with a DFlash2 drafter bills the drafter as it is resident and as it loads**: `assistantLoadBytes` reads the
+  safetensors headers and bills what the 8-bit gs64 quantize step leaves (0.71 GiB for the shipped drafter, not its 1.12
+  GiB of BF16 file bytes: the codebooks and norms stay dense) plus a load transient, the dense linears the weight map keeps
+  until the load ends (0.89 GiB), which `loadWarmupBytes` adds through `dflash_load_transient_bytes` (stamped with the
+  other drafter terms). Measured on the real drafter: resident 760.8 MB, peak over before 1712.4 MB; the formula is
+  never under either, within 0.04%.
+- **A request bills the MTP head only when it runs MTP** (`requestBillsMtpHead`, the `requestSpecModes` verdict): a
+  DFlash2 request never builds the head's cache, state or QSA ring. `enable_drafter:false` hands the request back to MTP
+  and bills the head. The head weights and coarse lm_head stay billed at load for that hand-back. The load-time and
+  auto-context bills (`mtpHeadDefaultOn`, `sessionBytesPerToken`) drop the head terms when Qwen's default round is DFlash2.
+- **The cold-load gate stamps the drafter's request terms before reading the serving bill** (`coldServingBillBytes`), the
+  same config the load preflight reads after `stampDflashRequestTerms`; unstamped, the gate missed the DFlash2 per-request
+  term (0.48 GB at chunk 4096).
 - Qwen drops disabled native MTP tensors before the transformer binds them. An auto context bills no context term: it
   is pinned after the load from what the weights leave. Their default KV remains affine 8-bit.
 - An explicit launch or model-settings context is checked before loading resident Sushi Qwen and MiMo EXL3 packs.
