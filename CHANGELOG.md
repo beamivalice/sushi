@@ -4,6 +4,10 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **Qwen3.8-Flash-Next verifies 2 to 8 rows at an even price per row**: MTP and DFlash2 rounds of five rows and wider no longer pay a step at the fifth and seventh row, an eight-row verify is about 16% faster, and the output stays byte-identical to serial decoding. DFlash2 prices its rows from the measured cost, so it verifies more rows where drafts pay.
+
 ## v1.3.0 — Qwen EXL3 Quantizer, Adaptive DFlash2, KV6, Dashboard
 
 - **Qwen3.8-Flash-Next EXL3 quantizer**: `sushi convert exl3` writes a Sushi pack from the BF16 checkpoint at the rate you pick, with the trunk in the format the packs serve; runs resume where they stopped, keep finished layers and packs, and fit their Metal threadgroups to any Apple GPU. Check the result with `sushi kld`. Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the M2 Pro report (#57).

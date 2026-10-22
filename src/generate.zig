@@ -4618,7 +4618,7 @@ pub const Generator = struct {
             // re-point moe_seq_offset at the committed length.
             self.ctx.cache.step = kv_step_snap;
             if (self.ctx.ssm_entries) |entries| {
-                const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
+                const gdn_captured = entries.len > 0 and transformer_mod.ssmHasSpecCapture(&entries[0]);
                 if (!gdn_captured) return error.SpecRollbackUnavailable;
                 try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
             }
@@ -7143,7 +7143,7 @@ pub const Generator = struct {
         new_hidden = .{ .ctx = null };
 
         const gdn_captured = if (self.ctx.ssm_entries) |entries|
-            entries.len > 0 and entries[0].spec_state_seq.ctx != null
+            entries.len > 0 and transformer_mod.ssmHasSpecCapture(&entries[0])
         else
             false;
 

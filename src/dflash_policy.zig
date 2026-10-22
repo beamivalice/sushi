@@ -14,15 +14,23 @@ pub const MAX_DRAFTS: u32 = MAX_ROWS - 1;
 /// Round cost by verify rows relative to a one-row round; index = rows, 0 unused.
 pub const Costs = [MAX_ROWS + 1]f32;
 
-/// Qwen3.8-Flash-Next on an M5 Max, Sushi-2.6bpw: the verify costs 20.6, 26.3 and 41.7 ms at 2, 4 and 8
-/// rows, a one-row round about 17.2 ms, so a row adds 0.2 of the first; accept and append add 4%.
-const ROW_STEP: f32 = 0.20;
-const FIXED: f32 = 0.04;
+/// Verify forward ms by rows (index = rows, 0 unused) on an M5 Max, Qwen3.8-Flash-Next-SushiTrellisQ-2.75, kv8:
+/// the decode meter's mean over 1K and 8K context, two boots each. Rows past 8 continue at the 2..8 slope.
+const VERIFY_MS = [_]f32{ 0, 17.22, 20.38, 22.37, 25.07, 27.46, 30.78, 34.53, 37.37 };
+/// What a round pays however many rows it verifies: the drafter, the head and selector, accept and append.
+const FIXED_MS: f32 = 4.0;
+
+fn verifyMs(rows: usize) f32 {
+    if (rows < VERIFY_MS.len) return VERIFY_MS[rows];
+    const last = VERIFY_MS.len - 1;
+    return VERIFY_MS[last] + (VERIFY_MS[last] - VERIFY_MS[2]) / @as(f32, @floatFromInt(last - 2)) * @as(f32, @floatFromInt(rows - last));
+}
 
 pub fn ladder() Costs {
     var out: Costs = undefined;
     out[0] = 0;
-    for (1..MAX_ROWS + 1) |r| out[r] = 1 + FIXED + ROW_STEP * @as(f32, @floatFromInt(r - 1));
+    const one = verifyMs(1) + FIXED_MS;
+    for (1..MAX_ROWS + 1) |r| out[r] = (verifyMs(r) + FIXED_MS) / one;
     return out;
 }
 
@@ -116,11 +124,12 @@ pub fn pickRows(calib: *const Calibration, conf: []const f32, min: u32, max: u32
 
 const testing = std.testing;
 
-test "ladder: a row adds a fifth of the first, never cheaper for more rows" {
+test "ladder: priced from the measured forward and the fixed round cost, never cheaper for more rows" {
     const c = ladder();
-    try testing.expectApproxEqAbs(@as(f32, 1.04), c[1], 1e-4);
-    try testing.expectApproxEqAbs(@as(f32, 1.64), c[4], 1e-4);
-    try testing.expectApproxEqAbs(@as(f32, 2.44), c[8], 1e-4);
+    try testing.expectEqual(@as(f32, 1), c[1]);
+    try testing.expectApproxEqAbs(@as(f32, 1.15), c[2], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 1.37), c[4], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 1.95), c[8], 0.01);
     var r: u32 = 2;
     while (r <= MAX_ROWS) : (r += 1) try testing.expect(c[r] >= c[r - 1]);
 }
@@ -134,8 +143,9 @@ test "chooseRows: sure drafts buy every row, a weak first draft buys none, a poo
     try testing.expectEqual(@as(u32, 2), chooseRows(&[_]f32{ 0.95, 0.05, 0.99, 0.99 }, &costs).rows);
     // 70% a draft: the third and fourth rows still pay their fifth.
     try testing.expectEqual(@as(u32, 4), chooseRows(&[_]f32{ 0.8, 0.8, 0.8 }, &costs).rows);
-    // 40% a draft: only the first row is worth its cost.
-    try testing.expectEqual(@as(u32, 2), chooseRows(&[_]f32{ 0.4, 0.4, 0.4 }, &costs).rows);
+    // 40% a draft: two drafts pay, the third does not.
+    try testing.expectEqual(@as(u32, 3), chooseRows(&[_]f32{ 0.4, 0.4, 0.4 }, &costs).rows);
+    try testing.expectEqual(@as(u32, 1), chooseRows(&[_]f32{ 0.15, 0.15, 0.15 }, &costs).rows);
 }
 
 test "chooseRows: a poisoned input still answers" {
@@ -159,14 +169,15 @@ test "Calibration: no data answers the prior, then the data takes over bin by bi
 
 test "Calibration.observeRound counts only the positions a round reached" {
     var c = Calibration{};
-    // three drafts, the second rejected: positions 0 and 1 were reached, 2 never.
+    // three drafts, the second rejected: positions 0 and 1 were reached, 2 never. The second
+    // observation shares the first's bin and so ages it once.
     c.observeRound(&[_]f32{ 0.9, 0.9, 0.99 }, 3, 1);
     var total: f32 = 0;
     for (c.seen) |v| total += v;
-    try testing.expectApproxEqAbs(@as(f32, 2), total, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 1 + Calibration.KEEP), total, 1e-4);
     var hits: f32 = 0;
     for (c.hit) |v| hits += v;
-    try testing.expectApproxEqAbs(@as(f32, 1), hits, 1e-4);
+    try testing.expectApproxEqAbs(Calibration.KEEP, hits, 1e-4);
 }
 
 test "pickRows: the calibrated choice, held inside min..max" {

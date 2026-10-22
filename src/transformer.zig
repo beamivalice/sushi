@@ -7896,6 +7896,9 @@ pub const SSMCacheEntry = struct {
     /// re-running it for the accepted prefix is pure waste. Null outside a
     /// capturing verify; freed at the end of every `nextPld` round.
     spec_state_seq: mlx.mlx_array = .{ .ctx = null },
+    /// The verify that stored only its final state: what rollback replays the accepted rows from.
+    /// Held instead of `spec_state_seq`, never beside it.
+    spec_replay: gdn_decode.Replay = .{},
     /// PLD spec-decode capture: the conv1d input `[B, (kernel-1)+T, conv_dim]`
     /// of the verify forward, so the accepted-position `conv_state` is just a
     /// slice (no re-forward). Null outside capture.
@@ -8430,6 +8433,7 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
 /// entry that never captured. Called at the end of every `nextPld` round and
 /// in the cache teardown paths so the capture never outlives a round.
 pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
+    entry.spec_replay.deinit();
     if (entry.spec_state_seq.ctx != null) {
         _ = mlx.mlx_array_free(entry.spec_state_seq);
         entry.spec_state_seq = .{ .ctx = null };
@@ -8505,6 +8509,11 @@ fn splitSpecCaptures(s: mlx.mlx_stream, m: *const SSMCacheEntry, e: *SSMCacheEnt
 /// only `spec_conv_input`, whose leading `kernel-1` rows cannot be told from
 /// verify positions without it. Passing it explicitly is what lets one helper
 /// roll back both shapes.
+/// True when a verify left this entry's recurrent state recoverable at any accepted row.
+pub fn ssmHasSpecCapture(entry: *const SSMCacheEntry) bool {
+    return entry.spec_state_seq.ctx != null or entry.spec_replay.held();
+}
+
 pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
     // qwen4_exp per-request state beside the GDN pair. PLE layer: the conv
     // window + token history slice at 1+accepted (same shape as conv_state
@@ -8566,7 +8575,12 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
         }
     }
     const acc: c_int = @intCast(accepted);
-    if (entry.spec_state_seq.ctx != null) {
+    if (entry.spec_state_seq.ctx == null and entry.spec_replay.held() and entry.spec_conv_input.ctx != null) {
+        const replayed = try gdn_decode.replayState(entry.spec_replay, entry.spec_conv_input, acc + 1, s);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        entry.ssm_state = replayed;
+        patch_ssm = true;
+    } else if (entry.spec_state_seq.ctx != null) {
         const seq_shape = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
 
         // ssm_state = spec_state_seq[accepted]  →  [B, Hv, Dv, Dk]
@@ -16737,7 +16751,7 @@ pub const Transformer = struct {
         if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
         // Capture marks speculative verification. A short prefill tail has the
         // same shape but must keep the ordinary forward path and shared expert.
-        return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 6;
+        return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 8;
     }
 
 
@@ -17847,7 +17861,7 @@ pub const Transformer = struct {
                     return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
                 }
             }
-            var r = (try gdn_decode.step(geo, seq_len, inputs, self.s)) orelse break :recur;
+            var r = (try gdn_decode.step(geo, seq_len, inputs, false, self.s)) orelse break :recur;
             defer r.deinit();
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
             const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse break :recur;
@@ -17863,13 +17877,15 @@ pub const Transformer = struct {
                 if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
                 ssm.spec_conv_input = conv_input;
                 if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
-                ssm.spec_state_seq = r.state_seq;
-                r.state_seq = .{ .ctx = null };
+                ssm.spec_state_seq = .{ .ctx = null };
+                const pre_state = ssm.ssm_state;
+                ssm.ssm_state = .{ .ctx = null };
+                try ssm.spec_replay.hold(pre_state, geo, inputs);
             }
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = r.conv_state;
             r.conv_state = .{ .ctx = null };
-            _ = mlx.mlx_array_free(ssm.ssm_state);
+            if (ssm.ssm_state.ctx != null) _ = mlx.mlx_array_free(ssm.ssm_state);
             ssm.ssm_state = r.ssm_state;
             r.ssm_state = .{ .ctx = null };
             const once = if (seq_len == 1) &gdn_decode_recur_engaged else &gdn_verify_recur_engaged;
@@ -44623,7 +44639,7 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
 
     const geo = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
     const in = gdn_decode.Inputs{ .qkv = qkv, .a = a_in, .b = b_in, .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w, .A_log = A_log, .dt_bias = dt_bias, .q_scale = q_scale, .k_scale = k_scale, .gate_dtype = gate_dt };
-    const got = (try gdn_decode.step(geo, t_len, in, s)) orelse return error.FusedDeclined;
+    const got = (try gdn_decode.step(geo, t_len, in, true, s)) orelse return error.FusedDeclined;
     defer got.deinit();
     const flat = (try gdnNormGateFused(s, got.y, z, 0, value_dim, norm_w, eps_arr, false, hv, dv, 1, t_len)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(flat);
@@ -44700,7 +44716,7 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
         one_in.b = row[2];
         one_in.conv_state = conv;
         one_in.ssm_state = state;
-        const one = (try gdn_decode.step(geo, 1, one_in, s)) orelse return error.FusedDeclined;
+        const one = (try gdn_decode.step(geo, 1, one_in, true, s)) orelse return error.FusedDeclined;
         defer one.deinit();
         _ = mlx.mlx_array_free(conv);
         conv = try gdnRecurRef(one.conv_state);
@@ -44779,7 +44795,7 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
         const per_head = try gdnRecurRand(rnd, &.{hv}, 1.0, dt, s);
         defer _ = mlx.mlx_array_free(per_head);
         const in = gdn_decode.Inputs{ .qkv = qkv, .a = ab, .b = ab, .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w, .A_log = per_head, .dt_bias = per_head, .q_scale = scale, .k_scale = scale };
-        try testing.expect((try gdn_decode.step(.{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 }, t_len, in, s)) == null);
+        try testing.expect((try gdn_decode.step(.{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 }, t_len, in, true, s)) == null);
     }
 }
 
@@ -44806,8 +44822,12 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
     try qkvExpectBitsEqual(s, chain.ssm_state, fused.ssm_state);
     if (capture) {
         try qkvExpectBitsEqual(s, chain.spec_conv_input, fused.spec_conv_input);
+        // From three rows on the fused verify stores its final state only and rollback replays.
+        const replays = seq >= 3;
+        try testing.expectEqual(replays, fused.spec_replay.held());
+        try testing.expectEqual(replays, fused.spec_state_seq.ctx == null);
         var i: c_int = 0;
-        while (i + 1 < seq) : (i += 1) {
+        while (!replays and i + 1 < seq) : (i += 1) {
             const ra = try gdnRecurRowsAxis0(chain.spec_state_seq, i, s);
             defer _ = mlx.mlx_array_free(ra);
             const rb = try gdnRecurRowsAxis0(fused.spec_state_seq, i, s);
@@ -44928,9 +44948,26 @@ fn gdnRecurLayerCase(wide: bool) !void {
                     .conv_state = try gdnRecurRef(e.conv_state),
                     .ssm_state = try gdnRecurRef(e.ssm_state),
                     .initialized = true,
-                    .spec_state_seq = try gdnRecurRef(e.spec_state_seq),
+                    .spec_state_seq = if (e.spec_state_seq.ctx != null) try gdnRecurRef(e.spec_state_seq) else .{ .ctx = null },
                     .spec_conv_input = try gdnRecurRef(e.spec_conv_input),
                 };
+                if (e.spec_replay.held()) {
+                    var rep = e.spec_replay;
+                    rep.pre_state = try gdnRecurRef(rep.pre_state);
+                    try back.spec_replay.hold(rep.pre_state, rep.geo, .{
+                        .qkv = .{},
+                        .a = rep.a,
+                        .b = rep.b,
+                        .conv_state = .{},
+                        .ssm_state = rep.pre_state,
+                        .conv_w = rep.conv_w,
+                        .A_log = rep.A_log,
+                        .dt_bias = rep.dt_bias,
+                        .q_scale = rep.q_scale,
+                        .k_scale = rep.k_scale,
+                        .gate_dtype = rep.gate_dtype,
+                    });
+                }
                 defer {
                     ssmFreeSpecCapture(&back);
                     _ = mlx.mlx_array_free(back.conv_state);
@@ -45035,7 +45072,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
     xfm.spec_capture_ssm = false;
     defer _ = mlx.mlx_array_free(out);
     try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(live.ssm_state));
-    try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(live.spec_state_seq));
+    try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(if (live.spec_replay.held()) live.spec_replay.pre_state else live.spec_state_seq));
 
     const x0 = try gdnRecurRows(x, 0, 1, s);
     defer _ = mlx.mlx_array_free(x0);
@@ -51420,6 +51457,27 @@ const L10VerifySlots = struct {
 /// The solo MTP verify: capture armed, PLE deferred, one `forwardWithCaptureAll`, flush
 /// after. `forwardRowAxisVerify` at one row must match it.
 fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.mlx_array {
+    if (entry.spec_state_seq.ctx == null and entry.spec_replay.held()) {
+        // A replaying verify: the state after every accepted prefix, rebuilt, then the final state.
+        const rows = mlx.getShape(entry.spec_conv_input)[1] - 3;
+        var parts: [gdn_decode.MAX_SEQ]mlx.mlx_array = undefined;
+        var built: usize = 0;
+        defer for (parts[0..built]) |part| {
+            _ = mlx.mlx_array_free(part);
+        };
+        var i: c_int = 1;
+        while (i < rows) : (i += 1) {
+            const state = try gdn_decode.replayState(entry.spec_replay, entry.spec_conv_input, i, s);
+            defer _ = mlx.mlx_array_free(state);
+            parts[built] = mlx.mlx_array_new();
+            built += 1;
+            try mlx.check(mlx.mlx_expand_dims(&parts[built - 1], state, 0, s));
+        }
+        parts[built] = mlx.mlx_array_new();
+        built += 1;
+        try mlx.check(mlx.mlx_expand_dims(&parts[built - 1], entry.ssm_state, 0, s));
+        return Transformer.concatAxis0(s, parts[0..built]);
+    }
     const shape = mlx.getShape(entry.spec_state_seq);
     if (shape.len != 5 or shape[0] < 1) return error.SpecCaptureShape;
     var final = mlx.mlx_array_new();
@@ -52715,8 +52773,8 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
             for ([_]bool{ false, true }) |capture| {
                 xfm.spec_capture_ssm = capture;
                 for ([_]c_int{ 1, 2, 4 }) |batch| {
-                    for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 16, 4096 }) |width| {
-                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 6, xfm.verifyFeatureEnabled(feature, false, batch, width));
+                    for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 4096 }) |width| {
+                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 8, xfm.verifyFeatureEnabled(feature, false, batch, width));
                         try testing.expectEqual(is_qwen4, xfm.verifyFeatureEnabled(feature, true, batch, width));
                     }
                 }
@@ -52748,6 +52806,7 @@ fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_a
     var gen: Gen = undefined;
     gen.xfm = xfm;
     gen.ctx = slot.ctx;
+    gen.sampling = .{};
     defer slot.ctx = gen.ctx;
     var state: Gen.MtpRoundState = undefined;
     state.tracing = false;
@@ -52806,7 +52865,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     try testing.expectEqual(prefill_routes, mtp_verify_kernel_calls[2]);
     try testing.expectEqual(prefill_hc, qwen4_forward.mtp_verify_hc_prepared_calls);
     var position = prefix_len;
-    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7 }) |width| {
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |width| {
         const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
         defer _ = mlx.mlx_array_free(input);
         single_verify_test_features = @splat(false);
@@ -52826,13 +52885,13 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
                     try testing.expect(x.ctx == null and y.ctx == null);
                 } else try expectRowsByteEqual(a, xfm.s, x, y, "single verify " ++ field);
             }
-            if (left.spec_state_seq.ctx != null) {
+            if (ssmHasSpecCapture(left)) {
                 const x = try logicalSsmCapture(xfm.s, left);
                 defer _ = mlx.mlx_array_free(x);
                 const y = try logicalSsmCapture(xfm.s, right);
                 defer _ = mlx.mlx_array_free(y);
                 try expectRowsByteEqual(a, xfm.s, x, y, "single verify logical capture");
-            } else try testing.expect(right.spec_state_seq.ctx == null);
+            } else try testing.expect(!ssmHasSpecCapture(right));
             try testing.expectEqual(left.ple_prev_valid, right.ple_prev_valid);
             try testing.expectEqualSlices(u32, &left.ple_prev, &right.ple_prev);
             ssmFreeSpecCapture(left);
@@ -52840,7 +52899,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         }
         errdefer std.debug.print("[single-verify-exact] context={d} width={d} before={any} after={any}\n", .{ prefix_len, width, before, after });
         for (before, after, 0..) |old, new, feature| {
-            if (feature == 4 and verifySharedHardware() and width >= 2 and width <= 6) {
+            if (feature == 4 and verifySharedHardware() and width >= 2 and width <= 8) {
                 try testing.expect(new > old);
             } else try testing.expectEqual(old, new);
         }
@@ -54150,8 +54209,8 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
                         try testing.expectEqual(l.ctx == null, r.ctx == null);
                         if (l.ctx != null) try qkvExpectBitsEqual(s, l, r);
                     }
-                    try testing.expectEqual(left.spec_state_seq.ctx == null, right.spec_state_seq.ctx == null);
-                    if (left.spec_state_seq.ctx != null) {
+                    try testing.expectEqual(ssmHasSpecCapture(&left), ssmHasSpecCapture(&right));
+                    if (ssmHasSpecCapture(&left)) {
                         const l = try logicalSsmCapture(s, &left);
                         defer _ = mlx.mlx_array_free(l);
                         const r = try logicalSsmCapture(s, &right);

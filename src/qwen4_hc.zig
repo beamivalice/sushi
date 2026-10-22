@@ -840,12 +840,12 @@ pub const HcPrepared = struct {
     }
 };
 
-pub var hc_prepared_entries: [8]HcPrepared = @splat(.{});
+pub var hc_prepared_entries: [16]HcPrepared = @splat(.{});
 
 pub var hc_prepared_clock: u64 = 0;
 
 pub fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending) !?HcFusedOut {
-    return hcReadPreparedWidth(s, x, w, width, eps, pending, 6);
+    return hcReadPreparedWidth(s, x, w, width, eps, pending, 8);
 }
 
 pub fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {

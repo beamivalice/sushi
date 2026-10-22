@@ -19,7 +19,6 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_LMHEAD_FULL` | `transformer.zig:24018` | `1` reads the full lm_head instead of the greedy top-32 shortlist (MiMo; the shortlist is not certified exact) | once | yes: engine-mtp |
 | `SUSHI_LOOP_TRIM` | `scheduler.zig:6233` | default on: trims displayed loop-stop replies; `0` keeps the whole degenerate tail for strict bytes (`tests/test_loop_stop_signal.sh` boots both) | once | yes: server-http-apis, tests/CLAUDE |
 | `SUSHI_MTP_ADAPTIVE_SERIAL` | `generate.zig:9517` | default on; `0` disables the adaptive speculate-vs-serial vote at long KV (`tests/test_mtp_adaptive.sh` boots both) | once | yes: mimo2-perf, tests/CLAUDE |
-| `SUSHI_MTP_DENSE_ROWS` | `mtp_dense_rows.zig:10` | `1` runs the dense-row router GEMV for MTP verify rows (default off; one equivalence run failed, seven reruns passed) | once | yes: engine-mtp, qwen4-perf |
 | `SUSHI_MTP_DRAFT_HEAD_BITS` | `mtp.zig:822, mimo_mtp.zig:33` | draft-only lm_head requant width (default 3, MiMo coarse readout 2; `0\|off` disables); verification is untouched | load | yes: mimo2-mtp |
 | `SUSHI_MTP_HEAD_QUANT_BITS` | `mtp.zig:1780` | requant width of dense MTP head trunks at load (default 4, g64; `0` off) | load | yes: engine-mtp |
 | `SUSHI_NGRAM_WARM` | `qwen4_exp.zig:146` | default on: pread the Flash-Next n-gram table at load; `0` skips it | once | yes: qwen4-arch, qwen4-perf |

@@ -151,6 +151,13 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - Engagement: `[mtp] prompt-lookup drafts engaged: k=… suffix=…` once, `[spec-stats] … lookup=rounds/drafted/landed`
   and `lookup_table=`. A/B driver: `tests/bench_mtp_lookup.sh`.
 
+## Verify price by rows
+
+A verify row costs about 2.9 ms on Flash-Next STQ-2.75 at every width from 2 to 8, with no step at five or seven rows
+([qwen4-perf](qwen4-perf.md#verify-rows8)). GDN rollback replays the accepted rows from the pre-verify state
+(`SSMCacheEntry.spec_replay`, `ssmRollbackFromCapture`) instead of picking one of R stored states; the S=2 fold and the
+chain/group paths still capture per row. `dflash_policy.ladder()` is that table plus the 4 ms a DFlash2 round pays whatever its width.
+
 ## Round cost table
 
 - **Round cost is MEASURED** per model/width/KV bucket from live single-chunk rounds (`round_cost.zig`;
@@ -198,8 +205,10 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
   SUSHI_MTP_COST_TABLE=0`, or a pinned depth).
 - Pinned-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
-- `SUSHI_MTP_DENSE_ROWS=1` stays off by default: one `test_mtp_equivalence.sh` run with it on failed (top-2 gap
-  1.125 nats, a slow loaded run) and seven reruns passed ([perf-baselines](qwen4-perf.md#m2max-decode)).
+- The router and shared-expert gate run the dense-rows kernel at every width, serial decode included, so one arithmetic
+  serves a row whether it decodes alone or verifies beside others on any device
+  ([qwen4-perf](qwen4-perf.md#verify-rows8)). It replaced `SUSHI_MTP_DENSE_ROWS=1`, which one equivalence run failed
+  while it was off by default.
 
 ## Head KV and norms
 

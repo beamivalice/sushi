@@ -598,6 +598,7 @@ pub fn qwen4MtpStateNew(self: *Transformer) !Qwen4MtpState {
     entry.qsa_score_buf = .{ .ctx = null };
     entry.qsa_score_blocks = 0;
     entry.spec_state_seq = .{ .ctx = null };
+    entry.spec_replay = .{};
     entry.spec_conv_input = .{ .ctx = null };
     entry.spec_ple_input = .{ .ctx = null };
     const cache = try KVCache.initWithConfig(self.allocator, self.config.num_hidden_layers + 1, m.cache.config);

@@ -1,16 +1,11 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 
+/// Test hook: false takes MLX's own matmul.
 pub var override: ?bool = null;
-var env_enabled: ?bool = null;
 
 pub fn enabled() bool {
-    if (override) |value| return value;
-    if (env_enabled) |value| return value;
-    const p = std.c.getenv("SUSHI_MTP_DENSE_ROWS");
-    const value = p != null and std.mem.eql(u8, std.mem.span(p.?), "1");
-    env_enabled = value;
-    return value;
+    return override orelse true;
 }
 
 // MLX v0.32.2 GEMV (BM4 BN1 SM1 SN32 TM4 TN4), with independent activation rows.
@@ -68,7 +63,7 @@ const GATE_SOURCE =
 ;
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
-var configurations: [2][31]?mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
+var configurations: [2][32]?mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
 pub var calls: [2]usize = .{ 0, 0 };
 var logged: [2]bool = .{ false, false };
 
@@ -83,7 +78,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_a
     const strides = mlx.mlx_array_strides(w);
     if (strides[0] != 1 or strides[1] != 2560) return null;
     const rows = mlx.mlx_array_size(x) / 2560;
-    if (rows < 2 or rows > 32) return null;
+    if (rows < 1 or rows > 32) return null;
     const which: usize = if (n == 512) 0 else 1;
     if (kernels[which] == null) {
         const names = [_][*:0]const u8{ "x", "w" };
@@ -105,14 +100,14 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_a
         if (kernel.ctx == null) return error.MetalKernelCompileFailed;
         kernels[which] = kernel;
     }
-    if (configurations[which][rows - 2] == null) {
+    if (configurations[which][rows - 1] == null) {
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ @intCast(rows), n }, 2, .bfloat16));
         const threads: c_int = if (which == 0) 128 else 512;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, if (which == 0) 32 * threads else threads, @intCast(rows), 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, threads, 1, 1));
-        configurations[which][rows - 2] = cfg;
+        configurations[which][rows - 1] = cfg;
     }
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
@@ -121,7 +116,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_a
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernels[which].?, iv, configurations[which][rows - 2].?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernels[which].?, iv, configurations[which][rows - 1].?, s));
     calls[which] += 1;
     if (!@import("builtin").is_test and !logged[which]) {
         logged[which] = true;
@@ -139,7 +134,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_a
     return out;
 }
 
-test "MTP dense rows preserve serial bits on transposed router and singleton gate" {
+test "dense rows, serial decode included, preserve MLX's bits on the transposed router and singleton gate" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const a = std.testing.allocator;
@@ -158,7 +153,7 @@ test "MTP dense rows preserve serial bits on transposed router and singleton gat
         try mlx.check(mlx.mlx_array_eval(w));
         try std.testing.expectEqual(@as(usize, 1), mlx.mlx_array_strides(w)[0]);
         try std.testing.expectEqual(@as(usize, @intCast(k)), mlx.mlx_array_strides(w)[1]);
-        for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8, 9, 16, 32 }) |rows| {
+        for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 32 }) |rows| {
             const xh = try a.alloc(u16, @intCast(rows * k));
             defer a.free(xh);
             for (xh, 0..) |*v, i| {

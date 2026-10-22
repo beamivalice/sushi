@@ -71,10 +71,79 @@ const SOURCE =
     \\}
 ;
 
+// Row-streaming arm: O outputs per simdgroup keep their codes in registers while rows stream through, each
+// row's per-lane block chain being qmv's. SPLIT pairs simdgroups on the same outputs, MT rows each.
+const STREAM_SOURCE =
+    \\const int lane = int(thread_index_in_simdgroup);
+    \\const int sgi = int(simdgroup_index_in_threadgroup);
+    \\const int output0 = (int(threadgroup_position_in_grid.x) * (SPLIT ? SG / 2 : SG) + (SPLIT ? sgi / 2 : sgi)) * O;
+    \\const int row0 = SPLIT ? (sgi % 2) * MT : 0;
+    \\float result[MT][O];
+    \\for (int m = 0; m < MT; ++m) for (int o = 0; o < O; ++o) result[m][o] = 0.0f;
+    \\for (int k = 0; k < K; k += 256) {
+    \\  float codes[O][8];
+    \\  float sc[O];
+    \\  float bi[O];
+    \\  for (int o = 0; o < O; ++o) {
+    \\    const device uint8_t* q = reinterpret_cast<const device uint8_t*>(w) + size_t(output0 + o) * K + k + lane * 8;
+    \\    for (int i = 0; i < 8; ++i) codes[o][i] = float(q[i]);
+    \\    const int group = (output0 + o) * (K / GS) + (k + lane * 8) / GS;
+    \\    sc[o] = float(scales[group]);
+    \\    bi[o] = float(biases[group]);
+    \\  }
+    \\  for (int m = 0; m < MT; ++m) {
+    \\    if (row0 + m >= M) break;
+    \\    const device bfloat16_t* xp = x + (row0 + m) * K + k + lane * 8;
+    \\    float xt[8];
+    \\    float sum = 0.0f;
+    \\    for (int i = 0; i < 8; ++i) { sum += xp[i]; xt[i] = xp[i]; }
+    \\    for (int o = 0; o < O; ++o) {
+    \\      float accum = 0.0f;
+    \\      for (int i = 0; i < 8; ++i) accum += xt[i] * codes[o][i];
+    \\      result[m][o] += sc[o] * accum + sum * bi[o];
+    \\    }
+    \\  }
+    \\}
+    \\for (int m = 0; m < MT; ++m) for (int o = 0; o < O; ++o) {
+    \\  const float value = simd_sum(result[m][o]);
+    \\  if (lane == 0 && row0 + m < M) y[(row0 + m) * N + output0 + o] = bfloat16_t(value);
+    \\}
+;
+
+const Arm = enum { tile, s1x4, p4x8, p2x8 };
+
+// Measured per shape on the Flash-Next trunk and head (docs/qwen4-perf.md#verify-rows8): the tile arm above is
+// flat to 4 rows, then pays a second tile.
+fn rowsArm(n: c_int, k: c_int, m: c_int, gs: c_int) Arm {
+    if (@mod(k, 256) != 0 or @mod(gs, 8) != 0) return .tile;
+    const arm: Arm = switch (m) {
+        5 => .s1x4,
+        6 => .p4x8,
+        7 => if (n == 640) .p2x8 else .s1x4,
+        8 => if (n == 10240 or n == 12288) .p2x8 else .tile,
+        else => .tile,
+    };
+    if (arm == .tile) return arm;
+    const g = armGeometry(arm);
+    return if (@mod(n, g.o * (if (g.split) @divExact(g.sg, 2) else g.sg)) == 0) arm else .tile;
+}
+
+fn armGeometry(arm: Arm) struct { o: c_int, sg: c_int, split: bool } {
+    return switch (arm) {
+        .tile => unreachable,
+        .s1x4 => .{ .o = 1, .sg = 4, .split = false },
+        .p4x8 => .{ .o = 4, .sg = 8, .split = true },
+        .p2x8 => .{ .o = 2, .sg = 8, .split = true },
+    };
+}
+
+pub var rows_arm_calls: [4]u64 = @splat(0);
+var stream_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
 const Key = struct { dims: [8]c_int = @splat(0), ndim: usize, n: c_int, gs: c_int };
-const Entry = struct { key: Key, cfg: mlx.mlx_fast_metal_kernel_config, k_size: mlx.mlx_array, n_size: mlx.mlx_array, tick: u64 };
+const Entry = struct { key: Key, arm: Arm, cfg: mlx.mlx_fast_metal_kernel_config, k_size: mlx.mlx_array, n_size: mlx.mlx_array, tick: u64 };
 var entries: [128]Entry = undefined;
 var count: usize = 0;
 var tick: u64 = 0;
@@ -97,6 +166,18 @@ fn configuration(xs: []const c_int, n: c_int, k: c_int, m: c_int, gs: c_int) !*c
     errdefer _ = mlx.mlx_array_free(n_size);
     var shape = key.dims;
     shape[xs.len - 1] = n;
+    const arm = rowsArm(n, k, m, gs);
+    if (arm != .tile) {
+        const g = armGeometry(arm);
+        const per_group = if (g.split) @divExact(g.sg, 2) else g.sg;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, xs.len, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(n, g.o * per_group) * g.sg * 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, g.sg * 32, 1, 1));
+        const mt = if (g.split) @divTrunc(m + 1, 2) else m;
+        inline for (.{ "M", "N", "K", "GS", "O", "SG", "MT", "SPLIT" }, .{ m, n, k, gs, g.o, g.sg, mt, @as(c_int, @intFromBool(g.split)) }) |name, value|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name, value));
+        return store(key, arm, cfg, k_size, n_size);
+    }
     const tiles = @divTrunc(m + 3, 4);
     const nv = @divTrunc(m + tiles - 1, tiles);
     const fast = @mod(k, 256) == 0;
@@ -112,6 +193,10 @@ fn configuration(xs: []const c_int, n: c_int, k: c_int, m: c_int, gs: c_int) !*c
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NV", nv));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FAST", @intFromBool(fast)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RPS", rps));
+    return store(key, .tile, cfg, k_size, n_size);
+}
+
+fn store(key: Key, arm: Arm, cfg: mlx.mlx_fast_metal_kernel_config, k_size: mlx.mlx_array, n_size: mlx.mlx_array) *const Entry {
     var slot = count;
     if (count == entries.len) {
         slot = 0;
@@ -122,7 +207,7 @@ fn configuration(xs: []const c_int, n: c_int, k: c_int, m: c_int, gs: c_int) !*c
         _ = mlx.mlx_array_free(entries[slot].k_size);
         _ = mlx.mlx_array_free(entries[slot].n_size);
     } else count += 1;
-    entries[slot] = .{ .key = key, .cfg = cfg, .k_size = k_size, .n_size = n_size, .tick = tick };
+    entries[slot] = .{ .key = key, .arm = arm, .cfg = cfg, .k_size = k_size, .n_size = n_size, .tick = tick };
     return &entries[slot];
 }
 
@@ -161,16 +246,33 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx
         @import("log.zig").info("[mtp-qmv] row-identical affine8 projections engaged\n", .{});
     }
     const cfg = try configuration(xs, n, k, @intCast(rows), gs);
-    const inputs = [_]mlx.mlx_array{ x, w, sc, bi, cfg.k_size, cfg.n_size };
-    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    rows_arm_calls[@intFromEnum(cfg.arm)] +%= 1;
+    const tile_inputs = [_]mlx.mlx_array{ x, w, sc, bi, cfg.k_size, cfg.n_size };
+    const stream_inputs = [_]mlx.mlx_array{ x, w, sc, bi };
+    const inputs: []const mlx.mlx_array = if (cfg.arm == .tile) &tile_inputs else &stream_inputs;
+    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel.?, iv, cfg.cfg, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, if (cfg.arm == .tile) kernel.? else try streamKernel(), iv, cfg.cfg, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
+}
+
+fn streamKernel() !mlx.mlx_fast_metal_kernel {
+    if (stream_kernel) |value| return value;
+    const names = [_][*:0]const u8{ "x", "w", "scales", "biases" };
+    const outs = [_][*:0]const u8{"y"};
+    const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const value = mlx.mlx_fast_metal_kernel_new("mtp_serial_qmv8_rows_stream", iv, ov, STREAM_SOURCE, "", true, false);
+    if (value.ctx == null) return error.MetalKernelCompileFailed;
+    stream_kernel = value;
+    return value;
 }
 
 pub fn denseMatmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_array {
@@ -179,11 +281,13 @@ pub fn denseMatmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.
     const ws = mlx.getShape(w);
     if (xs.len < 2 or xs.len > 8 or ws.len != 2 or ws[0] <= 0 or ws[1] <= 0 or xs[xs.len - 1] != ws[0]) return null;
     const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(ws[0]));
-    if (rows < 2 or rows > 32) return null;
-    if (try f32GemvRows(s, x, w)) |out| return out;
+    if (rows < 1 or rows > 32) return null;
+    // One row takes the same kernel as a verify row where the kernel exists, else MLX's own matmul.
+    if (rows >= 2) if (try f32GemvRows(s, x, w)) |out| return out;
     if (dense_rows.enabled()) {
         if (try dense_rows.matmul(s, x, w)) |out| return out;
     }
+    if (rows == 1) return null;
     return try serialRows(s, x, w, .{}, .{}, null, @intCast(rows));
 }
 
@@ -372,7 +476,7 @@ fn testSharedRows(gs: c_int) !void {
     const a = std.testing.allocator;
     var random = std.Random.DefaultPrng.init(0x8a57a);
     const rng = random.random();
-    for ([_][2]c_int{ .{ 4096, 8192 }, .{ 12288, 2560 }, .{ 2560, 6144 }, .{ 512, 640 }, .{ 10240, 384 }, .{ 7, 256 }, .{ 8, 128 }, .{ 1, 128 }, .{ 13, 512 }, .{ 9, gs }, .{ 8, gs * 3 }, .{ 8, gs * 9 }, .{ 48, 2560 } }) |dims| {
+    for ([_][2]c_int{ .{ 4096, 8192 }, .{ 12288, 2560 }, .{ 2560, 6144 }, .{ 10240, 2560 }, .{ 6144, 2560 }, .{ 640, 2560 }, .{ 512, 640 }, .{ 10240, 384 }, .{ 7, 256 }, .{ 8, 128 }, .{ 1, 128 }, .{ 13, 512 }, .{ 9, gs }, .{ 8, gs * 3 }, .{ 8, gs * 9 }, .{ 48, 2560 } }) |dims| {
         const n = dims[0];
         const k = dims[1];
         const wh = try a.alloc(u32, @intCast(n * @divExact(k, 4)));
@@ -398,11 +502,14 @@ fn testSharedRows(gs: c_int) !void {
             for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rng.float(f32) - 0.5) * 0.4)) >> 16);
             const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), k }, 2, .bfloat16);
             defer _ = mlx.mlx_array_free(x);
+            const tile_before = rows_arm_calls[0];
             const together = (try matmul(s, x, w, sc, bi)) orelse {
                 std.debug.print("qmv8 declined gs={d} N={d} K={d} M={d}\n", .{ gs, n, k, rows });
                 return error.KernelDeclined;
             };
             defer _ = mlx.mlx_array_free(together);
+            // The trunk geometries leave the two-tile arm from five rows on.
+            if (rows >= 5 and rows <= 7 and @mod(k, 256) == 0 and @mod(n, 16) == 0) try std.testing.expectEqual(tile_before, rows_arm_calls[0]);
             for (0..rows) |row| {
                 var xr = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(xr);

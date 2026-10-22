@@ -49,6 +49,7 @@ test {
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
     _ = @import("dflash.zig");
+    _ = @import("dflash_policy.zig");
     _ = @import("dflash_conv.zig");
     _ = @import("dflash_qmv.zig");
     _ = @import("mtp.zig");
