@@ -414,9 +414,9 @@ pub const DRAFTER_DEPTH_MAX: u32 = 16;
 pub const QWEN_MIN_ROWS: u32 = 2;
 /// The widest verify whose rows are decode-tick identical on qwen4 (`mtp.MAX_DEPTH` drafts + t1).
 pub const QWEN_MAX_ROWS: u32 = 9;
-pub const GLM_DEFAULT_ROWS: u32 = 3;
-/// The widest tree the GLM planner carries.
-pub const GLM_MAX_ROWS: u32 = 4;
+pub const GLM_MIN_ROWS: u32 = 2;
+/// The widest tree a GLM round verifies (`glm5_attention_decode_batch.max_tail`).
+pub const GLM_MAX_ROWS: u32 = 8;
 
 pub fn qwenMinRows() u32 {
     return drafter_min_depth orelse QWEN_MIN_ROWS;
@@ -443,19 +443,12 @@ pub fn qwenRowBounds(min: ?u32, max: ?u32, config_block: u32) error{DrafterDepth
     return .{ .min = lo, .max = hi };
 }
 
-/// GLM-5.3-Flash serves one tree shape: null keeps the engine's own default (two nodes, three rows), an
-/// explicit max sets the rows, and a min is only checked against them.
-pub fn glmRows(min: ?u32, max: ?u32) error{DrafterDepthUnsupported}!?u32 {
-    if (min == null and max == null) return null;
-    const rows = max orelse GLM_DEFAULT_ROWS;
-    if (rows > GLM_MAX_ROWS or (min orelse 0) > rows) return error.DrafterDepthUnsupported;
-    return rows;
-}
-
-/// Draft nodes a GLM round proposes: the block bound, then the two-node default or the flags' rows - 1.
-pub fn glmMaxNodes(block_size: u32, explicit: bool) usize {
-    const cap: u32 = if (explicit) GLM_MAX_ROWS - 1 else GLM_DEFAULT_ROWS - 1;
-    return @min(@max(block_size, 2) - 1, cap);
+/// GLM-5.3-Flash: the rows a round may verify, from the flags or the defaults; the verify path bounds them.
+pub fn glmRowBounds(min: ?u32, max: ?u32) error{DrafterDepthUnsupported}!RowBounds {
+    const hi = max orelse GLM_MAX_ROWS;
+    const lo = min orelse GLM_MIN_ROWS;
+    if (hi > GLM_MAX_ROWS or lo < GLM_MIN_ROWS or lo > hi) return error.DrafterDepthUnsupported;
+    return .{ .min = lo, .max = hi };
 }
 
 test "dflash: a drafter depth parses an integer in 2..16 and names everything else" {
@@ -479,17 +472,14 @@ test "dflash: Qwen rows default to 2..block and are bounded by the drafter block
     try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(9, null, 8));
 }
 
-test "dflash: GLM keeps its own default unless asked, and an explicit 3 is that default" {
-    try testing.expectEqual(@as(?u32, null), try glmRows(null, null));
-    try testing.expectEqual(@as(?u32, 4), try glmRows(null, 4));
-    try testing.expectEqual(@as(?u32, 3), try glmRows(2, null));
-    try testing.expectError(error.DrafterDepthUnsupported, glmRows(null, 5));
-    try testing.expectError(error.DrafterDepthUnsupported, glmRows(4, 3));
-    // unset: the loader's block (8 on the released drafter); explicit 3: block 3.
-    try testing.expectEqual(glmMaxNodes(8, false), glmMaxNodes(3, true));
-    try testing.expectEqual(@as(usize, 2), glmMaxNodes(8, false));
-    try testing.expectEqual(@as(usize, 3), glmMaxNodes(4, true));
-    try testing.expectEqual(@as(usize, 1), glmMaxNodes(2, true));
+test "dflash: GLM rows default to 2..8 and the flags move either end inside them" {
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 8 }, try glmRowBounds(null, null));
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 4 }, try glmRowBounds(null, 4));
+    try testing.expectEqual(RowBounds{ .min = 3, .max = 8 }, try glmRowBounds(3, null));
+    try testing.expectEqual(RowBounds{ .min = 5, .max = 5 }, try glmRowBounds(5, 5));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(null, 9));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(4, 3));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(1, null));
 }
 
 /// Resolve the effective block size: the config's value, capped by what the

@@ -256,30 +256,63 @@ pub const TreeParams = struct {
 };
 
 /// Nodes in the order taken (a parent always before its children): `tokens`,
-/// `parents` (node index, -1 = under the anchor) and `depth` (0 = position 0).
+/// `parents` (node index, -1 = under the anchor), `depth` (0 = position 0) and `cond`, the
+/// selector's probability of the node among its siblings' candidates.
 pub const DraftTree = struct {
     tokens: []u32,
     parents: []i32,
     depth: []u32,
+    cond: []f32,
 
     pub fn deinit(self: *DraftTree, allocator: std.mem.Allocator) void {
         allocator.free(self.tokens);
         allocator.free(self.parents);
         allocator.free(self.depth);
+        allocator.free(self.cond);
+    }
+
+    /// Keeps the nodes at most `rows` deep (the root is row 1) and then the first `keep` of them in the order taken; the
+    /// survivors still follow their parents.
+    pub fn cut(self: *DraftTree, allocator: std.mem.Allocator, rows: usize, keep: usize) !void {
+        var kept: usize = 0;
+        var moved: [16]i32 = undefined;
+        for (0..self.tokens.len) |i| {
+            if (self.depth[i] + 2 > rows or kept >= keep) continue;
+            moved[i] = @intCast(kept);
+            self.tokens[kept] = self.tokens[i];
+            self.depth[kept] = self.depth[i];
+            self.cond[kept] = self.cond[i];
+            self.parents[kept] = if (self.parents[i] < 0) -1 else moved[@intCast(self.parents[i])];
+            kept += 1;
+        }
+        self.tokens = try allocator.realloc(self.tokens, kept);
+        self.parents = try allocator.realloc(self.parents, kept);
+        self.depth = try allocator.realloc(self.depth, kept);
+        self.cond = try allocator.realloc(self.cond, kept);
     }
 };
 
+/// The best-first tree with its nodes renumbered depth-first.
 pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeParams) !DraftTree {
+    var tree = try bestFirstNodes(allocator, lat, p);
+    errdefer tree.deinit(allocator);
+    try preorder(allocator, &tree);
+    return tree;
+}
+
+/// The nodes in the order taken: node n is the n-th likeliest, so any prefix is the best tree of that size.
+pub fn bestFirstNodes(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeParams) !DraftTree {
     try validateLattice(lat, p);
     const k = lat.k;
-    const Item = struct { value: f32, parent: i32, depth: u32, cand: u32 };
+    const Item = struct { value: f32, parent: i32, depth: u32, cand: u32, step: f32 };
     var queue: std.ArrayList(Item) = .empty;
     defer queue.deinit(allocator);
-    var tree = DraftTree{ .tokens = &.{}, .parents = &.{}, .depth = &.{} };
+    var tree = DraftTree{ .tokens = &.{}, .parents = &.{}, .depth = &.{}, .cond = &.{} };
     errdefer tree.deinit(allocator);
     tree.tokens = try allocator.alloc(u32, p.max_nodes);
     tree.parents = try allocator.alloc(i32, p.max_nodes);
     tree.depth = try allocator.alloc(u32, p.max_nodes);
+    tree.cond = try allocator.alloc(f32, p.max_nodes);
     var scores: [64]f32 = undefined;
     std.debug.assert(k <= scores.len);
 
@@ -308,7 +341,7 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
                     best = j;
                 };
                 taken[best] = true;
-                try q.append(alloc, .{ .value = base + best_v - lse, .parent = parent, .depth = depth, .cand = @intCast(best) });
+                try q.append(alloc, .{ .value = base + best_v - lse, .parent = parent, .depth = depth, .cand = @intCast(best), .step = @exp(best_v - lse) });
             }
         }
     };
@@ -323,6 +356,7 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
         tree.tokens[n] = @intCast(lat.cands[@as(usize, it.depth) * k + it.cand]);
         tree.parents[n] = it.parent;
         tree.depth[n] = it.depth;
+        tree.cond[n] = it.step;
         if (it.depth + 1 < lat.m) try Push.run(allocator, &queue, lat, scores[0..k], p, @intCast(n), it.cand, it.depth + 1, it.value);
         n += 1;
     }
@@ -330,15 +364,15 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
         tree.tokens = try allocator.realloc(tree.tokens, n);
         tree.parents = try allocator.realloc(tree.parents, n);
         tree.depth = try allocator.realloc(tree.depth, n);
+        tree.cond = try allocator.realloc(tree.cond, n);
     }
-    try preorder(allocator, &tree);
     return tree;
 }
 
 /// Renumber the nodes depth-first, each node's children in the order they
 /// were taken (best first): the likeliest path lands on consecutive rows, so
 /// a round that keeps it moves no KV rows.
-fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
+pub fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     const n = t.tokens.len;
     if (n == 0) return;
     const order = try allocator.alloc(usize, n);
@@ -370,9 +404,12 @@ fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     defer allocator.free(parents);
     const depth = try allocator.dupe(u32, t.depth);
     defer allocator.free(depth);
+    const cond = try allocator.dupe(f32, t.cond);
+    defer allocator.free(cond);
     for (order, 0..) |old, i| {
         t.tokens[i] = tokens[old];
         t.depth[i] = depth[old];
+        t.cond[i] = cond[old];
         t.parents[i] = if (parents[old] < 0) -1 else new_index[@intCast(parents[old])];
     }
 }
@@ -472,6 +509,70 @@ test "GLM DFlash best-first tree visits likely ancestry before siblings" {
     try std.testing.expectError(error.InvalidGlmDraftLattice, bestFirstTree(a, &lat, .{ .max_nodes = 3 }));
 }
 
+
+fn fixtureLattice(cands: *[7 * 4]i32, unary: *[7 * 4]f32, anchor: *[4]f32, edges: *[6 * 4 * 4]f32) Lattice {
+    for (cands, unary, 0..) |*id, *v, i| {
+        id.* = @intCast(100 + i);
+        v.* = @as(f32, @floatFromInt((i * 7) % 13)) / 8 - 0.5;
+    }
+    for (anchor, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 3)) / 4;
+    for (edges, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 3) % 17)) / 8 - 0.75;
+    return .{ .m = 7, .k = 4, .cands = cands, .unary = unary, .e0 = anchor, .e = edges };
+}
+
+test "GLM best-first nodes in the order taken: any prefix is the best tree of that size, with its selector probabilities" {
+    const a = std.testing.allocator;
+    var cands: [7 * 4]i32 = undefined;
+    var unary: [7 * 4]f32 = undefined;
+    var anchor: [4]f32 = undefined;
+    var edges: [6 * 4 * 4]f32 = undefined;
+    const lat = fixtureLattice(&cands, &unary, &anchor, &edges);
+    var full = try bestFirstNodes(a, &lat, .{ .max_nodes = 7 });
+    defer full.deinit(a);
+    for (1..7) |n| {
+        var small = try bestFirstNodes(a, &lat, .{ .max_nodes = n });
+        defer small.deinit(a);
+        try std.testing.expectEqualSlices(u32, full.tokens[0..n], small.tokens);
+        try std.testing.expectEqualSlices(i32, full.parents[0..n], small.parents);
+        try std.testing.expectEqualSlices(f32, full.cond[0..n], small.cond);
+    }
+    var roots: f32 = 0;
+    for (full.cond, full.parents) |c, parent| {
+        try std.testing.expect(c > 0 and c <= 1);
+        if (parent < 0) roots += c;
+    }
+    try std.testing.expect(roots <= 1.0001);
+}
+
+test "GLM draft tree cut keeps the rows that fit, then the likeliest nodes, and the survivors follow their parents" {
+    const a = std.testing.allocator;
+    var cands: [7 * 4]i32 = undefined;
+    var unary: [7 * 4]f32 = undefined;
+    var anchor: [4]f32 = undefined;
+    var edges: [6 * 4 * 4]f32 = undefined;
+    const lat = fixtureLattice(&cands, &unary, &anchor, &edges);
+    var whole = try bestFirstNodes(a, &lat, .{ .max_nodes = 7 });
+    defer whole.deinit(a);
+    var three = try bestFirstNodes(a, &lat, .{ .max_nodes = 3 });
+    defer three.deinit(a);
+    var kept = try bestFirstNodes(a, &lat, .{ .max_nodes = 7 });
+    defer kept.deinit(a);
+    try kept.cut(a, 8, 3);
+    try std.testing.expectEqualSlices(u32, three.tokens, kept.tokens);
+    try std.testing.expectEqualSlices(i32, three.parents, kept.parents);
+    var shallow = try bestFirstNodes(a, &lat, .{ .max_nodes = 7 });
+    defer shallow.deinit(a);
+    try shallow.cut(a, 3, 7);
+    for (shallow.depth, shallow.parents, 0..) |depth, parent, i| {
+        try std.testing.expect(depth <= 1);
+        try std.testing.expect(parent < @as(i32, @intCast(i)));
+    }
+    try std.testing.expect(shallow.tokens.len >= 1 and shallow.tokens.len <= whole.tokens.len);
+    var none = try bestFirstNodes(a, &lat, .{ .max_nodes = 7 });
+    defer none.deinit(a);
+    try none.cut(a, 1, 7);
+    try std.testing.expectEqual(@as(usize, 0), none.tokens.len);
+}
 
 test "GLM sampled tree visits only the target-selected path and preserves categorical probabilities" {
     const Fixture = struct {

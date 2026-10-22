@@ -98,7 +98,7 @@ fn outputTiles(comptime source: []const u8, comptime members: usize) [:0]const u
     return tileKLoops(body) ++ "\nfor(uint tile=0;tile<uint(TILES);++tile){\nconst uint ot=ot0+tile;\n" ++
         replace(source[cut..], "acc[", "acc[tile][") ++ "\nthreadgroup_barrier(mem_flags::mem_threadgroup);\n}\n";
 }
-fn groupedSource(comptime triples: bool) [:0]const u8 {
+fn groupedSource(comptime triples: bool, comptime tiled: bool) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     const original = replace(support.cooperative_source, "threadgroup float partial[4 * 256];", "");
     const cut = std.mem.indexOf(u8, original, "for (uint si = 0u; si < 8u; si++)").?;
@@ -113,6 +113,7 @@ fn groupedSource(comptime triples: bool) [:0]const u8 {
     paired = replace(paired, "const float ins[8]", "const float2 ins[8]");
     paired = replace(paired, "acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);", "acc[0][p*2u]=fma(ins[p*2u].x,w.x,acc[0][p*2u]); acc[1][p*2u]=fma(ins[p*2u].y,w.x,acc[1][p*2u]);");
     paired = replace(paired, "acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);", "acc[0][p*2u+1u]=fma(ins[p*2u+1u].x,w.y,acc[0][p*2u+1u]); acc[1][p*2u+1u]=fma(ins[p*2u+1u].y,w.y,acc[1][p*2u+1u]);");
+    if (tiled) return MEMBERS ++ "\nif(partner==first) {\n" ++ outputTiles(original, 1) ++ "\n} else {\n" ++ outputTiles(paired ++ EPILOGUE, 2) ++ "\n}\n";
     if (!triples) return MEMBERS ++ "\nif(partner==first) {\n" ++ original ++ "\n} else {\n" ++ paired ++ EPILOGUE ++ "\n}\n";
     var triple = replace(paired, "float acc[2][8]", "float acc[3][8]");
     triple = replace(triple, "xb1=size_t(partner)*uint(IDIM);", "xb1=size_t(partner)*uint(IDIM), xb2=size_t(third)*uint(IDIM);");
@@ -127,14 +128,15 @@ fn groupedSource(comptime triples: bool) [:0]const u8 {
     const epilogue = replace(replace(replace(EPILOGUE, "j<2u", "j<3u"), "j==0u?first:partner", "j==0u?first:(j==1u?partner:third)"), "if(lid<32u)", "if(lid<48u)");
     return THREE_MEMBERS ++ "\nif(partner==first) {\n" ++ outputTiles(original, 1) ++ "\n} else if(third==first) {\n" ++ outputTiles(paired ++ EPILOGUE, 2) ++ "\n} else {\n" ++ outputTiles(triple ++ epilogue, 3) ++ "\n}\n";
 }
-const SOURCE = groupedSource(false);
-const THREE_SOURCE = groupedSource(true);
-const PAIR_SOURCE: [:0]const u8 =
-    \\const bool upper=threadgroup_position_in_grid.z!=0u;
-    \\const device half* x=upper?xu:xg;
-    \\const device ushort* trellis=upper?tu:tg;
-    \\device half* y=upper?yu:yg;
-++ replace(SOURCE, "uint split = uint(threadgroup_position_in_grid.z);", "uint split=0u;");
+const SOURCE = groupedSource(false, false);
+const THREE_SOURCE = groupedSource(true, false);
+const TILED_SOURCE = groupedSource(false, true);
+fn pairSource(comptime source: []const u8) [:0]const u8 {
+    return "const bool upper=threadgroup_position_in_grid.z!=0u;\nconst device half* x=upper?xu:xg;\nconst device ushort* trellis=upper?tu:tg;\ndevice half* y=upper?yu:yg;\n" ++
+        replace(source, "uint split = uint(threadgroup_position_in_grid.z);", "uint split=0u;");
+}
+const PAIR_SOURCE = pairSource(SOURCE);
+const TILED_PAIR_SOURCE = pairSource(TILED_SOURCE);
 fn laneSource(comptime source: []const u8) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     var result: []const u8 = source;
@@ -152,8 +154,8 @@ fn laneSource(comptime source: []const u8) [:0]const u8 {
     }
     return result ++ "";
 }
-const LANE_SOURCE = laneSource(SOURCE);
-const LANE_PAIR_SOURCE = laneSource(PAIR_SOURCE);
+const LANE_TILED_SOURCE = laneSource(TILED_SOURCE);
+const LANE_TILED_PAIR_SOURCE = laneSource(TILED_PAIR_SOURCE);
 const LANE_THREE_SOURCE = laneSource(THREE_SOURCE);
 const LANE_THREE_PAIR_SOURCE = laneSource(
     "const bool upper=threadgroup_position_in_grid.z!=0u;\nconst device half* x=upper?xu:xg;\nconst device ushort* trellis=upper?tu:tg;\ndevice half* y=upper?yu:yg;\n" ++
@@ -161,8 +163,8 @@ const LANE_THREE_PAIR_SOURCE = laneSource(
 );
 var three_lane_kernels: support.Slots = support.empty;
 var three_pair_lane_kernels: support.Slots = support.empty;
-var single_lane_kernels: support.Slots = support.empty;
-var pair_lane_kernels: support.Slots = support.empty;
+var tiled_lane_kernels: support.Slots = support.empty;
+var tiled_pair_lane_kernels: support.Slots = support.empty;
 var single_kernels: support.Slots = support.empty;
 var pair_kernels: support.Slots = support.empty;
 const Key = struct { input: c_int, output: c_int, slots: c_int, rate: c_int, paired: bool, reduction: Reduction, tiles: c_int = 1 };
@@ -206,11 +208,11 @@ pub fn projectLayout(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: 
     if (!mlx.streamIsGpu(s) or !eligible(x, bank, ids)) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(bank);
-    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = false, .reduction = reduction, .tiles = if (layout == .lane and xs[0] == 24) 2 else 1 });
+    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = false, .reduction = reduction, .tiles = if (layout == .lane) 2 else 1 });
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_lane_kernels, "sushi_glm_exl3_group3_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_THREE_SOURCE) else if (layout == .lane) try support.makeKernel(&single_lane_kernels, "sushi_glm_exl3_group2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_SOURCE) else try support.makeKernel(&single_kernels, "sushi_glm_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
+    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_lane_kernels, "sushi_glm_exl3_group3_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_THREE_SOURCE) else if (layout == .lane) try support.makeKernel(&tiled_lane_kernels, "sushi_glm_exl3_group2_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_TILED_SOURCE) else try support.makeKernel(&single_kernels, "sushi_glm_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ x, bank, ids }, 3);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -228,11 +230,11 @@ pub fn pairLayout(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Ar
     if (!mlx.streamIsGpu(s) or !eligible(xg, tg, ids) or !eligible(xu, tu, ids) or !std.mem.eql(c_int, mlx.getShape(tg), mlx.getShape(tu)) or !std.mem.eql(c_int, mlx.getShape(xg), mlx.getShape(xu))) return null;
     const xs = mlx.getShape(xg);
     const ws = mlx.getShape(tg);
-    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = true, .reduction = reduction, .tiles = if (layout == .lane and xs[0] == 24) 2 else 1 });
+    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = true, .reduction = reduction, .tiles = if (layout == .lane) 2 else 1 });
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_pair_lane_kernels, "sushi_glm_exl3_pair_group3_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_THREE_PAIR_SOURCE) else if (layout == .lane) try support.makeKernel(&pair_lane_kernels, "sushi_glm_exl3_pair_group2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_PAIR_SOURCE) else try support.makeKernel(&pair_kernels, "sushi_glm_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
+    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_pair_lane_kernels, "sushi_glm_exl3_pair_group3_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_THREE_PAIR_SOURCE) else if (layout == .lane) try support.makeKernel(&tiled_pair_lane_kernels, "sushi_glm_exl3_pair_group2_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_TILED_PAIR_SOURCE) else try support.makeKernel(&pair_kernels, "sushi_glm_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ xg, xu, tg, tu, ids }, 5);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -506,7 +508,7 @@ test "GLM group2 half4 composition preserves all-rate cooperative projection bit
         defer owned.deinit();
         const g = try owned.weights(32, k, n, rate, 987);
         const u = try owned.weights(32, k, n, rate, 977);
-        for ([_]c_int{ 3, 24, 32, 65, 128 }) |count| {
+        for ([_]c_int{ 2, 3, 16, 24, 32, 40, 48, 56, 64, 65, 128 }) |count| {
             const xg = try owned.floats(&.{ count, k }, .float16, 877, 0.3, s);
             const xu = try owned.floats(&.{ count, k }, .float16, 857, 0.5, s);
             const pg = try laneInput(&owned, xg, s);

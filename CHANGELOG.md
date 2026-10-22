@@ -9,6 +9,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Qwen3.8-Flash-Next verifies 2 to 8 rows at an even price per row**: MTP and DFlash2 rounds of five rows and wider no longer pay a step at the fifth and seventh row, an eight-row verify is about 16% faster, and the output stays byte-identical to serial decoding. DFlash2 prices its rows from the measured cost, so it verifies more rows where drafts pay.
 - **Qwen with DFlash2 reserves the memory it uses**: the MTP head's cache is no longer reserved for requests DFlash2 serves and the drafter counts at its loaded size, so about 2.8 GB more fits at 1M context, while a model swap now reserves the drafter's per-request memory it used to miss.
 - **DFlash2 speeds up image, video and sampled requests on Qwen3.8-Flash-Next**: a request with images now decodes with the drafter (about 1.7-2x plain decoding, output unchanged) instead of falling back to plain decoding, and the speed gate judges a request on its steady rounds against today's verify cost, so it no longer stops DFlash2 where it is winning.
+- **Adaptive DFlash2 for GLM-5.3-Flash**: GLM verifies 2 to 8 draft rows per round as the drafter's confidence pays, and a request whose drafts stop paying falls back to plain decoding and retries later (`--drafter-min-depth` / `--drafter-max-depth`).
 
 ## v1.3.0 — Qwen EXL3 Quantizer, Adaptive DFlash2, KV6, Dashboard
 

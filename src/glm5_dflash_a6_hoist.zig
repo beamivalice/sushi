@@ -1,4 +1,4 @@
-//! Exact A5/A6 masked-coefficient hoist; original row arithmetic retained.
+//! Exact A5/A6 masked-coefficient hoist for the three-row MLA value bank; original row arithmetic retained.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
@@ -148,98 +148,6 @@ const HEAD_SOURCE: [:0]const u8 = blk: {
     body = replace(body, "(token0 + m) * N", "((token0 + m)*64+head) * N");
     break :blk body;
 };
-// Preserve qmv_fast's BF16 sum boundaries and power-of-two scaling once per input.
-const INPUT_PREP_SOURCE =
-    \\const uint group=thread_position_in_grid.x;
-    \\constexpr uint V=BITS==5?16:8;
-    \\if(group>=uint(M*K/V))return;
-    \\const uint at=group*V;
-    \\float sum=0.0f;
-    \\if(BITS==5) for(uint i=0;i<16;i+=8) {
-    \\ sum+=x[at+i]+x[at+i+1]+x[at+i+2]+x[at+i+3]+x[at+i+4]+x[at+i+5]+x[at+i+6]+x[at+i+7];
-    \\ px[at+i]=float(x[at+i]);
-    \\ px[at+i+1]=float(x[at+i+1])/32.0f;
-    \\ px[at+i+2]=float(x[at+i+2])/4.0f;
-    \\ px[at+i+3]=float(x[at+i+3])/128.0f;
-    \\ px[at+i+4]=float(x[at+i+4])/16.0f;
-    \\ px[at+i+5]=float(x[at+i+5])/2.0f;
-    \\ px[at+i+6]=float(x[at+i+6])/64.0f;
-    \\ px[at+i+7]=float(x[at+i+7])/8.0f;
-    \\} else for(uint i=0;i<8;i+=4) {
-    \\ sum+=x[at+i]+x[at+i+1]+x[at+i+2]+x[at+i+3];
-    \\ px[at+i]=float(x[at+i]);
-    \\ px[at+i+1]=float(x[at+i+1])/64.0f;
-    \\ px[at+i+2]=float(x[at+i+2])/16.0f;
-    \\ px[at+i+3]=float(x[at+i+3])/4.0f;
-    \\}
-    \\ps[group]=sum;
-;
-const PREPARED_SOURCE: [:0]const u8 = blk: {
-    const start = std.mem.indexOf(u8, SOURCE, "  for (int m = 0; m < R; ++m) {\n    sum[m]").?;
-    const end = std.mem.indexOfPos(u8, SOURCE, start, "  for (int r = 0; r < 2;").?;
-    break :blk SOURCE[0..start] ++
-        "  for(int m=0;m<R;++m){sum[m]=ps[m*(K/V)+k/V+lane];for(int i=0;i<V;++i)local[m][i]=px[m*K+k+lane*V+i];}\n" ++ SOURCE[end..];
-};
-var prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const PrepConfig = struct { k: c_int, bits: c_int, config: mlx.mlx_fast_metal_kernel_config };
-var prepare_configs: [8]?PrepConfig = @splat(null);
-const Prepared = struct {
-    scaled: Arr,
-    sums: Arr,
-    fn deinit(self: Prepared) void {
-        _ = mlx.mlx_array_free(self.scaled);
-        _ = mlx.mlx_array_free(self.sums);
-    }
-};
-fn prepare(stream: mlx.mlx_stream, x: Arr, k: c_int, bits: c_int) !Prepared {
-    if (prepare_kernel == null) {
-        const iv = mlx.mlx_vector_string_new_data(&.{"x"}, 1);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&.{ "px", "ps" }, 2);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const kernel = mlx.mlx_fast_metal_kernel_new("sushi_a6_prepare_three", iv, ov, INPUT_PREP_SOURCE, "", true, false);
-        if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-        prepare_kernel = kernel;
-    }
-    var cached: ?mlx.mlx_fast_metal_kernel_config = null;
-    for (prepare_configs) |entry| if (entry) |v| {
-        if (v.k == k and v.bits == bits) {
-            cached = v.config;
-            break;
-        }
-    };
-    const config = cached orelse mlx.mlx_fast_metal_kernel_config_new();
-    var retained = cached != null;
-    defer if (!retained) {
-        _ = mlx.mlx_fast_metal_kernel_config_free(config);
-    };
-    if (cached == null) {
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &.{ 1, 3, k }, 3, .float32));
-        const lane_values: c_int = if (bits == 5) 16 else 8;
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &.{ 1, 3, @divExact(k, lane_values) }, 3, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 3 * @divExact(k, lane_values), 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "M", 3));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", k));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", bits));
-        for (&prepare_configs) |*entry| if (entry.* == null) {
-            entry.* = .{ .k = k, .bits = bits, .config = config };
-            retained = true;
-            break;
-        };
-    }
-    const iv = mlx.mlx_vector_array_new_value(x);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    var ov = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, prepare_kernel.?, iv, config, stream));
-    var result = Prepared{ .scaled = mlx.mlx_array_new(), .sums = mlx.mlx_array_new() };
-    errdefer result.deinit();
-    try mlx.check(mlx.mlx_vector_array_get(&result.scaled, ov, 0));
-    try mlx.check(mlx.mlx_vector_array_get(&result.sums, ov, 1));
-    return result;
-}
-
 var dispatch_count: usize = 0;
 pub fn dispatchCount() usize {
     return dispatch_count;
@@ -247,8 +155,8 @@ pub fn dispatchCount() usize {
 pub fn resetDispatchCount() void {
     dispatch_count = 0;
 }
-var kernels: [3]?mlx.mlx_fast_metal_kernel = @splat(null);
-const Key = struct { m: c_int, n: c_int, k: c_int, bits: c_int, headed: bool, prepared: bool };
+var kernel: ?mlx.mlx_fast_metal_kernel = null;
+const Key = struct { m: c_int, n: c_int, k: c_int, bits: c_int };
 const Cached = struct { key: Key, config: mlx.mlx_fast_metal_kernel_config };
 var configs: [32]?Cached = @splat(null);
 
@@ -269,35 +177,29 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     if (!mlx.streamIsGpu(stream) or x.ctx == null or linear.w.ctx == null or linear.scales.ctx == null or linear.biases.ctx == null) return null;
     const sh = mlx.getShape(x);
     const ws = mlx.getShape(linear.w);
-    const headed = sh.len == 4;
-    if (headed) {
-        if (!std.mem.eql(c_int, sh, &.{ 3, 64, 1, 512 }) or !(std.mem.eql(c_int, ws, &.{ 64, 256, 96 }) or std.mem.eql(c_int, ws, &.{ 64, 256, 80 }))) return null;
-    } else if (sh.len != 3 or sh[0] != 1 or (sh[1] != 3 and sh[1] != 4) or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0) return null;
-    const k = sh[sh.len - 1];
-    const n = ws[ws.len - 2];
-    const bits: c_int = if (@as(i64, ws[ws.len - 1]) * 16 == @as(i64, k) * 3) 6 else if (@mod(k, 512) == 0 and @as(i64, ws[ws.len - 1]) * 32 == @as(i64, k) * 5) 5 else return null;
+    if (!std.mem.eql(c_int, sh, &.{ 3, 64, 1, 512 }) or !(std.mem.eql(c_int, ws, &.{ 64, 256, 96 }) or std.mem.eql(c_int, ws, &.{ 64, 256, 80 }))) return null;
+    const k = sh[3];
+    const n = ws[1];
+    const bits: c_int = if (@as(i64, ws[2]) * 16 == @as(i64, k) * 3) 6 else if (@mod(k, 512) == 0 and @as(i64, ws[2]) * 32 == @as(i64, k) * 5) 5 else return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(linear.w) != .uint32 or !(try rowMajorReady(linear.w))) return null;
     const grid_shape = [_]c_int{ 64, n, @divExact(k, 128) };
     for ([_]Arr{ linear.scales, linear.biases }) |grid| {
-        if (mlx.mlx_array_dtype(grid) != .bfloat16 or !std.mem.eql(c_int, if (headed) &grid_shape else grid_shape[1..], mlx.getShape(grid)) or !(try rowMajorReady(grid))) return null;
+        if (mlx.mlx_array_dtype(grid) != .bfloat16 or !std.mem.eql(c_int, &grid_shape, mlx.getShape(grid)) or !(try rowMajorReady(grid))) return null;
     }
-    const prepared = if (@import("glm5_model.zig").naxArms() and !headed and sh[1] == 3 and n >= 4096 and k >= 4096) try prepare(stream, x, k, bits) else null;
-    defer if (prepared) |value| value.deinit();
-    const kernel = &kernels[if (prepared != null) @as(usize, 2) else @intFromBool(headed)];
-    if (kernel.* == null) {
-        const ins = [_][*:0]const u8{ "x", "w", "scales", "biases", "px", "ps" };
+    if (kernel == null) {
+        const ins = [_][*:0]const u8{ "x", "w", "scales", "biases" };
         const outs = [_][*:0]const u8{"y"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, if (prepared != null) 6 else 4);
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        kernel.* = mlx.mlx_fast_metal_kernel_new(if (prepared != null) "sushi_glm_a6_prepared" else if (headed) "sushi_glm_value_three_rows" else "sushi_glm_dflash_affine6_hoisted", iv, ov, if (prepared != null) PREPARED_SOURCE else if (headed) HEAD_SOURCE else SOURCE, "", true, false);
-        if (kernel.*.?.ctx == null) {
-            kernel.* = null;
+        kernel = mlx.mlx_fast_metal_kernel_new("sushi_glm_value_three_rows", iv, ov, HEAD_SOURCE, "", true, false);
+        if (kernel.?.ctx == null) {
+            kernel = null;
             return error.MetalKernelCompileFailed;
         }
     }
-    const key = Key{ .m = if (headed) sh[0] else sh[1], .n = n, .k = k, .bits = bits, .headed = headed, .prepared = prepared != null };
+    const key = Key{ .m = sh[0], .n = n, .k = k, .bits = bits };
     var cached: ?mlx.mlx_fast_metal_kernel_config = null;
     for (configs) |item| if (item) |entry| if (std.meta.eql(key, entry.key)) {
         cached = entry.config;
@@ -309,16 +211,13 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
         _ = mlx.mlx_fast_metal_kernel_config_free(config);
     };
     if (cached == null) {
-        const tile: c_int = if (key.m < 4) key.m else 4;
-        const output_shape: []const c_int = if (headed) &.{ key.m, 64, 1, key.n } else &.{ 1, key.m, key.n };
-        const threads: c_int = if (headed) 64 else 128;
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, output_shape.ptr, output_shape.len, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(key.n, 8) * threads, @divTrunc(key.m + tile - 1, tile), if (headed) 64 else 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, threads, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &.{ key.m, 64, 1, key.n }, 4, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(key.n, 8) * 64, @divTrunc(key.m + 3, 4), 64));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "M", key.m));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "N", key.n));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", key.k));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "R", tile));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "R", if (key.m < 4) key.m else 4));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", bits));
         for (&configs) |*item| if (item.* == null) {
             item.* = .{ .key = key, .config = config };
@@ -326,12 +225,12 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
             break;
         };
     }
-    const arrays = [_]Arr{ x, linear.w, linear.scales, linear.biases, if (prepared) |v| v.scaled else .{ .ctx = null }, if (prepared) |v| v.sums else .{ .ctx = null } };
-    const iv = mlx.mlx_vector_array_new_data(&arrays, if (prepared != null) 6 else 4);
+    const arrays = [_]Arr{ x, linear.w, linear.scales, linear.biases };
+    const iv = mlx.mlx_vector_array_new_data(&arrays, arrays.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel.*.?, iv, config, stream));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel.?, iv, config, stream));
     var output = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(output);
     try mlx.check(mlx.mlx_vector_array_get(&output, ov, 0));

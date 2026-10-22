@@ -1,4 +1,4 @@
-//! Verification-only latent prefix plus at most four ancestry rows.
+//! Verification-only latent prefix plus at most `max_rows` ancestry rows.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -130,7 +130,8 @@ test "GLM latent overlay byte bill excludes immutable prefix" {
     try std.testing.expectEqual(@as(usize, 3072), try tailBytes(512, 3, 2));
     try std.testing.expectEqual(@as(usize, 6144), try tailBytes(512, 3, 4));
     try std.testing.expectEqual(@as(usize, 4096), try tailBytes(512, 4, 2));
-    try std.testing.expectError(error.InvalidGlmOverlay, tailBytes(512, 5, 2));
+    try std.testing.expectEqual(@as(usize, 8192), try tailBytes(512, 8, 2));
+    try std.testing.expectError(error.InvalidGlmOverlay, tailBytes(512, max_rows + 1, 2));
 }
 
 fn fork(source: *const @import("glm5_attention.zig").State) !@import("glm5_attention.zig").State {
@@ -169,13 +170,13 @@ test "GLM latent overlay branch outputs index state and commit match full append
         const ape = try ops.zeros(&.{ 4, 8 }, dtype);
         _ = try source.append(try normal(&ops, &.{ @intCast(prefix), 32 }, dtype, 11), try normal(&ops, &.{ @intCast(prefix), 8 }, dtype, 12), try ops.zeros(&.{ @intCast(prefix), 8 }, dtype), ape, s);
         try source.evaluate();
-        const latents = try normal(&ops, &.{ 4, 32 }, dtype, 31);
-        const keys = try normal(&ops, &.{ 4, 8 }, dtype, 32);
-        const gates = try ops.zeros(&.{ 4, 8 }, dtype);
-        const queries = try normal(&ops, &.{ 4, 2, 32 }, dtype, 41);
-        const iq = try normal(&ops, &.{ 4, 2, 8 }, dtype, 42);
-        const iw = try ops.ones(&.{ 4, 2 }, dtype);
-        for ([_][]const u32{ &.{0}, &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 2 }, &.{ 0, 1, 2, 3 } }) |path| {
+        const latents = try normal(&ops, &.{ max_rows, 32 }, dtype, 31);
+        const keys = try normal(&ops, &.{ max_rows, 8 }, dtype, 32);
+        const gates = try ops.zeros(&.{ max_rows, 8 }, dtype);
+        const queries = try normal(&ops, &.{ max_rows, 2, 32 }, dtype, 41);
+        const iq = try normal(&ops, &.{ max_rows, 2, 8 }, dtype, 42);
+        const iw = try ops.ones(&.{ max_rows, 2 }, dtype);
+        for ([_][]const u32{ &.{0}, &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 2 }, &.{ 0, 1, 2, 3 }, &.{ 0, 1, 2, 3, 4 }, &.{ 0, 2, 5, 7 }, &.{ 0, 1, 2, 3, 4, 5, 6, 7 } }) |path| {
             var original = try fork(&source);
             defer original.deinit();
             var virtual = try fork(&source);

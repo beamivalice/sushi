@@ -125,8 +125,8 @@ const HEADER5: [:0]const u8 =
     \\ }
     \\}
 ;
-pub const Kernel = enum { qkv, hoist, tiles, shared, kda_project };
-var logged: [5][9]bool = @splat(@splat(false));
+pub const Kernel = enum { qkv, hoist, tiles, shared, kda_project, rows };
+var logged: [6][9]bool = @splat(@splat(false));
 /// One line per kernel and stored width names the affine paths a pack reaches.
 pub fn logEngaged(comptime kernel: Kernel, bits: c_int) void {
     const seen = &logged[@intFromEnum(kernel)][@intCast(bits)];
@@ -138,6 +138,7 @@ pub fn logEngaged(comptime kernel: Kernel, bits: c_int) void {
         .tiles => "[glm-dflash] affine row tiles",
         .shared => "[glm] shared-expert gate/up/activation fusion",
         .kda_project => "[glm] KDA q/k/v/f_a/g_a/beta projection",
+        .rows => "[glm-dflash] row-streaming projections",
     };
     @import("log.zig").info("{s} engaged (A{d}g128)\n", .{ label, bits });
 }

@@ -57,6 +57,7 @@ test {
     _ = @import("mimo_mtp.zig");
     _ = @import("mtp_dense_rows.zig");
     _ = @import("round_cost.zig");
+    _ = @import("spec_cost_gate.zig");
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("qwen4_exp.zig");

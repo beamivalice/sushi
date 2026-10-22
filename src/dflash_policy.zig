@@ -67,12 +67,54 @@ pub fn chooseRows(p: []const f32, costs: *const Costs) Choice {
         alive *= if (pk >= 0) @min(pk, 1) else 0; // a NaN is no acceptance
         tokens[k + 2] = tokens[k + 1] + alive;
     }
+    return bestRows(&tokens, n, costs);
+}
+
+fn bestRows(tokens: *const [MAX_ROWS + 1]f32, n: usize, costs: *const Costs) Choice {
     var best: f32 = 0;
     for (1..n + 2) |r| best = @max(best, tokens[r] / costs[r]);
     for (1..n + 2) |r| {
         if (tokens[r] / costs[r] >= best * (1 - ROW_TIE)) return .{ .rows = @intCast(r), .tokens = tokens[r] };
     }
     return .{ .rows = 1, .tokens = 1 };
+}
+
+/// Round cost for a ladder that starts at `first` for one row and adds `step` per row.
+pub fn linearLadder(first: f32, step: f32) Costs {
+    var out: Costs = undefined;
+    out[0] = 0;
+    for (1..MAX_ROWS + 1) |r| out[r] = first + step * @as(f32, @floatFromInt(r - 1));
+    return out;
+}
+
+/// GLM-5.3-Flash-Sushi-2.4bpw on an M5 Max, ms of a round by verify rows: the verify of one chain, the mean of 1K and
+/// 8K history (33-35, 38-41, 45-48, 54-59, 61-68, 76-86, 79-91 ms at 2..8 rows), plus about 7.4 ms of draft, replay
+/// and commit; one row is the plain tick, 30 ms. Past eight rows the cost grows 13 ms a row.
+pub fn glmLadder() Costs {
+    var out: Costs = undefined;
+    const ms = [_]f32{ 0, 30, 41.3, 46.9, 53.6, 63.6, 72.0, 88.1, 92.6 };
+    for (0..MAX_ROWS + 1) |r| out[r] = if (r < ms.len) ms[r] else ms[ms.len - 1] + 13 * @as(f32, @floatFromInt(r - ms.len + 1));
+    return out;
+}
+
+/// The widest tree a round drafts unless the flags ask otherwise; the ladder and the calibrated confidences decide
+/// how much of it a round uses.
+pub const GLM_USEFUL_ROWS: u32 = 8;
+
+/// Rows for a tree of drafts in the order taken (`parents[k]` is a draft index before k, or -1 under t1; `conf[k]`
+/// the drafter's probability of draft k among its siblings): a draft adds the probability that the accepted path
+/// runs through it, since at most one sibling does.
+pub fn chooseTreeRows(calib: *const Calibration, parents: []const i32, conf: []const f32, costs: *const Costs) Choice {
+    const n: usize = @min(@min(parents.len, conf.len), MAX_DRAFTS);
+    var tokens: [MAX_ROWS + 1]f32 = undefined;
+    var path: [MAX_DRAFTS]f32 = undefined;
+    tokens[1] = 1;
+    for (0..n) |k| {
+        const own = calib.probability(conf[k]);
+        path[k] = (if (own >= 0) @min(own, 1) else 0) * (if (parents[k] < 0) 1 else path[@intCast(parents[k])]);
+        tokens[k + 2] = tokens[k + 1] + path[k];
+    }
+    return bestRows(&tokens, n, costs);
 }
 
 /// Probability that a draft is accepted given its predecessors were, by the drafter's confidence in it:
@@ -122,7 +164,22 @@ pub const Calibration = struct {
             self.observe(conf[k], k < accepted);
         }
     }
+
+    /// A verified tree: row k (parent row `parents[k]`, 0 = t1) was reached when its parent was accepted, and is
+    /// accepted when it is on the path `accepted` (rows in order, t1 first).
+    pub fn observeTree(self: *Calibration, conf: []const f32, parents: []const i32, count: usize, accepted: []const u32) void {
+        var on_path: [16]bool = @splat(false);
+        for (accepted) |row| on_path[row] = true;
+        for (1..@min(count, @min(conf.len, 16))) |row| {
+            if (on_path[@intCast(parents[row])]) self.observe(conf[row], on_path[row]);
+        }
+    }
 };
+
+/// Rows (t1 included) for a tree of drafts in the order taken, kept inside `min..max`.
+pub fn pickTreeRows(calib: *const Calibration, parents: []const i32, conf: []const f32, min: u32, max: u32, costs: *const Costs) u32 {
+    return std.math.clamp(chooseTreeRows(calib, parents, conf, costs).rows, min, max);
+}
 
 /// Rows (t1 included) for a round whose drafts carry confidences `conf`, kept inside `min..max`.
 pub fn pickRows(calib: *const Calibration, conf: []const f32, min: u32, max: u32) u32 {
@@ -212,4 +269,61 @@ test "pickRows: the calibrated choice, held inside min..max" {
     // A regime where confident drafts keep failing pulls the choice down.
     for (0..200) |_| c.observeRound(&sure, 7, 0);
     try testing.expectEqual(@as(u32, 2), pickRows(&c, &sure, 2, 8));
+}
+
+test "linearLadder: a first row, then a fixed step per row" {
+    const c = linearLadder(35, 8.5);
+    try testing.expectApproxEqAbs(@as(f32, 35), c[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 43.5), c[2], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 94.5), c[8], 1e-3);
+}
+
+test "chooseTreeRows: a chain is chooseRows, a sibling adds only its own odds" {
+    const costs = ladder();
+    const calib = Calibration{};
+    const conf = [_]f32{ 0.95, 0.9, 0.5, 0.2 };
+    var p: [conf.len]f32 = undefined;
+    for (conf, &p) |c, *out| out.* = calib.probability(c);
+    const chain = chooseTreeRows(&calib, &.{ -1, 0, 1, 2 }, &conf, &costs);
+    const want = chooseRows(&p, &costs);
+    try testing.expectEqual(want.rows, chain.rows);
+    try testing.expectApproxEqAbs(want.tokens, chain.tokens, 1e-5);
+    // Two siblings under t1: the second row buys the second sibling's odds, not the chain's product.
+    const forks = chooseTreeRows(&calib, &.{ -1, -1 }, conf[0..2], &costs);
+    try testing.expect(forks.rows >= 1);
+    const both = 1 + p[0] + p[1];
+    var wide = Costs{ 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    wide[1] = 1;
+    try testing.expectApproxEqAbs(both, chooseTreeRows(&calib, &.{ -1, -1 }, conf[0..2], &wide).tokens, 1e-5);
+}
+
+test "Calibration.observeTree: only drafts whose parent was accepted are reached" {
+    var c = Calibration{};
+    const prior_hit = c.probability(0.9);
+    const prior_miss = c.probability(0.5);
+    // rows: 0 = t1, 1 and 2 under t1, 3 under 1, 4 under 2 (never reached).
+    const conf = [_]f32{ 1, 0.9, 0.5, 0.99, 0.2 };
+    const parents = [_]i32{ -1, 0, 0, 1, 2 };
+    for (0..30) |_| c.observeTree(&conf, &parents, 5, &.{ 0, 1 });
+    try testing.expect(c.probability(0.9) > prior_hit);
+    try testing.expect(c.probability(0.5) < prior_miss);
+    try testing.expectEqual(@as(f32, 0), c.seen[Calibration.bin(0.2)]);
+    try testing.expect(c.probability(0.99) < Calibration.prior(0.99));
+}
+
+test "glmLadder: certain drafts take four rows or more, weak ones two, and the cost never falls" {
+    const costs = glmLadder();
+    var r: u32 = 2;
+    while (r <= MAX_ROWS) : (r += 1) try testing.expect(costs[r] > costs[r - 1]);
+    var calib = Calibration{};
+    var guess: f32 = 0;
+    while (guess < 1) : (guess += 0.01) for (0..40) |_| calib.observe(guess, true);
+    const sure_parents = [_]i32{ -1, 0, 1, 2, 3, 4, 5 };
+    const sure_conf: [7]f32 = @splat(0.99);
+    try testing.expect(pickTreeRows(&calib, &sure_parents, &sure_conf, 2, 8, &costs) >= 4);
+    const fresh = Calibration{};
+    try testing.expectEqual(@as(u32, 2), pickTreeRows(&fresh, &.{ -1, 0, 1 }, &[_]f32{ 0.5, 0.4, 0.3 }, 2, 8, &costs));
+    // Two rows cost nearly what three do, so a middling draft pair still takes the third row.
+    try testing.expectEqual(@as(u32, 3), pickTreeRows(&fresh, &.{ -1, 0 }, &[_]f32{ 0.85, 0.8 }, 2, 8, &costs));
+    try testing.expectEqual(@as(u32, 3), pickTreeRows(&calib, &sure_parents, &sure_conf, 3, 3, &costs));
 }

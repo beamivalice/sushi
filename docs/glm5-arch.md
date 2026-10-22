@@ -99,15 +99,21 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **Stored formats**: BF16, or one uniform affine format per assistant: A4 g64, A6 g128 or A8 g128 (anything else is
   `UnsupportedGlmDraftStorage`). A4 g64 is the first-load default (774.5 MB vs A6's 1013.1 MB; drafts ~11% faster, decode within drift, target
   output exact); an A6 cache from the earlier policy is regenerated.
-- **Rows**: `--drafter-max-depth <n>` (2..4) sets the verifier rows per round, root plus n-1 nodes; unset is the two-node tree (3 rows), and an explicit 3 is the same tree. `--drafter-min-depth` is only checked against it.
-- **Tree**: two draft nodes plus the root, up to four children per node; the verifier runs all rows layerwise.
+- **Rows**: a round verifies 2..8 rows (root plus draft nodes), chosen by `dflash_policy.zig` (`chooseTreeRows`) from the
+  assistant's own probabilities under GLM's measured cost ladder (`glmLadder`); `--drafter-min-depth` /
+  `--drafter-max-depth` bound the choice and equal values pin it. A draft node adds the probability that the accepted
+  path runs through it (siblings exclude each other), calibrated online per confidence bin (`Calibration.observeTree`).
+  The verify is bit-exact at every width and each row past the second costs 5-10 ms ([ladder](glm5-perf.md#glm-eight-row-verify));
+  the assistant drafts no wider than `GLM_USEFUL_ROWS` (8) unless `--drafter-max-depth` says less.
+- **Tree**: the assistant's best-first nodes (up to four children per node, `bestFirstNodes`: node n is the n-th likeliest,
+  so a round keeps a prefix and renumbers it depth-first); the verifier runs all rows layerwise.
   KDA replays only the accepted path from a prework tape; IndexPool builds branch-local pools from the committed prefix
   plus each node's ancestry (pooling flattened tree rows would pool siblings together), held beside the reserved
   pooled buffer and never written into it ([kernels](glm5-kernels.md#dflash2-verification)); MLA reads the
   committed prefix plus the ancestry tail. Commit publishes target state and assistant context together; a commit that fails after
   taking over the request's MLA buffers leaves the request failed.
-- **Draft execution**: the fixed two-node tree keeps all eight noise rows as attention keys and values, but the
-  final layer computes only the anchor and two required output rows. Two-tap BF16 convolutions preserve the original
+- **Draft execution**: the tree keeps all eight noise rows as attention keys and values, but the
+  final layer and the readout compute only the anchor and the rows the tree's widest round can use. Two-tap BF16 convolutions preserve the original
   multiply/add rounding in one kernel, and sliding layers share a block mask. On M5 Max, the A4 g64 assistant's
   eight-row FFN projections reuse weights across the full block with MLX's original reduction order.
   [Paired measurements](glm5-perf.md#glm-draft-ten-percent) show about 12% lower draft time; depth and acceptance
@@ -119,20 +125,27 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
   shift each tree row at the span state its own ancestry reaches, before the reserved-id mask, as serial sampling does
   (`Generator.glmPenalty`); greedy output stays byte-identical to `--no-drafter`. Constrained, forced-tool-call,
   repeat/presence-penalized, logprobs or explicitly budgeted-thinking requests decode serially.
-- **A round's tree is cut to `min(output budget, positions left)` rows deep** (`proposeRound`): the verifier refuses an
+- **A round's tree is cut to `min(output budget, positions left)` rows deep** (`proposeRoundAdaptive`): the verifier refuses an
   ancestry past the context, so a two-token tail never carries a three-row chain.
 - **Bills**: assistant weights at load; per request the sliding window ×4, captures per prefill row, three recurrent
   checkpoints, the 256 MiB verification-scratch cap and 64 MiB. The MLA reservation is input + max_tokens + 3 rows:
   a request without max_tokens reserves its whole context window (946K rows: 11.3 GB BF16, 6.3 GB kv8).
   The reserve gate's budget sizes the cache from the request's own clamped rows, never from the generator's config
   copy (unpinned, it resolves a smaller auto context and under-budgets the reservation).
-- **No yield gate**: `[spec-stats] gate_min` is the generic DFlash bar (the ladder's break-even for the block) and is never evaluated on the
-  native path. N2 beats a serial step above ~1.1 accepted drafts per round at 1K–30K; measured requests ran 1.31–1.90.
+- **Stop switch** (`spec_cost_gate.zig`, per request, per round, resumable): rounds run while their wall ms per emitted token stay
+  within 5% of the measured price of a plain one-row tick; a window of 8 rounds that loses twice in a row (a trial window is
+  its own second look) sends the request to plain ticks, which still commit the assistant's taps so rounds resume. The
+  plain-tick price is probed (3 ticks) at the start and every 512 tokens, a lost request retries a round window after 64
+  tokens, doubling to 512 per failed trial. Verbatim lookup chains are priced by neither side. The plain tick costs ~1.9 ms
+  more than a serial token (host sync, a separate eval, the assistant's commit), so a request that stays plain loses ~5%
+  to `--no-drafter`; the gate bounds a losing request at that. `[spec-stats] glm_round_ms` carries `plain=N serial_ms=`
+  and the plain ticks' own phases. `[spec-stats] gate_min` is the generic DFlash bar and is not evaluated on this path.
 
 Wider trees lost: N3 with every four-row kernel optimized measured 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`,
-inside 1.46% drift) because verification per round grew 20.6%.
+inside 1.46% drift) because verification per round grew 20.6%. The verify now runs 2..8 rows bit-exactly at 5-10 ms a row
+([ladder](glm5-perf.md#glm-eight-row-verify)).
 
-- **N2 saturates on copies, breaks even on prose** (no runtime yield gate): a ~2K-token verbatim copy and a rename
+- **N2 saturates on copies, breaks even on prose** (measured before the stop switch): a ~2K-token verbatim copy and a rename
   edit accepted 2.00 of 2 drafts every round (41.4/40.8 vs 25.2 tok/s serial), low-effort prose 0.88 (26.1 vs 25.6);
   greedy bytes equal serial (`144f63db`, BF16 latent, Sushi-2.3bpw + A4 g64, `taskpolicy -a`, busy box, 2026-10-04).
 - **Verbatim lookup chains**: there is no standalone PLD, so `--no-drafter`

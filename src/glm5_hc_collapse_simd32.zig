@@ -1,4 +1,4 @@
-//! Exact mHC coefficients for 1-4 rows: one uniform SIMD32 subgroup per row.
+//! Exact mHC coefficients for 1-8 rows: one uniform SIMD32 subgroup per row.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
@@ -15,7 +15,7 @@ pub fn resetDispatchCount() void {
     calls = 0;
 }
 pub fn geometry(x: []const c_int, mixes: []const c_int, scale: []const c_int, base: []const c_int, iters: c_int, epsilon: f32) bool {
-    return x.len == 4 and x[0] == 1 and x[1] >= 1 and x[1] <= 4 and std.mem.eql(c_int, x[2..], &.{ 4, 4096 }) and std.mem.eql(c_int, mixes, &.{ 1, x[1], 24 }) and
+    return x.len == 4 and x[0] == 1 and x[1] >= 1 and x[1] <= 8 and std.mem.eql(c_int, x[2..], &.{ 4, 4096 }) and std.mem.eql(c_int, mixes, &.{ 1, x[1], 24 }) and
         std.mem.eql(c_int, scale, &.{3}) and std.mem.eql(c_int, base, &.{24}) and iters == 20 and std.math.isFinite(epsilon) and epsilon > 0;
 }
 const COEFFICIENTS: [:0]const u8 =
@@ -103,7 +103,7 @@ fn run(x: Arr, mixes: Arr, scale: Arr, base: Arr, iters: c_int, epsilon: f32, s:
     if (!geometry(mlx.getShape(x), mlx.getShape(mixes), mlx.getShape(scale), mlx.getShape(base), iters, epsilon) or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     for ([_]Arr{ mixes, scale, base }) |a| if (mlx.mlx_array_dtype(a) != .float32) return null;
     if (norm) |n| {
-        if (!enabled() or !@import("glm5_model.zig").naxArms() or (mlx.getShape(x)[1] != 1 and mlx.getShape(x)[1] != 3) or n.weight.ctx == null or
+        if (!enabled() or !@import("glm5_model.zig").naxArms() or n.weight.ctx == null or
             mlx.mlx_array_dtype(n.weight) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(n.weight), &.{4096}) or
             !std.math.isFinite(n.epsilon) or n.epsilon <= 0) return null;
     }
@@ -181,7 +181,7 @@ fn check(ops: *Ops, x: Arr, mix: Arr, scale: Arr, base: Arr, expected_calls: usi
     try exact(ops, reference.mixed, new.mixed);
     try exact(ops, reference.post, new.post);
     try exact(ops, reference.comb, new.comb);
-    if (mlx.mlx_array_dtype(x) == .bfloat16 and (mlx.getShape(x)[1] == 1 or mlx.getShape(x)[1] == 3) and @import("glm5_model.zig").naxArms()) {
+    if (mlx.mlx_array_dtype(x) == .bfloat16 and @import("glm5_model.zig").naxArms()) {
         const weight = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{4096}, 997, ops.s));
         for ([_]f32{ 1e-6, 1e-5 }) |eps| {
             const normalized = (try collapseNormalized(x, mix, scale, base, 20, 1e-6, ops.s, .{ .weight = weight, .epsilon = eps })) orelse return error.TestExpectedHcNorm;
@@ -213,16 +213,16 @@ fn f32At(raw: []const u8, i: usize) f32 {
     return @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
 }
 
-test "GLM HC SIMD32 primitive hook exact T1-T4 specials and original fallback" {
+test "GLM HC SIMD32 primitive hook exact T1-T8 specials and original fallback" {
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
-    var values: [96]f32 = undefined;
+    var values: [192]f32 = undefined;
     for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) / 8 - 1;
     const scale = try ops.own(mlx.mlx_array_new_data(&[_]f32{ 0.125, 0.25, 0.0625 }, &.{3}, 1, .float32));
     var bases: [24]f32 = undefined;
     for (&bases, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) / 16 - 0.25;
     const base = try ops.own(mlx.mlx_array_new_data(&bases, &.{24}, 1, .float32));
-    const wide = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 4, 4, 4096 }, 731, ops.s));
+    const wide = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 8, 4, 4096 }, 731, ops.s));
     // Hostile rows: signed zeros, NaN/Inf, saturated logits and opposite huge comb logits.
     var special = values;
     special[0] = -0.0;
@@ -233,9 +233,9 @@ test "GLM HC SIMD32 primitive hook exact T1-T4 specials and original fallback" {
     special[24 + 8] = 1000;
     special[24 + 9] = -1000;
     for (0..16) |i| special[72 + 8 + i] = if (i % 2 == 0) 1e30 else -1e30;
-    for (1..5) |t| {
+    for (1..9) |t| {
         const x = try ops.slice(wide, 1, 0, @intCast(t));
-        for ([_]*const [96]f32{ &values, &special }) |set| {
+        for ([_]*const [192]f32{ &values, &special }) |set| {
             const mix = try ops.own(mlx.mlx_array_new_data(set, &.{ 1, @intCast(t), 24 }, 3, .float32));
             try check(&ops, x, mix, scale, base, 1);
         }

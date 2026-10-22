@@ -69,7 +69,7 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             };
             const dec = target.cfg.expertDecode();
             const gs = mlx.getShape(layer.bank.gate.trellis);
-            const lane_rows = shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook.servesGlmFastPaths() and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]);
+            const lane_rows = shape[1] >= 2 and shape[1] <= 8 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook.servesGlmFastPaths() and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]);
             if (lane_rows) if (layer.shared) |shared| {
                 const y = try dense(shared, ops, x, target.cfg.glm_swiglu_limit);
                 if (try api.glm_group2.moeLayoutShared(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane, y)) |joined| {
@@ -227,8 +227,8 @@ fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_in
     target.cfg.glm_swiglu_limit = 10;
     target.layers[3].ffn.moe.shared = null;
     try mlx.check(mlx.mlx_array_eval(w));
-    const full = try fixtures.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 4, 4096 }, 731, stream));
-    for ([_]c_int{ 3, 4 }) |rows_in| {
+    const full = try fixtures.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 8, 4096 }, 731, stream));
+    for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |rows_in| {
         var ops = Ops{ .s = stream };
         defer ops.deinit();
         const x = try ops.slice(full, 1, 0, rows_in);

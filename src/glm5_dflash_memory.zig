@@ -49,6 +49,13 @@ test "GLM DFlash overlay trees keep every overlay branch at a full-context reser
     const three = try plan(7585, 946432, 236608, 512, 128, 64, 3, 2);
     try std.testing.expect(three.live_bytes + @import("glm5_attention_decode_batch.zig").scratchLimit() <= limit_bytes);
     try std.testing.expectError(error.GlmTreeScratchLimit, plan(7585, 946432, 236608, 512, 128, 64, overlay_rows + 1, 2));
+    // An eight-row chain keeps all its branches beside the wider native scratch.
+    const decode = @import("glm5_attention_decode_batch.zig");
+    for (5..overlay_rows + 1) |rows| {
+        const wide = try plan(7585, 946432, 236608, 512, 128, 64, rows, 2);
+        try std.testing.expectEqual(rows, wide.branches);
+        try std.testing.expect(wide.live_bytes + decode.scratchLimitFor(rows) <= limit_bytes);
+    }
 }
 
 test "GLM DFlash overlay branch scratch does not grow with the reservation" {

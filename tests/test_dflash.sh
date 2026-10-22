@@ -329,6 +329,8 @@ if echo "$BLINE" | grep -q ", capped ("; then
     ok "block capped for this machine's verify lanes ($BLINE)"
 elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
     ok "wide verify lane present, checkpoint block ($DECLARED_BLOCK) kept ($BLINE)"
+elif grep -q "decodes with DFlash2 (.* rows per round" "$LOG"; then
+    ok "rows policy sets the block ($BLINE)"
 else
     bad "block resolves against the machine's verify lanes (declared=$DECLARED_BLOCK)" "$BLINE"
 fi
@@ -348,6 +350,58 @@ if [ "$RESTORES_HIT" -gt "$RESTORES_COLD" ] && [ "$RATE_COLD" = "$RATE_HIT" ]; t
     ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"
 else
     bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$RESTORES_COLD->$RESTORES_HIT"
+fi
+
+# [11b] GLM-5.3-Flash rounds choose 2..8 rows from the drafter's confidence. The verifier is bit-exact against serial
+# decode at every width, so greedy output is byte-equal whatever rows a round took, streamed or not, and an
+# opted-out request runs no round.
+if grep -q "GLM-5.3-Flash decodes with DFlash2" "$LOG"; then
+    if grep -q "GLM-5.3-Flash decodes with DFlash2 (2\.\.8 rows per round)" "$LOG"; then
+        ok "GLM adaptive rows default to 2..8"
+    else
+        bad "GLM adaptive rows default to 2..8" "$(grep 'decodes with DFlash2' "$LOG" | head -2)"
+    fi
+    GLM_COPY="Repeat this sentence exactly, word for word, three times: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea."
+    for GLM_PROMPT in "$GLM_COPY" "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests." "Count from 1 to 120, one number per line, with no other output."; do
+        G_ON=$(gen "$GLM_PROMPT" 200 ", \"enable_drafter\": true")
+        DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
+        G_OFF=$(gen "$GLM_PROMPT" 200 ", \"enable_drafter\": false")
+        if [ -n "$G_ON" ] && [ "$G_ON" = "$G_OFF" ]; then
+            ok "GLM greedy adaptive rows == serial ($(echo "$GLM_PROMPT" | head -c 30)...)"
+        else
+            bad "GLM greedy adaptive rows == serial" "--- on ---" "$(echo "$G_ON" | head -c 300)" "--- off ---" "$(echo "$G_OFF" | head -c 300)"
+        fi
+    done
+    GLM_BODY='{"model":"sushi","messages":[{"role":"user","content":"Count from 1 to 120, one number per line, with no other output."}],"temperature":0.0,"max_tokens":200,"enable_drafter":true'
+    GLM_WHOLE=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$GLM_BODY}")
+    GLM_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$GLM_BODY,\"stream\":true}")
+    DFLASH_ON_REQS=$((DFLASH_ON_REQS + 2))
+    if python3 - "$GLM_WHOLE" "$GLM_STREAM" <<'PY'
+import json, sys
+msg = json.loads(sys.argv[1])["choices"][0]["message"]
+expected = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
+actual = ""
+for line in sys.argv[2].splitlines():
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        continue
+    choices = json.loads(line[6:]).get("choices") or []
+    if choices:
+        delta = choices[0].get("delta") or {}
+        actual += (delta.get("reasoning_content") or "") + (delta.get("content") or "")
+assert actual == expected and expected, (expected[:200], actual[:200])
+PY
+    then
+        ok "GLM adaptive rows: stream == non-stream"
+    else
+        bad "GLM adaptive rows: stream == non-stream" "$(echo "$GLM_STREAM" | tail -c 400)"
+    fi
+    GLM_STATS_BEFORE=$(grep -c "mode=dflash" "$LOG")
+    gen "Say hello in five words." 20 ", \"enable_drafter\": false" > /dev/null
+    if [ "$(grep -c "mode=dflash" "$LOG")" -eq "$GLM_STATS_BEFORE" ]; then
+        ok "GLM enable_drafter:false runs no round"
+    else
+        bad "GLM enable_drafter:false runs no round"
+    fi
 fi
 
 # [12] The assistant context also survives the SSD tier (v4 spec sidecar):

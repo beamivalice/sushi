@@ -18,7 +18,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 | `glm5_latent.zig` | latent storage view (BF16 or kv8), the `SUSHI_LATENT` kernel helper, kv8 row bytes |
 | `glm5_attention_nax_packed.zig` / `glm5_indexpool_nax.zig` | head-packed native sparse attention (B16/B32); NAX prefill index scores |
 | `glm5_attention_decode_batch.zig` / `glm5_attention_overlay.zig` | native B1/B3/B4 decode and verify attention; verify latent overlays |
-| `glm5_mla_prefill_batch.zig` / `glm5_mla_verify_batch.zig` | head-batched MLA prefill projections (affine or BF16 banks); three-row query and three/four-row value verification |
+| `glm5_mla_prefill_batch.zig` / `glm5_mla_verify_batch.zig` | head-batched MLA prefill projections (affine or BF16 banks); two- to eight-row query and value verification |
 | `glm5_kda_prework.zig` / `glm5_kda_value_rows.zig` / `glm5_kda_fused.zig` / `glm5_kda_prefill_cluster.zig` | KDA prework, R4 recurrence, one-token body and output epilogue, FA/GA/beta cluster |
 | `glm5_a6_dense_once.zig` / `glm5_decode.zig` / `glm5_router.zig` / `glm5_activation.zig` | T2048 A6 expansion; copy-free QKV; router; dense/shared activation |
 | `glm5_hc_prefill.zig` / `glm5_hc_collapse_simd32.zig` | RMS-fused HC prefill projection; SIMD32 verify collapse |
@@ -145,7 +145,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   diag arms, Sushi-2.5bpw, kv8, 4x512 teacher): KLD 0.071569 against the fused arm's 0.071762 (−0.27%), top-1 90.33%
   against 89.70%. Serial decode 34.07 → 32.54 ms/token at 8K and 33.84 → 32.66 at 32K, arms interleaved in one
   process on a contended box; DFlash2 verification per round is unchanged (~60 ms). 32 MiB per pending layer.
-- HC collapse on one to four rows (T3 first, then T1/T2/T4: serial decode, tails, lookup and company): one SIMD32 subgroup runs the coefficients and 20 Sinkhorn iterations that thread 0
+- HC collapse on one to eight rows (T3 first, then T1/T2/T4: serial decode, tails, lookup and company): one SIMD32 subgroup runs the coefficients and 20 Sinkhorn iterations that thread 0
   ran alone while 255 threads waited (exact; −27.6% component, 8K model −2.65% vs 1.99% drift). T1/T2/T4 in one process on Sushi-2.5bpw kv8 at 1K (`SUSHI_GLM_ROWS_UBENCH`, 24 rounds,
   arms interleaved, `taskpolicy -a`, lock, AC): serial token 30.87 → 28.98 ms (−6.1%), grouped T2 40.92 → 38.98 (−4.7%),
   T4 66.41 → 64.19 (−3.3%); T3 unchanged (51.50 vs 51.41, the control). Bit-exact against the reference kernel at every width.
@@ -161,7 +161,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   ([A5 trunk](glm5-perf.md#glm-a5-verify)). One-shot load lines name each path a pack reaches: `[glm] copy-free QKV
   engaged (A5g128)`, `[glm-dflash] coefficient hoist rows engaged`, `[glm-dflash] affine row tiles engaged`.
   A6 dense-once and the MLA prefill head batches stay A6-only: the head batch changes numerics, so an A5 arm needs
-  its own KLD gate. `SUSHI_GLM_QMM_UBENCH=1` times serial rows, hoist and row tiles per width at the trunk shapes.
+  its own KLD gate. `SUSHI_GLM_QMM_UBENCH=1` times serial rows, the row-streaming kernel and row tiles per width at the trunk shapes.
 - **Prepared three-row inputs**: large A5/A6 projections reuse the input's original BF16 group sums and exact
   power-of-two coefficients across output tiles. HC expansion emits both the rounded residual and its FP32
   normalized view for the next collapse. The default NAX three-row path uses two-layer asynchronous groups;
@@ -179,13 +179,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   [4.0–4.7% of full verification time](glm5-perf.md#glm-three-output-tiles) at the measured prefixes.
 - **Groups**: `verifyGroups` runs several requests' trees (≤ 16 rows) in one layer loop. KDA `project`/`finish` and
   MLA `mlaProject`/`mlaFinish` take every row; `recur` and `mlaAttend` take one request's rows and state. Each group
-  equals its solo `verify` bit for bit; `SUSHI_GLM_ROWS_UBENCH=N` (`_CTX`, `_TEXT`) times grouped against serial rows.
+  equals its solo `verify` bit for bit; `SUSHI_GLM_ROWS_UBENCH=N` (`_CTX`, `_TEXT`) times grouped against serial rows and one request's 1..8-row chains (bit-equal to serial rows).
 - **KDA**: parent-indexed prework over 1–16 nodes, then a tree recurrence holding FP32 parent states locally; the tape
   keeps projected prework and replays only the accepted path. The first-child leaf (chain row 2, fork row 1) is kept and
   aliased on a hit (4 MiB per layer; −25%; 59% hits at 8K, break-even 21%).
-- **MLA**: trees of at most four nodes read the committed buffer plus a ≤4-row ancestry tail instead of a replaced
-  latent buffer (1.97× at 32K); the native gather and the overlay both read four-row tails (`max_tail`), exact against
-  those rows committed. Query projections broadcast the one-row geometry over three rows; value projections do so
+- **MLA**: trees of at most eight nodes read the committed buffer plus a ≤8-row ancestry tail instead of a replaced
+  latent buffer (1.97× at 32K); the native gather and the overlay both read eight-row tails (`max_tail`), exact against
+  those rows committed. A batch of 2..8 branches is one gather plus the block-masked FP32 composite (its tiles do not
+  change with the batch, so every row equals B1); its bank needs 64 MiB from six rows, inside the 256 MiB verifier bound. Query projections broadcast the one-row geometry over three rows; value projections do so
   over three or four rows.
   Accepted rows append at commit. An overlay branch writes no shared buffer: the pools its ancestry completes stay in
   `State.pool_tail`, and the tree scorer reads pools from `tail_base` on from it (same per-pool arithmetic, exact).
@@ -201,9 +202,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   `194351a3`). It drains the stream first: the verify's command buffer still holds the old buffers after `mlx_eval`
   returns, so on a slow GPU (CI's VM) the commit found them shared and copied them. A failure after the hand-over
   leaves the request failed.
-- **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order. The A5/A6
-  three/four-row specialization uses complete row tiles and two outputs per SIMD subgroup, reducing per-thread
-  accumulators. Combined with batched FP32 attention, verification takes about 11% less time on M5 Max with
+- **Rows 2..8** (bit-exact, [ladder](glm5-perf.md#glm-eight-row-verify)): `glm5_dflash_rows.zig` streams 2..8 rows through each
+  A5/A6 weight read (qmv_fast order per row; the straddling bytes keep two products; one simdgroup per two outputs up to
+  six rows, two simdgroups splitting the rows at seven and eight, both packs' coefficients live for A6 at K >= 16384);
+  the HC collapse and fused expansion take 1..8 rows; the FFN lane kernels (`glm_group2`, slots in ballots of 32 per
+  member loop, two output tiles per threadgroup at every slot count, three-member sharing at 24 slots) serve 2..8 rows and
+  the dense KDA column batch 2..8; the MLA absorbed-query and value banks take 2..8 rows as one broadcast QMM; the sparse
+  selection of a tree's rows with equal pool and tail counts is one scorer, one argpartition and one expansion
+  (`decodeSelectedRows`). A single 5..8-row hoist or tile (one dispatch holding all rows' accumulators) spilled
+  registers and was slower, which is why the streaming kernel keeps the per-row accumulators short.
+- **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order (A8, one row
+  and nine to sixteen rows; A5/A6 at 2..8 rows use the row-streaming kernel above). Combined with batched FP32 attention, verification takes about 11% less time on M5 Max with
   Sushi-2.5bpw/A4 g64 ([measurement](glm5-perf.md#glm-verify-final)). Retained BF16 KDA projections run as column
   GEMVs with rows in the batch grid (exact; stock multi-row `Linear` is not); the router batches up to 16 rows.
   Sampled rounds use the same batched rows: their logits equal per-row serial projections bit for bit (215 real 8K

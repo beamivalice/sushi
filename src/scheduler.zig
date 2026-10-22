@@ -4713,13 +4713,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             sch.drafter_block_size = bounds.max;
         } else if (params.config.isGlm5()) {
-            const rows = dflash_mod.glmRows(dflash_mod.drafter_min_depth, dflash_mod.drafter_max_depth) catch |err| {
+            const bounds = dflash_mod.glmRowBounds(dflash_mod.drafter_min_depth, dflash_mod.drafter_max_depth) catch |err| {
                 d.deinit();
                 sch.allocator.destroy(d);
-                log.err("--drafter-min-depth/--drafter-max-depth: GLM-5.3-Flash verifies at most {d} rows per round\n", .{dflash_mod.GLM_MAX_ROWS});
+                log.err("--drafter-min-depth/--drafter-max-depth: GLM-5.3-Flash verifies {d}..{d} rows per round\n", .{ dflash_mod.GLM_MIN_ROWS, dflash_mod.GLM_MAX_ROWS });
                 return err;
             };
-            if (rows) |n| sch.drafter_block_size = n;
+            sch.drafter_block_size = bounds.max;
         }
         var cap_note_buf: [96]u8 = undefined;
         const cap_note: []const u8 = if (!wide_lane and !params.config.isQwen4() and !dflash_mod.drafterDepthExplicit() and d.config.block_size > sch.drafter_block_size)
@@ -4736,6 +4736,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             d.config.target_layer_ids,
         });
         if (params.config.isQwen4()) log.info("[spec] Qwen3.8-Flash-Next decodes with DFlash2 ({d}..{d} rows per round; --drafter outranks MTP, --no-drafter selects it)\n", .{ dflash_mod.qwenMinRows(), sch.drafter_block_size });
+        if (params.config.isGlm5()) log.info("[spec] GLM-5.3-Flash decodes with DFlash2 ({d}..{d} rows per round)\n", .{ dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS, sch.drafter_block_size });
     } else if (drafter_dir.len > 0) {
         log.err("Drafter at {s} is not a DFlash assistant (its config lacks block_size, mask_token_id and target_layer_ids)\n", .{drafter_dir});
         return error.UnsupportedDrafter;

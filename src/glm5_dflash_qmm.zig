@@ -108,7 +108,7 @@ pub fn resetDispatchCount() void {
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 const Key = struct { m: c_int, n: c_int, k: c_int, bits: c_int };
 const Cached = struct { key: Key, config: mlx.mlx_fast_metal_kernel_config };
-var configs: [32]?Cached = @splat(null);
+var configs: [128]?Cached = @splat(null);
 
 fn rowMajorReady(a: Arr) !bool {
     if (a.ctx == null) return false;
@@ -122,7 +122,7 @@ fn rowMajorReady(a: Arr) !bool {
 }
 
 pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
-    if (try @import("glm5_dflash_a6_hoist.zig").project(stream, x, linear)) |output| {
+    if (try @import("glm5_dflash_rows.zig").project(stream, x, linear)) |output| {
         dispatch_count += 1;
         return output;
     }
@@ -214,11 +214,8 @@ test "GLM DFlash affine row tiles preserve serial qmv bits" {
             var scope = Ops{ .s = s };
             defer scope.deinit();
             const input = try scope.slice(x.*, 1, 0, rows);
-            const hoist = @import("glm5_dflash_a6_hoist.zig");
-            const hoist_before = hoist.dispatchCount();
             const actual = try scope.own((try project(s, input, linear)) orelse return error.TestExpectedGlmTreeQmm);
-            // Coefficient reuse must also engage beyond the Q/K/V shape.
-            try std.testing.expectEqual(hoist_before + @as(usize, if (bits != 8 and (rows == 3 or rows == 4)) 1 else 0), hoist.dispatchCount());
+            // Two to eight rows of A5/A6 stream through the row kernels, never the tiles.
             try mlx.check(mlx.mlx_array_eval(actual));
             if (rows > 1) {
                 const before = dispatchCount();
@@ -318,6 +315,6 @@ test "GLM verify row projections per stored width (SUSHI_GLM_QMM_UBENCH)" {
             if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6 / banks;
         };
         for (&times) |*t| std.mem.sort(f64, t, {}, std.sort.asc(f64));
-        std.debug.print("[glm-qmm-ubench] A{d} {d}x{d} T3 per projection: serial {d:.4} ms, hoist {d:.4} ms, tiles {d:.4} ms\n", .{ bits, shape.n, shape.k, times[0][5], times[1][5], times[2][5] });
+        std.debug.print("[glm-qmm-ubench] A{d} {d}x{d} T3 per projection: serial {d:.4} ms, rows {d:.4} ms, tiles {d:.4} ms\n", .{ bits, shape.n, shape.k, times[0][5], times[1][5], times[2][5] });
     };
 }

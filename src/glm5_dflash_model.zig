@@ -105,7 +105,7 @@ pub const MlaTape = struct {
 const MlaRows = struct { qa: Arr, latent: Arr, index_q: Arr, keys: Arr, index_weights: Arr, gates: Arr, broadcast: bool };
 
 /// Every MLA projection over all rows. The absorbed query keeps each row's one-row geometry
-/// unless exactly three rows take the exact broadcast.
+/// unless two or more rows take the exact broadcast.
 fn mlaProject(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, mode: kda.ProjectionMode) !MlaRows {
     const t: c_int = mlx.getShape(x)[1];
     const heads: c_int = @intCast(cfg.num_attention_heads);
@@ -157,10 +157,10 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
     var scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(rows.latent));
     if (native_mode) {
         const limit = @import("glm5_dflash_memory.zig").limit_bytes;
-        if (scratch.common_bytes >= limit - native.scratchLimit()) return error.GlmTreeScratchLimit;
-        scratch.branches = @min(parents.len, (limit - scratch.common_bytes - native.scratchLimit()) / scratch.per_branch_bytes);
+        if (scratch.common_bytes >= limit - native.scratchLimitFor(parents.len)) return error.GlmTreeScratchLimit;
+        scratch.branches = @min(parents.len, (limit - scratch.common_bytes - native.scratchLimitFor(parents.len)) / scratch.per_branch_bytes);
         if (scratch.branches == 0) return error.GlmTreeScratchLimit;
-        scratch.live_bytes = scratch.common_bytes + scratch.branches * scratch.per_branch_bytes + native.scratchLimit();
+        scratch.live_bytes = scratch.common_bytes + scratch.branches * scratch.per_branch_bytes + native.scratchLimitFor(parents.len);
     }
     mla_scratch_bound = @max(mla_scratch_bound, scratch.live_bytes);
     const latent = try ops.slice(rows.latent, 0, begin, end);
@@ -179,13 +179,18 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
     // sparse branches naturally bill their necessary indexer work in mla_branches.
     var pending: [16]Arr = undefined;
     var pending_count: usize = 0;
-    const batched_native = native_mode and (parents.len == 3 or parents.len == 4) and scratch.branches == parents.len;
+    const batched_native = native_mode and parents.len >= 2 and scratch.branches == parents.len;
     var native_ids: [native.max_tail]Arr = undefined;
     var native_branches: [native.max_tail]native.Branch = undefined;
     const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
+    var branch_states: [native.max_tail]attention.State = undefined;
+    var select_rows: [native.max_tail]attention.SelectRow = undefined;
+    var kept_branches: usize = 0;
+    defer for (branch_states[0..kept_branches]) |*kept| kept.deinit();
     for (0..parents.len) |row| {
         var branch = try state.share();
-        defer branch.deinit();
+        var keep = false;
+        defer if (!keep) branch.deinit();
         var path: [16]u32 = undefined;
         const kept = ancestry(parents, row, &path);
         const overlay = parents.len <= @import("glm5_dflash_memory.zig").overlay_rows;
@@ -199,8 +204,11 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
         const weights = try ops.slice(index_weights, 0, at, at + 1);
         const offset = state.processed + kept.len - 1;
         if (batched_native) {
-            native_ids[row] = try ops.own(try attention.decodeSelected(&branch, index_query, weights, offset, ops.s));
-            native_branches[row] = .{ .offset = offset, .length = branch.processed, .path = .{ 0, 0, 0, 0 } };
+            branch_states[row] = branch;
+            keep = true;
+            kept_branches = row + 1;
+            select_rows[row] = .{ .state = &branch_states[row], .index_q = index_query, .weights = weights, .offset = offset };
+            native_branches[row] = .{ .offset = offset, .length = branch.processed, .path = native.pathOf(&.{}) };
             @memcpy(native_branches[row].path[0..kept.len], kept);
             continue;
         }
@@ -221,6 +229,8 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
         attended[row] = try ops.reshape(y, &.{ 1, heads, 1, width });
     }
     if (batched_native) {
+        try attention.decodeSelectedRows(select_rows[0..parents.len], native_ids[0..parents.len], ops.s);
+        for (native_ids[0..parents.len]) |*id| id.* = try ops.own(id.*);
         const prefix = if (state.processed == 0) attention.Latent{ .data = readable } else state.latentView();
         const selected = try ops.concat(native_ids[0..parents.len], 0);
         const batched = try native.run(ops, qa, prefix, state.processed, readable, native_branches[0..parents.len], selected, scale);
@@ -240,7 +250,7 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
 fn mlaFinish(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, attended: []const Arr, joined: ?Arr, cfg: *const @import("model.zig").ModelConfig, mode: kda.ProjectionMode) !Arr {
     const value_width: c_int = @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim);
     var result_rows: [16]Arr = undefined;
-    const broadcast = if (rows.broadcast or (layer.quantized and attended.len == 4)) try @import("glm5_mla_verify_batch.zig").run(ops, .{ .x = joined orelse try ops.concat(attended, 0), .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value) else null;
+    const broadcast = if (rows.broadcast or (layer.quantized and attended.len >= 2)) try @import("glm5_mla_verify_batch.zig").run(ops, .{ .x = joined orelse try ops.concat(attended, 0), .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value) else null;
     if (joined != null) if (broadcast) |all| return kda.linearRows(ops, layer.out, try ops.reshape(all, &.{ 1, @intCast(attended.len), value_width }), mode);
     for (attended, 0..) |y4, row| {
         const values = if (broadcast) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
@@ -397,7 +407,7 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
     }
     const rows: c_int = @intCast(total);
     const cadence = evaluationCadence(total, mode);
-    const fold_norm = rows == 3 and base.naxArms() and @import("glm5_hc_collapse_simd32.zig").enabled();
+    const fold_norm = rows >= 2 and rows <= 8 and base.naxArms() and @import("glm5_hc_collapse_simd32.zig").enabled();
     var h: Arr = undefined;
     {
         var ops = Ops{ .s = target.s };

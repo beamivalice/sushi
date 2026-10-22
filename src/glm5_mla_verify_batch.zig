@@ -9,7 +9,7 @@ pub fn run(ops: *Ops, in: Input, dir: Direction) !?Arr {
     if (!mlx.streamIsGpu(ops.s) or !@import("glm5_model.zig").naxArms()) return null;
     for ([_]Arr{ in.x, in.w, in.scales, in.biases }) |a| if (a.ctx == null) return null;
     const xs = mlx.getShape(in.x);
-    if (xs.len != 4 or (if (dir == .query) xs[0] != 3 else xs[0] != 3 and xs[0] != 4) or
+    if (xs.len != 4 or xs[0] < 2 or xs[0] > 8 or
         !std.mem.eql(c_int, &.{ xs[0], 64, 1, if (dir == .query) @as(c_int, 256) else 512 }, xs) or
         mlx.mlx_array_dtype(in.x) != .bfloat16 or mlx.mlx_array_dtype(in.w) != .uint32 or
         mlx.mlx_array_dtype(in.scales) != .bfloat16 or mlx.mlx_array_dtype(in.biases) != .bfloat16 or
@@ -39,8 +39,7 @@ fn fixture(ops: *Ops, dir: Direction, rows: c_int, bits: c_int) !Input {
 }
 
 test "GLM MLA verify batch matches each serial row projection" {
-    for ([_]c_int{ 6, 5 }) |bits| for ([_]Direction{ .query, .value }) |dir| for ([_]c_int{ 3, 4 }) |rows| {
-        if (dir == .query and rows != 3) continue;
+    for ([_]c_int{ 6, 5 }) |bits| for ([_]Direction{ .query, .value }) |dir| for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |rows| {
         var ops = Ops{ .s = mlx.gpuStream() };
         defer ops.deinit();
         const in = try fixture(&ops, dir, rows, bits);

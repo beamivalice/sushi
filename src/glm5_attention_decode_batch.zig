@@ -1,4 +1,4 @@
-//! Mode-matched native decode attention for B1, B3 and B4.
+//! Mode-matched native decode attention for B1 and up to eight batched branches.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -14,7 +14,11 @@ pub fn enabled() bool {
 }
 /// Per pending layer: the FP32 composite's bounded branch planes.
 pub fn scratchLimit() usize {
-    return 32 * 1024 * 1024;
+    return scratchLimitFor(4);
+}
+/// Batches past five rows hold a wider FP32 bank; only a verify forms them.
+pub fn scratchLimitFor(rows: usize) usize {
+    return (if (rows <= 5) @as(usize, 32) else 64) * 1024 * 1024;
 }
 pub fn supportedConfig(cfg: *const @import("model.zig").ModelConfig, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) bool {
     return cfg.num_attention_heads == 64 and cfg.mla_kv_lora_rank == 512 and cfg.mla_qk_nope_head_dim == 256 and
@@ -36,24 +40,30 @@ pub fn resetCalls() void {
     logged = false;
 }
 /// Ancestry rows a branch may read from the verification tape (the gather's `paths` stride).
-pub const max_tail = 4;
+pub const max_tail = 8;
 pub const Branch = struct {
     offset: usize,
     length: usize,
     path: [max_tail]u32,
 };
+pub fn pathOf(ids: []const u32) [max_tail]u32 {
+    var path: [max_tail]u32 = @splat(0);
+    @memcpy(path[0..ids.len], ids);
+    return path;
+}
 pub fn temporaryBytes(batch: usize) !usize {
-    if (batch != 1 and batch != 3 and batch != 4) return error.UnsupportedGlmDecodeBatch;
+    if (batch == 0 or batch > max_tail) return error.UnsupportedGlmDecodeBatch;
     const bytes = try packed_attention.compositeBytes(batch);
     // Multi-row gathers write the FP32 bank directly, omitting the BF16 intermediate.
-    return if (batch >= 3) bytes - batch * 2051 * 512 * 2 else bytes;
+    return if (batch >= 2) bytes - batch * 2051 * 512 * 2 else bytes;
 }
+/// Serial rows run as B1; a verify's wider batch is billed inside `glm5_dflash_memory.limit_bytes`.
 pub fn transientBudget(pending_layers: usize) !usize {
     if (!enabled()) return 0;
     return std.math.mul(usize, scratchLimit(), pending_layers);
 }
 fn geometry(q: []const c_int, prefix: []const c_int, prefix_rows: usize, tape: []const c_int, ids: []const c_int, branches: []const Branch) bool {
-    if (q.len != 3 or (q[0] != 1 and q[0] != 3 and q[0] != 4) or q[1] != 64 or q[2] != 512 or branches.len != q[0] or
+    if (q.len != 3 or q[0] < 1 or q[0] > max_tail or q[1] != 64 or q[2] != 512 or branches.len != q[0] or
         prefix.len != 2 or prefix[0] < prefix_rows or prefix[1] != 512 or prefix_rows > 1048576 or
         tape.len != 2 or tape[0] < 1 or tape[0] > max_tail or tape[1] != 512 or
         ids.len != 2 or ids[0] != q[0] or ids[1] != 2051) return false;
@@ -76,7 +86,7 @@ const gather_source: [:0]const u8 =
     \\if(d==0u) mask[slot]=valid;
     \\if(!valid) {for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=OutT(0);return;}
     \\if(uint(id)<uint(prefix_length)) {for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=SUSHI_LATENT(prefix,uint(id),d+j,512u);return;}
-    \\const device bfloat* values=tape+size_t(paths[row*4u+uint(id)-uint(prefix_length)])*512u;
+    \\const device bfloat* values=tape+size_t(paths[row*uint(TAIL)+uint(id)-uint(prefix_length)])*512u;
     \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=values[d+j];
 ;
 var gather_kernels: [latent_store.variants]?mlx.mlx_fast_metal_kernel = @splat(null);
@@ -92,7 +102,7 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
     const qs = mlx.mlx_array_strides(q);
     if (qs[1] != 512 or qs[2] != 1) return null;
     const batch: c_int = @intCast(branches.len);
-    if (try temporaryBytes(branches.len) > scratchLimit()) return error.GlmDecodeBatchScratchBudget;
+    if (try temporaryBytes(branches.len) > scratchLimitFor(branches.len)) return error.GlmDecodeBatchScratchBudget;
     var offsets: [max_tail]u32 = undefined;
     var lengths: [max_tail]u32 = undefined;
     var paths: [max_tail * max_tail]u32 = undefined;
@@ -111,7 +121,7 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
     const ids = try ops.contiguous(selected);
     const cfg_index: usize = @intCast(batch - 1);
     // SUSHI_LATENT still returns BF16, including kv8's rounding boundary.
-    const bank_dtype: mlx.mlx_dtype = if (batch >= 3) .float32 else .bfloat16;
+    const bank_dtype: mlx.mlx_dtype = if (batch >= 2) .float32 else .bfloat16;
     const cfg = configs[cfg_index] orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -120,6 +130,7 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, batch * 2051 * 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", bank_dtype));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TAIL", max_tail));
         configs[cfg_index] = c;
         break :blk c;
     };
@@ -160,7 +171,7 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
     }
     // Block-masked GEMM fixes its tiles at 32x32x16 regardless of batch size.
     // Ordinary GEMM changes tiles/split-K with the batch, so retain B1 there.
-    const out = if (how == .block_masked and batch >= 3)
+    const out = if (how == .block_masked and batch >= 2)
         try packed_attention.compositeWith(ops, q, bank.*, mask.*, scale, how)
     else blk: {
         var rows: [max_tail]Arr = undefined;
@@ -307,9 +318,9 @@ pub fn runRow(ops: *Ops, q: Arr, cache: Latent, offset: usize, selection: RowSel
 
 test "GLM decode batch geometry ancestry and conservative scratch" {
     const branches = [_]Branch{
-        .{ .offset = 16381, .length = 16382, .path = .{ 0, 0, 0, 0 } },
-        .{ .offset = 16382, .length = 16383, .path = .{ 0, 1, 0, 0 } },
-        .{ .offset = 16382, .length = 16383, .path = .{ 0, 2, 0, 0 } },
+        .{ .offset = 16381, .length = 16382, .path = pathOf(&.{0}) },
+        .{ .offset = 16382, .length = 16383, .path = pathOf(&.{ 0, 1 }) },
+        .{ .offset = 16382, .length = 16383, .path = pathOf(&.{ 0, 2 }) },
     };
     try std.testing.expect(geometry(&.{ 3, 64, 512 }, &.{ 16384, 512 }, 16381, &.{ 3, 512 }, &.{ 3, 2051 }, &branches));
     try std.testing.expect(!geometry(&.{ 0, 64, 512 }, &.{ 16384, 512 }, 16381, &.{ 3, 512 }, &.{ 0, 2051 }, &.{}));
@@ -317,12 +328,17 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
     bad[2].offset += 1;
     try std.testing.expect(!geometry(&.{ 3, 64, 512 }, &.{ 16384, 512 }, 16381, &.{ 3, 512 }, &.{ 3, 2051 }, &bad));
     bad = branches;
-    bad[2].path = .{ 0, 0, 0, 0 };
+    bad[2].path = pathOf(&.{});
     try std.testing.expect(!geometry(&.{ 3, 64, 512 }, &.{ 16384, 512 }, 16381, &.{ 3, 512 }, &.{ 3, 2051 }, &bad));
     try std.testing.expect(try temporaryBytes(3) <= scratchLimit());
     try std.testing.expect(try temporaryBytes(4) <= scratchLimit());
-    try std.testing.expectError(error.UnsupportedGlmDecodeBatch, temporaryBytes(5));
+    for (5..max_tail + 1) |rows| {
+        try std.testing.expect(try temporaryBytes(rows) <= scratchLimitFor(rows));
+        try std.testing.expectEqual(rows > 5, try temporaryBytes(rows) > scratchLimit());
+    }
+    try std.testing.expectError(error.UnsupportedGlmDecodeBatch, temporaryBytes(max_tail + 1));
     try std.testing.expectEqual(scratchLimit() * 4, try transientBudget(4));
+    try std.testing.expect(scratchLimitFor(8) > scratchLimit());
     try std.testing.expectError(error.Overflow, transientBudget(std.math.maxInt(usize)));
     const model = @import("glm5_model.zig");
     model.reference_numerics = true;
@@ -331,12 +347,12 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
 }
 
 test "GLM kv8 and kv6 decode batches match BF16 and independent B1 branches" {
-    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| for ([_]usize{ 3, 4 }) |rows| for ([_]usize{ 5, 3000 }) |prefix_rows| for ([_]bool{ false, true }) |chain| {
-        try decodeBatchParity(bits, rows, prefix_rows, chain);
+    for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| for ([_]usize{ 2, 3, 4, 5, 6, 7, 8 }) |rows| for ([_]usize{ 5, 3000 }) |prefix_rows| for ([_]bool{ false, true }) |chain| for ([_]f32{ 0.05, 2 }) |spread| {
+        try decodeBatchParity(bits, rows, prefix_rows, chain, spread);
     };
 }
 
-fn decodeBatchParity(bits: u8, rows: usize, prefix_rows: usize, chain: bool) !void {
+fn decodeBatchParity(bits: u8, rows: usize, prefix_rows: usize, chain: bool, spread: f32) !void {
     const s = mlx.gpuStream();
     var ops = Ops{ .s = s };
     defer ops.deinit();
@@ -363,7 +379,7 @@ fn decodeBatchParity(bits: u8, rows: usize, prefix_rows: usize, chain: bool) !vo
     const key = try ops.slot();
     try mlx.check(mlx.mlx_random_key(key, 63));
     const query = try ops.slot();
-    try mlx.check(mlx.mlx_random_normal(query, &.{ @intCast(rows), 64, 512 }, 3, .bfloat16, 0, 0.05, key.*, s));
+    try mlx.check(mlx.mlx_random_normal(query, &.{ @intCast(rows), 64, 512 }, 3, .bfloat16, 0, spread, key.*, s));
     resetCalls();
     const got = (try run(&ops, query.*, kv8, prefix_rows, tape, branches[0..rows], selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
     const want = (try run(&ops, query.*, bf16, prefix_rows, tape, branches[0..rows], selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
@@ -400,8 +416,8 @@ test "GLM B1 reads a four-row ancestry tail exactly as those rows committed to t
     try mlx.check(mlx.mlx_random_key(&key, 72));
     const query = try ops.slot();
     try mlx.check(mlx.mlx_random_normal(query, &.{ 1, 64, 512 }, 3, .bfloat16, 0, 0.05, key, s));
-    const deep = Branch{ .offset = length - 1, .length = length, .path = .{ 0, 1, 2, 3 } };
-    const flat = Branch{ .offset = length - 1, .length = length, .path = .{ 0, 0, 0, 0 } };
+    const deep = Branch{ .offset = length - 1, .length = length, .path = pathOf(&.{ 0, 1, 2, 3 }) };
+    const flat = Branch{ .offset = length - 1, .length = length, .path = pathOf(&.{}) };
     const got = (try run(&ops, query.*, prefix, prefix_rows, tail4, &.{deep}, selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
     const want = (try run(&ops, query.*, committed, prefix_rows + 3, tail1, &.{flat}, selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
     try @import("glm5_attention.zig").expectSameBits(want, got);

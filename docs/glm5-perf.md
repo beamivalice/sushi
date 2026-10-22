@@ -4,6 +4,80 @@ The recorded speed numbers for GLM-5.3-Flash (`glm5_next`) on this box. Method, 
 release ladders: [perf-baselines](perf-baselines.md); the rules there (inherit the recorded baseline, name
 commit, binary stamp, QoS and lock beside every number) apply to every section here. Architecture: [glm5-arch](glm5-arch.md).
 
+<a id="glm-eight-row-verify"></a>
+## GLM DFlash2: verifying two to eight rows, bit-exact
+
+2026-10-22, M5 Max, GLM-5.3-Flash-Sushi-2.4bpw, kv8, A4 g64 assistant, ReleaseFast, `taskpolicy -a`, lock per run, untimed
+(no fans). Every width 2..8 equals serial decode bit for bit: the decode-batch parity test (kv8/kv6, chain and fork, two
+query magnitudes), the row-streaming projection test (A5/A6, nine served shapes, rows 2..8, three input magnitudes) and, on
+this pack, the rows ubench (`SUSHI_GLM_ROWS_UBENCH=6`, `_CTX`, `_TEXT`): 0 of N rows' logits differ at 1K and 8K for
+chains of 2..8 rows and for branching 5- and 8-row trees. Do not use `_CTX=32768` there (four 32K requests fail with
+`MlxError`).
+
+Verify of one chain, ms (rows ubench, real weights, 6 rounds, cool box):
+
+| rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1K, row-tile kernels (`8fb960a6`) | 27.5 | 37.3 | 38.8 | 51.8 | 83.9 | 89.8 | 98.0 | 104.9 |
+| 1K, row-streaming projections | 27.3 | 35.1 | 38.7 | 47.5 | 59.3 | 66.8 | 81.8 | 85.7 |
+| 1K, + HC at 1..8 rows | 27.0 | 34.3 | 38.4 | 46.6 | 56.4 | 63.8 | 78.8 | 82.6 |
+| 1K, + two-tile lane experts, 2 rows on the lane path | 27.2 | 32.9 | 38.5 | 44.8 | 54.0 | 61.1 | 75.8 | 79.3 |
+| 8K, row-tile kernels | 29.6 | 40.4 | 42.2 | 58.2 | 96.0 | 104.9 | 114.6 | 124.0 |
+| 8K, all three | 30.0 | 35.7 | 41.2 | 49.6 | 60.4 | 71.7 | 89.0 | 94.7 |
+| 1K, + grouped selection and MLA banks at 2..8 rows (`4bdcaaf2`, fans max) | 27.0 | 32.8 | 38.4 | 44.5 | 53.9 | 61.1 | 75.8 | 79.3 |
+| 8K, same | 29.2 | 35.0 | 40.5 | 47.9 | 58.5 | 68.0 | 85.6 | 91.1 |
+
+What each step is: `glm5_dflash_rows.zig` streams every row of 2..8 through one read of an A5/A6 weight in qmv_fast's
+per-lane order (one simdgroup per two outputs for up to six rows, two simdgroups splitting the rows from seven; the
+exact row tile it replaces covered four rows and ran twice from the fifth, +32-38 ms); the HC collapse and the fused
+expansion take 1..8 rows (one subgroup per row, so exact by construction); the lane expert kernels carry two output
+tiles per threadgroup at every slot count and serve two rows (routed layer 3 at 2..8 rows: 0.535 / 0.663 / 0.793 / 0.948
+/ 1.073 / 1.226 / 1.313 ms, was 0.579 / 0.668 / 0.875 / 1.014 / 1.154 / 1.330 / 1.424). Seven rows cost as much as eight
+(the split kernel is the cheaper of the two for both), so the policy never lands on seven. A padded split with clamped
+rows was tried for seven and moved nothing.
+
+Longer history: the 8K-minus-1K growth was 2.8 / 2.8 / 4.8 / 6.4 / 10.5 / 13.3 / 15.4 ms at 2..8 rows. A synchronised
+profile put it in the per-row sparse selection (`decodeSelected`: index scores and top-k, one graph per row in
+`mlaAttend`, GPU time, about 0.8 ms a row at 8K); the batched gather and composite attention add only 2 ms from 1K to 8K
+at eight rows. `decodeSelectedRows` now scores (a per-row-offset, per-row-tail copy of the tree scorer), partitions and
+expands the rows of one tree that share a pool count and tail length together, bit-identical to selecting each alone;
+in an interleaved same-boot A/B it saves 1-5 ms at 3-6 rows (8K and 16K) and is a wash at 7-8 rows. The scorer and the
+argpartition themselves are what remains of the 8K growth (an exact multi-row scorer would be the next lever).
+
+Real rounds with the rows pinned, measured with the row-tile kernels of the first row of the table
+(`--drafter-min-depth N --drafter-max-depth N --no-mtp-lookup`, greedy, 256-300 tokens, DFlash and serial in one boot,
+bytes equal everywhere; DFlash/serial ms per token, below 1 wins; no fans, a box heating through the series):
+
+| rows | verify ms | prose | code | copy | count | echo | novel | accepted drafts code / count |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 2 | 37-41 | 0.98 | 0.86 | 0.84 | 0.85 | 0.83 | n/a | 0.96 / 0.99 |
+| 3 | 49-51 | 0.91 | 0.68 | 0.65 | 0.64 | 0.63 | 1.07 | 1.78 / 1.97 |
+| 4 | 67-70 | 1.09 | 0.71 | 0.66 | 0.64 | 0.63 | 1.12 | 2.56 / 2.95 |
+| 5 | 111-114 | 1.21 | 0.94 | 0.82 | 0.79 | 0.77 | 1.17 | 3.15 / 3.85 |
+| 6 | 122-129 | 1.23 | 0.98 | 0.80 | 0.71 | 0.69 | 1.19 | 3.50 / 4.71 |
+| 8 | 145-151 | 1.26 | 0.86 | 0.64 | 0.60 | 0.60 | 1.24 | 4.62 / 6.62 |
+
+`glmLadder` is the mean of the 1K and 8K chain verify plus about 7.4 ms of draft, replay and commit (2..8 rows: 41.3 /
+46.9 / 53.6 / 63.6 / 72.0 / 88.1 / 92.6 ms), and the assistant may draft up to `GLM_USEFUL_ROWS` (8); the calibrated
+confidences decide how many rows a round uses. Pin the ladder only from a cool box: the pinned runs above read the
+verify high while the box heated, which priced two rows below three and made the policy pick two rows on weak text.
+
+llmprobe 0.6.15 `--bench-only --rungs 16k,32k --runs 1`, one run each, fans max, 180 s idle, AC, fresh HOME (tok/s; v1.3.0
+is the recorded `ebe920ac` run of 2026-10-22, not rerun; the new build is `4bdcaaf2`; the die reached 94 C and the run's own
+sustained-load check read -19.9%, so the later rungs are low):
+
+| cell | v1.3.0 | new | change |
+|---|--:|--:|--:|
+| headline decode | 54.7 | 56.9 | +4.0% |
+| novel | 42.1 | 40.8 | -3.1% |
+| predictable | 66.7 | 74.4 | +11.5% |
+| 16k decode / predictable | 46.9 / 61.8 | 44.2 / 70.5 | -5.8% / +14.1% |
+| 32k decode / predictable | 45.3 / 59.7 | 46.1 / 68.4 | +1.8% / +14.6% |
+| first token ms; TTFT 16k / 32k ms | 422; 20088 / 39080 | 431; 20164 / 40627 | |
+
+The policy chose 2.4-3.4 rows on prose and code, 5.8 on counting and echo, 4.1-4.2 on lookup chains (rows = 1 + accepted
+drafts per round over the accepted fraction, from `[spec-stats]`); the stop switch tripped in none of 12 requests.
+
 <a id="glm-nonnax"></a>
 ## GLM-5.3 Sushi-2.3bpw without NAX, rehearsed on the M5 Max
 

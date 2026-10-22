@@ -16,6 +16,7 @@ const mimo_mtp = @import("mimo_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_settings = @import("model_settings.zig");
 const round_cost = @import("round_cost.zig");
+const spec_cost_gate = @import("spec_cost_gate.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
@@ -1757,6 +1758,9 @@ pub const Generator = struct {
     glm_prefill_window: ?GlmSpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
+    /// Whether a DFlash2 round pays against a plain one-row tick for this request, and the plain ticks it ran.
+    glm_gate: spec_cost_gate.Gate = .{},
+    glm_plain: struct { ticks: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, capped by the machine's verify lanes).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
@@ -2193,13 +2197,19 @@ pub const Generator = struct {
             if (self.glm_dflash_native) {
                 const rounds: f64 = @floatFromInt(self.dflash_attempted);
                 const r = self.glm_round;
-                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2} lookup={d}/{d}\n", .{
+                const plain_ticks: f64 = @floatFromInt(@max(self.glm_plain.ticks, 1));
+                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2} lookup={d}/{d} plain={d} serial_ms={d:.2} plain_ms verify={d:.2} replay={d:.2} commit={d:.2}\n", .{
                     @as(f64, @floatFromInt(r.draft_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.verify_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.replay_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.commit_ns)) / rounds / 1e6,
                     self.glm_lookup.rounds,
                     self.glm_lookup.landed,
+                    self.glm_plain.ticks,
+                    self.glm_gate.serial_ms orelse 0.0,
+                    @as(f64, @floatFromInt(self.glm_plain.verify_ns)) / plain_ticks / 1e6,
+                    @as(f64, @floatFromInt(self.glm_plain.replay_ns)) / plain_ticks / 1e6,
+                    @as(f64, @floatFromInt(self.glm_plain.commit_ns)) / plain_ticks / 1e6,
                 });
             }
             return;
@@ -4097,8 +4107,13 @@ pub const Generator = struct {
         const schedule = @import("glm5_dflash_model.zig").bindDefaultSchedule();
         defer schedule.restore();
         var timer = io_util.Stopwatch.init(self.timer.io);
-        const lookup = try self.glmLookupChain(allocator);
-        const proposal = lookup orelse try self.glmPropose(dflash_mod.glmMaxNodes(self.dflash_block_size, dflash_mod.drafterDepthExplicit()));
+        const tick = io_util.Stopwatch.init(self.timer.io);
+        const action = self.glm_gate.next();
+        const lookup = if (self.glm_gate.probing()) null else try self.glmLookupChain(allocator);
+        const proposal = lookup orelse switch (action) {
+            .round => try self.glmProposeRound(),
+            .plain => self.glmPlainProposal(),
+        };
         const draft_ns = timer.read();
         timer.reset();
         const request = self.ctx.glm5_request.?;
@@ -4110,11 +4125,25 @@ pub const Generator = struct {
         defer layerwise.deinit();
         const verify_ns = timer.read();
         const result = try self.glmRoundEnd(allocator, &proposal, layerwise, draft_ns, verify_ns, lookup != null);
+        const wall_ms = @as(f64, @floatFromInt(tick.read())) / @as(f64, std.time.ns_per_ms);
+        const emitted: u32 = @intCast(result.tokens.len);
         if (lookup != null) {
             self.glm_lookup.rounds += 1;
             self.glm_lookup.landed += result.accepted_tokens;
-        }
+            self.glm_gate.observeLookup(emitted);
+        } else if (proposal.count == 1) {
+            self.glm_gate.observePlain(wall_ms);
+        } else self.glm_gate.observeRound(wall_ms, emitted);
         return result;
+    }
+
+    /// The pending token alone: a plain one-row tick that still commits the assistant's taps, so
+    /// DFlash2 rounds resume on the next tick.
+    fn glmPlainProposal(self: *const Generator) @import("glm5_dflash.zig").Proposal {
+        var one = @import("glm5_dflash.zig").Proposal{ .count = 1 };
+        one.tokens[0] = self.next_token_id;
+        one.parents[0] = -1;
+        return one;
     }
 
     /// Drafts a verbatim-copy round takes from the context instead of the assistant: four rows,
@@ -4153,6 +4182,13 @@ pub const Generator = struct {
         return true;
     }
 
+    /// This request's round draft: as many rows as the policy finds worth their verify, within the flags' bounds.
+    fn glmProposeRound(self: *Generator) !@import("glm5_dflash.zig").Proposal {
+        const costs = dflash_policy.glmLadder();
+        const min = dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS;
+        return @import("glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
+    }
+
     /// This request's round draft of at most `max_nodes` nodes.
     pub fn glmPropose(self: *Generator, max_nodes: usize) !@import("glm5_dflash.zig").Proposal {
         return @import("glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
@@ -4168,6 +4204,7 @@ pub const Generator = struct {
         var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, budget, self.eos_token_ids);
         round.draft_ns = draft_ns;
         round.verify_ns = verify_ns;
+        if (!lookup and proposal.count > 1) self.dflash_calib.observeTree(&proposal.conf, &proposal.parents, proposal.count, round.rows[0..round.count]);
         // Accepted share of the tree's depth: a fork can land one draft, a chain two.
         var depth: [16]u32 = @splat(0);
         var deepest: u32 = 0;
@@ -4194,14 +4231,21 @@ pub const Generator = struct {
         self.advanceStep(@intCast(tokens.len));
         self.ctx.cache.step = request.offset;
         self.next_token_id = round.pending orelse tokens[tokens.len - 1];
-        self.dflash_attempted += 1;
-        self.dflash_accepted_tokens += round.accepted_drafts;
-        self.dflash_round_width = @intCast(round.verified_rows - 1);
-        self.glm_round.drafted += round.verified_rows - 1;
-        self.glm_round.draft_ns += round.draft_ns;
-        self.glm_round.verify_ns += round.verify_ns;
-        self.glm_round.replay_ns += round.replay_ns;
-        self.glm_round.commit_ns += round.commit_ns;
+        if (round.verified_rows > 1) {
+            self.dflash_attempted += 1;
+            self.dflash_accepted_tokens += round.accepted_drafts;
+            self.dflash_round_width = @intCast(round.verified_rows - 1);
+            self.glm_round.drafted += round.verified_rows - 1;
+            self.glm_round.draft_ns += round.draft_ns;
+            self.glm_round.verify_ns += round.verify_ns;
+            self.glm_round.replay_ns += round.replay_ns;
+            self.glm_round.commit_ns += round.commit_ns;
+        } else if (!lookup) {
+            self.glm_plain.ticks += 1;
+            self.glm_plain.verify_ns += round.verify_ns;
+            self.glm_plain.replay_ns += round.replay_ns;
+            self.glm_plain.commit_ns += round.commit_ns;
+        }
         if (round.stopped) {
             self.done = true;
             self.finish_reason = "stop";

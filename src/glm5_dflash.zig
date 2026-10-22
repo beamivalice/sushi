@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const forward = @import("glm5_forward.zig");
 const draft = @import("dflash.zig");
 const tree = @import("glm5_dflash_tree.zig");
+const policy = @import("dflash_policy.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 
@@ -215,6 +216,8 @@ pub fn validatePair(assistant: *const draft.DflashModel, target: *const forward.
 pub const Proposal = struct {
     tokens: [16]u32 = undefined,
     parents: [16]i32 = undefined,
+    /// The assistant's probability of each draft among its siblings; row 0 has none.
+    conf: [16]f32 = undefined,
     count: usize,
 };
 
@@ -222,7 +225,33 @@ pub fn proposeTree(assistant: *draft.DflashModel, context: *const draft.DflashCt
     return proposeTreeWithChildren(assistant, context, target, pending, max_nodes, 4);
 }
 
-pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, pending: u32, max_nodes: usize, children: usize) !Proposal {
+/// The assistant's best-first nodes in the order taken, before any row count is chosen.
+pub const Drafted = struct {
+    nodes: tree.DraftTree,
+    allocator: std.mem.Allocator,
+    pending: u32,
+
+    pub fn deinit(self: *Drafted) void {
+        self.nodes.deinit(self.allocator);
+    }
+
+    /// The verifier's rows over the nodes left, depth-first with the root first.
+    pub fn proposal(self: *Drafted) !Proposal {
+        try tree.preorder(self.allocator, &self.nodes);
+        var result = Proposal{ .count = self.nodes.tokens.len + 1 };
+        result.tokens[0] = self.pending;
+        result.parents[0] = -1;
+        result.conf[0] = 1;
+        for (self.nodes.tokens, self.nodes.parents, self.nodes.cond, 1..) |token, parent, conf, row| {
+            result.tokens[row] = token;
+            result.parents[row] = parent + 1;
+            result.conf[row] = conf;
+        }
+        return result;
+    }
+};
+
+pub fn draftNodes(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, pending: u32, max_nodes: usize, children: usize) !Drafted {
     try validatePair(assistant, target);
     if (max_nodes == 0 or max_nodes > 15 or children == 0 or children > 16 or pending >= target.cfg.vocab_size) return error.InvalidGlmDraftTree;
     // forwardBlock uses spare cache rows; fork so an evaluation failure cannot alter committed context.
@@ -234,29 +263,25 @@ pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const dr
     noise[0] = pending;
     const ids = try ops.own(mlx.mlx_array_new_data(&noise, &[_]c_int{ 1, @intCast(assistant.config.block_size) }, 2, .uint32));
     const embeds = try ops.own(try target.rawEmbedding(ids));
-    // A two-node tree reads only the first two draft rows, plus their anchor.
-    const bounded = max_nodes == 2 and assistant.config.block_size == 8;
+    // A tree of n nodes reads only the first n draft rows, plus their anchor.
+    const needed: c_int = @intCast(@min(max_nodes + 1, assistant.config.block_size));
+    const bounded = needed < assistant.config.block_size;
     const hidden = try ops.own(if (bounded)
-        try draft.forwardBlockPrefix(assistant, &work, embeds, context.absLen(), 3)
+        try draft.forwardBlockPrefix(assistant, &work, embeds, context.absLen(), @intCast(needed))
     else
         try draft.forwardBlock(assistant, &work, embeds, context.absLen()));
-    const readout_input = if (bounded) try ops.slice(hidden, 1, 1, 3) else hidden;
-    const projected = try ops.own(try target.projectHead(readout_input));
-    const transformed = try ops.own(try draft.applyLogitTransforms(projected, assistant.config.output_multiplier, assistant.config.logit_softcap, assistant.s));
-    const logits = if (bounded) transformed else try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
-    const selector_input = if (bounded) try ops.slice(hidden, 1, 0, 3) else hidden;
+    const projected = try ops.own(try target.projectHead(try ops.slice(hidden, 1, 1, needed)));
+    const logits = try ops.own(try draft.applyLogitTransforms(projected, assistant.config.output_multiplier, assistant.config.logit_softcap, assistant.s));
+    const selector_input = try ops.slice(hidden, 1, 0, needed);
     var lattice = try tree.lattice(assistant.allocator, &assistant.selector.?, assistant.config.selector_top_k, selector_input, logits, pending, assistant.s);
     defer lattice.deinit(assistant.allocator);
-    var branches = try tree.bestFirstTree(assistant.allocator, &lattice, .{ .max_nodes = max_nodes, .children = children });
-    defer branches.deinit(assistant.allocator);
-    var result = Proposal{ .count = branches.tokens.len + 1 };
-    result.tokens[0] = pending;
-    result.parents[0] = -1;
-    for (branches.tokens, branches.parents, 1..) |token, parent, row| {
-        result.tokens[row] = token;
-        result.parents[row] = parent + 1;
-    }
-    return result;
+    return .{ .nodes = try tree.bestFirstNodes(assistant.allocator, &lattice, .{ .max_nodes = max_nodes, .children = children }), .allocator = assistant.allocator, .pending = pending };
+}
+
+pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, pending: u32, max_nodes: usize, children: usize) !Proposal {
+    var drafted = try draftNodes(assistant, context, target, pending, max_nodes, children);
+    defer drafted.deinit();
+    return drafted.proposal();
 }
 
 fn sameArray(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
@@ -560,6 +585,39 @@ test "GLM DFlash bounds proposal depth by budget and remaining context before ve
             try sameRequest(&serial, &req, s);
         }
     }
+
+    // The policy picks the rows: free rows buy the widest tree, dear rows keep the narrowest, and the
+    // bounds hold either way; a tree is cut by depth first.
+    var open_request = try forward.Request.init(allocator, 4);
+    defer open_request.deinit();
+    var open_context = try draft.DflashCtx.init(allocator, &assistant, 0);
+    defer open_context.deinit();
+    var open_prefix: [6]u32 = undefined;
+    for (&open_prefix, 0..) |*t, i| t.* = @intCast(i % 4);
+    const open_ids = try ops.own(mlx.mlx_array_new_data(&open_prefix, &[_]c_int{ 1, 6 }, 2, .uint32));
+    const open_pending = try prefill(&assistant, &open_context, &target, &open_request, open_ids);
+    var calib = policy.Calibration{};
+    var guess: f32 = 0;
+    while (guess < 1) : (guess += 0.01) for (0..40) |_| calib.observe(guess, true);
+    const cheap = policy.linearLadder(1, 0);
+    const dear = policy.linearLadder(1, 100);
+    for ([_]usize{ 1, 4 }) |children| {
+        const wide = try proposeRoundAdaptive(&assistant, &open_context, &target, &open_request, open_pending, 100, &.{}, children, .{ .min = 2, .max = 4 }, &calib, &cheap);
+        try std.testing.expectEqual(@as(usize, 4), wide.count);
+        const narrow = try proposeRoundAdaptive(&assistant, &open_context, &target, &open_request, open_pending, 100, &.{}, children, .{ .min = 2, .max = 4 }, &calib, &dear);
+        try std.testing.expectEqual(@as(usize, 2), narrow.count);
+        const pinned = try proposeRoundAdaptive(&assistant, &open_context, &target, &open_request, open_pending, 100, &.{}, children, .{ .min = 3, .max = 3 }, &calib, &dear);
+        try std.testing.expectEqual(@as(usize, 3), pinned.count);
+        const short = try proposeRoundAdaptive(&assistant, &open_context, &target, &open_request, open_pending, 2, &.{}, children, .{ .min = 2, .max = 4 }, &calib, &cheap);
+        var rows: [16]usize = undefined;
+        for (short.parents[0..short.count], 0..) |parent, i| {
+            rows[i] = if (parent < 0) 1 else rows[@intCast(parent)] + 1;
+            try std.testing.expect(rows[i] <= 2);
+        }
+        try std.testing.expect(wide.conf[1] > 0 and wide.conf[1] <= 1);
+        const plain = try proposeRoundAdaptive(&assistant, &open_context, &target, &open_request, open_pending, 1, &.{}, children, .{ .min = 2, .max = 4 }, &calib, &cheap);
+        try std.testing.expectEqual(@as(usize, 1), plain.count);
+    }
 }
 
 test "trimToDepth keeps the rows within the depth and re-indexes their parents" {
@@ -669,6 +727,8 @@ pub const RoundResult = struct {
     commit_ns: u64,
     replay_ns: u64 = 0,
     verifier: []const u8 = "serial_branch_oracle",
+    /// The proposal rows the round kept, root first.
+    rows: [16]u32 = undefined,
 };
 
 /// Test oracle round: every proposed node runs the serial target forward.
@@ -692,6 +752,7 @@ pub fn roundTreeOracle(io: std.Io, assistant: *draft.DflashModel, context: *draf
     const kept = try commitVerified(assistant, context, request, &verified, budget, eos);
     var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .commit_ns = timer.read() };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
+    result.rows = kept.rows;
     return result;
 }
 
@@ -743,6 +804,28 @@ pub fn proposeRound(assistant: *draft.DflashModel, context: *const draft.DflashC
     return proposal;
 }
 
+/// A round whose row count the policy chooses from the assistant's own confidence: the widest tree
+/// the bounds allow is drafted, then cut to the rows with the best expected tokens per ms.
+pub fn proposeRoundAdaptive(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, request: *const forward.Request, pending: u32, budget: usize, eos: []const u32, children: usize, bounds: struct { min: u32, max: u32 }, calib: *const policy.Calibration, costs: *const policy.Costs) !Proposal {
+    if (children == 0 or children > 16 or bounds.min < 2 or bounds.max < bounds.min or bounds.max > 16) return error.InvalidGlmDraftTree;
+    try validatePair(assistant, target);
+    if (budget == 0) return error.InvalidGlmDraftBudget;
+    if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
+    const depth = @min(budget, target.cfg.max_position_embeddings -| request.offset);
+    if (depth <= 1 or std.mem.indexOfScalar(u32, eos, pending) != null) {
+        var one = Proposal{ .count = 1 };
+        one.tokens[0] = pending;
+        one.parents[0] = -1;
+        return one;
+    }
+    var drafted = try draftNodes(assistant, context, target, pending, bounds.max - 1, children);
+    defer drafted.deinit();
+    try drafted.nodes.cut(drafted.allocator, depth, bounds.max - 1);
+    const rows = policy.pickTreeRows(calib, drafted.nodes.parents, drafted.nodes.cond, bounds.min, bounds.max, costs);
+    try drafted.nodes.cut(drafted.allocator, depth, rows - 1);
+    return drafted.proposal();
+}
+
 /// Drops the nodes whose chain from the root is longer than `depth` rows; parents precede children.
 fn trimToDepth(proposal: *Proposal, depth: usize) void {
     var rows: [16]usize = undefined;
@@ -754,6 +837,7 @@ fn trimToDepth(proposal: *Proposal, depth: usize) void {
         if (rows[i] > depth) continue;
         moved[i] = @intCast(kept);
         proposal.tokens[kept] = proposal.tokens[i];
+        proposal.conf[kept] = proposal.conf[i];
         proposal.parents[kept] = if (parent < 0) -1 else moved[@intCast(parent)];
         kept += 1;
     }
@@ -774,11 +858,13 @@ pub fn finishRound(io: std.Io, assistant: *const draft.DflashModel, context: *dr
     };
     var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = 0, .verify_ns = 0, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = "layerwise_tree_grouped" };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
+    result.rows = kept.rows;
     return result;
 }
 
 test {
     _ = @import("glm5_dflash_qmm.zig");
+    _ = @import("glm5_dflash_rows.zig");
 }
 
 test {

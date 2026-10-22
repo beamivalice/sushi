@@ -536,7 +536,7 @@ test "GLM DFlash KDA replay keeps raw BF16 one-token history bits" {
 test "GLM DFlash dense rows preserve integrated serial outputs" {
     const dense = @import("glm5_dflash_dense_rows.zig");
     // 128 and 64 serve KDA's FA/GA/beta, 32 the MLA index weights.
-    for ([_]c_int{ 128, 64, 32 }) |width| for ([_]c_int{ 2, 3, 4 }) |rows| {
+    for ([_]c_int{ 128, 64, 32 }) |width| for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |rows| {
         var ops = Ops{ .s = mlx.gpuStream() };
         defer ops.deinit();
         const key = try ops.slot();

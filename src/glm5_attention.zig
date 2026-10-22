@@ -256,6 +256,8 @@ pub const State = struct {
 var score_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var score_tail_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var expand_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var score_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attention_kernels: [latent_store.variants]?mlx.mlx_fast_metal_kernel = @splat(null);
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -368,6 +370,14 @@ const EXPAND: [:0]const u8 =
     \\}
     \\out[i]=token;
 ;
+fn replaceOnce(comptime source: []const u8, comptime old: []const u8, comptime value: []const u8) [:0]const u8 {
+    const at = comptime std.mem.indexOf(u8, source, old) orelse @compileError("missing " ++ old);
+    return source[0..at] ++ value ++ source[at + old.len ..] ++ "";
+}
+// The verifier's rows sit at their own offsets and carry their own tails.
+const SCORE_ROWS_KEYS: [:0]const u8 = "#define SUSHI_POOL_KEYS(p) ((p) < uint(tail_base) ? keys + size_t(p) * uint(I) : tail + (size_t(row) * uint(TAIL_ROWS) + ((p) - uint(tail_base))) * uint(I))\n";
+const SCORE_ROWS: [:0]const u8 = replaceOnce(SCORE, "const uint limit = uint(offset) + row + 1u;", "const uint limit = uint(offsets[row]) + 1u;");
+const EXPAND_ROWS: [:0]const u8 = replaceOnce(EXPAND, "const uint pos=uint(offset)+row;", "const uint pos=uint(offsets[row]);");
 const ATTENTION: [:0]const u8 = partials.common ++ partials.partial_tail;
 const MERGE: [:0]const u8 =
     \\#pragma clang fp contract(off)
@@ -621,6 +631,107 @@ pub fn decodeSelected(state: *const State, index_q: Arr, weights: Arr, offset: u
     return scope.result(try scope.shape(ids.*, &.{ 1, selected_width }));
 }
 
+pub const SelectRow = struct { state: *const State, index_q: Arr, weights: Arr, offset: usize };
+
+/// `decodeSelected` for the rows of one verifier tree. Rows that share a pool count and tail length score, partition
+/// and expand together, which the one-row geometry of each stays bit-identical to; the others select alone. All rows
+/// must branch from the same prefix. `out[i]` is owned by the caller.
+pub fn decodeSelectedRows(rows: []const SelectRow, out: []Arr, s: mlx.mlx_stream) !void {
+    if (rows.len > 16 or out.len < rows.len) return error.InvalidGlmAttentionShape;
+    var done: [16]bool = @splat(false);
+    for (rows, 0..) |row, i| {
+        if (done[i]) continue;
+        var members: [16]usize = undefined;
+        var count: usize = 0;
+        if (row.offset + 1 > pool_size * (pool_budget + 1) - 1) for (rows[i..], i..) |other, j| {
+            if (!done[j] and (other.offset + 1) / 4 == (row.offset + 1) / 4 and other.state.poolTailRows() == row.state.poolTailRows() and
+                mlx.mlx_array_dtype(other.index_q) == mlx.mlx_array_dtype(row.index_q))
+            {
+                members[count] = j;
+                count += 1;
+            }
+        };
+        if (count < 2) {
+            done[i] = true;
+            out[i] = try decodeSelected(row.state, row.index_q, row.weights, row.offset, s);
+            continue;
+        }
+        for (members[0..count]) |j| done[j] = true;
+        try selectGroup(rows, members[0..count], out, s);
+    }
+}
+
+fn stacked(scope: *Scope, parts: []const Arr) !Arr {
+    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    const joined = try scope.slot();
+    try mlx.check(mlx.mlx_concatenate_axis(joined, vec, 0, scope.s));
+    return joined.*;
+}
+
+var group_selects: usize = 0;
+
+fn selectGroup(rows: []const SelectRow, members: []const usize, out: []Arr, s: mlx.mlx_stream) !void {
+    group_selects += 1;
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const g: c_int = @intCast(members.len);
+    const first = rows[members[0]];
+    const pools: c_int = @intCast((first.offset + 1) / 4);
+    const tail_rows: c_int = @intCast(first.state.poolTailRows());
+    var queries: [16]Arr = undefined;
+    var weights: [16]Arr = undefined;
+    var tails: [16]Arr = undefined;
+    var offsets: [16]u32 = undefined;
+    for (members, 0..) |j, k| {
+        queries[k] = rows[j].index_q;
+        weights[k] = rows[j].weights;
+        tails[k] = rows[j].state.pool_tail;
+        offsets[k] = @intCast(rows[j].offset);
+    }
+    const keys = first.state.indexKeys();
+    const tail = if (tail_rows > 0) try scope.shape(try stacked(&scope, tails[0..members.len]), &.{ g, tail_rows, mlx.getShape(keys)[1] }) else keys;
+    const offset_array = try scope.own(mlx.mlx_array_new_data(&offsets, &.{g}, 1, .uint32));
+    const scores = try treeScoresRows(&scope, keys, tail, tail_rows, try stacked(&scope, queries[0..members.len]), try stacked(&scope, weights[0..members.len]), offset_array, pools);
+    const pools_top = try partitionTop(&scope, scores, g);
+    const ec = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(ec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(ec, &.{ g, selected_width }, 2, .int32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(ec, g * selected_width, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(ec, 256, 1, 1));
+    try template(ec, "ROWS", g);
+    try template(ec, "K", @min(pools, pool_budget));
+    const ek = try kernel(&expand_rows_kernel, "sushi_glm_expand_pools_rows", &.{ "selected", "offsets" }, &.{"out"}, EXPAND_ROWS);
+    const ev = try apply(ek, &.{ pools_top, offset_array }, ec, s);
+    defer _ = mlx.mlx_vector_array_free(ev);
+    const tokens = try kernelOutput(&scope, ev, 0);
+    for (members, 0..) |j, k| out[j] = try scope.result(try scope.cut(tokens, @intCast(k), @intCast(k + 1)));
+}
+
+/// `treeScoresTail` for rows at their own offsets, each with its own tail of `tail_rows` pools.
+fn treeScoresRows(scope: *Scope, pooled: Arr, tail: Arr, tail_rows: c_int, index_q: Arr, weights: Arr, offsets: Arr, pools: c_int) !Arr {
+    const sh = mlx.getShape(index_q);
+    const rows = sh[0];
+    if (sh[1] > 32 or sh[2] > 128) return error.InvalidGlmAttentionShape;
+    const row_group = @min(rows, if (@import("glm5_model.zig").naxArms()) @as(c_int, 16) else 8);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, pools }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(pools + 31, 32) * 32, rows, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, row_group, 1));
+    try template(cfg, "J", sh[1]);
+    try template(cfg, "I", sh[2]);
+    try template(cfg, "RT", row_group);
+    try template(cfg, "TAIL_ROWS", tail_rows);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", mlx.mlx_array_dtype(index_q)));
+    const count = try scope.own(mlx.mlx_array_new_int(pools));
+    const first = try scope.own(mlx.mlx_array_new_int(pools - tail_rows));
+    const k = try kernelWithHeader(&score_rows_kernel, "sushi_glm_index_scores_tree_rows", &.{ "q", "keys", "tail", "weights", "offsets", "count", "tail_base" }, &.{"out"}, SCORE_ROWS, SCORE_HEADER ++ SCORE_ROWS_KEYS);
+    const ov = try apply(k, &.{ index_q, pooled, tail, weights, offsets, count, first }, cfg, scope.s);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    return kernelOutput(scope, ov, 0);
+}
+
 fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, headpack: bool, overlay: ?latent_overlay.View) !Arr {
     if (headpack) {
         var ops = @import("glm5_model.zig").Ops{ .s = scope.s };
@@ -860,7 +971,7 @@ fn attendNativeDecode(state: *const State, q: Arr, iq: ?Arr, weights: ?Arr, offs
             const prefix = if (view) |v| v.storage() else state.latentView();
             const prefix_rows = if (view) |v| v.prefix_rows else pos;
             const tail = if (view) |v| v.tail else try ops.own(try state.latentView().dense(@intCast(pos), @intCast(pos + 1), s));
-            const branch = native.Branch{ .offset = pos, .length = pos + 1, .path = .{ 0, 1, 2, 3 } };
+            const branch = native.Branch{ .offset = pos, .length = pos + 1, .path = native.pathOf(&.{ 0, 1, 2, 3 }) };
             const out = (try native.run(&ops, query, prefix, prefix_rows, tail, &.{branch}, indices, scale)) orelse return error.GlmDecodeNativeUnsupported;
             try mlx.check(mlx.mlx_vector_array_append_value(outputs, out));
             try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
@@ -1207,6 +1318,43 @@ test "GLM tree index scorer equals the SIMD-sum scorer bit for bit at real magni
     const state = State{ .pooled = pooled, .processed = 2400 };
     _ = try indexScores(&scope, &state, try normal(&scope, &.{ 1, 32, 128 }, 8, 3), try normal(&scope, &.{ 1, 32 }, 9, 0.1), 2399);
     try std.testing.expectEqual(calls + 1, tree_score_calls);
+}
+
+test "GLM verifier rows select exactly what each row selects alone, at every tail length and pool boundary" {
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const prefix_pools = 1100;
+    const pooled = try normal(&scope, &.{ prefix_pools, 128 }, 31, 4);
+    // Pool count and tail length per row: rows 0, 1 and 6 share a group, as do 2 and 3, and 4 and 5; row 7 is dense.
+    const cases = [_]struct { tail: usize, processed: usize }{
+        .{ .tail = 0, .processed = 4400 }, .{ .tail = 0, .processed = 4403 }, .{ .tail = 1, .processed = 4404 }, .{ .tail = 1, .processed = 4406 },
+        .{ .tail = 2, .processed = 4408 }, .{ .tail = 2, .processed = 4409 }, .{ .tail = 0, .processed = 4402 }, .{ .tail = 0, .processed = 2000 },
+    };
+    var states: [cases.len]State = undefined;
+    var rows: [cases.len]SelectRow = undefined;
+    for (cases, 0..) |case, i| {
+        const seed: u64 = 500 + 10 * i;
+        states[i] = .{ .pooled = pooled, .processed = case.processed };
+        if (case.tail > 0) states[i].pool_tail = try normal(&scope, &.{ @intCast(case.tail), 128 }, seed, 4);
+        rows[i] = .{ .state = &states[i], .index_q = try normal(&scope, &.{ 1, 32, 128 }, seed + 1, 3), .weights = try normal(&scope, &.{ 1, 32 }, seed + 2, 0.1), .offset = case.processed - 1 };
+        if (case.processed < 2100) states[i].pooled = try scope.cut(pooled, 0, @intCast(case.processed / 4));
+    }
+    var grouped: [cases.len]Arr = undefined;
+    const before = group_selects;
+    try decodeSelectedRows(&rows, &grouped, s);
+    try std.testing.expectEqual(before + 3, group_selects);
+    defer for (grouped) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (rows, 0..) |row, i| {
+        const alone = try scope.own(try decodeSelected(row.state, row.index_q, row.weights, row.offset, s));
+        try mlx.check(mlx.mlx_array_eval(alone));
+        try mlx.check(mlx.mlx_array_eval(grouped[i]));
+        try std.testing.expectEqualSlices(c_int, mlx.getShape(alone), mlx.getShape(grouped[i]));
+        const n = mlx.mlx_array_size(alone);
+        try std.testing.expectEqualSlices(i32, mlx.mlx_array_data_int32(alone).?[0..n], mlx.mlx_array_data_int32(grouped[i]).?[0..n]);
+    }
 }
 
 test "GLM attention rejects invalid append without advancing request state" {
@@ -1573,7 +1721,7 @@ fn serialRowCase(bits: u8) !void {
         const w = try normal(&round, &.{ 1, 32 }, 74, 0.1);
         const ids = try ops.own(try decodeSelected(&state, iq, w, pos, s));
         const tail = try ops.own(try state.latentView().dense(@intCast(pos), @intCast(length), s));
-        const want = (try native.run(&ops, q, state.latentView(), pos, tail, &.{.{ .offset = pos, .length = length, .path = .{ 0, 1, 2, 3 } }}, ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+        const want = (try native.run(&ops, q, state.latentView(), pos, tail, &.{.{ .offset = pos, .length = length, .path = native.pathOf(&.{ 0, 1, 2, 3 }) }}, ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
         const got = (try native.runRow(&ops, q, state.latentView(), pos, .{ .ids = ids }, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
         try expectSameBits(want, got);
         const pools = try decodePools(&state, iq, w, pos, s);
@@ -1662,9 +1810,9 @@ fn decodeCompositeCase(fraction: ?f64) !void {
     const prefix = Latent{ .data = try normal(&scope, &.{ prefix_rows, 512 }, 30, 1) };
     const tape = try normal(&scope, &.{ 3, 512 }, 31, 1);
     const branches = [_]native.Branch{
-        .{ .offset = prefix_rows, .length = prefix_rows + 1, .path = .{ 0, 0, 0, 0 } },
-        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 1, 0, 0 } },
-        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 2, 0, 0 } },
+        .{ .offset = prefix_rows, .length = prefix_rows + 1, .path = native.pathOf(&.{0}) },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = native.pathOf(&.{ 0, 1 }) },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = native.pathOf(&.{ 0, 2 }) },
     };
     var ids: [3 * 2051]i32 = undefined;
     for (branches, 0..) |branch, row| for (0..2051) |k| {
