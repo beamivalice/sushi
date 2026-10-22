@@ -11,6 +11,10 @@
 #   3. OPT-OUT: a request with enable_drafter:false logs no mode=dflash line.
 #
 #   4. OPT-IN: a drafter beside the pack is NOT loaded without --drafter: the boot decodes with MTP.
+#   6. IMAGE: a request with an image runs DFlash rounds and equals serial decoding byte for byte (the target's verify
+#      carries the M-RoPE positions; the drafter reads the sequence).
+#   5. SAMPLED (temperature 1.0, top_p 0.95, top_k 20, what agent clients send): every bank request runs DFlash rounds
+#      and answers; the per-draft acceptance is printed, because a greedy-only bar never sees the runtime gate act.
 #
 # Usage: DFLASH2_QWEN_MODEL=<pack dir> [DFLASH2_QWEN_DRAFTER=<drafter dir>] ./tests/test_dflash2_qwen.sh [port]
 # Boot flags: SUSHI_TEST_EXTRA_ARGS (e.g. a pinned block size knob while measuring).
@@ -66,8 +70,22 @@ start_server() { # $1 = boot name, rest = flags
 # One bank run: prints a JSON list of {"id","text"}; every request is greedy.
 bank() { # $1 = out file, $2 = extra JSON fields for each request body
     python3 - "$PORT" "$1" "${2:-}" <<'PYBANK'
-import json, sys, urllib.request
+import base64, json, struct, sys, urllib.request, zlib
 port, out, extra = sys.argv[1], sys.argv[2], json.loads(sys.argv[3] or "{}")
+
+
+def png(w, h):
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    rows = []
+    for y in range(h):
+        row = b"".join(bytes(((x // 28) * 37 % 256, (y // 28) * 53 % 256, 128)) * 28 for x in range(0, w, 28))
+        rows.append(b"\x00" + row[: 3 * w])
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b"")
+
+
+IMAGE = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png(224, 224)).decode()}},
+         {"type": "text", "text": "Describe this image in one sentence, then count from 1 to 30."}]
 CODE = "def total_by_sku(rows):\n    totals = {}\n    for row in rows:\n        totals[row['sku']] = totals.get(row['sku'], 0) + int(row['qty'])\n    return totals\n"
 bank = [
     ("prose", "Write a short story about a robot learning to paint.", False, 200),
@@ -76,6 +94,7 @@ bank = [
     ("math", "A train leaves at 9:40 and travels 150 km at 60 km/h. When does it arrive? Show the steps.", False, 200),
     ("json", "Give a JSON object describing three fruits with name, color and calories. Output only the JSON.", False, 160),
     ("think", "Why is the sky blue? Answer in two sentences.", True, 400),
+    ("image", IMAGE, False, 240),
 ]
 rows = []
 for name, prompt, think, max_tokens in bank:
@@ -130,7 +149,7 @@ grep -q "DFlash drafter ready" "$LOG" && ok "boot: DFlash drafter ready ($(grep 
     bad "boot: DFlash drafter ready" "$(grep -i -E 'dflash|drafter' "$LOG" | head -5)"
 bank "$ARTIFACTS/dflash.json" || bad "bank with the drafter" "request failed"
 N_STATS=$(grep -c "mode=dflash" "$LOG")
-if [ "$N_STATS" -eq 6 ]; then ok "every bank request ran DFlash rounds ($N_STATS stats lines)"; else bad "six mode=dflash stats lines" "saw $N_STATS"; fi
+if [ "$N_STATS" -eq 7 ]; then ok "every bank request ran DFlash rounds ($N_STATS stats lines)"; else bad "seven mode=dflash stats lines" "saw $N_STATS"; fi
 ATTEMPTS_BAD=$(grep "mode=dflash" "$LOG" | grep -c "attempts=0 ")
 [ "$ATTEMPTS_BAD" -eq 0 ] && ok "no request ran zero rounds" || bad "no request ran zero rounds" "$ATTEMPTS_BAD with attempts=0"
 grep "mode=dflash" "$LOG" | sed -n 's/.*attempts=\([0-9]*\).*avg_per_round=\([0-9.]*\).*per_draft_pct=\([0-9.]*\).*/  attempts=\1 avg_per_round=\2 per_draft_pct=\3/p'
@@ -142,6 +161,19 @@ bank "$ARTIFACTS/optout.json" '{"enable_drafter": false}' >/dev/null 2>&1
 AFTER=$(grep -c "mode=dflash" "$LOG")
 # stream_matches ran two dflash requests (2 stats lines); the opt-out bank adds none.
 [ "$AFTER" -eq $((BEFORE + 2)) ] && ok "enable_drafter:false runs no DFlash rounds" || bad "enable_drafter:false runs no DFlash rounds" "stats lines $BEFORE -> $AFTER (expected +2 from the stream pair)"
+SAMPLED_BEFORE=$AFTER
+bank "$ARTIFACTS/sampled.json" '{"temperature": 1.0, "top_p": 0.95, "top_k": 20}' || bad "sampled bank with the drafter" "request failed"
+SAMPLED_AFTER=$(grep -c "mode=dflash" "$LOG")
+[ "$SAMPLED_AFTER" -eq $((SAMPLED_BEFORE + 7)) ] && ok "every sampled bank request ran DFlash rounds" ||
+    bad "every sampled bank request ran DFlash rounds" "stats lines $SAMPLED_BEFORE -> $SAMPLED_AFTER (expected +7)"
+echo "sampled (T1.0 top_p 0.95 top_k 20):"
+tail -n 7 <(grep "mode=dflash" "$LOG") | sed -n 's/.*attempts=\([0-9]*\).*avg_per_round=\([0-9.]*\).*per_draft_pct=\([0-9.]*\).*runtime_disabled=\([a-z]*\).*/  attempts=\1 avg_per_round=\2 per_draft_pct=\3 runtime_disabled=\4/p'
+python3 - "$ARTIFACTS/sampled.json" <<'PYSAMPLED'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+sys.exit(0 if all(len(r["text"].replace("\x01", "").strip()) > 0 for r in rows) else 1)
+PYSAMPLED
+[ $? -eq 0 ] && ok "every sampled answer is non-empty" || bad "every sampled answer is non-empty"
 stop_server
 
 echo "== boot 2: serial (--no-drafter --no-mtp)"

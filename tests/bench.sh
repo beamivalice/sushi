@@ -10,6 +10,7 @@
 #   ./tests/bench.sh --only sushi-4bpw              # one row
 #   ./tests/bench.sh --url 127.0.0.1:1234 -m <id>   # a server someone else started
 #   ./tests/bench.sh --full                         # median of 3 per rung, to 64k
+#   ./tests/bench.sh --sampled                      # also a sampled cell (llmprobe's creative preset: T1.0, top_p 0.95)
 #
 # Each cell is sushi at its FASTEST: MTP is forced on where the checkpoint
 # carries a head, so a model-settings.json cannot turn it off. The mode
@@ -29,6 +30,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ONLY=""
 FULL=0
+SAMPLED=0
 URL=""
 URL_MODEL=""
 TAG="$(date +%Y%m%d-%H%M%S)"
@@ -38,7 +40,7 @@ BINARY="${BINARY:-$ROOT/zig-out/bin/sushi}"
 LLMPROBE="${LLMPROBE:-npx -y llmprobe@latest}"
 PORT=11250
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --url)     URL="$2"; shift 2 ;;
         -m|--model) URL_MODEL="$2"; shift 2 ;;
         --full)    FULL=1; shift ;;
+        --sampled) SAMPLED=1; shift ;;
         --tag)     TAG="$2"; shift 2 ;;
         --settle)  SETTLE="$2"; shift 2 ;;
         -h|--help) usage ;;
@@ -83,6 +86,12 @@ probe() { # logical host model_id
     # shellcheck disable=SC2086
     $LLMPROBE "$2" -m "$3" "${depth[@]}" --save "$OUT/$1.json" \
         || echo "  llmprobe failed for $1" >&2
+    # Greedy bench cells never see a draft rejected at temperature; agent clients send T1.0, top_p 0.95, top_k 20
+    # (the pack's generation_config supplies top_k).
+    if [[ "$SAMPLED" -eq 1 ]]; then
+        $LLMPROBE "$2" -m "$3" "${depth[@]}" --sampling creative --save "$OUT/$1-sampled.json" \
+            || echo "  llmprobe (sampled) failed for $1" >&2
+    fi
 }
 
 # --mtp restates the default wherever the checkpoint ships a head, so the
@@ -145,7 +154,7 @@ for path in sorted(Path(sys.argv[1]).glob("*.json")):
     # WHICH speculative mode ran is only knowable from the server's own log
     # (llmprobe reports that one engaged, not which one). Name it in the cell
     # only when it actually paid: armed-but-not-accepting is not "mtp".
-    log = path.with_suffix(".log")
+    log = path.with_name(path.stem.removesuffix("-sampled") + ".log")
     modes = re.findall(r"\[spec-stats\] mode=(\w+)",
                        log.read_text(errors="replace")) if log.exists() else []
     mode = f" {max(set(modes), key=modes.count)}" if modes and tps > 1.05 else ""

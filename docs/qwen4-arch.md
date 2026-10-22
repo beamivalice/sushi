@@ -103,8 +103,8 @@ native tree.
   drafter's context grows by the committed taps only.
 - **Verify**: ONE batched forward of `[t1, drafts]` with per-position GDN capture; a partial accept rolls GDN, PLE and
   QSA state back through `ssmRollbackFromCapture`, shared with the MTP verify (rows are decode-identical up to 9).
-  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/test_dflash2_qwen.sh`: six prompts, stream ==
-  non-stream, opt-out, and that a drafter beside the pack is ignored; run on Sushi-2bpw, 2.6bpw, 4bpw and an STQ SPEC1
+  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/test_dflash2_qwen.sh`: seven prompts incl. an image, stream ==
+  non-stream, opt-out, a sampled bank at T1.0 / top_p 0.95 / top_k 20, and that a drafter beside the pack is ignored; run on Sushi-2bpw, 2.6bpw, 4bpw and an STQ SPEC1
   pack, and streamed at `--ssd-budget-gb 32` on 2.6bpw).
 - **Rows**: a verify row is bytes, not dispatches (about 3.3 ms per row on Sushi-2.6bpw). The drafter drafts a block of
   `--drafter-max-depth` - 1 (default 8 rows) and the round verifies only as many rows as `dflash_policy.zig` finds worth
@@ -112,9 +112,15 @@ native tree.
   expected tokens per ladder cost, never below `--drafter-min-depth` (default 2). Prose and thinking settle near 2-3 rows,
   code, JSON and copy take 8. Equal min and max pin one row count.
 - **Yield gate**: a request whose DFlash rounds cost more per token than its serial decode (5% margin, after 8 rounds)
-  falls back to plain ticks for the rest of the request. The serial price is the round-cost table's width-0 cell of the
-  request's context bucket; without a sample the gate asks for the ladder's break-even yield at the request's MEAN
-  verified rows, never the block's.
+  falls back to plain ticks for the rest of the request, and drops the drafter's window with it (the plain tick does no
+  tap capture, window append or drafter forward). The serial price is the round-cost table's width-0 cell of the
+  request's own context bucket, never a shorter bucket's (a 24k token costs 17.7 ms, a 90k one about 30); without a
+  sample the gate asks for `dflash_policy.breakEvenDrafts` at the request's MEAN verified rows, never the block's:
+  0.42 accepted drafts at 2 rows, 0.69 at 4, 1.40 at 8.
+- **Image and video requests**: served by the drafter like text. The target's verify carries the M-RoPE positions (the
+  scalar `offset + delta` RoPE past the position table, as every decode and MTP verify does), so exactness never reads
+  the drafter's positions; the drafter keeps a 1-D sequential position over its sliding window, and the tapped hiddens of
+  image rows enter its context like any other row. On a DFlash2 server a request is DFlash2 or plain ticks, never MTP.
 - **Bill**: `dflashRequestBytes` (window x 4 + tap and encoder rows of one prefill chunk + 64 MiB) joins the request
   bill in the commit that loads the drafter; the weights join the load bill.
 - **Lessons**: an accepted-per-round floor that is right for a dense 27B target disabled rounds that beat serial here

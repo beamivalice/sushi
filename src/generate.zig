@@ -1762,6 +1762,7 @@ pub const Generator = struct {
     dflash_block_size: u32 = 0,
     /// Wall ms of this request's DFlash rounds, for the cost gate.
     dflash_wall_ms: f64 = 0,
+    dflash_gate_window: DflashGateWindow = .{},
     /// Drafts the verifies of this request carried, and the selector-confidence calibration that picks rows.
     dflash_drafts_verified: u64 = 0,
     dflash_calib: dflash_policy.Calibration = .{},
@@ -2005,10 +2006,9 @@ pub const Generator = struct {
     pub const DFLASH_GATE_MARGIN: f32 = 0.05;
 
     /// Accepted drafts per round at which a round of `rows` verifier rows costs one serial step per
-    /// token, used until a serial sample exists. A round costs about 0.25 + 0.28 serial steps per
-    /// row (Sushi-2.6bpw, M5 Max: 24.1, 30.6 and 46.7 ms at 2, 4 and 8 rows against a 13.3 ms token).
+    /// token, used while the request's context bucket holds no serial sample. The policy's own cost ladder.
     pub fn dflashBreakEvenAccepted(rows: f32) f32 {
-        return 0.25 + 0.28 * rows;
+        return dflash_policy.breakEvenDrafts(rows);
     }
 
     /// Does the request's DFlash yield lose to serial decoding? With a measured serial price (the
@@ -2025,6 +2025,24 @@ pub const Generator = struct {
         const avg = @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(attempted));
         return avg < dflashBreakEvenAccepted(rows);
     }
+
+    /// The rounds the gate judges: those after the warmup. The warmup's own wall carries one-time costs (graph builds,
+    /// first touches of a long context) that would decide a request the steady rounds win.
+    pub const DflashGateWindow = struct {
+        open: bool = false,
+        attempted: u64 = 0,
+        accepted: u64 = 0,
+        wall_ms: f64 = 0,
+
+        pub fn shouldDisable(self: *DflashGateWindow, attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
+            if (attempted < DFLASH_GATE_WARMUP) return false;
+            if (!self.open) {
+                self.* = .{ .open = true, .attempted = attempted, .accepted = accepted, .wall_ms = wall_ms };
+                return false;
+            }
+            return dflashGateShouldDisable(attempted - self.attempted, accepted - self.accepted, wall_ms - self.wall_ms, rows, serial_ms_tok);
+        }
+    };
 
     /// Verifier rows a round of this request carried on average: the block's until a round has run.
     fn dflashMeanRows(self: *const Generator) f32 {
@@ -4213,7 +4231,7 @@ pub const Generator = struct {
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
-        std.debug.assert(self.dflash_ctx != null);
+        std.debug.assert(self.dflash_ctx != null or self.spec_disabled_runtime);
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         if (self.completion_tokens >= self.max_tokens) {
@@ -4700,14 +4718,24 @@ pub const Generator = struct {
     fn checkDflashRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
         const serial = dflashSerialPrice(&self.xfm.round_cost, self.xfm.round_cost.bucketOf(self.mtpKvLen()));
-        if (!dflashGateShouldDisable(self.dflash_attempted, self.dflash_accepted_tokens, self.dflash_wall_ms, self.dflashMeanRows(), serial)) return;
-        const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
-            @as(f32, @floatFromInt(self.dflash_attempted));
+        if (!self.dflash_gate_window.shouldDisable(self.dflash_attempted, self.dflash_accepted_tokens, self.dflash_wall_ms, self.dflashMeanRows(), serial)) return;
+        const w = self.dflash_gate_window;
+        const rounds = self.dflash_attempted - w.attempted;
+        const accepted = self.dflash_accepted_tokens - w.accepted;
         log.info(
-            "  dflash=disabled (runtime yield {d:.2} accepted/round, {d:.2} ms/token against {d:.2} serial, after {d} attempts)\n",
-            .{ avg, self.dflash_wall_ms / @as(f64, @floatFromInt(self.dflash_attempted + self.dflash_accepted_tokens)), serial orelse 0.0, self.dflash_attempted },
+            "  dflash=disabled (runtime yield {d:.2} accepted/round, {d:.2} ms/token against {d:.2} serial, over {d} rounds after the warmup)\n",
+            .{ @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(rounds)), (self.dflash_wall_ms - w.wall_ms) / @as(f64, @floatFromInt(rounds + accepted)), serial orelse 0.0, rounds },
         );
+        self.stopDflash();
+    }
+
+    /// Serial decoding for the rest of the request: nothing resumes the drafter, so its window goes now.
+    fn stopDflash(self: *Generator) void {
         self.spec_disabled_runtime = true;
+        if (self.dflash_ctx) |*dc| {
+            dc.deinit();
+            self.dflash_ctx = null;
+        }
     }
 
     /// Qwen native-MTP speculative round. Structure mirrors `nextDrafter`
@@ -13026,18 +13054,76 @@ test "Generator.dflashGateShouldDisable: a serial price decides by ms per token,
     try testing.expect(!G.dflashGateShouldDisable(w, w + w / 2, round_ms * @as(f64, @floatFromInt(w)), 4.0, 13.3));
     // A slower serial token (a larger pack) keeps rounds the 13.3 ms one would drop.
     try testing.expect(!G.dflashGateShouldDisable(w, w, round_ms * @as(f64, @floatFromInt(w)), 4.0, 20.0));
-    // No serial sample: the ladder's break-even yield, 1.37 accepted drafts at 4 rows.
-    try testing.expectApproxEqAbs(@as(f32, 1.37), G.dflashBreakEvenAccepted(4.0), 0.001);
-    try testing.expect(G.dflashGateShouldDisable(w, w + w / 5, 0, 4.0, null));
-    try testing.expect(!G.dflashGateShouldDisable(w, w + w / 2, 0, 4.0, null));
+    // No serial sample: the ladder's break-even yield, 0.69 accepted drafts at 4 rows.
+    try testing.expectApproxEqAbs(@as(f32, 0.69), G.dflashBreakEvenAccepted(4.0), 0.01);
+    try testing.expect(G.dflashGateShouldDisable(w, w / 2, 0, 4.0, null));
+    try testing.expect(!G.dflashGateShouldDisable(w, w * 9 / 10, 0, 4.0, null));
     // A round never offers fewer accepted drafts than its break-even asks for, up to eight rows.
     for ([_]f32{ 3, 4, 5, 6, 8 }) |rows| try testing.expect(G.dflashBreakEvenAccepted(rows) < rows - 1);
-    // Rows the policy left out of a round are not a cost: 2.5 accepted per round at five rows on average
-    // clears the bar the eight-row block would set at 2.49.
+    // Rows the policy left out of a round are not a cost: 1.3 accepted per round at five rows on average
+    // clears the bar, and the same yield at the eight-row block does not.
     const rounds = 3 * w;
-    const acc = rounds * 5 / 2;
-    try testing.expect(!G.dflashGateShouldDisable(rounds, acc, 0, 5.0, null));
-    try testing.expect(G.dflashGateShouldDisable(rounds, acc - rounds / 20, 0, 8.0, null));
+    try testing.expect(!G.dflashGateShouldDisable(rounds, rounds * 13 / 10, 0, 5.0, null));
+    try testing.expect(G.dflashGateShouldDisable(rounds, rounds * 13 / 10, 0, 8.0, null));
+    // Normandy, 15k context: 1.18 accepted per round over 3.3 rows at 15.26 ms per token, against 17.74 ms serial,
+    // is a request DFlash wins, whether or not the bucket held a serial price when the gate looked.
+    const emitted: f64 = 1370 + 1617;
+    try testing.expect(!G.dflashGateShouldDisable(1370, 1617, 15.26 * emitted, 3.33, 17.74));
+    try testing.expect(!G.dflashGateShouldDisable(1370, 1617, 15.26 * emitted, 3.33, null));
+}
+
+test "Generator.DflashGateWindow: one-time costs in the warmup rounds do not decide the request, a steady loser is still dropped" {
+    const G = Generator;
+    const w: u64 = G.DFLASH_GATE_WARMUP;
+    const serial: f32 = 14.5;
+    // Warmup rounds of 80 ms (graph builds), then 30 ms rounds that emit 3.4 tokens: 8.8 ms per token.
+    var win = G.DflashGateWindow{};
+    var wall: f64 = 80.0 * @as(f64, @floatFromInt(w));
+    try testing.expect(!win.shouldDisable(w, 2 * w, wall, 5.0, serial));
+    var n: u64 = w;
+    while (n < 4 * w) : (n += 1) {
+        wall += 30.0;
+        try testing.expect(!win.shouldDisable(n + 1, 2 * w + (n + 1 - w) * 5 / 2, wall, 5.0, serial));
+    }
+    // The cumulative price over the same rounds is above the serial token, so the unwindowed test dropped it.
+    try testing.expect(G.dflashGateShouldDisable(w, 2 * w, 80.0 * @as(f64, @floatFromInt(w)), 5.0, serial));
+    // Rounds of 60 ms emitting 2 tokens (30 ms per token) lose once a warmup's worth of them has run.
+    var loser = G.DflashGateWindow{};
+    var lw: f64 = 30.0 * @as(f64, @floatFromInt(w));
+    try testing.expect(!loser.shouldDisable(w, w, lw, 5.0, serial));
+    var dropped_at: u64 = 0;
+    n = w;
+    while (n < 4 * w) : (n += 1) {
+        lw += 60.0;
+        if (loser.shouldDisable(n + 1, w + (n + 1 - w), lw, 5.0, serial)) {
+            dropped_at = n + 1;
+            break;
+        }
+    }
+    try testing.expectEqual(2 * w, dropped_at);
+}
+
+test "Generator.stopDflash: the drafter's window is released and no later tick can reach it" {
+    var g: Generator = undefined;
+    g.spec_disabled_runtime = false;
+    g.dflash_ctx = .{ .cache = try KVCache.init(testing.allocator, 5), .base_pos = 128 };
+    g.stopDflash();
+    try testing.expect(g.spec_disabled_runtime);
+    try testing.expect(g.dflash_ctx == null);
+    g.stopDflash();
+    try testing.expect(g.dflash_ctx == null);
+}
+
+test "Generator.dflashSerialPrice prices a context bucket by its own cell, never a shorter bucket's" {
+    var t = round_cost.Table{ .layout = .long };
+    const short_kv: u32 = 24000;
+    const long_kv: u32 = 90000;
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(0, short_kv, 17.74, 1, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 17.74), Generator.dflashSerialPrice(&t, t.bucketOf(short_kv)).?, 1e-3);
+    try testing.expect(Generator.dflashSerialPrice(&t, t.bucketOf(long_kv)) == null);
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(0, long_kv, 30.2, 1, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 30.2), Generator.dflashSerialPrice(&t, t.bucketOf(long_kv)).?, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 17.74), Generator.dflashSerialPrice(&t, t.bucketOf(short_kv)).?, 1e-3);
 }
 
 test "Generator.dflashSerialPrice reads the width-0 cell the DFlash fallback feeds, then the serial row" {

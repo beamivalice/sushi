@@ -678,11 +678,7 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .enable_thinking = params.enable_thinking,
-            // An external drafter does not carry M-RoPE positions for image tokens.
-            .enable_drafter = assistantSidecarEnabledForRequest(
-                params.enable_drafter,
-                params.vision_embeddings != null,
-            ),
+            .enable_drafter = params.enable_drafter,
             .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
             .enable_mtp = params.enable_mtp,
@@ -7747,19 +7743,6 @@ pub fn glmNativeDflashArmed(
     return is_glm5 and enable_drafter and has_dflash and generate_mod.glmDflashEligible(sampling, logprobs_n);
 }
 
-/// Resolve the request-level switch shared by the classic external drafter
-/// and DFlash. Vision stays guarded: placeholder ids alone do not tell an
-/// external sidecar how to position image tokens.
-pub fn assistantSidecarEnabledForRequest(requested: bool, has_vision: bool) bool {
-    return requested and !has_vision;
-}
-
-test "assistant sidecar is refused for image requests" {
-    try testing.expect(assistantSidecarEnabledForRequest(true, false));
-    try testing.expect(!assistantSidecarEnabledForRequest(false, false));
-    try testing.expect(!assistantSidecarEnabledForRequest(true, true));
-}
-
 /// Which spec mode a decode tick drives for a slot.
 pub const SpecTickMode = enum { mtp, dflash, regular };
 
@@ -10699,10 +10682,9 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
         const w = specInitWiring(true, true, false, true, true, false);
         try testing.expect(!w.use_mtp);
     }
-    // An image request keeps the head (the qwen4 head takes the slot's
-    // M-RoPE table); `assistantSidecarEnabledForRequest` already switched the drafter off.
+    // An image request keeps the head when the drafter is off for it.
     {
-        const w = specInitWiring(true, true, true, true, assistantSidecarEnabledForRequest(true, true), true);
+        const w = specInitWiring(true, true, true, true, false, true);
         try testing.expect(w.use_mtp and !w.use_dflash);
     }
 }
@@ -11435,6 +11417,37 @@ fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Scheduler {
     sch.abandoned = null;
     sch.orphan_vision_n = 0;
     return sch;
+}
+
+test "an image request keeps its drafter: verify carries the M-RoPE positions, the drafter reads the sequence" {
+    const Probe = struct {
+        fn free(_: mlx.mlx_array) void {}
+    };
+    slot_vision_free_test_hook = Probe.free;
+    defer slot_vision_free_test_hook = null;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    var sch = submitTestScheduler(testing.allocator, 2);
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+    defer sch.prefilling.deinit(testing.allocator);
+    const slot = try sch.submit(.{
+        .model = &model,
+        .prompt_ids = &.{1},
+        .sampling = .{},
+        .eos_token_ids = &.{},
+        .max_tokens = 1,
+        .enable_drafter = true,
+        .vision_embeddings = .{ .ctx = @ptrFromInt(1) },
+    });
+    try testing.expect(slot.enable_drafter);
+    sch.complete(slot);
+    var batch: [16]*Slot = undefined;
+    const take = takeTeardownLocked(&sch, &batch);
+    for (batch[0..take.cleanup_n]) |s| s.deinit();
+    destroyAbandoned(take.abandoned);
 }
 
 test "a submit that fails once its slot is built hands the slot to the inference thread" {

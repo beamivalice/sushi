@@ -34,6 +34,17 @@ pub fn ladder() Costs {
     return out;
 }
 
+/// Accepted drafts per round at which a round of `rows` rows (fractional for a mean) costs the same per
+/// token as a serial step, which is one verify forward of a single row.
+pub fn breakEvenDrafts(rows: f32) f32 {
+    const c = ladder();
+    const r = std.math.clamp(rows, 1, @as(f32, MAX_ROWS));
+    const lo: usize = @intFromFloat(@floor(r));
+    const hi: usize = @min(lo + 1, MAX_ROWS);
+    const cost = c[lo] + (c[hi] - c[lo]) * (r - @as(f32, @floatFromInt(lo)));
+    return cost * (verifyMs(1) + FIXED_MS) / verifyMs(1) - 1;
+}
+
 pub const Choice = struct {
     /// Rows to verify, t1 included (1 = no draft is worth its row).
     rows: u32,
@@ -132,6 +143,16 @@ test "ladder: priced from the measured forward and the fixed round cost, never c
     try testing.expectApproxEqAbs(@as(f32, 1.95), c[8], 0.01);
     var r: u32 = 2;
     while (r <= MAX_ROWS) : (r += 1) try testing.expect(c[r] >= c[r - 1]);
+}
+
+test "breakEvenDrafts: the yield at which a round of N rows matches a serial step, rising with rows" {
+    try testing.expectApproxEqAbs(@as(f32, 0.42), breakEvenDrafts(2), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.69), breakEvenDrafts(4), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 1.40), breakEvenDrafts(8), 0.01);
+    try testing.expectApproxEqAbs((breakEvenDrafts(4) + breakEvenDrafts(5)) / 2, breakEvenDrafts(4.5), 1e-4);
+    // Every row a round verifies must pay for itself: the bar never exceeds the drafts it carries.
+    var r: u32 = 2;
+    while (r <= MAX_ROWS) : (r += 1) try testing.expect(breakEvenDrafts(@floatFromInt(r)) < @as(f32, @floatFromInt(r - 1)));
 }
 
 test "chooseRows: sure drafts buy every row, a weak first draft buys none, a poor draft hides the ones behind it" {
