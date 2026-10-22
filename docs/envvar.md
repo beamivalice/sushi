@@ -6,12 +6,13 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Summary.** 163 vars. By kind: tradeoff levers 13, diagnostics 38, microbenches 61, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
-## Tradeoff levers (13)
+## Tradeoff levers (14)
 
 Two arms that trade speed, memory or exactness, or a policy a user may want to move.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
+| `MLX_MAX_OPS_PER_BUFFER`, `MLX_MAX_MB_PER_BUFFER` | read by MLX (`device.cpp`), not sushi; mirrored by `server.resolveMlxCadence` | MLX's arch default (50 / 50 on Max and Ultra, 40 / 40 on base and Pro). A larger MB per buffer keeps more prefill inputs alive and the bill adds (MB - 50) MiB x 9/8 for it; ops per buffer is not billed (measured no effect) | once, at the first Metal device | yes: engine-memory-admission |
 | `MLX_ENABLE_TF32` | `transformer.zig:3717, glm5_kld_capture.zig:196` | default on: the QSA score GEMM may use TF32 on NAX; `0` keeps f32. GLM teacher capture requires `0` | once | yes: glm5-kernels, glm5-kld, quality-kld, ... |
 | `QWEN4_PLE_PREFETCH_PREFILL` | `qwen4_exp.zig:949` | wide n-gram gather arm: unset = kv gate (pool from 256k keys, serial walk below), `0` serial, `1` pool; both arms measured, the best flips with table residency | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_DECODE_ASYNC_LADDER` | `transformer.zig:15036` | unset: batched Qwen4 decode ladders every 4th layer, other paths serial; `0\|off` off, `auto` every 8th, `<n>` every n-th | boot | yes: engine-kernels, qwen4-perf |

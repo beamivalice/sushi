@@ -270,6 +270,32 @@ pub fn getGpuPct() u32 {
     return if (value >= 0 and value <= 100) @intCast(value) else 0;
 }
 
+/// System-wide GPU memory in use (`AGXAccelerator` "In use system memory"): every process's
+/// Metal allocations plus the driver's, the quantity `iogpu.wired_limit_mb` is enforced on.
+/// 0 when IOKit is unavailable.
+pub fn getGpuInUseSystemMemBytes() u64 {
+    if (comptime !is_macos) return 0;
+    const matching = IOServiceMatching("AGXAccelerator") orelse return 0;
+    var iter: u32 = 0;
+    if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return 0;
+    defer _ = IOObjectRelease(iter);
+
+    const entry = IOIteratorNext(iter);
+    if (entry == 0) return 0;
+    defer _ = IOObjectRelease(entry);
+
+    var props: ?*anyopaque = null;
+    if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return 0;
+    defer if (props) |p| CFRelease(p);
+
+    const perf = cfDictGet(props, "PerformanceStatistics") orelse return 0;
+    const in_use = cfDictGet(perf, "In use system memory") orelse return 0;
+
+    var value: i64 = 0;
+    _ = CFNumberGetValue(in_use, 4, @ptrCast(&value));
+    return if (value > 0) @intCast(value) else 0;
+}
+
 fn cfDictGet(dict: ?*const anyopaque, key_name: [*:0]const u8) ?*const anyopaque {
     const key = CFStringCreateWithCString(null, key_name, 0x08000100) orelse return null;
     defer CFRelease(key);

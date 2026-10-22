@@ -2863,6 +2863,141 @@ pub fn wiredLimitMbForBudget(budget_bytes: u64, kv_bytes: u64) u64 {
 /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
 pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
+/// GPU memory the wired limit counts that MLX does not own: other processes' Metal allocations
+/// (WindowServer, every app with a layer) and the driver's. `AGXAccelerator` "In use system
+/// memory" is system-wide, so this is that counter less MLX's active + cache, read once at
+/// startup before MLX holds a model (`measureGpuFloor`). A command buffer fails once MLX's peak
+/// passes the wired limit less this floor; above it the counter is elastic.
+pub var gpu_floor_bytes = std.atomic.Value(u64).init(0);
+
+/// What the bill may still be wrong by once the floor is planned, including sushi's own non-MLX
+/// Metal objects that arrive after the startup reading.
+pub const GPU_FLOOR_SLACK_BYTES: u64 = 512 << 20;
+
+/// PURE: what stays unplanned under a declared wired limit: the operator's margin, or the
+/// measured floor plus the bill's slack when that is larger.
+pub fn wiredUnplannedBytes(margin: u64, gpu_floor: u64) u64 {
+    if (gpu_floor == 0) return margin;
+    return @max(margin, gpu_floor +| GPU_FLOOR_SLACK_BYTES);
+}
+
+/// PURE: the floor from one idle reading; 0 when IOKit gave nothing.
+pub fn gpuFloorFrom(in_use_system: u64, mlx_active: u64, mlx_cache: u64) u64 {
+    if (in_use_system == 0) return 0;
+    return in_use_system -| (mlx_active +| mlx_cache);
+}
+
+/// Read the floor once, at startup, before MLX holds a model: the only moment the counter is
+/// clean both ways: right after a load it lags low while the weights are still being wired, and
+/// after an unload it lags high while freed pages unwire.
+pub fn measureGpuFloor() void {
+    var active: usize = 0;
+    var cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    const in_use = metrics.getGpuInUseSystemMemBytes();
+    const floor = gpuFloorFrom(in_use, active, cache);
+    gpu_floor_bytes.store(floor, .monotonic);
+    log.info("[mem] GPU floor {d} MB (system GPU in use {d} MB, MLX active {d} MB + cache {d} MB)\n", .{
+        floor >> 20,
+        in_use >> 20,
+        active >> 20,
+        cache >> 20,
+    });
+}
+
+/// The MB-per-buffer the prefill terms were measured at (`prefillStreamBytesPerToken` on an
+/// M4 Max, MLX's Max/Ultra default). MLX commits a command buffer once its distinct inputs pass
+/// `MLX_MAX_MB_PER_BUFFER`, and every op's inputs live until its buffer completes, up to 10
+/// buffers in flight (`mlx/backend/metal/eval.cpp`, `MAX_ACTIVE_TASKS`).
+pub const BILL_FIT_MB_PER_BUFFER: u64 = 50;
+
+/// MLX's per-buffer defaults by architecture suffix (`mlx/backend/metal/device.cpp`).
+pub fn mlxDefaultMbPerBuffer(arch: []const u8) u64 {
+    if (arch.len == 0) return 40;
+    return switch (arch[arch.len - 1]) {
+        'p', 'g' => 40,
+        's', 'd' => 50,
+        else => 40,
+    };
+}
+
+pub fn mlxDefaultOpsPerBuffer(arch: []const u8) u64 {
+    if (arch.len == 0) return 40;
+    return switch (arch[arch.len - 1]) {
+        'p' => 20,
+        'g' => 40,
+        's', 'd' => 50,
+        else => 40,
+    };
+}
+
+/// PURE: MLX's reading of its env override (a positive integer replaces the default).
+pub fn mlxPerBufferFromEnv(raw: ?[]const u8, default: u64) u64 {
+    const s = raw orelse return default;
+    const n = std.fmt.parseInt(u64, std.mem.trim(u8, s, " \t"), 10) catch return default;
+    return if (n > 0) n else default;
+}
+
+/// PURE: prefill bytes the command-buffer cadence keeps alive beyond what the bill's fitted
+/// terms already hold; ops per buffer does not move the peak. A narrower cap is not credited.
+pub fn cadenceInflightBytes(mb_per_buffer: u64) u64 {
+    return (mb_per_buffer -| BILL_FIT_MB_PER_BUFFER) * (1 << 20) * 9 / 8;
+}
+
+test "the bill plans the non-MLX GPU floor and the command-buffer size" {
+    const t = std.testing;
+    const mb: u64 = 1 << 20;
+    // An idle reading: 28.96 GB in use, 28.28 active + 0.06 cache -> a 0.62 GB floor.
+    try t.expectEqual(@as(u64, 620 * mb), gpuFloorFrom(28_960 * mb, 28_280 * mb, 60 * mb));
+    try t.expectEqual(@as(u64, 0), gpuFloorFrom(0, 28_280 * mb, 0));
+    try t.expectEqual(@as(u64, 0), gpuFloorFrom(100 * mb, 200 * mb, 0));
+    // No reading keeps the operator's margin; a floor above margin - slack widens it.
+    try t.expectEqual(WIRED_LIMIT_MARGIN_BYTES, wiredUnplannedBytes(WIRED_LIMIT_MARGIN_BYTES, 0));
+    try t.expectEqual(WIRED_LIMIT_MARGIN_BYTES, wiredUnplannedBytes(WIRED_LIMIT_MARGIN_BYTES, 256 * mb));
+    try t.expectEqual(620 * mb + GPU_FLOOR_SLACK_BYTES, wiredUnplannedBytes(WIRED_LIMIT_MARGIN_BYTES, 620 * mb));
+    // The default cadence bills nothing extra; 1000 MB bills about 1.07 GB.
+    try t.expectEqual(@as(u64, 0), cadenceInflightBytes(BILL_FIT_MB_PER_BUFFER));
+    try t.expectEqual(@as(u64, 0), cadenceInflightBytes(40));
+    try t.expectEqual(@as(u64, 950 * mb * 9 / 8), cadenceInflightBytes(1000));
+    // MLX's table and env reading.
+    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer("applegpu_g13s"));
+    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer("applegpu_g13d"));
+    try t.expectEqual(@as(u64, 40), mlxDefaultMbPerBuffer("applegpu_g13g"));
+    try t.expectEqual(@as(u64, 20), mlxDefaultOpsPerBuffer("applegpu_g14p"));
+    try t.expectEqual(@as(u64, 1000), mlxPerBufferFromEnv("1000", 50));
+    try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv("0", 50));
+    try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv("lots", 50));
+    try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv(null, 50));
+}
+
+/// The effective `MLX_MAX_MB_PER_BUFFER`, resolved once at startup.
+pub var mlx_mb_per_buffer: u64 = BILL_FIT_MB_PER_BUFFER;
+
+/// Main thread, before other threads: resolve MLX's command-buffer cadence the way MLX does
+/// and say what it is, since MLX reads the env once and reports nothing.
+pub fn resolveMlxCadence() void {
+    var arch_z: [*:0]const u8 = "";
+    var dev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&dev);
+    var info = mlx.mlx_device_info_new();
+    defer _ = mlx.mlx_device_info_free(info);
+    if (mlx.mlx_device_info_get(&info, dev) == 0) _ = mlx.mlx_device_info_get_string(&arch_z, info, "architecture");
+    const arch = std.mem.span(arch_z);
+    const env_mb: ?[]const u8 = if (std.c.getenv("MLX_MAX_MB_PER_BUFFER")) |v| std.mem.span(v) else null;
+    const env_ops: ?[]const u8 = if (std.c.getenv("MLX_MAX_OPS_PER_BUFFER")) |v| std.mem.span(v) else null;
+    mlx_mb_per_buffer = mlxPerBufferFromEnv(env_mb, mlxDefaultMbPerBuffer(arch));
+    const ops = mlxPerBufferFromEnv(env_ops, mlxDefaultOpsPerBuffer(arch));
+    log.info("[mem] MLX command buffers: {d} ops / {d} MB ({s}, {s}); prefill bill +{d} MB in flight\n", .{
+        ops,
+        mlx_mb_per_buffer,
+        if (env_mb != null or env_ops != null) "env" else "default",
+        if (arch.len > 0) arch else "unknown arch",
+        cadenceInflightBytes(mlx_mb_per_buffer) >> 20,
+    });
+    measureGpuFloor();
+}
+
 /// PURE: the ceiling with the wired-limit floor applied. `wired_floor == 0` returns
 /// `physicalMemoryCeiling` byte for byte. A declared limit IS the ceiling, its margin included:
 /// the working-set term is the limit itself, so on a quiet box it would plan into the margin.
@@ -2925,13 +3060,16 @@ fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64
     const c = config orelse return 0;
     // Resident MiMo fills a 128 GB Mac, so its ceiling is the declared limit, not what other apps leave free.
     if (!c.longCtxGated() and !c.expert_streaming and !c.isMimo() and !c.isGlm5()) return 0;
-    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, wired_limit_margin_bytes);
+    const unplanned = wiredUnplannedBytes(wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic));
+    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, unplanned);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
-        log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
+        log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB, GPU floor {d} MB, unplanned {d} MB)\n", .{
             floor >> 20,
             wiredLimitBytes() >> 20,
             getGpuWorkingSetLimit() >> 20,
             wired_limit_margin_bytes >> 20,
+            gpu_floor_bytes.load(.monotonic) >> 20,
+            unplanned >> 20,
         });
     }
     return floor;
@@ -3214,7 +3352,8 @@ pub fn prefillTransientReserveAtKv(
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
+        cadenceInflightBytes(mlx_mb_per_buffer);
 }
 
 /// The composed score sheet a ringed arch's SLIDING layers build where
@@ -6680,7 +6819,8 @@ pub fn prefillNeededAtChunk(
             glm5TransientBytes(config, seq, chunk, kv_bits) +| glmPrefixStateBytes(config, seq, warm),
             glmCommitStateBytes(config, seq, warm, kv_bits),
         )) *| 5 / 4 +|
-            (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+            (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +|
+            cadenceInflightBytes(mlx_mb_per_buffer);
     }
     const heads: u64 = config.num_attention_heads;
     const kv_heads: u64 = config.num_key_value_heads;
@@ -6691,7 +6831,8 @@ pub fn prefillNeededAtChunk(
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
+        cadenceInflightBytes(mlx_mb_per_buffer);
 }
 
 /// Headroom a rung must clear beyond its own bill when the long-context gate is what widened

@@ -16,6 +16,28 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
 - `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- **A command buffer fails (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) once MLX's peak passes the wired limit less
+  the GPU memory MLX does not own** (#61). The limit counts AGX "In use system memory", which is system-wide: other
+  processes' Metal allocations (WindowServer, every app with a layer) count against it. Measured on an M1 Max 32 GB,
+  `iogpu.wired_limit_mb=30000` (31.46 GB), Qwen3.8-Flash-Next Ternary, kv8, `--no-mtp`, sushi 1.2.4, 8k-35k prompts,
+  30+ cold prefills: a 0.62 GB floor idle, MLX peaks of 30.57 GB and below passed, 30.85 GB and above failed.
+  - **Non-MLX GPU floor**: under a declared limit the ceiling is the limit less the larger of `--wired-margin-gib` and
+    floor + 512 MiB slack (`wiredUnplannedBytes`). The floor is read once, at startup, before MLX holds a model
+    (`measureGpuFloor`): right after a load it read 0 and 407 MB (weights still being wired), and after an unload it
+    lags high while freed pages unwire.
+  - Above the floor the counter is elastic: 1-op/1-MB command buffers drove it to the limit itself, with 1.85 GB of
+    non-MLX share, and the prefill passed.
+  - Other processes' memory is not the trigger here. A ballast of 1-4 GB touched incompressible RAM was swapped out
+    and the prefill passed at the same speed. With the model resident, `mlock` of even 0.5 GB was refused (EAGAIN).
+- **The bill counts MLX's command-buffer size** (`cadenceInflightBytes`, in `prefillNeededAtChunk` and
+  `prefillTransientReserveAtKv`). MLX keeps each op's inputs alive until its command buffer completes, up to 10 in
+  flight, and commits a buffer once its distinct inputs pass `MLX_MAX_MB_PER_BUFFER`. The prefill terms were fitted
+  at 50 MB, MLX's Max/Ultra default, so the term is (MB per buffer - 50) MiB x 9/8 and 0 at the default.
+  - Measured, same box: 1000 MB lifted MLX's prefill peak by 1.11 / 1.12 / 1.03 GB at 8k / 19k / 35k. 1000 ops at
+    50 MB moved nothing.
+  - At 1000/1000, 19k and the 35k edge failed inside admission, 3/3 and 2/2; the default passed at every length.
+  - Startup logs the cadence MLX resolved from its arch table or the env: `[mem] MLX command buffers: 50 ops / 50 MB
+    (default, applegpu_g13s); prefill bill +0 MB in flight`.
 - The box: M5 Max 128 GB; the default wired limit admits about 120 GB; a resident MiMo EXL3 pack is over 90 GB, so two
   heavy GPU jobs at once risk an OOM for both (and concurrent conversions have died together in a GPU reset).
 
