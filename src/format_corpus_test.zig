@@ -1825,6 +1825,37 @@ const corpus = [_]Expect{
         .content_contains = "atem:function_calls block",
     },
 
+    // ── Claude-style `<function_calls><invoke>` in place of the model's own dialect ──
+    .{
+        // The whole call arrives as content with finish stop, so an agent reads the turn as done.
+        .family = "qwen4_exp",
+        .name = "Claude invoke markup after thinking is a call",
+        .raw = "List the folder first.</think>\n\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x/wiki && ls -la && wc -l *.md | tail -1</parameter>\n</invoke>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "cd /x/wiki && ls -la && wc -l *.md | tail -1",
+        .reasoning_contains = "List the folder",
+    },
+    .{
+        // Not the model's dialect, so an undeclared name is a data block, not a call.
+        .family = "qwen4_exp",
+        .name = "Claude invoke naming an undeclared tool is not a call",
+        .raw = "<function_calls>\n<invoke name=\"teleport\">\n<parameter name=\"to\">mars</parameter>\n</invoke>\n</function_calls>",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "qwen4_exp",
+        .name = "prose naming the invoke tag is not a call",
+        .raw = "Claude's format wraps each call in <invoke name=\"x\"> tags.",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+        .content_contains = "<invoke name=\"x\"> tags",
+    },
+
     // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
     .{
         .family = "minicpm5",
@@ -2452,7 +2483,7 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
+        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function", "<invoke",
     };
     var checked: usize = 0;
     for (corpus) |entry| {

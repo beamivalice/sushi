@@ -1897,6 +1897,40 @@ const tool_markup_openers = [_][]const u8{
     INKLING_INVOKE_TAG,
 };
 
+/// Earliest index of Claude-style `<function_calls>` / `<invoke …>` markup, or null. Like MiniCPM5's,
+/// the opener alone is prose ("wrap it in <invoke name=…>"): a `<parameter ` or `</invoke>` must be there too.
+fn bareInvokeMarkupCut(text: []const u8) ?usize {
+    if (std.mem.indexOf(u8, text, "<parameter ") == null and
+        std.mem.indexOf(u8, text, BARE_INVOKE.invoke_close) == null) return null;
+    var cut = std.mem.indexOf(u8, text, FUNCTION_CALLS_TAG);
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, text, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= text.len or std.ascii.isWhitespace(text[after])) {
+            if (cut == null or p < cut.?) cut = p;
+            break;
+        }
+        scan = after;
+    }
+    return cut;
+}
+
+/// True while `buf` holds, or ends in a growing prefix of, a `<function_calls>` / `<invoke …` opener.
+fn invokeOpenerHoldsForTools(buf: []const u8) bool {
+    if (std.mem.indexOf(u8, buf, FUNCTION_CALLS_TAG) != null) return true;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= buf.len or std.ascii.isWhitespace(buf[after])) return true;
+        scan = after;
+    }
+    inline for (.{ FUNCTION_CALLS_TAG, BARE_INVOKE.invoke }) |marker| {
+        var k: usize = 2;
+        while (k < marker.len) : (k += 1) if (std.mem.endsWith(u8, buf, marker[0..k])) return true;
+    }
+    return false;
+}
+
 /// Earliest index of MiniCPM5 attribute-form tool markup, or null.
 /// Discriminated exactly as the streaming gate does it — `<function` followed
 /// by WHITESPACE, with a `name=` inside the opener region — so `<functional`,
@@ -1946,6 +1980,12 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     // dialect is `<function` + whitespace + a `name=` attribute, so prose words
     // beginning `<function…` are left alone.
     if (miniCpm5MarkupCut(text)) |p| {
+        if (p < cut) {
+            cut = p;
+            is_inkling = false;
+        }
+    }
+    if (bareInvokeMarkupCut(text)) |p| {
         if (p < cut) {
             cut = p;
             is_inkling = false;
@@ -3052,6 +3092,8 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 
     // `<function…` family: MiniCPM5's `<function name="…">`.
     if (functionOpenerHoldsForTools(buf)) return true;
+    // Claude-style `<function_calls>` / `<invoke name="…">`.
+    if (invokeOpenerHoldsForTools(buf)) return true;
 
     // Trailing partial prefixes — the next streamed token could complete any
     // of these into a real tool open. Order doesn't matter; first endsWith
@@ -3506,7 +3548,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // (the bytes after `<` are `atem`, not `tool`). Runs on the FULL text —
     // tool segments arrive wrapped in channel headers the think-strip above
     // would misjudge.
-    try parseAtemToolCalls(allocator, text, &calls);
+    try parseInvokeToolCalls(allocator, text, &calls, ATEM_INVOKE);
     // gpt_oss / harmony (`to=functions.NAME<|channel|>commentary…<|message|>`):
     // the name lives in the header, not the payload, so no generic scan can
     // recover it. Runs on the FULL text for the same reason ATEM does — the
@@ -3526,6 +3568,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // arg_key/arg_value body. When it matched, the generic scans are skipped
     // but the shared safety net at the bottom still runs.
     try parseHy3ToolCalls(allocator, effective_text, &calls);
+    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -5366,10 +5409,19 @@ fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
 // coercion chokepoint still gets the final word). The parser keys on the
 // INVOKE tag so a dropped wrapper still parses (delimiter-drop class), and
 // truncation salvages NAME + completed parameters — never fragment values.
-const ATEM_INVOKE_TAG = "<atem:invoke";
-const ATEM_PARAM_TAG = "<atem:parameter";
-const ATEM_PARAM_CLOSE = "</atem:parameter>";
-const ATEM_INVOKE_CLOSE = "</atem:invoke>";
+const InvokeDialect = struct {
+    invoke: []const u8,
+    param: []const u8,
+    param_close: []const u8,
+    invoke_close: []const u8,
+    /// Not the model's own dialect: kept only when it names a declared tool (`filterInferredBySchema`).
+    inferred: bool,
+};
+const ATEM_INVOKE: InvokeDialect = .{ .invoke = "<atem:invoke", .param = "<atem:parameter", .param_close = "</atem:parameter>", .invoke_close = "</atem:invoke>", .inferred = false };
+/// Claude's spelling of the same grammar (`<function_calls><invoke name="X"><parameter name="k">`),
+/// which models trained on Claude transcripts emit in place of their own (qwen4_exp).
+const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true };
+const FUNCTION_CALLS_TAG = "<function_calls>";
 
 /// gpt_oss / harmony tool calls. Structurally unlike every other family here:
 /// the function NAME is not in the payload at all, it is the segment header's
@@ -5428,11 +5480,16 @@ fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
     }
 }
 
-fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), comptime d: InvokeDialect) !void {
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, ATEM_INVOKE_TAG)) |inv| {
-        const after_tag = inv + ATEM_INVOKE_TAG.len;
+    while (std.mem.indexOfPos(u8, text, pos, d.invoke)) |inv| {
+        const after_tag = inv + d.invoke.len;
         const seg = text[after_tag..];
+        // `<invoked>` is a word, not the tag.
+        if (seg.len > 0 and !std.ascii.isWhitespace(seg[0])) {
+            pos = after_tag;
+            continue;
+        }
         // Attribute scan bounded so a runaway unclosed quote can't eat the
         // rest of the output.
         const raw_name = dsmlAttr(seg[0..@min(seg.len, 512)], "name") orelse {
@@ -5453,10 +5510,10 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         var args_json: ?[]const u8 = null;
         if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
             const body_all = seg[te + 1 ..];
-            const body_end = std.mem.indexOf(u8, body_all, ATEM_INVOKE_CLOSE) orelse body_all.len;
-            args_json = try atemParamsToJson(allocator, body_all[0..body_end]);
+            const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
+            args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
             pos = if (body_end < body_all.len)
-                after_tag + te + 1 + body_end + ATEM_INVOKE_CLOSE.len
+                after_tag + te + 1 + body_end + d.invoke_close.len
             else
                 text.len; // truncated body — completed params already salvaged
         } else {
@@ -5466,24 +5523,24 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         const name = try allocator.dupe(u8, name_slice);
         errdefer allocator.free(name);
         const arguments = args_json orelse try allocator.dupe(u8, "{}");
-        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = d.inferred });
     }
 }
 
-/// Assemble `<atem:parameter name="k">v</atem:parameter>` runs into a JSON
+/// Assemble `<parameter name="k">v</parameter>` runs (ATEM's namespaced or Claude's bare) into a JSON
 /// object string. A value that parses as COMPLETE JSON keeps its spelled type;
 /// everything else is a raw string, exact bytes. Keys are escaped + deduped
 /// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
 /// JSON. Returns null when no complete parameter was found.
-fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8 {
+fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d: InvokeDialect) !?[]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
     var map: std.json.ObjectMap = .empty;
     var pos: usize = 0;
     var found = false;
-    while (std.mem.indexOfPos(u8, body, pos, ATEM_PARAM_TAG)) |p| {
-        const after = p + ATEM_PARAM_TAG.len;
+    while (std.mem.indexOfPos(u8, body, pos, d.param)) |p| {
+        const after = p + d.param.len;
         const seg = body[after..];
         const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
         const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
@@ -5494,13 +5551,13 @@ fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8
         // The value runs to the CONFIRMED closing tag — rich values with
         // newlines/quotes/`<` survive; no close by end of text = fragment,
         // dropped.
-        const vend_rel = std.mem.indexOf(u8, body[vstart..], ATEM_PARAM_CLOSE) orelse break;
+        const vend_rel = std.mem.indexOf(u8, body[vstart..], d.param_close) orelse break;
         const raw = body[vstart .. vstart + vend_rel];
         const v: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
             std.json.Value{ .string = raw };
         try map.put(aa, pname, v);
         found = true;
-        pos = vstart + vend_rel + ATEM_PARAM_CLOSE.len;
+        pos = vstart + vend_rel + d.param_close.len;
     }
     if (!found) return null;
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
@@ -14101,6 +14158,40 @@ test "parseAtemToolCalls: parallel invokes each parse; dropped wrapper still par
     try testing.expectEqual(@as(usize, 2), calls.len);
     try testing.expectEqualStrings("a.one", calls[0].name);
     try testing.expectEqualStrings("a.two", calls[1].name);
+}
+
+test "parseToolCalls: Claude-style bare <invoke> markup is an inferred call" {
+    const allocator = testing.allocator;
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x && ls -la</parameter>\n<parameter name=\"timeout\">30</parameter>\n</invoke>\n</function_calls>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    // Not the model's own dialect: it must name a declared tool to survive.
+    try testing.expect(calls[0].inferred);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("cd /x && ls -la", parsed.value.object.get("command").?.string);
+    try testing.expectEqual(@as(i64, 30), parsed.value.object.get("timeout").?.integer);
+    try testing.expect((try parseToolCalls(allocator, "I <invoked> it with <parameters> set.")) == null);
+    // An unparsed block never reaches content; prose naming the tag stays.
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls"));
+    const prose = "Claude's format wraps each call in <invoke name=\"x\"> tags.";
+    try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
+}
+
+test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; prose releases" {
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n</function_calls>";
+    for ([_]usize{ 0, std.mem.indexOf(u8, text, "<invoke").? }) |start| {
+        var end = start + 2;
+        while (end <= text.len) : (end += 1) {
+            testing.expect(streamShouldBufferForTools(text[start..end])) catch |e| {
+                std.debug.print("gate flushed a prefix of an accepted call: '{s}'\n", .{text[start..end]});
+                return e;
+            };
+        }
+    }
+    try testing.expect(!streamShouldBufferForTools("I <invoked> the <function_callback> helper"));
 }
 
 test "muse streaming gate: headers hold, self holds then splits, user splits" {

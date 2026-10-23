@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen tool calls written in Claude's `<function_calls><invoke>` markup are executed**: Qwen3.8-Flash-Next sometimes answers in that shape, which used to end an agent's turn as plain text; it now becomes a tool call when it names a declared tool.
 - **`frequency_penalty` follows OpenAI's definition**: it is subtracted from a token's logit once per time the token has been generated, instead of being read as `repeat_penalty` 1 + x (which halved every seen logit at 1.0), and `presence_penalty` and `frequency_penalty` accept -2 to 2 on chat, completions and Responses.
 - **After a Metal out-of-memory failure the next request no longer fails at once**: the failed request is reported as the out-of-memory it was, and the error no longer carries over to the request after it. Thanks to [@holistech](https://github.com/holistech) for the report (#61).
 - **The memory bill counts GPU memory other apps hold and the size of MLX's command buffers**: on a Mac with a raised GPU memory limit, admission plans under the limit less what other apps hold on the GPU, and a larger `MLX_MAX_MB_PER_BUFFER` is billed, so a prompt that would hit Metal's "Insufficient Memory" mid-prefill is refused up front instead. Startup logs both. Thanks to [@holistech](https://github.com/holistech) for the report (#61).

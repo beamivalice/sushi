@@ -87,6 +87,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A JSON call cut INSIDE the object still names its tool** (`truncatedJsonCallName`): recover NAME + `{}`, NEVER ship
   partial values, never ship raw markup as content. Model-mangled arg JSON → `looseRepairToolCallJson`, never drop
   the whole call. A tag parser never bails on ONE missing delimiter.
+- **Claude's `<function_calls><invoke name=…><parameter name=…>` is a call** when no other family matched
+  (`BARE_INVOKE`, ATEM's grammar without the namespace; qwen4_exp writes it after Claude transcripts). It is
+  `inferred`, so an undeclared name stays prose. The stream gate holds `<function_calls>` and `<invoke ` with every
+  growing prefix (`invokeOpenerHoldsForTools`); the scrubber cuts it only beside a `<parameter ` or `</invoke>`
+  (`bareInvokeMarkupCut`), so prose naming the tag survives. Corpus family `qwen4_exp`.
 - **A `</think>` inside a tool ARGUMENT is payload** (`thinkCloseIsToolCallPayload`): decline a close whose nearest
   preceding tool opener is still OPEN AND whose block closes afterwards.
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched).
