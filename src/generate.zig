@@ -954,6 +954,8 @@ pub const SamplingParams = struct {
     top_k: u32 = 0, // 0 = disabled
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
+    /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
+    frequency_penalty: f32 = 0.0,
     seed: ?u64 = null,
     /// Draw index under `seed`: every sample takes a fresh key.
     draw: u64 = 0,
@@ -1160,7 +1162,7 @@ fn specDecodeUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
     return draftsRefused(sampling) or logprobs_n != 0;
 }
 
-/// MTP rounds shift every verify row for a repeat or presence penalty (`penaltyShiftRows`), so
+/// MTP rounds shift every verify row for a repeat, presence or frequency penalty (`penaltyShiftRows`), so
 /// only what a draft run cannot honour keeps them off.
 pub fn mtpUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
     return mtpRefusal(sampling, logprobs_n) != null;
@@ -1175,7 +1177,7 @@ pub fn mtpRefusal(sampling: SamplingParams, logprobs_n: u32) ?[]const u8 {
 }
 
 /// A grammar mask or a forced tool call decides tokens a draft run would skip past, and a
-/// repeat or presence penalty reads ids no verify row has committed yet; only MTP shifts the rows.
+/// repeat, presence or frequency penalty reads ids no verify row has committed yet; only MTP shifts the rows.
 pub fn draftsRefused(sampling: SamplingParams) bool {
     return sampling.constraint != null or sampling.call_force != null or penaltyActive(sampling);
 }
@@ -1217,11 +1219,11 @@ fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assis
 /// Only the synchronous serial sampler (`sampleToken`) applies these penalties. A repeat
 /// penalty of 0 or below is off: it would divide by zero or flip signs.
 pub fn penaltyActive(sampling: SamplingParams) bool {
-    return repeatPenaltyOn(sampling.repeat_penalty) or sampling.presence_penalty != 0.0;
+    return penaltiesOf(sampling).active();
 }
 
-fn repeatPenaltyOn(repeat_penalty: f32) bool {
-    return seen_penalty.repeatOn(repeat_penalty);
+fn penaltiesOf(sampling: SamplingParams) seen_penalty.Penalties {
+    return .{ .repeat = sampling.repeat_penalty, .presence = sampling.presence_penalty, .frequency = sampling.frequency_penalty };
 }
 
 /// Generation result (for non-streaming use).
@@ -3836,16 +3838,16 @@ pub const Generator = struct {
         return true;
     }
 
-    /// Row j of a verify block under the request's repeat and presence penalties, over the committed
+    /// Row j of a verify block under the request's repeat, presence and frequency penalties, over the committed
     /// ids and `ids[0..j]` (inclusive): the logits its serial tick would sample. Drafts stay raw.
     pub fn penaltyShiftRows(self: *Generator, logits: *mlx.mlx_array, ids: mlx.mlx_array) !bool {
         if (!penaltyActive(self.sampling)) return false;
         const shape = mlx.getShape(logits.*);
-        const committed = try think_penalty.buildMask(std.heap.page_allocator, self.generated_ids.items, @intCast(shape[shape.len - 1]));
+        const committed = try seen_penalty.buildCounts(std.heap.page_allocator, self.generated_ids.items, @intCast(shape[shape.len - 1]));
         defer _ = mlx.mlx_array_free(committed);
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
-        try seen_penalty.shiftRows(&out, logits.*, ids, committed, self.sampling.repeat_penalty, self.sampling.presence_penalty, self.xfm.s);
+        try seen_penalty.shiftRows(&out, logits.*, ids, committed, penaltiesOf(self.sampling), self.xfm.s);
         _ = mlx.mlx_array_free(logits.*);
         logits.* = out;
         return true;
@@ -10691,12 +10693,12 @@ fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.ml
     return sampled;
 }
 
-/// `sampleTokenLazy` under the request's repeat/presence penalty over `generated_ids`.
+/// `sampleTokenLazy` under the request's penalties over `generated_ids`.
 fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
     if (penaltyActive(sampling) and generated_ids.len > 0) {
         var penalized = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(penalized);
-        try applyRepeatPenaltyWithAllocator(allocator, &penalized, logits, generated_ids, sampling.repeat_penalty, sampling.presence_penalty, s);
+        try applyPenaltiesWithAllocator(allocator, &penalized, logits, generated_ids, penaltiesOf(sampling), s);
         return sampleTokenLazy(penalized, sampling, s);
     }
     return sampleTokenLazy(logits, sampling, s);
@@ -11867,7 +11869,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
     if (penaltyActive(sampling)) {
         if (generated_ids) |ids| {
             if (ids.len > 0) {
-                try applyRepeatPenalty(&penalized, current, ids, sampling.repeat_penalty, sampling.presence_penalty, s);
+                try applyPenalties(&penalized, current, ids, penaltiesOf(sampling), s);
                 current = penalized;
                 penalized_owned = true;
             }
@@ -12395,42 +12397,17 @@ fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bou
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
 
-/// Apply repeat penalty to already-generated tokens.
-/// Uses pure MLX GPU ops — no CPU readback, preserves lazy evaluation graph.
-fn applyRepeatPenalty(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
-    return applyRepeatPenaltyWithAllocator(std.heap.page_allocator, res, logits, generated_ids, repeat_penalty, presence_penalty, s);
+/// Penalties over the already-generated tokens. Pure MLX GPU ops after the host tally: no readback,
+/// the lazy graph stays intact.
+fn applyPenalties(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, pen: seen_penalty.Penalties, s: mlx.mlx_stream) !void {
+    return applyPenaltiesWithAllocator(std.heap.page_allocator, res, logits, generated_ids, pen, s);
 }
 
-fn applyRepeatPenaltyWithAllocator(allocator: std.mem.Allocator, res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
+fn applyPenaltiesWithAllocator(allocator: std.mem.Allocator, res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, pen: seen_penalty.Penalties, s: mlx.mlx_stream) !void {
     const shape = mlx.getShape(logits);
-    const vocab_size: usize = @intCast(shape[shape.len - 1]);
-
-    // Collect unique token ids
-    var seen_set = std.AutoHashMap(u32, void).init(allocator);
-    defer seen_set.deinit();
-    for (generated_ids) |id| {
-        if (id < vocab_size) {
-            try seen_set.put(id, {});
-        }
-    }
-
-    if (seen_set.count() == 0) return;
-
-    // Build boolean mask: true at positions of seen tokens
-    const mask_data = try allocator.alloc(u8, vocab_size);
-    defer allocator.free(mask_data);
-    @memset(mask_data, 0);
-
-    var it = seen_set.keyIterator();
-    while (it.next()) |id_ptr| {
-        mask_data[id_ptr.*] = 1;
-    }
-
-    const arr_shape = [_]c_int{ 1, @intCast(vocab_size) };
-    const mask_arr = mlx.mlx_array_new_data(mask_data.ptr, &arr_shape, 2, .bool_);
-    defer _ = mlx.mlx_array_free(mask_arr);
-
-    try seen_penalty.apply(res, logits, mask_arr, repeat_penalty, presence_penalty, s);
+    const counts = try seen_penalty.buildCounts(allocator, generated_ids, @intCast(shape[shape.len - 1]));
+    defer _ = mlx.mlx_array_free(counts);
+    try seen_penalty.apply(res, logits, counts, pen, s);
 }
 
 /// Greedy argmax over the last axis.
@@ -12525,8 +12502,15 @@ test "penalty rows: every verify row equals its serial tick over the committed i
         .{ .committed = &.{}, .ids = &.{ 9, 9, 2 } },
         .{ .committed = &.{ 0, 39 }, .ids = &.{ 20 } },
     };
-    const Pen = struct { repeat: f32, presence: f32 };
-    const pens = [_]Pen{ .{ .repeat = 1.3, .presence = 0 }, .{ .repeat = 1, .presence = 1.5 }, .{ .repeat = 1.2, .presence = 0.7 }, .{ .repeat = 0.8, .presence = 0.25 } };
+    const Pen = seen_penalty.Penalties;
+    const pens = [_]Pen{
+        .{ .repeat = 1.3 },
+        .{ .presence = 1.5 },
+        .{ .repeat = 1.2, .presence = 0.7 },
+        .{ .repeat = 0.8, .presence = 0.25 },
+        .{ .frequency = 0.6 },
+        .{ .repeat = 1.2, .presence = 0.3, .frequency = 0.45 },
+    };
     for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
         for (cases) |c| {
             const rows = c.ids.len;
@@ -12541,12 +12525,12 @@ test "penalty rows: every verify row equals its serial tick over the committed i
             const id_shape = [_]c_int{ 1, @intCast(rows) };
             const ids = mlx.mlx_array_new_data(c.ids.ptr, &id_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(ids);
-            const committed = try think_penalty.buildMask(a, c.committed, v);
+            const committed = try seen_penalty.buildCounts(a, c.committed, v);
             defer _ = mlx.mlx_array_free(committed);
             for (pens) |p| {
                 var shifted = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(shifted);
-                try seen_penalty.shiftRows(&shifted, block, ids, committed, p.repeat, p.presence, s);
+                try seen_penalty.shiftRows(&shifted, block, ids, committed, p, s);
                 const got = try samplerTestReadFlat(a, shifted, rows * v, s);
                 defer a.free(got);
                 for (0..rows) |j| {
@@ -12558,7 +12542,7 @@ test "penalty rows: every verify row equals its serial tick over the committed i
                     try mlx.check(mlx.mlx_slice(&row, block, &.{ 0, @intCast(j), 0 }, 3, &.{ 1, @as(c_int, @intCast(j)) + 1, @intCast(v) }, 3, &.{ 1, 1, 1 }, 3, s));
                     var serial = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(serial);
-                    try applyRepeatPenalty(&serial, row, history[0 .. c.committed.len + j + 1], p.repeat, p.presence, s);
+                    try applyPenalties(&serial, row, history[0 .. c.committed.len + j + 1], p, s);
                     const want = try samplerTestReadFlat(a, serial, v, s);
                     defer a.free(want);
                     try testing.expectEqualSlices(f32, want, got[j * v ..][0..v]);
@@ -12740,7 +12724,7 @@ test "argmax with negative values" {
     try testing.expectEqual(@as(u32, 3), result); // index 3 has value -0.5 (highest)
 }
 
-test "applyRepeatPenalty reduces seen token logits" {
+test "applyPenalties reduces seen token logits" {
     const s = mlx.gpuStream();
     // logits: [1.0, 2.0, 3.0, 4.0, 5.0]
     const data = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0 };
@@ -12753,7 +12737,7 @@ test "applyRepeatPenalty reduces seen token logits" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat = 2.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -12769,7 +12753,7 @@ test "applyRepeatPenalty reduces seen token logits" {
     try testing.expectApproxEqAbs(@as(f32, 5.0), res_data[4], 0.01);
 }
 
-test "applyRepeatPenalty with negative logits" {
+test "applyPenalties with negative logits" {
     const s = mlx.gpuStream();
     // Mix of positive and negative logits
     const data = [_]f32{ -2.0, 3.0, -1.0, 4.0 };
@@ -12782,7 +12766,7 @@ test "applyRepeatPenalty with negative logits" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat = 2.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -12796,7 +12780,7 @@ test "applyRepeatPenalty with negative logits" {
     try testing.expectApproxEqAbs(@as(f32, 2.0), res_data[3], 0.01);
 }
 
-test "applyRepeatPenalty presence penalty" {
+test "applyPenalties presence penalty" {
     const s = mlx.gpuStream();
     const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const shape = [_]c_int{ 1, 4 };
@@ -12807,7 +12791,7 @@ test "applyRepeatPenalty presence penalty" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 1.0, 0.5, s);
+    try applyPenalties(&res, logits, &generated, .{ .presence = 0.5 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -12821,7 +12805,45 @@ test "applyRepeatPenalty presence penalty" {
     try testing.expectApproxEqAbs(@as(f32, 4.0), res_data[3], 0.01);
 }
 
-test "applyRepeatPenalty combined penalties" {
+test "frequency_penalty subtracts per occurrence, presence_penalty once, and neither scales a logit" {
+    const s = mlx.gpuStream();
+    var data = [_]f32{ 2, 2, 2, 2, 2, -2, 2, 2 };
+    const logits = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 8 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try applyPenalties(&out, logits, &.{ 3, 3, 5 }, .{ .frequency = 0.5, .presence = 0.25 }, s);
+    const got = try samplerTestReadFlat(testing.allocator, out, 8, s);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(f32, &.{ 2, 2, 2, 0.75, 2, -2.75, 2, 2 }, got);
+    try testing.expect(penaltyActive(.{ .frequency_penalty = 0.5 }));
+    try testing.expect(!penaltyActive(.{ .frequency_penalty = 0 }));
+}
+
+test "the serial and lazy samplers count every occurrence under frequency_penalty" {
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    var host: [4]f32 = .{ 5.0, 4.8, 0, 0 };
+    const logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const generated = [_]u32{ 0, 0, 0 };
+    // Three occurrences cost 0.3 (id 1 wins); a once-per-id presence of 0.1 would not.
+    const Case = struct { sampling: SamplingParams, want: u32 };
+    for ([_]Case{
+        .{ .sampling = .{ .temperature = 0, .frequency_penalty = 0.1 }, .want = 1 },
+        .{ .sampling = .{ .temperature = 0, .presence_penalty = 0.1 }, .want = 0 },
+    }) |c| {
+        const sync = try sampleToken(a, logits, c.sampling, &generated, 0, null, s);
+        const lazy = try penalizedSampleLazy(std.heap.page_allocator, logits, c.sampling, &generated, s);
+        defer _ = mlx.mlx_array_free(lazy);
+        const got = try samplerTestReadFlat(a, lazy, 1, s);
+        defer a.free(got);
+        try testing.expectEqual(c.want, sync.token_id);
+        try testing.expectEqual(@as(f32, @floatFromInt(c.want)), got[0]);
+    }
+}
+
+test "applyPenalties combined penalties" {
     const s = mlx.gpuStream();
     const data = [_]f32{ 2.0, -1.0, 3.0 };
     const shape = [_]c_int{ 1, 3 };
@@ -12832,7 +12854,7 @@ test "applyRepeatPenalty combined penalties" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 1.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat = 2.0, .presence = 1.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -19409,7 +19431,7 @@ test "a lazy penalty allocation failure fails the request instead of sampling un
     const host = [_]f32{ 5, 4, 3, 2 };
     const logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, 1, 4 }, 3, .float32);
     defer _ = mlx.mlx_array_free(logits);
-    for (0..2) |fail_index| {
+    for (0..1) |fail_index| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
         try testing.expectError(error.OutOfMemory, penalizedSampleLazy(failing.allocator(), logits, .{ .temperature = 0, .presence_penalty = 2 }, &.{0}, s));
     }

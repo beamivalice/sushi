@@ -6,10 +6,43 @@ pub fn repeatOn(repeat_penalty: f32) bool {
     return repeat_penalty > 0.0 and repeat_penalty != 1.0;
 }
 
-/// The repeat and presence penalties on every logit where `seen` (bool, broadcast against `logits`)
-/// is true. The serial sampler and the MTP verify rows both come here, so a row equals its serial tick.
-pub fn apply(res: *mlx.mlx_array, logits: mlx.mlx_array, seen: mlx.mlx_array, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
+/// The three penalties of a request. `repeat` scales a seen id's logit (llama.cpp's); `presence` is
+/// subtracted once per seen id and `frequency` once per occurrence (OpenAI's definitions).
+pub const Penalties = struct {
+    repeat: f32 = 1.0,
+    presence: f32 = 0.0,
+    frequency: f32 = 0.0,
+
+    pub fn active(self: Penalties) bool {
+        return repeatOn(self.repeat) or self.presence != 0.0 or self.frequency != 0.0;
+    }
+};
+
+/// `[vocab]` int32 occurrences of each id in `ids`.
+pub fn buildCounts(allocator: std.mem.Allocator, ids: []const u32, vocab: usize) !mlx.mlx_array {
+    const buf = try allocator.alloc(i32, vocab);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+    for (ids) |id| {
+        if (id < vocab) buf[id] += 1;
+    }
+    const shape = [_]c_int{@intCast(vocab)};
+    return mlx.mlx_array_new_data(buf.ptr, &shape, 1, .int32);
+}
+
+fn asFloat32(out: *mlx.mlx_array, a: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    try mlx.check(mlx.mlx_astype(out, a, .float32, s));
+}
+
+/// The penalties on every logit whose id has a nonzero entry in `counts` (int32, broadcast against
+/// `logits`). The serial sampler and the MTP verify rows both come here, so a row equals its serial tick.
+pub fn apply(res: *mlx.mlx_array, logits: mlx.mlx_array, counts: mlx.mlx_array, pen: Penalties, s: mlx.mlx_stream) !void {
     var current = logits;
+    const zero_i = mlx.mlx_array_new_int(0);
+    defer _ = mlx.mlx_array_free(zero_i);
+    var seen = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(seen);
+    try mlx.check(mlx.mlx_greater(&seen, counts, zero_i, s));
 
     // Repeat penalty: seen tokens divide by the penalty when positive and multiply by it when negative.
     var penalized = mlx.mlx_array_new();
@@ -18,10 +51,10 @@ pub fn apply(res: *mlx.mlx_array, logits: mlx.mlx_array, seen: mlx.mlx_array, re
         _ = mlx.mlx_array_free(penalized);
     };
 
-    if (repeatOn(repeat_penalty)) {
-        const rp = mlx.mlx_array_new_float(repeat_penalty);
+    if (repeatOn(pen.repeat)) {
+        const rp = mlx.mlx_array_new_float(pen.repeat);
         defer _ = mlx.mlx_array_free(rp);
-        const inv_rp = mlx.mlx_array_new_float(1.0 / repeat_penalty);
+        const inv_rp = mlx.mlx_array_new_float(1.0 / pen.repeat);
         defer _ = mlx.mlx_array_free(inv_rp);
         const zero = mlx.mlx_array_new_float(0.0);
         defer _ = mlx.mlx_array_free(zero);
@@ -47,28 +80,36 @@ pub fn apply(res: *mlx.mlx_array, logits: mlx.mlx_array, seen: mlx.mlx_array, re
         penalized_owned = true;
     }
 
-    // Presence penalty: subtract from seen tokens
-    if (presence_penalty != 0.0) {
-        const pp = mlx.mlx_array_new_float(presence_penalty);
-        defer _ = mlx.mlx_array_free(pp);
-
-        var seen_float = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(seen_float);
-        try mlx.check(mlx.mlx_astype(&seen_float, seen, .float16, s));
-
-        var subtract = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(subtract);
-        try mlx.check(mlx.mlx_multiply(&subtract, seen_float, pp, s));
-
-        try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
-    } else {
+    if (pen.presence == 0.0 and pen.frequency == 0.0) {
         try mlx.check(mlx.mlx_copy(res, current, s));
+        return;
     }
+    // Additive part in float32: presence * seen + frequency * count.
+    var seen_f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(seen_f);
+    try asFloat32(&seen_f, seen, s);
+    var counts_f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(counts_f);
+    try asFloat32(&counts_f, counts, s);
+    const pp = mlx.mlx_array_new_float(pen.presence);
+    defer _ = mlx.mlx_array_free(pp);
+    const fp = mlx.mlx_array_new_float(pen.frequency);
+    defer _ = mlx.mlx_array_free(fp);
+    var by_presence = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(by_presence);
+    try mlx.check(mlx.mlx_multiply(&by_presence, seen_f, pp, s));
+    var by_count = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(by_count);
+    try mlx.check(mlx.mlx_multiply(&by_count, counts_f, fp, s));
+    var subtract = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(subtract);
+    try mlx.check(mlx.mlx_add(&subtract, by_presence, by_count, s));
+    try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
 }
 
 /// Row j of `logits` `[1, L, V]` under the penalties as its serial tick applies them: after the
-/// committed ids (`committed`, `[V]` bool) and `ids[0..j]` (`[1, L]` int32, inclusive, lazy is fine).
-pub fn shiftRows(out: *mlx.mlx_array, logits: mlx.mlx_array, ids: mlx.mlx_array, committed: mlx.mlx_array, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
+/// committed ids (`committed`, `[V]` int32 counts) and `ids[0..j]` (`[1, L]` int32, inclusive, lazy is fine).
+pub fn shiftRows(out: *mlx.mlx_array, logits: mlx.mlx_array, ids: mlx.mlx_array, committed: mlx.mlx_array, pen: Penalties, s: mlx.mlx_stream) !void {
     const shape = mlx.getShape(logits);
     var vocab_ids = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vocab_ids);
@@ -85,13 +126,8 @@ pub fn shiftRows(out: *mlx.mlx_array, logits: mlx.mlx_array, ids: mlx.mlx_array,
     var through = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(through);
     try mlx.check(mlx.mlx_cumsum(&through, hit_i, 1, false, true, s));
-    const zero = mlx.mlx_array_new_int(0);
-    defer _ = mlx.mlx_array_free(zero);
-    var in_round = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(in_round);
-    try mlx.check(mlx.mlx_greater(&in_round, through, zero, s));
-    var seen = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(seen);
-    try mlx.check(mlx.mlx_logical_or(&seen, in_round, committed, s));
-    try apply(out, logits, seen, repeat_penalty, presence_penalty, s);
+    var counts = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(counts);
+    try mlx.check(mlx.mlx_add(&counts, through, committed, s));
+    try apply(out, logits, counts, pen, s);
 }

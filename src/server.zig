@@ -9357,7 +9357,8 @@ fn handleChatCompletions(
 
     const repeat_penalty = parseRepeatPenalty(root);
 
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const presence_penalty = parseAdditivePenalty(root, "presence_penalty");
+    const frequency_penalty = parseAdditivePenalty(root, "frequency_penalty");
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9689,7 +9690,7 @@ fn handleChatCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty }, logprobs_n);
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -9705,6 +9706,7 @@ fn handleChatCompletions(
         .top_k = top_k,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = frequency_penalty,
         .seed = seed,
     };
 
@@ -9856,11 +9858,8 @@ fn handleCompletions(
 
     const repeat_penalty = parseRepeatPenalty(root);
 
-    const presence_penalty_c: f32 = if (root.get("presence_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(@min(@max(f, 0.0), 2.0)),
-        .integer => |i| @floatFromInt(@min(@max(i, 0), 2)),
-        else => 0.0,
-    } else 0.0;
+    const presence_penalty_c = parseAdditivePenalty(root, "presence_penalty");
+    const frequency_penalty_c = parseAdditivePenalty(root, "frequency_penalty");
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9948,7 +9947,7 @@ fn handleCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty_c }, logprobs_n);
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty_c, .frequency_penalty = frequency_penalty_c }, logprobs_n);
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, root);
@@ -9958,6 +9957,7 @@ fn handleCompletions(
         .top_k = top_k,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
+        .frequency_penalty = frequency_penalty_c,
         .seed = seed,
     };
     sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, true, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
@@ -11237,10 +11237,11 @@ test "the bill prices the MTP head only for a request that runs it: a DFlash2 re
     try t.expect(head.qsa_ring_bytes > dflash.qsa_ring_bytes);
 }
 
-test "requestSpecModes: a repeat or presence penalty keeps the sidecar off but MTP on" {
+test "requestSpecModes: a repeat, presence or frequency penalty keeps the sidecar off but MTP on" {
     const presence = generate_mod.SamplingParams{ .presence_penalty = 1.5 };
     const repeat = generate_mod.SamplingParams{ .repeat_penalty = 1.1 };
-    for ([_]generate_mod.SamplingParams{ presence, repeat }) |sampling| {
+    const frequency = generate_mod.SamplingParams{ .frequency_penalty = 0.5 };
+    for ([_]generate_mod.SamplingParams{ presence, repeat, frequency }) |sampling| {
         // A loaded sidecar cannot take the request, so the round falls to MTP.
         var r = requestSpecModes(true, true, true, true, sampling, 0);
         try std.testing.expect(r.use_mtp and !r.use_drafter);
@@ -13977,16 +13978,18 @@ fn formatLogprobsObject(
     return try std.fmt.allocPrint(allocator, "{{\"content\":{s}}}", .{content_buf.items});
 }
 
-/// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
-/// `repeat_penalty` (0 or absent = unset, at most 10), else OpenAI's `frequency_penalty` (0-2) as
-/// `1 + fp`, else 1.0 (off).
+/// The multiplicative `repeat_penalty` (llama.cpp's, at most 10), else vLLM's `repetition_penalty`;
+/// 0 or absent is 1.0 (off). OpenAI's `frequency_penalty` is a separate additive penalty.
 fn parseRepeatPenalty(root: std.json.ObjectMap) f32 {
     const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
     if (rp > 0.0) return rp;
     const rep_p = parseJsonFloat(root, "repetition_penalty", 0.0, 0.0, 10.0);
-    if (rep_p > 0.0) return rep_p;
-    const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    return if (fp > 0.0) 1.0 + fp else 1.0;
+    return if (rep_p > 0.0) rep_p else 1.0;
+}
+
+/// OpenAI's `presence_penalty` and `frequency_penalty`: -2 to 2, 0 = off.
+fn parseAdditivePenalty(root: std.json.ObjectMap, key: []const u8) f32 {
+    return parseJsonFloat(root, key, 0.0, -2.0, 2.0);
 }
 
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
@@ -17813,9 +17816,9 @@ fn handleResponsesInner(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const frequency_penalty = parseAdditivePenalty(root, "frequency_penalty");
+    const repeat_penalty = parseRepeatPenalty(root);
+    const presence_penalty = parseAdditivePenalty(root, "presence_penalty");
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
@@ -18088,7 +18091,7 @@ fn handleResponsesInner(
     if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty }, 0);
+    const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, 0);
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     // ── sampling ──
@@ -18098,6 +18101,7 @@ fn handleResponsesInner(
         .top_k = top_k,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = frequency_penalty,
         .seed = seed,
     };
     var sc: generate_mod.SchemaConstraint = undefined;
@@ -20072,21 +20076,20 @@ test "jsonEscape empty string" {
     try testing.expectEqualStrings("\"\"", result);
 }
 
-test "repeat_penalty: 0 or below is unset, then frequency_penalty, then off, on chat and completions alike" {
+test "repeat_penalty: 0 or below is unset, then off, on chat and completions alike" {
     const a = std.testing.allocator;
     const Case = struct { body: []const u8, want: f32 };
     const cases = [_]Case{
         .{ .body = "{}", .want = 1.0 },
         .{ .body = "{\"repeat_penalty\":1.3}", .want = 1.3 },
         .{ .body = "{\"repeat_penalty\":0}", .want = 1.0 },
-        .{ .body = "{\"repeat_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.5 },
-        .{ .body = "{\"repeat_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.1 },
-        .{ .body = "{\"frequency_penalty\":0.1}", .want = 1.1 },
+        .{ .body = "{\"repeat_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.0 },
+        .{ .body = "{\"repeat_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.0 },
+        .{ .body = "{\"frequency_penalty\":1}", .want = 1.0 },
         .{ .body = "{\"repeat_penalty\":50}", .want = 10.0 },
         .{ .body = "{\"repetition_penalty\":1.3}", .want = 1.3 },
         .{ .body = "{\"repetition_penalty\":0}", .want = 1.0 },
-        .{ .body = "{\"repetition_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.5 },
-        .{ .body = "{\"repetition_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.1 },
+        .{ .body = "{\"repetition_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.0 },
         .{ .body = "{\"repetition_penalty\":50}", .want = 10.0 },
         .{ .body = "{\"repeat_penalty\":1.2,\"repetition_penalty\":1.5}", .want = 1.2 },
     };
@@ -20094,6 +20097,26 @@ test "repeat_penalty: 0 or below is unset, then frequency_penalty, then off, on 
         const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
         defer parsed.deinit();
         try std.testing.expectApproxEqAbs(c.want, parseRepeatPenalty(parsed.value.object), 1e-6);
+    }
+}
+
+test "OpenAI frequency and presence penalties are additive fields in -2..2, never a repeat_penalty multiplier" {
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, frequency: f32, presence: f32 };
+    const cases = [_]Case{
+        .{ .body = "{}", .frequency = 0, .presence = 0 },
+        .{ .body = "{\"frequency_penalty\":1,\"presence_penalty\":0}", .frequency = 1, .presence = 0 },
+        .{ .body = "{\"frequency_penalty\":0.5,\"presence_penalty\":-0.25}", .frequency = 0.5, .presence = -0.25 },
+        .{ .body = "{\"frequency_penalty\":-9,\"presence_penalty\":9}", .frequency = -2, .presence = 2 },
+        .{ .body = "{\"frequency_penalty\":\"x\"}", .frequency = 0, .presence = 0 },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqual(c.frequency, parseAdditivePenalty(root, "frequency_penalty"));
+        try std.testing.expectEqual(c.presence, parseAdditivePenalty(root, "presence_penalty"));
+        try std.testing.expectEqual(@as(f32, 1.0), parseRepeatPenalty(root));
     }
 }
 

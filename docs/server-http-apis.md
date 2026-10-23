@@ -133,11 +133,13 @@ before reading a completed stream and requires clean EOF.
   (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
-- **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
+- **A repeat/presence/frequency penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
   drafter path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
   MTP does run: each verify row carries the penalty ([engine-mtp](engine-mtp.md#spec-verify-invariant)).
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
-  completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off.
+  completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off. OpenAI's `presence_penalty` and
+  `frequency_penalty` (-2 to 2, `parseAdditivePenalty`) are subtracted from the logit once per seen id and once per
+  occurrence; `frequency_penalty` is never read as `repeat_penalty` 1 + x, which halved every seen logit at 1.0.
 - **Think penalty** (`think_penalty` request > `--think-penalty` > model-settings.json > off, 0-20; arXiv 2606.00206):
   while the thought is open every single-token spelling of the paper's markers (bare or space-led, lower or capital)
   loses λ; a split spelling is skipped (its first piece starts other words). The paper penalises everywhere; we stop

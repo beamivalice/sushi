@@ -47,9 +47,9 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
 - Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active
   rewards and penalties bypass the target head shortlist. The think-penalty preset retains its original arithmetic.
-- A repeat/presence penalty shifts every verify block right after `thinkShiftRows` (`penaltyShiftRows`, the same
+- A repeat/presence/frequency penalty shifts every verify block right after `thinkShiftRows` (`penaltyShiftRows`, the same
   solo, grouped and batched sites): row j is penalised over the committed ids plus the verify ids through j with
-  the serial tick's own arithmetic (`seen_penalty.apply`), so MTP == serial holds. Drafts stay raw: exact
+  the serial tick's own arithmetic (`seen_penalty.apply` over per-id counts), so MTP == serial holds. Drafts stay raw: exact
   acceptance is valid for any proposal, a penalty only lowers acceptance. A plain batched tick samples no penalty,
   so a penalised slot stays out of the planner's and the crowd's plain ticks and keeps its MTP round.
 - Qwen3.8-Flash-Next's DFlash2 drafter verifies through the same forward, per-position capture and `ssmRollbackFromCapture`
