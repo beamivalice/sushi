@@ -9527,7 +9527,7 @@ fn handleChatCompletions(
     if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
-    const default_effort_budget = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
+    const default_effort_budget = model_mod.defaultThinkBudget(config, server_config.default_reasoning_budget);
     const effort_budget: i32 = if (effort_cfg) |e| e.budget else default_effort_budget;
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
@@ -16158,7 +16158,7 @@ fn handleAnthropicMessages(
         config.defaultEnableThinking()
     else
         false;
-    var reasoning_budget: i32 = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
+    var reasoning_budget: i32 = model_mod.defaultThinkBudget(config, server_config.default_reasoning_budget);
     var budget_explicit = false;
     if (root.get("thinking")) |think_val| {
         if (think_val == .object) {
@@ -17879,9 +17879,9 @@ fn handleResponsesInner(
     // Budget precedence as on chat: reasoning_budget_tokens > the effort word's budget >
     // --reasoning-budget.
     var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
-    if (root.get("reasoning") == null) reasoning_cfg.effort = model_mod.defaultEffortWord(config);
+    if (reasoning_cfg.effort == null and (root.get("reasoning") == null or reasoning_cfg.enable)) reasoning_cfg.effort = model_mod.defaultEffortWord(config);
     var enable_thinking = reasoning_cfg.enable;
-    var effort_budget: i32 = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
+    var effort_budget: i32 = model_mod.defaultThinkBudget(config, server_config.default_reasoning_budget);
     var effort_notice: ?EffortNotice = null;
     defer if (effort_notice) |n| n.deinit(allocator);
     defer clearEffortNotice(stream);
@@ -22043,7 +22043,7 @@ test "effort refusal and /v1/models list name the model's accepted words" {
     try std.testing.expectEqualStrings("reasoning effort 'minimal' is not supported by Qwen3.8-Flash-Next-EXL3-K4; use one of: off, low, medium, xhigh", msg);
     const row = try reasoningEffortsJson(allocator, &.{ .model_type = "qwen4_exp" });
     defer allocator.free(row);
-    try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"off\"", row);
+    try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"medium\"", row);
     const legacy = try reasoningEffortsJson(allocator, &.{ .model_type = "llama" });
     defer allocator.free(legacy);
     try std.testing.expectEqualStrings("", legacy);
@@ -22063,8 +22063,9 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
     var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
     const Case = struct { arch: []const u8, gen: []const u8, want: []const u8 };
     for ([_]Case{
-        .{ .arch = "qwen4_exp", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"off\"" },
-        .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":true}}", .want = ",\"default_reasoning_effort\":\"low\"" },
+        .{ .arch = "qwen4_exp", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"medium\"" },
+        .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":true}}", .want = ",\"default_reasoning_effort\":\"medium\"" },
+        .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":false}}", .want = ",\"default_reasoning_effort\":\"off\"" },
         .{ .arch = "mimo_v2", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"on\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"on\"" },
         .{ .arch = "glm5_next", .gen = "{}", .want = ",\"reasoning_efforts\":[\"low\",\"high\",\"max\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"high\"" },
     }) |c| {

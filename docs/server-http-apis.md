@@ -29,13 +29,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
   uncapped, and off/none is off.
 - `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
-  none runs at (`model.defaultReasoningEffort`: `--think`, else GLM high, else off/on per `defaultEnableThinking`,
-  where a thinking Qwen silence renders low), and `reasoning_effort_budgets`, the thinking-token cap of each capped word
+  none runs at (`model.defaultReasoningEffort`: `--think`, else Qwen medium, else GLM high, else off/on per
+  `defaultEnableThinking`), and `reasoning_effort_budgets`, the thinking-token cap of each capped word
   (Qwen `low` 2048, `medium` 8192; `{}` for MiMo and GLM).
 - CLI `--think X` requires an explicit effort word and is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
   any X but off is on) or, lacking it, keeps its own default. It never fails a load.
-- A thinking request that names NO effort gets no server budget (decided): Qwen3.8 renders it as low
-  (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
+- **Qwen thinks at medium by default** (owner decision): a request naming no thinking field (no `enable_thinking`,
+  `reasoning_effort`, Anthropic `thinking` or Responses `reasoning`, as `sushi run` sends none) runs with thinking on
+  at `medium` and its 8192-token cap (`model.archDefaultArm`, read by `defaultEnableThinking`, `defaultEffortWord`
+  and `defaultThinkBudget`). Precedence: the request's own fields, then `--think`, then an explicit
+  `--reasoning-budget` over the cap, then this default; a checkpoint whose `generation_config.json` declares
+  `enable_thinking` false stays off. Explicit thinking off stays off. MiMo and GLM keep their defaults. A thinking
+  request on another arch that names NO effort gets no server budget: Qwen3.8's template renders an absent word as
+  low (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via
   `ResponseStore`, WS via Upgrade. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.

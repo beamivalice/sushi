@@ -1121,6 +1121,7 @@ pub const ModelConfig = struct {
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
         if (self.isGlm5()) return true;
+        if (self.isQwen4()) return true;
         // mimo_v2: the vendor template's own default is on (only an explicit
         // `enable_thinking is false` closes the think block).
         if (std.mem.eql(u8, self.model_type, "mimo_v2")) return true;
@@ -2704,8 +2705,24 @@ pub fn thinkFlagBudget(model_type: []const u8, fallback: i32) i32 {
     return fallback;
 }
 
+/// The arm a request naming no effort takes when `--think` is not given: Qwen's own, unless the
+/// checkpoint declares thinking off.
+fn archDefaultArm(config: *const ModelConfig) ?EffortArm {
+    if (!config.isQwen4() or config.gen_enable_thinking == false) return null;
+    return findEffortArm(&qwen4_exp_efforts, .medium);
+}
+
+/// The thinking cap of a request naming no effort: `--think`'s, else an explicit
+/// `--reasoning-budget`, else the arch default's.
+pub fn defaultThinkBudget(config: *const ModelConfig, launch_budget: i32) i32 {
+    if (thinkFlagArm(config.model_type)) |arm| return arm.budget orelse launch_budget;
+    if (launch_budget >= 0) return launch_budget;
+    return if (archDefaultArm(config)) |arm| arm.budget orelse launch_budget else launch_budget;
+}
+
 pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
     if (thinkFlagArm(config.model_type)) |arm| return @tagName(arm.effort);
+    if (archDefaultArm(config)) |arm| return @tagName(arm.effort);
     return if (config.isGlm5()) "high" else null;
 }
 
@@ -5958,8 +5975,9 @@ test "thinking policy: --think binds the models that take it, the rest keep thei
     const mimo = ModelConfig{ .model_type = "mimo_v2" };
     const qwen = ModelConfig{ .model_type = "qwen4_exp" };
     think_effort_flag = .on;
-    try testing.expect(!qwen.defaultEnableThinking());
-    try testing.expect(defaultEffortWord(&qwen) == null);
+    // Qwen has no `on` arm, so the flag does not bind it and it keeps its own default.
+    try testing.expect(qwen.defaultEnableThinking());
+    try testing.expectEqualStrings("medium", defaultEffortWord(&qwen).?);
     try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
     for ([_]Effort{ .low, .medium, .high, .xhigh, .max }) |e| {
         think_effort_flag = e;
@@ -5968,7 +5986,7 @@ test "thinking policy: --think binds the models that take it, the rest keep thei
     }
     think_effort_flag = .minimal;
     try testing.expectEqualStrings("on", defaultEffortWord(&mimo).?);
-    try testing.expect(defaultEffortWord(&qwen) == null);
+    try testing.expectEqualStrings("medium", defaultEffortWord(&qwen).?);
     think_effort_flag = .off;
     try testing.expectEqualStrings("off", defaultEffortWord(&mimo).?);
     try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
@@ -6045,12 +6063,14 @@ test "thinking policy: default_reasoning_effort is the word a request naming non
     const mimo_off = ModelConfig{ .model_type = "mimo_v2", .gen_enable_thinking = false };
     const qwen = ModelConfig{ .model_type = "qwen4_exp" };
     const qwen_on = ModelConfig{ .model_type = "qwen4_exp", .gen_enable_thinking = true };
+    const qwen_off = ModelConfig{ .model_type = "qwen4_exp", .gen_enable_thinking = false };
     think_effort_flag = null;
     try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
     try testing.expectEqualStrings("on", defaultReasoningEffort(&mimo).?);
     try testing.expectEqualStrings("off", defaultReasoningEffort(&mimo_off).?);
-    try testing.expectEqualStrings("off", defaultReasoningEffort(&qwen).?);
-    try testing.expectEqualStrings("low", defaultReasoningEffort(&qwen_on).?);
+    try testing.expectEqualStrings("medium", defaultReasoningEffort(&qwen).?);
+    try testing.expectEqualStrings("medium", defaultReasoningEffort(&qwen_on).?);
+    try testing.expectEqualStrings("off", defaultReasoningEffort(&qwen_off).?);
     try testing.expect(defaultReasoningEffort(&ModelConfig{ .model_type = "llama" }) == null);
     think_effort_flag = .medium;
     try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
@@ -6081,6 +6101,40 @@ test "thinking policy: thinkFlagBudget uses current arch caps and preserves unca
     think_effort_flag = .on;
     try testing.expectEqual(@as(i32, 456), thinkFlagBudget("mimo_v2", 456));
     try testing.expectEqual(@as(i32, 789), thinkFlagBudget("unknown", 789));
+}
+
+test "Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and the checkpoint's own word" {
+    const saved = think_effort_flag;
+    defer think_effort_flag = saved;
+    const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    const qwen_off = ModelConfig{ .model_type = "qwen4_exp", .gen_enable_thinking = false };
+    const mimo = ModelConfig{ .model_type = "mimo_v2" };
+    const glm = ModelConfig{ .model_type = "glm5_next" };
+    think_effort_flag = null;
+    try testing.expect(qwen.defaultEnableThinking());
+    try testing.expectEqualStrings("medium", defaultEffortWord(&qwen).?);
+    // medium's cap applies to silence; an explicit --reasoning-budget outranks it
+    try testing.expectEqual(@as(i32, 8192), defaultThinkBudget(&qwen, -1));
+    try testing.expectEqual(@as(i32, 321), defaultThinkBudget(&qwen, 321));
+    // A checkpoint that declares thinking off stays off.
+    try testing.expect(!qwen_off.defaultEnableThinking());
+    try testing.expect(defaultEffortWord(&qwen_off) == null);
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&qwen_off, -1));
+    // --think outranks the arch default, `off` included.
+    think_effort_flag = .low;
+    try testing.expectEqualStrings("low", defaultEffortWord(&qwen).?);
+    try testing.expectEqual(@as(i32, 2048), defaultThinkBudget(&qwen, -1));
+    think_effort_flag = .off;
+    try testing.expect(!qwen.defaultEnableThinking());
+    think_effort_flag = .xhigh;
+    try testing.expectEqualStrings("xhigh", defaultEffortWord(&qwen).?);
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&qwen, -1));
+    // MiMo and GLM keep their own defaults and budgets.
+    think_effort_flag = null;
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&mimo, -1));
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&glm, -1));
+    try testing.expect(defaultEffortWord(&mimo) == null);
+    try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
 }
 
 test "GLM vision config rejects unsupported tower geometry and accepts a text-only checkpoint" {

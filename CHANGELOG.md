@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen now thinks at medium effort by default**: Qwen3.8-Flash-Next answers a request that names no thinking field with thinking on at `medium` (capped at 8192 thinking tokens), where it used to answer without thinking. `enable_thinking: false`, `reasoning_effort: none`, `--think` and `--reasoning-budget` still win.
 - **Qwen tool calls written in Claude's `<function_calls><invoke>` markup are executed**: Qwen3.8-Flash-Next sometimes answers in that shape, which used to end an agent's turn as plain text; it now becomes a tool call when it names a declared tool.
 - **`frequency_penalty` follows OpenAI's definition**: it is subtracted from a token's logit once per time the token has been generated, instead of being read as `repeat_penalty` 1 + x (which halved every seen logit at 1.0), and `presence_penalty` and `frequency_penalty` accept -2 to 2 on chat, completions and Responses.
 - **After a Metal out-of-memory failure the next request no longer fails at once**: the failed request is reported as the out-of-memory it was, and the error no longer carries over to the request after it. Thanks to [@holistech](https://github.com/holistech) for the report (#61).
