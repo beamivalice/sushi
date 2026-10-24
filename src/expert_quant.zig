@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("expert_io.zig");
+const expert_usage = @import("expert_usage.zig");
 pub const expert_exl3 = @import("sushi_exl3").format;
 
 /// The per-expert rate and offset table a rate-grouped layer keeps beside its stored banks. A group's gate trellis
@@ -17,6 +18,9 @@ pub const StoreShape = struct {
     union_sets: u8 = 1,
     /// Each grouped layer's union `Ragged` meta table.
     union_meta_bytes: u64 = 0,
+    /// Every routed expert with each layer's cache meta table, when every routed layer is rate-grouped; else 0. A
+    /// budget that holds it beside the trunk serves the pack resident (`expert_stream.budgetLedger`).
+    all_bytes: u64 = 0,
 };
 
 pub const Geometry = struct {
@@ -32,6 +36,15 @@ pub const Geometry = struct {
     /// The bank rates the config names decoders for (`Spec.rates`); null admits any up to `exl3_n`.
     exl3_rates: ?u128 = null,
     shape: StoreShape = .{},
+    /// `--drop-expert`: experts a layer left unloaded, and which they are (`drop.n == drop_n`; the store refuses one
+    /// without the other).
+    drop_n: u16 = 0,
+    drop: ?*const expert_usage.Drop = null,
+
+    /// Routed experts a layer that can still be picked.
+    pub fn kept(self: Geometry) u16 {
+        return self.experts - self.drop_n;
+    }
 };
 
 pub const SourceSpan = struct {
@@ -95,7 +108,8 @@ pub fn mxfp4GeomFromShapes(
 pub fn isExpertStreamingArch(model_type: []const u8) bool {
     return std.mem.eql(u8, model_type, "glm5_next") or
         std.mem.eql(u8, model_type, "qwen4_exp") or
-        std.mem.eql(u8, model_type, "mimo_v2");
+        std.mem.eql(u8, model_type, "mimo_v2") or
+        std.mem.eql(u8, model_type, "deepseek_v41");
 }
 
 pub fn kFromPackedDim(last: u64) ?expert_exl3.Rate {
@@ -106,7 +120,9 @@ pub fn kFromPackedDim(last: u64) ?expert_exl3.Rate {
 /// Routed experts are leading-index banks or individual source tensors.
 /// Both MXFP4 layouts use nine component ids with three absent bias slots; GLM's
 /// FP8 source keeps e4m3 weights and their f32 block-128 `weight_scale_inv` grids.
-pub const Layout = enum { bf16_individual, bf16_fused, quantized_split, exl3_k4, mxfp4_split, mxfp4_individual, fp8_individual };
+/// `mxfp4_w123` is `mxfp4_individual` under DeepSeek's names (`layers.L.ffn.experts.E.w1|w3|w2`, `.scale`),
+/// with routed experts in every layer.
+pub const Layout = enum { bf16_individual, bf16_fused, quantized_split, exl3_k4, mxfp4_split, mxfp4_individual, mxfp4_w123, fp8_individual };
 
 pub const Component = enum(u4) {
     gate_w,
@@ -205,7 +221,7 @@ pub fn streamingLayoutOfDir(allocator: std.mem.Allocator, io: std.Io, model_type
     if (parsed.value != .object) return error.InvalidSafetensorsIndex;
     const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
     if (map != .object) return error.InvalidSafetensorsIndex;
-    if (!std.mem.eql(u8, model_type, "qwen4_exp")) try rejectExl3RateGroups(map.object);
+    if (!std.mem.eql(u8, model_type, "qwen4_exp") and !std.mem.eql(u8, model_type, "deepseek_v41")) try rejectExl3RateGroups(map.object);
     return layoutFromIndexJsonWithFirstMoe(allocator, model_type, raw, layers, first_moe_layer) orelse error.ExpertStreamingUnsupportedLayout;
 }
 
@@ -249,7 +265,49 @@ pub fn mxfp4IndividualTensorKey(
 }
 
 fn isMxfp4Layout(layout: Layout) bool {
-    return layout == .mxfp4_split or layout == .mxfp4_individual;
+    return layout == .mxfp4_split or layout == .mxfp4_individual or layout == .mxfp4_w123;
+}
+
+/// DeepSeek's routed expert tensors: gate is `w1`, up `w3`, down `w2`; the scale leaf is `scale`.
+pub fn mxfp4W123TensorKey(buf: []u8, layer: u16, expert: u16, projection: Projection, part: Part) ![]const u8 {
+    const leaf = switch (part) {
+        .weight => "weight",
+        .scales => "scale",
+        .biases => return error.Mxfp4BiasUnsupported,
+    };
+    const w: u8 = switch (projection) {
+        .gate => '1',
+        .up => '3',
+        .down => '2',
+    };
+    return std.fmt.bufPrint(buf, "layers.{d}.ffn.experts.{d}.w{c}.{s}", .{ layer, expert, w, leaf });
+}
+
+fn individualKey(layout: Layout, buf: []u8, layer: u16, expert: u16, projection: Projection, part: Part) ![]const u8 {
+    return if (layout == .mxfp4_w123)
+        mxfp4W123TensorKey(buf, layer, expert, projection, part)
+    else
+        mxfp4IndividualTensorKey(buf, layer, expert, projection, part);
+}
+
+fn parseW123Key(key: []const u8) Mxfp4IndividualKeyParse {
+    const prefix = "layers.";
+    if (!std.mem.startsWith(u8, key, prefix)) return .not_family;
+    var parts = std.mem.splitScalar(u8, key[prefix.len..], '.');
+    const layer = decimalU16(parts.next() orelse return .not_family) orelse return .not_family;
+    if (!std.mem.eql(u8, parts.next() orelse return .not_family, "ffn")) return .not_family;
+    if (!std.mem.eql(u8, parts.next() orelse return .not_family, "experts")) return .not_family;
+    const expert = decimalU16(parts.next() orelse return .not_family) orelse return .not_family;
+    const name = parts.next() orelse return .malformed;
+    const projection: Projection = if (std.mem.eql(u8, name, "w1")) .gate else if (std.mem.eql(u8, name, "w3")) .up else if (std.mem.eql(u8, name, "w2")) .down else return .malformed;
+    const leaf = parts.next() orelse return .malformed;
+    if (parts.next() != null) return .malformed;
+    const part: Part = if (std.mem.eql(u8, leaf, "weight")) .weight else if (std.mem.eql(u8, leaf, "scale")) .scales else return .malformed;
+    return .{ .valid = .{ .layer = layer, .expert = expert, .projection = projection, .part = part } };
+}
+
+fn parseIndividualKey(layout: Layout, key: []const u8) Mxfp4IndividualKeyParse {
+    return if (layout == .mxfp4_w123) parseW123Key(key) else parseMxfp4IndividualKey(key);
 }
 
 const ParsedMxfp4IndividualKey = struct {
@@ -447,6 +505,7 @@ pub fn isRoutedExpertKey(layout: Layout, key: []const u8) bool {
         .mxfp4_split => std.mem.startsWith(u8, key, "model.layers.") and
             std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null,
         .mxfp4_individual => parseMxfp4IndividualKey(key) == .valid,
+        .mxfp4_w123 => parseW123Key(key) == .valid,
     };
 }
 
@@ -500,6 +559,7 @@ const IndividualMapState = struct {
 };
 
 fn inspectMxfp4IndividualMap(
+    layout: Layout,
     map: std.json.ObjectMap,
     layers: u16,
     experts: ?u16,
@@ -508,7 +568,7 @@ fn inspectMxfp4IndividualMap(
     var state: IndividualMapState = .{};
     var it = map.iterator();
     while (it.next()) |entry| {
-        switch (parseMxfp4IndividualKey(entry.key_ptr.*)) {
+        switch (parseIndividualKey(layout, entry.key_ptr.*)) {
             .not_family => {},
             .malformed => state.malformed = true,
             .valid => |parsed| {
@@ -525,13 +585,14 @@ fn inspectMxfp4IndividualMap(
 }
 
 fn mxfp4IndividualBankCompleteFromFirst(
+    layout: Layout,
     map: std.json.ObjectMap,
     layers: u16,
     experts: ?u16,
     first_moe_layer: u16,
 ) bool {
-    if (layers == 0 or first_moe_layer == 0 or first_moe_layer >= layers) return false;
-    const state = inspectMxfp4IndividualMap(map, layers, experts, first_moe_layer);
+    if (layers == 0 or first_moe_layer >= layers or (first_moe_layer == 0 and layout != .mxfp4_w123)) return false;
+    const state = inspectMxfp4IndividualMap(layout, map, layers, experts, first_moe_layer);
     if (!state.seen or state.malformed or state.out_of_range or state.dense_prefix) return false;
     const expert_count: u32 = if (experts) |count|
         count
@@ -546,7 +607,7 @@ fn mxfp4IndividualBankCompleteFromFirst(
             const expert: u16 = @intCast(expert_usize);
             for ([_]Projection{ .gate, .up, .down }) |projection| {
                 for ([_]Part{ .weight, .scales }) |part| {
-                    const key = mxfp4IndividualTensorKey(&buf, layer, expert, projection, part) catch return false;
+                    const key = individualKey(layout, &buf, layer, expert, projection, part) catch return false;
                     if (!stringAt(map, key)) return false;
                 }
             }
@@ -665,11 +726,11 @@ fn layoutFromWeightMapWithFirstMoe(map: std.json.ObjectMap, layers: u16, first_m
     if (layers == 0) return null;
     // Individual source keys are intentionally checked before every packed
     // layout. A complete bank beside any other routed bank is ambiguous.
-    const individual_state = inspectMxfp4IndividualMap(map, layers, null, first_moe_layer);
+    const individual_state = inspectMxfp4IndividualMap(.mxfp4_individual, map, layers, null, first_moe_layer);
     if (individual_state.malformed) return null;
     if (individual_state.seen) {
         if (individual_state.out_of_range or individual_state.dense_prefix or
-            !mxfp4IndividualBankCompleteFromFirst(map, layers, null, first_moe_layer) or
+            !mxfp4IndividualBankCompleteFromFirst(.mxfp4_individual, map, layers, null, first_moe_layer) or
             hasAnyAlternativeExpertKey(map, layers, true))
             return null;
         return .mxfp4_individual;
@@ -740,6 +801,13 @@ pub fn layoutFromIndexJsonWithFirstMoe(
         const fp8 = hasFp8ScaleKey(map.object);
         validateBf16IndividualMap(map.object, layers, first_moe_layer, null, fp8) catch return null;
         return if (fp8) .fp8_individual else .bf16_individual;
+    }
+    if (std.mem.eql(u8, model_type, "deepseek_v41")) {
+        // An STQ pack's trellis banks under the routed nesting, or the release's own e2m1 experts in every layer, and
+        // no other routed bank beside them.
+        if (exl3BankComplete(map.object, EXL3_PREFIXES[1], first_moe_layer, layers)) return .exl3_k4;
+        if (!mxfp4IndividualBankCompleteFromFirst(.mxfp4_w123, map.object, layers, null, first_moe_layer)) return null;
+        return .mxfp4_w123;
     }
     const mimo = std.mem.eql(u8, model_type, "mimo_v2");
     const layout = layoutFromWeightMapWithFirstMoe(map.object, layers, first_moe_layer, mimo) orelse return null;
@@ -826,6 +894,12 @@ pub const LayerGroups = struct {
     experts: [rate_group_limit]u16 = @splat(0),
     base: [rate_group_limit]u16 = @splat(0),
     n: [rate_group_limit][3]u32 = @splat(@splat(0)),
+    /// Experts of each group `--drop-expert` leaves unloaded; they keep their ids and positions in the pack.
+    dropped: [rate_group_limit]u16 = @splat(0),
+
+    pub fn keptOf(self: *const LayerGroups, g: usize) u16 {
+        return self.experts[g] - self.dropped[g];
+    }
 
     pub fn groupOf(self: *const LayerGroups, expert: u16) u8 {
         var g: u8 = 0;
@@ -841,7 +915,14 @@ pub const LayerGroups = struct {
         return total;
     }
 
-    /// One expert of every group: the least a cache of this layer can hold.
+    /// Every kept expert of every group.
+    pub fn allBytes(self: *const LayerGroups, hidden: u32, inter: u32) u64 {
+        var total: u64 = 0;
+        for (0..self.count) |g| total += @as(u64, self.keptOf(g)) * self.expertBytes(g, hidden, inter);
+        return total;
+    }
+
+    /// One expert of every group that still has one: the least a cache of this layer can hold.
     pub fn floorBytes(self: *const LayerGroups, hidden: u32, inter: u32) u64 {
         var total: u64 = 0;
         for (0..self.count) |g| total += self.expertBytes(g, hidden, inter);
@@ -926,9 +1007,11 @@ pub const QuantStore = struct {
             };
             grouped = true;
             out.layer_floor_bytes = @max(out.layer_floor_bytes, lg.floorBytes(self.geometry.hidden, self.geometry.intermediate));
-            out.union_meta_bytes += @as(u64, self.geometry.experts) * rate_group_meta_bytes;
+            out.union_meta_bytes += @as(u64, self.geometry.kept()) * rate_group_meta_bytes;
+            out.all_bytes += lg.allBytes(self.geometry.hidden, self.geometry.intermediate) + @as(u64, self.geometry.kept()) * rate_group_meta_bytes;
         }
         if (grouped and uniform) out.union_sets = 2;
+        if (uniform) out.all_bytes = 0;
         return out;
     }
 
@@ -947,8 +1030,14 @@ pub const QuantStore = struct {
             geometry.first_moe_layer > geometry.layers)
             return error.InvalidExpertGeometry;
         if (isMxfp4Layout(chosen) and
-            (geometry.first_moe_layer == 0 or moeLayerCount(geometry) == 0))
+            ((geometry.first_moe_layer == 0 and chosen != .mxfp4_w123) or moeLayerCount(geometry) == 0))
             return error.Mxfp4DensePrefixMismatch;
+        if (geometry.drop_n != 0) {
+            // A bill that counts dropped experts out needs the list that says which, or it under-bills.
+            const d = geometry.drop orelse return error.ExpertDropListMissing;
+            if (d.n != geometry.drop_n or d.first_layer != geometry.first_moe_layer or d.rows.len != moeLayerCount(geometry) or geometry.drop_n >= geometry.experts)
+                return error.ExpertDropListMismatch;
+        } else if (geometry.drop != null) return error.ExpertDropListMismatch;
 
         const io = std.Io.Threaded.global_single_threaded.io();
         var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
@@ -1015,7 +1104,7 @@ pub const QuantStore = struct {
 
         if (chosen == .bf16_individual or chosen == .fp8_individual) {
             try populateBf16IndividualStore(allocator, model_dir, weight_map, &files_list, &store);
-        } else if (chosen == .mxfp4_individual) {
+        } else if (chosen == .mxfp4_individual or chosen == .mxfp4_w123) {
             try populateMxfp4IndividualStore(
                 allocator,
                 model_dir,
@@ -1278,9 +1367,13 @@ fn populateExl3GroupedLayer(
     for (0..plan.count) |g| {
         lg.experts[g] = @intCast(plan.groups[g].experts);
         lg.base[g] = @intCast(at);
+        if (geometry.drop) |d| {
+            lg.dropped[g] = @intCast(d.droppedIn(layer, at, at + plan.groups[g].experts));
+            if (lg.keptOf(g) == 0) return error.DropEmptiesRateGroup;
+        }
         for (0..3) |pi| {
             lg.n[g][pi] = plan.groups[g].rates[pi].n;
-            weight_total[pi] += @as(u64, plan.groups[g].experts) * tiles * lg.n[g][pi] * 2;
+            weight_total[pi] += @as(u64, lg.keptOf(g)) * tiles * lg.n[g][pi] * 2;
         }
         for (0..component_count) |ci| {
             const piece = pieces[g][ci];
@@ -1306,7 +1399,7 @@ fn populateExl3GroupedLayer(
             .weight => {
                 var widest: u32 = 0;
                 for (0..plan.count) |g| widest = @max(widest, lg.n[g][pi]);
-                const average = (weight_total[pi] + geometry.experts - 1) / geometry.experts;
+                const average = (weight_total[pi] + geometry.kept() - 1) / geometry.kept();
                 if (!metadata_ready) {
                     store.rows[ci] = in_dim / 16;
                     store.cols[ci] = out_dim / 16 * widest;
@@ -1380,7 +1473,7 @@ fn cachedTensorRegion(file: *const SourceFile, key: []const u8) !io_mod.TensorRe
     if (dtype != .string) return error.InvalidSafetensorsTensor;
     const dt: io_mod.Dtype = if (std.mem.eql(u8, dtype.string, "BF16"))
         .bf16
-    else if (std.mem.eql(u8, dtype.string, "U8") or std.mem.eql(u8, dtype.string, "UINT8"))
+    else if (io_mod.isByteDtype(dtype.string))
         .u8
     else if (std.mem.eql(u8, dtype.string, "U32") or std.mem.eql(u8, dtype.string, "UINT32"))
         .u32
@@ -1445,10 +1538,12 @@ fn openSource(allocator: std.mem.Allocator, list: *std.ArrayList(SourceFile), di
 }
 
 fn validateMxfp4IndividualMap(
+    layout: Layout,
     map: std.json.ObjectMap,
     geometry: Geometry,
 ) !void {
     const state = inspectMxfp4IndividualMap(
+        layout,
         map,
         geometry.layers,
         geometry.experts,
@@ -1459,6 +1554,7 @@ fn validateMxfp4IndividualMap(
     if (state.malformed or state.out_of_range or hasAnyAlternativeExpertKey(map, geometry.layers, true))
         return error.InvalidSafetensorsIndex;
     if (!mxfp4IndividualBankCompleteFromFirst(
+        layout,
         map,
         geometry.layers,
         geometry.experts,
@@ -1475,7 +1571,7 @@ fn populateMxfp4IndividualStore(
     store: *QuantStore,
 ) !void {
     const geometry = store.geometry;
-    try validateMxfp4IndividualMap(weight_map, geometry);
+    try validateMxfp4IndividualMap(store.layout, weight_map, geometry);
 
     var metadata_ready = false;
     var key_buf: [192]u8 = undefined;
@@ -1489,7 +1585,7 @@ fn populateMxfp4IndividualStore(
                 if (in_dim % 32 != 0) return error.UnsupportedExpertQuant;
                 for ([_]Part{ .weight, .scales }) |part| {
                     const c: Component = if (part == .weight) weightOf(projection) else scalesOf(projection);
-                    const key = mxfp4IndividualTensorKey(&key_buf, layer, expert, projection, part) catch
+                    const key = individualKey(store.layout, &key_buf, layer, expert, projection, part) catch
                         return error.InvalidExpertGeometry;
                     const mapped = weight_map.get(key) orelse return error.MissingExpertTensor;
                     if (mapped != .string) return error.InvalidSafetensorsIndex;
@@ -2206,4 +2302,28 @@ test "GLM EXL3 index uses native source nesting and refuses mixed expert formats
     const dense = try std.fmt.allocPrint(std.testing.allocator, "{s},\"model.language_model.layers.0.mlp.switch_mlp.up_proj.trellis\":\"bad.safetensors\"}}}}", .{raw[0 .. raw.len - 2]});
     defer std.testing.allocator.free(dense);
     try std.testing.expect(layoutFromIndexJsonWithFirstMoe(std.testing.allocator, "glm5_next", dense, 4, 3) == null);
+}
+
+test "DeepSeek expert keys round trip and the layout claims only the trunk's experts" {
+    const t = std.testing;
+    var buf: [96]u8 = undefined;
+    for ([_]Projection{ .gate, .up, .down }) |projection| for ([_]Part{ .weight, .scales }) |part| {
+        const key = try mxfp4W123TensorKey(&buf, 39, 383, projection, part);
+        const parsed = parseW123Key(key).valid;
+        try t.expectEqual(@as(u16, 39), parsed.layer);
+        try t.expectEqual(@as(u16, 383), parsed.expert);
+        try t.expectEqual(projection, parsed.projection);
+        try t.expectEqual(part, parsed.part);
+        try t.expect(isRoutedExpertKey(.mxfp4_w123, key));
+        try t.expect(!isRoutedExpertKey(.mxfp4_individual, key));
+    };
+    try t.expectEqualStrings("layers.2.ffn.experts.5.w3.scale", try mxfp4W123TensorKey(&buf, 2, 5, .up, .scales));
+    for ([_][]const u8{
+        "mtp.0.ffn.experts.0.w1.weight",
+        "layers.1.ffn.shared_experts.w1.weight",
+        "layers.1.ffn.gate.weight",
+        "layers.1.engram.embed.weight",
+        "layers.1.ffn.experts.0.w1.bias",
+    }) |key| try t.expect(!isRoutedExpertKey(.mxfp4_w123, key));
+    try t.expectError(error.Mxfp4BiasUnsupported, mxfp4W123TensorKey(&buf, 0, 0, .gate, .biases));
 }

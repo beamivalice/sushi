@@ -39,6 +39,8 @@ pub const Ragged = struct {
     experts: u32 = 0,
     hidden: c_int = 0,
     inter: c_int = 0,
+    /// Set by `initSplit`: its pools share no one trellis, which the decode kernels index.
+    prefill_only: bool = false,
 
     /// Builds the ragged storage from per-group banks (lazy or evaluated); the banks stay the caller's.
     pub fn init(s: mlx.mlx_stream, banks: []const root.Bank) !Ragged {
@@ -183,6 +185,65 @@ pub const Ragged = struct {
         return self;
     }
 
+    /// A prefill bank over two streamed banks of one layer: each pool g of `cache` whole, then, where `overflow[g] > 0`,
+    /// the first `overflow[g]` slots of `spill`'s pool g as a pool of its own. A route's slot ids follow the pools in
+    /// that order. The scales are concatenated lazily, so they read the storage when the forward runs.
+    pub fn initSplit(s: mlx.mlx_stream, cache: *const Ragged, spill: *const Ragged, overflow: []const u32) !Ragged {
+        if (overflow.len != cache.count or spill.count != cache.count) return error.Exl3GroupMissing;
+        var self: Ragged = .{ .hidden = cache.hidden, .inter = cache.inter, .prefill_only = true };
+        errdefer self.deinit();
+        var meta: std.ArrayList(u32) = .empty;
+        defer meta.deinit(std.heap.page_allocator);
+        var suh: [3][max_groups]mlx.mlx_array = undefined;
+        var svh: [3][max_groups]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (0..made) |p| for (0..3) |pi| {
+            _ = mlx.mlx_array_free(suh[pi][p]);
+            _ = mlx.mlx_array_free(svh[pi][p]);
+        };
+        for (0..cache.count) |g| {
+            for ([_]struct { bank: *const Ragged, slots: u32 }{ .{ .bank = cache, .slots = cache.experts_of[g] }, .{ .bank = spill, .slots = overflow[g] } }) |part| {
+                if (part.slots == 0) continue;
+                if (self.count == max_groups) return error.Exl3GroupMissing;
+                const p = self.count;
+                var view: root.Bank = undefined;
+                for (0..3) |pi| {
+                    const src = projOf(part.bank.views[g], pi);
+                    const sh = mlx.getShape(src.trellis);
+                    const dst = projPtr(&view, pi);
+                    dst.* = .{ .trellis = .{ .ctx = null }, .suh = .{ .ctx = null }, .svh = .{ .ctx = null } };
+                    dst.trellis = try rowsView(s, src.trellis, 0, @intCast(part.slots), &[_]c_int{ @intCast(part.slots), sh[1], sh[2], sh[3] });
+                    suh[pi][p] = try rowsView(s, src.suh, 0, @intCast(part.slots), &[_]c_int{ @intCast(part.slots), mlx.getShape(src.suh)[1] });
+                    svh[pi][p] = try rowsView(s, src.svh, 0, @intCast(part.slots), &[_]c_int{ @intCast(part.slots), mlx.getShape(src.svh)[1] });
+                }
+                made += 1;
+                self.views[p] = view;
+                self.view_count += 1;
+                self.rates[p] = cache.rates[g];
+                self.base[p] = self.experts;
+                self.experts_of[p] = part.slots;
+                for (0..part.slots) |local| try meta.appendSlice(std.heap.page_allocator, &.{ self.rates[p][0], self.rates[p][1], self.rates[p][2], @intCast(p), 0, 0, 0, @intCast(local) });
+                self.experts += part.slots;
+                self.count += 1;
+            }
+        }
+        for (0..3) |pi| {
+            self.suh[pi] = try concat(s, suh[pi][0..made]);
+            self.svh[pi] = try concat(s, svh[pi][0..made]);
+        }
+        self.meta = mlx.mlx_array_new_data(meta.items.ptr, &[_]c_int{@intCast(meta.items.len)}, 1, .uint32);
+        for (self.views[0..self.view_count], 0..) |*view, p| {
+            for (0..3) |pi| {
+                const dst = projPtr(view, pi);
+                const lo: c_int = @intCast(self.base[p]);
+                const hi: c_int = @intCast(self.base[p] + self.experts_of[p]);
+                dst.suh = try rowsView(s, self.suh[pi], lo, hi, mlx.getShape(suh[pi][p]));
+                dst.svh = try rowsView(s, self.svh[pi], lo, hi, mlx.getShape(svh[pi][p]));
+            }
+        }
+        return self;
+    }
+
     pub fn deinit(self: *Ragged) void {
         for ([_][]mlx.mlx_array{ &self.trellis, &self.suh, &self.svh }) |set| {
             for (set) |*a| freeHandle(a);
@@ -257,9 +318,10 @@ fn concat(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
 /// Rows lo..hi of `a` along axis 0, reshaped to `shape`: a view, never a copy.
 fn rowsView(s: mlx.mlx_stream, a: mlx.mlx_array, lo: c_int, hi: c_int, shape: []const c_int) !mlx.mlx_array {
     const sh = mlx.getShape(a);
-    var start: [2]c_int = @splat(0);
-    var stop: [2]c_int = @splat(0);
-    const strides: [2]c_int = @splat(1);
+    if (sh.len > 4) return error.BadExl3Shape;
+    var start: [4]c_int = @splat(0);
+    var stop: [4]c_int = @splat(0);
+    const strides: [4]c_int = @splat(1);
     @memcpy(stop[0..sh.len], sh);
     start[0] = lo;
     stop[0] = hi;
@@ -276,6 +338,19 @@ fn rowsView(s: mlx.mlx_stream, a: mlx.mlx_array, lo: c_int, hi: c_int, shape: []
 
 const N_DECL = "constexpr uint N = uint(NHW);\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n";
 const PAIR_LOOP = "for (uint proj = 0u; proj < 2u; proj++) {\n";
+
+/// The four decode kernels: the pair and the fused-mid down that prepare their own inputs, and the pair and down that
+/// read the inputs `pairPrepare` and `midMixed` made once per slot.
+const Kind = enum {
+    pair,
+    down,
+    pair_prepared,
+    down_prepared,
+
+    fn isDown(self: Kind) bool {
+        return self == .down or self == .down_prepared;
+    }
+};
 
 /// One rate class of a layer: gate and up n of the pair kernel, or down n (`up` 0).
 pub const RateClass = struct { gate: u32, up: u32 = 0 };
@@ -308,8 +383,16 @@ fn caseHead(out: *std.ArrayList(u8), alloc: std.mem.Allocator, n: u32) !void {
 /// rate classes, read per threadgroup from `meta` (a threadgroup is one slot, so the switch never
 /// diverges), and the trellis at the expert's ragged offset. The pair kernel's case holds both
 /// projections unrolled: a switch inside its projection loop kept the loop rolled, +40% at 21 cases.
-fn mixedSource(alloc: std.mem.Allocator, down: bool, classes: []const RateClass) ![:0]u8 {
-    const base: []const u8 = if (down) kernels.DOWN_FUSED_SOURCE else kernels.PAIR_GEMV_SOURCE;
+fn mixedSource(alloc: std.mem.Allocator, kind: Kind, classes: []const RateClass, limit: c_int) ![:0]u8 {
+    const down = kind.isDown();
+    const clamped = if (kind == .down and limit > 0) try clampSwiglu(alloc, kernels.DOWN_FUSED_SOURCE, limit) else null;
+    defer if (clamped) |c| alloc.free(c);
+    const base: []const u8 = clamped orelse switch (kind) {
+        .pair => kernels.PAIR_GEMV_SOURCE,
+        .down => kernels.DOWN_FUSED_SOURCE,
+        .pair_prepared => kernels.PAIR_GEMV_PREPARED_SOURCE,
+        .down_prepared => kernels.DOWN_PREPARED_SOURCE,
+    };
     const d = std.mem.indexOf(u8, base, N_DECL) orelse return error.RateGroupSourceAnchor;
     const a = if (down) std.mem.indexOf(u8, base, "float acc[OTPT][8] = {};") orelse return error.RateGroupSourceAnchor else std.mem.indexOf(u8, base, PAIR_LOOP) orelse return error.RateGroupSourceAnchor;
     // The pair body ends with its projection loop; the down body runs to the end.
@@ -345,6 +428,28 @@ fn mixedSource(alloc: std.mem.Allocator, down: bool, classes: []const RateClass)
     return out.toOwnedSliceSentinel(alloc, 0);
 }
 
+/// The fused mid with the gate capped at `limit` and the up branch clipped to +-limit, after their output scales
+/// (DeepSeek's and GLM's clamped SwiGLU).
+fn clampSwiglu(alloc: std.mem.Allocator, src: []const u8, limit: c_int) ![]u8 {
+    var out = try alloc.dupe(u8, src);
+    for ([_]u8{ 'g', 'u' }) |which| for (0..4) |k| {
+        var head_buf: [32]u8 = undefined;
+        const head = try std.fmt.bufPrint(&head_buf, "const float {c}{d} = ", .{ which, k });
+        const at = std.mem.indexOf(u8, out, head) orelse return error.RateGroupSourceAnchor;
+        const end = std.mem.indexOfScalarPos(u8, out, at, ';') orelse return error.RateGroupSourceAnchor;
+        const rhs = out[at + head.len .. end];
+        const wrapped = if (which == 'g')
+            try std.fmt.allocPrint(alloc, "{s}min({s}, {d}.0f)", .{ head, rhs, limit })
+        else
+            try std.fmt.allocPrint(alloc, "{s}clamp({s}, -{d}.0f, {d}.0f)", .{ head, rhs, limit, limit });
+        defer alloc.free(wrapped);
+        const next = try replaceOnce(alloc, out, out[at..end], wrapped);
+        alloc.free(out);
+        out = next;
+    };
+    return out;
+}
+
 fn replaceOnce(alloc: std.mem.Allocator, src: []const u8, old: []const u8, new: []const u8) ![]u8 {
     const at = std.mem.indexOf(u8, src, old) orelse return error.RateGroupSourceAnchor;
     if (std.mem.indexOfPos(u8, src, at + old.len, old) != null) return error.RateGroupSourceAnchor;
@@ -352,7 +457,8 @@ fn replaceOnce(alloc: std.mem.Allocator, src: []const u8, old: []const u8, new: 
 }
 
 const KernelEntry = struct {
-    down: bool,
+    kind: Kind,
+    limit: c_int,
     classes: [max_groups]RateClass,
     count: usize,
     decode: exl3.Decode,
@@ -371,31 +477,37 @@ fn header(dec: exl3.Decode) ![:0]const u8 {
 
 /// A kernel per (codebook, window, table, rate classes): the name spells all four, since MLX keys its
 /// libraries by name.
-fn mixedKernel(down: bool, classes: []const RateClass) !mlx.mlx_fast_metal_kernel {
+fn mixedKernel(kind: Kind, classes: []const RateClass, limit: c_int) !mlx.mlx_fast_metal_kernel {
     const dec = kernels.activeDecode();
+    const down = kind.isDown();
     const slot = for (kernel_cache.items) |*k| {
-        if (k.down == down and k.count == classes.len and std.mem.eql(u8, std.mem.sliceAsBytes(k.classes[0..k.count]), std.mem.sliceAsBytes(classes)) and
+        if (k.kind == kind and k.limit == limit and k.count == classes.len and std.mem.eql(u8, std.mem.sliceAsBytes(k.classes[0..k.count]), std.mem.sliceAsBytes(classes)) and
             k.decode.codebook == dec.codebook and k.decode.window == dec.window and k.decode.table == dec.table) break &k.kernel;
     } else blk: {
-        var e: KernelEntry = .{ .down = down, .classes = undefined, .count = classes.len, .decode = dec, .kernel = null };
+        var e: KernelEntry = .{ .kind = kind, .limit = limit, .classes = undefined, .count = classes.len, .decode = dec, .kernel = null };
         @memcpy(e.classes[0..classes.len], classes);
         try kernel_cache.append(std.heap.page_allocator, e);
         break :blk &kernel_cache.items[kernel_cache.items.len - 1].kernel;
     };
     if (slot.*) |k| return k;
     const alloc = std.heap.page_allocator;
-    const src = try mixedSource(alloc, down, classes);
+    const src = try mixedSource(alloc, kind, classes, limit);
     defer alloc.free(src);
     var name: std.ArrayList(u8) = .empty;
     defer name.deinit(alloc);
-    try name.print(alloc, "sushi_exl3_rg_{s}_{s}_w{d}", .{ if (down) "down" else "pair", @tagName(dec.codebook), dec.window.bits() });
+    try name.print(alloc, "sushi_exl3_rg_{s}_{s}_w{d}", .{ @tagName(kind), @tagName(dec.codebook), dec.window.bits() });
     if (dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[dec.table.?].digest});
     for (classes) |c| try name.print(alloc, "_{d}x{d}", .{ c.gate, c.up });
+    if (limit > 0) try name.print(alloc, "_clamp{d}", .{limit});
     try name.append(alloc, 0);
-    const pair_ins = [_][*:0]const u8{ "x", "suhg", "suhu", "tg", "tu", "slots", "meta" };
-    const down_ins = [_][*:0]const u8{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots", "meta" };
+    const ins: []const [*:0]const u8 = switch (kind) {
+        .pair => &.{ "x", "suhg", "suhu", "tg", "tu", "slots", "meta" },
+        .down => &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots", "meta" },
+        .pair_prepared => &.{ "prep", "tg", "tu", "slots", "meta" },
+        .down_prepared => &.{ "middle", "trellis", "slots", "meta" },
+    };
     const outs: []const [*:0]const u8 = if (down) &.{"y"} else &.{ "yg", "yu" };
-    return kernels.getNamedKernel(slot, @ptrCast(name.items.ptr), if (down) &down_ins else &pair_ins, outs, src, try header(dec));
+    return kernels.getNamedKernel(slot, @ptrCast(name.items.ptr), ins, outs, src, try header(dec));
 }
 
 const DecodeKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, down: bool, layout: kernels.GemvLayout };
@@ -439,7 +551,7 @@ fn getOut(v: mlx.mlx_vector_array, i: usize) !mlx.mlx_array {
 fn pairMixed(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, topk: c_int, classes: []const RateClass) ![2]mlx.mlx_array {
     const nslots: c_int = @intCast(mlx.mlx_array_size(slots));
     const cfg = try decodeConfig(.{ .in_dim = rb.hidden, .out_dim = rb.inter, .nslots = nslots, .topk = topk, .down = false, .layout = kernels.gemvLayout(@divExact(rb.inter, 16)) });
-    const ov = try kernels.applyOuts(s, try mixedKernel(false, classes), &.{ x, rb.suh[0], rb.suh[1], rb.trellis[0], rb.trellis[1], slots, rb.meta }, cfg, 2);
+    const ov = try kernels.applyOuts(s, try mixedKernel(.pair, classes, 0), &.{ x, rb.suh[0], rb.suh[1], rb.trellis[0], rb.trellis[1], slots, rb.meta }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(ov);
     const g = try getOut(ov, 0);
     errdefer _ = mlx.mlx_array_free(g);
@@ -447,12 +559,82 @@ fn pairMixed(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.
 }
 
 /// The fused SwiGLU mid and down GEMV: f16 inner down planes [nslots, hidden].
-fn downMixed(s: mlx.mlx_stream, inner: [2]mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, classes: []const RateClass) !mlx.mlx_array {
+fn downMixed(s: mlx.mlx_stream, inner: [2]mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, classes: []const RateClass, limit: c_int) !mlx.mlx_array {
     const nslots: c_int = @intCast(mlx.mlx_array_size(slots));
     const cfg = try decodeConfig(.{ .in_dim = rb.inter, .out_dim = rb.hidden, .nslots = nslots, .topk = 0, .down = true, .layout = kernels.gemvLayout(@divExact(rb.hidden, 16)) });
-    const ov = try kernels.applyOuts(s, try mixedKernel(true, classes), &.{ inner[0], inner[1], rb.trellis[2], rb.svh[0], rb.svh[1], rb.suh[2], slots, rb.meta }, cfg, 1);
+    const ov = try kernels.applyOuts(s, try mixedKernel(.down, classes, limit), &.{ inner[0], inner[1], rb.trellis[2], rb.svh[0], rb.svh[1], rb.suh[2], slots, rb.meta }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     return getOut(ov, 0);
+}
+
+/// The pair GEMV on the inputs `pairPrepare` made once per slot (a pair threadgroup otherwise re-derives its K span of
+/// x, 72 times a slot at DeepSeek's width): the planes `pairMixed` writes, byte for byte.
+fn pairPreparedMixed(s: mlx.mlx_stream, prep: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, topk: c_int, classes: []const RateClass) ![2]mlx.mlx_array {
+    const nslots: c_int = @intCast(mlx.mlx_array_size(slots));
+    const cfg = try decodeConfig(.{ .in_dim = rb.hidden, .out_dim = rb.inter, .nslots = nslots, .topk = topk, .down = false, .layout = kernels.gemvLayout(@divExact(rb.inter, 16)) });
+    const ov = try kernels.applyOuts(s, try mixedKernel(.pair_prepared, classes, 0), &.{ prep, rb.trellis[0], rb.trellis[1], slots, rb.meta }, cfg, 2);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    const g = try getOut(ov, 0);
+    errdefer _ = mlx.mlx_array_free(g);
+    return .{ g, try getOut(ov, 1) };
+}
+
+const MidKey = struct { dim: c_int, nslots: c_int, nsplit: c_int };
+var mid_cfgs: kernels.CfgCache(MidKey, 16) = .{};
+var mid_kernels: [4]struct { limit: c_int = -1, kernel: ?mlx.mlx_fast_metal_kernel = null } = @splat(.{});
+
+/// The SwiGLU mid and the down input's Hadamard once per slot, `[nslots, inter]` f16: what the fused-mid down
+/// otherwise re-derives in every threadgroup of the slot.
+fn midMixed(s: mlx.mlx_stream, inner: [2]mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, limit: c_int) !mlx.mlx_array {
+    const nslots: c_int = @intCast(mlx.mlx_array_size(slots));
+    const nsplit: c_int = @intCast(kernels.pairSplitCountFor(rb.hidden));
+    const key: MidKey = .{ .dim = rb.inter, .nslots = nslots, .nsplit = nsplit };
+    const cfg = mid_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ nslots, rb.inter }, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(rb.inter, 128) * 32, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", rb.inter));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
+        mid_cfgs.put(key, c);
+        break :blk c;
+    };
+    const slot = for (&mid_kernels) |*k| {
+        if (k.limit == limit or k.limit == -1) break k;
+    } else return error.Exl3GroupMissing;
+    if (slot.kernel == null) {
+        const alloc = std.heap.page_allocator;
+        const clamped = if (limit > 0) try clampSwiglu(alloc, kernels.DECODE_MID_SOURCE, limit) else null;
+        defer if (clamped) |c| alloc.free(c);
+        const text: []const u8 = clamped orelse kernels.DECODE_MID_SOURCE;
+        const src = try alloc.allocSentinel(u8, text.len, 0);
+        defer alloc.free(src);
+        @memcpy(src, text);
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "sushi_exl3_rg_mid_clamp{d}\x00", .{limit});
+        slot.limit = limit;
+        slot.kernel = try kernels.getNamedKernel(&slot.kernel, @ptrCast(name.ptr), &.{ "ig", "iu", "svhg", "svhu", "suhd", "slots" }, &.{"prepared"}, src, "");
+    }
+    const ov = try kernels.applyOuts(s, slot.kernel.?, &.{ inner[0], inner[1], rb.svh[0], rb.svh[1], rb.suh[2], slots }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    return getOut(ov, 0);
+}
+
+/// The down GEMV on `midMixed`'s inputs: the plane `downMixed` writes, byte for byte.
+fn downPreparedMixed(s: mlx.mlx_stream, middle: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, classes: []const RateClass) !mlx.mlx_array {
+    const nslots: c_int = @intCast(mlx.mlx_array_size(slots));
+    const cfg = try decodeConfig(.{ .in_dim = rb.inter, .out_dim = rb.hidden, .nslots = nslots, .topk = 0, .down = true, .layout = kernels.gemvLayout(@divExact(rb.hidden, 16)) });
+    const ov = try kernels.applyOuts(s, try mixedKernel(.down_prepared, classes, 0), &.{ middle, rb.trellis[2], slots, rb.meta }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    return getOut(ov, 0);
+}
+
+/// Whether a decode chain of `rows` rows prepares its inputs once per slot: 2 or more rows at DeepSeek's geometry,
+/// where a one-row chain keeps the fused prepare (the extra dispatches cost it more than they save).
+fn preparedOn(rb: *const Ragged, rows: usize) bool {
+    if (prepared_force) |v| return v and rows >= 2;
+    return rows >= 2 and rb.hidden == 5120 and rb.inter == 2304;
 }
 
 var engaged: [2]bool = @splat(false);
@@ -467,22 +649,42 @@ fn logEngaged(arm: enum { decode, prefill }, rb: *const Ragged, pair: usize, dow
     }
 }
 
+/// Test arms of the prepared verify chain: null follows the geometry, a value forces it.
+pub var prepared_force: ?bool = null;
+var prepared_engaged: bool = false;
+
 /// Routed SwiGLU over decode or verify rows `x` [rows, hidden] for flat u32 `slots` and `scores`
 /// [rows*topk]: ONE pair and ONE down dispatch whatever the group count (a pass per group lost at
 /// every count: a dispatch costs a fixed ~10 us), then the served finish reduce, folding `shared`
 /// (with `gate`: the bf16 `sigmoid(gate) * shared`) as the uniform chain does.
 pub fn moeDecode(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, gate: ?mlx.mlx_array) !mlx.mlx_array {
+    return moeDecodeClamped(s, x, rb, slots, scores, topk, out_dtype, shared, gate, 0);
+}
+
+/// `moeDecode` with the SwiGLU clamped at `limit` (0: none).
+pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, gate: ?mlx.mlx_array, limit: c_int) !mlx.mlx_array {
+    if (rb.prefill_only) return error.Exl3SplitBankIsPrefillOnly;
     const rows = mlx.getShape(x)[0];
     var pc: [max_groups]RateClass = undefined;
     var dc: [max_groups]RateClass = undefined;
     const pair = classesOf(rb, false, &pc);
     const downs = classesOf(rb, true, &dc);
     logEngaged(.decode, rb, pair.len, downs.len);
-    const inner = try pairMixed(s, x, rb, slots, topk, pair);
+    const prepared = preparedOn(rb, @intCast(rows));
+    const inner = if (prepared) blk: {
+        const prep = try kernels.pairPrepare(s, x, rb.suh[0], rb.suh[1], slots, rb.hidden, @intCast(mlx.mlx_array_size(slots)), topk);
+        defer _ = mlx.mlx_array_free(prep);
+        break :blk try pairPreparedMixed(s, prep, rb, slots, topk, pair);
+    } else try pairMixed(s, x, rb, slots, topk, pair);
     defer for (inner) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    const down = try downMixed(s, inner, rb, slots, downs);
+    const down = if (prepared) blk: {
+        const middle = try midMixed(s, inner, rb, slots, limit);
+        defer _ = mlx.mlx_array_free(middle);
+        prepared_engaged = true;
+        break :blk try downPreparedMixed(s, middle, rb, slots, downs);
+    } else try downMixed(s, inner, rb, slots, downs, limit);
     defer _ = mlx.mlx_array_free(down);
     return kernels.downFinishReduceWithShared(s, down, rb.svh[2], slots, scores, rb.hidden, rows, topk, out_dtype, shared, gate, false);
 }
@@ -494,12 +696,12 @@ pub fn moeDecode(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: 
 /// per expert), the inverse sort order, and each sorted row's expert index inside its group.
 const GROUP_WINDOW_SOURCE: [:0]const u8 =
     \\const uint tid = uint(thread_index_in_threadgroup);
-    \\const uint n = uint(count[0]);
+    \\const uint n = uint(count[0]), groups = uint(count[1]), experts = uint(threads_per_threadgroup.x);
     \\const uint C = (n + uint(WIN) - 1u) / uint(WIN);
-    \\const uint capacity = uint(GROUPS) * C + uint(EXPERTS);
-    \\threadgroup uint counts[uint(EXPERTS)];
-    \\for (uint i = tid; i < capacity; i += uint(EXPERTS)) { starts[i] = 0u; nlives[i] = 0u; }
-    \\for (uint i = tid; i < n; i += uint(EXPERTS)) {
+    \\const uint capacity = groups * C + experts;
+    \\threadgroup uint counts[MAX_EXPERTS];
+    \\for (uint i = tid; i < capacity; i += experts) { starts[i] = 0u; nlives[i] = 0u; }
+    \\for (uint i = tid; i < n; i += experts) {
     \\  inverse[uint(order[i])] = i;
     \\  local[i] = meta[uint(eids[i]) * 8u + 7u];
     \\}
@@ -539,10 +741,10 @@ fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, ord
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, e, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, e, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WIN", win));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EXPERTS", e));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GROUPS", @intCast(rb.count)));
-    const nn: u32 = @intCast(n);
-    const count = mlx.mlx_array_new_data(&nn, &.{1}, 1, .uint32);
+    // The expert and group counts of a split bank change per chunk, so they ride in `count`, not the kernel name.
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "MAX_EXPERTS", @intCast(PREFILL_MAX_EXPERTS)));
+    const nn = [2]u32{ @intCast(n), @intCast(rb.count) };
+    const count = mlx.mlx_array_new_data(&nn, &.{2}, 1, .uint32);
     defer _ = mlx.mlx_array_free(count);
     const kernel = try kernels.getNamedKernel(&group_window_kernel, "sushi_exl3_rg_windows", &.{ "eids", "order", "count", "meta" }, &.{ "starts", "nlives", "inverse", "local" }, GROUP_WINDOW_SOURCE, "");
     const ov = try kernels.applyOuts(s, kernel, &.{ sorted, order, count, rb.meta }, cfg, 4);
@@ -560,7 +762,7 @@ fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, ord
 
 /// Planes a combine dispatch reads at most: Metal binds 31 buffers.
 const COMBINE_PLANES: usize = 24;
-var combine_kernels: [2][COMBINE_PLANES + 1]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
+var combine_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 /// Each sorted row of `planes` (group `first + i`'s GEMM output, valid on its own rows only), or of
 /// `prev` for a row of a group before `first`.
@@ -598,12 +800,14 @@ fn combine(s: mlx.mlx_stream, planes: []const mlx.mlx_array, sorted: mlx.mlx_arr
     while (true) {
         const m = @min(COMBINE_PLANES, planes.len - first);
         const chained = prev != null;
-        const slot = &combine_kernels[@intFromBool(chained)][m];
+        const slot = &combine_kernels[@intFromBool(chained)];
+        // Every dispatch binds all COMBINE_PLANES planes (the last real one repeated, its cases never reached), so the
+        // source and the library are one per chain position whatever the group count.
         const kernel = slot.* orelse blk: {
             const alloc = std.heap.page_allocator;
-            const src = try combineSource(alloc, m, chained);
+            const src = try combineSource(alloc, COMBINE_PLANES, chained);
             defer alloc.free(src);
-            const name = try std.fmt.allocPrintSentinel(alloc, "sushi_exl3_rg_combine_{d}{s}", .{ m, if (chained) "_chained" else "" }, 0);
+            const name = try std.fmt.allocPrintSentinel(alloc, "sushi_exl3_rg_combine{s}", .{if (chained) "_chained" else ""}, 0);
             defer alloc.free(name);
             var ins: [COMBINE_PLANES + 3][*:0]const u8 = undefined;
             ins[0] = "eids";
@@ -613,8 +817,8 @@ fn combine(s: mlx.mlx_stream, planes: []const mlx.mlx_array, sorted: mlx.mlx_arr
                 ins[k] = "prev";
                 k += 1;
             }
-            @memcpy(ins[k..][0..m], PLANE_NAMES[0..m]);
-            break :blk try kernels.getNamedKernel(slot, name.ptr, ins[0 .. k + m], &.{"y"}, src, "");
+            @memcpy(ins[k..][0..COMBINE_PLANES], PLANE_NAMES[0..COMBINE_PLANES]);
+            break :blk try kernels.getNamedKernel(slot, name.ptr, ins[0 .. k + COMBINE_PLANES], &.{"y"}, src, "");
         };
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -632,7 +836,8 @@ fn combine(s: mlx.mlx_stream, planes: []const mlx.mlx_array, sorted: mlx.mlx_arr
             k += 1;
         }
         @memcpy(ins[k..][0..m], planes[first..][0..m]);
-        const ov = try kernels.applyOuts(s, kernel, ins[0 .. k + m], cfg, 1);
+        for (ins[k + m .. k + COMBINE_PLANES]) |*pad| pad.* = planes[first + m - 1];
+        const ov = try kernels.applyOuts(s, kernel, ins[0 .. k + COMBINE_PLANES], cfg, 1);
         defer _ = mlx.mlx_vector_array_free(ov);
         const y = try getOut(ov, 0);
         first += m;
@@ -673,6 +878,11 @@ fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize
 /// Routed SwiGLU over prefill rows `x` [rows, hidden]: the served prefill chain (token prepare, gate
 /// and up GEMMs, SwiGLU mid, down GEMM, inverse-indexed finish) with each GEMM run once per group.
 pub fn moePrefill(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int) !mlx.mlx_array {
+    return moePrefillClamped(s, x, rb, slots, scores, topk, 0);
+}
+
+/// `moePrefill` with the SwiGLU clamped at `limit` (0: none).
+pub fn moePrefillClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int) !mlx.mlx_array {
     const rows = mlx.getShape(x)[0];
     const n = rows * topk;
     logEngaged(.prefill, rb, 0, 0);
@@ -697,7 +907,7 @@ pub fn moePrefill(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots:
     defer _ = mlx.mlx_array_free(g);
     const u = try groupedGemm(s, prep[1], rb, 1, sorted, &w, win);
     defer _ = mlx.mlx_array_free(u);
-    const mid = try kernels.midSwigluPrep(s, g, u, rb.svh[0], rb.svh[1], rb.suh[2], sorted, rb.inter, n);
+    const mid = try kernels.midSwigluPrepWithLimit(s, g, u, rb.svh[0], rb.svh[1], rb.suh[2], sorted, rb.inter, n, limit);
     defer _ = mlx.mlx_array_free(mid);
     const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win);
     defer _ = mlx.mlx_array_free(d);
@@ -860,6 +1070,10 @@ fn servedComposition(s: mlx.mlx_stream, f: *const Fixture, out_dtype: mlx.mlx_dt
 
 /// The routed SwiGLU in f32 from the host tile decode, each expert at its own rates.
 fn hostTruth(alloc: std.mem.Allocator, f: *const Fixture, dec: exl3.Decode) ![]f32 {
+    return hostTruthClamped(alloc, f, dec, 0);
+}
+
+fn hostTruthClamped(alloc: std.mem.Allocator, f: *const Fixture, dec: exl3.Decode, limit: f32) ![]f32 {
     const h = f.spec.hidden;
     const i_d = f.spec.inter;
     const out = try alloc.alloc(f32, f.spec.rows * h);
@@ -895,7 +1109,11 @@ fn hostTruth(alloc: std.mem.Allocator, f: *const Fixture, dec: exl3.Decode) ![]f
         const x = f.xf[(si / f.spec.topk) * h ..][0..h];
         proj(x, f.words[g][0][l * tiles * r[0] ..][0 .. tiles * r[0]], f.suh[g][0][l * h ..][0..h], f.svh[g][0][l * i_d ..][0..i_d], h, i_d, r[0], dec, scratch, gy);
         proj(x, f.words[g][1][l * tiles * r[1] ..][0 .. tiles * r[1]], f.suh[g][1][l * h ..][0..h], f.svh[g][1][l * i_d ..][0..i_d], h, i_d, r[1], dec, scratch, uy);
-        for (gy, uy) |*gv, u| gv.* = (gv.* / (1.0 + @exp(-gv.*))) * u;
+        for (gy, uy) |*gv, u_raw| {
+            const gc = if (limit > 0) @min(gv.*, limit) else gv.*;
+            const u = if (limit > 0) std.math.clamp(u_raw, -limit, limit) else u_raw;
+            gv.* = (gc / (1.0 + @exp(-gc))) * u;
+        }
         proj(gy, f.words[g][2][l * tiles * r[2] ..][0 .. tiles * r[2]], f.suh[g][2][l * i_d ..][0..i_d], f.svh[g][2][l * h ..][0..h], i_d, h, r[2], dec, scratch, dy);
         for (out[(si / f.spec.topk) * h ..][0..h], dy) |*o, v| o.* += w * v;
     }
@@ -1024,6 +1242,74 @@ test "exl3 rate groups: decode rows hold the f32-truth bar for every codebook" {
     }
 }
 
+test "exl3 rate groups: a clamped SwiGLU holds the f32-truth bar at decode and prefill where the clamp is live" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const limit: c_int = 10;
+    for ([_]exl3.Decode{ .{ .codebook = .pair1, .window = .w16 }, exl3.Decode.tabled(.spec1, .w15) }) |dec| {
+        kernels.setDecodeParams(dec);
+        defer kernels.setDecodeParams(.mul1);
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 } };
+        const experts = [_]u32{ 5, 3, 4 };
+        for ([_]usize{ 4, 40 }) |rows| {
+            var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = rows, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
+            defer f.deinit();
+            const want = try hostTruthClamped(alloc, &f, dec, @floatFromInt(limit));
+            // The clamp moves the answer at these magnitudes.
+            try t.expect(relRms(try hostTruth(alloc, &f, dec), want) > 0.1);
+            const y = if (rows <= kernels.DECODE_ROWS_MAX)
+                try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit)
+            else
+                try moePrefillClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), limit);
+            defer _ = mlx.mlx_array_free(y);
+            var cy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cy);
+            const got = try toF32(s, y, &cy);
+            for (got) |v| try t.expect(std.math.isFinite(v));
+            try t.expect(relRms(got, want) < 0.01);
+        }
+    }
+}
+
+test "exl3 rate groups: verify rows through the prepared pair input and middle write the self-preparing chain's bytes, 2 to 6 rows" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const limit: c_int = 10;
+    for ([_]exl3.Decode{ .{ .codebook = .pair1, .window = .w16 }, exl3.Decode.tabled(.spec1, .w15) }) |dec| {
+        kernels.setDecodeParams(dec);
+        defer kernels.setDecodeParams(.mul1);
+        defer prepared_force = null;
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 }, .{ 32, 26, 24 } };
+        const experts = [_]u32{ 5, 3, 4, 2 };
+        for ([_]usize{ 2, 3, 4, 5, 6, 9, 16 }) |rows| {
+            var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = rows, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
+            defer f.deinit();
+            prepared_force = false;
+            const self_prep = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
+            defer _ = mlx.mlx_array_free(self_prep);
+            var c0 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(c0);
+            const want = try bytesOf(s, self_prep, &c0);
+            prepared_force = true;
+            prepared_engaged = false;
+            const prep = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
+            defer _ = mlx.mlx_array_free(prep);
+            var c1 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(c1);
+            try t.expect(prepared_engaged);
+            try t.expectEqualSlices(u8, want, try bytesOf(s, prep, &c1));
+        }
+    }
+}
+
 fn reshaped(s: mlx.mlx_stream, a: mlx.mlx_array, shape: []const c_int) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -1123,6 +1409,44 @@ test "exl3 rate groups: groups sharing one rate equal the uniform layer to the b
     };
 }
 
+test "exl3 rate groups: a shared expert folded into the clamped f32 reduce is the separate f32 add, to the byte" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const dec: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    kernels.setDecodeParams(dec);
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const rates = [_][3]u32{ @splat(24), @splat(32), .{ 32, 32, 26 } };
+    const experts = [_]u32{ 5, 3, 4 };
+    for ([_]c_int{ 1, 5 }) |rows| {
+        var f = try Fixture.init(arena.allocator(), s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = @intCast(rows), .topk = 6 });
+        defer f.deinit();
+        const xb = try cast(s, f.x, .bfloat16);
+        defer _ = mlx.mlx_array_free(xb);
+        // A bf16 shared output at the magnitudes of the routed sum.
+        const shared = try cast(s, f.x, .bfloat16);
+        defer _ = mlx.mlx_array_free(shared);
+        const routed = try moeDecodeClamped(s, xb, &f.rb, f.slots, f.scores, 6, .float32, null, null, 10);
+        defer _ = mlx.mlx_array_free(routed);
+        var sf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sf);
+        try mlx.check(mlx.mlx_astype(&sf, shared, .float32, s));
+        var sum = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sum);
+        try mlx.check(mlx.mlx_add(&sum, routed, sf, s));
+        var cw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cw);
+        const want = try bytesOf(s, sum, &cw);
+        const folded = try moeDecodeClamped(s, xb, &f.rb, f.slots, f.scores, 6, .float32, shared, null, 10);
+        defer _ = mlx.mlx_array_free(folded);
+        var cg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cg);
+        try t.expectEqualSlices(u8, want, try bytesOf(s, folded, &cg));
+    }
+}
+
 test "exl3 rate groups: decode rows agree with today's masked moeGroups to f32 summation order" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1201,11 +1525,15 @@ fn randomWords(rnd: std.Random, out: []u16) void {
 }
 
 fn benchBank(rnd: std.Random, experts: u32, n: [3]u32) !root.Bank {
+    return benchBankAt(rnd, experts, n, RG_HIDDEN, RG_INTER);
+}
+
+fn benchBankAt(rnd: std.Random, experts: u32, n: [3]u32, hidden: c_int, inter: c_int) !root.Bank {
     var bank: root.Bank = undefined;
     const alloc = std.heap.page_allocator;
     for (0..3) |p| {
-        const in_d: c_int = if (p == 2) RG_INTER else RG_HIDDEN;
-        const out_d: c_int = if (p == 2) RG_HIDDEN else RG_INTER;
+        const in_d: c_int = if (p == 2) inter else hidden;
+        const out_d: c_int = if (p == 2) hidden else inter;
         const e: c_int = @intCast(experts);
         const shape = [_]c_int{ e, @divExact(in_d, 16), @divExact(out_d, 16), @intCast(n[p]) };
         const words = try alloc.alloc(u16, @as(usize, @intCast(e * shape[1] * shape[2])) * n[p]);
@@ -1632,6 +1960,84 @@ fn prefillRoutes(alloc: std.mem.Allocator, rnd: std.Random, rows: usize, rb: ?*c
         }
     }
     return mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ @intCast(rows), 1, RG_TOPK }, 3, .uint32);
+}
+
+// One DeepSeek-V4.1 routed layer (5120 x 2304, 384 experts in four PAIR1 groups at n24/26/32/40, top-6) through the
+// grouped prefill chain with every expert routed exactly r rows: the cost of a window against its live rows.
+// Prints only under SUSHI_EXL3_RG_ROWS_UBENCH.
+test "exl3 rate groups prefill cost by rows per expert at DeepSeek-V4.1 geometry (SUSHI_EXL3_RG_ROWS_UBENCH=1)" {
+    if (!diagOn("SUSHI_EXL3_RG_ROWS_UBENCH")) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer kernels.setDecodeParams(.mul1);
+    const alloc = std.heap.page_allocator;
+    var prng = std.Random.DefaultPrng.init(0xd541);
+    const rnd = prng.random();
+    const hidden: c_int = 5120;
+    const inter: c_int = 2304;
+    const experts: u32 = 384;
+    const topk: usize = 6;
+    var banks: [4]root.Bank = undefined;
+    for ([_]u32{ 24, 26, 32, 40 }, 0..) |n, g| banks[g] = try benchBankAt(rnd, experts / 4, .{ n, n, n }, hidden, inter);
+    var rb = try Ragged.init(s, &banks);
+    defer rb.deinit();
+    for (&banks) |*b| freeBank(b);
+    const st = rb.storage();
+    const vec = mlx.mlx_vector_array_new_data(&st, st.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+    const dec: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    const per_expert = [_]usize{ 1, 4, 8, 12, 16, 17, 20, 24, 28, 32, 33, 40, 48 };
+    const steps = 4;
+    var times: [per_expert.len][5]u64 = undefined;
+    var xs: [per_expert.len]mlx.mlx_array = undefined;
+    var routes: [per_expert.len]mlx.mlx_array = undefined;
+    var scores: [per_expert.len]mlx.mlx_array = undefined;
+    for (per_expert, 0..) |r, a| {
+        const rows = experts * r / topk;
+        const xh = try alloc.alloc(u16, rows * @as(usize, @intCast(hidden)));
+        defer alloc.free(xh);
+        for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.05)) >> 16);
+        xs[a] = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), 1, hidden }, 3, .bfloat16);
+        const ids = try alloc.alloc(u32, rows * topk);
+        defer alloc.free(ids);
+        for (ids, 0..) |*id, j| id.* = @intCast(j % experts);
+        routes[a] = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ @intCast(rows), 1, @intCast(topk) }, 3, .uint32);
+        const scv = try alloc.alloc(u16, rows * topk);
+        defer alloc.free(scv);
+        for (scv) |*v| v.* = @truncate(@as(u32, @bitCast(0.05 + rnd.float(f32) * 0.1)) >> 16);
+        scores[a] = mlx.mlx_array_new_data(scv.ptr, &[_]c_int{ @intCast(rows), 1, @intCast(topk) }, 3, .bfloat16);
+    }
+    defer for (0..per_expert.len) |a| {
+        _ = mlx.mlx_array_free(xs[a]);
+        _ = mlx.mlx_array_free(routes[a]);
+        _ = mlx.mlx_array_free(scores[a]);
+    };
+    for (0..6) |round| {
+        for (0..per_expert.len) |j| {
+            const arm = (round + j) % per_expert.len;
+            var x = try rgLink(s, xs[arm], xs[arm]);
+            for (0..steps) |_| {
+                const y = try root.moeRagged(s, x, &rb, routes[arm], scores[arm], dec, false, null, null);
+                const next = try rgLink(s, xs[arm], y);
+                _ = mlx.mlx_array_free(y);
+                _ = mlx.mlx_array_free(x);
+                x = next;
+            }
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var sw = io_util.Stopwatch.init(io);
+            try mlx.check(mlx.mlx_array_eval(x));
+            const ns = sw.read();
+            _ = mlx.mlx_array_free(x);
+            if (round > 0) times[arm][round - 1] = ns;
+        }
+    }
+    for (&times, per_expert) |*t, r| {
+        std.mem.sort(u64, t, {}, std.sort.asc(u64));
+        const ms = @as(f64, @floatFromInt(t[2])) / steps / 1e6;
+        const flop = @as(f64, @floatFromInt(experts * r)) * 3 * 2 * @as(f64, @floatFromInt(hidden * inter));
+        std.debug.print("[rg-rows] rows/expert={d} rows={d}: {d:.3} ms/layer median, {d:.3} us/expert, {d:.1} TFLOP/s\n", .{ r, experts * r / topk, ms, ms * 1e3 / @as(f64, @floatFromInt(experts)), flop / (ms / 1e3) / 1e12 });
+    }
 }
 
 // Prefill chunks of one Flash-Next MoE layer: uniform n32, today's moeGroups, and the grouped chain,

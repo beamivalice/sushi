@@ -145,6 +145,24 @@ The parser trusts no field: a wrong JSON type or a value outside its field's ran
 qwen4_exp geometry the forward divides by or indexes with is `InvalidQwen4Geometry`. The served packs' configs, cut
 to what the engine reads, are committed in `src/fixtures/model-configs/` and pinned by a parse test.
 
+<a id="dsv41-stq"></a>
+### DeepSeek-V4.1 STQ packs (`deepseek_v41`)
+
+A `deepseek_v41` pack may store its routed experts, its trunk linears and its head as trellis banks; every tensor it
+does not convert keeps the release's own name and format (FP8 + scale, or dense).
+- `expert_quant`: an STQ block (PAIR1 for the routed experts). The banks are rate groups under the routed nesting,
+  `model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.gN.{trellis,suh,svh}`, every layer, and they stream; the router
+  rows `layers.{L}.ffn.gate.{weight,bias}` follow group order. `swiglu_limit` must be a whole number (the clamp the
+  trellis chain applies). DSpark stage `i`'s experts: `mtp.{i}.mlp.switch_mlp.{P}[.gN].{trellis,suh,svh}`, resident.
+- `trunk_quant`: an STQ block of the same shape (SPEC1); its `k` is the widest trunk bank. A linear `<base>` stored as
+  `<base>.trellis` U16 `[in/16, out/16, n]`, `<base>.suh` F16 `[in]`, `<base>.svh` F16 `[out]` replaces
+  `<base>.weight`; the grouped `attn.wo_a` is the bank form `[o_groups, in/16, o_lora/16, n]`. The head is `head.*`.
+  Both sides on the 128 grid; a linear off it (the indexer's `weights_proj`) stays FP8.
+- The embedding may be MLX's affine triple `embed.{weight,scales,biases}` (bits and group from the shapes), gathered by row.
+- Refused by name: `Dsv41WeightLayout` (a trellis bank without `trunk_quant`, a bank that is not U16 with F16 scales,
+  a stage group set that does not cover the stage's experts), `UnsupportedDsv41Config` (a fractional clamp, a quant
+  block naming a non-STQ codebook), `ExpertLayoutUnsupported` (an index without every routed group).
+
 ### Stored-affine trunk linears (`mimo_v2`)
 
 A MiMo pack may STORE `o_proj` (every layer's `model.layers.{L}.self_attn.o_proj`),
@@ -195,6 +213,36 @@ Before any bytes are uploaded, a stamped shard's `codebook`, `window` and `k` ar
 A disagreement is `Exl3ShardStampMismatch` — a named refusal, never garbage
 weights. An **unstamped** shard is legacy and is admitted. `k` is compared as
 halfwords: at or below the config's rate passes, wider refuses.
+
+<a id="expert-cache-profile"></a>
+## Optional: `expert_cache_profile.json`
+
+A pack may carry a sidecar that tells a streamed load how to split its expert cache between rate-grouped layers.
+
+Format: `{"version": 1, "experts": E, "top_k": K, "tokens": N, "source": "...", "layers": [[c0, ..., c(E-1), cold], ...]}`.
+- One row per routed layer, in layer order. `c[d]` is the hits a layer's LRU cache gains from its (d+1)-th slot,
+  counted as stack distances over calibration routes in token order.
+- `cold` counts first touches.
+
+How a load uses it:
+- The engine spends the ledger's uniform total, unchanged, greedily by hits per byte. Each layer starts at a floor:
+  one expert of every rate group, or a quarter of the uniform share, whichever is larger.
+- Pools stay rate-sized inside a layer.
+- A load without the file falls back to the uniform split, as does a file with a wrong version, layer count or expert
+  count, a negative count, bad JSON, or a routed layer that is not rate-grouped.
+- The load line names the split: `[expert-stream] slots per layer: profile (min..max)` or `uniform (n)`.
+- The file never touches a shard, so adding it needs no re-stamp.
+
+<a id="expert-usage"></a>
+## Optional: `expert_usage.json`
+
+A DeepSeek-V4.1 pack may carry the routing counts `--drop-expert n` ranks ([dsv41-arch](dsv41-arch.md#drop-expert)).
+
+Format: `{"version": 1, "source": "...", "tokens": N, "top_k": K, "layers": [[count per expert id], ...]}`.
+- One row per routed layer, in layer order, one count per expert id in the router's numbering (the shard order).
+- Experts rank by count ascending, ties by expert id; the first `n` of a layer are dropped.
+- A flag with no file, a wrong version, a layer or expert count that is not the model's, or a negative count is
+  refused before any weight loads. The file never touches a shard, so adding it needs no re-stamp.
 
 ## Component packs
 

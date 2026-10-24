@@ -75,6 +75,7 @@ const glm5_forward_mod = @import("glm5_forward.zig");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const expert_stream_mod = @import("expert_stream.zig");
+const expert_usage = @import("expert_usage.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -1852,7 +1853,7 @@ pub const Scheduler = struct {
             }
             const assistant_bytes = try streamedAssistantBytes(self.io, self.allocator, owned.config, self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path), entry.path);
             const plan = try planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, settings_budget, coldLoadVision(owned.config, true), assistant_bytes);
-            break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.bounce_bytes);
+            break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, loadStagingBytes(owned.config, billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.workspace_bytes), plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config, false), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
         else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
@@ -2164,7 +2165,7 @@ pub const Scheduler = struct {
         // dispatches what it was going to dispatch anyway.
         return gen.spec_disabled_runtime or specTickMode(
             slot.enable_mtp,
-            gen.mtp != null,
+            gen.mtp != null or gen.dspark,
             slot.enable_drafter,
             gen.dflash != null,
         ) == .regular;
@@ -2666,7 +2667,8 @@ fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: bool) e
 fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
     const geometry = config.expertGeometry();
     const layout = expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer) catch return false;
-    return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), layout);
+    if (config.isDsv41() and !@import("dsv41_source.zig").shipsDspark(io, allocator, model_dir)) return false;
+    return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), layout);
 }
 
 /// An engine-default MTP under expert streaming resolves off (`expert_stream.mtpUnderStreaming`):
@@ -2861,18 +2863,29 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
 
 /// `assistant_bytes` is a resident DFlash2 drafter: it comes out of the budget the expert cache is cut from.
 pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, budget_bytes: u64, vision: bool, assistant_bytes: u64) !StreamingPlan {
-    const geometry = config.expertGeometry();
+    var geometry = config.expertGeometry();
+    if (config.drop_expert != 0 and !config.isDsv41()) return error.LaunchFlagUnsupported;
+    var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else expert_usage.load(allocator, model_dir, config.expertDropRequest()) catch |err| {
+        log.err("{s}\n", .{expert_usage.describe(err)});
+        return error.ExpertDropRefused;
+    };
+    defer if (drop) |*d| d.deinit();
+    if (drop) |*d| geometry.drop = d;
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
-    if (config.stream_mtp_head and !expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), streamed.expert_layout)) {
+    if (config.stream_mtp_head and !expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), streamed.expert_layout)) {
         log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
         return error.ExpertStreamingMtpUnsupported;
     }
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
-    split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry) +| assistant_bytes;
+    split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry) +| assistant_bytes +|
+        (if (streamed.dsv41) |c| @import("dsv41_engram.zig").cacheBytes(c.engram) else 0);
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
-    const bill = try expert_stream_mod.expertBillFor(allocator, model_dir, geometry, streamed.expert_layout);
+    const bill = expert_stream_mod.expertBillFor(allocator, model_dir, geometry, streamed.expert_layout) catch |err| {
+        if (err == error.DropEmptiesRateGroup) log.err("--drop-expert {d} would leave a rate group of some layer with no expert; use a smaller n\n", .{config.drop_expert});
+        return err;
+    };
     const per_expert = bill.expert_bytes;
     streamed.expert_shape = bill.shape;
     const picked = resolveStreamedVision(budget_bytes, &streamed, split, per_expert, vision) catch |err| {
@@ -2939,8 +2952,15 @@ pub fn fp8ExpertScratchBytes(layout: expert_stream_mod.quant.Layout, geometry: e
 
 /// The expert fill peak a streamed load and its requests bill. Flash-Next's streamed prefill peaked no higher than
 /// its resident one, the union workspace and bounce already inside the budget (engine-expert-streaming.md#budget).
+/// DeepSeek fills preallocated slabs in place: its fill stages nothing beyond the workspace and bounce the budget holds.
 pub fn billedFillPeakBytes(config: *const ModelConfig, prefill_peak_bytes: u64) u64 {
-    return if (config.longCtxGated()) 0 else prefill_peak_bytes;
+    return if (config.longCtxGated() or config.isDsv41()) 0 else prefill_peak_bytes;
+}
+
+/// What a streamed load holds beside its cache and bounce buffers while it fills. A request bill never carries the
+/// workspace: it is allocated at boot and already counted in the active memory a request reads.
+pub fn loadStagingBytes(config: *const ModelConfig, billed_fill_peak_bytes: u64, workspace_bytes: u64) u64 {
+    return billed_fill_peak_bytes +| (if (config.isDsv41()) workspace_bytes else 0);
 }
 
 /// Marks the config streamed: the fields every streamed forward and bill reads.
@@ -2952,6 +2972,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
     config.expert_bounce_bytes = plan.cache.bounce_bytes;
     config.expert_fill_peak_bytes = billedFillPeakBytes(config, plan.cache.prefill_peak_bytes);
+    config.expert_borrow_bytes = if (config.dsv41) |c| @import("dsv41_borrow.zig").plannedBytes(&c, plan.layout == .exl3_k4, plan.cache.cache_bytes) else 0;
     config.expert_vision_tower_bytes = plan.split.vision;
     config.expert_vision_encode_bytes = if (plan.vision.on) plan.vision.encode_bytes else 0;
 }
@@ -2978,7 +2999,7 @@ pub fn resolveExpertCache(
         if (mtp_resident) split.mtp else 0,
         split.vision,
         @intCast(config.expertLayerCount()),
-        @intCast(config.num_experts),
+        @intCast(config.keptExperts()),
         @intCast(config.num_experts_per_tok),
         per_expert,
         expert_stream_mod.BOUNCE_BYTES,
@@ -3147,7 +3168,7 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
 /// head rides the checkpoint (its shards are billed already), none ships, or the arch loads its head
 /// elsewhere (MiMo and GLM never call `loadMtp`).
 fn mtpSidecarBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, mtp_on: bool) u64 {
-    if (!mtp_on or config.isMimo() or config.isGlm5()) return 0;
+    if (!mtp_on or config.isMimo() or config.isGlm5() or config.isDsv41()) return 0;
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return 0;
     defer dir.close(io);
     const rel = switch (mtp_mod.resolveMtpSource(io, allocator, dir) orelse return 0) {
@@ -3864,7 +3885,7 @@ fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak
 /// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
 /// the requested context's admission bill (the warmup ends before any request allocates).
 pub fn loadRequirementBytes(config: *const ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
-    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, config.expert_fill_peak_bytes, config.expert_bounce_bytes);
+    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
     return weights_bytes +| @max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill);
 }
 
@@ -4048,6 +4069,18 @@ test "a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep th
     try testing.expectEqual(fill, billedFillPeakBytes(&glm, fill));
 }
 
+test "a streamed DeepSeek load bills its union workspace and no fill peak" {
+    const fill: u64 = 9_911 << 20;
+    const workspace: u64 = 3_525 << 20;
+    const ds = ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };
+    const qwen = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
+    const mimo = ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
+    try testing.expectEqual(@as(u64, 0), billedFillPeakBytes(&ds, fill));
+    try testing.expectEqual(workspace, loadStagingBytes(&ds, billedFillPeakBytes(&ds, fill), workspace));
+    try testing.expectEqual(@as(u64, 0), loadStagingBytes(&qwen, billedFillPeakBytes(&qwen, fill), workspace));
+    try testing.expectEqual(fill, loadStagingBytes(&mimo, billedFillPeakBytes(&mimo, fill), workspace));
+}
+
 test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {
     const gib: u64 = 1 << 30;
     const cfg = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
@@ -4107,6 +4140,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             return error.GlmKvQuantUnsupported;
         }
     }
+    if (@import("server.zig").archFlagRefusal(params.config, .{
+        .kv_quant = params.kv_quant_explicit,
+        .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
+        .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
+        .mtp_depth = depth_bounds.active.explicit(),
+        .drop_expert = params.config.drop_expert != 0,
+    })) |why| {
+        log.err("{s}\n", .{why});
+        return error.LaunchFlagUnsupported;
+    }
+    if (@import("server.zig").settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());
     const streamed = expert_stream_mod.expertStreamingEngaged(
         params.config.supportsExpertStreaming(),
@@ -4142,7 +4186,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const plan = try planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision, assistant_bytes);
         vision_cost = plan.vision;
         load_vision = plan.vision.on;
-        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
+        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer{s}\n", .{
             led.budget_bytes >> 30,
             @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.mtp_bytes)) / 1e9,
@@ -4152,6 +4196,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             @as(f64, @floatFromInt(led.bounce_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.cache_bytes)) / 1e9,
             plan.cache.slots_per_layer,
+            if (led.resident) ", every routed expert resident" else "",
         });
         applyStreamingPlan(params.config, plan, budget.bytes);
         if (params.config.expert_source_dir == null) {
@@ -4310,6 +4355,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer sch.allocator.destroy(xfm_ptr);
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
     errdefer xfm_ptr.deinit();
+    if (xfm_ptr.expert_stream) |engine| {
+        engine.borrow_publish = &params.config.expert_borrow_bytes;
+        engine.publishBorrowable();
+    }
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
@@ -4322,7 +4371,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     // An explicit launch flag outranks the per-model settings stamped on the config at BOTH construction sites.
-    const kv_cache = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
+    const kv_cache = @import("server.zig").kvCacheForLaunch(params.config, params.kv_quant_config, params.kv_quant_explicit);
     const load_ctx = model_settings.contextPick(sch.ctx_size_flag, params.config.ctx_override);
     var ctx_buf: [16]u8 = undefined;
     log.info("[kv-cache] {s} ({s}); ctx {s} ({s})\n", .{
@@ -4335,12 +4384,22 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const acceptance = generate_mod.mtpAcceptanceFor(params.config.mtp_acceptance_override);
     const greedy_tail = generate_mod.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
     // GLM has no MTP head; the server's `MTP: off` line already says so.
-    if (!params.config.isGlm5()) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
+    if (!params.config.isGlm5() and !params.config.isDsv41()) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
         if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
         mtp_acceptance_mod.name(acceptance.value),     model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
         if (greedy_tail.value) "on" else "off",        model_settings.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
-    const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5();
+    const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5() and !params.config.isDsv41();
+    if (params.config.isDsv41()) {
+        const c = &params.config.dsv41.?;
+        log.info("[dsv41] {d} bytes/token of compressed state\n", .{params.config.kvBytesPerToken()});
+        if (params.config.dsparkOn()) {
+            log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s})\n", .{ c.n_mtp, c.dspark.block, mtp.sourceName() });
+        } else {
+            const why: []const u8 = if (c.dspark.block == 0 or !@import("dsv41_source.zig").shipsDspark(sch.io, sch.allocator, params.model_dir)) "no DSpark stages in this checkpoint" else "--no-mtp or model-settings mtp:false";
+            log.info("[spec] DeepSeek-V4.1-Flash decodes with plain ticks ({s})\n", .{why});
+        }
+    }
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
@@ -4768,7 +4827,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Same predicate as the resident bill that prices this copy.
     if (mimoCoarseHeadBytes(params.config) > 0 and xfm_ptr.lm_head_coarse == null)
         xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
-    if (mtp_enabled and !params.config.isMimo() and !params.config.isGlm5() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
+    if (mtp_enabled and !params.config.isMimo() and !params.config.isGlm5() and !params.config.isDsv41() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
@@ -4823,7 +4882,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // pure read; if this ever does not run, that ask still builds.
     if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
 
-    if (xfm_ptr.expert_stream) |engine| {
+    if (xfm_ptr.expert_stream) |engine| warm: {
+        if (engine.plan.resident) break :warm;
         const slots = engine.warmSlotsPerLayer();
         const layers = expert_stream_mod.moeLayerCount(engine.geometry);
         const bytes = @as(u64, slots) * layers * engine.plan.expert_bytes;
@@ -4876,6 +4936,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         generate_mod.MtpHeadRef{ .qwen = h }
     else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
+    else if (xfm_ptr.dsv41 != null and xfm_ptr.dsv41.?.dspark != null)
+        generate_mod.MtpHeadRef{ .dsv41 = xfm_ptr }
     else if (mimo_head) |h|
         generate_mod.MtpHeadRef{ .mimo = h }
     else
@@ -4892,7 +4954,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.mtp_depth = @min(entry.mtp_depth, @min(@as(u32, @intCast(h.heads)), rows_max));
         xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, @min(@as(u32, @intCast(h.heads)), rows_max));
     }
-    if (entry.mtp != null) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
+    if (entry.mtp != null and !params.config.isDsv41()) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
         depth_bounds.floorFor(depth_bounds.active, entry.mtp_depth),
         entry.mtp_depth,
         if (depth_bounds.active.explicit()) "--mtp-min-depth/--mtp-max-depth" else "default",
@@ -4985,15 +5047,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0 and !params.config.isGlm5();
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
-        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5()) .min_span_recency else .min_span;
+        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
-        entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5();
+        entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5() or params.config.isDsv41();
         if (disk_tier) |tier| {
             entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =
-                if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5()) .min_span_recency else .oldest;
+                if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .oldest;
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isGlm5())
                 @import("glm5_prefix.zig").checkpoint_cap
+            else if (params.config.isDsv41())
+                @import("dsv41_prefix.zig").checkpoint_cap
             else if (params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
@@ -5016,7 +5080,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk.?.sweepSiblings();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
-        const cp_max = if (params.config.isGlm5()) @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max) else params.ssm_checkpoint_max;
+        const cp_max = if (params.config.isGlm5())
+            @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
+        else if (params.config.isDsv41())
+            @import("dsv41_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
+        else
+            params.ssm_checkpoint_max;
         entry.ssm_checkpoint_max = cp_max;
         // The cache re-applies the cap after a replace-path merge; without this
         // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.
@@ -5041,7 +5110,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         expertStreamingGateBytes(
             streaming_resident_bytes.?,
             params.config.expert_cache_bytes,
-            params.config.expert_fill_peak_bytes,
+            loadStagingBytes(params.config, params.config.expert_fill_peak_bytes, params.config.expert_workspace_bytes),
             params.config.expert_bounce_bytes,
         )
     else
@@ -6083,6 +6152,10 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // generated this turn. The cache reflects exactly this state — Generator
     // forwarded each emitted token into slot.cache as it was sampled.
     const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    if (slot.model.transformer) |t| if (t.dsv41 != null) @import("dsv41_prefix.zig").markRows(&slot.cache) catch |err| {
+        log.warn("[hot-cache] DeepSeek row marker failed: {s} — not committed\n", .{@errorName(err)});
+        return;
+    };
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
@@ -6266,6 +6339,11 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         log.debug("[hot-cache] cancelled prefill carried no stride checkpoints — a hybrid entry would restore as a miss; not committed\n", .{});
         return;
     }
+    const is_dsv41 = if (slot.model.transformer) |t| t.dsv41 != null else false;
+    if (is_dsv41 and salvage.checkpoints.len == 0) {
+        log.debug("[hot-cache] cancelled prefill carried no checkpoints — a DeepSeek entry would restore as a miss; not committed\n", .{});
+        return;
+    }
     // The sink's `forwarded` is the authoritative length — `cache.step`
     // only advances when Generator init completes, so it reads 0 on every
     // aborted prefill.
@@ -6274,6 +6352,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         return;
     };
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
+    if (is_dsv41) @import("dsv41_prefix.zig").markRows(&slot.cache) catch return;
     // Pass the media boundary RAW: when the cancelled prefill forwarded less
     // than the media position, the cache re-keys the pure-text entry to the
     // null vision key (a kept pixel key with no boundary is the
@@ -6411,7 +6490,7 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
     const gen = if (slot.legacy_gen) |*g| g else return;
     const mode = specTickMode(
         slot.enable_mtp,
-        gen.mtp != null,
+        gen.mtp != null or gen.dspark,
         slot.enable_drafter,
         gen.dflash != null,
     );
@@ -6754,6 +6833,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
     // A chunk record covers a prefix, so it may claim only the media blocks inside it.
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, abs_kv_pos);
     if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s);
+    if (slot.model.transformer.?.dsv41 != null) return hc.writeThroughDsv41(&slot.cache, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s);
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     hc.writeThroughHybrid(
@@ -6793,6 +6873,8 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     if (d.writer == null) return false;
+    // A DeepSeek restore point is a full copy of the state: it goes to SSD however short the new span.
+    if (slot.model.transformer) |t| if (t.dsv41 != null) return true;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
@@ -7031,7 +7113,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.enable_drafter,
         slot.dflash != null,
     );
+    // deepseek_v41's head is DSpark: no head cache, no hidden capture; the model holds its own state.
     const use_mtp = wiring.use_mtp;
+    const use_dspark = use_mtp and if (slot.mtp) |h| h == .dsv41 else false;
+    const use_head_mtp = use_mtp and !use_dspark;
     const use_dflash = wiring.use_dflash or glmNativeDflashArmed(slot.model.config.?.isGlm5(), slot.enable_drafter, slot.dflash != null, slot.sampling, slot.logprobs_n);
     log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{
         use_mtp,             use_dflash,
@@ -7081,7 +7166,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 null;
             errdefer if (dfl_target) |*dc| dc.deinit();
             var dfl_base: usize = 0;
-            var mtp_target: ?generate_mod.MtpCacheRef = if (use_mtp and slot.mtp != null)
+            var mtp_target: ?generate_mod.MtpCacheRef = if (use_head_mtp and slot.mtp != null)
                 slot.mtp.?.makeCache(slot.allocator) catch null
             else
                 null;
@@ -7093,7 +7178,20 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
             // releases it on every path that ends the slot.
             const dfl_restore: ?prefix_cache_mod.DflashTarget = if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null;
-            const lookup = (if (slot.glm5_request) |*request| hc.lookupAndRestoreGlm(
+            const lookup_sw = io_util.Stopwatch.init(sch.io);
+            const lookup = (if (xfm_ptr.dsv41) |dsv| hc.lookupAndRestoreDsv41(
+                &slot.cache,
+                &slot.moe_seq_offset,
+                dsv,
+                xfm_ptr.s,
+                slot.full_prompt,
+                slot.has_tools,
+                slot.vision_key,
+                slot.media_start,
+                slot.media_chain,
+                @intFromPtr(slot),
+                slot.skip_prefix_cache,
+            ) else if (slot.glm5_request) |*request| hc.lookupAndRestoreGlm(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 request,
@@ -7124,6 +7222,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
+            if (xfm_ptr.dsv41 != null) log.info("[dsv41-prefix] reused {d} of {d} prompt tokens from {s}, prefilling {d}; lookup and restore {d} ms\n", .{
+                lookup.matched, slot.full_prompt.len, if (lookup.matched == 0) "nothing" else if (hc.last_restored_disk_id != null) "SSD" else "RAM", slot.full_prompt.len - lookup.matched, lookup_sw.read() / std.time.ns_per_ms,
+            });
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
@@ -7356,10 +7457,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .dflash_block_size = slot.drafter_block_size,
             // Use the resolved thinking mode and normalize the M5/block-16
             // calibration to this machine's effective assistant width.
-            .mtp_enabled = use_mtp,
+            .mtp_enabled = use_head_mtp,
             .mtp_acceptance = generate_mod.mtpAcceptanceFor(slot.model.config.?.mtp_acceptance_override).value,
             .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override).value,
-            .mtp = if (use_mtp) slot.mtp else null,
+            .mtp = if (use_head_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,
             .mtp_depth = slot.mtp_depth,
@@ -7369,7 +7470,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // exactly prompt_len with t1 NOT in cache. Generator.next's
             // transition shim sync-forwards [t1] on the first decode call.
             // DFlash/MTP init paths already skip preforward unconditionally.
-            .skip_lazy_preforward = !use_mtp and !use_dflash,
+            .skip_lazy_preforward = !use_head_mtp and !use_dflash,
+            .dspark_enabled = use_dspark,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
@@ -7960,10 +8062,20 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // generators handle the disabled fallback internally.
     const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
         slot.enable_mtp,
-        gen.mtp != null,
+        gen.mtp != null or gen.dspark,
         slot.enable_drafter,
         gen.dflash != null,
     );
+    if (tick_mode == .mtp and gen.dspark) {
+        const result = try gen.nextDspark(slot.allocator);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
+        }
+        defer slot.allocator.free(result.?.tokens);
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
+        return;
+    }
     if (tick_mode == .mtp) {
         gen.mtp_group_cap = 0;
         const result = try gen.nextMtp(slot.allocator);

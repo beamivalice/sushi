@@ -25,6 +25,8 @@ const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
 const glm5_forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
+const dsv41_model = @import("dsv41_model.zig");
+const dsv41_prefix = @import("dsv41_prefix.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -437,11 +439,12 @@ const Entry = struct {
     donated_bytes: u64 = 0,
 };
 
-/// Where a hybrid restore puts its recurrent state: the slot's SSM entries, or a GLM request.
+/// Where a hybrid restore puts its recurrent state: the slot's SSM entries, a GLM request, or the DeepSeek model's request state.
 const Recurrent = union(enum) {
     none,
     ssm: []SSMCacheEntry,
     glm: *glm5_forward.Request,
+    dsv41: *dsv41_model.Model,
 
     fn hybrid(self: Recurrent) bool {
         return self != .none;
@@ -454,6 +457,7 @@ const Recurrent = union(enum) {
             .none => {},
             .ssm => |entries| HotPrefixCache.resetSsmEntries(entries),
             .glm => |request| request.reset(),
+            .dsv41 => |m| dsv41_model.resetState(m),
         }
     }
 };
@@ -880,6 +884,8 @@ pub const HotPrefixCache = struct {
         // rebuilding that state. Off until dsv4 state rides the ssm-entry
         // machinery (needsSsmEntries class).
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return false;
+        // deepseek_v41's request state is a checkpoint (`dsv41_prefix`): without them nothing restores.
+        if (config.isDsv41()) return enable_ssm_checkpoints;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -1484,6 +1490,24 @@ pub const HotPrefixCache = struct {
         return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .glm = request }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, null, slot_id, skip);
     }
 
+    /// A DeepSeek-V4.1 request restores its whole state from the entry's checkpoint into the model.
+    pub fn lookupAndRestoreDsv41(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        model: *dsv41_model.Model,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        media_chain: []const MediaSpan,
+        slot_id: ?usize,
+        skip: bool,
+    ) !LookupResult {
+        return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .dsv41 = model }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, null, null, slot_id, skip);
+    }
+
     /// An unreadable or corrupt file fails the same way on every later lookup, so its entry dies;
     /// a coverage miss (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays.
     fn poisonUnreadable(d: *kv_disk_cache.DiskTier, idx: usize, err: anyerror) void {
@@ -1621,6 +1645,33 @@ pub const HotPrefixCache = struct {
                     return res;
                 }
                 break :disk;
+            }
+            if (rec == .dsv41) {
+                const ram_eff: usize = if (match) |m| blk: {
+                    const cps = self.entries.items[m.idx].ssm_checkpoints orelse break :blk 0;
+                    const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
+                    break :blk cp.pos;
+                } else 0;
+                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits) orelse break :disk;
+                if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
+                const sw = io_util.Stopwatch.init(d.io);
+                var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, dsv41_prefix.snapshotLayers(rec.dsv41), s) catch |err| {
+                    log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    poisonUnreadable(d, hm.idx, err);
+                    target_cache.truncate(0, s) catch {};
+                    break :disk;
+                };
+                defer cp.deinit(d.allocator);
+                dsv41_prefix.restore(rec.dsv41, &cp, prompt_ids) catch |err| {
+                    log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    target_cache.truncate(0, s) catch {};
+                    rec.reset();
+                    break :disk;
+                };
+                target_moe_seq_offset.* = hm.cp;
+                self.last_restored_disk_id = d.entries.items[hm.idx].id;
+                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
+                return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
             }
             const disk_limit: u32 = @intCast(prompt_ids.len);
             // A ringed cache restores only at a ring file: the chunks hold its other layers alone.
@@ -1828,6 +1879,13 @@ pub const HotPrefixCache = struct {
             effective_matched = 0;
             if (e.glm) |*rows| if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, @min(restore_cap, rows.len))) |cp| {
                 try glm5_prefix.restore(rec.glm, rows, cp);
+                effective_matched = cp.pos;
+            };
+            if (effective_matched == 0) rec.reset();
+        } else if (rec == .dsv41) {
+            effective_matched = 0;
+            if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, restore_cap)) |cp| {
+                try dsv41_prefix.restore(rec.dsv41, cp, prompt_ids);
                 effective_matched = cp.pos;
             };
             if (effective_matched == 0) rec.reset();
@@ -3192,6 +3250,29 @@ pub const HotPrefixCache = struct {
         if (floor) d.settleCheckpoints(d.last_store_id, cps);
     }
 
+    /// DeepSeek's prefill write-through: the request's restore points so far go to the SSD tier and every one of them
+    /// leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
+    /// commit returns. Below the tier's floor nothing is written and the points stay for the commit.
+    pub fn writeThroughDsv41(self: *HotPrefixCache, cache: *transformer_mod.KVCache, prompt: []const u32, has_tools: bool, media: MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream) void {
+        if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+        var pending = false;
+        for (cps) |*cp| pending = pending or !cp.isReleased();
+        if (!pending) return;
+        dsv41_prefix.markRows(cache) catch |err| {
+            log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
+            return;
+        };
+        var bytes: u64 = 0;
+        for (cps) |*cp| if (!cp.isReleased()) {
+            bytes += ssmCheckpointBytes(cp);
+        };
+        var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+        self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
+        for (cps) |*cp| cp.release();
+        // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
+        log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, prefill held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
+    }
+
     /// Write the pending record whole and release it: its rows may be a finished request's own
     /// buffers, which nothing could read again to resume a partial entry.
     fn flushPendingRecord(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, s: mlx.mlx_stream) void {
@@ -4255,6 +4336,13 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     // Qwen3.5-style full_attention_interval-marks-hybrid: same gate.
     cfg.has_hybrid_layers = false;
     cfg.full_attention_interval = 4;
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
+}
+
+test "HotPrefixCache: shouldUse admits deepseek_v41 only with checkpoints (its state restores from them)" {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "deepseek_v41";
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
 }
@@ -13798,4 +13886,542 @@ test "GLM image turn persists its whole turn, and a foreign key restarts like a 
     defer _ = mlx.mlx_array_free(want);
     try glm5_forward.expectArrayBits(want, got);
     try glm5_prefix.expectSameLogicalState(&cold, &warm);
+}
+
+const Dsv41Net = struct {
+    m: *dsv41_model.Model,
+    ids: []u32,
+    fx: model_mod.Weights,
+
+    fn load(self: *Dsv41Net) !void {
+        const dir = try dsv41_model.fixtureDir();
+        self.fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+        errdefer self.fx.deinit();
+        var sc = @import("dsv41_scope.zig").Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        self.ids = try dsv41_model.tokens(&sc, &self.fx);
+        errdefer testing.allocator.free(self.ids);
+        self.m = try dsv41_model.tinyModel(dir, .{ .act = .bfloat16, .dspark = true }, mlx.gpuStream());
+    }
+
+    fn deinit(self: *Dsv41Net) void {
+        self.m.deinit();
+        testing.allocator.free(self.ids);
+        self.fx.deinit();
+    }
+
+    /// Prefills `tokens` in `chunks` from the request's current position, a checkpoint after each listed chunk.
+    fn prefill(self: *Dsv41Net, tokens: []const u32, chunks: []const usize, at_start: usize, checkpoints: []const usize, cps: *std.ArrayList(SSMCheckpoint)) !void {
+        var at = at_start;
+        for (chunks, 0..) |n, i| {
+            _ = mlx.mlx_array_free(try dsv41_model.extend(self.m, tokens[at .. at + n], .last));
+            at += n;
+            if (std.mem.indexOfScalar(usize, checkpoints, i) != null) try cps.append(testing.allocator, try dsv41_prefix.capture(testing.allocator, self.m, at));
+        }
+    }
+};
+
+fn dsv41Lookup(hc: *HotPrefixCache, net: *Dsv41Net, prompt: []const u32) !LookupResult {
+    return dsv41LookupMedia(hc, net, prompt, 0, null);
+}
+
+fn dsv41LookupMedia(hc: *HotPrefixCache, net: *Dsv41Net, prompt: []const u32, vision_key: u64, media_start: ?usize) !LookupResult {
+    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    var off: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &off, net.m, mlx.gpuStream(), prompt, false, vision_key, media_start, &.{}, null, false);
+    try testing.expectEqual(res.matched, target.step);
+    try testing.expectEqual(res.matched, (try dsv41_model.ensureState(net.m)).n);
+    return res;
+}
+
+test "DeepSeek hot cache: an image prompt restores whole for its own images and only up to the image for others (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    const prompt = net.ids[0..30];
+    var hc = HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+
+    // The prompt holds an image from position 15; checkpoints sit at 12 (before it) and 20 (inside its span).
+    dsv41_model.resetState(net.m);
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    try net.prefill(prompt, &.{ 12, 8, 10 }, 0, &.{ 0, 1 }, &cps);
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    cache.step = prompt.len;
+    defer cache.deinit();
+    const owned = try cps.toOwnedSlice(testing.allocator);
+    const own_key: u64 = 0xdee5eec;
+    try testing.expectEqual(CommitStatus{ .ok = prompt.len }, try hc.commitWithMediaState(&cache, prompt, false, own_key, 0, 15, owned, null, null, prompt.len));
+
+    // Another image under the same ids: equal ids do not make equal rows, so only the text before it is shared.
+    const other = try dsv41LookupMedia(&hc, &net, prompt, own_key ^ 1, 15);
+    try testing.expectEqual(@as(usize, 12), other.matched);
+    // The same image shares the checkpoint inside its span.
+    const same = try dsv41LookupMedia(&hc, &net, prompt, own_key, 15);
+    try testing.expectEqual(@as(usize, 20), same.matched);
+    // A text prompt with the same ids is no image prompt either.
+    const text = try dsv41LookupMedia(&hc, &net, prompt, 0, null);
+    try testing.expectEqual(@as(usize, 12), text.matched);
+}
+
+test "DeepSeek hot cache restores the highest checkpoint under the match and continues like a cold prefill (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    const first = net.ids[0..30];
+    var hc = HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+
+    // Turn one: chunks of 12, 8 and 10 with a checkpoint after the first two (positions 12 and 20).
+    dsv41_model.resetState(net.m);
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    try net.prefill(first, &.{ 12, 8, 10 }, 0, &.{ 0, 1 }, &cps);
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    cache.step = first.len;
+    defer cache.deinit();
+    const owned = try cps.toOwnedSlice(testing.allocator);
+    try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitWithState(&cache, first, false, 0, owned, null, null));
+    const e = &hc.entries.items[0];
+    var billed: u64 = 0;
+    for (e.ssm_checkpoints.?) |*cp| billed += ssmCheckpointBytes(cp);
+    try testing.expect(billed > 0);
+    try testing.expectEqual(billed, e.kv_bytes);
+    try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
+
+    // Turn two shares the first 25 tokens and goes its own way: it restores at 20 and runs the same chunks as cold.
+    var next: [40]u32 = undefined;
+    @memcpy(next[0..25], first[0..25]);
+    for (next[25..], 25..) |*t, i| t.* = (net.ids[i] + 1) % 90;
+    const res = try dsv41Lookup(&hc, &net, &next);
+    try testing.expectEqual(@as(usize, 20), res.matched);
+    const warm = try dsv41_model.extend(net.m, next[20..], .all);
+    defer _ = mlx.mlx_array_free(warm);
+    var warm_cp = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
+    defer warm_cp.deinit(testing.allocator);
+
+    dsv41_model.resetState(net.m);
+    var cold_cps: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (cold_cps.items) |*cp| cp.deinit(testing.allocator);
+        cold_cps.deinit(testing.allocator);
+    }
+    try net.prefill(&next, &.{ 12, 8 }, 0, &.{}, &cold_cps);
+    const cold = try dsv41_model.extend(net.m, next[20..], .all);
+    defer _ = mlx.mlx_array_free(cold);
+    var cold_cp = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
+    defer cold_cp.deinit(testing.allocator);
+    try glm5_forward.expectArrayBits(cold, warm);
+    for (cold_cp.layers, warm_cp.layers) |a, b| {
+        for ([_][2]mlx.mlx_array{ .{ a.conv_state, b.conv_state }, .{ a.ssm_state, b.ssm_state }, .{ a.aux_state, b.aux_state }, .{ a.qsa_pooled, b.qsa_pooled } }) |pair| {
+            try testing.expectEqual(pair[0].ctx == null, pair[1].ctx == null);
+            if (pair[0].ctx != null and mlx.mlx_array_size(pair[0]) > 0) try glm5_forward.expectArrayBits(pair[0], pair[1]);
+        }
+    }
+
+    // A prompt that shares nothing restores nothing and leaves the model's state empty.
+    var other: [20]u32 = undefined;
+    for (&other) |*t| t.* = 90;
+    try testing.expectEqual(@as(usize, 0), (try dsv41Lookup(&hc, &net, &other)).matched);
+    // A prompt that diverges before the first checkpoint cannot use any.
+    var early: [20]u32 = undefined;
+    @memcpy(early[0..5], first[0..5]);
+    for (early[5..]) |*t| t.* = 91;
+    try testing.expectEqual(@as(usize, 0), (try dsv41Lookup(&hc, &net, &early)).matched);
+}
+
+test "DeepSeek hot cache bills the held checkpoints in its residency and gives them back on eviction (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var hc = HotPrefixCache.init(testing.allocator, 1);
+    defer hc.deinit();
+    var billed: [2]u64 = undefined;
+    for (&billed, 0..) |*b, turn| {
+        var prompt: [24]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = (net.ids[i] + @as(u32, @intCast(turn)) * 7) % 90;
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(&prompt, &.{ 16, 8 }, 0, &.{ 0, 1 }, &cps);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = prompt.len;
+        _ = try hc.commitWithState(&cache, &prompt, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+        var held: u64 = 0;
+        for (hc.entries.items) |*e| for (e.ssm_checkpoints.?) |*cp| {
+            held += ssmCheckpointBytes(cp);
+        };
+        b.* = held;
+        try testing.expect(held > 0);
+        try testing.expectEqual(held, hc.residentBytes());
+    }
+    // The second turn shares nothing with the first, so the one-entry cache evicted it: only the second is billed.
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqual(billed[1], hc.residentBytes());
+}
+
+test "DeepSeek hot cache over its byte budget keeps the entry with fewer checkpoints, billed exactly (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    dsv41_model.resetState(net.m);
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    try net.prefill(net.ids[0..24], &.{ 8, 8, 8 }, 0, &.{ 0, 1, 2 }, &cps);
+    // The tiny state is far shorter than the commit floor (256 tokens): relabel the positions, as the budget only reads bytes.
+    for (cps.items, 0..) |*cp, i| cp.pos = 800 * (i + 1);
+    const one = ssmCheckpointBytes(&cps.items[0]);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, one * 2 + one / 2);
+    defer hc.deinit();
+    hc.cp_thin = .min_span_recency;
+    var tokens: [2400]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = net.ids[i % net.ids.len];
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+    cache.step = tokens.len;
+    _ = try hc.commitWithState(&cache, &tokens, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expect(hc.residentBytes() <= one * 2 + one / 2);
+    const e = &hc.entries.items[0];
+    var sum: u64 = 0;
+    for (e.ssm_checkpoints.?) |*cp| sum += ssmCheckpointBytes(cp);
+    try testing.expectEqual(sum, e.kv_bytes);
+    try testing.expectEqual(e.kv_bytes, hc.residentBytes());
+}
+
+fn dsv41SsdOnlyCache(io: std.Io, base: []const u8, fp: []const u8) !HotPrefixCache {
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    errdefer hc.deinit();
+    hc.ssd_first = true;
+    hc.hybrid = true;
+    hc.cp_thin = .min_span_recency;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.cp_thin = .min_span_recency;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+    return hc;
+}
+
+fn cloneCheckpointForTest(src: *const SSMCheckpoint) !SSMCheckpoint {
+    const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, src.layers.len);
+    for (src.layers, layers) |l, *out| out.* = .{
+        .conv_state = try transformer_mod.materializedOwnedCopy(mlx.gpuStream(), l.conv_state),
+        .ssm_state = try transformer_mod.materializedOwnedCopy(mlx.gpuStream(), l.ssm_state),
+        .initialized = true,
+    };
+    return .{ .pos = src.pos, .layers = layers };
+}
+
+fn expectCheckpointBits(want: *const SSMCheckpoint, got: *const SSMCheckpoint) !void {
+    try testing.expectEqual(want.pos, got.pos);
+    try testing.expectEqual(want.layers.len, got.layers.len);
+    for (want.layers, got.layers) |a, b| {
+        for ([_][2]mlx.mlx_array{ .{ a.conv_state, b.conv_state }, .{ a.ssm_state, b.ssm_state } }) |pair| {
+            try testing.expectEqualSlices(c_int, mlx.getShape(pair[0]), mlx.getShape(pair[1]));
+            try testing.expectEqual(mlx.mlx_array_dtype(pair[0]), mlx.mlx_array_dtype(pair[1]));
+            try glm5_forward.expectArrayBits(pair[0], pair[1]);
+        }
+    }
+}
+
+fn dsv41LongPrompt(net: *const Dsv41Net, buf: []u32, shared_with: ?[]const u32, shared: usize) []const u32 {
+    for (buf, 0..) |*t, i| t.* = if (shared_with != null and i < shared) shared_with.?[i] else net.ids[(i * 5 + 3) % net.ids.len];
+    return buf;
+}
+
+test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same bytes, and a restart restores it like a cold prefill (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [700]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    var next_buf: [760]u32 = undefined;
+    for (&next_buf, 0..) |*t, i| t.* = if (i < 650) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    var want_512: SSMCheckpoint = undefined;
+    {
+        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-ssd");
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(first, &.{ 256, 256, 188 }, 0, &.{ 0, 1 }, &cps);
+        // the in-RAM state at 512, kept for the byte comparison
+        want_512 = try cloneCheckpointForTest(&cps.items[1]);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        const status = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, status);
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+    defer want_512.deinit(testing.allocator);
+
+    // A fresh tier on the same directory: nothing in RAM, the entry only on disk.
+    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-ssd");
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
+    try testing.expectEqual(@as(usize, 512), res.matched);
+    try testing.expect(hc.last_restored_disk_id != null);
+    try testing.expectEqual(@as(usize, 512), target.step);
+    try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
+    var got_512 = try dsv41_prefix.capture(testing.allocator, net.m, 512);
+    defer got_512.deinit(testing.allocator);
+    try expectCheckpointBits(&want_512, &got_512);
+
+    const warm = try dsv41_model.extend(net.m, next[512..], .all);
+    defer _ = mlx.mlx_array_free(warm);
+    dsv41_model.resetState(net.m);
+    var cold_cps: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (cold_cps.items) |*cp| cp.deinit(testing.allocator);
+        cold_cps.deinit(testing.allocator);
+    }
+    try net.prefill(next, &.{ 256, 256 }, 0, &.{}, &cold_cps);
+    const cold = try dsv41_model.extend(net.m, next[512..], .all);
+    defer _ = mlx.mlx_array_free(cold);
+    try glm5_forward.expectArrayBits(cold, warm);
+}
+
+test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as they are taken and restore the same bytes (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [700]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    var next_buf: [760]u32 = undefined;
+    for (&next_buf, 0..) |*t, i| t.* = if (i < 650) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    var want_512: SSMCheckpoint = undefined;
+    {
+        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-wt");
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        var at: usize = 0;
+        for ([_]usize{ 512, 188 }, 0..) |n, i| {
+            _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at .. at + n], .last));
+            at += n;
+            if (i != 0) continue;
+            // The state at 512 as an owned copy, kept for the byte comparison.
+            want_512 = try dsv41_prefix.capture(testing.allocator, net.m, at);
+            _ = mlx.mlx_synchronize(s);
+            var before: usize = 0;
+            _ = mlx.mlx_get_active_memory(&before);
+            try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
+            cache.step = at;
+            hc.writeThroughDsv41(&cache, first[0..at], false, .{}, cps.items, s);
+            try testing.expect(cps.items[0].isReleased());
+            _ = mlx.mlx_synchronize(s);
+            var after: usize = 0;
+            _ = mlx.mlx_get_active_memory(&after);
+            // What the prefill still holds is the tier's row markers (a byte a token for keys and for values), not the state.
+            try testing.expect(after <= before + 2 * at);
+        }
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+    defer want_512.deinit(testing.allocator);
+
+    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-wt");
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
+    try testing.expectEqual(@as(usize, 512), res.matched);
+    var got_512 = try dsv41_prefix.capture(testing.allocator, net.m, 512);
+    defer got_512.deinit(testing.allocator);
+    try expectCheckpointBits(&want_512, &got_512);
+
+    const warm = try dsv41_model.extend(net.m, next[512..], .all);
+    defer _ = mlx.mlx_array_free(warm);
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[0..512], .last));
+    const cold = try dsv41_model.extend(net.m, next[512..], .all);
+    defer _ = mlx.mlx_array_free(cold);
+    try glm5_forward.expectArrayBits(cold, warm);
+}
+
+test "DeepSeek SSD tier: the namespace names the layout, and another layout's entries are never read (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const dir = try dsv41_model.fixtureDir();
+    var cfg = try model_mod.parseConfig(io, testing.allocator, dir);
+    defer cfg.deinit(testing.allocator);
+    cfg.stream_mtp_head = true;
+    const tag = cfg.cacheLayoutNamespace() orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(dsv41_prefix.namespaceTag(cfg.dsparkOn()), tag);
+    try testing.expect(!std.mem.eql(u8, dsv41_prefix.namespaceTag(true), dsv41_prefix.namespaceTag(false)));
+    const a = try kv_disk_cache.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(true));
+    defer testing.allocator.free(a);
+    const b = try kv_disk_cache.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(false));
+    defer testing.allocator.free(b);
+    try testing.expect(!std.mem.eql(u8, a, b));
+
+    // An entry stored under one fingerprint is a miss under the other.
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [600]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    {
+        var hc = try dsv41SsdOnlyCache(io, base, a);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+    }
+    var next_buf: [620]u32 = undefined;
+    @memcpy(next_buf[0..600], first);
+    for (next_buf[600..]) |*t| t.* = 91;
+    for ([_]struct { fp: []const u8, want: usize }{ .{ .fp = a, .want = 512 }, .{ .fp = b, .want = 0 } }) |arm| {
+        var hc = try dsv41SsdOnlyCache(io, base, arm.fp);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
+        try testing.expectEqual(arm.want, res.matched);
+    }
+}
+
+test "DeepSeek with both tiers: the RAM entry serves the active session and, once it is gone, the SSD entry does (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [600]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    var next_buf: [620]u32 = undefined;
+    @memcpy(next_buf[0..600], first);
+    for (next_buf[600..]) |*t| t.* = 91;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.hybrid = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "dsv41-both", 0, 128);
+    hc.disk.?.enableBackgroundWriter();
+    dsv41_model.resetState(net.m);
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+    cache.step = first.len;
+    try dsv41_prefix.markRows(&cache);
+    try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+
+    const ram = try dsv41Lookup(&hc, &net, &next_buf);
+    try testing.expectEqual(@as(usize, 512), ram.matched);
+    try testing.expect(hc.last_restored_disk_id == null);
+    // Dropping the RAM entry leaves the disk copy, which restores the same point.
+    hc.evictAt(0, "test");
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    const disk = try dsv41Lookup(&hc, &net, &next_buf);
+    try testing.expectEqual(@as(usize, 512), disk.matched);
+    try testing.expect(hc.last_restored_disk_id != null);
+}
+
+test "DeepSeek SSD tier under the engine's default KV scheme, which every slot cache carries: commit, restart, restore (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [600]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    var next_buf: [620]u32 = undefined;
+    @memcpy(next_buf[0..600], first);
+    for (next_buf[600..]) |*t| t.* = 91;
+    const kv = kv_quant.KVQuantConfig.engine_default;
+    try testing.expect(kv.scheme != .off);
+    {
+        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-kv8");
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
+        defer cache.deinit();
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-kv8");
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
+    try testing.expectEqual(@as(usize, 512), res.matched);
+    try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
 }

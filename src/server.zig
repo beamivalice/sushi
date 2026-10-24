@@ -13,11 +13,15 @@ const token_mask = @import("token_mask.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const fp8_block = @import("fp8_block.zig");
 const model_mod = @import("model.zig");
+const dsv41_config = @import("dsv41_config.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const vision_common = @import("vision_common.zig");
 const mimo_vision = @import("mimo_vision.zig");
 const glm5_vision = @import("glm5_vision.zig");
+const dsv41_vision = @import("dsv41_vision.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
+const dsv41_prefix = @import("dsv41_prefix.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -569,7 +573,7 @@ fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
 /// Will a request that omits `enable_mtp` run the head on this model? The load-time bills
 /// (`sessionBytesPerToken`) price its KV whenever it does, the request-time bill per request.
 fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
-    if (config.isGlm5()) return false;
+    if (config.isGlm5() or config.isDsv41()) return false;
     // A loaded DFlash2 drafter outranks the head: the default round never builds its cache.
     if (config.dflash_loaded) return false;
     const choice = mtpChoiceFor(config);
@@ -671,9 +675,15 @@ var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
 
 /// THIS model's KV scheme and its source, the one answer the load log, `/props` and every bill read.
 pub fn kvCacheFor(config: *const model_mod.ModelConfig) transformer_mod.KvCacheChoice {
-    if (global_scheduler) |sch| return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, sch.kv_quant_config, sch.kv_quant_explicit);
+    if (global_scheduler) |sch| return kvCacheForLaunch(config, sch.kv_quant_config, sch.kv_quant_explicit);
     const launch = configured_kv_quant orelse transformer_mod.KVQuantConfig.engine_default;
-    return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, launch, configured_kv_quant != null);
+    return kvCacheForLaunch(config, launch, configured_kv_quant != null);
+}
+
+/// `kvCacheFor` under a given launch choice. deepseek_v41 keeps its own compressed state; `--kv-quant` has nothing to quantize.
+pub fn kvCacheForLaunch(config: *const model_mod.ModelConfig, launch: transformer_mod.KVQuantConfig, explicit: bool) transformer_mod.KvCacheChoice {
+    if (config.isDsv41()) return .{ .config = .dense, .source = .default };
+    return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, launch, explicit);
 }
 
 pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
@@ -1873,6 +1883,8 @@ pub fn serve(
     // Asked by the prefill loop: the width of the next chunk, re-priced at every boundary.
     scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
     defer scheduler_mod.prefill_chunk_adapt = null;
+    dsv41_borrow.headroom_fn = &dsv41Headroom;
+    defer dsv41_borrow.headroom_fn = null;
     scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
     defer scheduler_mod.prefill_chunk_widen_ok = null;
     // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
@@ -3165,10 +3177,10 @@ fn expertStreamingPlannedKvBytes(config: *const model_mod.ModelConfig) u64 {
 fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
     const seq: u64 = expertStreamingPlannedSeq(config);
     const explicit = explicitPrefillChunk();
-    // A request picks its own rung against free memory, so the load must only prove the ladder's floor fits;
-    // pricing the widest rung refused every streamed load on a small Mac.
+    // A request picks its own rung against free memory, and an unpinned arch's load-time pin is memory-sized after
+    // this check, so the load must only prove the ladder's floor fits.
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
-    const chunk: u64 = if (explicit > 0) (perRequestFloorWidth(config) orelse explicit) else if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else if (perRequestPrefillChunkEnabled(config)) floor else 8192;
+    const chunk: u64 = if (explicit > 0) (perRequestFloorWidth(config) orelse explicit) else if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else floor;
     return prefillNeededAtChunk(config, @max(seq, chunk), 2048, defaultKvBits(config), chunk, .{}) -| config.expert_fill_peak_bytes;
 }
 
@@ -3196,15 +3208,30 @@ pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_byte
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const ceiling = currentGpuMemoryCeiling(config, active_mem);
-    if (!expertStreamingLoadFits(
+    if (!expertStreamingConfigFits(config, ceiling, active_mem, resident_bytes)) {
+        log.err("the streamed load bills {d} MB (active {d}, resident {d}, cache {d}, workspace and bounce {d}, serving {d}) against {d} MB; lower --ssd-budget-gb\n", .{
+            (active_mem + resident_bytes + config.expert_cache_bytes + config.expert_bounce_bytes + scheduler_mod.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes) + @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes)) >> 20,
+            active_mem >> 20,
+            resident_bytes >> 20,
+            config.expert_cache_bytes >> 20,
+            (config.expert_bounce_bytes + scheduler_mod.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes)) >> 20,
+            @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes) >> 20,
+            ceiling >> 20,
+        });
+        return error.ExpertCacheDoesNotFit;
+    }
+}
+
+fn expertStreamingConfigFits(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64, resident_bytes: u64) bool {
+    return expertStreamingLoadFits(
         ceiling,
         active_mem,
         resident_bytes,
         config.expert_cache_bytes,
         config.expert_bounce_bytes,
-        config.expert_fill_peak_bytes,
+        scheduler_mod.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes),
         @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes),
-    )) return error.ExpertCacheDoesNotFit;
+    );
 }
 
 pub fn streamingStubMarker(architecture: []const u8, geometry_ok: bool, index_complete: bool) bool {
@@ -3328,6 +3355,7 @@ pub fn prefillTransientReserveAtKv(
     kv_len: u64,
 ) u64 {
     const seq: u64 = @max(kv_len, chunk);
+    if (config.dsv41) |c| return c.transientBytes(chunk, seq) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
     if (config.isGlm5()) return glm5TransientBytes(config, seq, chunk, kv_bits);
     return prefillMemoryNeeded(
         seq,
@@ -3503,7 +3531,8 @@ pub fn resolvePrefillChunk(
     ctx_kv_bytes: u64,
     hot_cache_ask: u64,
 ) u32 {
-    if (config.isGlm5()) return glmPrefillChunk(config, kv_bits, ceiling, active_mem);
+    if (config.isGlm5()) return contextNeutralChunk(config, kv_bits, ceiling, active_mem, @import("glm5_forward.zig").prefill_chunk);
+    if (config.isDsv41()) return contextNeutralChunk(config, kv_bits, ceiling, active_mem, dsv41_config.prefill_width);
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
@@ -3514,20 +3543,20 @@ pub fn resolvePrefillChunk(
     return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
 }
 
-/// GLM's widest rung, at most its numerics width, that advertises the same auto context as the
-/// narrowest: the bill `max_safe_context` and admission charge decides, not a share of free memory.
-fn glmPrefillChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64) u32 {
+/// The widest rung, at most `width` (the arch's numerics width), that advertises the same auto context as the
+/// narrowest: the bill `max_safe_context` and admission charge decides, not a share of free memory. GLM and DeepSeek,
+/// whose per-token state is small beside their prefill transient.
+fn contextNeutralChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, width: u32) u32 {
     const narrowest = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
-    const floor = glmAdvertisedContextAt(config, kv_bits, ceiling, active_mem, narrowest);
+    const floor = advertisedContextAt(config, kv_bits, ceiling, active_mem, narrowest);
     for (PREFILL_CHUNK_LADDER) |chunk| {
-        // A rung wider than this would make output depend on whether an assistant loaded.
-        if (chunk > @import("glm5_forward.zig").prefill_chunk) continue;
-        if (glmAdvertisedContextAt(config, kv_bits, ceiling, active_mem, chunk) >= floor) return chunk;
+        if (chunk > width) continue;
+        if (advertisedContextAt(config, kv_bits, ceiling, active_mem, chunk) >= floor) return chunk;
     }
     return narrowest;
 }
 
-fn glmAdvertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
+fn advertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
     return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap());
 }
 
@@ -3764,6 +3793,18 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             hot_cache_ask,
             pin_override,
         );
+        {
+            var cache_mem: usize = 0;
+            _ = mlx.mlx_get_cache_memory(&cache_mem);
+            log.debug("[prefill] pinned {d}: ceiling {d} MB, active {d} MB, mlx cache {d} MB, system available {d} MB, working set {d} MB\n", .{
+                config.pinned_prefill_chunk,
+                currentGpuMemoryCeiling(config, active_mem) >> 20,
+                active_mem >> 20,
+                cache_mem >> 20,
+                metrics.getAvailableMemBytes() >> 20,
+                getGpuWorkingSetLimit() >> 20,
+            });
+        }
         // Say when the ctx bar is the binding one.
         if (config.longCtxGated() and explicitPrefillChunk() == 0) {
             const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
@@ -3788,6 +3829,11 @@ pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pin
     if (perRequestPrefillChunkEnabled(config)) {
         const widest = rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated());
         return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d}\n", .{ widest, pinned }) catch null;
+    }
+    if (config.isDsv41() and launch > dsv41_config.prefill_width) {
+        if (pinned == dsv41_config.prefill_width)
+            return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (DeepSeek's default width; --prefill-chunk overrides)\n", .{pinned}) catch null;
+        return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, dsv41_config.prefill_width }) catch null;
     }
     if (pinned >= launch) return null;
     if (config.isGlm5() and pinned == @import("glm5_forward.zig").prefill_chunk)
@@ -4173,6 +4219,8 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
 /// and history where the head is on. Execution state (the QSA score bank) is
 /// RAM-only and never enters it; GLM's KDA checkpoints, DFlash2 window and MiMo's rings are fixed per entry.
 pub fn diskBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    // An entry keeps up to `checkpoint_cap` restore points, each a full copy of the state.
+    if (config.dsv41) |c| return c.stateBytesPerToken() *| dsv41_prefix.checkpointMax(ssm_checkpoint_max);
     const rows = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken();
     if (config.isGlm5() or !config.longCtxGated() or !mtpHeadDefaultOn(config)) return rows;
     const layers = config.attnCacheLayerCount();
@@ -4485,6 +4533,154 @@ test "bf16 expert cache admission bills cache workspace bounce and resident trun
     try std.testing.expect(!expertStreamingLoadFits(needed - 1, 10 * gb, 16 * gb, 60 * gb, 536_870_912, fill_peak, serving));
 }
 
+test "DeepSeek's streamed request bill brackets the prefill peaks measured on the M5 Max" {
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.max_position_embeddings = 1_048_576;
+    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    try std.testing.expectEqual(generate_mod.TAIL_MERGE_MAX - 1, dsv41_config.tail_merge_rows);
+    // Live per-chunk `peak_bytes - active_bytes` (`SUSHI_PREFILL_CHUNK_PEAK`), CED prefill, `--ssd-budget-gb 94`, the STQ d4
+    // pack, DSpark on: `chunk` is the configured width, `seq` where the chunk ended (a last chunk absorbs its tail).
+    const measured = [_]struct { seq: u64, chunk: u64, peak_mb: u64 }{
+        .{ .seq = 7168, .chunk = 1024, .peak_mb = 3_560 },
+        .{ .seq = 8675, .chunk = 1024, .peak_mb = 4_049 },
+        .{ .seq = 18432, .chunk = 512, .peak_mb = 2_635 },
+        .{ .seq = 34625, .chunk = 512, .peak_mb = 2_997 },
+        .{ .seq = 108032, .chunk = 512, .peak_mb = 2_600 },
+        .{ .seq = 108675, .chunk = 512, .peak_mb = 2_740 },
+    };
+    for (measured) |m| {
+        const bill = prefillNeededAtChunk(&config, m.seq, 16, 16, m.chunk, .{});
+        const peak = m.peak_mb * 1_000_000;
+        // Under-billing is a Metal OOM: at least a tenth over the peak. The upper bar keeps the net small.
+        try std.testing.expect(bill >= peak + peak / 10);
+        try std.testing.expect(bill <= peak * 4);
+    }
+}
+
+test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024, then 512, never wider" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.max_position_embeddings = 1_048_576;
+    config.num_attention_heads = 64;
+    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    const MB: u64 = 1 << 20;
+    // What `--ssd-budget-gb 96` on the 128 GB M5 Max leaves to serve, as its pin measured it.
+    const at96: u64 = 110_100 * MB - 97_080 * MB;
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 0, .{}));
+    // Its attention scores only the picked keys, so a long prompt keeps the width while the bill fits.
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, 400_000, 2048, 16, at96, 512, 0, .{}));
+    const long: u64 = 524_288;
+    const at1024 = prefillNeededAtChunk(&config, long, 2048, 16, 1024, .{});
+    const only_narrow = prefillNeededAtChunk(&config, long, 2048, 16, 512, .{});
+    try t.expect(prefillNeededAtChunk(&config, long, 2048, 16, 2048, .{}) > at1024 and at1024 > only_narrow);
+    try t.expectEqual(@as(u32, 1024), chooseRequestPrefillChunk(&config, long, 2048, 16, at1024, 512, 0, .{}));
+    try t.expectEqual(@as(u32, 512), chooseRequestPrefillChunk(&config, long, 2048, 16, only_narrow, 512, 0, .{}));
+    try t.expectEqual(@as(u32, 512), chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 512, .{}));
+    var buf: [256]u8 = undefined;
+    try t.expectEqualStrings("Prefill chunk: per request, up to 2048 at a short prompt (the widest rung each request's bill admits); load-time fallback 512\n", prefillChunkLoadLine(&buf, &config, 512, 8192).?);
+    // The ladder never narrows the advertised context: it is priced at the 512 floor.
+    try t.expectEqual(@as(u32, 974_848), advertisedContextAt(&config, 16, 110_100 * MB, 97_080 * MB, 512));
+}
+
+test "DeepSeek advertises the longest context its own request bill admits" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.max_position_embeddings = 1_048_576;
+    config.num_attention_heads = 64;
+    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    const GB: u64 = 1_000_000_000;
+    // The request bill grows with the prompt (the state and the rows' growth), so a serving budget of exactly one
+    // prompt's bill advertises that prompt and not one token less.
+    for ([_]u64{ 8192, 65_536, 131_072, 262_144, 524_288, 1_048_576 }) |seq| {
+        for ([_]u64{ 512, 1024 }) |chunk| {
+            const bill = prefillNeededAtChunk(&config, seq, 0, 16, chunk, .{});
+            try t.expect(memoryContextAtChunk(&config, 16, 100 * GB + bill, 100 * GB, chunk) >= seq);
+            try t.expect(memoryContextAtChunk(&config, 16, 100 * GB + bill - 1, 100 * GB, chunk) < seq);
+        }
+    }
+    // At 96 the whole 1M context fits the fallback width's bill.
+    const MB: u64 = 1 << 20;
+    try t.expectEqual(@as(u32, 1_048_576), memoryContextAtChunk(&config, 16, 110_100 * MB, 97_080 * MB, 512));
+}
+
+test "a streamed DeepSeek bills its workspace at load and no fill peak at load or per request" {
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.max_position_embeddings = 1_048_576;
+    config.expert_cache_bytes = 93_993 << 20;
+    config.expert_bounce_bytes = 512 << 20;
+    config.expert_workspace_bytes = 3_525 << 20;
+    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    const mib: u64 = 1 << 20;
+    // A 100-token request pays its own transient, not the cache layer and a second workspace.
+    try std.testing.expect(prefillNeededAtChunk(&config, 100, 512, 16, 512, .{}) < 2048 * mib);
+    const resident: u64 = 8_295 * mib;
+    const held = resident + config.expert_cache_bytes + config.expert_bounce_bytes + config.expert_workspace_bytes;
+    const serving = expertStreamingServingBytes(&config);
+    try std.testing.expect(expertStreamingConfigFits(&config, held + serving, 0, resident));
+    try std.testing.expect(!expertStreamingConfigFits(&config, held + serving - 1, 0, resident));
+}
+
+test "DeepSeek's request bill takes its prefill working set out of the decoder pools a prefill may release" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.max_position_embeddings = 1_048_576;
+    const c = config.dsv41.?;
+    const seq: u64 = 524_288;
+    const state = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + dsv41CheckpointReserve(&config, seq, 2048)) * 5 / 4;
+    const work = c.transientBytes(2048, seq) * 5 / 4;
+    const decode = c.decodeTransientBytes(dsv41_borrow.verify_rows, seq) * 5 / 4;
+    // No pool to lend: the whole working set is billed, as before.
+    try t.expectEqual(state + work, prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
+    // Pools that cover part of it: admission pays only the rest.
+    config.expert_borrow_bytes = work / 2;
+    try t.expectEqual(state + work - work / 2, prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
+    // Pools that cover all of it: the state and a decode forward, at any chunk.
+    config.expert_borrow_bytes = 60_000_000_000;
+    for ([_]u64{ 512, 1024, 2048 }) |chunk| {
+        const ck = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + dsv41CheckpointReserve(&config, seq, chunk)) * 5 / 4;
+        try t.expectEqual(ck + decode, prefillNeededAtChunk(&config, seq, 2048, 16, chunk, .{}));
+    }
+    // The widest rung is then always affordable, and a chunk boundary never steps down for the working set.
+    const MB: u64 = 1 << 20;
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode, 512, 0, .{}));
+    var st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st));
+    config.expert_borrow_bytes = 0;
+    var st0: generate_mod.AdaptiveWidthState = .{};
+    try t.expect(adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st0) < 2048);
+}
+
+test "with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpark on wired 124000 advertises its whole context" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.max_position_embeddings = 1_048_576;
+    config.num_attention_heads = 64;
+    const saved = .{ prefix_cache_ram_enabled, prefix_cache_disk_bytes };
+    defer {
+        prefix_cache_ram_enabled = saved[0];
+        prefix_cache_disk_bytes = saved[1];
+    }
+    // The served default: no RAM tier, the SSD tier on, so restore points go to SSD as a prefill takes them.
+    prefix_cache_ram_enabled = false;
+    prefix_cache_disk_bytes = 20 << 30;
+    const MB: u64 = 1 << 20;
+    // The budget-100 boot on wired 124000 read a 122,170 MiB ceiling and 100,328 MiB active; 17 GiB more at 117.
+    const ceiling: u64 = 122_170 * MB;
+    const active: u64 = (100_328 + 17 * 1024) * MB;
+    // Its expert cache, 13.57 GB under the budget (94% of the experts), split evenly: the decoder half is lendable.
+    config.expert_borrow_bytes = (117 * (1 << 30) - 13_570_000_000) / 2;
+    try t.expectEqual(@as(u32, 974_848), advertisedContextAt(&config, 16, ceiling, active, 2048));
+    // Billing the working set leaves no context worth serving.
+    config.expert_borrow_bytes = 0;
+    try t.expect(advertisedContextAt(&config, 16, ceiling, active, 512) < 262_144);
+}
+
 test "bf16 expert load admission includes 65k KV and QSA serving terms" {
     const fused_guard = qsaScoreFusedOffGuard();
     defer fused_guard.deinit();
@@ -4551,7 +4747,7 @@ test "a streamed load bills the narrowest rung the per-request ladder can take" 
     try std.testing.expectEqual(at(&config, 1024), expertStreamingServingBytes(&config));
     config.pinned_prefill_chunk = 0;
     per_request_chunk_override = false;
-    try std.testing.expectEqual(at(&config, 8192), expertStreamingServingBytes(&config));
+    try std.testing.expectEqual(at(&config, floor), expertStreamingServingBytes(&config));
 }
 
 test "bf16 streaming marker is a property of the checkpoint, not of the launch flags" {
@@ -5952,6 +6148,8 @@ fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceil
         const budget = admissionAvailable(ceiling, active_mem) -| ctxSizingCacheReserve(config);
         return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
     }
+    // DeepSeek's request bill grows with the prompt (the indexer's scores), so its context is the longest that bill admits.
+    if (config.isDsv41()) return maxSushiContextAtWidth(config, kv_bits, admissionAvailable(ceiling, active_mem) -| ctxSizingCacheReserve(config), chunk, .{});
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
     const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
     return safeContextForBudget(
@@ -6035,6 +6233,7 @@ pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
 /// Every sizer that used to add `qsaRingBytes` adds this instead — a second
 /// per-slot constant billed at only some of them is the under-bill class.
 pub fn slotRingBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    if (config.dsv41) |c| return c.stateFixedBytes(config.dsparkOn());
     if (config.isGlm5()) return config.qsaRingBytes() + config.ssmCheckpointBytes();
     const swa = config.swaRingBytes() +| prefix_cache_mod.SLOT_RING_CHECKPOINTS *| config.swaRingCheckpointBytes();
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits) +| batchedDecodeRowsBytes(config);
@@ -6373,6 +6572,23 @@ fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureS
     return generate_mod.glmCaptureSchedule(generate_mod.glm_checkpoint_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
 }
 
+/// The restore points a DeepSeek prefill holds in RAM while it runs: with a RAM tier the capped list plus the copy
+/// taken before a thin, each a full copy of the state at most `seq` tokens deep; SSD-first only what is in flight to
+/// the tier. Zero with no prefix cache at all.
+fn dsv41CheckpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+    const c = config.dsv41 orelse return 0;
+    const base = effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config));
+    const stride = generate_mod.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
+    if (stride == 0) return 0;
+    const one = c.stateFixedBytes(config.dsparkOn()) +| seq *| c.stateBytesPerToken();
+    // SSD-first, a point the tier takes shares the request's rows and leaves RAM as the writer copies it: what is in
+    // flight is the writer's bounded host buffer, and the fixed rings each point copies.
+    if (seq >= kv_disk_cache.MIN_PERSIST_TOKENS and prefix_cache_mod.ssdFirstActive(config, diskTierOn(config), prefix_cache_ram_enabled))
+        return @min(disk_writer_permit_bytes, one) +| c.stateFixedBytes(config.dsparkOn());
+    const held = @min(@as(u64, dsv41_prefix.checkpointMax(ssm_checkpoint_max)), seq / stride + 1) + 1;
+    return held *| one;
+}
+
 /// What a GLM request holds for the prefix cache while it runs: its prefill's KDA checkpoints (at
 /// most `warm.checkpoints`, plus the copy taken before each thin; a released prefill holds
 /// `glm5_prefix.checkpoint_ram_held`) and the assistant window it keeps from prefill end.
@@ -6405,6 +6621,28 @@ pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const 
     if (!flag) return null;
     if (config.isMimo()) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
     return "MTP head KV: following --kv-quant (--mtp-head-kv-quant)";
+}
+
+/// The launch flags a load can be refused for, as the process was started.
+pub const LaunchFlagUse = struct { kv_quant: bool = false, qwen_gdn_16: bool = false, mtp_head_kv_quant: bool = false, mtp_depth: bool = false, drop_expert: bool = false };
+
+/// A launch flag with nothing to act on in this arch, named with the reason; null when every flag given applies.
+/// An explicit flag is refused rather than ignored, before the weights load.
+pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse) ?[]const u8 {
+    if (use.drop_expert and !config.isDsv41()) return "--drop-expert has no effect on this model: only deepseek_v41 packs carry an expert usage list; drop the flag";
+    if (!config.isDsv41()) return null;
+    if (use.kv_quant) return "--kv-quant has no effect on deepseek_v41: its compressed state is stored as the QAT round trips left it, so there is no KV cache to quantize; drop the flag";
+    if (use.qwen_gdn_16) return "--qwen-gdn has no effect on deepseek_v41: it has no GatedDeltaNet layers; drop the flag";
+    if (use.mtp_head_kv_quant) return "--mtp-head-kv-quant has no effect on deepseek_v41: its DSpark stages keep their own windows; drop the flag";
+    if (use.mtp_depth) return "--mtp-min-depth/--mtp-max-depth have no effect on deepseek_v41: the DSpark block is fixed by the checkpoint; drop the flags";
+    return null;
+}
+
+/// A model-settings.json `kv_quant` on an arch with no KV cache is ignored with this one line, never a refusal:
+/// the file outlives the flags that wrote it, and only an explicit launch flag is a request.
+pub fn settingsKvQuantIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
+    if (!config.isDsv41() or config.kv_quant_override == null) return null;
+    return "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 }
 
 /// What `--qwen-gdn 16` does on this arch, for the boot log; null at the f32 default.
@@ -6442,6 +6680,7 @@ fn mtpHeadStateBytesPerToken(config: *const model_mod.ModelConfig) u64 {
 }
 
 fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    if (config.dsv41) |c| return c.stateBytesPerToken();
     if (config.isGlm5()) return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + config.qsaHistoryBytesPerToken();
     const head: u64 = if (mtpHeadDefaultOn(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
     return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
@@ -6814,6 +7053,12 @@ pub fn prefillNeededAtChunk(
     chunk: u64,
     warm: WarmPrefix,
 ) u64 {
+    if (config.dsv41) |c| {
+        const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
+        // The prefill's working set comes out of the decoder pools it may release (`dsv41_borrow`); a decode forward's never does.
+        const work = @max(c.decodeTransientBytes(dsv41_borrow.verify_rows, seq) *| 5 / 4, c.transientBytes(chunk, seq) *| 5 / 4 -| dsv41BorrowableBytes(config));
+        return (held +| dsv41CheckpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+    }
     if (config.isGlm5()) {
         return (glmCacheBytes(config, seq, max_tokens, kv_bits) +| @max(
             glm5TransientBytes(config, seq, chunk, kv_bits) +| glmPrefixStateBytes(config, seq, warm),
@@ -6976,7 +7221,19 @@ pub fn prefillChunkCost(
 ) u64 {
     const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
         statePerTokenBilled(config);
-    return prefillTransientReserveAtKv(config, kv_bits, width, kv_len) +| (width *| per_tok);
+    return (prefillTransientReserveAtKv(config, kv_bits, width, kv_len) -| dsv41BorrowableBytes(config)) +| (width *| per_tok);
+}
+
+/// The decoder pools a DeepSeek prefill may still release for its working set (`dsv41_borrow`); 0 elsewhere.
+fn dsv41BorrowableBytes(config: *const model_mod.ModelConfig) u64 {
+    return @atomicLoad(u64, &config.expert_borrow_bytes, .monotonic);
+}
+
+/// `dsv41_borrow.headroom_fn`: what admission reads as available, live.
+fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    return admissionAvailable(currentGpuMemoryCeiling(config, active_mem), active_mem);
 }
 
 /// The width the next chunk runs at. Asymmetric because a Metal abort is uncatchable: HOLD
@@ -14508,6 +14765,7 @@ fn mediaKindRefusal(messages: []const chat_mod.Message, flat: FlatMedia, has_tow
 fn visionScratchBytes(config: *const model_mod.ModelConfig, patches: u64) u64 {
     if (config.mimo_vision) return mimo_vision.encodeScratchBytes(config, patches);
     if (config.glm5_vision) return glm5_vision.encodeScratchBytes(config, patches);
+    if (config.isDsv41()) return dsv41_vision.encodeScratchBytes(config, patches);
     return qwen_vision.encodeScratchBytes(config, patches);
 }
 
@@ -14539,6 +14797,8 @@ pub fn largestImageEncodeBytes(config: *const model_mod.ModelConfig) u64 {
     const merge: u64 = @max(vp.merge, 1);
     const patches: u64 = if (vp.mode == .glm5)
         @as(u64, vp.max_tokens) * merge * merge
+    else if (vp.mode == .dsv41)
+        merge * merge * (vp.max_tokens - 2)
     else
         vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / @max(@as(u64, vp.patch) * vp.patch, 1);
     const largest = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
@@ -14627,7 +14887,7 @@ fn placeMedia(
             next_image += 1;
             // A gridless (fixed-square) tower has no per-image row count here.
             if (im.grid_h == 0) return error.MediaLayoutUnsupported;
-            break :blk mediaRows(1, im.grid_h, im.grid_w, merge);
+            break :blk if (config.isDsv41()) dsv41_vision.spanRows(im.grid_h, im.grid_w, merge) else mediaRows(1, im.grid_h, im.grid_w, merge);
         } else blk: {
             const vd = videos[next_video];
             next_video += 1;
@@ -14879,6 +15139,14 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
         .merge = config.qv_merge,
         .min_pixels = config.qv_min_pixels,
         .max_pixels = config.qv_max_pixels,
+    };
+    if (config.dsv41) |c| if (c.vision) |v| return .{
+        .mode = .dsv41,
+        .patch = v.patch,
+        .merge = v.downsample,
+        .min_pixels = v.min_pixels,
+        .max_tokens = v.max_tokens,
+        .max_wh_ratio = v.max_wh_ratio,
     };
     if (config.glm5_vision) return .{
         .mode = .glm5,
@@ -15280,6 +15548,14 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
+
+    // DeepSeek-V4.1 letterboxes into a canvas of whole patches; the span's size is `dsv41_vision.spanRows`.
+    if (vp.mode == .dsv41) {
+        const pr: dsv41_vision.Processor = .{ .patch = vp.patch, .downsample = vp.merge, .max_tokens = vp.max_tokens, .min_pixels = vp.min_pixels, .max_wh_ratio = vp.max_wh_ratio };
+        const pv = dsv41_vision.preprocess(allocator, px[0 .. @as(usize, src_h) * src_w * 3], src_h, src_w, pr) catch return null;
+        log.info("  Decoded {d}x{d} image → deepseek grid {d}x{d} ({d} tokens, canvas {d}x{d})\n", .{ src_w, src_h, pv.grid_h, pv.grid_w, dsv41_vision.spanRows(pv.grid_h, pv.grid_w, vp.merge), pv.w, pv.h });
+        return .{ .pixels = pv.bytes, .width = pv.w, .height = pv.h, .grid_h = pv.grid_h, .grid_w = pv.grid_w };
+    }
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
@@ -15807,6 +16083,49 @@ test "placeMedia expands each placeholder to its block's rows, in prompt order" 
         .{ .kind = .video, .start = 9, .rows = 2 },
         .{ .kind = .image, .start = 14, .rows = 3 },
     }, placed.items);
+}
+
+test "deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check" {
+    // The released tokenizer splits `<｜deepseek_image｜>` out of any text (an AGENTS.md that names it);
+    // only attached media make an id a placeholder, and this arch serves none.
+    var cfg = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    cfg.image_token_id = 129264;
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = std.testing.allocator,
+        .id = "m",
+        .path = "",
+        .bytes_on_disk = 0,
+        .arch_hint = "deepseek_v41",
+        .config = &cfg,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .ready,
+        .error_name = null,
+    };
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "the token <｜deepseek_image｜> is reserved" }};
+    var ids = try std.testing.allocator.dupe(u32, &.{ 0, 128803, 5, 129264, 6, 128804 });
+    defer std.testing.allocator.free(ids);
+    const before = ids;
+    switch (try prepareRequestMedia(std.testing.allocator, &entry, &messages, &ids, 1 << 20)) {
+        .ready => |ready| {
+            var r = ready;
+            defer r.deinit(std.testing.allocator);
+        },
+        .refused => return error.TextOnlyPromptRefused,
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 0, 128803, 5, 129264, 6, 128804 }, ids);
+    try std.testing.expectEqual(before.ptr, ids.ptr);
+    const found = countMediaPlaceholders(ids, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), found.images);
 }
 
 test "mediaChain keys every block by its pixels, its position and the blocks before it" {
@@ -22068,6 +22387,7 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
         .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":false}}", .want = ",\"default_reasoning_effort\":\"off\"" },
         .{ .arch = "mimo_v2", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"on\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"on\"" },
         .{ .arch = "glm5_next", .gen = "{}", .want = ",\"reasoning_efforts\":[\"low\",\"high\",\"max\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"high\"" },
+        .{ .arch = "deepseek_v41", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"high\",\"max\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"high\"" },
     }) |c| {
         const config_json = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"{s}\"}}", .{c.arch});
         defer t.allocator.free(config_json);
@@ -24785,6 +25105,45 @@ test "qwenGdnLine: --qwen-gdn 16 is reported per arch, and has no effect where t
     try t.expectEqualStrings("GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)", qwenGdnLine(&mimo, false).?);
 }
 
+test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line" {
+    const t = std.testing;
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(archFlagRefusal(&dsv41, .{}) == null);
+    const all = LaunchFlagUse{ .kv_quant = true, .qwen_gdn_16 = true, .mtp_head_kv_quant = true, .mtp_depth = true };
+    try t.expect(archFlagRefusal(&qwen4, all) == null);
+    for ([_]struct { use: LaunchFlagUse, flag: []const u8 }{
+        .{ .use = .{ .kv_quant = true }, .flag = "--kv-quant" },
+        .{ .use = .{ .qwen_gdn_16 = true }, .flag = "--qwen-gdn" },
+        .{ .use = .{ .mtp_head_kv_quant = true }, .flag = "--mtp-head-kv-quant" },
+        .{ .use = .{ .mtp_depth = true }, .flag = "--mtp-min-depth/--mtp-max-depth" },
+    }) |c| {
+        const why = archFlagRefusal(&dsv41, c.use) orelse return error.TestExpectedRefusal;
+        try t.expect(std.mem.startsWith(u8, why, c.flag));
+        try t.expect(std.mem.indexOf(u8, why, "deepseek_v41") != null);
+    }
+    try t.expectEqualStrings("off", kvCacheForLaunch(&dsv41, transformer_mod.KVQuantConfig.affine(4), true).label());
+    try t.expectEqualStrings("kv4", kvCacheForLaunch(&qwen4, transformer_mod.KVQuantConfig.affine(4), true).label());
+    try t.expect(settingsKvQuantIgnoredLine(&dsv41) == null);
+    dsv41.kv_quant_override = transformer_mod.KVQuantConfig.affine(8);
+    try t.expect(std.mem.indexOf(u8, settingsKvQuantIgnoredLine(&dsv41).?, "model-settings.json kv_quant is ignored") != null);
+    try t.expect(settingsKvQuantIgnoredLine(&qwen4) == null);
+    try t.expectEqualStrings("off", kvCacheForLaunch(&dsv41, transformer_mod.KVQuantConfig.engine_default, false).label());
+}
+
+test "--drop-expert is refused on every arch but deepseek_v41, before the weights load" {
+    const t = std.testing;
+    const use = LaunchFlagUse{ .drop_expert = true };
+    const dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    try t.expect(archFlagRefusal(&dsv41, use) == null);
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
+        const cfg = model_mod.ModelConfig{ .model_type = arch };
+        const why = archFlagRefusal(&cfg, use) orelse return error.TestExpectedRefusal;
+        try t.expect(std.mem.startsWith(u8, why, "--drop-expert"));
+        try t.expect(archFlagRefusal(&cfg, .{}) == null);
+    }
+}
+
 test "the 64 GB Sushi-2.6bpw recipe's bills at both GDN widths: 250000 context, kv8, MTP, 32000 new tokens" {
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
@@ -26659,21 +27018,21 @@ test "GLM release defaults advertise the full context at the widest prefill chun
     const ceiling: u64 = 115_904 * 1024 * 1024;
     const active: u64 = 104_350_000_000;
     try std.testing.expectEqual(@as(u32, 2048), resolvePrefillChunk(&cfg, kv_bits, ceiling, active, 0, 0));
-    try std.testing.expectEqual(cap, glmAdvertisedContextAt(&cfg, kv_bits, ceiling, active, 2048));
+    try std.testing.expectEqual(cap, advertisedContextAt(&cfg, kv_bits, ceiling, active, 2048));
     // A 1 GiB idle cache reserve takes the same bytes as a 1 GiB lower ceiling: 2048 rows would cost
     // advertised context there, 1024 keeps all of it.
     const reserved = ceiling - 1024 * 1024 * 1024;
-    try std.testing.expect(glmAdvertisedContextAt(&cfg, kv_bits, reserved, active, 2048) < cap);
+    try std.testing.expect(advertisedContextAt(&cfg, kv_bits, reserved, active, 2048) < cap);
     try std.testing.expectEqual(@as(u32, 1024), resolvePrefillChunk(&cfg, kv_bits, reserved, active, 0, 0));
-    try std.testing.expectEqual(cap, glmAdvertisedContextAt(&cfg, kv_bits, reserved, active, 1024));
+    try std.testing.expectEqual(cap, advertisedContextAt(&cfg, kv_bits, reserved, active, 1024));
     // The least free memory at which 1024 rows still advertise the position cap keeps 1024.
     var low: u64 = 0;
     var high: u64 = ceiling - active;
     while (low < high) {
         const mid = low + (high - low) / 2;
-        if (glmAdvertisedContextAt(&cfg, kv_bits, active + mid, active, 1024) >= cap) high = mid else low = mid + 1;
+        if (advertisedContextAt(&cfg, kv_bits, active + mid, active, 1024) >= cap) high = mid else low = mid + 1;
     }
-    try std.testing.expect(glmAdvertisedContextAt(&cfg, kv_bits, active + low, active, 2048) < cap);
+    try std.testing.expect(advertisedContextAt(&cfg, kv_bits, active + low, active, 2048) < cap);
     try std.testing.expectEqual(@as(u32, 1024), resolvePrefillChunk(&cfg, kv_bits, active + low, active, 0, 0));
     // Far less memory: every widening costs advertised context.
     try std.testing.expectEqual(@as(u32, 512), resolvePrefillChunk(&cfg, kv_bits, active + 8 * 1024 * 1024 * 1024, active, 0, 0));
@@ -27473,4 +27832,98 @@ test "reasoning usage tokenization ignores SSE boundaries" {
     const empty = try formatReasoningDetails(a, &tok, "");
     defer a.free(empty);
     try std.testing.expectEqualStrings(",\"completion_tokens_details\":{\"reasoning_tokens\":0}", empty);
+}
+
+test "dsv41 bills: a prefill holds its restore points beside the state with a RAM tier, and only the writer's in-flight bytes SSD-first (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try @import("dsv41_model.zig").fixtureDir();
+    const t = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var cfg = try model_mod.parseConfig(io, t.allocator, dir);
+    defer cfg.deinit(t.allocator);
+    const saved = .{ prefix_cache_ram_enabled, ssm_checkpoint_stride, ssm_checkpoint_max, prefix_cache_disk_bytes, prefix_cache_capacity };
+    defer {
+        prefix_cache_ram_enabled = saved[0];
+        ssm_checkpoint_stride = saved[1];
+        ssm_checkpoint_max = saved[2];
+        prefix_cache_disk_bytes = saved[3];
+        prefix_cache_capacity = saved[4];
+    }
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    prefix_cache_capacity = 32;
+    const c = cfg.dsv41.?;
+    const seq: u64 = 20_000;
+    const one = c.stateFixedBytes(cfg.dsparkOn()) + seq * c.stateBytesPerToken();
+    prefix_cache_ram_enabled = false;
+    prefix_cache_disk_bytes = 0;
+    const off = prefillNeededAtChunk(&cfg, seq, 0, 8, 512, .{});
+    try t.expectEqual(@as(u64, 0), dsv41CheckpointReserve(&cfg, seq, 512));
+    for ([_][2]bool{ .{ true, false }, .{ true, true } }) |tiers| {
+        prefix_cache_ram_enabled = tiers[0];
+        prefix_cache_disk_bytes = if (tiers[1]) 20 << 30 else 0;
+        // One checkpoint per 8192-token stride and the prompt end, plus the copy taken before a thin.
+        try t.expectEqual(@as(u64, 4) * one, dsv41CheckpointReserve(&cfg, seq, 512));
+        try t.expectEqual(off + 4 * one * 5 / 4, prefillNeededAtChunk(&cfg, seq, 0, 8, 512, .{}));
+        // The list is capped, whatever the prompt.
+        try t.expectEqual(@as(u64, 5) * (c.stateFixedBytes(cfg.dsparkOn()) + 1_000_000 * c.stateBytesPerToken()), dsv41CheckpointReserve(&cfg, 1_000_000, 512));
+    }
+    // SSD-first: each point goes to the tier as it is taken, so the bill is the writer's bounded host buffer and one
+    // point's fixed rings, whatever the prompt; under the tier's floor the points wait for the commit in RAM.
+    prefix_cache_ram_enabled = false;
+    prefix_cache_disk_bytes = 20 << 30;
+    const rings = c.stateFixedBytes(cfg.dsparkOn());
+    try t.expectEqual(one + rings, dsv41CheckpointReserve(&cfg, seq, 512));
+    const big: u64 = 1 << 40;
+    try t.expectEqual(@min(disk_writer_permit_bytes, rings + big * c.stateBytesPerToken()) + rings, dsv41CheckpointReserve(&cfg, big, 512));
+    try t.expect(dsv41CheckpointReserve(&cfg, 100, 512) == 2 * (rings + 100 * c.stateBytesPerToken()));
+    // An entry on disk keeps up to the cap of full states.
+    try t.expectEqual(c.stateBytesPerToken() * 4, diskBytesPerToken(&cfg, 8));
+    ssm_checkpoint_stride = 0;
+    try t.expectEqual(@as(u64, 0), dsv41CheckpointReserve(&cfg, seq, 512));
+}
+
+test "DeepSeek vision serving: the processor carries the release's budgets, a placeholder expands to the whole span, and its encode is billed" {
+    const a = std.testing.allocator;
+    const cfg = try model_mod.parseConfigFromJson(a, dsv41_config.release_config);
+    const vp = visionPreprocFromConfig(&cfg);
+    try std.testing.expectEqual(.dsv41, vp.mode);
+    try std.testing.expectEqual(@as(u32, 14), vp.patch);
+    try std.testing.expectEqual(@as(u32, 3), vp.merge);
+    try std.testing.expectEqual(@as(u32, 1024), vp.max_tokens);
+    try std.testing.expectEqual(@as(u32, 295936), vp.min_pixels);
+    try std.testing.expect(cfg.has_vision and !cfg.qwen_vision);
+
+    // 520x390 plans a 34x45 patch grid: 12x15 aligner cells, a newline per row, start and end.
+    const images = [_]chat_mod.ImageData{testGridImage(34, 45, "")};
+    const ids = [_]u32{ 1, cfg.image_token_id, 2 };
+    const counts = countMediaPlaceholders(&ids, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), counts.images);
+    var placed = try placeMedia(a, &ids, &cfg, &images, &.{}, null);
+    defer placed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 194), placed.rows);
+    try std.testing.expectEqual(@as(usize, 196), placed.ids.len);
+    for (placed.ids[1..195]) |t| try std.testing.expectEqual(cfg.image_token_id, t);
+    try std.testing.expectEqual(@as(usize, 1), placed.items.len);
+    try std.testing.expectEqual(@as(usize, 1), placed.items[0].start);
+
+    const bill = visionEncodeBill(&cfg, &images, &.{}, placed.rows);
+    try std.testing.expectEqual(@as(u64, 1530), bill.largest_group_patches);
+    const input_bytes: u64 = 1530 * 588 * 4;
+    const output_bytes: u64 = 194 * 5120 * 2;
+    try std.testing.expectEqual(dsv41_vision.encodeScratchBytes(&cfg, 1530) + input_bytes + 3 * output_bytes, bill.bytes);
+
+    // The reserve a streamed load keeps covers the largest image the processor admits.
+    const reserve = largestImageEncodeBytes(&cfg);
+    const proc = dsv41_vision.Processor.of(cfg.dsv41.?.vision.?);
+    var largest: u64 = 0;
+    for ([_][2]u32{ .{ 1920, 1080 }, .{ 4000, 3000 }, .{ 7000, 1000 }, .{ 1000, 7000 }, .{ 640, 640 }, .{ 14, 14 } }) |s| {
+        const plan = dsv41_vision.planGrid(s[0], s[1], proc).?;
+        const img = [_]chat_mod.ImageData{testGridImage(plan.vit_h, plan.vit_w, "")};
+        const rows = dsv41_vision.spanTokens(plan.llm_h, plan.llm_w);
+        const one = visionEncodeBill(&cfg, &img, &.{}, rows).bytes;
+        try std.testing.expect(one <= reserve);
+        largest = @max(largest, one);
+    }
+    try std.testing.expect(largest * 10 >= reserve * 8);
 }

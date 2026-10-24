@@ -1,8 +1,12 @@
 const std = @import("std");
 const glm5_mod = @import("glm5_forward.zig");
+const dsv41_model = @import("dsv41_model.zig");
+const dsv41_stream = @import("dsv41_stream.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
 const GlmRequest = glm5_mod.Request;
 const qwen4_mod = @import("qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
+const expert_usage = @import("expert_usage.zig");
 const expert_bf16 = @import("expert_bf16_kernels.zig");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -10229,6 +10233,7 @@ test "persistent group: forwardWith releases a bound member between batched tick
     }
     p_xfm.glm5 = null;
     p_xfm.qwen4 = null;
+    p_xfm.dsv41 = null;
     p_xfm.moe_layers = null;
     p_xfm.emb_w = .{ .ctx = null };
     p_xfm.config = std.mem.zeroes(ModelConfig);
@@ -13961,6 +13966,12 @@ pub const Transformer = struct {
     glm5: ?*glm5_mod.Model = null,
     glm5_request: ?glm5_mod.Request = null,
 
+    // deepseek_v41: the model owns its one request's state (single flight), its routed experts
+    // stream through `dsv41_experts` over `expert_stream`.
+    dsv41: ?*dsv41_model.Model = null,
+    dsv41_experts: ?*dsv41_stream.Stream = null,
+    dsv41_stq_experts: ?*dsv41_stream.StqStream = null,
+
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
     // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
@@ -14077,6 +14088,7 @@ pub const Transformer = struct {
         var name_buf: [256]u8 = undefined;
 
         if (config.isGlm5()) return initGlm5(allocator, config, weights, s);
+        if (config.isDsv41()) return initDsv41(allocator, config, weights, s);
 
         const emb_base: []const u8 = "embed_tokens";
         const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
@@ -14449,6 +14461,7 @@ pub const Transformer = struct {
     /// Reset all caches for a new request (KV cache + SSM state for MoE).
     pub fn resetCache(self: *Transformer) !void {
         if (self.glm5_request) |*request| request.reset();
+        if (self.dsv41) |m| dsv41_model.resetState(m);
         const prev_config = self.cache.config;
         try self.cache.reinit(self.config.num_hidden_layers, prev_config);
         if (self.ssm_entries) |entries| {
@@ -14692,6 +14705,18 @@ pub const Transformer = struct {
             m.deinit(self.allocator);
             self.qwen4_mtp = null;
         }
+        if (self.dsv41) |m| {
+            m.deinit();
+            self.dsv41 = null;
+        }
+        if (self.dsv41_experts) |st| {
+            self.allocator.destroy(st);
+            self.dsv41_experts = null;
+        }
+        if (self.dsv41_stq_experts) |st| {
+            self.allocator.destroy(st);
+            self.dsv41_stq_experts = null;
+        }
         if (self.expert_stream) |engine| {
             engine.deinit();
             self.allocator.destroy(engine);
@@ -14726,6 +14751,7 @@ pub const Transformer = struct {
     pub fn useCurrentThreadStream(self: *Transformer) void {
         self.s = mlx.gpuStream();
         if (self.glm5) |mdl| mdl.s = self.s;
+        if (self.dsv41) |m| m.s = self.s;
     }
 
     // ── Core ops ──
@@ -15623,7 +15649,7 @@ pub const Transformer = struct {
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         // A streamed GLM load (the KLD teacher) admits one claimant per expert stream.
         if (self.glm5) |m| if (m.expert_stream != null) return true;
-        return false;
+        return self.dsv41 != null;
     }
 
     pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
@@ -15654,7 +15680,9 @@ pub const Transformer = struct {
     pub fn moduleStateSpecRollback(self: *const Transformer) bool {
         // qwen4_exp: GDN per-position capture + PLE window/token capture +
         // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
-        // head's verify can rewind. dsv4 cannot.
+        // head's verify can rewind. dsv4 cannot. deepseek_v41 cuts its own rows
+        // back to the accepted prefix (`dsv41_model.finishVerify`).
+        if (self.dsv41) |m| return m.dspark != null;
         return self.qwen4_mtp != null;
     }
 
@@ -15798,9 +15826,22 @@ pub const Transformer = struct {
     pub const verifyRowsJoined = qwen4_forward.verifyRowsJoined;
     pub const warmupMimoVerify = mimo_forward.warmupMimoVerify;
 
+    pub fn dsv41Draft(self: *Transformer, t1: u32) !dsv41_model.Draft {
+        return dsv41DraftImpl(self, t1);
+    }
+
+    pub fn dsv41Verify(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
+        return dsv41VerifyImpl(self, ctx, ids);
+    }
+
+    pub fn dsv41Finish(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !void {
+        return dsv41FinishImpl(self, ctx, accepted);
+    }
+
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.glm5) |mdl| return forwardGlm5WithImpl(self, ctx, token_ids, mdl);
+        if (self.dsv41) |m| return forwardDsv41With(self, ctx, token_ids, m);
         if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
         return self.forwardMoeWith(ctx, token_ids);
     }
@@ -17230,7 +17271,22 @@ pub const Transformer = struct {
     fn newExpertEngine(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream) !*expert_stream_mod.Engine {
         const engine = try allocator.create(expert_stream_mod.Engine);
         errdefer allocator.destroy(engine);
-        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, config.expert_source_dir orelse return error.MissingExpertSourceDir, config.expertGeometry(), config.expert_cache_bytes, s, .{ .layout = config.expert_layout });
+        const dir = config.expert_source_dir orelse return error.MissingExpertSourceDir;
+        // The engine owns the drop for its life; nothing else lets go of it.
+        const drop: ?*expert_usage.Drop = if (config.drop_expert == 0) null else blk: {
+            if (!config.isDsv41()) return error.LaunchFlagUnsupported;
+            const d = try allocator.create(expert_usage.Drop);
+            errdefer allocator.destroy(d);
+            d.* = try expert_usage.load(allocator, dir, config.expertDropRequest());
+            break :blk d;
+        };
+        errdefer if (drop) |d| {
+            d.deinit();
+            allocator.destroy(d);
+        };
+        var geometry = config.expertGeometry();
+        geometry.drop = drop;
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop });
         return engine;
     }
 
@@ -27702,6 +27758,121 @@ fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
     shell.glm5_request = request;
     shell.expert_stream = engine;
     return shell;
+}
+
+fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
+    const stq = config.dsv41.?.expert_dec != null;
+    if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
+    const engine = try Transformer.newExpertEngine(allocator, &config, s);
+    errdefer {
+        engine.deinit();
+        allocator.destroy(engine);
+    }
+    // The load drops each tensor from the map once its arrays are bound.
+    const mdl = try dsv41_model.init(allocator, config.dsv41.?, @constCast(weights), config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
+    errdefer mdl.deinit();
+    dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
+    if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
+    if (mdl.ced_split) |split|
+        log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });
+    const verify_profile = diagEnvOn("SUSHI_DSV41_VERIFY_PROFILE");
+    if (verify_profile or diagEnvOn("SUSHI_DSV41_PREFILL_PROFILE")) {
+        mdl.profile = try allocator.create(dsv41_model.Profile);
+        mdl.profile.?.* = .init(verify_profile);
+    }
+    var shell = try initModuleShell(allocator, config, s);
+    if (stq) {
+        // CED runs the decoder over a chunk's last rows, so a prefill can take the decoder's pools for its working set.
+        if (mdl.ced_split) |split| engine.borrow_from = @intCast(split);
+        const experts = try allocator.create(dsv41_stream.StqStream);
+        experts.* = .{ .engine = engine, .cfg = &mdl.cfg };
+        mdl.experts = .{ .hook = experts.hook() };
+        shell.dsv41_stq_experts = experts;
+    } else {
+        const experts = try allocator.create(dsv41_stream.Stream);
+        experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };
+        mdl.experts = .{ .hook = experts.hook() };
+        shell.dsv41_experts = experts;
+    }
+    shell.dsv41 = mdl;
+    shell.expert_stream = engine;
+    // A failed warm costs the first requests their compiles, not the load.
+    var clock = expert_stream_mod.Clock.init();
+    const had_error = mlx.errorPending();
+    if (dsv41_model.warmKernels(mdl)) {
+        log.info("[dsv41] kernels warmed for 1..{d} rows{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", clock.lap() / std.time.ns_per_ms });
+    } else |e| {
+        mlx.dropLatchedErrorUnless(had_error);
+        log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
+    }
+    // The warm's transients leave the pool, so the load's memory reading is the model's.
+    _ = mlx.mlx_clear_cache();
+    return shell;
+}
+
+/// One request at a time: the model holds its state, which `cache.step` mirrors. Logits are the last row.
+fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *dsv41_model.Model) !mlx.mlx_array {
+    if (ctx.cache.step == 0) dsv41_model.resetState(m);
+    const st = try dsv41_model.ensureState(m);
+    if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
+    m.s = self.s;
+    const rows = mlx.getShape(ids);
+    if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, self.s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const host = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidDsv41Input;
+    const n: usize = @intCast(rows[1]);
+    if (self.expert_stream) |engine| {
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n);
+        engine.beginForward();
+    }
+    // The model splices the image rows itself: the span's embedding never leaves it.
+    const vision: ?dsv41_model.VisionRows = if (ctx.vision_embeddings) |ve| .{ .rows = ve, .offset = ctx.vision_splice_offset } else null;
+    const last = try dsv41_model.extendVision(m, host[0..n], .last, dsv41_model.SPAN, vision);
+    defer _ = mlx.mlx_array_free(last);
+    if (self.expert_stream) |engine| engine.finishForward(n);
+    ctx.cache.step = st.n;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, self.s));
+    return out;
+}
+
+/// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
+fn dsv41DraftImpl(self: *Transformer, t1: u32) !dsv41_model.Draft {
+    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    return dsv41_model.draftHeads(m, t1, .conf);
+}
+
+/// Advances the request by `ids` (`[t1, drafts...]`) as a chunk `dsv41Finish` trims; the logits of every row,
+/// f32 `[1, L, vocab]`.
+fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
+    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    const st = try dsv41_model.ensureState(m);
+    if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
+    if (self.expert_stream) |engine| {
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len);
+        engine.beginForward();
+    }
+    const all = try dsv41_model.verify(m, ids);
+    defer _ = mlx.mlx_array_free(all);
+    if (self.expert_stream) |engine| engine.finishForward(ids.len);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, all, &[_]c_int{ 1, @intCast(ids.len), @intCast(m.cfg.vocab) }, 3, self.s));
+    return out;
+}
+
+/// Keeps the first `accepted + 1` rows of the open verify chunk.
+fn dsv41FinishImpl(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !void {
+    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    try dsv41_model.finishVerify(m, accepted);
+    ctx.cache.step = (try dsv41_model.ensureState(m)).n;
 }
 
 fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
@@ -56600,6 +56771,7 @@ test "a GLM prefill interleaved with another stream's decode builds the solo pre
 test "a streamed GLM load keeps its one teacher stream exclusive" {
     var t: Transformer = undefined;
     t.qwen4 = null;
+    t.dsv41 = null;
     t.expert_stream = null;
     var glm: glm5_mod.Model = undefined;
     glm.expert_stream = null;

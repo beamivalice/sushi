@@ -251,6 +251,12 @@ fn printUsage(io: std.Io) void {
         \\                      every cache checkpoint (about 54 MB each on
         \\                      Flash-Next) to save memory on smaller machines.
         \\                      No effect on GLM or MiMo, which have no GDN arm.
+        \\  --drop-expert <n>   DeepSeek-V4.1 only: never load or pick the n least-used
+        \\                      routed experts of every layer, ranked by the pack's
+        \\                      expert_usage.json (n a multiple of 8; default 0 =
+        \\                      off). A token's pick moves to its next-best expert;
+        \\                      the memory bill shrinks by the dropped bytes. Answers
+        \\                      change, so score it with `sushi kld compare`.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8, 6 or 4 — affine group quant; default 8 on
         \\                          every model (GLM refuses 4). 16 (or `off`)
@@ -869,6 +875,12 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--qwen-gdn: expected 32 or 16; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--drop-expert") and i + 1 < args.len) {
+            i += 1;
+            model_mod.drop_expert = @import("expert_usage.zig").parseCount(args[i]) orelse {
+                log.err("--drop-expert: expected a multiple of 8 routed experts per layer (0 = off); got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             kv_quant_explicit = true;
@@ -1429,7 +1441,7 @@ pub fn main(init: std.process.Init) !void {
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
-        const kv_cache = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_quant_config, kv_quant_explicit);
+        const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_config, kv_quant_explicit);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
         const mtp_choice = scheduler_mod.mtpChoiceFor(enable_mtp, mtp_explicit, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });

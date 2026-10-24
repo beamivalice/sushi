@@ -9,7 +9,7 @@
 #   SMOKE_ARCHES=qwen4_exp ./tests/test_smoke_matrix.sh
 #   SMOKE_CONFIGS=default,kv4 ./tests/test_smoke_matrix.sh
 #   SMOKE_MAX_GB=80 ./tests/test_smoke_matrix.sh  # skip bigger packs (default: no cap)
-#   QWEN4_EXP_MODEL=<pack> MIMO_STREAM_MODEL=<pack> MIMO_SSD_BUDGET_GB=60
+#   QWEN4_EXP_MODEL=<pack> MIMO_STREAM_MODEL=<pack> MIMO_SSD_BUDGET_GB=60 DSV41_MODEL=<pack> DSV41_SSD_BUDGET_GB=88
 #
 # Configs: default (kv8) | off (--kv-quant off) | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
 # where the pack ships a head and does not stream) | nospec (--no-mtp
@@ -35,6 +35,7 @@ mkdir -p "$OUT/home"
 ARCHES=(
     "qwen4_exp|yes|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
     "mimo_v2|yes|${MIMO_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
+    "deepseek_v41|yes|${DSV41_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/deepseek-ai/DeepSeek-V4.1-Flash-1017}"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,off,kv4,mtp,nospec}"
 
@@ -81,7 +82,7 @@ trap stop EXIT
 post() { curl -s --max-time 300 "$BASE$1" -H "Content-Type: application/json" -d "$2"; }
 Q='Reply in one short sentence: what colour is the sky on a clear day?'
 TOOLS='[{"type":"function","function":{"name":"get_weather","description":"Current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
-TAGS='<think>|</think>|<\|channel>|<channel\|>|<tool_call>|<function='
+TAGS='<think>|</think>|<\|channel>|<channel\|>|<tool_call>|<function=|DSML'
 
 run_checks() { # $1 thinking yes/no, $2 has_spec yes/no
     local think="$1"
@@ -263,10 +264,13 @@ for entry in "${ARCHES[@]}"; do
 
     arch_flags=()
     [[ "$arch" == mimo_v2 ]] && arch_flags=(${MIMO_SSD_BUDGET_GB:+--ssd-budget-gb "$MIMO_SSD_BUDGET_GB"})
+    # Its routed experts always stream, so the budget is required; its KV is not a KV cache, so only default and nospec differ.
+    [[ "$arch" == deepseek_v41 ]] && arch_flags=(--ssd-budget-gb "${DSV41_SSD_BUDGET_GB:-88}")
 
     for cfg in "${WANT_CFG[@]}"; do
         CELL="$arch.$cfg"
         flags=(${arch_flags[@]+"${arch_flags[@]}"})
+        if [[ "$arch" == deepseek_v41 && "$cfg" != default && "$cfg" != nospec ]]; then skip "$CELL" "no KV cache to configure"; continue; fi
         case "$cfg" in
             default) ;;
             off)     flags+=(--kv-quant off) ;;
@@ -284,10 +288,15 @@ for entry in "${ARCHES[@]}"; do
         echo "  booted in $(( $(date +%s) - t0 ))s"
         run_checks "$think"
         if [[ "$cfg" == mtp ]]; then
-            check "mtp: engaged in the log" "$(grep -q 'spec-stats\] mode=mtp' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
+            check "mtp: engaged in the log" "$(grep -Eq 'spec-stats\] mode=(mtp|dspark)' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
+        fi
+        if [[ "$arch" == deepseek_v41 && "$cfg" == default ]]; then
+            before=$(grep -c 'spec-stats\] mode=dspark' "$OUT/$CELL.server.log")
+            post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Write two sentences about the sea.\"}],\"max_tokens\":120,\"temperature\":1,\"top_p\":0.95,\"enable_thinking\":false}" > /dev/null
+            check "dspark: a sampled request drafts" "$([[ "$(grep -c 'spec-stats\] mode=dspark' "$OUT/$CELL.server.log")" -gt "$before" ]] && echo 0 || echo 1)"
         fi
         if [[ "$cfg" == nospec ]]; then
-            check "nospec: no speculation engaged" "$(grep -Eq 'spec-stats\] mode=(mtp|drafter|dflash)' "$OUT/$CELL.server.log" && echo 1 || echo 0)"
+            check "nospec: no speculation engaged" "$(grep -Eq 'spec-stats\] mode=(mtp|dspark|drafter|dflash)' "$OUT/$CELL.server.log" && echo 1 || echo 0)"
         fi
         stop
     done

@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("log.zig");
+pub const kernel_keys = @import("mlx_kernel_keys.zig");
 
 // ── Opaque handle types ──
 pub const mlx_array = extern struct { ctx: ?*anyopaque = null };
@@ -352,19 +353,52 @@ pub extern "c" fn mlx_vector_string_free(vec: mlx_vector_string) c_int;
 // ── Custom Metal kernels ──
 pub const mlx_fast_metal_kernel_config = extern struct { ctx: ?*anyopaque = null };
 pub extern "c" fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config;
-pub extern "c" fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int;
-pub extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
+pub fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int {
+    kernel_keys.configFree(cls);
+    return raw_kernel.mlx_fast_metal_kernel_config_free(cls);
+}
+pub fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int {
+    kernel_keys.configNote(cls, " ->{t}", .{dtype});
+    return raw_kernel.mlx_fast_metal_kernel_config_add_output_arg(cls, shape, size, dtype);
+}
 pub extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
-pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+pub fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int {
+    kernel_keys.configNote(cls, " {s}={t}", .{ name, dtype });
+    return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_dtype(cls, name, dtype);
+}
 pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int {
+    kernel_keys.configNote(cls, " {s}={d}", .{ name, value });
+    return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_int(cls, name, value);
+}
 pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
-pub extern "c" fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel;
-pub extern "c" fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int;
-pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
+pub fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
+    const k = raw_kernel.mlx_fast_metal_kernel_new(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    kernel_keys.kernelNew(k, name, source, header, ensure_row_contiguous, atomic_outputs);
+    return k;
+}
+pub fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int {
+    kernel_keys.kernelFree(cls);
+    return raw_kernel.mlx_fast_metal_kernel_free(cls);
+}
+pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int {
+    kernel_keys.apply(cls, inputs, config);
+    return raw_kernel.mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, s);
+}
+
+/// The custom-kernel entry points under the wrappers above, which note each kernel's library key.
+const raw_kernel = struct {
+    extern "c" fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+    extern "c" fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel;
+    extern "c" fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int;
+    extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
+};
 
 // ── Random ──
 pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;

@@ -74,6 +74,7 @@ test "format corpus: late system notes never vanish, and a template that places 
         .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/dsv41_chat_template.jinja"), .in_place = true },
         .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
     };
     for (templates) |template| {
@@ -634,6 +635,22 @@ const corpus = [_]Expect{
         .last_tool_arg_value = "b.txt",
     },
     .{
+        // DeepSeek-V4.1 spells every DSML tag name with a leading space.
+        .family = "dsv41-dsml",
+        .name = "V4.1 spaced DSML tags after thinking",
+        .raw = "The user wants weather.</think>I'll check.\n\n<｜DSML｜ calls>\n" ++
+            "<｜DSML｜ invoke name=\"get_weather\">\n" ++
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n" ++
+            "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n" ++
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        .thinking = true,
+        .opened_by_template = true,
+        .reasoning_contains = "wants weather",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+    },
+    .{
         .family = "dsv4-dsml",
         .name = "server-cut DSML value ships completed pairs, never the fragment",
         .raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n" ++
@@ -669,6 +686,25 @@ const corpus = [_]Expect{
         .tool_count = 1,
         .tool_arg_key = "path",
         .tool_arg_value = "index.html",
+    },
+    .{
+        // Another family's invoke markup inside a value is payload, and the call stays the DSML one.
+        .family = "dsv41-dsml",
+        .name = "Anthropic invoke markup inside a DSML parameter value is payload",
+        .raw = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write_file\">\n" ++
+            "<｜DSML｜ parameter name=\"content\" string=\"true\">run <invoke name=\"bash\"><parameter name=\"command\">ls</parameter></invoke></｜DSML｜ parameter>\n" ++
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        .tool_name = "write_file",
+        .tool_count = 1,
+        .tool_arg_key = "content",
+        .tool_arg_value = "run <invoke name=\"bash\"><parameter name=\"command\">ls</parameter></invoke>",
+    },
+    .{
+        .family = "dsv41-dsml",
+        .name = "prose naming the invoke tag is not a call",
+        .raw = "Claude's format wraps each call in <invoke name=\"bash\"> tags.",
+        .no_tool_calls = true,
+        .content_exact = "Claude's format wraps each call in <invoke name=\"bash\"> tags.",
     },
     .{
         // Verbatim capture (2026-08-01, same session): the model answered a
@@ -2976,6 +3012,7 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .system_headers = 2 },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .system_headers = 0 },
         .{ .name = "role loop", .tpl = chatml, .system_headers = 2 },
     };
     const messages = [_]chat.Message{
@@ -3014,6 +3051,7 @@ test "format corpus: a forced tool_choice reaches the prompt once, on every temp
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
         .{ .name = "no tools (fallback injection)", .tpl = no_tools_chatml },
     };
     const choices = [_]chat.ToolChoice{ .required, .{ .named = "get_time" } };
@@ -3036,11 +3074,12 @@ test "format corpus: a forced call is the family's own call markup and parses ba
     // itself writes after a closed thought, or the parse chain meets a dialect the
     // template never taught the model.
     const allocator = testing.allocator;
-    const Case = struct { name: []const u8, tpl: []const u8 };
+    const Case = struct { name: []const u8, tpl: []const u8, end: []const u8 = "<|im_end|>" };
     const cases = [_]Case{
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .end = "<｜end▁of▁sentence｜>" },
     };
     const calls = [_]chat.ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
     const history = [_]chat.Message{
@@ -3064,7 +3103,7 @@ test "format corpus: a forced call is the family's own call markup and parses ba
         const rendered = try chat.renderChatTemplate(allocator, &history, &config, null, null, true, null, false);
         defer allocator.free(rendered);
         const answer_at = std.mem.lastIndexOf(u8, rendered, "</think>").? + "</think>".len;
-        const answer = rendered[answer_at .. answer_at + std.mem.indexOf(u8, rendered[answer_at..], "<|im_end|>").?];
+        const answer = rendered[answer_at .. answer_at + std.mem.indexOf(u8, rendered[answer_at..], c.end).?];
         const forced = try std.mem.concat(allocator, u8, &.{ named.sep, named.call });
         defer allocator.free(forced);
         errdefer std.debug.print("\n[{s}] forced {s}\n answer {s}\n", .{ c.name, forced, answer });
@@ -3090,11 +3129,12 @@ test "format corpus: a string value parses back byte-exact from each family's ow
     // Qwen3.8 frames a value with one newline per side; MiMo writes it bare. The
     // parser may remove only what the family's template added.
     const allocator = testing.allocator;
-    const Case = struct { name: []const u8, tpl: []const u8 };
+    const Case = struct { name: []const u8, tpl: []const u8, open: []const u8 = "<tool_call>", close: []const u8 = "</tool_call>" };
     const cases = [_]Case{
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .open = "<｜DSML｜ calls>", .close = "</｜DSML｜ calls>" },
     };
     const values = [_][]const u8{ "plain", "last line\n", "\nafter a blank line", "two blank lines\n\n", "  indented\n", "\n" };
     for (cases) |c| {
@@ -3110,8 +3150,8 @@ test "format corpus: a string value parses back byte-exact from each family's ow
             };
             const rendered = try chat.renderChatTemplate(allocator, &history, &config, null, null, true, null, false);
             defer allocator.free(rendered);
-            const start = std.mem.indexOf(u8, rendered, "<tool_call>").?;
-            const end = std.mem.indexOf(u8, rendered, "</tool_call>").? + "</tool_call>".len;
+            const start = std.mem.indexOf(u8, rendered, c.open).?;
+            const end = std.mem.indexOf(u8, rendered, c.close).? + c.close.len;
             const parsed = (try chat.parseToolCalls(allocator, rendered[start..end])) orelse return error.CallNotParsed;
             defer {
                 for (parsed) |tc| {
@@ -3140,6 +3180,7 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "muse", .tpl = @embedFile("fixtures/muse_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
     };
     const partial = "It is half past";
     const messages = [_]chat.Message{
@@ -3412,6 +3453,7 @@ test "format corpus: tool traffic renders through every served template, never t
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .media = false },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .media = false },
     };
     const one = [_]chat.ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\",\"nested\":{\"a\":[1,{\"b\":true}]}}" }};
     const two = [_]chat.ToolCall{
@@ -3498,6 +3540,7 @@ test "format corpus: a history call whose arguments are not an object still rend
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
     };
     const bad_args = [_][]const u8{ "", "null", "[]", "[1,2]", "5", "\"text\"", "not json", "{\"a\":" };
     const before = chat.template_fallbacks.load(.monotonic);

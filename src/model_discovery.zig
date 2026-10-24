@@ -60,6 +60,7 @@ const supported_model_types = [_][]const u8{
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "mimo_v2", // MiMo-V2.6-Flash: resident EXL3 packs (text + image), or the original checkpoint streamed.
     "glm5_next", // GLM-5.3-Flash (MLA + KDA hybrid MoE)
+    "deepseek_v41", // DeepSeek-V4.1-Flash: the original checkpoint, experts streamed (text only).
 };
 
 fn isSupportedModelType(model_type: []const u8) bool {
@@ -280,7 +281,7 @@ pub fn qwen4StreamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, mod
             var experts = expert_quant.QuantStore.open(allocator, model_dir, geometry) catch return null;
             experts.deinit();
         },
-        .bf16_individual, .fp8_individual, .mxfp4_split, .mxfp4_individual => {
+        .bf16_individual, .fp8_individual, .mxfp4_split, .mxfp4_individual, .mxfp4_w123 => {
             var experts = expert_quant.QuantStore.openForLayout(allocator, model_dir, geometry, layout) catch return null;
             experts.deinit();
         },

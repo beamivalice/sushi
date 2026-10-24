@@ -92,7 +92,7 @@ const HC_EXPAND: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\#pragma clang fp reassociate(off)
     \\const uint i = thread_position_in_grid.x;
-    \\if (i >= uint(ROWS) * 4u * uint(D)) return;
+    \\if (i >= threads_per_grid.x) return;
     \\const uint row = i / (4u * uint(D));
     \\const uint h = (i / uint(D)) % 4u;
     \\const uint d = i % uint(D);
@@ -151,7 +151,6 @@ pub fn hcExpand(residual: mlx.mlx_array, branch: mlx.mlx_array, post: mlx.mlx_ar
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OutT", dtype));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", sh[3]));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
     const kernel = try makeKernel(&hc_expand_kernel, "sushi_glm_hc_expand", &.{ "residual", "branch", "post", "comb" }, &.{"out"}, HC_EXPAND);
     const output = try applyKernel(kernel, &.{ residual, branch, post, comb }, cfg, s);
     defer _ = mlx.mlx_vector_array_free(output);

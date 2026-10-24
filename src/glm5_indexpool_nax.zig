@@ -30,12 +30,13 @@ pub fn outputBytes(rows: usize, pools: usize) !usize {
 const EPILOGUE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint i=thread_position_in_grid.x;
-    \\if(i>=uint(ROWS)*uint(COLS)) return;
-    \\const uint row=i/uint(COLS),col=i%uint(COLS),p=uint(first)+col;
+    \\const uint COLS=uint(dots_shape[1]);
+    \\if(i>=threads_per_grid.x) return;
+    \\const uint row=i/COLS,col=i%COLS,p=uint(first)+col;
     \\if((p+1u)*4u>uint(offset)+row+1u) {out[i]=-INFINITY;return;}
     \\float total=0.0f;
     \\for(uint h=0u;h<32u;++h) {
-    \\ const float dot=float(dots[(row*32u+h)*uint(COLS)+col]);
+    \\ const float dot=float(dots[(row*32u+h)*COLS+col]);
     \\ total+=float(InT(max(dot,0.0f)*float(weights[row*32u+h])));
     \\}
     \\out[i]=float(InT(total));
@@ -105,8 +106,6 @@ pub fn scores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: m
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, cols }, 2, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * cols, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "COLS", cols));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", .bfloat16));
         if (epi_kernel == null) epi_kernel = try kernel("sushi_glm_index_nax_epilogue", &.{ "dots", "weights", "offset", "first" }, EPILOGUE);
         const tile = try apply(&ops, epi_kernel.?, cfg, &.{ dots, weights, try scalar(&ops, offset), try scalar(&ops, first) });

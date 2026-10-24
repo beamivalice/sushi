@@ -37,8 +37,10 @@ const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const glm5_forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
+const dsv41_prefix = @import("dsv41_prefix.zig");
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
+const dspark_rows = @import("dspark_rows.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
 pub const ThinkPenalty = think_penalty.ThinkPenalty;
@@ -337,6 +339,9 @@ pub const MtpHeadRef = union(enum) {
     qwen4: *Transformer,
     /// mimo_v2: the checkpoint's trained heads; per-request rows live in `mimo_mtp.State`.
     mimo: *mimo_mtp.Head,
+    /// deepseek_v41: the DSpark stages and their windows live on the model's own state, so a request that
+    /// drafts with them (`nextDspark`) holds the model exclusively.
+    dsv41: *Transformer,
 
     /// Is this head's decode state module-owned (one per model, `Qwen4Mtp.cache`) rather
     /// than per-request? Both the scheduler and the sticky-serial arm ask this.
@@ -345,6 +350,8 @@ pub const MtpHeadRef = union(enum) {
             .qwen => false,
             // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
             .qwen4, .mimo => false,
+            // The model's own request state; its slot is exclusive through `ownsModuleDecodeState`.
+            .dsv41 => false,
         };
     }
 
@@ -359,6 +366,7 @@ pub const MtpHeadRef = union(enum) {
                 break :blk .{ .qwen4 = .{ .t = t, .st = st, .allocator = allocator } };
             },
             .mimo => |h| .{ .mimo = .{ .st = try h.newState(allocator) } },
+            .dsv41 => error.Dsv41DsparkHasNoHeadCache,
         };
     }
 
@@ -404,6 +412,7 @@ pub const MtpHeadRef = union(enum) {
                 cache.activate();
                 break :blk qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx);
             },
+            .dsv41 => error.Dsv41DsparkHasNoHeadStep,
         };
     }
 
@@ -462,6 +471,7 @@ pub const MtpHeadRef = union(enum) {
                 const out = try qwen4Step(t, id_arr, hidden, rope_offset, .none, mrope_ctx);
                 _ = mlx.mlx_array_free(out.hidden_next);
             },
+            .dsv41 => return error.Dsv41DsparkHasNoHeadStep,
         }
     }
 
@@ -476,6 +486,7 @@ pub const MtpHeadRef = union(enum) {
             // very weight the coarse head is a copy of — is not assigned yet.
             .qwen4 => |t| t.qwen4DraftRerankReady(),
             .mimo => |h| h.canRerankDrafts(),
+            .dsv41 => false,
         };
     }
 
@@ -492,6 +503,7 @@ pub const MtpHeadRef = union(enum) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
             .mimo => |h| h.draftSelect(target, x, suppress_mask),
+            .dsv41 => error.Dsv41DsparkHasNoHeadStep,
         };
     }
 
@@ -508,6 +520,7 @@ pub const MtpHeadRef = union(enum) {
             .qwen => |h| h.draftShortlist(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftShortlist(x, suppress_mask),
             .mimo => |h| h.draftShortlist(target, x, suppress_mask),
+            .dsv41 => null,
         };
     }
 
@@ -521,6 +534,7 @@ pub const MtpHeadRef = union(enum) {
             .qwen => |h| h.m5NaxCostProfile(target),
             .qwen4 => |t| mtp_mod.qwen4G17CostProfileForKv(t, kv),
             .mimo => if (target.config.expert_layout == .exl3_k4) .mimo_exl3 else .generic,
+            .dsv41 => .generic,
         };
     }
 
@@ -538,6 +552,7 @@ pub const MtpHeadRef = union(enum) {
                 }
                 break :blk null;
             },
+            .dsv41 => null,
         };
     }
 
@@ -558,6 +573,7 @@ pub const MtpHeadRef = union(enum) {
                     m.ev_seed_m_lo = m_lo;
                 }
             },
+            .dsv41 => {},
         }
     }
 };
@@ -1187,6 +1203,37 @@ pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
     return !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null;
 }
 
+/// Drafts a sampled DSpark round can verify; the checkpoint's block is 5.
+const dsv41_max_drafts = 16;
+
+/// `SUSHI_DSV41_DSPARK_ROWS` (diagnostic): `sweep` cycles the verify width over `dspark_sweep_rows`, a number forces
+/// it (rows past the block repeat its last draft, so only their cost means anything), `log` keeps the policy; each
+/// round logs a `[dspark-round]` line.
+const DsparkDiag = union(enum) { off, log, sweep, rows: u8 };
+// Odd length: the forwards alternate between a fast and a slow state, and an even cycle would pair one with each width.
+const dspark_sweep_rows = [_]u8{ 1, 2, 3, 4, 5, 6, 8 };
+var dspark_diag_cache: ?DsparkDiag = null;
+
+fn dsparkDiag() DsparkDiag {
+    if (dspark_diag_cache) |d| return d;
+    const raw = std.c.getenv("SUSHI_DSV41_DSPARK_ROWS");
+    const d: DsparkDiag = if (raw) |r| blk: {
+        const v = std.mem.span(r);
+        if (std.mem.eql(u8, v, "sweep")) break :blk .sweep;
+        if (std.mem.eql(u8, v, "log")) break :blk .log;
+        break :blk if (std.fmt.parseInt(u8, v, 10)) |n| .{ .rows = std.math.clamp(n, 1, dsv41_max_drafts + 1) } else |_| .off;
+    } else .off;
+    dspark_diag_cache = d;
+    return d;
+}
+
+/// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
+/// rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`), after which the request
+/// decodes serially.
+pub fn dsparkEligible(sampling: SamplingParams, logprobs_n: u32) bool {
+    return !mtpUnsupported(sampling, logprobs_n);
+}
+
 /// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
 /// agrees back `mtp_lookup.STRONG_SUFFIX` tokens and the budget holds the whole chain.
 pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@import("glm5_dflash.zig").Proposal {
@@ -1464,8 +1511,10 @@ fn restorableCheckpoint(glm: ?*glm5_forward.Request, pos: usize) bool {
     return glm == null or pos % glm5_prefix.pool_size == 0;
 }
 
-/// A prefill checkpoint at absolute `pos`: the slot's SSM entries, or the GLM request's KDA state.
-fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Transformer, ctx: *const ForwardCtx, glm: ?*glm5_forward.Request, pos: usize) !SSMCheckpoint {
+/// A prefill checkpoint at absolute `pos`: the slot's SSM entries, the GLM request's KDA state, or DeepSeek's whole request state.
+/// `to_ssd`: a write-through takes the point to the SSD tier before the next forward, so DeepSeek's shares its rows.
+fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Transformer, ctx: *const ForwardCtx, glm: ?*glm5_forward.Request, pos: usize, to_ssd: bool) !SSMCheckpoint {
+    if (xfm.dsv41) |m| return if (to_ssd and pos >= @import("kv_disk_cache.zig").MIN_PERSIST_TOKENS) dsv41_prefix.captureShared(allocator, m, pos) else dsv41_prefix.capture(allocator, m, pos);
     if (glm) |request| {
         if (request.offset != pos) return error.GlmCachePositionMismatch;
         return glm5_prefix.captureKda(allocator, request, xfm.s);
@@ -1778,6 +1827,12 @@ pub const Generator = struct {
     dflash_attempted: u64 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
+    /// deepseek_v41: this request drafts with DSpark (`nextDspark`) over the model's own state.
+    dspark: bool = false,
+    /// Forces the verify width (the `SUSHI_DSV41_DSPARK_ROWS` diagnostic, and the tests).
+    dspark_diag: DsparkDiag = .off,
+    dspark_policy: dspark_rows.Policy = .{},
+    dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dsv41_max_drafts + 2]u32 = @splat(0) } = .{},
     /// Per-phase wall-time trace (SUSHI_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
@@ -2099,6 +2154,32 @@ pub const Generator = struct {
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
+        if (self.dspark and self.dspark_stats.rounds > 0) {
+            const st = self.dspark_stats;
+            const rounds: f64 = @floatFromInt(st.rounds);
+            const round_ms = @as(f64, @floatFromInt(st.draft_ns + st.verify_ns)) / rounds / 1e6;
+            const per_round = @as(f64, @floatFromInt(st.accepted)) / rounds;
+            var rows_buf: [160]u8 = undefined;
+            var rows_w = std.Io.Writer.fixed(&rows_buf);
+            for (st.rows_hist, 0..) |n, r| if (n > 0) rows_w.print("{s}{d}:{d}", .{ if (rows_w.end > 0) "," else "", r, n }) catch break;
+            log.info(
+                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% drafted={d} draft_ms={d:.1} verify_ms={d:.1} round_ms={d:.1} tok_s={d:.2} plain={d} rows={s}\n",
+                .{
+                    st.rounds,
+                    st.accepted,
+                    per_round,
+                    if (st.drafted > 0) 100.0 * @as(f64, @floatFromInt(st.accepted)) / @as(f64, @floatFromInt(st.drafted)) else 0.0,
+                    st.drafted,
+                    @as(f64, @floatFromInt(st.draft_ns)) / rounds / 1e6,
+                    @as(f64, @floatFromInt(st.verify_ns)) / rounds / 1e6,
+                    round_ms,
+                    (per_round + 1.0) * 1000.0 / round_ms,
+                    st.plain,
+                    rows_w.buffered(),
+                },
+            );
+            return;
+        }
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
@@ -2330,6 +2411,9 @@ pub const Generator = struct {
         /// behavior to the regular sampling path. Has no effect when
         /// `drafter_enabled` is true.
         skip_lazy_preforward: bool = false,
+        /// deepseek_v41: decode with DSpark rounds (`dsparkEligible`); the pending token is
+        /// then not in the cache, as after a skipped lazy pre-forward.
+        dspark_enabled: bool = false,
         /// Phase 1 (performance-plan): during prefill, capture an SSM
         /// checkpoint every `ssm_checkpoint_stride` tokens. 0 = disabled.
         /// Snapshots land in `Generator.ssm_checkpoints` for the caller to
@@ -2541,6 +2625,7 @@ pub const Generator = struct {
         ), options.decode_share_width_cap);
         // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
         const trace_enabled = log.isDebug();
+        const chunk_peak = trace_enabled and transformer_mod.diagEnvOn("SUSHI_PREFILL_CHUNK_PEAK");
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
@@ -2564,7 +2649,7 @@ pub const Generator = struct {
         const glm_request = ctx.glm5_request;
         const want_ssm_cp = shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
-            (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,
+            (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null or xfm.dsv41 != null,
             has_vision,
         );
         // The snapshot backoff: a checkpoint AT the prompt end is
@@ -2905,6 +2990,8 @@ pub const Generator = struct {
                     var mem_buf: [256]u8 = undefined;
                     const line = formatPrefillMemLine(&mem_buf, pos, end, eval_dt / std.time.ns_per_ms, mlxPrefillMem());
                     log.debug("{s}", .{line});
+                    // The next line's peak is then its own chunk's: what a transient bill is fitted to.
+                    if (chunk_peak) _ = mlx.mlx_reset_peak_memory();
                 }
 
                 // This chunk's latch, read before anything persists it, snapshots it or yields
@@ -2918,7 +3005,7 @@ pub const Generator = struct {
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
                 if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) {
-                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
+                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2, options.write_through_hook != null);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
                         doomed.deinit(allocator);
@@ -3037,12 +3124,14 @@ pub const Generator = struct {
                     // may have been a stride-aligned one (already evaluated)
                     // or a partial tail (also evaluated). The snapshot is a
                     // cheap refcount-share.
-                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, final_abs);
+                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, final_abs, options.write_through_hook != null);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
                         doomed.deinit(allocator);
                         return e;
                     };
+                    // DeepSeek's shared point leaves before the final span appends to the rows it views.
+                    if (xfm.dsv41 != null) if (options.write_through_hook) |wt| wt.call(wt.ctx, final_abs, ssm_checkpoints.items);
                     ssm_cp_peak = @max(ssm_cp_peak, @as(u32, @intCast(ssm_checkpoints.items.len)));
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
@@ -3346,7 +3435,7 @@ pub const Generator = struct {
         // in cache — matches `forwardBatchedDecode`'s expectation and
         // the drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
-        if (options.skip_lazy_preforward) {
+        if (options.skip_lazy_preforward or options.dspark_enabled) {
             const sample_lazy = try firstTokenSample(xfm, logits, sampling, s);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
@@ -3385,6 +3474,8 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
+                .dspark = options.dspark_enabled and dsparkEligible(sampling, options.logprobs_n),
+                .dspark_diag = dsparkDiag(),
             };
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
@@ -4253,6 +4344,153 @@ pub const Generator = struct {
             self.finish_reason = "stop";
         }
         return .{ .tokens = tokens, .accepted_tokens = @intCast(round.accepted_drafts) };
+    }
+
+    /// One DSpark round (deepseek_v41, greedy): the stages draft a block from the pending token, a verify chunk
+    /// `[t1, drafts]` reads it through the trunk, and the longest prefix of drafts the trunk's own argmax agrees with
+    /// stays, with the trunk's token after it pending. The model cuts its state back to the kept rows.
+    pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.done) return null;
+        if (!self.dspark) return error.SpecDecodeUnsupported;
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+            return null;
+        }
+        if (try self.checkStop()) return null;
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const t1 = self.next_token_id;
+        const diag = self.dspark_diag;
+        var timer = io_util.Stopwatch.init(self.timer.io);
+
+        const policy = &self.dspark_policy;
+        const forced: ?usize = switch (diag) {
+            .off, .log => if (policy.next() == .plain) 1 else null,
+            .rows => |n| n,
+            .sweep => dspark_sweep_rows[self.dspark_stats.rounds % dspark_sweep_rows.len],
+        };
+        var ids_buf: [dsv41_max_drafts + 1]u32 = undefined;
+        var conf_buf: [dsv41_max_drafts]f32 = @splat(0);
+        var block: ?@import("dsv41_model.zig").Draft = null;
+        defer if (block) |*b| b.deinit();
+        var block_len: usize = 1;
+        if (forced == null or forced.? > 1) {
+            block = try xfm.dsv41Draft(t1);
+            block_len = block.?.ids.len;
+            @memcpy(ids_buf[0..block_len], block.?.ids);
+            @memcpy(conf_buf[0 .. block_len - 1], block.?.conf);
+        } else ids_buf[0] = t1;
+        const draft_ns = timer.read();
+        timer.reset();
+        if (forced) |f| if (f > block_len) for (block_len..f) |i| {
+            ids_buf[i] = ids_buf[block_len - 1];
+        };
+        // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
+        const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
+        const rows: usize = @min(wanted, self.max_tokens - self.completion_tokens);
+        const ctx_before = self.ctx.cache.step;
+        var logits = try xfm.dsv41Verify(&self.ctx, ids_buf[0..rows]);
+        defer _ = mlx.mlx_array_free(logits);
+        if (self.sampling.think_penalty.active() or penaltyActive(self.sampling)) {
+            var row_ids: [dsv41_max_drafts + 1]i32 = undefined;
+            if (rows > row_ids.len) return error.SpecDecodeUnsupported;
+            for (ids_buf[0..rows], row_ids[0..rows]) |id, *o| o.* = @intCast(id);
+            const row_ids_arr = mlx.mlx_array_new_data(&row_ids, &[_]c_int{ 1, @intCast(rows) }, 2, .int32);
+            defer _ = mlx.mlx_array_free(row_ids_arr);
+            _ = try self.thinkShiftRows(&logits, row_ids_arr);
+            _ = try self.penaltyShiftRows(&logits, row_ids_arr);
+        }
+        var accepted: u32 = 0;
+        var pending: u32 = 0;
+        if (isGreedyTemperature(self.sampling.temperature)) {
+            var verified = try verifyArgmax(logits, self.sampling.suppress_mask, s);
+            defer verified.deinit();
+            try mlx.check(mlx.mlx_array_eval(verified.lazy()));
+            const best = try verified.ids(rows);
+            while (accepted + 1 < rows and @as(u32, @intCast(best[accepted])) == ids_buf[1 + accepted]) accepted += 1;
+            pending = @intCast(best[accepted]);
+        } else {
+            const verdict = try self.dsparkSampledVerdict(logits, ids_buf[1..rows]);
+            accepted = verdict.accepted;
+            pending = verdict.pending;
+        }
+        try xfm.dsv41Finish(&self.ctx, accepted);
+        const verify_ns = timer.read();
+
+        const n_commit: usize = 1 + accepted;
+        const tokens = try allocator.dupe(u32, ids_buf[0..n_commit]);
+        errdefer allocator.free(tokens);
+        try self.generated_ids.appendSlice(allocator, tokens);
+        self.advanceStep(@intCast(n_commit));
+        self.next_token_id = pending;
+        const st = &self.dspark_stats;
+        st.rounds += 1;
+        st.plain += @intFromBool(rows == 1);
+        st.rows_hist[rows] += 1;
+        st.drafted += rows - 1;
+        st.accepted += accepted;
+        st.draft_ns += draft_ns;
+        st.verify_ns += verify_ns;
+        if (diag == .off or diag == .log) {
+            const ms = struct {
+                fn of(ns: u64) f32 {
+                    return @floatCast(@as(f64, @floatFromInt(ns)) / 1e6);
+                }
+            }.of;
+            if (block == null) policy.observePlain(ms(verify_ns)) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, ms(draft_ns), ms(verify_ns));
+        }
+        if (dsparkDiag() != .off) log.info("  [dspark-round] ctx={d} rows={d} accepted={d} draft_ms={d:.1} verify_ms={d:.1} gate={s} conf={any}\n", .{
+            ctx_before,
+            rows,
+            accepted,
+            @as(f64, @floatFromInt(draft_ns)) / 1e6,
+            @as(f64, @floatFromInt(verify_ns)) / 1e6,
+            @tagName(policy.gate.mode),
+            conf_buf[0 .. block_len - 1],
+        });
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+        return .{ .tokens = tokens, .accepted_tokens = accepted };
+    }
+
+    /// The longest accepted prefix of point-mass `drafts` against the verify rows' filtered densities (keep a
+    /// draft with probability p), and the token pending after it: the residual sample at the first reject, or the
+    /// bonus draw from the last row on a full accept. The output distribution is the serial sampler's.
+    fn dsparkSampledVerdict(self: *Generator, logits: mlx.mlx_array, drafts: []const u32) !struct { accepted: u32, pending: u32 } {
+        const s = self.xfm.s;
+        const m: u32 = @intCast(drafts.len);
+        const probs = try probsAllPositions(logits, self.sampling, s);
+        defer _ = mlx.mlx_array_free(probs);
+        if (m == 0) {
+            const drawn = try sampleFromProbsLazy(probs, self.mtpSamplingDraw(self.sampling), s);
+            defer _ = mlx.mlx_array_free(drawn);
+            try mlx.check(mlx.mlx_array_eval(drawn));
+            var id: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&id, drawn));
+            return .{ .accepted = 0, .pending = @intCast(id) };
+        }
+        var arrs: [dsv41_max_drafts]mlx.mlx_array = undefined;
+        if (m > arrs.len) return error.SpecDecodeUnsupported;
+        var built: usize = 0;
+        defer for (arrs[0..built]) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (drafts) |d| {
+            const id: i32 = @intCast(d);
+            arrs[built] = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
+            built += 1;
+        }
+        var graph = try mtpBatchedAcceptGraph(probs, arrs[0..m], null, m, self.mtpSamplingDraw(self.sampling), s);
+        defer graph.deinit();
+        try mlx.check(mlx.mlx_array_eval(graph.accept_p));
+        try mlx.check(mlx.mlx_array_eval(graph.corr_samples));
+        const p = mlx.mlx_array_data_float32(graph.accept_p) orelse return error.MlxArrayDataNull;
+        const corr = mlx.mlx_array_data_int32(graph.corr_samples) orelse return error.MlxArrayDataNull;
+        const accepted = mtp_acceptance.exactPrefix(p[0..m], null, null, &self.prng);
+        return .{ .accepted = accepted, .pending = @intCast(corr[accepted]) };
     }
 
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
@@ -5450,7 +5688,7 @@ pub const Generator = struct {
             if (g.mtpMropeContext() != null) any_mrope = true;
             switch (g.mtp.?) {
                 .qwen4 => {},
-                .qwen, .mimo => all_qwen4 = false,
+                .qwen, .mimo, .dsv41 => all_qwen4 = false,
             }
         }
         if (!all_qwen4 or any_mrope or gens.len == 1) {
@@ -19961,4 +20199,528 @@ test "MTP depth bounds: a lookup draft is never wider than an explicit max" {
     const cap = depth_bounds.lookupCap(Generator.mtpLookupDraftCap(false), .{ .max = 3 });
     const got = idx.match(1, cap) orelse return error.NoMatch;
     try testing.expectEqual(@as(usize, 3), got.draft.len);
+}
+
+test "dsv41 generator: DSpark rounds through the Generator keep the budget, the stats and the first token (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.dsv41.?.dspark != null and xfm.moduleStateSpecRollback());
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const prompt = ids[0..30];
+    const want: u32 = 30;
+
+    var serial: std.ArrayList(u32) = .empty;
+    defer serial.deinit(a);
+    {
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .skip_lazy_preforward = true });
+        defer gen.deinit(a);
+        while (try gen.next(a)) |t| try serial.append(a, t);
+    }
+    try testing.expectEqual(@as(usize, want), serial.items.len);
+    try xfm.resetCache();
+
+    var spec: std.ArrayList(u32) = .empty;
+    defer spec.deinit(a);
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    try testing.expect(gen.dspark);
+    var accepted_sum: u64 = 0;
+    while (try gen.nextDspark(a)) |r| {
+        defer a.free(r.tokens);
+        try testing.expectEqual(@as(usize, r.accepted_tokens) + 1, r.tokens.len);
+        accepted_sum += r.accepted_tokens;
+        try spec.appendSlice(a, r.tokens);
+    }
+    // The bf16 span rows and the one-row decode round differently, so a near-tie may break either way: byte
+    // identity with serial is pinned on the exact stream in dsv41_model.zig and on a real pack by the live check.
+    try testing.expectEqual(serial.items.len, spec.items.len);
+    try testing.expectEqual(serial.items[0], spec.items[0]);
+    try testing.expect(gen.dspark_stats.rounds > 0);
+    try testing.expectEqual(accepted_sum, gen.dspark_stats.accepted);
+    try testing.expect(gen.dspark_stats.accepted <= gen.dspark_stats.drafted);
+    try testing.expectEqualStrings("length", gen.finish_reason);
+
+    // A forced verify width keeps the budget and the first token; one row is the serial decode step itself.
+    for ([_]u8{ 1, 2, 3, 4, 6 }) |width| {
+        try xfm.resetCache();
+        var w = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer w.deinit(a);
+        w.dspark_diag = .{ .rows = width };
+        var got: std.ArrayList(u32) = .empty;
+        defer got.deinit(a);
+        while (try w.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try testing.expect(r.tokens.len <= width);
+            try got.appendSlice(a, r.tokens);
+        }
+        try testing.expectEqual(serial.items.len, got.items.len);
+        try testing.expectEqual(serial.items[0], got.items[0]);
+        try testing.expect(w.dspark_stats.drafted <= w.dspark_stats.rounds * (width - 1));
+        if (width == 1) try testing.expectEqualSlices(u32, serial.items, got.items);
+    }
+
+    // A repeat penalty shifts the verify rows by the ids before them, as a serial tick does: no id repeats.
+    const penalized_params = SamplingParams{ .temperature = 0.0, .repeat_penalty = 10.0 };
+    var distinct: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&distinct) |*r| r.deinit(a);
+    {
+        try xfm.resetCache();
+        var g = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, penalized_params, &.{}, .{ .skip_lazy_preforward = true });
+        defer g.deinit(a);
+        while (try g.next(a)) |t| try distinct[0].append(a, t);
+        try xfm.resetCache();
+        var d = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, penalized_params, &.{}, .{ .dspark_enabled = true });
+        defer d.deinit(a);
+        try testing.expect(d.dspark);
+        while (try d.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try distinct[1].appendSlice(a, r.tokens);
+        }
+        try testing.expect(d.dspark_stats.rounds > 0);
+    }
+    for (distinct) |list| {
+        try testing.expectEqual(@as(usize, want), list.items.len);
+        for (list.items, 0..) |t, i| try testing.expect(std.mem.indexOfScalar(u32, list.items[0..i], t) == null);
+    }
+    var logprob_req = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 4, .{ .temperature = 0.8 }, &.{}, .{ .dspark_enabled = true, .logprobs_n = 2 });
+    defer logprob_req.deinit(a);
+    try testing.expect(!logprob_req.dspark);
+    try testing.expectError(error.SpecDecodeUnsupported, logprob_req.nextDspark(a));
+
+    // A sampled request drafts too: the verify rows take the exact rule for a point-mass draft. A seeded stream
+    // repeats only at a fixed verify width: the adaptive width follows measured ms, so it differs under GPU load.
+    const sampled_params = SamplingParams{ .temperature = 0.8, .seed = 7 };
+    var runs: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&runs) |*r| r.deinit(a);
+    for (&runs) |*out| {
+        try xfm.resetCache();
+        var sampled = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, sampled_params, &.{}, .{ .dspark_enabled = true });
+        defer sampled.deinit(a);
+        try testing.expect(sampled.dspark);
+        sampled.dspark_diag = .{ .rows = 3 };
+        while (try sampled.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try out.appendSlice(a, r.tokens);
+        }
+        try testing.expect(sampled.dspark_stats.rounds > 0);
+        try testing.expectEqualStrings("length", sampled.finish_reason);
+    }
+    try testing.expectEqual(@as(usize, want), runs[0].items.len);
+    try testing.expectEqualSlices(u32, runs[0].items, runs[1].items);
+    {
+        try xfm.resetCache();
+        var adaptive = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, sampled_params, &.{}, .{ .dspark_enabled = true });
+        defer adaptive.deinit(a);
+        var n: usize = 0;
+        while (try adaptive.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            n += r.tokens.len;
+        }
+        try testing.expectEqual(@as(usize, want), n);
+        try testing.expectEqualStrings("length", adaptive.finish_reason);
+    }
+
+    // One verified row draws its pending token from the filtered row: seeded, repeatable, not a placeholder.
+    var single: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&single) |*r| r.deinit(a);
+    for (&single) |*out| {
+        try xfm.resetCache();
+        var one = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, sampled_params, &.{}, .{ .dspark_enabled = true });
+        defer one.deinit(a);
+        one.dspark_diag = .{ .rows = 1 };
+        while (try one.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try out.appendSlice(a, r.tokens);
+        }
+    }
+    try testing.expectEqual(@as(usize, want), single[0].items.len);
+    try testing.expectEqualSlices(u32, single[0].items, single[1].items);
+    try testing.expect(std.mem.count(u32, single[0].items, &.{single[0].items[1]}) < want - 1);
+}
+
+test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+
+    var baseline: usize = 0;
+    var active: usize = 0;
+    for (0..12) |i| {
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        gen.deinit(a);
+        if (i == 3) try mlx.check(mlx.mlx_get_active_memory(&baseline));
+    }
+    try mlx.check(mlx.mlx_get_active_memory(&active));
+    try testing.expect(active <= baseline + 64 * 1024);
+}
+
+test "dsv41 generator: serial decode serves sampling, penalties and logprobs, one request after another (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const prompt = ids[0..30];
+    const want: u32 = 12;
+    const cases = [_]struct { sampling: SamplingParams, logprobs: u32 }{
+        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 0 },
+        .{ .sampling = .{ .temperature = 0.8, .top_p = 0.9, .top_k = 20, .seed = 5 }, .logprobs = 0 },
+        .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 5 }, .logprobs = 0 },
+        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 3 },
+    };
+    for (cases) |c| {
+        var runs: [2]std.ArrayList(u32) = .{ .empty, .empty };
+        defer for (&runs) |*r| r.deinit(a);
+        for (&runs) |*out| {
+            try xfm.resetCache();
+            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, c.sampling, &.{}, .{ .skip_lazy_preforward = true, .logprobs_n = c.logprobs });
+            defer gen.deinit(a);
+            gen.logprobs_n = c.logprobs;
+            while (try gen.next(a)) |t| {
+                try out.append(a, t);
+                if (c.logprobs > 0) {
+                    const lp = gen.last_logprob orelse return error.MissingLogprobs;
+                    try testing.expectEqual(@as(usize, c.logprobs), lp.top_logprobs.len);
+                }
+            }
+        }
+        try testing.expectEqual(@as(usize, want), runs[0].items.len);
+        try testing.expectEqualSlices(u32, runs[0].items, runs[1].items);
+    }
+}
+
+test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its closer and decodes the rest serially (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const closer: u32 = 4;
+    const forced = [_]u32{ 3, closer, 10 };
+    var bound = ThinkBound{ .budget = 6, .opener_id = null, .closer_id = closer, .forced = &forced, .in_think = true };
+    const want: u32 = 30;
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], want, .{ .temperature = 0.0, .think_bound = &bound }, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    try testing.expect(gen.dspark);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    // The scheduler's order: the bound is checked before every tick; a fired bound decodes serially.
+    while (true) {
+        bound.observe(gen.generated_ids.items);
+        if (bound.due()) {
+            bound.fired = true;
+            const r = try gen.commitForcedTokens(a, &forced);
+            defer a.free(r.emitted);
+            try out.appendSlice(a, r.emitted);
+            if (r.stopped) break;
+            continue;
+        }
+        if (bound.fired) {
+            const t = (try gen.next(a)) orelse break;
+            try out.append(a, t);
+        } else {
+            const r = (try gen.nextDspark(a)) orelse break;
+            defer a.free(r.tokens);
+            try out.appendSlice(a, r.tokens);
+        }
+    }
+    try testing.expect(bound.fired);
+    // The last forced id stays pending and is emitted by the serial tick that follows.
+    const at = std.mem.indexOf(u32, out.items, forced[0 .. forced.len - 1]) orelse return error.ForcedTokensMissing;
+    try testing.expectEqual(forced[forced.len - 1], out.items[at + forced.len - 1]);
+    try testing.expect(at >= bound.budget);
+    try testing.expectEqual(@as(usize, want), out.items.len);
+}
+
+test "dspark eligibility: sampled, penalized and thinking-bound requests draft, logprobs do not" {
+    try testing.expect(dsparkEligible(.{ .temperature = 0.0 }, 0));
+    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .top_p = 0.9, .top_k = 40 }, 0));
+    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .repeat_penalty = 1.1 }, 0));
+    try testing.expect(dsparkEligible(.{ .temperature = 0.0, .presence_penalty = 0.5 }, 0));
+    try testing.expect(!dsparkEligible(.{ .temperature = 1.0 }, 3));
+    var bound = ThinkBound{ .budget = 10, .opener_id = null, .closer_id = 1, .forced = &.{}, .in_think = true };
+    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .think_bound = &bound }, 0));
+}
+
+test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restore at one prefills its suffix exactly like cold (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+
+    var first: [100]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = ids[i % ids.len];
+    var next: [100]u32 = undefined;
+    @memcpy(next[0..80], first[0..80]);
+    for (next[80..], 80..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+    const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .ssm_checkpoint_stride = 16, .ssm_checkpoint_max = 4 };
+
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &first, 4, greedy, &.{}, opts);
+    defer gen.deinit(a);
+    // The tiny prompt is one chunk, so the prompt-end snapshot (99 - 30) is the only restore point.
+    try testing.expectEqual(@as(usize, 1), gen.ssm_checkpoints.items.len);
+    try testing.expectEqual(@as(usize, 69), gen.ssm_checkpoints.items[0].pos);
+
+    try xfm.resetCache();
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    {
+        var cold = try Generator.initWithOptions(io, a, &xfm, &tok, &next, 6, greedy, &.{}, opts);
+        defer cold.deinit(a);
+        try want.append(a, cold.next_token_id);
+        while (try cold.next(a)) |t| try want.append(a, t);
+    }
+
+    // The first request's own checkpoint at 69 serves the second, which shares 80 tokens with it.
+    try xfm.resetCache();
+    try dsv41_prefix.restore(xfm.dsv41.?, &gen.ssm_checkpoints.items[0], &next);
+    xfm.cache.step = 69;
+    var warm_opts = opts;
+    warm_opts.ssm_checkpoint_pos_offset = 69;
+    var warm = try Generator.initWithOptions(io, a, &xfm, &tok, next[69..], 6, greedy, &.{}, warm_opts);
+    defer warm.deinit(a);
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(a);
+    try got.append(a, warm.next_token_id);
+    while (try warm.next(a)) |t| try got.append(a, t);
+    try testing.expectEqualSlices(u32, want.items, got.items);
+}
+
+test "dsv41 generator: under a write-through every restore point the tier takes is gone before the next forward, and the tokens do not move (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const floor = @import("kv_disk_cache.zig").MIN_PERSIST_TOKENS;
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    var prompt: [1400]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
+    const saved_chunk = prefill_chunk_override;
+    defer prefill_chunk_override = saved_chunk;
+    prefill_chunk_override = 256;
+    const base: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 256, .adaptive_chunk_width = false, .ssm_checkpoint_stride = 256, .ssm_checkpoint_max = 4 };
+
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    {
+        // The load takes each tensor out of the map, so each model reads its own.
+        var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+        defer weights.deinit();
+        var xfm = try Transformer.init(io, a, config, &weights);
+        defer xfm.deinit();
+        var kept = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 6, greedy, &.{}, base);
+        defer kept.deinit(a);
+        try want.append(a, kept.next_token_id);
+        while (try kept.next(a)) |t| try want.append(a, t);
+    }
+
+    // The tier's part: past its floor it takes every point it is shown and releases it, the newest too.
+    const Tier = struct {
+        seen: [256]usize = undefined,
+        n: usize = 0,
+        fn call(ctx: *anyopaque, pos: usize, cps: []SSMCheckpoint) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen[self.n] = pos;
+            self.n += 1;
+            if (pos < floor) return;
+            for (cps) |*cp| cp.release();
+        }
+    };
+    var tier = Tier{};
+    var opts = base;
+    opts.write_through_hook = .{ .ctx = &tier, .call = Tier.call };
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 6, greedy, &.{}, opts);
+    defer gen.deinit(a);
+    // Points at 256, 512 and 768 and the prompt-end snapshot at 1369, which the tier sees before the final span runs.
+    try testing.expectEqual(@as(usize, 1369), tier.seen[tier.n - 1]);
+    try testing.expectEqual(@as(usize, 4), gen.ssm_checkpoints.items.len);
+    for (gen.ssm_checkpoints.items) |*cp| try testing.expect(cp.isReleased());
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(a);
+    try got.append(a, gen.next_token_id);
+    while (try gen.next(a)) |t| try got.append(a, t);
+    try testing.expectEqualSlices(u32, want.items, got.items);
+}
+
+test "dsv41 generator: after a DSpark request the slot cache marks its rows and snapshots like the scheduler's commit (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    // The scheduler's slot owns a cache with one entry per layer; the Transformer's own is a shell.
+    // `initSlot` hands every slot the engine's default KV scheme, whatever the pack reports.
+    var slot_cache = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+    defer slot_cache.deinit();
+    if (config.swaRingTokens() > 0) slot_cache.setSwaRing(config.sliding_window);
+    var off: usize = 0;
+    var ctx = xfm.defaultCtx();
+    ctx.cache = &slot_cache;
+    ctx.moe_seq_offset = &off;
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 12, .{ .temperature = 0.0 }, &.{}, .{ .ctx = ctx, .dspark_enabled = true, .ssm_checkpoint_stride = 8, .ssm_checkpoint_max = 4 });
+    defer gen.deinit(a);
+    while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+    try testing.expect(slot_cache.step > 0);
+    // the scheduler's commit: the generator's checkpoints and the whole token record, SSD-first with no RAM tier
+    const cps = gen.takeSsmCheckpoints();
+    var total: std.ArrayList(u32) = .empty;
+    defer total.deinit(a);
+    try total.appendSlice(a, ids[0..30]);
+    try total.appendSlice(a, gen.generated_ids.items);
+    try dsv41_prefix.markRows(&slot_cache);
+    var snap = try slot_cache.snapshotRetained(xfm.s);
+    defer snap.deinit();
+    try testing.expectEqual(slot_cache.step, snap.step);
+    try testing.expect(snap.entries[0].initialized);
+    const prefix_cache = @import("prefix_cache.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    var hc = prefix_cache.HotPrefixCache.initWithMem(a, 0, 0);
+    defer hc.deinit();
+    hc.ssd_first = true;
+    hc.disk = try @import("kv_disk_cache.zig").DiskTier.init(a, testing.io, base, "dsv41-live", 0, 128);
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+    const st = try hc.commitWithRing(&slot_cache, total.items, false, 0, 0, null, if (cps.len > 0) cps else null, null, null, 30, .{});
+    try testing.expect(st == .disk_only);
+    try testing.expect(hc.pending_disk != null);
 }

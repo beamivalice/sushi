@@ -81,6 +81,19 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
   and writes `P.ack`. A volume without room for every remaining boundary, id and logits row plus 16 GiB is refused
   before the first batch (`GlmLayerMajorDiskTooSmall`).
 
+<a id="dsv41-kld"></a>
+### DeepSeek-V4.1
+
+`kld capture` and `compare` run `deepseek_v41` through the generic path, streamed (`--ssd-budget-gb` is required; the
+load names it before touching the GPU). The state is the activation dtype and the model keeps its own, so a flag that
+would silently do nothing is refused by name at load (`refuseForDsv41`): `--kv-quant` (`Dsv41KvQuantUnsupported`),
+`--qwen-gdn 16` (`Dsv41HasNoQwenGdnState`), `--hidden-out` (`Dsv41HiddenCaptureUnsupported`) and `SUSHI_IMATRIX_OUT`
+(`Dsv41ImatrixCaptureUnsupported`). The teacher is exact routing: `capture` refuses `--drop-expert` and
+`--expert-pick-tolerance`; `compare --drop-expert n` scores a pruned student against it
+([dsv41-arch](dsv41-arch.md#drop-expert)). `SUSHI_DSV41_COMPOSED=1` runs the op chains in place of the fused kernels, the
+teacher arm of a fused-kernel A/B.
+A tiny-model test (`DSV41_TINY`) captures a teacher and compares it in both arms.
+
 ## Bundled four-prompt screen
 
 `--prompts standard4` uses four prompts compiled into the CLI: deterministic Python

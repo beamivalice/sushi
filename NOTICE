@@ -17,6 +17,11 @@ The confidence calibration and row choice in src/dflash_policy.zig follow
 mlx-serve src/dflash_policy.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE.
 
+The DeepSeek-V4.1 image plan, letterbox box and aligner unfold in src/dsv41_vision.zig
+follow mlx-serve src/dsv41_vision.zig (https://github.com/ddalcu/mlx-serve),
+Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; their numbers are
+re-derived against the release's inference/image_processor.py and vision.py.
+
 The lattice and best-first draft tree in src/glm5_dflash_tree.zig are adapted
 from mlx-serve src/dflash.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE. Its tree policy
@@ -43,6 +48,50 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+MIT License
+================================================================================
+
+--------------------------------------------------------------------------------
+DeepSeek-V4.1-Flash reference implementation
+https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+Copyright (c) 2023 DeepSeek
+Licensed under the MIT License:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The DeepSeek-V4.1 forward in src/dsv41_model.zig follows the release's
+`inference/model.py` (attention, compressor and indexer, hyper-connections,
+router, Engram and DSpark stages), the fake-quantization round trips in
+src/dsv41_qat.zig follow `act_quant` and `fp4_act_quant` in `inference/kernel.py`,
+the n-gram hash and compressed vocabulary map in src/dsv41_engram.zig follow
+`inference/engram.py`, and the image processor and tower in src/dsv41_vision.zig
+follow `inference/image_processor.py` and `inference/vision.py`. All are
+implemented in Zig against mlx-c with SSD-streamed expert banks.
+`src/fixtures/dsv41_chat_template.jinja` is a Jinja transcription of the
+release's `encoding/encoding.py`, and `src/fixtures/dsv41_template_cases.json`
+and `src/fixtures/dsv41_engram_token_map.bin` are generated from that encoder and
+the release's tokenizer. tests/dump_dsv41_fixtures.py,
+tests/dump_dsv41_template_cases.py, tests/dump_dsv41_token_map.py and
+tests/dump_dsv41_vision_fixtures.py run the unmodified reference externally to
+generate independent numerical fixtures.
 
 ================================================================================
 Apache License, Version 2.0
@@ -337,6 +386,28 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     Modifications: scoped to the common prelude, the qwen4_exp branch and
     discovery; qwen4_exp adds a geometry refusal, and the fixtures are the
     served packs' configs.
+  * The DeepSeek-V4.1-Flash arm (`src/dsv41_*.zig`, `src/fixtures/dsv41_chat_template.jinja`,
+    `src/fixtures/dsv41_engram_token_map.bin`, the spaced DSML tags in `src/chat.zig`), from
+    mlx-serve's `src/deepseek_v41.zig`, `src/dsv41_engram.zig` and `src/chat.zig` at f1c3276f
+    by David Dalcu. Modifications: the MLX-native path only (no embedded ds4 engine); the
+    op scope, Engram lookup, attention and indexer formulation were rewritten against the
+    release's `inference/model.py` and pinned to it by a tiny-model oracle, the expert
+    stream rides sushi's shared expert cache, and the template
+    cases are regenerated from the release's encoder. The fused Metal kernels
+    (`src/dsv41_kernels.zig`) are the `dsv41_*` kernels of the same file at 49bb6be0, with
+    the expert dots rewritten for the release's mxfp4 banks (upstream's are affine repacks),
+    MLX's own exp, cos and sin, and the rotary, hyper-connection and Engram indexing adapted
+    to the original checkpoint layout. The release itself is MIT, Copyright (c) 2023
+    DeepSeek.
+  * The DSpark speculative decoder of that arm (`dspark`, `draft`, `verify` and `finishVerify`
+    in `src/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `src/deepseek_v41.zig`
+    at 49bb6be0 (`dsparkDraft`, `dsparkBeginWith`, `dsparkFinish` and their rollback of a
+    verify chunk) by David Dalcu. Modifications: the stages and heads load from the original
+    `mtp.*` tensors with resident mxfp4 experts, the draft attention and the attention-output
+    round trip follow the release's `DSparkAttention`, the verify chunk goes through the
+    shared forward and the streamed expert cache, rejected rows leave the backbone rings by
+    their 16 rows of slack, and the rounds run behind sushi's `--mtp` and spec-tick
+    dispatch, sampled requests verifying by the exact rule for a point-mass draft.
 
 --------------------------------------------------------------------------------
 MLX

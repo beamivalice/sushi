@@ -20,7 +20,7 @@ base=len(texts)
 if os.environ.get('TOKENIZER_CASES_JSON'):
     texts += [r['prompt'] for r in json.loads(Path(os.environ['TOKENIZER_CASES_JSON']).read_text())['cases']]
 rows=[]
-for name in ['GLM-5.3-Flash-Sushi-2.5bpw','Qwen3.8-Flash-Next-Sushi-4bpw','MiMo-V2.6-Flash-Sushi-2.3bpw']:
+for name in ['GLM-5.3-Flash-Sushi-2.5bpw','Qwen3.8-Flash-Next-Sushi-4bpw','MiMo-V2.6-Flash-Sushi-2.3bpw','deepseek-ai/DeepSeek-V4.1-Flash-1017']:
     path=model_root/name
     if not (path/'tokenizer.json').exists():
         print(f'SKIP: {name} not on this box'); continue

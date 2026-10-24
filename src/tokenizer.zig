@@ -2,6 +2,7 @@ const std = @import("std");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const unicode_props = @import("tokenizer_unicode.zig");
+const deepseek_pretok = @import("tokenizer_deepseek.zig");
 
 const WordRules = enum { legacy, letters, letters_marks };
 
@@ -65,7 +66,7 @@ pub fn reservedOutputIds(
 }
 
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
-pub const PretokStyle = enum { gpt2, llama3 };
+pub const PretokStyle = enum { gpt2, llama3, deepseek };
 
 /// Precedes a special's text that the sender wrote as plain text (see `Tokenizer.markLiteralSpecials`).
 /// A Unicode noncharacter, so it cannot be part of a real message.
@@ -513,6 +514,7 @@ pub const Tokenizer = struct {
         switch (self.pretok_style) {
             .gpt2 => try gpt2PreTokenizeRules(allocator, text, self.digit_group, self.word_rules, &words),
             .llama3 => try llama3PreTokenize(allocator, text, &words),
+            .deepseek => try deepseek_pretok.preTokenize(allocator, text, &words),
         }
 
         // For each word: map bytes to unicode chars, then BPE merge, then look up vocab
@@ -1519,6 +1521,7 @@ fn isIndividualDigitsRule(node: std.json.Value) bool {
 /// echoed "8 4" — the DSV4 echo-precision class on a new spelling).
 fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
     if (pt != .object) return .gpt2;
+    if (isDeepseekSequence(pt)) return .deepseek;
     if (splitRegexIsLlama3(pt)) return .llama3;
     if (pt.object.get("pretokenizers")) |list| {
         if (list == .array) {
@@ -1528,6 +1531,27 @@ fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
         }
     }
     return .gpt2;
+}
+
+/// DeepSeek-V4.x's `Sequence`: its three Splits (digits, CJK, the punctuation grammar), each isolated, then a
+/// ByteLevel that does not split. Only that exact spelling is read as the grammar `tokenizer_deepseek` runs.
+fn isDeepseekSequence(pt: std.json.Value) bool {
+    const list = pt.object.get("pretokenizers") orelse return false;
+    if (list != .array or list.array.items.len != 4) return false;
+    const regexes = [_][]const u8{ deepseek_pretok.digits_regex, deepseek_pretok.cjk_regex, deepseek_pretok.main_regex };
+    for (regexes, list.array.items[0..3]) |want, node| {
+        if (node != .object) return false;
+        const rx = splitRegexOf(node) orelse return false;
+        const behavior = node.object.get("behavior") orelse return false;
+        const invert = node.object.get("invert") orelse return false;
+        if (!std.mem.eql(u8, rx, want) or behavior != .string or !std.mem.eql(u8, behavior.string, "Isolated") or invert != .bool or invert.bool) return false;
+    }
+    const byte_level = list.array.items[3];
+    if (byte_level != .object) return false;
+    const ty = byte_level.object.get("type") orelse return false;
+    if (ty != .string or !std.mem.eql(u8, ty.string, "ByteLevel")) return false;
+    const use_regex = byte_level.object.get("use_regex") orelse return false;
+    return use_regex == .bool and !use_regex.bool;
 }
 
 fn splitRegexIsLlama3(node: std.json.Value) bool {

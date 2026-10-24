@@ -94,7 +94,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `ensurePortFree` probes the address with a connect AND a bind, so a listener or a bound-but-silent socket both refuse
   with "port N is already in use"; the listener binds with SO_REUSEADDR only, so a racing second sushi fails its bind
   with the same message instead of co-binding. Guard: `tests/test_port_conflict.sh`.
-- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`) by
+- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by
   name (`ArchitectureUnsupported` → 503). A checkpoint in an unsupported file format is refused by name
   (`ModelFormatUnsupported` → 503; `--model` exits).
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`: streaming index > MiMo source trunk > vision >
@@ -227,6 +227,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`Message.media_parts`); the serializer hands the template a typed part list, so the TEMPLATE renders each
   placeholder; `prepareRequestMedia` expands every pad to its block's rows and encodes all blocks in prompt order.
   The engine never inserts pads itself: a template that renders fewer placeholders than blocks is a named 400.
+  DeepSeek-V4.1's template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image's atom at
+  its offset instead, and `placeMedia` expands it to the image's whole span (`dsv41_vision.spanRows`: aligner rows,
+  newlines, start and end), not a merged-grid count.
 - **Media refusals are named**: an undecodable image is a 400 naming `messages[i]`/`input[i]` and the reason
   (`imageRejectReason`), an `input_audio` part a 400 unless the model encodes audio (`RequestMedia.accepts_audio`),
   more than `chat.MAX_REQUEST_IMAGES` (64) a 400 with both counts, a prompt the media pushes past the context a 400
@@ -234,6 +237,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`MediaFault`); never a text-only answer.
 - Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen_vision.zig` / `src/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
   image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
+  `src/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
   `stb_image` + libwebp decode image input.
 
 ## Config reading

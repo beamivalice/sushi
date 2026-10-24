@@ -793,7 +793,8 @@ test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank acr
         const grouped = engine.layers[0].grouped orelse return error.TestExpectedGroupedLayer;
         var saw_union = false;
         var saw_cache = false;
-        for ([_]usize{ 1, 1, 2, 33, 65, 1, 1 }) |rows| {
+        var saw_wide_union = false;
+        for ([_]usize{ 1, 1, 2, 33, 65, 1, 1, 65 }) |rows| {
             const topk: usize = 2;
             const routes = try a.alloc(u16, rows * topk);
             defer a.free(routes);
@@ -813,11 +814,16 @@ test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank acr
             var expect_union = false;
             for (distinct, grouped.slots[0..groups.len]) |count, slots| expect_union = expect_union or count > slots;
 
+            // A route the prefill GEMMs serve reads an overflowing group's cached experts in place: no host copies.
+            const wide = rows > exl3.kernels.DECODE_ROWS_MAX;
             const before = engine.fill_experts_total;
-            var prepared = try engine.prepareHost(0, routes);
+            const copied = engine.copy_bytes_total;
+            var prepared = try if (wide) engine.prepareHostWide(0, routes) else engine.prepareHost(0, routes);
             defer prepared.deinit();
             try std.testing.expectEqual(expected_misses, engine.fill_experts_total - before);
             try std.testing.expectEqual(expect_union, prepared.workspace);
+            if (wide) try std.testing.expectEqual(copied, engine.copy_bytes_total);
+            saw_wide_union = saw_wide_union or (wide and expect_union);
             saw_union = saw_union or expect_union;
             saw_cache = saw_cache or !expect_union;
             const bank = prepared.ragged orelse return error.TestExpectedRaggedBank;
@@ -851,6 +857,7 @@ test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank acr
         }
         try std.testing.expect(saw_cache);
         try std.testing.expectEqual(layer_slots < experts, saw_union);
+        try std.testing.expectEqual(layer_slots < experts, saw_wide_union);
     }
 }
 
@@ -934,6 +941,45 @@ test "EXL3 streaming GPU mixed grouped and uniform layers stay within the worksp
     for (engine.grouped_union) |op| held += @as(u64, op.stride) * op.count;
     try std.testing.expect(held <= ledger.workspace_bytes);
     try std.testing.expectEqual(ledger.workspace_bytes, engine.plan.workspace_bytes);
+}
+
+test "EXL3 streaming GPU a cache profile moves slots to the layer that reuses its experts, within the uniform bytes" {
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const mlx = @import("mlx.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var specs: std.ArrayList(TensorSpec) = .empty;
+    var entries: std.ArrayList(IndexSpec) = .empty;
+    const banks = [_]BankGroup{ .{ .experts = 2, .n = 32, .group = 0 }, .{ .experts = 4, .n = 48, .group = 1 } };
+    for (0..2) |layer| try appendBankSpecs(arena.allocator(), &specs, &entries, @intCast(layer), &banks, 128, 256);
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs.items);
+    try writeIndex(io, a, tmp.dir, entries.items);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const geom: stream.Geometry = .{ .layers = 2, .experts = 6, .hidden = 128, .intermediate = 256, .exl3_n = 64 };
+    const bill = try stream.expertBillFor(a, path, geom, .exl3_k4);
+    const uniform_bytes = 2 * 4 * bill.expert_bytes;
+
+    var slots: [2][2]u32 = undefined;
+    for (0..2) |arm| {
+        // Layer 1 keeps hitting deep in its stack; layer 0 only on its hottest expert.
+        if (arm == 1) try tmp.dir.writeFile(io, .{ .sub_path = stream.cache_profile_file, .data = "{\"version\":1,\"experts\":6,\"tokens\":100,\"source\":\"test\",\"layers\":[[90,0,0,0,0,0,10],[20,20,20,20,20,20,10]]}" });
+        var engine = try stream.Engine.initWithOptions(a, path, geom, uniform_bytes, mlx.gpuStream(), .{ .layout = .exl3_k4, .bounce_size = 1 << 20 });
+        defer engine.deinit();
+        var held: u64 = 0;
+        for (engine.layers, 0..) |layer, li| {
+            const g = layer.grouped orelse return error.TestExpectedGroupedLayer;
+            slots[arm][li] = g.cache_slots;
+            for (0..g.groups.count) |gi| held += @as(u64, g.slots[gi]) * g.groups.expertBytes(gi, 128, 256);
+        }
+        try std.testing.expect(held <= uniform_bytes);
+    }
+    try std.testing.expectEqual(slots[0][0], slots[0][1]);
+    try std.testing.expect(slots[1][1] > slots[0][1] and slots[1][0] < slots[0][0]);
 }
 
 test "EXL3 streaming CPU bills a grouped store's floor, one expert of every rate group, and one workspace set per layer kind" {

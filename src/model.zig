@@ -15,8 +15,13 @@ pub fn parseQwenGdn(value: []const u8) ?bool {
     return null;
 }
 
+/// `--drop-expert`: routed experts a layer left unloaded by usage (0 = off). A launch decision like `--qwen-gdn`:
+/// `parseConfig` copies it into every load's config.
+pub var drop_expert: u16 = 0;
+
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
+const dsv41_config = @import("dsv41_config.zig");
 const expert_io = @import("expert_io.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
@@ -198,12 +203,17 @@ pub const ModelConfig = struct {
     /// (a two-arm lever: it isolates the table's quantization cost under `kld compare`).
     ngram_bf16_dir: ?[]u8 = null,
     expert_cache_bytes: u64 = 0,
+    /// `--drop-expert`: routed experts a layer that are never loaded or picked.
+    drop_expert: u16 = 0,
     expert_ssd_budget_bytes: u64 = 0,
     expert_workspace_bytes: u64 = 0,
     /// What the streamed store bills beyond its mean expert, set by the streaming plan.
     expert_shape: expert_quant.StoreShape = .{},
     expert_bounce_bytes: u64 = 0,
     expert_fill_peak_bytes: u64 = 0,
+    /// The expert-cache bytes a prefill may still take for its working set (DeepSeek's decoder pools), written by the
+    /// inference thread as pools are released and restored; read it with `@atomicLoad`.
+    expert_borrow_bytes: u64 = 0,
     /// A streamed load's resident vision tower (in the ssd budget) and its largest single-image
     /// encode (beside the budget, at the wired-limit admission); 0 = tower off.
     expert_vision_tower_bytes: u64 = 0,
@@ -277,6 +287,8 @@ pub const ModelConfig = struct {
     glm_index_tail: bool = true,
     glm_mtp_layers: u32 = 0,
     glm_fp8_trunk: bool = false,
+    /// deepseek_v41's own geometry, parsed once from config.json.
+    dsv41: ?dsv41_config.Config = null,
 
     // Multi-head Latent Attention (bailing_hybrid's full-attention layers,
     // DeepSeek-V3 shape): low-rank Q (q_a_proj → q_a_layernorm → q_b_proj) and
@@ -615,13 +627,14 @@ pub const ModelConfig = struct {
     /// once at load: a long session's load-time reserve (and, ungated, the hot-cache ask) pins
     /// every ordinary prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5();
+        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5() or self.isDsv41();
     }
 
     /// The width a per-request arch's prefill starts at; only a chunk that no longer fits beside its
     /// KV steps down. GLM's native prefill paths are built for 2048 rows.
     pub fn prefillStartWidth(self: *const ModelConfig) u32 {
         if (self.isGlm5()) return @import("glm5_forward.zig").prefill_chunk;
+        if (self.isDsv41()) return dsv41_config.prefill_width;
         if (self.longCtxGated()) return 4096;
         if (self.swaRingTokens() > 0) return 2048;
         return std.math.maxInt(u32);
@@ -709,6 +722,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.dsv41) |c| return c.stateBytesPerToken();
         if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * self.mla_kv_lora_rank * 2;
         // A ringed arch pays per token only on its global layers; the sliding
         // half is `swaRingBytes`, a constant. Both halves land in the same
@@ -803,6 +817,7 @@ pub const ModelConfig = struct {
     /// is no GDN state. A restored state of the other width would be cast, and one written under a bf16
     /// gate continues differently, so neither is restored.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (self.isDsv41()) return @import("dsv41_prefix.zig").namespaceTag(self.dsparkOn());
         if (self.linear_num_value_heads == 0 or self.isGlm5()) return null;
         return if (self.gdnStateDtype() == .float32) "gdn-f32-state-v1" else "gdn-gate-f32-v1";
     }
@@ -874,6 +889,16 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "glm5_next");
     }
 
+    pub fn isDsv41(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "deepseek_v41");
+    }
+
+    /// Does this load keep deepseek_v41's DSpark stages resident? They are its MTP head: `--mtp` under streaming.
+    pub fn dsparkOn(self: *const ModelConfig) bool {
+        const c = self.dsv41 orelse return false;
+        return self.stream_mtp_head and c.dspark.block > 0;
+    }
+
     /// Streaming is a CAPABILITY of the checkpoint's routed-expert banks, not of
     /// its precision: both the dense HF layout and an MLX pack's per-projection
     /// banks stream. The disk-side half of the answer is the discovery layout probe.
@@ -893,6 +918,23 @@ pub const ModelConfig = struct {
             .exl3_n = self.expert_quant_rate.n,
             .exl3_rates = self.expert_quant_rates,
             .shape = self.expert_shape,
+            .drop_n = self.drop_expert,
+        };
+    }
+
+    /// Routed experts a layer that can still be picked.
+    pub fn keptExperts(self: *const ModelConfig) u32 {
+        return self.num_experts - self.drop_expert;
+    }
+
+    /// What `--drop-expert` asks of this model's pack.
+    pub fn expertDropRequest(self: *const ModelConfig) @import("expert_usage.zig").Request {
+        return .{
+            .n = self.drop_expert,
+            .layers = self.expertLayerCount(),
+            .first_layer = @intCast(self.first_k_dense_replace),
+            .experts = self.num_experts,
+            .top_k = self.num_experts_per_tok,
         };
     }
 
@@ -900,9 +942,10 @@ pub const ModelConfig = struct {
     /// An EXL3 bank is a self-describing quantized weight the resident kernels
     /// read as they are, whatever the trunk's own width says.
     pub fn expertStreamingRequired(self: *const ModelConfig) bool {
+        if (self.isDsv41()) return true;
         if (self.expert_layout == .exl3_k4) return false;
         return self.supportsExpertStreaming() and
-            (self.quant_bits == 0 or self.expert_layout == .mxfp4_individual);
+            (self.quant_bits == 0 or self.expert_layout == .mxfp4_individual or self.expert_layout == .mxfp4_w123);
     }
 
     pub fn isMimo(self: *const ModelConfig) bool {
@@ -1098,6 +1141,8 @@ pub const ModelConfig = struct {
     /// score budget that exists for exactly this materializing path never
     /// applies. A new arch scoring wider than it stores adds its arm here.
     pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
+        // DeepSeek scores only each row's picked keys, billed in its own transient: no dense sheet narrows its chunk.
+        if (self.isDsv41()) return 0;
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
@@ -1120,7 +1165,7 @@ pub const ModelConfig = struct {
         // The checkpoint's own declared default outranks the arch allowlist:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
-        if (self.isGlm5()) return true;
+        if (self.isGlm5() or self.isDsv41()) return true;
         if (self.isQwen4()) return true;
         // mimo_v2: the vendor template's own default is on (only an explicit
         // `enable_thinking is false` closes the think block).
@@ -1198,6 +1243,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
     config.gdn_state_f32 = qwen_gdn_f32;
+    config.drop_expert = drop_expert;
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (std.c.getenv("SUSHI_NGRAM_BF16_DIR")) |raw| {
@@ -2193,6 +2239,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         try validateQwen4Config(&config);
     } else if (std.mem.eql(u8, model_type, "mimo_v2")) {
         try parseMimoConfig(&config, cfg_obj);
+    } else if (std.mem.eql(u8, model_type, "deepseek_v41")) {
+        const c = try dsv41_config.parse(cfg_obj, root);
+        config.model_type = "deepseek_v41";
+        config.weight_prefix = "";
+        config.hidden_act = .silu;
+        config.num_experts = c.experts;
+        config.num_experts_per_tok = c.top_k;
+        config.moe_intermediate_size = c.moe_inter;
+        config.first_k_dense_replace = 0;
+        config.rms_norm_eps = c.eps;
+        config.has_vision = c.vision != null;
+        if (c.vision) |v| {
+            // The shared ViT geometry the media bills read.
+            config.qv_depth = v.layers;
+            config.qv_hidden = v.hidden;
+            config.qv_heads = v.heads;
+            config.qv_head_dim = v.headDim();
+            config.qv_intermediate = v.inter;
+            config.qv_out_hidden = c.dim;
+            config.qv_patch = v.patch;
+            config.qv_merge = v.downsample;
+            config.qv_temporal_patch = 1;
+        }
+        config.dsv41 = c;
     } else {
         // Not served: the weight loader refuses it by name (`ArchitectureUnsupported`).
         config.model_type = "unsupported";
@@ -2561,6 +2631,14 @@ pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_d
 /// What a streamed load keeps resident under `config.expert_layout`: everything but the routed banks,
 /// with the tower apart.
 pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !ResidentSplit {
+    if (config.isDsv41()) {
+        const source = @import("dsv41_source.zig");
+        return .{
+            .trunk = try source.residentBytes(io, allocator, model_dir),
+            .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir) else 0,
+            .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir) else 0,
+        };
+    }
     if (config.isGlm5())
         return @import("glm5_diagnostic.zig").streamedSplit(io, allocator, model_dir, config.num_hidden_layers);
     if (config.usesMimoSourceTrunk()) {
@@ -2680,7 +2758,7 @@ pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir:
 
 /// The architectures this build serves. Every other `model_type` is refused
 /// by name at the loader, so the inherited forwards behind it are unreachable.
-pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" };
+pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41" };
 
 /// The engine's thinking-effort vocabulary. Each served arch accepts a subset
 /// (`effortArms`); a word outside it is refused. `selectEffortPick` folds Qwen
@@ -2723,7 +2801,7 @@ pub fn defaultThinkBudget(config: *const ModelConfig, launch_budget: i32) i32 {
 pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
     if (thinkFlagArm(config.model_type)) |arm| return @tagName(arm.effort);
     if (archDefaultArm(config)) |arm| return @tagName(arm.effort);
-    return if (config.isGlm5()) "high" else null;
+    return if (config.isGlm5() or config.isDsv41()) "high" else null;
 }
 
 /// The word a request naming no effort runs at (`/v1/models` `default_reasoning_effort`).
@@ -2754,6 +2832,14 @@ const mimo_v2_efforts = [_]EffortArm{
     .{ .effort = .on },
 };
 
+// DeepSeek's encoder takes low|high|max and renders a numeric budget; medium folds to high.
+const deepseek_v41_efforts = [_]EffortArm{
+    .{ .effort = .off },
+    .{ .effort = .low },
+    .{ .effort = .high },
+    .{ .effort = .max },
+};
+
 const glm5_efforts = [_]EffortArm{
     .{ .effort = .low },
     .{ .effort = .high },
@@ -2765,6 +2851,7 @@ pub fn effortArms(model_type: []const u8) ?[]const EffortArm {
     if (std.mem.eql(u8, model_type, "glm5_next")) return &glm5_efforts;
     if (std.mem.eql(u8, model_type, "qwen4_exp")) return &qwen4_exp_efforts;
     if (std.mem.eql(u8, model_type, "mimo_v2")) return &mimo_v2_efforts;
+    if (std.mem.eql(u8, model_type, "deepseek_v41")) return &deepseek_v41_efforts;
     return null;
 }
 
@@ -2837,9 +2924,10 @@ pub fn loadWeightsForConfig(
     load_vision: bool,
 ) !Weights {
     if (!isServedArch(config.model_type)) {
-        log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2, glm5_next only)\n", .{config.model_type});
+        log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2, glm5_next, deepseek_v41 only)\n", .{config.model_type});
         return error.ArchitectureUnsupported;
     }
+    if (config.isDsv41()) return loadWeightsDsv41(io, allocator, model_dir, config, load_vision);
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
         const glm = @import("glm5_diagnostic.zig");
@@ -2863,6 +2951,16 @@ pub fn loadWeightsForConfig(
     if (std.mem.eql(u8, config.model_type, "qwen4_exp") and config.mtp_override == false)
         try weights.dropPrefix("language_model.mtp.");
     return weights;
+}
+
+/// deepseek_v41's resident trunk from the release's shards, and its vision tower when asked for; its routed experts stream.
+fn loadWeightsDsv41(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
+    const stq = config.dsv41.?.expert_dec != null;
+    if (config.expert_layout != (if (stq) expert_quant.Layout.exl3_k4 else .mxfp4_w123)) {
+        log.err("deepseek_v41: model.safetensors.index.json does not list every routed expert (layout {s}); the download is incomplete\n", .{@tagName(config.expert_layout)});
+        return error.ExpertLayoutUnsupported;
+    }
+    return @import("dsv41_source.zig").loadResident(io, allocator, model_dir, .{ .dspark = config.dsparkOn(), .vision = load_vision and config.has_vision });
 }
 
 pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout, vision: bool, keep_mtp: bool) !Weights {
@@ -3219,7 +3317,7 @@ fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
 }
 
 /// One header entry's payload as an MLX array. Caller frees.
-fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
+pub fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
     if (meta != .object) return error.InvalidSafetensorsTensor;
     const dtype_value = meta.object.get("dtype") orelse return error.InvalidSafetensorsTensor;
     const dims = meta.object.get("shape") orelse return error.InvalidSafetensorsTensor;
@@ -5806,6 +5904,18 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
     }
 }
 
+test "--drop-expert reaches the geometry as a count of experts the bill leaves out" {
+    const t = std.testing;
+    var c = ModelConfig{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .num_experts = 384, .num_experts_per_tok = 6 };
+    try t.expectEqual(@as(u16, 384), c.expertGeometry().kept());
+    c.drop_expert = 16;
+    try t.expectEqual(@as(u32, 368), c.keptExperts());
+    try t.expectEqual(@as(u16, 368), c.expertGeometry().kept());
+    const req = c.expertDropRequest();
+    try t.expectEqual(@as(usize, 40), req.layers);
+    try t.expectEqual(@as(u32, 6), req.top_k);
+}
+
 test "--qwen-gdn takes 16 or 32 and nothing else" {
     try testing.expectEqual(@as(?bool, true), parseQwenGdn("32"));
     try testing.expectEqual(@as(?bool, false), parseQwenGdn("16"));
@@ -6316,4 +6426,13 @@ test "readTensorArray returns the file's tensor, imported without a copy when la
         if (case.imported) try t.expect(got.mapped != null);
         if (got.mapped) |m| try t.expectEqual(@intFromPtr(got.bytes.ptr), @intFromPtr(m));
     }
+}
+
+test "deepseek_v41 thinks by default, at its native high effort" {
+    const dsv41 = ModelConfig{ .model_type = "deepseek_v41" };
+    try testing.expect(dsv41.defaultEnableThinking());
+    try testing.expectEqualStrings("high", defaultReasoningEffort(&dsv41).?);
+    // A checkpoint that declares thinking off still outranks the arch default.
+    const declared_off = ModelConfig{ .model_type = "deepseek_v41", .gen_enable_thinking = false };
+    try testing.expect(!declared_off.defaultEnableThinking());
 }

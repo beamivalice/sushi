@@ -25,7 +25,7 @@ pub fn apply(s: mlx.mlx_stream, gate: Arr, up: Arr, limit: f32) !?Arr {
         defer _ = mlx.mlx_vector_string_free(outs);
         const source: [:0]const u8 =
             \\uint i = thread_position_in_grid.x;
-            \\if (i >= N) return;
+            \\if (i >= threads_per_grid.x) return;
             \\float g = float(gate[i]), u = float(up[i]);
             \\g = g > 10.0f ? 10.0f : g;
             \\u = u > 10.0f ? 10.0f : u;
@@ -34,7 +34,7 @@ pub fn apply(s: mlx.mlx_stream, gate: Arr, up: Arr, limit: f32) !?Arr {
             \\bfloat16_t mid = bfloat16_t(g * float(sigmoid[as_type<ushort>(cg)]));
             \\out[i] = bfloat16_t(float(mid) * u);
         ;
-        // ensure_row_contiguous makes strided inputs safe; use host-known N for bounds.
+        // ensure_row_contiguous makes strided inputs safe; the grid is the element count.
         const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_clamped_bf16_swiglu", ins, outs, source, "", true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         kernel = k;
@@ -43,7 +43,6 @@ pub fn apply(s: mlx.mlx_stream, gate: Arr, up: Arr, limit: f32) !?Arr {
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = mlx.getShape(gate);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, shape.len, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", @intCast(n)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(n), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     const inputs = mlx.mlx_vector_array_new_data(&.{ gate, up, try @import("hc_prefill.zig").sigmoidTable(s) }, 3);

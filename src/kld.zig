@@ -37,6 +37,8 @@ pub const Options = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     /// `--qwen-gdn 16` stores the GDN state in bf16, so a student arm can be scored against the f32 teacher.
     qwen_gdn_f32: bool = true,
+    /// DeepSeek only, compare only: the student drops this many routed experts a layer by the pack's usage list.
+    drop_expert: u16 = 0,
     ssd_budget_bytes: u64 = 0,
     pick_tolerance: f32 = 0,
     wired_margin_bytes: u64 = 0,
@@ -83,6 +85,7 @@ const ValueFlag = enum {
     ctx_size,
     kv_quant,
     qwen_gdn,
+    drop_expert,
     ssd_budget_gb,
     expert_pick_tolerance,
     wired_margin_gib,
@@ -104,6 +107,7 @@ const value_flags = [_]struct { []const u8, ValueFlag }{
         .{ "--ctx-size", .ctx_size },
         .{ "--kv-quant", .kv_quant },
         .{ "--qwen-gdn", .qwen_gdn },
+        .{ "--drop-expert", .drop_expert },
         .{ "--ssd-budget-gb", .ssd_budget_gb },
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
         .{ "--wired-margin-gib", .wired_margin_gib },
@@ -164,6 +168,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
                 .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
+                .drop_expert => o.drop_expert = @import("expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
@@ -182,7 +187,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
         .capture => {
             if (o.prompts.len == 0) return error.MissingPrompts;
             if (o.out_dir.len == 0) return error.MissingOut;
-            if (o.pick_tolerance > 0) return error.TeacherMustBeLossless;
+            if (o.pick_tolerance > 0 or o.drop_expert != 0) return error.TeacherMustBeLossless;
         },
         .compare => {
             if (o.fixture.len == 0) return error.MissingFixture;
@@ -223,6 +228,8 @@ pub const USAGE =
     \\  --qwen-gdn <32|16>    Qwen only: bits of the GatedDeltaNet recurrent state (default 32 =
     \\                        f32; 16 = bf16, the decay gate is f32 either way). A student at 16 is
     \\                        scored against the f32 teacher. A GLM pack has no GDN arm and refuses it.
+    \\  --drop-expert <n>     compare only, DeepSeek-V4.1 only: drop the n least-used routed experts of every layer by
+    \\                        the pack's expert_usage.json (a multiple of 8; 0 = off). The teacher is never pruned.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
@@ -893,10 +900,21 @@ pub const Loaded = struct {
     }
 };
 
+/// DeepSeek-V4.1 keeps its own state in the activation dtype and has no hidden-boundary or imatrix tap:
+/// a flag that would silently do nothing is refused by name.
+pub fn refuseForDsv41(config: *const model_mod.ModelConfig, opts: Options) !void {
+    if (!config.isDsv41()) return;
+    if (opts.kv_quant_config.isQuant()) return error.Dsv41KvQuantUnsupported;
+    if (!opts.qwen_gdn_f32) return error.Dsv41HasNoQwenGdnState;
+    if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;
+    if (opts.imatrix_out.len > 0) return error.Dsv41ImatrixCaptureUnsupported;
+}
+
 pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Loaded {
     const self = try allocator.create(Loaded);
     errdefer allocator.destroy(self);
     model_mod.qwen_gdn_f32 = opts.qwen_gdn_f32;
+    model_mod.drop_expert = opts.drop_expert;
     self.* = .{
         .allocator = allocator,
         .io = io,
@@ -907,6 +925,11 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         .xfm = undefined,
     };
     errdefer self.config.deinit(allocator);
+    try refuseForDsv41(&self.config, opts);
+    if (server_mod.archFlagRefusal(&self.config, .{ .drop_expert = opts.drop_expert != 0 })) |why| {
+        log.err("{s}\n", .{why});
+        return error.LaunchFlagUnsupported;
+    }
     scheduler_mod.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
     self.config.ctx_override = model_settings_mod.contextPick(opts.ctx_size, self.config.ctx_override).value;
 
@@ -2042,6 +2065,15 @@ test "kld: --qwen-gdn 16 stores the GDN state in bf16, 32 is the default width" 
     try testing.expect(wide.qwen_gdn_f32);
 }
 
+test "kld: --drop-expert is a student-side multiple of 8, and a capture refuses it because the teacher is exact" {
+    const cmp = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--drop-expert", "16" });
+    try testing.expectEqual(@as(u16, 16), cmp.drop_expert);
+    try testing.expectEqual(@as(u16, 0), (try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f" })).drop_expert);
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--drop-expert", "12" }));
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--drop-expert", "many" }));
+    try testing.expectError(error.TeacherMustBeLossless, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--drop-expert", "8" }));
+}
+
 test "kld: the recorded strict NLL is the teacher's own log-softmax, as the capture wrote it" {
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -2879,4 +2911,90 @@ test "pickToken scores the forced token and falls back to the argmax" {
     try testing.expectEqual(@as(u32, 1), pickToken(null, 0, &row));
     try testing.expectEqual(@as(u32, 2), pickToken(&.{ 2, 0 }, 0, &row));
     try testing.expectEqual(@as(u32, 0), pickToken(&.{ 2, 0 }, 1, &row));
+}
+
+test "kld: deepseek_v41 refuses by name what its module-owned state cannot honor" {
+    const dsv = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    try refuseForDsv41(&dsv, .{});
+    try testing.expectError(error.Dsv41KvQuantUnsupported, refuseForDsv41(&dsv, .{ .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) }));
+    try testing.expectError(error.Dsv41HasNoQwenGdnState, refuseForDsv41(&dsv, .{ .qwen_gdn_f32 = false }));
+    try testing.expectError(error.Dsv41HiddenCaptureUnsupported, refuseForDsv41(&dsv, .{ .hidden_out = "/x" }));
+    try testing.expectError(error.Dsv41ImatrixCaptureUnsupported, refuseForDsv41(&dsv, .{ .imatrix_out = "/x.safetensors" }));
+    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    try refuseForDsv41(&qwen, .{ .qwen_gdn_f32 = false, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) });
+}
+
+test "kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)" {
+    const dir = try @import("dsv41_model.zig").fixtureDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try testing.expectError(error.ExpertStreamingRequired, loadModel(io, testing.allocator, .{ .model_dir = dir }));
+    try testing.expectError(error.Dsv41KvQuantUnsupported, loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
+}
+
+test "kld: a deepseek_v41 teacher captures and compare reads it back, fused against composed included (DSV41_TINY)" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_stream = @import("dsv41_stream.zig");
+    const dir = try dsv41_model.fixtureDir();
+    var metal: bool = false;
+    mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;
+    if (!metal) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"pre_tokenizer":{"type":"ByteLevel"},"model":{"type":"BPE",
+        \\ "vocab":{"a":0,"b":1,"c":2,"d":3},"merges":[]}}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts.jsonl", .data =
+        \\{"id":"p0","prompt_ids":[0,17,23,5,42,8,61,3,90,12,4]}
+        \\{"id":"p1","prompt_ids":[0,33,7,70]}
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try arena.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
+
+    var config = try model_mod.parseConfig(io, allocator, dir);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try dsv41_stream.expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try allocator.dupe(u8, dir);
+    var loaded = Loaded{ .allocator = allocator, .io = io, .config = config, .tok = try tokenizer_mod.loadTokenizer(io, allocator, root), .chat_config = undefined, .weights = undefined, .xfm = undefined };
+    defer loaded.config.deinit(allocator);
+    defer loaded.tok.deinit();
+    loaded.weights = try model_mod.loadWeightsForConfig(io, allocator, dir, &loaded.config, false);
+    defer loaded.weights.deinit();
+    loaded.xfm = try transformer_mod.Transformer.init(io, allocator, loaded.config, &loaded.weights);
+    defer loaded.xfm.deinit();
+    try testing.expectEqual(@as(u32, 1), loaded.config.eos_token_ids[0]);
+
+    var quiet: Out = .{ .silent = true };
+    const teacher = try std.fmt.allocPrint(arena, "{s}/teacher", .{root});
+    dsv41_model.setFused(loaded.xfm.dsv41.?, true);
+    try runCapture(io, allocator, &loaded, .{ .model_dir = root, .prompts = try std.fmt.allocPrint(arena, "{s}/prompts.jsonl", .{root}), .out_dir = teacher, .tokens = 4, .no_template = true }, &quiet);
+    var base = try readBaseline(allocator, io, teacher);
+    defer base.deinit();
+    try testing.expectEqual(@as(usize, 2), base.prompts.len);
+    try testing.expectEqualStrings("bf16", base.kv_cache_format);
+
+    for ([_]bool{ true, false }) |composed| {
+        dsv41_model.setFused(loaded.xfm.dsv41.?, composed);
+        const json_path = try std.fmt.allocPrint(arena, "{s}/compare-{s}.json", .{ root, if (composed) "composed" else "fused" });
+        try runCompare(io, allocator, &loaded, .{ .command = .compare, .model_dir = root, .fixture = teacher, .json_out = json_path }, &quiet);
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, json_path, arena, .limited(1 << 22));
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, text, .{});
+        const o = parsed.value.object;
+        try testing.expectEqualStrings(COMPARE_SCHEMA, o.get("schema").?.string);
+        try testing.expectEqual(@as(f64, 8), try jsonNumber(o.get("positions").?));
+        try testing.expectEqual(@as(usize, 2), o.get("prompts").?.array.items.len);
+        const kld = try jsonNumber(o.get("mean_kld_to_eos").?);
+        try testing.expect(std.math.isFinite(kld));
+        // The same arm replays its own teacher bit for bit.
+        if (composed) {
+            try testing.expectEqual(@as(f64, 0), kld);
+            try testing.expectEqual(@as(f64, 1), try jsonNumber(o.get("mean_top1").?));
+        }
+    }
 }

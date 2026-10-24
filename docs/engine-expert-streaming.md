@@ -91,6 +91,11 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   target of N GiB = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
   bounce; the remainder is a uniform per-layer LRU. The ledger refuses a budget under two slots per layer, and under
   one expert of every rate group of a grouped layer (`SsdBudgetBelowResident`, `StoreShape.layer_floor_bytes`).
+- **Resident**: a budget that holds every routed expert (`StoreShape.all_bytes`, set when every routed layer is
+  rate-grouped) beside the trunk, MTP and tower bills no union workspace, selected slab or bounce. The engine sizes
+  every pool to its whole layer, reads all of them at load (`[expert-stream] resident:` line; no 80% warm) and maps
+  each expert to its slot (`LayerState.resident_map`), so a DeepSeek STQ route takes its slots on the GPU with no
+  host read of the picks (`Engine.residentRoute`). Same bytes out as the streamed path (tested on the tiny STQ pack).
 - Precedence: `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming both.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
@@ -120,6 +125,18 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - **DFlash2 on a streamed Flash-Next**: a drafter named with `--drafter` loads resident and its bytes join the trunk in the ledger, so the expert
   cache is cut from the budget that remains (`planExpertStreamingWith`; Sushi-2.6bpw at 32 GiB: 342 -> 326 slots/layer). Its 2..8-row
   verify rides the same streamed decode path as an MTP verify (greedy bank byte-equal to serial, stream == non-stream).
+- **Per-layer split from a profile**: a pack's [`expert_cache_profile.json`](pack-format.md#expert-cache-profile) lets
+  `profiledAllot` move the uniform cache bytes between rate-grouped layers by decode hits per byte (same total, same
+  bill). Without one, every layer gets the same bytes ([dsv41-memory](dsv41-memory.md)).
+- **Dropped experts** (`--drop-expert n`, [dsv41-arch](dsv41-arch.md#drop-expert)): the plan, the ledger, the profile split, the per-group
+  pools and the union bank count the kept experts only; a route that names a dropped id is `ExpertDropped`, and the warm skips them.
+- **Lending pools** (`Engine.borrowLayer`, `restoreLayer`, from `borrow_from` on): a whole rate-grouped layer's pool can be
+  released (its bank dropped, its slabs unmapped once MLX lets go; MLX's active bytes fall by the pool) and later
+  rebuilt with the experts it held. A released layer's routes read every distinct pick into the union workspace and
+  run on the union bank, the same bytes out. DeepSeek's STQ prefill borrows its decoder layers' pools for its working
+  set ([dsv41-memory](dsv41-memory.md#borrow)); the engine publishes the bytes still lendable to
+  `ModelConfig.expert_borrow_bytes`. A resident pack has no union workspace: its first release makes one (sized for
+  the lendable layers, paid out of the pools the plan releases) and the last restore drops it.
 - **Load-time cache warm**: preload the lowest expert IDs into `floor(0.8 * slots_per_layer)` slots per MoE layer
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
   routes; dense prefix layers are skipped.
@@ -147,9 +164,16 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   layer). One group overflowing its pool sends the whole layer through the union workspace: every group's experts are
   read into it at their group position, misses that fit are admitted into their pool, and the bank over the
   workspace serves the forward.
-- **Off for grouped layers**: the speculative expert queue (`specRoute`) and the lossy pick
-  (`--expert-pick-tolerance`) run on a uniform cache map only; a grouped layer takes the exact, non-speculative
-  path. The load-time warm preloads the lowest expert ids, which fill group 0 first.
+- **A wide route splits instead** (`prepareHostWide`, a route only the per-group prefill GEMMs read): every group
+  keeps its hits and admitted misses in its pool, only the declined misses are read into the workspace, and
+  `Ragged.initSplit` serves each overflowing group as two pools, its cache and its spill. No host copies, the same
+  SSD reads, the same bytes out. The decode kernels index one trellis, so a decode-width route keeps the copying union.
+- The breakdown line's `copy_ms` / `unions` time the host copies of a union route: cached hits copied into the
+  workspace and admitted misses copied back. A read-ahead (the next router on this layer's rows) was measured and cut:
+  it guessed about a quarter of a 1024-row chunk's picks and did not move cold prefill.
+- **Off for grouped layers**: the speculative expert queue (`specRoute`) runs on a uniform cache map only; a grouped
+  layer takes the non-speculative path. The lossy pick reaches DeepSeek's grouped layers through
+  `Engine.swapGroupedMisses` (below). The load-time warm preloads the lowest expert ids, which fill group 0 first.
 - Rate groups on MiMo stay resident-only; GLM serves none.
 
 ## Decode schedule
@@ -158,6 +182,10 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   submitted with `mlx_async_eval` as soon as it is built, and at decode widths (<= 16 rows) the shared expert is
   submitted between the ids and the blocking read, so the GPU runs it during the host round trip. Same ops, same
   order; output is bit-identical.
+- DeepSeek-V4.1 STQ (`dsv41_stream.StqStream`) keeps the same one wait per layer without the speculative queue: picks
+  submitted, shared expert queued behind them, routed chain and layer output submitted ([dsv41-arch](dsv41-arch.md#stq)).
+  Its breakdown line carries the picks wait as `idswait_ms` (the GPU's attention of the layer) and the routed chain's
+  host build as `compute_ms`; `fill_ms` is the SSD reads, `other_ms` the rest of the host's build and the GPU's tail.
 - At decode widths each layer's experts are queued from a GPU copy of the cache map (`Engine.specRoute`: expert →
   slot, -1 where not ready) before the host reads the router ids. The host keeps that result only when every routed
   id resolved to the slot the GPU gathered (`specMatches`), else rebuilds it; a union workspace always rebuilds. The
@@ -188,6 +216,10 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 - At one-row decode the pick runs on the GPU (`expertPickGpu`, the same algorithm as `substituteMisses`, fed the
   layer's map and starvation counts) and the experts are queued from its slots; the picked ids ride the ids' command
   buffer. The host still makes its own pick and keeps the GPU result only when both agree.
+- On a rate-grouped layer (DeepSeek-V4.1 STQ, `dsv41_stream.StqStream`, decode widths): a missed expert may take an
+  expert held in any of the layer's pools, which its own group's pool serves; the scores compared are the router's
+  sqrt-softplus scores, the weights' own scale. Same starvation limit; the `[expert-swap]` lines count it
+  (`Engine.swapped_ids`). A resident layer never misses, so it never swaps.
 - Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
   non-zero tolerance: the teacher is exact routing. Numbers: [quality-kld](quality-kld.md#lossy-expert-pick).
 

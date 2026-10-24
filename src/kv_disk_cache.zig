@@ -1216,6 +1216,30 @@ pub const DiskTier = struct {
         return cp_pos;
     }
 
+    /// The restore point at `cp_pos` of entry `idx` as a checkpoint the caller owns, for a state that has no KV
+    /// rows of its own (DeepSeek's): the entry's chunks are read only to prove they cover the position.
+    pub fn restoreCheckpointInto(
+        self: *DiskTier,
+        cache: *KVCache,
+        idx: usize,
+        cp_pos: u32,
+        n_layers: usize,
+        s: mlx.mlx_stream,
+    ) !transformer_mod.SSMCheckpoint {
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
+        self.drainEntry(self.entries.items[idx].id);
+        const e = &self.entries.items[idx];
+        if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
+        if (std.mem.indexOfScalar(u32, e.ssm_positions, cp_pos) == null) return error.DiskCacheNoCheckpoint;
+        var cp = try self.loadSsmFile(e.id, cp_pos, n_layers);
+        errdefer cp.deinit(self.allocator);
+        try self.restoreKvInto(cache, e, cp_pos, s);
+        e.last_used = self.bump();
+        self.writeMeta(e.*) catch {};
+        return cp;
+    }
+
     /// Largest persisted SSM checkpoint position ≤ `limit` for entry `idx`;
     /// null when none qualifies (hybrid KV without SSM state is unusable, so
     /// the caller must skip the entry entirely).

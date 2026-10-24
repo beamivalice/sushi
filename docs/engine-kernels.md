@@ -130,6 +130,22 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   MiMo, GLM and non-NAX GPUs take the blocked kernel. Not bit-identical to it (dot order); prefill +3.8% at 32K
   ([qwen4-perf](qwen4-perf.md#gdn-pipelined), 9b3369a6, Sushi-4bpw kv8 `--no-mtp`).
 
+### DeepSeek-V4.1 fused gather-attention (`dsv41_attn_fused`)
+
+- One threadgroup per (query row, 16 heads); the row's window keys and picked compressed rows stream through
+  threadgroup memory 16 at a time, shared by the 16 heads (MQA), and eight simdgroups each own 64 of the 512 channels
+  of both products. The softmax is online in f32 and seeded with the sink as a zero-valued key.
+- P reaches the bf16 matrix unit as a high and a low bf16 part (two MMAs), which keeps ~16 bits of it; a single bf16 P
+  would be 2^-9. The error against the CPU f32 `attnCore` is 4e-6 to 1.3e-5 of peak, the GPU `attnCore` 3.5e-4 to 7e-4
+  (its f32 matmul keeps ~11 bits).
+- A matrix's per-lane (row, column) is `fm = (lane / 4 & 4) + (lane / 2) % 4`, `fn = (lane / 4 & 2) * 2 + (lane % 2) * 2`
+  with `thread_elements()`: the online rescale and the output store use it instead of a threadgroup round trip.
+- Release shape (64 heads x 512, window 128, 512 picks), best of 16 interleaved on the M5 Max, `SUSHI_DSV41_ATTN_UBENCH=1`
+  test "dsv41 attention span timing": span 256 core 13-15 ms, f16 `attnWide` 5.9-6.8 ms, fused 2.7-3.3 ms; span 128
+  core 6.3-7.2, wide 2.8-3.2, fused 1.5-1.7; window-only span 256 core 3.6-4.0, wide 2.1, fused 0.7-1.0. Peak bytes beyond
+  the inputs a span: core 897 MB, wide 284 MB, fused 16 MB (the output). Four simdgroups were 15% slower than eight.
+  The box was shared with other Metal compiles, so the fused arm spread up to 2x between runs; core and wide hold.
+
 ## Verify lanes
 
 - `vqmmLaneFor`: split-K M 2–7 / wide tile N≥100K / NAX m16 M 8–16; parity = fp32-dequant per width, never vs
@@ -198,6 +214,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - Interleave A/B kernels in ONE process (separate runs drift 15%); one-shot per-kernel ubench timings are not
   evidence (codebook-free kernels swung 20-40% between arms from clock ramp).
+- A bench of independent calls lets one-dispatch launches overlap, so it flatters a launch with few threadgroups.
+  Time a decode-shaped kernel's geometry on a chain as well, each call fed by the previous output
+  ([engine-exl3-experts](engine-exl3-experts.md#dense-rows)).
 - Size every probe and config cache for all the arms of an A/B. A full cache re-probes on every call, which added
   ~170 us per call to the dev arms. An ablation that skips a tile's only reader lets the compiler drop the tile's
   stores and their loads.

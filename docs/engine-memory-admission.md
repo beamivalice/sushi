@@ -196,8 +196,8 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   drains it before the next, so a larger permit buys no speed and on a small Mac crowds macOS's share of RAM.
 - The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
-- A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next) prefills every request
-  from its start width (`prefillStartWidth`: 4096, 2048, 2048; an explicit `--prefill-chunk` sets it instead). Each
+- A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next, deepseek_v41) prefills every
+  request from its start width (`prefillStartWidth`: 4096, 2048, 2048, 2048; an explicit `--prefill-chunk` sets it instead). Each
   chunk boundary steps down a rung, never up again, only where the next chunk's cost no longer fits the live
   headroom beside the KV (`adaptivePrefillWidth`). Admission bills the request's top at the widest rung whose whole
   bill fits (`chooseRequestPrefillChunk`), so a long prompt is never under-billed; the load-time pin is only the
@@ -353,6 +353,10 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   and the scheduler's `admissionPassArmed` read that one predicate), crediting only
   provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
+- **DeepSeek STQ bills a request's state, not its prefill working set**: the working set comes out of decoder-layer
+  expert pools each prefill forward releases when its need passes the live headroom, refused before anything is released
+  where the pools cannot cover it; admission bills that term only past the lendable bytes, plus a decode forward's
+  working set, and SSD-first its restore points' in-flight bytes ([dsv41-memory](dsv41-memory.md#borrow)).
 - qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill. The SSD
   tier fills buffers the slot owns (`LookupResult.slot_owned`), so its rows are credited like a checkout's: the
   first append grows each layer and its old rows are freed at that layer's eval window, which is all the bill keeps
@@ -397,6 +401,12 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - **A streamed `--vision` load bills its tower in the ssd budget and proves its largest image beside it**: the load
   admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
   ([engine-expert-streaming](engine-expert-streaming.md#vision)).
+- **DeepSeek-V4.1's tower is billed in that term**: `dsv41_source.visionBytes` sums the pack's `vision.*`, `aligner.*`,
+  `image_*` and each layer's `bias_vl` as stored (bf16 tower 970,536,960 bytes plus 40 f32 biases of 1,536 bytes on an STQ pack), so the
+  `[expert-stream] ssd budget` line reads `vision 0.97 GB` under `--vision` where it read `0.00` while the tower was
+  not served; a load without `--vision` bills 0 and leaves those tensors unread. A request's encode is `dsv41_vision.encodeScratchBytes`
+  (activations of the widest block, the 512-query score sheet and the aligner, a bound for the 9,198 patches a 1024-token
+  span can hold) plus the f32 patches and three copies of the 5120-wide span rows.
 - **A video's block is ONE temporal group**, never the whole video: `forwardVideo` encodes and evaluates each group
   alone, so the bill grows linearly with the group count (the old N^2 over all groups billed 79 GB at 8x46x82).
   Measured peak (pixel upload to evaluated output) = one group's scratch + all pixels + the earlier groups' rows:

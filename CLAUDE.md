@@ -1,17 +1,17 @@
 # Sushi — project context for AI
 
 A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwen4_exp`),
-MiMo-V2.6-Flash (`mimo_v2`) and GLM-5.3-Flash (`glm5_next`). Qwen and MiMo use
+MiMo-V2.6-Flash (`mimo_v2`), GLM-5.3-Flash (`glm5_next`) and DeepSeek-V4.1-Flash (`deepseek_v41`). Qwen and MiMo use
 native MTP and affine8 KV by default. GLM batches up to four requests over an affine8 MLA latent
 (`--kv-quant 16` = BF16) and FP32 KDA state, with DFlash2, image/video input and prefix reuse; its MTP
-stays off. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of ddalcu's mlx-serve.
+stays off. DeepSeek serves one request at a time with streamed experts, DSpark, image input and prefix reuse. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of ddalcu's mlx-serve.
 
 - **sushi** is public code: every change ships with its license, NOTICE and docs story; it is not scoped to EXL3 or
-  to these three models forever.
+  to these four models forever.
 - **sashimi** is the PRIVATE quant-creation stack (converters, allocators, imatrix, repackers). This repo keeps only
   the CONSUMER contract (`docs/pack-format.md`, the shard-stamp check, `src/fixtures/`, `sushi kld`) and the oracle
   fixture dumpers (`tests/dump_*_fixtures.py`). Converter knowledge goes to `docs/private/`, never a committed file.
-- `src/` holds only the three served architectures and their shared machinery. Any other `model_type` is refused by
+- `src/` holds only the four served architectures and their shared machinery. Any other `model_type` is refused by
   name (`ArchitectureUnsupported` → 503), as is an unsupported file format (`ModelFormatUnsupported` → 503).
 
 <a id="docs-index"></a>
@@ -19,7 +19,7 @@ stays off. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of dd
 
 This file holds rules and the map. Knowledge, measurements and lessons live in `docs/<category>-<topic>.md`; read the
 doc for the area before changing it, and update it in the same landing. A doc about ONE served architecture takes
-that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`); `engine-`, `server-` and the rest are shared.
+that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine-`, `server-` and the rest are shared.
 
 | doc | what it holds |
 |---|---|
@@ -35,6 +35,9 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`); `engine-`, `serve
 | [docs/glm5-kernels.md](docs/glm5-kernels.md) | GLM kernels, exactness rules, drift screen, ruled-out list |
 | [docs/glm5-perf.md](docs/glm5-perf.md) | GLM tok/s: DFlash2 round levers, three/four-row verify, prefill chunk, long context |
 | [docs/glm5-kld.md](docs/glm5-kld.md) | GLM KLD against the native BF16 teacher |
+| [docs/dsv41-arch.md](docs/dsv41-arch.md) | DeepSeek-V4.1-Flash: geometry, FP8 trunk + streamed experts, Engram, CED prefill, oracle, kernels, DSpark, STQ packs, `--drop-expert`, prefix cache, image input |
+| [docs/dsv41-memory.md](docs/dsv41-memory.md) | DeepSeek-V4.1 ledger, per-layer cache split, 1M-token state, prefill borrow, resident load |
+| [docs/dsv41-parity.md](docs/dsv41-parity.md) | DeepSeek-V4.1 against Qwen: feature matrix, larger gaps, live checks |
 | [docs/glm5-prefix-cache.md](docs/glm5-prefix-cache.md) | GLM cache keys, latent and KDA state, restore, spec state |
 | [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
@@ -100,15 +103,17 @@ Box: M5 Max 128 GB, macOS 27.
 | `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
 | `mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | mimo2-arch |
 | `glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, decode kernels, prefix state, vision | glm5-* |
+| `dsv41_*.zig` / `dspark_rows.zig` / `expert_usage.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1: config, resident loader, forward, QAT, Engram, expert-stream hooks, prefill borrow, prefix state, vision tower; DSpark verify width; `--drop-expert` usage list; pre-tokenizer | dsv41-arch, dsv41-memory |
 | `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | qwen4-arch |
 | `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
 | `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, shard-stamp check | mimo2-arch |
-| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3 decoders and kernels | engine-exl3-experts |
+| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3/STQ decoders and kernels, rate groups, dense trellis linears (`exl3/linear.zig`) | engine-exl3-experts |
 | `encoder/` | `sushi convert exl3`: Metal and CPU trellis search, source readers, trunk and shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, round-cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier | engine-prefix-cache |
+| `mlx_kernel_keys.zig` | custom-kernel library keys behind `mlx.zig`'s kernel wrappers (`SUSHI_KERNEL_BUILD_LOG`) | engine-mlx-gotchas |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
 | `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: shared preprocessing, Qwen3-VL + M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |

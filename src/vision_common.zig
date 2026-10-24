@@ -289,6 +289,27 @@ pub fn resizeRgbNormalizedChw(
         return error.InvalidImageDimensions;
     if (rgb.len != source_plane * 3 or dst.len != target_plane * 3)
         return error.InvalidImageBuffer;
+    const resized = try resizeRgbU8(allocator, rgb, source_h, source_w, target_h, target_w, filter);
+    defer allocator.free(resized);
+    for (0..target_plane) |p| {
+        inline for (0..3) |channel| dst[channel * target_plane + p] = normalizeQwenPixel(resized[p * 3 + channel]);
+    }
+}
+
+/// Pillow's `Image.resize` of interleaved RGB, uint8 in and out (the caller frees): a horizontal
+/// pass then a vertical one, each rounded to uint8 as Pillow does.
+pub fn resizeRgbU8(
+    allocator: std.mem.Allocator,
+    rgb: []const u8,
+    source_h: u32,
+    source_w: u32,
+    target_h: u32,
+    target_w: u32,
+    filter: Filter,
+) ![]u8 {
+    if (source_h == 0 or source_w == 0 or target_h == 0 or target_w == 0)
+        return error.InvalidImageDimensions;
+    if (rgb.len != @as(usize, source_h) * source_w * 3) return error.InvalidImageBuffer;
 
     var horizontal_owned: ?[]u8 = null;
     defer if (horizontal_owned) |buffer| allocator.free(buffer);
@@ -316,6 +337,8 @@ pub fn resizeRgbNormalizedChw(
         break :resize buffer;
     } else rgb;
 
+    const out = try allocator.alloc(u8, @as(usize, target_h) * target_w * 3);
+    errdefer allocator.free(out);
     if (target_h != source_h) {
         var coefficients = try buildResampleCoefficients(allocator, source_h, target_h, filter);
         defer coefficients.deinit(allocator);
@@ -323,28 +346,18 @@ pub fn resizeRgbNormalizedChw(
             const bound = coefficients.bounds[y];
             const weights = coefficients.weights[y * coefficients.kernel_size ..][0..bound.len];
             for (0..target_w) |x| {
-                const destination = y * target_w + x;
                 inline for (0..3) |channel| {
                     var sum: i64 = RESAMPLE_ROUNDING_BIAS;
                     for (weights, 0..) |weight, source_offset| {
                         const source = ((bound.start + source_offset) * target_w + x) * 3 + channel;
                         sum += @as(i64, horizontal[source]) * @as(i64, weight);
                     }
-                    dst[channel * target_plane + destination] = normalizeQwenPixel(clipFixedResample(sum));
+                    out[(y * target_w + x) * 3 + channel] = clipFixedResample(sum);
                 }
             }
         }
-    } else {
-        for (0..target_h) |y| {
-            for (0..target_w) |x| {
-                const source = (y * target_w + x) * 3;
-                const destination = y * target_w + x;
-                inline for (0..3) |channel| {
-                    dst[channel * target_plane + destination] = normalizeQwenPixel(horizontal[source + channel]);
-                }
-            }
-        }
-    }
+    } else @memcpy(out, horizontal);
+    return out;
 }
 
 /// Number of LLM image-pad tokens an image of resized (H,W) expands to.

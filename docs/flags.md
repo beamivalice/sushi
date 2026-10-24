@@ -8,7 +8,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 104 rows: 57 shared by `run`, `serve` and the bare form, 47 in `run`, `launch`, `update`, `kld` and `convert`. By who: user 32, operator 28, machine 17, dev 26, dead 1. By recommendation: keep 96, cut 4, owner call 4. Among the 57 shared rows: keep 51, cut 4, owner call 2.
+**Summary.** 106 rows: 58 shared by `run`, `serve` and the bare form, 48 in `run`, `launch`, `update`, `kld` and `convert`. By who: user 33, operator 28, machine 17, dev 27, dead 1. By recommendation: keep 98, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -44,7 +44,8 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--skip-mem-preflight` | off → bypass the free-RAM check before a load (main.zig:699) | machine | help, engine-memory-admission, qwen4-perf; 0 tests | keep: the refusal text names it; the M2 Max runs need it |
 | `--wired-margin-gib` | `1` → headroom under `iogpu.wired_limit_mb`, 1..32 (main.zig:898) | machine | help, README, engine-memory-admission; 0 tests | keep |
 | `--ssd-budget-gb` | none → stream experts from SSD within a TOTAL resident target; also `ssd_budget_gb` in settings (main.zig:985) | machine | help, README, engine-expert-streaming; 9 tests | keep |
-| `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904) | user | help, README, engine-expert-streaming; 1 test | keep: a measured speed-for-exactness tradeoff |
+| `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904); engages on rate-grouped layers too (DeepSeek STQ, any group's pool) | user | help, README, engine-expert-streaming; 2 tests | keep: a measured speed-for-exactness tradeoff |
+| `--drop-expert` | `0` off → never load, bill, cache or pick the n least-used routed experts of every layer, ranked by the pack's `expert_usage.json`; a multiple of 8; DeepSeek-V4.1 only, every other arch refuses it at load (main.zig:886, `archFlagRefusal`); `sushi kld compare` takes it, `capture` refuses it ([dsv41-arch](dsv41-arch.md#drop-expert)) | user | help, dsv41-arch, engine-expert-streaming, pack-format; 18 tests | keep: frees expert bytes for re-routed picks; answers change, so score it with `sushi kld compare` |
 | `--prefill-chunk` | `8192` → ceiling on tokens per prefill chunk, auto-capped per model (main.zig:824) | machine | help, usage, engine-memory-admission; 11 tests, 2 scripts | keep |
 | `--prefill-decode-share` | `0` → target decode share of wall time during another request's prefill, 0..0.9 (main.zig:910) | user | help, server-lifecycle; 1 test | keep: latency of live streams against prefill speed |
 
@@ -52,17 +53,17 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--kv-quant` | `8` → KV scheme 8, 6, 4 or 16 (`off` = BF16; GLM takes 8, 6 and 16); also `kv_quant` in settings and per request (main.zig:972) | user | help, usage, engine-kv-cache; 21 tests | keep |
-| `--qwen-gdn` | `32` → GatedDeltaNet state width in bits, `32` (f32) or `16` (bf16), Qwen only; the decay gate is f32 either way (main.zig:830) | machine | help, usage, engine-kv-cache, quality-kld; 3 tests (parse, config, boot line) | keep: the 32, 48 and 64 GB recipes pass `16` to halve the state per checkpoint (about 54 MB each); against the f32 default the bf16 state (arm b) is about 2% faster on 4-stream aggregate and its KLD is inside the noise ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher), [qwen4-perf](qwen4-perf.md#gdn-f32-cost)) |
-| `--mtp-head-kv-quant` | off → Qwen's MTP head KV follows `--kv-quant`; no effect on MiMo (main.zig:762) | machine | help, usage, README, engine-mtp; 0 tests | keep: the long-context memory bills use it |
+| `--kv-quant` | `8` → KV scheme 8, 6, 4 or 16 (`off` = BF16; GLM takes 8, 6 and 16); also `kv_quant` in settings and per request (main.zig:972); DeepSeek-V4.1 refuses it at load (a settings value is ignored with one log line) | user | help, usage, engine-kv-cache; 21 tests | keep |
+| `--qwen-gdn` | `32` → GatedDeltaNet state width in bits, `32` (f32) or `16` (bf16), Qwen only (DeepSeek-V4.1 refuses `16` at load); the decay gate is f32 either way (main.zig:830) | machine | help, usage, engine-kv-cache, quality-kld; 3 tests (parse, config, boot line) | keep: the 32, 48 and 64 GB recipes pass `16` to halve the state per checkpoint (about 54 MB each); against the f32 default the bf16 state (arm b) is about 2% faster on 4-stream aggregate and its KLD is inside the noise ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher), [qwen4-perf](qwen4-perf.md#gdn-f32-cost)) |
+| `--mtp-head-kv-quant` | off → Qwen's MTP head KV follows `--kv-quant`; no effect on MiMo; DeepSeek-V4.1 refuses it at load (main.zig:762) | machine | help, usage, README, engine-mtp; 0 tests | keep: the long-context memory bills use it |
 
 ## Speculation (MTP, prompt lookup, drafter)
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
 | `--mtp` / `--no-mtp` | on for Qwen and MiMo, off for GLM → force the head on (required for a streamed pack) or off; also `mtp` in settings (main.zig:754) | user | help, usage, engine-mtp; 22 tests | keep |
-| `--mtp-min-depth` | `1` → fewest tokens a round drafts, 1..8 (main.zig:771) | machine | help, engine-mtp; 5 tests | keep: depth range is a property of the chip; launch-only by design |
-| `--mtp-max-depth` | adaptive, up to 8 on eligible M5 → most tokens a round drafts, 1..8 (main.zig:771) | machine | help, engine-mtp; 5 tests | keep |
+| `--mtp-min-depth` | `1` → fewest tokens a round drafts, 1..8; DeepSeek-V4.1 refuses it at load, its DSpark block is fixed (main.zig:771) | machine | help, engine-mtp; 5 tests | keep: depth range is a property of the chip; launch-only by design |
+| `--mtp-max-depth` | adaptive, up to 8 on eligible M5 → most tokens a round drafts, 1..8; DeepSeek-V4.1 refuses it at load (main.zig:771) | machine | help, engine-mtp; 5 tests | keep |
 | `--mtp-typical` | off, exact → typical acceptance, d > 0, lossy for sampled requests; also `mtp_acceptance` in settings (main.zig:780) | user | help, engine-mtp; 1 test | keep: measured 15-20% on sampled decode; docs warn it has looped |
 | `--mtp-tokenv3` | off → TokenV3 cascade acceptance, 0..1, lossy (main.zig:783) | user | help; 2 tests | owner call |
 | `--mtp-greedy-tail` | off → sampled requests draft only the first token by sampling; also in settings (main.zig:786) | user | help, engine-mtp, mimo2-perf; 1 test | keep: measured to pay only beside `--mtp-typical` |
@@ -137,6 +138,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--ctx-size` | model max → context override (kld.zig:108) | dev | help | keep |
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
 | `kld`: `--qwen-gdn` | `32` → `16` scores a bf16-state student against the f32 teacher; a GLM capture refuses it (kld.zig:107) | dev | help, quality-kld; 2 tests | keep |
+| `kld`: `--drop-expert` | `0` → compare only, the student drops n experts a layer by the pack's usage list; a capture refuses it (the teacher is exact) (kld.zig:112) | dev | help, dsv41-arch; 1 test | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |
 | `kld`: `--wired-margin-gib` | `1` → headroom under the wired limit (kld.zig:114) | dev | help | keep |

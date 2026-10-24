@@ -51,6 +51,12 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - **MLX binds a `metal_kernel` input of fewer than 8 elements in the `constant` address space**: a kernel source never
   declares `const device T*` from an input (`auto p = in + off`); the FP8 tile kernel's scales did, and a tiny linear
   failed to build at 9..128 rows. Guard: the fp8_block small-scales test.
+- **Every template arg value is its own Metal library, compiled on the inference thread at first eval (tens of ms)**:
+  MLX keys a `metal_kernel` library by name, source, template args, each input's dtype and binding (scalar, `constant`
+  under 8 elements, device) and output dtypes. A row count, pick count, split count or context width never rides a
+  template arg: read it from `threads_per_grid`, an input's `_shape`, or a small input buffer. DeepSeek's index top-k
+  width and packed-KV row counts did, and decode below 512 tokens of context compiled a library every token (the
+  "slow state"). `SUSHI_KERNEL_BUILD_LOG=1` logs each new key; guard: the `dsv41 kernels:` zero-new-library tests.
 
 ## Laziness and barriers
 
@@ -120,3 +126,6 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - The cased `llama3` grammar needs `\p{Lu}` in the Split regex: contractions plus `\p{N}{1,3}` is also GLM's plain
   Llama-3 pattern, which is the gpt2 path with `.letters` word rules and 3-digit groups. The BPE `ignore_merges` flag
   (GLM sets it) is honoured in `bpeMerge`. The parity script covers GLM, Qwen and MiMo on code and tool-call text.
+- DeepSeek's `Scope.out` handle belongs to the caller: a `block` result chained through a loop in a scope must be
+  adopted with `sc.keep` or it leaks every iteration (the DSpark draft leaked its stage outputs per round). Guard: the
+  `DSpark requests leave the MLX active memory flat` test in `generate.zig`.

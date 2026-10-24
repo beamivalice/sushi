@@ -91,7 +91,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`BARE_INVOKE`, ATEM's grammar without the namespace; qwen4_exp writes it after Claude transcripts). It is
   `inferred`, so an undeclared name stays prose. The stream gate holds `<function_calls>` and `<invoke ` with every
   growing prefix (`invokeOpenerHoldsForTools`); the scrubber cuts it only beside a `<parameter ` or `</invoke>`
-  (`bareInvokeMarkupCut`), so prose naming the tag survives. Corpus family `qwen4_exp`.
+  (`bareInvokeMarkupCut`), and the parser reads it only beside one of them too (`parseInvokeToolCalls`), so prose
+  naming the tag survives even when the name it shows is a declared tool. Corpus families `qwen4_exp`, `dsv41-dsml`.
 - **A `</think>` inside a tool ARGUMENT is payload** (`thinkCloseIsToolCallPayload`): decline a close whose nearest
   preceding tool opener is still OPEN AND whose block closes afterwards.
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched).

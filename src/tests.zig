@@ -21,6 +21,7 @@ test {
     _ = @import("imatrix.zig");
     _ = @import("hidden_capture.zig");
     _ = @import("expert_quant.zig");
+    _ = @import("expert_usage.zig");
     _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
@@ -37,6 +38,7 @@ test {
     _ = @import("vision_common.zig");
     _ = @import("mimo_vision.zig");
     _ = @import("glm5_vision.zig");
+    _ = @import("dsv41_vision.zig");
     _ = @import("mrope.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
@@ -48,6 +50,8 @@ test {
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
+    _ = @import("spec_cost_gate.zig");
+    _ = @import("dspark_rows.zig");
     _ = @import("dflash.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("dflash_conv.zig");
@@ -62,6 +66,7 @@ test {
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("tokenizer.zig");
+    _ = @import("tokenizer_deepseek.zig");
     _ = @import("tokenize_cache.zig");
     _ = @import("prefix_cache.zig");
     _ = @import("restore_dump.zig");
@@ -74,6 +79,14 @@ test {
     _ = @import("kv_disk_writer.zig");
     _ = @import("model_discovery.zig");
     _ = @import("mimo_source.zig");
+    _ = @import("dsv41_config.zig");
+    _ = @import("dsv41_qat.zig");
+    _ = @import("dsv41_engram.zig");
+    _ = @import("dsv41_source.zig");
+    _ = @import("dsv41_model.zig");
+    _ = @import("dsv41_stream.zig");
+    _ = @import("dsv41_borrow.zig");
+    _ = @import("dsv41_kernels.zig");
     _ = @import("glm5_next.zig");
     _ = @import("glm5_model.zig");
     _ = @import("glm5_trunk_cov.zig");

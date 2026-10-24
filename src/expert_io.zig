@@ -1260,6 +1260,12 @@ test "expert io file cache reopens a replaced shard and reuses a stable one" {
 
 pub const Dtype = enum { bf16, f16, u8, u16, u32, f32, f8e4m3, other };
 
+/// One byte per element, moved as opaque bytes: unsigned, signed (packed e2m1 pairs) or e8m0 scales.
+pub fn isByteDtype(name: []const u8) bool {
+    for ([_][]const u8{ "U8", "UINT8", "I8", "F8_E8M0" }) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
 pub const TensorRegion = struct {
     data_offset: u64,
     tensor_offset: u64,
@@ -1429,7 +1435,7 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
         .f16
     else if (std.mem.eql(u8, dtype.string, "U16"))
         .u16
-    else if (std.mem.eql(u8, dtype.string, "U8") or std.mem.eql(u8, dtype.string, "UINT8"))
+    else if (isByteDtype(dtype.string))
         .u8
     else if (std.mem.eql(u8, dtype.string, "U32") or std.mem.eql(u8, dtype.string, "UINT32"))
         .u32

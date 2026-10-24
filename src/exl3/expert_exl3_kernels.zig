@@ -945,10 +945,10 @@ const FINISH_SOURCE: [:0]const u8 =
     \\const float s2 = v.z + v.w;
     \\const float s3 = v.z - v.w;
     \\const float sc = 0.08838834764831845f;
-    \\y[xb + lane] = half((s0 + s2) * sc * float(svh[sb + lane]));
-    \\y[xb + lane + 32u] = half((s1 + s3) * sc * float(svh[sb + lane + 32u]));
-    \\y[xb + lane + 64u] = half((s0 - s2) * sc * float(svh[sb + lane + 64u]));
-    \\y[xb + lane + 96u] = half((s1 - s3) * sc * float(svh[sb + lane + 96u]));
+    \\y[xb + lane] = OutT((s0 + s2) * sc * float(svh[sb + lane]));
+    \\y[xb + lane + 32u] = OutT((s1 + s3) * sc * float(svh[sb + lane + 32u]));
+    \\y[xb + lane + 64u] = OutT((s0 - s2) * sc * float(svh[sb + lane + 64u]));
+    \\y[xb + lane + 96u] = OutT((s1 - s3) * sc * float(svh[sb + lane + 96u]));
 ;
 
 var gemm_sorted_kernel: KernelSlots = no_kernels;
@@ -1367,7 +1367,8 @@ pub fn gemmWindowAligned() bool {
 }
 var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
-var finish_cfgs: CfgCache(UnaryKey, 8) = .{};
+const FinishKey = struct { dim: c_int, topk: c_int, out_dt: mlx.mlx_dtype };
+var finish_cfgs: CfgCache(FinishKey, 8) = .{};
 var gemm_sorted_cfgs: CfgCache(GemmSortedKey, 8) = .{};
 var gemm_simdmat_cfgs: CfgCache(GemmSortedKey, 8) = .{};
 var gemm_nax_cfgs: CfgCache(GemmSortedKey, 8) = .{};
@@ -1924,16 +1925,22 @@ pub fn prepareIndexed(s: mlx.mlx_stream, x_in: mlx.mlx_array, suh: mlx.mlx_array
 }
 
 pub fn finishIndexed(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
+    return finishIndexedAs(s, inner, svh, slots, .float16);
+}
+
+/// `finishIndexed` storing `out_dt` (f16, bf16 or f32), rounded once from the f32 result.
+pub fn finishIndexedAs(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, out_dt: mlx.mlx_dtype) !mlx.mlx_array {
     const sh = mlx.getShape(inner);
     const topk = sh[0];
     const out_dim = sh[1];
     const blocks = @divExact(out_dim, 128);
-    const key = UnaryKey{ .dim = out_dim, .topk = topk };
+    const key = FinishKey{ .dim = out_dim, .topk = topk, .out_dt = out_dt };
     const cfg = finish_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const out_shape = [_]c_int{ topk, out_dim };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", out_dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * blocks, topk, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
@@ -2424,6 +2431,421 @@ pub fn projectIndexed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_arra
     return finishIndexed(s, inner, svh, slots);
 }
 
+/// The suh + H128 (or svh + H128) butterfly of one 128-block over a simdgroup, unscaled: lane l holds
+/// elements l, l+32, l+64, l+96, in `PREPARE_SOURCE`'s arithmetic order.
+const ROWS_HELPERS: [:0]const u8 =
+    \\static inline size_t exl3_seg_at(uint r, uint col, uint rows, uint odim, uint b1, uint b2, uint b3) {
+    \\  const uint lo = col < b1 ? 0u : col < b2 ? b1 : col < b3 ? b2 : b3;
+    \\  const uint hi = col < b1 ? b1 : col < b2 ? b2 : col < b3 ? b3 : odim;
+    \\  return (size_t)lo * rows + (size_t)r * (hi - lo) + (col - lo);
+    \\}
+    \\static inline void exl3_store(device float *p, float v) { *p = v; }
+    \\static inline void exl3_store(device half *p, float v) { *p = half(v); }
+    \\static inline void exl3_store(device bfloat16_t *p, float v) { *p = bfloat16_t(v); }
+    \\static inline float4 exl3_h128(float4 v, uint lane) {
+    \\  for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\    const float4 p = simd_shuffle_xor(v, bit);
+    \\    v = (lane & bit) == 0u ? v + p : p - v;
+    \\  }
+    \\  const float s0 = v.x + v.y;
+    \\  const float s1 = v.x - v.y;
+    \\  const float s2 = v.z + v.w;
+    \\  const float s3 = v.z - v.w;
+    \\  return float4(s0 + s2, s1 + s3, s0 - s2, s1 - s3);
+    \\}
+    \\
+;
+
+/// The multi-row kernels' k walk: KT k-tiles from tk0, CHUNK halves per row at a time, each chunk first
+/// prepared (suh + H128) for every row into `prep`, element e of a 128-block at offset `PREP_SLOT`.
+const ROWS_CHUNK_OPEN: []const u8 =
+    \\for (uint c0 = tk0; c0 < tk0 + KT; c0 += CT) {
+    \\  const uint c1 = min(c0 + CT, tk0 + KT);
+    \\  const uint nb = (c1 - c0) / 8u;
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (uint item = sg; item < uint(ROWS) * nb; item += SGS) {
+    \\    const uint r = item / nb;
+    \\    const uint b = (item - r * nb) * 128u;
+    \\    const uint k = c0 * TILE + b;
+    \\    const auto xr = x + (size_t)r * uint(IDIM) + k;
+    \\    const float4 v = exl3_h128(float4(
+    \\      float(xr[lane]) * float(suh[k + lane]),
+    \\      float(xr[lane + 32u]) * float(suh[k + lane + 32u]),
+    \\      float(xr[lane + 64u]) * float(suh[k + lane + 64u]),
+    \\      float(xr[lane + 96u]) * float(suh[k + lane + 96u])), lane);
+    \\    threadgroup half *pw = prep + r * uint(CHUNK) + b + PREP_SLOT;
+    \\    pw[0] = half(v.x * psc);
+    \\    pw[32] = half(v.y * psc);
+    \\    pw[64] = half(v.z * psc);
+    \\    pw[96] = half(v.w * psc);
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+;
+
+/// The fold: row r's 128 output sums, KPARTS partials each in `tgm`, through the output H128 + svh.
+const ROWS_FOLD: []const u8 =
+    \\  for (uint r = sg; r < uint(ROWS); r += SGS) {
+    \\    float4 v = 0.0f;
+    \\    for (uint k = 0u; k < KPARTS; k++) {
+    \\      const threadgroup float *pr = tgm + (r * KPARTS + k) * 128u + lane;
+    \\      v += float4(pr[0], pr[32], pr[64], pr[96]);
+    \\    }
+    \\    v = exl3_h128(v, lane);
+    \\    const uint ob = ot0 * TILE + lane;
+    \\    const auto yr = y + exl3_seg_at(r, ob, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
+    \\    yr[0] = OutT(v.x * psc * float(svh[ob]));
+    \\    yr[32] = OutT(v.y * psc * float(svh[ob + 32u]));
+    \\    yr[64] = OutT(v.z * psc * float(svh[ob + 64u]));
+    \\    yr[96] = OutT(v.w * psc * float(svh[ob + 96u]));
+    \\  }
+    \\
+;
+
+const ROWS_HEAD: []const u8 =
+    \\constexpr uint TILE = 16u;
+    \\constexpr uint N = uint(NHW);
+    \\constexpr uint PACKED_W = N / 2u;
+    \\constexpr uint OT = uint(ODIM) / TILE;
+    \\constexpr uint KT = uint(IDIM) / uint(NSPLIT) / TILE;
+    \\constexpr uint CT = uint(CHUNK) / TILE;
+    \\constexpr uint PREP_F = uint(ROWS) * uint(CHUNK) / 2u;
+    \\threadgroup float tgm[PREP_F > PART_F ? PREP_F : PART_F];
+    \\threadgroup half *prep = (threadgroup half *)tgm;
+    \\const uint ot0 = uint(threadgroup_position_in_grid.x) * TGT;
+    \\const uint split = uint(threadgroup_position_in_grid.y);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint tk0 = split * KT;
+    \\const float psc = 0.08838834764831845f;
+    \\if constexpr (GROUPS > 1) {
+    \\  const size_t grp = threadgroup_position_in_grid.z;
+    \\  x += grp * uint(ROWS) * uint(IDIM);
+    \\  trellis += grp * (uint(IDIM) / TILE) * OT * N;
+    \\  suh += grp * uint(IDIM);
+    \\  svh += grp * uint(ODIM);
+    \\  y += grp * (FOLD ? uint(ROWS) : uint(ROWS) * uint(NSPLIT)) * uint(ODIM);
+    \\}
+    \\if constexpr (uint(SB1) < uint(ODIM)) {
+    \\  const uint c0 = ot0 * TILE;
+    \\  suh += (uint(c0 >= uint(SB1)) + uint(c0 >= uint(SB2)) + uint(c0 >= uint(SB3))) * uint(IDIM);
+    \\}
+    \\
+;
+
+/// `projectIndexed` over ROWS activation rows of one dense matrix: a lane decodes each of its weights
+/// once and feeds every row. A threadgroup owns TGRP output tile pairs, with KPH simdgroups per pair
+/// splitting its k range; it prepares that range for every row in threadgroup memory, in GEMV lane
+/// order. With one 128-wide output block per threadgroup and no k split (FOLD) it also applies the output
+/// H128 + svh; otherwise each k split stores f32 partials that `ROWS_FINISH_SOURCE` sums.
+const ROWS_SOURCE: [:0]const u8 = metalReplaceFound(ROWS_BODY, "PREP_SLOT", LANE_ORDER_SLOT);
+const ROWS_BODY: [:0]const u8 =
+    \\constexpr uint SGS = uint(TGRP) * uint(KPH);
+    \\constexpr uint KPARTS = uint(KPH);
+    \\constexpr uint TGT = 2u * uint(TGRP);
+    \\constexpr uint PART_F = uint(ROWS) * KPARTS * TGT * 16u;
+    \\
+++ ROWS_HEAD ++
+    \\const uint lid = uint(thread_index_in_threadgroup);
+    \\const uint tgp = sg % uint(TGRP);
+    \\const uint kph = sg / uint(TGRP);
+    \\constexpr uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
+    \\float acc[ROWS][2][2] = {};
+    \\const device uint *wt = (const device uint *)trellis + (size_t)(ot0 + 2u * tgp) * PACKED_W;
+    \\
+++ ROWS_CHUNK_OPEN ++
+    \\  const device uint *wp = wt + (size_t)(c0 + kph) * OT * PACKED_W;
+    \\  const threadgroup half *pp = prep + kph * TILE + (lane & 3u) * 4u;
+    \\  for (uint tk = c0 + kph; tk < c1; tk += 2u * uint(KPH)) {
+    \\    exl3_lane_bits<N> merged[2][2];
+    \\    for (uint u = 0u; u < 2u; u++) {
+    \\      for (uint o = 0u; o < 2u; o++) {
+    \\        merged[u][o] = exl3_lane<N>(wp + u * uint(KPH) * OT * PACKED_W + o * PACKED_W, lane);
+    \\      }
+    \\    }
+    \\    for (uint u = 0u; u < 2u; u++) {
+    \\      float4 xin[ROWS];
+    \\      for (uint r = 0u; r < uint(ROWS); r++) {
+    \\        xin[r] = float4(*((const threadgroup half4 *)(pp + r * uint(CHUNK) + u * uint(KPH) * TILE)));
+    \\      }
+    \\      for (uint o = 0u; o < 2u; o++) {
+    \\        for (uint p = 0u; p < 4u; p++) {
+    \\          const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
+    \\          const float2 w = exl3_decode2(cw);
+    \\          for (uint r = 0u; r < uint(ROWS); r++) {
+    \\            const float2 i2 = (p & 1u) != 0u ? xin[r].zw : xin[r].xy;
+    \\            acc[r][o][p >> 1u] = fma(i2.y, w.y, fma(i2.x, w.x, acc[r][o][p >> 1u]));
+    \\          }
+    \\        }
+    \\      }
+    \\    }
+    \\    wp += 2u * uint(KPH) * OT * PACKED_W;
+    \\    pp += 2u * uint(KPH) * TILE;
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\for (uint r = 0u; r < uint(ROWS); r++) {
+    \\  for (uint o = 0u; o < 2u; o++) {
+    \\    float lo = acc[r][o][0];
+    \\    float hi = acc[r][o][1];
+    \\    lo += simd_shuffle_xor(lo, 1u);
+    \\    hi += simd_shuffle_xor(hi, 1u);
+    \\    lo += simd_shuffle_xor(lo, 2u);
+    \\    hi += simd_shuffle_xor(hi, 2u);
+    \\    if ((lane & 3u) == 0u) {
+    \\      threadgroup float *pr = tgm + ((r * KPARTS + kph) * TGT + 2u * tgp + o) * 16u + (lane >> 2u);
+    \\      pr[0] = exl3_out(lo);
+    \\      pr[8] = exl3_out(hi);
+    \\    }
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if constexpr (FOLD) {
+    \\
+++ ROWS_FOLD ++
+    \\} else {
+    \\  for (uint i = lid; i < uint(ROWS) * TGT * 16u; i += SGS * 32u) {
+    \\    const uint r = i / (TGT * 16u);
+    \\    const uint c = i - r * TGT * 16u;
+    \\    float sum = 0.0f;
+    \\    for (uint k = 0u; k < KPARTS; k++) sum += tgm[(r * KPARTS + k) * TGT * 16u + c];
+    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, sum);
+    \\  }
+    \\}
+;
+
+/// `ROWS_SOURCE` on the matrix units: a simdgroup owns 32 outputs, decodes them into `matmul2d` weight
+/// fragments (the NAX GEMM's) and multiplies every k-tile with a 16-row tile holding the prepared rows
+/// (rows past ROWS repeat the last row; their sums are never stored), so a row costs no ALU of its own.
+/// A threadgroup owns one 128-wide output block; FOLD as in `ROWS_SOURCE`.
+const ROWS_NAX_SOURCE: [:0]const u8 = metalReplaceFound(ROWS_NAX_BODY, "PREP_SLOT", "lane");
+const ROWS_NAX_BODY: [:0]const u8 =
+    \\constexpr uint SGS = 4u;
+    \\constexpr uint KPARTS = 1u;
+    \\constexpr uint TGT = 8u;
+    \\constexpr uint PART_F = uint(ROWS) * 128u;
+    \\
+++ ROWS_HEAD ++
+    \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<desc, execution_simdgroup> op;
+    \\auto left = op.get_left_input_cooperative_tensor<half, half, float>();
+    \\auto right = op.get_right_input_cooperative_tensor<half, half, float>();
+    \\auto destination = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(left)>, metal::remove_addrspace_t<decltype(right)>, float>();
+    \\nax_zero(destination);
+    \\const short2 origin = nax_origin(lane);
+    \\const uint xrow = min(uint(origin.y), uint(ROWS) - 1u);
+    \\const device uint *wp = (const device uint *)trellis + ((size_t)tk0 * OT + ot0 + 2u * sg) * PACKED_W;
+    \\
+++ ROWS_CHUNK_OPEN ++
+    \\  const threadgroup half *pl = prep + xrow * uint(CHUNK) + uint(origin.x);
+    \\  for (uint tk = c0; tk < c1; tk++) {
+    \\    const nfrag w0 = nax_wfrag_k<N>(wp, lane);
+    \\    const nfrag w1 = nax_wfrag_k<N>(wp + PACKED_W, lane);
+    \\    for (short s = 0; s < 8; s++) {
+    \\      right[s] = w0[s];
+    \\      right[8 + s] = w1[s];
+    \\    }
+    \\    const half4 v = *((const threadgroup half4 *)(pl + (tk - c0) * TILE));
+    \\    for (uint c = 0u; c < 4u; c++) {
+    \\      left[c] = v[c];
+    \\      left[4 + c] = half(0.0h);
+    \\    }
+    \\    op.run(left, right, destination);
+    \\    wp += OT * PACKED_W;
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (uint(origin.y) < uint(ROWS)) {
+    \\  for (uint ct = 0u; ct < 2u; ct++) {
+    \\    for (uint c = 0u; c < 4u; c++) {
+    \\      const uint col = sg * 32u + ct * 16u + uint(origin.x) + c;
+    \\      if constexpr (FOLD) tgm[uint(origin.y) * 128u + col] = destination[ct * 8u + c];
+    \\      else exl3_store(y + (size_t)(uint(origin.y) * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + c]));
+    \\    }
+    \\  }
+    \\}
+    \\if constexpr (FOLD) {
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+++ ROWS_FOLD ++
+    \\}
+;
+
+/// Sums a row's k-split partials, then applies the output H128 + svh.
+const ROWS_FINISH_SOURCE: [:0]const u8 =
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint b = uint(threadgroup_position_in_grid.x) * 128u + lane;
+    \\const uint r = uint(threadgroup_position_in_grid.z) * uint(ROWS) + uint(threadgroup_position_in_grid.y);
+    \\const uint g = uint(threadgroup_position_in_grid.z);
+    \\float4 v = 0.0f;
+    \\for (uint s = 0u; s < uint(NSPLIT); s++) {
+    \\  const device float *p = part + (size_t)(r * uint(NSPLIT) + s) * uint(ODIM) + b;
+    \\  v += float4(p[0], p[32], p[64], p[96]);
+    \\}
+    \\v = exl3_h128(v, lane);
+    \\const float psc = 0.08838834764831845f;
+    \\device OutT *yr = y + (size_t)g * uint(ROWS) * uint(ODIM) + exl3_seg_at(uint(threadgroup_position_in_grid.y), b, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
+    \\yr[0] = OutT(v.x * psc * float(svh[g * uint(ODIM) + b]));
+    \\yr[32] = OutT(v.y * psc * float(svh[g * uint(ODIM) + b + 32u]));
+    \\yr[64] = OutT(v.z * psc * float(svh[g * uint(ODIM) + b + 64u]));
+    \\yr[96] = OutT(v.w * psc * float(svh[g * uint(ODIM) + b + 96u]));
+;
+
+pub const PROJECT_ROWS_MAX: c_int = 8;
+/// Threadgroup memory a launch stages its prepared rows in: an occupancy bound.
+const ROWS_TG_BYTES: c_int = 8192;
+/// One multi-row launch: `tgrp` output tile pairs per threadgroup, `kph` simdgroups per pair over its k
+/// range, `nsplit` threadgroups over the k dim, `chunk` halves per row staged at a time. `nax` launches
+/// `ROWS_NAX_SOURCE`, whose threadgroup is always tgrp 4, kph 1.
+const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, nax: bool = false };
+const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom };
+const RowsFinishKey = struct { out_dim: c_int, rows: c_int, groups: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int };
+/// DeepSeek's trunk alone holds a dozen shapes at each of a decode and a verify width, so a smaller cache thrashes.
+var rows_cfgs: CfgCache(RowsKey, 64) = .{};
+var rows_finish_cfgs: CfgCache(RowsFinishKey, 64) = .{};
+var rows_kernel: KernelSlots = no_kernels;
+var rows_nax_kernel: KernelSlots = no_kernels;
+var rows_finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const ROWS_INS = [_][*:0]const u8{ "x", "trellis", "suh", "svh" };
+const ROWS_NAX_FRAGS: [:0]const u8 = GEMM_NAX_INCLUDES ++ GEMM_NAX_FRAGS ++ ROWS_HELPERS;
+
+fn rowsKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
+    if (g.nax) return codebookKernelWith(&rows_nax_kernel, "sushi_exl3_rows_nax", &ROWS_INS, &.{"y"}, ROWS_NAX_SOURCE, ROWS_NAX_FRAGS);
+    return codebookKernelWith(&rows_kernel, "sushi_exl3_rows", &ROWS_INS, &.{"y"}, ROWS_SOURCE, ROWS_HELPERS);
+}
+
+fn rowsFolds(g: RowsGeom) bool {
+    return g.tgrp == 4 and g.nsplit == 1;
+}
+
+fn rowsChunk(in_dim: c_int, rows: c_int, nsplit: c_int) c_int {
+    return @min(@divExact(in_dim, nsplit), @max(128, @divFloor(@divFloor(ROWS_TG_BYTES / 2, rows), 128) * 128));
+}
+
+/// Picked on dependent chains of calls (`SUSHI_EXL3_ROWS_SWEEP`): a threadgroup walking a whole k range is
+/// latency-bound in a forward, so k splits into ranges of at most 512 over at least 320 threadgroups; only an
+/// lm_head-wide output fills the GPU with whole 128-wide blocks and folds the finish.
+fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int) RowsGeom {
+    const nax = rows >= 2 and gemmNaxOn();
+    if (@divExact(out_dim, 128) * groups >= 1024) return .{ .tgrp = 4, .kph = if (nax) 1 else 2, .nsplit = 1, .chunk = rowsChunk(in_dim, rows, 1), .nax = nax };
+    const blocks = @divExact(in_dim, 128);
+    const tgs = groups * @divExact(out_dim, @as(c_int, if (nax) 128 else 32));
+    var nsplit: c_int = 1;
+    while (nsplit < blocks and (@rem(blocks, nsplit) != 0 or @divExact(in_dim, nsplit) > 512 or tgs * nsplit < 320)) nsplit += 1;
+    if (nax) return .{ .tgrp = 4, .kph = 1, .nsplit = nsplit, .chunk = rowsChunk(in_dim, rows, nsplit), .nax = true };
+    return .{ .tgrp = 1, .kph = 4, .nsplit = nsplit, .chunk = rowsChunk(in_dim, rows, nsplit) };
+}
+
+/// `y[r] = svh * H128(W . H128(suh * x[r]))` for every row of `x` (`[rows, in]` f16, bf16 or f32, rows 1..8), over one
+/// trellis `[in/16, out/16, n]` (or a one-matrix bank), its `suh [in]` and `svh [out]`: `projectIndexed`'s
+/// numbers, each weight decoded once for all rows. Returns `[rows, out]` in x's dtype, rounded once from the f32 sum. A bank `[G, in/16, out/16, n]` takes
+/// `x` `[G * rows, in]`, group g's rows contiguous, `suh [G, in]` and `svh [G, out]`, and returns `[G * rows, out]`.
+pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array) !mlx.mlx_array {
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(trellis);
+    if (xs.len != 2 or ts.len < 3) return error.BadExl3Shape;
+    const groups: c_int = if (ts.len == 4) ts[0] else 1;
+    const g = rowsGeometry(xs[1], ts[ts.len - 2] * 16, @divExact(xs[0], groups), groups);
+    return projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), null);
+}
+
+/// `projectRows` over linears that share their input, stacked along the output (one trellis `[1, in/16, out/16, n]`,
+/// `suh [S, in]` one row per linear, `svh [out]`): linear s owns the columns from `bounds[s - 1]` (0 for s = 0) to
+/// `bounds[s]` (`out` past the last), every bound a multiple of 128. Returns `[rows * out]`, each linear's
+/// `[rows, width]` contiguous at `start * rows`.
+pub fn projectRowsSegmented(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, bounds: [3]c_int) !mlx.mlx_array {
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(trellis);
+    if (xs.len != 2 or ts.len != 4 or ts[0] != 1) return error.BadExl3Shape;
+    const out = ts[2] * 16;
+    var segs: usize = 1;
+    var prev: c_int = 0;
+    for (bounds) |b| {
+        if (b < prev or b > out or @rem(b, 128) != 0) return error.BadExl3Shape;
+        if (b > prev and b < out) segs += 1;
+        prev = b;
+    }
+    if (mlx.mlx_array_size(suh) != segs * @as(usize, @intCast(xs[1]))) return error.BadExl3Shape;
+    const g = rowsGeometry(xs[1], out, xs[0], 1);
+    const y = try projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), bounds);
+    defer _ = mlx.mlx_array_free(y);
+    var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, y, &[_]c_int{xs[0] * out}, 1, s));
+    return flat;
+}
+
+fn projectRowsWith(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, seg_bounds: ?[3]c_int) !mlx.mlx_array {
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(trellis);
+    if (xs.len != 2 or !(ts.len == 3 or ts.len == 4)) return error.BadExl3Shape;
+    const groups: c_int = if (ts.len == 4) ts[0] else 1;
+    const rows = @divExact(xs[0], groups);
+    const in_dim = xs[1];
+    const out_tiles = ts[ts.len - 2];
+    if (rows < 1 or rows > PROJECT_ROWS_MAX or @rem(in_dim, 128) != 0 or ts[ts.len - 3] * 16 != in_dim or @rem(out_tiles, 8) != 0) return error.BadExl3Shape;
+    switch (mlx.mlx_array_dtype(x)) {
+        .float16, .bfloat16, .float32 => {},
+        else => return error.BadExl3Shape,
+    }
+    if (mlx.mlx_array_dtype(trellis) != .uint16) return error.BadExl3Shape;
+    const out_dim = out_tiles * 16;
+    const out_dt = mlx.mlx_array_dtype(x);
+    const rate = try packedRate(ts[ts.len - 1]);
+    const fold = rowsFolds(g);
+    const bounds = seg_bounds orelse @as([3]c_int, @splat(out_dim));
+    const key = RowsKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = rows, .groups = groups, .n = rate.n, .out_dt = out_dt, .bounds = bounds, .geom = g };
+    const cfg = rows_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const sgs = g.tgrp * g.kph;
+        const out_shape = [_]c_int{ groups * if (fold) rows else rows * g.nsplit, out_dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, if (fold) out_dt else .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(out_tiles, 2 * g.tgrp) * sgs * 32, g.nsplit, groups));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, sgs * 32, 1, 1));
+        inline for (.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD" }, .{ in_dim, out_dim, rows, groups, g.tgrp, g.kph, g.nsplit, g.chunk, @as(c_int, @intFromBool(fold)) }) |name, v|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
+        inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
+        rows_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ov = try applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    if (fold) return y;
+    defer _ = mlx.mlx_array_free(y);
+    return rowsFinish(s, y, svh, out_dim, rows, groups, g.nsplit, out_dt, bounds);
+}
+
+fn rowsFinish(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_array, out_dim: c_int, rows: c_int, groups: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int) !mlx.mlx_array {
+    const key = RowsFinishKey{ .out_dim = out_dim, .rows = rows, .groups = groups, .nsplit = nsplit, .out_dt = out_dt, .bounds = bounds };
+    const cfg = rows_finish_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ groups * rows, out_dim }, 2, out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(out_dim, 128) * 32, rows, groups));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", rows));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
+        inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
+        rows_finish_cfgs.put(key, c);
+        break :blk c;
+    };
+    const kernel = try getNamedKernel(&rows_finish_kernel, "sushi_exl3_rows_finish", &.{ "part", "svh" }, &.{"y"}, ROWS_FINISH_SOURCE, ROWS_HELPERS);
+    const ov = try applyOuts(s, kernel, &.{ part, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    return y;
+}
+
 /// The suh scale + H128 Hadamard that feeds this GEMV is applied here, over the
 /// k range this threadgroup owns, rather than in a dispatch of its own: the tile
 /// loop then reads its operands from threadgroup memory instead of device.
@@ -2878,7 +3300,7 @@ pub fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, sv
     return midSwigluPrepWithLimit(s, ig, iu, svhg, svhu, suhd, slots, dim, nslots, 0);
 }
 
-fn midSwigluPrepWithLimit(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, dim: c_int, nslots: c_int, limit: c_int) !mlx.mlx_array {
+pub fn midSwigluPrepWithLimit(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, dim: c_int, nslots: c_int, limit: c_int) !mlx.mlx_array {
     const key = MidKey{ .dim = dim, .nslots = nslots, .limit = limit };
     const cfg = mid_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
@@ -7763,6 +8185,443 @@ test "exl3 codebook A/B at production shape" {
     }
 }
 
+const TrunkShape = struct { name: []const u8, out: c_int, in: c_int, group: c_int, per_token: c_int };
+/// A served trunk: its linears (out x in, calls per token), the MLX affine bits it is served at, and the
+/// trellis rates (n) it is timed against.
+const TrunkSet = struct { name: []const u8, bits: c_int, ns: [3]c_int, shapes: []const TrunkShape, dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 }, rows: []const c_int = &.{ 1, 3, 4 } };
+const TRUNK_SETS = [_]TrunkSet{
+    .{ .name = "qwen4", .bits = 8, .ns = .{ 96, 112, 128 }, .shapes = &.{
+        .{ .name = "gdn.qkv", .out = 10240, .in = 2560, .group = 64, .per_token = 36 },
+        .{ .name = "gdn.z", .out = 6144, .in = 2560, .group = 128, .per_token = 36 },
+        .{ .name = "gdn.out", .out = 2560, .in = 6144, .group = 128, .per_token = 36 },
+        .{ .name = "attn.q", .out = 12288, .in = 2560, .group = 64, .per_token = 12 },
+        .{ .name = "attn.k|v", .out = 512, .in = 2560, .group = 64, .per_token = 24 },
+        .{ .name = "attn.index_qk", .out = 640, .in = 2560, .group = 64, .per_token = 12 },
+        .{ .name = "attn.o", .out = 2560, .in = 6144, .group = 64, .per_token = 12 },
+        .{ .name = "shared.gate|up", .out = 640, .in = 2560, .group = 128, .per_token = 96 },
+        .{ .name = "shared.down", .out = 2560, .in = 640, .group = 128, .per_token = 48 },
+        .{ .name = "lm_head", .out = 248320, .in = 2560, .group = 128, .per_token = 1 },
+    } },
+    .{ .name = "glm5", .bits = 6, .ns = .{ 64, 80, 96 }, .shapes = &.{
+        .{ .name = "kda.q|k|v", .out = 8192, .in = 4096, .group = 128, .per_token = 102 },
+        .{ .name = "kda.o", .out = 4096, .in = 8192, .group = 128, .per_token = 34 },
+        .{ .name = "mla.q_a", .out = 1536, .in = 4096, .group = 128, .per_token = 12 },
+        .{ .name = "mla.q_b", .out = 16384, .in = 1536, .group = 128, .per_token = 12 },
+        .{ .name = "mla.kv_a", .out = 512, .in = 4096, .group = 128, .per_token = 12 },
+        .{ .name = "mla.kv_b", .out = 32768, .in = 512, .group = 128, .per_token = 12 },
+        .{ .name = "mla.o", .out = 4096, .in = 16384, .group = 128, .per_token = 12 },
+        .{ .name = "indexer.wq_b", .out = 4096, .in = 1536, .group = 128, .per_token = 12 },
+        .{ .name = "mlp.gate|up", .out = 12288, .in = 4096, .group = 128, .per_token = 6 },
+        .{ .name = "mlp.down", .out = 4096, .in = 12288, .group = 128, .per_token = 3 },
+        .{ .name = "lm_head", .out = 154880, .in = 4096, .group = 128, .per_token = 1 },
+    } },
+    .{ .name = "dsv41", .bits = 8, .ns = .{ 64, 64, 64 }, .dec = exl3.Decode.tabled(.spec1, .w15), .rows = &.{ 1, 2, 3, 5, 8 }, .shapes = &.{
+        .{ .name = "wq_a", .out = 1280, .in = 5120, .group = 32, .per_token = 40 },
+        .{ .name = "wq_b", .out = 32768, .in = 1280, .group = 32, .per_token = 40 },
+        .{ .name = "wkv|comp", .out = 512, .in = 5120, .group = 32, .per_token = 100 },
+        .{ .name = "wo_b", .out = 5120, .in = 8192, .group = 32, .per_token = 40 },
+        .{ .name = "shared.w1|w3", .out = 2304, .in = 5120, .group = 32, .per_token = 80 },
+        .{ .name = "shared.w2", .out = 5120, .in = 2304, .group = 32, .per_token = 40 },
+        .{ .name = "idx.wq_b", .out = 4096, .in = 1280, .group = 32, .per_token = 8 },
+    } },
+};
+
+/// The trunk set a diagnostic's env value names; any other set value times the first.
+fn trunkSet(raw: ?[*:0]const u8) ?TrunkSet {
+    if (!diagEnvValueOn(raw)) return null;
+    for (TRUNK_SETS) |set| if (std.mem.eql(u8, std.mem.span(raw.?), set.name)) return set;
+    return TRUNK_SETS[0];
+}
+
+/// Matrix c of a `[copies, ...]` bank as its own `[1, ...]` view, evaluated (views share the bank's buffer).
+fn bankViews(alloc: std.mem.Allocator, s: mlx.mlx_stream, bank: mlx.mlx_array, copies: usize) ![]mlx.mlx_array {
+    const sh = mlx.getShape(bank);
+    const views = try alloc.alloc(mlx.mlx_array, copies);
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (views, 0..) |*v, c| {
+        v.* = mlx.mlx_array_new();
+        const start = [_]c_int{ @intCast(c), 0, 0, 0 };
+        const stop = [_]c_int{ @intCast(c + 1), sh[1], sh[2], sh[3] };
+        try mlx.check(mlx.mlx_slice(v, bank, &start, 4, &stop, 4, &.{ 1, 1, 1, 1 }, 4, s));
+        _ = mlx.mlx_vector_array_append_value(vec, v.*);
+    }
+    try mlx.check(mlx.mlx_eval(vec));
+    return views;
+}
+
+/// The next chained call's `[rows, in]` input from this call's `[rows, out]` output, so the GPU orders the
+/// calls: a view of it when out >= in, else of one concatenation.
+fn chainInput(s: mlx.mlx_stream, y: mlx.mlx_array, rows: c_int, in: c_int, out: c_int) !mlx.mlx_array {
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, y, &.{rows * out}, 1, s));
+    if (out < in) {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (0..@intCast(@divFloor(in + out - 1, out))) |_| _ = mlx.mlx_vector_array_append_value(vec, flat);
+        var cat = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+        _ = mlx.mlx_array_free(flat);
+        flat = cat;
+    }
+    var head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head);
+    try mlx.check(mlx.mlx_slice(&head, flat, &.{0}, 1, &.{rows * in}, 1, &.{1}, 1, s));
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&x, head, &.{ rows, in }, 2, s));
+    return x;
+}
+
+// Prints only under SUSHI_EXL3_ROWS_SWEEP (a diagnostic, never a test): projectRows on each trunk shape of the
+// set the value names (qwen4, glm5) under the launch geometries it admits there, at the set's middle rate, MCG,
+// rows 1/3/4, timed like the trunk bench (`indep`: calls independent, so one-dispatch launches overlap) and
+// with each call's input a view of the previous output (`chain`, a forward's order); `*` marks `rowsGeometry`.
+test "exl3 multi-row launch geometry sweep (SUSHI_EXL3_ROWS_SWEEP=qwen4|glm5|dsv41)" {
+    const set = trunkSet(std.c.getenv("SUSHI_EXL3_ROWS_SWEEP")) orelse return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    try set.dec.requireTable();
+    setDecodeParams(set.dec);
+    defer setDecodeParams(.mul1);
+    const rounds: usize = 5;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const n = set.ns[1];
+    for (set.shapes) |sh| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const out: usize = @intCast(sh.out);
+        const in: usize = @intCast(sh.in);
+        const copies: usize = std.math.clamp((768 << 20) / (out * in), 4, 96);
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer for (owned.items) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const words = try alloc.alloc(u16, copies * (in / 16) * (out / 16) * @as(usize, @intCast(n)));
+        rnd.bytes(std.mem.sliceAsBytes(words));
+        const bank = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ @intCast(copies), @divExact(sh.in, 16), @divExact(sh.out, 16), n }, 4, .uint16);
+        try owned.append(alloc, bank);
+        alloc.free(words);
+        const views = try bankViews(alloc, s, bank, copies);
+        try owned.appendSlice(alloc, views);
+        // A chain keeps its magnitude: suh = 1/sqrt(in) cancels the inner sum's growth.
+        const ones = try alloc.alloc(u16, @max(out, in));
+        @memset(ones, exl3.f32ToF16Bits(1.0));
+        const scaled = try alloc.alloc(u16, in);
+        @memset(scaled, exl3.f32ToF16Bits(1.0 / @sqrt(@as(f32, @floatFromInt(in)))));
+        const suh = mlx.mlx_array_new_data(scaled.ptr, &[_]c_int{sh.in}, 1, .float16);
+        const svh = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{sh.out}, 1, .float16);
+        try owned.appendSlice(alloc, &.{ suh, svh });
+        for (set.rows) |rows| {
+            var cands: std.ArrayList(RowsGeom) = .empty;
+            const blocks = @divExact(sh.in, 128);
+            for ([_]c_int{ 1, 2 }) |kph| try cands.append(alloc, .{ .tgrp = 4, .kph = kph, .nsplit = 1, .chunk = rowsChunk(sh.in, rows, 1) });
+            var d: c_int = 1;
+            while (d <= blocks and d <= 24) : (d += 1) if (@rem(blocks, d) == 0) try cands.append(alloc, .{ .tgrp = 1, .kph = 4, .nsplit = d, .chunk = rowsChunk(sh.in, rows, d) });
+            d = 1;
+            while (gemmNaxOn() and d <= blocks and d <= 24) : (d += 1) if (@rem(blocks, d) == 0) try cands.append(alloc, .{ .tgrp = 4, .kph = 1, .nsplit = d, .chunk = rowsChunk(sh.in, rows, d), .nax = true });
+            const policy = rowsGeometry(sh.in, sh.out, rows, 1);
+            for (cands.items) |g| {
+                if (std.meta.eql(g, policy)) break;
+            } else try cands.append(alloc, policy);
+            const xs = try alloc.alloc(mlx.mlx_array, copies);
+            for (xs) |*x| {
+                const xv = try alloc.alloc(f32, @as(usize, @intCast(rows)) * in);
+                for (xv) |*v| v.* = (rnd.float(f32) - 0.5) * 0.2;
+                const x32 = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ rows, sh.in }, 2, .float32);
+                defer _ = mlx.mlx_array_free(x32);
+                x.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(x, x32, .float16, s));
+                try owned.append(alloc, x.*);
+            }
+            const nc = cands.items.len;
+            const us = try alloc.alloc([rounds]f64, 2 * nc);
+            for (0..rounds + 1) |round| {
+                for (0..2 * nc) |j| {
+                    const a = (round + j) % (2 * nc);
+                    const g = cands.items[a % nc];
+                    const ys = try alloc.alloc(mlx.mlx_array, copies);
+                    var made: usize = 0;
+                    defer for (ys[0..made]) |y| {
+                        _ = mlx.mlx_array_free(y);
+                    };
+                    for (ys, 0..) |*y, c| {
+                        const x = if (a >= nc and c > 0) try chainInput(s, ys[c - 1], rows, sh.in, sh.out) else xs[c];
+                        defer if (a >= nc and c > 0) {
+                            _ = mlx.mlx_array_free(x);
+                        };
+                        y.* = try projectRowsWith(s, x, views[c], suh, svh, g, try rowsKernel(g), null);
+                        made += 1;
+                    }
+                    const vec = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(vec);
+                    for (ys) |y| _ = mlx.mlx_vector_array_append_value(vec, y);
+                    var sw = io_util.Stopwatch.init(io);
+                    try mlx.check(mlx.mlx_eval(vec));
+                    const t = sw.read();
+                    if (round > 0) us[a][round - 1] = @as(f64, @floatFromInt(t)) / 1e3 / @as(f64, @floatFromInt(copies));
+                }
+            }
+            for ([_][]const u8{ "indep", "chain" }, 0..) |mode, m| {
+                std.debug.print("[rows-sweep] {s} {s} {d}x{d} n{d} rows {d} {s}:", .{ set.name, sh.name, sh.out, sh.in, n, rows, mode });
+                for (cands.items, us[m * nc ..][0..nc]) |g, *row| {
+                    const mark: []const u8 = if (std.meta.eql(g, policy)) "*" else "";
+                    std.debug.print(" {s}t{d}k{d}s{d}{s} {d:.1}", .{ if (g.nax) "nax-" else "", g.tgrp, g.kph, g.nsplit, mark, std.mem.min(f64, row) });
+                }
+                std.debug.print("\n", .{});
+            }
+        }
+    }
+}
+
+/// The multi-row kernels preparing each row from the next row's activations: the defect the
+/// multi-row parity bar must convict.
+const ROWS_ROW_MUTANT = .{ "x + (size_t)r * uint(IDIM) + k;", "x + (size_t)((r + 1u) % uint(ROWS)) * uint(IDIM) + k;" };
+var rows_mutant_kernel: KernelSlots = no_kernels;
+var rows_nax_mutant_kernel: KernelSlots = no_kernels;
+
+fn rowsMutantKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
+    if (g.nax) return codebookKernelWith(&rows_nax_mutant_kernel, "sushi_exl3_rows_nax_row_mutant", &ROWS_INS, &.{"y"}, metalReplaceFound(ROWS_NAX_SOURCE, ROWS_ROW_MUTANT[0], ROWS_ROW_MUTANT[1]), ROWS_NAX_FRAGS);
+    return codebookKernelWith(&rows_mutant_kernel, "sushi_exl3_rows_row_mutant", &ROWS_INS, &.{"y"}, metalReplaceFound(ROWS_SOURCE, ROWS_ROW_MUTANT[0], ROWS_ROW_MUTANT[1]), ROWS_HELPERS);
+}
+
+/// The unnormalized 128-point Walsh-Hadamard transform, in f64.
+fn hadamard128F64(v: *[exl3.HAD_DIM]f64) void {
+    var h: usize = 1;
+    while (h < exl3.HAD_DIM) : (h *= 2) {
+        var i: usize = 0;
+        while (i < exl3.HAD_DIM) : (i += 2 * h) {
+            for (i..i + h) |j| {
+                const a = v[j];
+                v[j] = a + v[j + h];
+                v[j + h] = a - v[j + h];
+            }
+        }
+    }
+}
+
+const RowsCase = struct {
+    n: u32,
+    in_dim: usize,
+    out_dim: usize,
+    rows: usize,
+    seed: u64,
+    geom: ?RowsGeom = null,
+    mutate: Exl3Mutation = .none,
+    mutant_rows: bool = false,
+};
+
+/// `projectRows` and `projectIndexed` (each row its own slot) against the f64 projection of the same
+/// decoded weights. A projection's output is an orthonormal rotation (psc * H128) of its inner sums, so
+/// each 128-wide output block is scored in inner space: its error L2 (over svh) against the L2 of the
+/// block's summand magnitudes, the inner bar's scale. A correct arm carries the prepared input's and the
+/// output's f16 stores, `projectIndexed` also the inner's, and f32 accumulations `in_dim` and 128 deep.
+fn rowsParityStats(c: RowsCase) !Exl3GemmParityStats {
+    const dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
+    setDecodeParams(dec);
+    defer setDecodeParams(.mul1);
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const rate: exl3.Rate = .{ .n = c.n };
+    const it = c.in_dim / 16;
+    const ot = c.out_dim / 16;
+    const nh = rate.halfwords();
+    var prng = std.Random.DefaultPrng.init(c.seed);
+    const rnd = prng.random();
+    const tr = try alloc.alloc(u16, it * ot * nh);
+    rnd.bytes(std.mem.sliceAsBytes(tr));
+    const suh = try alloc.alloc(u16, c.in_dim);
+    const svh = try alloc.alloc(u16, c.out_dim);
+    for ([2][]u16{ suh, svh }) |v| for (v) |*e| {
+        const mag = std.math.exp2(rnd.float(f32) * 4 - 2);
+        e.* = exl3.f32ToF16Bits(if (rnd.boolean()) mag else -mag);
+    };
+    const xh = try alloc.alloc(u16, c.rows * c.in_dim);
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const zeros = try alloc.alloc(u32, c.rows);
+    @memset(zeros, 0);
+    const x_a = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(c.rows), @intCast(c.in_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_a);
+    const tr3 = mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ @intCast(it), @intCast(ot), @intCast(nh) }, 3, .uint16);
+    defer _ = mlx.mlx_array_free(tr3);
+    const tr4 = mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ 1, @intCast(it), @intCast(ot), @intCast(nh) }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr4);
+    const suh_a = mlx.mlx_array_new_data(suh.ptr, &[_]c_int{ 1, @intCast(c.in_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh_a);
+    const svh_a = mlx.mlx_array_new_data(svh.ptr, &[_]c_int{ 1, @intCast(c.out_dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh_a);
+    const slots = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{@intCast(c.rows)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const geom = c.geom orelse rowsGeometry(@intCast(c.in_dim), @intCast(c.out_dim), @intCast(c.rows), 1);
+    const got_a = try projectRowsWith(s, x_a, tr3, suh_a, svh_a, geom, if (c.mutant_rows) try rowsMutantKernel(geom) else try rowsKernel(geom), null);
+    defer _ = mlx.mlx_array_free(got_a);
+    const comp_a = try projectIndexed(s, x_a, tr4, suh_a, svh_a, slots);
+    defer _ = mlx.mlx_array_free(comp_a);
+    var got_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_c);
+    var comp_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(comp_c);
+    const got = try evalF16(s, got_a, &got_c);
+    const comp = try evalF16(s, comp_a, &comp_c);
+
+    const ref_dec = mutatedDecode(dec, c.mutate);
+    const w = try alloc.alloc(f32, c.in_dim * c.out_dim);
+    var tile: [exl3.TILE_VALUES]u16 = undefined;
+    for (0..it) |tk| for (0..ot) |tn| {
+        exl3.decodeTile(tr[(tk * ot + tn) * nh ..][0..nh], rate, ref_dec, &tile);
+        for (0..16) |r| for (0..16) |cc| {
+            w[(tk * 16 + r) * c.out_dim + tn * 16 + cc] = exl3.f16BitsToF32(tile[r * 16 + cc]);
+        };
+    };
+    const psc: f64 = exl3.HAD_SCALE;
+    const prep = try alloc.alloc(f64, c.in_dim);
+    const inner = try alloc.alloc(f64, c.out_dim);
+    const amag = try alloc.alloc(f64, c.out_dim);
+    var st = Exl3GemmParityStats{ .n = c.rows * c.out_dim, .ceiling = 3 * Exl3GemmParity.U_F16 + @as(f64, @floatFromInt(c.in_dim + exl3.HAD_DIM)) * Exl3GemmParity.U_F32 };
+    var se_k: f64 = 0;
+    var se_c: f64 = 0;
+    var blocks: usize = 0;
+    for (0..c.rows) |r| {
+        for (prep, 0..) |*p, k| p.* = @as(f64, exl3.f16BitsToF32(xh[r * c.in_dim + k])) * exl3.f16BitsToF32(suh[k]);
+        var b: usize = 0;
+        while (b < c.in_dim) : (b += exl3.HAD_DIM) {
+            hadamard128F64(prep[b..][0..exl3.HAD_DIM]);
+            for (prep[b..][0..exl3.HAD_DIM]) |*p| p.* *= psc;
+        }
+        @memset(inner, 0);
+        @memset(amag, 0);
+        for (prep, 0..) |p, k| for (w[k * c.out_dim ..][0..c.out_dim], inner, amag) |wv, *i, *a| {
+            i.* += p * wv;
+            a.* += @abs(p * wv);
+        };
+        b = 0;
+        while (b < c.out_dim) : (b += exl3.HAD_DIM) {
+            const blk = inner[b..][0..exl3.HAD_DIM];
+            hadamard128F64(blk);
+            var a2: f64 = 0;
+            var ek: f64 = 0;
+            var ec: f64 = 0;
+            for (b..b + exl3.HAD_DIM) |o| {
+                const sv: f64 = exl3.f16BitsToF32(svh[o]);
+                const want = inner[o] * psc * sv;
+                const g: f64 = @floatCast(got[r * c.out_dim + o]);
+                const cv: f64 = @floatCast(comp[r * c.out_dim + o]);
+                if (!std.math.isFinite(g) or !std.math.isFinite(cv)) {
+                    st.finite = false;
+                    return st;
+                }
+                a2 += amag[o] * amag[o];
+                ek += ((g - want) / sv) * ((g - want) / sv);
+                ec += ((cv - want) / sv) * ((cv - want) / sv);
+            }
+            const mk = @sqrt(ek / a2);
+            const mc = @sqrt(ec / a2);
+            st.kern_max = @max(st.kern_max, mk);
+            st.comp_max = @max(st.comp_max, mc);
+            se_k += mk * mk;
+            se_c += mc * mc;
+            blocks += 1;
+        }
+    }
+    st.rms_kern = @sqrt(se_k / @as(f64, @floatFromInt(blocks)));
+    st.rms_comp = @sqrt(se_c / @as(f64, @floatFromInt(blocks)));
+    return st;
+}
+
+fn rowsVerdict(c: RowsCase) !?Exl3GemmParityFail {
+    const st = try rowsParityStats(c);
+    return exl3GemmParityVerdict(st.finite, st.kern_max, st.rms_kern, st.rms_comp, st.ceiling);
+}
+
+test "exl3 multi-row projection matches projectIndexed per row against the f64 projection" {
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    const shapes = [_][2]usize{ .{ 512, 640 }, .{ 6144, 384 } };
+    for (0..PARITY_SEEDS) |i| {
+        for ([_]u32{ 40, 64, 112 }) |n| {
+            for (shapes) |sh| {
+                for (1..5) |rows| {
+                    try reportGemmParity(try rowsParityStats(.{ .n = n, .out_dim = sh[0], .in_dim = sh[1], .rows = rows, .seed = 1301 + i }));
+                }
+            }
+        }
+    }
+}
+
+test "exl3 multi-row projection holds the bar on every launch geometry and at eight rows" {
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    const geoms = [_]RowsGeom{
+        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256 },
+        .{ .tgrp = 4, .kph = 2, .nsplit = 1, .chunk = 768 },
+        .{ .tgrp = 4, .kph = 1, .nsplit = 2, .chunk = 384 },
+        .{ .tgrp = 1, .kph = 4, .nsplit = 3, .chunk = 128 },
+        .{ .tgrp = 2, .kph = 1, .nsplit = 6, .chunk = 128 },
+        .{ .tgrp = 4, .kph = 1, .nsplit = 1, .chunk = 256, .nax = true },
+        .{ .tgrp = 4, .kph = 1, .nsplit = 3, .chunk = 256, .nax = true },
+    };
+    for (geoms, 0..) |g, gi| {
+        if (g.nax and !gemmNaxOn()) continue;
+        for ([_]usize{ 1, 3, 8 }) |rows| {
+            for ([_]u32{ 48, 96, 128 }) |n| {
+                try reportGemmParity(try rowsParityStats(.{ .n = n, .out_dim = 1024, .in_dim = 768, .rows = rows, .seed = 1401 + gi, .geom = g }));
+            }
+        }
+    }
+}
+
+test "exl3 multi-row projection holds the bar at every admitted rate on both kernels" {
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    var n: u32 = exl3.Rate.min_n;
+    while (n <= exl3.Rate.max_n) : (n += 2) {
+        try reportGemmParity(try rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = .{ .tgrp = 1, .kph = 4, .nsplit = 2, .chunk = 128 } }));
+    }
+}
+
+test "exl3 the multi-row parity bar convicts a wrong row and a wrong window" {
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    const t = std.testing;
+    for ([_][2]usize{ .{ 512, 640 }, .{ 6144, 384 } }) |sh| {
+        for (2..5) |rows| {
+            try t.expect(try rowsVerdict(.{ .n = 112, .out_dim = sh[0], .in_dim = sh[1], .rows = rows, .seed = 1501, .mutant_rows = true }) != null);
+        }
+        try t.expect(try rowsVerdict(.{ .n = 112, .out_dim = sh[0], .in_dim = sh[1], .rows = 3, .seed = 1503, .mutate = .window }) != null);
+    }
+}
+
+test "exl3 multi-row projection is one dispatch on an lm_head-wide output and two on a narrower one" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    setDecodeParams(.{ .codebook = .mcg, .window = .w15 });
+    defer setDecodeParams(.mul1);
+    for ([_][3]c_int{ .{ 131072, 256, 1 }, .{ 6144, 2560, 2 }, .{ 512, 2560, 2 } }) |c| {
+        const words = try t.allocator.alloc(u16, @intCast(@divExact(c[0], 16) * @divExact(c[1], 16) * 112));
+        defer t.allocator.free(words);
+        @memset(words, 0x5a5a);
+        const ones = try t.allocator.alloc(u16, @intCast(@max(c[0], c[1]) * 4));
+        defer t.allocator.free(ones);
+        @memset(ones, exl3.f32ToF16Bits(1.0));
+        const x = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{ 4, c[1] }, 2, .float16);
+        defer _ = mlx.mlx_array_free(x);
+        const tr = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ @divExact(c[1], 16), @divExact(c[0], 16), 112 }, 3, .uint16);
+        defer _ = mlx.mlx_array_free(tr);
+        const suh = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{c[1]}, 1, .float16);
+        defer _ = mlx.mlx_array_free(suh);
+        const svh = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{c[0]}, 1, .float16);
+        defer _ = mlx.mlx_array_free(svh);
+        resetFusedDispatchCount();
+        const y = try projectRows(s, x, tr, suh, svh);
+        defer _ = mlx.mlx_array_free(y);
+        try t.expectEqual(@as(u32, @intCast(c[2])), fusedDispatchCount());
+        try t.expectEqualSlices(c_int, &.{ 4, c[0] }, mlx.getShape(y));
+    }
+}
+
 fn n40NaxReaderExact(comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool) !void {
     return n40WeightReaderExact(cb, win, raw, false);
 }
@@ -8319,7 +9178,7 @@ fn metalReplaceAll(comptime source: []const u8, comptime old: []const u8, compti
     return comptime source[0..at] ++ replacement ++ metalReplaceAll(source[at + old.len ..], old, replacement);
 }
 
-const DECODE_MID_SOURCE: [:0]const u8 = blk: {
+pub const DECODE_MID_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(200000);
     const start = std.mem.indexOf(u8, DOWN_FUSED_SOURCE, "const float sc =").?;
     const end = start + std.mem.indexOf(u8, DOWN_FUSED_SOURCE[start..], "threadgroup_barrier(mem_flags::mem_threadgroup);").?;
@@ -8333,7 +9192,7 @@ const DECODE_MID_SOURCE: [:0]const u8 = blk: {
     break :blk head ++ "\n" ++ metalReplaceAll(DOWN_FUSED_SOURCE[start..end], "prepared[base", "prepared[(size_t)slot * uint(IDIM) + base");
 };
 
-const DOWN_PREPARED_SOURCE: [:0]const u8 = blk: {
+pub const DOWN_PREPARED_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(200000);
     const start = std.mem.indexOf(u8, DOWN_FUSED_SOURCE, "const float sc =").?;
     const barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);";
@@ -8637,7 +9496,7 @@ const PAIR_PREP_BODY: [:0]const u8 =
 
 /// `PAIR_GEMV_SOURCE` reading its slot's prepared input from device memory instead of
 /// preparing its K span in threadgroup memory; every arm reads the same values in the same order.
-const PAIR_GEMV_PREPARED_SOURCE: [:0]const u8 = blk: {
+pub const PAIR_GEMV_PREPARED_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(400000);
     const start = std.mem.indexOf(u8, PAIR_GEMV_SOURCE, "threadgroup half prepared[2u * KSPAN];").?;
     const barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);\n";

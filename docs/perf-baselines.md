@@ -260,6 +260,56 @@ measured on the tree this was ported from.
   20 groups, one row. Its early exit saved nothing (passes over every slot cost the same): a dispatch costs a fixed
   ~10 us in this chain. Host-compacted slot lists still read 1.10 / 1.35 / 4.4.
 
+<a id="dsv41-stq"></a>
+## DeepSeek-V4.1 STQ pack kernels (trunk linears, routed chain)
+
+ReleaseFast, `taskpolicy -a`, M5 Max, NO GPU lock: another job held the GPU. Dependent-chain timings queue behind its
+long kernels (a one-row chain read 2-3 ms instead of ~250 us), so each cell is the best of 40 chains of 4 calls with the
+chain link removed: orderings and ratios hold, absolute microseconds are upper bounds. Re-take the cells on a quiet box before recording any as a baseline.
+Meters: `SUSHI_DSV41_STQ_UBENCH=1` and `SUSHI_DSV41_EXPERT_UBENCH=1` with `SUSHI_UBENCH_STEPS=4 SUSHI_UBENCH_ROUNDS=40`
+(exl3 test binary, `-Dtest-filter=UBENCH`).
+
+Trunk linears, us per call (and GB/s of trellis read), SPEC1 n64; `gemm` is what the pack used before (the sorted GEMM at
+every width), `rows` the multi-row kernel (SIMD at 1 row, NAX from 2), mxfp8 the release's own trunk:
+
+| linear | MB | 1 row: gemm | 1 row: rows | 5 rows: gemm | 5 rows: rows | 1 row: mxfp8 |
+|---|---|---|---|---|---|---|
+| `wq_a` 5120->1280 | 3.3 | 120 | 24 (134) | 168 | 56 | 31 |
+| `wq_b` 1280->32768 | 21.0 | 242 | 104 (201) | 375 | 191 | 265 |
+| `wkv`, compressor `wkv`/`wgate` 5120->512 | 1.3 | 97-114 | 20-23 | 101-113 | 23-30 | 24-26 |
+| `wo_a` 8 x 4096->1024 | 16.8 | 103 | 51 (328) | 129 | 75 | 74 |
+| `wo_b` 8192->5120 | 21.0 | 778 | 85 (247) | 630 | 322 | 660 |
+| shared `w1`/`w3` 5120->2304 | 5.9 | 107 | 25 (239) | 99 | 36 | 38 |
+| shared `w2` 2304->5120 | 5.9 | 69 | 34 (173) | 73 | 41 | 28 |
+| indexer `wq_b` 1280->4096 | 2.6 | 57 | 33 | 68 | 37 | 25 |
+| head 5120->129280, n96 | 496 | 1440 | 940 (528) | 1430 | 1410 (352) | 1276 |
+
+- Rows kernel over GEMM: 1.5-9x at one row, 1-4x at five (the head ties the GEMM there); at 256 rows (prefill) the GEMM stays: 8-40 GB/s, level with
+  mxfp8 and affine-4 on the same rows.
+- One row: SIMD against NAX, same kernel, interleaved: head 940 vs 1342 us, `wq_b` 89 vs 353, `wo_a` 61 vs 113,
+  `wo_b` 82 vs 106, `wkv` 19 vs 30, `wq_a` 52 vs 27 (the one shape NAX won). The head at one row reads at the roofline.
+- Small linears (<= 6 MB) sit at 20-35 us: a fixed per-call floor (two dispatches), not bytes. Twelve to thirteen of them
+  per layer are about half a millisecond of the layer's decode.
+- `wq_a` and `wkv` in one stacked launch against two (`SUSHI_DSV41_STQ_UBENCH=shared`, 8-step chains, best of 40,
+  same conditions, three runs): one row 29.4-38.1 us against 34.1-47.7 (0.80 to 0.88), five rows 35.7-47.7 against
+  43.3-51.3 (0.81 to 1.05).
+- The cells time `linear` on f16 rows. Served on bf16 rows a call stores bf16 directly (no cast dispatch); not re-timed.
+
+Routed chain (`moeDecodeClamped` / `moePrefillClamped`, 5120->2304->5120, top-6 clamped SwiGLU, bf16 rows, 16 route sets
+so the experts are cold), us per call over the picked experts' bytes:
+
+| layout (plan layer) | 1 row | 5 rows | 16 rows | 256 rows (prefill) |
+|---|---|---|---|---|
+| L2 n40:5 n32:17 n26:37 n24:325 | 241-259 (40-59 MB, 165-228 GB/s) | 1027 (193 MB, 188 GB/s) | 3666 (587 MB, 160 GB/s) | 35988 (2.6 GB, 72 GB/s) |
+| L23 five groups with the mixed class | 217-249 (40-48 MB, 183-192 GB/s) | 999 (229 MB, 229 GB/s) | 3663 (681 MB, 186 GB/s) | 40037 (3.0 GB, 74 GB/s) |
+| DSpark stage, 128 x n32, top-3 | 125 (27 MB, 213 GB/s) | 531 (128 MB, 241 GB/s) | 1799 (362 MB, 201 GB/s) | n/a |
+
+- The decode and verify chain runs at 0.3-0.45 of the roofline at every rate mix; cost follows bytes read, not the group
+  count (4 or 5 groups, one mixed class: within noise).
+- The 256-row prefill decodes every expert of the layer once per call (~13.6 G weights), so its time is the decode rate,
+  not the row count: wider spans cost the same per layer until 32 rows per expert, and a streamed layer also reads 2.6 GB
+  from SSD per call.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
