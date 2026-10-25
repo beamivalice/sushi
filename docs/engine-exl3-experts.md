@@ -124,9 +124,8 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **Decode**: four dispatches per MoE layer — pair prepare, split-K pair GEMV with f32 inner planes, fused mid+down
   GEMV, f32 finish reduce (`moeSwigluFused`; top-k ≤ 32, named refusal above). On MiMo geometry the SwiGLU mid is
   prepared once per (row, expert) (`preparedMidOn`, disabled for Qwen; like `mimoPrefillOn` it keys on geometry,
-  never on the rate), and at two or more rows the pair input too, in its own dispatch (`pairPrepare`): five
-  dispatches. A pair threadgroup would otherwise re-derive its K span of x (64 times per slot); one row keeps that
-  fused prepare, where the extra dispatch costs more than it saves. Rows ≤ `DECODE_ROWS_MAX` or verify rows take this
+  never on the rate), and the pair input too, in its own dispatch (`pairPrepare`): five dispatches. A pair
+  threadgroup would otherwise re-derive its K span of x (64 times per slot). Rows ≤ `DECODE_ROWS_MAX` or verify rows take this
   chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider
   (`Exl3MtpRowsExceedDecode`).
 - **The prepared pair input is stored in GEMV lane order** (`LANE_ORDER_SLOT`: each 16-row tile keeps rows 2q,
@@ -318,7 +317,7 @@ trunk SPEC1 (`spec1-w15`) n64, head n96, DSpark stage experts PAIR1 n32 resident
 | head | SPEC1 n96 | 5120 -> 129280 | rows kernel (one dispatch: wide output) | rows kernel | sorted GEMM |
 | DSpark stage experts | PAIR1 n32, resident, 128 experts | as routed, top-3 | one group, same chain | rows 5 (the block) | n/a |
 
-**Verify rows prepare once per slot** (`rate_groups.preparedOn`: 2 to 16 rows at 5120/2304, bytes equal to the one-row
+**Rows prepare once per slot** (`rate_groups.preparedOn`: 1 to 16 rows at 5120/2304, bytes equal to the self-preparing
 chain's). A pair threadgroup re-derived its K span of x (the Hadamard) and a down threadgroup the whole SwiGLU mid and
 its Hadamard, 72 and 160 times a slot; the chain now runs `pairPrepare` and a mid kernel (`midMixed`, the clamp in it)
 once per slot and the pair and down GEMVs read them through the same rate-class switch. Chain per layer, interleaved
@@ -327,7 +326,7 @@ in one process (`SUSHI_DSV41_EXPERT_UBENCH=1`, QUIET, lock): rows 2/3/4/5/6/16 =
 the DSpark stage bank; about 5 ms off a 6-row verify. Live, interleaved per sweep cycle in one boot (idle box, 180 s fans-max idle, ~1250 rounds), the verify ms are 2 to 7 ms lower at rows 2..8 (1k context: 2-row 53 -> 50, 4-row 75 -> 72, 6-row 103 -> 97; 16k inside noise). A repeated expert costs the same as a new one (the `shared` mode of
 the ubench, every row picks the same six: 273/395/515/734/1065 us at rows 2..6, level with distinct experts), so the slot
 is bound by its own prepare and FMA path and a grouped-by-expert kernel can only save the weight-decode share (about 1.6 us
-of ~26 us a pick), as MiMo's two-member grouping found (4-7%). The one-row chain keeps the fused prepare.
+of ~26 us a pick), as MiMo's two-member grouping found (4-7%). The one-row chain prepares once too (serial decode, layer 23 bank, interleaved in one process: 153 us self-preparing, 130 us prepared; `pairPrepare` 4, pair 76, mid 4, down 44, reduce 2), which took 23 us off each of 40 layers of a serial token.
 
 **Verify rows decode each distinct expert once** (`groupFor` in `rate_groups.zig`; prepared chain, 2 to 16 rows, up to 512
 slots): the pair and down kernels of the chain are the expert-grouped ones (see "Verify rows share an expert's weight reads" above),

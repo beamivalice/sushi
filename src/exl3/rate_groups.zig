@@ -678,11 +678,11 @@ fn downPreparedMixed(s: mlx.mlx_stream, middle: mlx.mlx_array, rb: *const Ragged
     return getOut(ov, 0);
 }
 
-/// Whether a decode chain of `rows` rows prepares its inputs once per slot: 2 or more rows at DeepSeek's geometry,
-/// where a one-row chain keeps the fused prepare (the extra dispatches cost it more than they save).
-fn preparedOn(rb: *const Ragged, rows: usize) bool {
-    if (prepared_force) |v| return v and rows >= 2;
-    return rows >= 2 and rb.hidden == 5120 and rb.inter == 2304;
+/// Whether a decode chain prepares its inputs once per slot, at DeepSeek's geometry: a threadgroup of the fused chain
+/// otherwise re-derives its slice of the input and of the SwiGLU mid, which the two extra dispatches cost less than.
+fn preparedOn(rb: *const Ragged) bool {
+    if (prepared_force) |v| return v;
+    return rb.hidden == 5120 and rb.inter == 2304;
 }
 
 var engaged: [2]bool = @splat(false);
@@ -730,7 +730,7 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
     const pair = classesOf(rb, false, &pc);
     const downs = classesOf(rb, true, &dc);
     logEngaged(.decode, rb, pair.len, downs.len);
-    const prepared = preparedOn(rb, @intCast(rows));
+    const prepared = preparedOn(rb);
     const group = if (prepared) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
     if (group > 0) kernels.logGroupedEngaged(group);
     const inner = if (prepared) blk: {
@@ -1337,7 +1337,7 @@ test "exl3 rate groups: a clamped SwiGLU holds the f32-truth bar at decode and p
     }
 }
 
-test "exl3 rate groups: verify rows through the prepared pair input and middle write the self-preparing chain's bytes, 2 to 6 rows" {
+test "exl3 rate groups: rows through the prepared pair input and middle write the self-preparing chain's bytes, 1 to 16 rows" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -1351,7 +1351,7 @@ test "exl3 rate groups: verify rows through the prepared pair input and middle w
         const alloc = arena.allocator();
         const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 }, .{ 32, 26, 24 } };
         const experts = [_]u32{ 5, 3, 4, 2 };
-        for ([_]usize{ 2, 3, 4, 5, 6, 9, 16 }) |rows| {
+        for ([_]usize{ 1, 2, 3, 4, 5, 6, 9, 16 }) |rows| {
             var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = rows, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
             defer f.deinit();
             prepared_force = false;

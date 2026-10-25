@@ -301,6 +301,36 @@ pub fn readCacheProfile(allocator: std.mem.Allocator, model_dir: []const u8, lay
     return parseCacheProfile(allocator, raw, layers, experts);
 }
 
+/// The experts a rate-grouped layer preloads: each pool's most used experts, as many as it has slots, least used first so
+/// the most used end up most recent in the pool's LRU.
+fn rankedWarm(allocator: std.mem.Allocator, out: *std.ArrayList(u16), gl: *const GroupedLayer, counts: []const u64, drop: ?*const expert_usage.Drop, layer: u16) !void {
+    for (0..gl.groups.count) |g| {
+        const lo: u16 = @intCast(gl.groups.base[g]);
+        const order = try expert_usage.rank(allocator, counts[lo .. lo + gl.groups.experts[g]]);
+        defer allocator.free(order);
+        var from = order.len;
+        var kept: usize = 0;
+        while (from > 0 and kept < gl.slots[g]) {
+            from -= 1;
+            if (drop) |d| if (d.isDropped(layer, lo + order[from])) continue;
+            kept += 1;
+        }
+        for (order[from..]) |o| {
+            if (drop) |d| if (d.isDropped(layer, lo + o)) continue;
+            try out.append(allocator, lo + o);
+        }
+    }
+}
+
+fn readWarmUsage(allocator: std.mem.Allocator, model_dir: []const u8, layers: usize, experts: usize) ?expert_usage.Usage {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return null;
+    defer dir.close(io);
+    const raw = dir.readFileAlloc(io, expert_usage.file_name, allocator, .limited(16 * 1024 * 1024)) catch return null;
+    defer allocator.free(raw);
+    return expert_usage.parse(allocator, raw, layers, experts) catch null;
+}
+
 /// Splits `total` bytes between layers by decode hits per byte: layer i starts at `floor[i]`, then the layer whose next
 /// expert (`mean[i]` bytes, capped at `full[i]`) gains the most hits per byte takes it, until nothing fits. False when
 /// the floors alone exceed `total`.
@@ -1719,6 +1749,8 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     geometry: Geometry,
     drop_owned: ?*expert_usage.Drop = null,
+    /// The pack's `expert_usage.json` counts, `[routed layer][expert id]`: ranks what `warmCache` preloads.
+    warm_usage: ?expert_usage.Usage = null,
     plan: CachePlan,
     store: ExpertStore,
     layers: []LayerState,
@@ -1883,6 +1915,7 @@ pub const Engine = struct {
                 d.n, @as(u64, d.n) * moeLayerCount(geometry), @as(f64, @floatFromInt(engine.droppedBytes())) / 1e9, d.source,
             });
         } else engine.drop_owned = opts.drop_owned;
+        if (!plan.resident) engine.warm_usage = readWarmUsage(allocator, model_dir, moeLayerCount(geometry), geometry.experts);
         log.info("[expert-stream] cache {d:.3} GB, {d} slots/layer, workspace {d:.3} GB, bounce {d:.3} GB, fallback_imports={d}\n", .{
             @as(f64, @floatFromInt(plan.cache_bytes)) / 1e9,
             plan.slots_per_layer,
@@ -1940,6 +1973,7 @@ pub const Engine = struct {
             d.deinit();
             self.allocator.destroy(d);
         }
+        if (self.warm_usage) |*u| u.deinit();
         self.* = undefined;
     }
 
@@ -2202,21 +2236,30 @@ pub const Engine = struct {
 
         const occurrences = try self.allocator.alloc(u16, warm_count);
         defer self.allocator.free(occurrences);
+        var ranked: std.ArrayList(u16) = .empty;
+        defer ranked.deinit(self.allocator);
+        var routed: usize = 0;
 
         for (self.layers, 0..) |*layer, layer_index| {
             if (!layer.active) continue;
-            var next: u16 = 0;
-            for (occurrences) |*expert| {
-                while (self.isDropped(@intCast(layer_index), next)) next += 1;
-                expert.* = next;
-                next += 1;
-            }
-            {
-                const saved_stats = layer.stats;
-                defer layer.stats = saved_stats;
-                var prepared = try self.prepareHost(@intCast(layer_index), occurrences);
-                prepared.deinit();
-            }
+            defer routed += 1;
+            ranked.clearRetainingCapacity();
+            if (layer.grouped) |gl| if (self.warm_usage) |u| {
+                try rankedWarm(self.allocator, &ranked, gl, u.counts[routed], self.geometry.drop, @intCast(layer_index));
+            };
+            const picks: []const u16 = if (ranked.items.len != 0) ranked.items else blk: {
+                var next: u16 = 0;
+                for (occurrences) |*expert| {
+                    while (self.isDropped(@intCast(layer_index), next)) next += 1;
+                    expert.* = next;
+                    next += 1;
+                }
+                break :blk occurrences;
+            };
+            const saved_stats = layer.stats;
+            defer layer.stats = saved_stats;
+            var prepared = try self.prepareHost(@intCast(layer_index), picks);
+            prepared.deinit();
         }
     }
 
@@ -4820,6 +4863,20 @@ test "spec map follows the ready cache slots and reports changes" {
     try t.expect(refreshSpecMap(&expert_to_slot, &ready, &out));
     try t.expectEqualSlices(i32, &.{ 2, -1, 0, -1 }, &out);
     try t.expect(!refreshSpecMap(&expert_to_slot, &ready, &out));
+}
+
+test "the warm set of a rate-grouped layer is each pool's most used experts, least used first" {
+    const t = std.testing;
+    var groups: quant.LayerGroups = .{ .count = 2 };
+    groups.experts[0..2].* = .{ 3, 5 };
+    groups.base[1] = 3;
+    var gl: GroupedLayer = .{ .groups = groups, .hidden = 0, .inter = 0 };
+    gl.slots[0..2].* = .{ 2, 3 };
+    const counts = [_]u64{ 5, 9, 1, 0, 7, 7, 2, 8 };
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(t.allocator);
+    try rankedWarm(t.allocator, &out, &gl, &counts, null, 0);
+    try t.expectEqualSlices(u16, &.{ 0, 1, 4, 5, 7 }, out.items);
 }
 
 test "a rate-grouped spec map holds the global slot of each ready expert of its pool and nothing else" {

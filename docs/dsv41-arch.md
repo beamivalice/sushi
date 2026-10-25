@@ -228,7 +228,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_gate`, `dsv41_route`, `dsv41_topk` | router logits, softplus scores/top-k/normalize, the indexer's top-k | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index |
 | `dsv41_dense_f32x` | the f32 matmul of the compressor projections | decode rows | vs f64 truth |
 | `dsv41_rope_tail`, `dsv41_kv_row` | `rotate` plus the QAT round trip (q, indexer q/k, compressed latent, inverse rotation of the heads); the window row's rms norm, rotation and fp8 round trip | every width | bit for bit (rms in MLX's accumulation order) |
-| `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit |
+| `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
 | `dsv41_attn_fused` | a wide span's whole `attnCore`: window band and picked rows read by index, online f32 softmax with the sink, no gathered rows or logits | wide chunks (more than 16 rows) on the GPU stream, bf16 activations, 16 divides the heads | 4e-6 to 1.3e-5 of peak against the CPU f32 `attnCore`, where the GPU `attnCore` is 3.5e-4 to 7e-4; the tiny oracle (4 heads) never engages it |
 | `dsv41_attn_softmax` | the f16 arm of a wide span (`Model.attn_f16`, off) | wide spans, window + picks <= 1024 columns | within 1/64 of peak of the f32 chain (bf16 outputs); f16 scores change output, so it waits for a KLD run |
 | `dsv41_index_scores`, `dsv41_index_scores_fp4`, `dsv41_index_tile` | the indexer's relu-weighted scores over key tiles, with the unseen groups at -inf | scalar up to 16 rows (`_fp4` reads the packed keys), matrix tiles when 8 divides the heads and the width | scalar and tile no further from the f64 truth than the chain; `_fp4` the unpacked keys' scores bit for bit; a tile scored at its key offset the whole list's columns bit for bit |
@@ -327,6 +327,18 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   sweep, same prompt, text byte-identical across arms) before / after: R1 36.8 / 24.9, R2 47.5 / 36.4, R3 53.8 / 44.0,
   R4 63.2 / 53.5, R5 72.0 / 61.9, R6 80.5 / 68.2, R8 97.6 / 84.9. Pairing rows that share an expert gives 3-7% of that at
   2-8 rows. 200 MLX ops per command buffer instead of 50 changed nothing (28.3 vs 27.8 tok/s).
+- **Serial decode 39.8 -> 46.5 tok/s** (same pack, settings and prompt as above, base `4132a1db`, lock, QUIET, fans max, die
+  under 50 °C, `taskpolicy -a`; the 600-token request twice after the warm request, greedy text byte-identical in every
+  arm). A Metal trace of a plain layer puts it at ~508 us of GPU: routed chain 160 (48 MB, ~300 GB/s, ALU-bound by the PAIR1
+  decode), shared expert 54 (17.7 MB), wq_b 48 (21 MB, ~450 GB/s), wo_a + wo_b 89 (38 MB, ~410 GB/s), attention core 41, gate
+  18, the hyper-connection stages ~40, the rest under 20 each. Three changes: the one-row routed chain prepares its pair input
+  and SwiGLU mid once (-23 us a layer); the attention output's fp8 round trip rides the attention kernel (-10 us a layer,
+  one dispatch fewer); the load-time warm fills each pool with its most used experts (above). First request 40.8 -> 43.3
+  from the first two, 43.4 -> 46.5 from the warm; the second request, with no cache misses, runs 46.8 -> 50.2. What is left
+  is the misses of a first request (each rebuilds the layer and the successor: +1.0 to 1.7 ms) and kernels at their
+  floor: the attention core is bound by its per-row softmax (unrolling the row loads or reading the packed fp4 rows in place
+  ran 2x slower), trunk weight prefetch under the small stages gained nothing in a process bench, and the rows geometry
+  policy is within 2-5% of the best of a sweep.
 
 Differences from mlx-serve: the attention-output fp8 round trip stays (upstream drops it), the verify block takes the same
 masked argmax as serial decode, and a verify is not split from the draft with a host sync per Markov step (the chain is

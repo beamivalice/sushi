@@ -624,7 +624,9 @@ const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++
     \\for (int d = sg * 32 + lane; d < D; d += NSG * 32) {
     \\  float o = 0.0f;
     \\  for (int g = 0; g < NSG; ++g) o += t_acc[g * D + d] * w[g];
-    \\  out[(i * H + h) * D + d] = dsv41_unrope<OT, RD, D>(OT(o / total), d, p0 + i, freqs);
+    \\  OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, p0 + i, freqs);
+    \\  if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
+    \\  out[(i * H + h) * D + d] = ov;
     \\}
 ;
 
@@ -642,6 +644,18 @@ const UNROPE_HEADER =
     \\  const float theta = float(pos) * freqs[(d - (D - RD)) / 2];
     \\  const float cs = metal::precise::cos(theta), sn = -metal::precise::sin(theta);
     \\  return OT(even ? x1 * cs - x2 * sn : x1 * sn + x2 * cs);
+    \\}
+;
+
+/// UNROPE_HEADER and the fp8 activation round trip of a simdgroup's 32 channels (one dsv41_qat group), for the
+/// kernels that write the heads attnOut rounds next.
+const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
+    \\template <typename OT>
+    \\inline OT dsv41_fp8_store(OT v) {
+    \\  #pragma clang fp contract(off)
+    \\  #pragma clang fp reassociate(off)
+    \\  const float s = qat_scale<0>(metal::simd_max(metal::fabs(float(v))));
+    \\  return static_cast<OT>(qat_round<0>(float(v), s));
     \\}
 ;
 
@@ -674,7 +688,9 @@ const ATTN_MERGE_SOURCE =
     \\  total += pl[base + j] * w;
     \\  o += pacc[(base + j) * D + d] * w;
     \\}
-    \\out[(size_t(i) * H + h) * D + d] = dsv41_unrope<OT, RD, D>(OT(o / total), d, meta[0] + i, freqs);
+    \\OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, meta[0] + i, freqs);
+    \\if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
+    \\out[(size_t(i) * H + h) * D + d] = ov;
 ;
 
 /// A wide span's softmax, one simdgroup per (row, head): the raw window scores `lw` [L*H, Wk] under the band
@@ -713,9 +729,9 @@ const ATTN_SOFTMAX_SOURCE =
     \\}
 ;
 
-var attn_dec_def = Def{ .name = "dsv41_attn_decode", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_SOURCE, .header = UNROPE_HEADER };
+var attn_dec_def = Def{ .name = "dsv41_attn_decode", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_SOURCE, .header = HEADS_HEADER };
 var attn_split_def = Def{ .name = "dsv41_attn_split", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_SOURCE };
-var attn_merge_def = Def{ .name = "dsv41_attn_merge", .ins = &.{ "pacc", "pm", "pl", "sink", "meta", "freqs" }, .outs = &.{"out"}, .source = ATTN_MERGE_SOURCE, .header = UNROPE_HEADER };
+var attn_merge_def = Def{ .name = "dsv41_attn_merge", .ins = &.{ "pacc", "pm", "pl", "sink", "meta", "freqs" }, .outs = &.{"out"}, .source = ATTN_MERGE_SOURCE, .header = HEADS_HEADER };
 var attn_softmax_def = Def{ .name = "dsv41_attn_softmax", .ins = &.{ "lw", "lc", "topk", "sink", "meta", "scal" }, .outs = &.{ "pw", "pc" }, .source = ATTN_SOFTMAX_SOURCE };
 
 const attn_dec_nsg = 8;
@@ -741,6 +757,8 @@ pub const DecodeArgs = struct {
     /// The inverse rotation of the heads' tail (`rd` channels, `freqs`), or `rd` 0.
     freqs: A = sc_mod.none,
     rd: usize = 0,
+    /// The heads leave through attnOut's fp8 round trip (groups of 32 channels).
+    qat_fp8: bool = false,
     out_dt: mlx.mlx_dtype,
 };
 
@@ -772,7 +790,7 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     const common = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "NSG", .v = attn_dec_nsg } };
     if (splits == 1) {
         var o: [1]A = undefined;
-        try launch(sc, &attn_dec_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, grid, tg, &(common ++ [_]Tmpl{.{ .name = "RD", .v = ci(a.rd) }}), &.{ .{ .name = "KT", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } }, &o);
+        try launch(sc, &attn_dec_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, grid, tg, &(common ++ [_]Tmpl{ .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) } }), &.{ .{ .name = "KT", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } }, &o);
         return o[0];
     }
     var parts: [3]A = undefined;
@@ -783,7 +801,7 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     }, grid, tg, &common, &.{.{ .name = "KT", .dt = kt }}, &parts);
     var o: [1]A = undefined;
     try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, .{ D, H, L }, .{ D, 1, 1 }, &.{
-        .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) },
+        .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) },
     }, &.{.{ .name = "OT", .dt = a.out_dt }}, &o);
     return o[0];
 }
@@ -2182,6 +2200,22 @@ test "dsv41 decode attention: the folded inverse rotation is the rotation of the
         const want = try qat_mod.rotate(&sc, plain, freqs, try positions(&sc, @intCast(a.c.p0), 1, 1), 64, true);
         const got = try attnDecodeSplit(&sc, decodeArgs(&a, dt, freqs), splits);
         try expectBitEqual("attn unrope", try hostOf(&sc, got), try hostOf(&sc, want));
+    };
+}
+
+test "dsv41 decode attention: the folded fp8 round trip is the round trip of the heads, bit for bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const freqs = try ropeFreqs(&sc);
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 2, 4, 5 }) |splits| {
+        const a = try attnData(&sc, .{}, dt);
+        var args = decodeArgs(&a, dt, freqs);
+        const plain = try attnDecodeSplit(&sc, args, splits);
+        const want = try qat_mod.qat(&sc, plain, .fp8_ue8m0, 32);
+        args.qat_fp8 = true;
+        const got = try attnDecodeSplit(&sc, args, splits);
+        try expectBitEqual("attn fp8", try hostOf(&sc, got), try hostOf(&sc, want));
     };
 }
 

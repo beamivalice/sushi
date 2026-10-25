@@ -1675,10 +1675,11 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             .scale = scale,
             .freqs = rope,
             .rd = rd,
+            .qat_fp8 = m.qat_on,
             .out_dt = m.act,
         });
         if (pf) |p| try p.mark(.core, &.{o});
-        return attnOut(sc, m, ly, o);
+        return attnOut(sc, m, ly, o, m.qat_on);
     }
     const n_spans = (L + span - 1) / span;
     const heads = try sc.a.alloc(A, n_spans);
@@ -1729,7 +1730,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     }
     try ls.win.write(kv, p0, sc.s);
 
-    const out = try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null));
+    const out = try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
     if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
     return out;
 }
@@ -1767,16 +1768,18 @@ fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0:
     const band = if (ds.band.ctx != null) ds.band else try sc.ge(try sc.zeros(&.{ ci(B), ci(dim(keys, 0)) }, .float32), try sc.f(0));
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const heads = try attnCore(sc, ly.sink, q, keys, band, none, none, scale, m.act);
-    return attnOut(sc, m, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null));
+    return attnOut(sc, m, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null), false);
 }
 
-/// The heads `o` `[L, H, hd]` (already inverse-rotated) through the output projections.
-fn attnOut(sc: *Scope, m: *const Model, ly: *const Layer, o: A) !A {
+/// The heads `o` `[L, H, hd]` (already inverse-rotated) through the output projections; `rounded`: they already left
+/// the fp8 round trip (the decode kernels fold it in).
+fn attnOut(sc: *Scope, m: *const Model, ly: *const Layer, o: A, rounded: bool) !A {
     const c = &m.cfg;
     const L = dim(o, 0);
     const og = c.o_groups;
     const gin = c.heads * c.head_dim / og;
-    const ob = try qatIf(sc, m, try sc.reshape(o, &.{ ci(L), ci(og), ci(gin) }), .fp8_ue8m0, 32);
+    const grouped = try sc.reshape(o, &.{ ci(L), ci(og), ci(gin) });
+    const ob = if (rounded) grouped else try qatIf(sc, m, grouped, .fp8_ue8m0, 32);
     const obg = try sc.transpose(ob, &.{ 1, 0, 2 }); // [og, L, in]
     const oa = if (ly.wo_a.stq) |q|
         try q.applyGrouped(sc, obg)

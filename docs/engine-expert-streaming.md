@@ -141,7 +141,11 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   the lendable layers, paid out of the pools the plan releases) and the last restore drops it.
 - **Load-time cache warm**: preload the lowest expert IDs into `floor(0.8 * slots_per_layer)` slots per MoE layer
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
-  routes; dense prefix layers are skipped.
+  routes; dense prefix layers are skipped. A rate-grouped pack with an `expert_usage.json` (`--drop-expert`'s list)
+  instead fills every pool of every layer with its most used experts, the most used last so they leave the LRU last
+  (`rankedWarm`). DeepSeek STQ 1.75bpw, `--no-mtp` serial, reqC (5.4k prompt) twice after the warm request: the first
+  600 tokens rebuilt 2062 layers before and 1106 after, 43.4 -> 46.5 tok/s (80% of each pool by usage: 1315 rebuilds,
+  45.6); the second pass, with no misses, is 50.2 either way. Greedy text byte-identical.
 
 <a id="rate-groups"></a>
 ## Rate groups under streaming (Flash-Next)
@@ -176,7 +180,7 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 - **Grouped layers queue from their own map**: `specRoute` serves a uniform cache map only; a rate-grouped layer's map
   is `Engine.specGrouped` (the global slot of each ready expert of its pools, one GPU copy per layer, refreshed with
   its host copy), used by DeepSeek-V4.1 STQ ([dsv41-arch](dsv41-arch.md#stq)). The lossy pick reaches DeepSeek's grouped
-  layers through `Engine.swapGroupedMisses` (below) and keeps the waiting schedule. The load-time warm preloads the lowest expert ids, which fill group 0 first.
+  layers through `Engine.swapGroupedMisses` (below) and keeps the waiting schedule. The load-time warm of a pack without a usage file preloads the lowest expert ids, which fill group 0 first.
 - Rate groups on MiMo stay resident-only; GLM serves none.
 
 ## Decode schedule
