@@ -184,13 +184,14 @@ pub fn build(b: *std.Build) void {
     }
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
-    const exl3_tests = b.addTest(.{
-        .name = "exl3-test",
-        .root_module = exl3_test_mod,
-        .filters = if (test_filter) |f| &.{f} else &.{},
-    });
-    test_build.dependOn(&b.addInstallArtifact(exl3_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-    test_step.dependOn(&b.addRunArtifact(exl3_tests).step);
+    const exl3_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
+        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .name = "exl3-test", .root_module = exl3_test_mod, .filters = &.{f} })}) catch @panic("OOM")
+    else
+        addExl3TestBins(b, exl3_test_mod);
+    for (exl3_tests) |exl3_test| {
+        test_build.dependOn(&b.addInstallArtifact(exl3_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        test_step.dependOn(&b.addRunArtifact(exl3_test).step);
+    }
 
     const encoder_mod = addEncoderModule(b, test_mod, exl3_test_mod, target, optimize);
     const encoder_tests = b.addTest(.{
@@ -261,6 +262,104 @@ fn namedBucket(stem: []const u8) usize {
         for (names) |name| if (std.mem.eql(u8, stem, name)) return i;
     }
     return test_buckets.len;
+}
+
+/// Seconds of the slow src/exl3 tests with the binaries running side by side; any other test weighs 1. Only the
+/// balance of the exl3 binaries reads this: a stale entry costs speed, never coverage.
+const exl3_test_weights = [_]struct { []const u8, u16 }{
+    .{ "group2 half4 composition preserves all-rate", 262 },
+    .{ "every admitted rate takes the fast arms", 175 },
+    .{ "every K1.5 to K2 rate takes the fast arms", 146 },
+    .{ "group2 cooperative projections preserve F16 bits", 140 },
+    .{ "prefill grid serves every admitted rate, mixed projections", 120 },
+    .{ "prefill rows hold the f32-truth bar for every codebook, past 24 groups", 94 },
+    .{ "the grouped chain at 5120x2304", 72 },
+    .{ "SPEC1 per-rate table: every reader decodes", 56 },
+    .{ "SPEC1 below K1.5 and above K4: the prefill GEMM", 48 },
+    .{ "SPEC1 below K1.5 and above K4: every reader decodes", 36 },
+    .{ "serves spec1 and std1 on the prefill grid", 36 },
+    .{ "one-bank and grouped trellis linears", 35 },
+    .{ "every slot writes the served kernels' bytes", 35 },
+    .{ "512-row E=512 topk=10 layer within 2x affine", 32 },
+    .{ "spec1's 2^12 folded into the stores", 28 },
+    .{ "PAIR1 decode and prefill rows hold the f32-truth bar", 27 },
+    .{ "PAIR1's 2^12 folded into the stores", 26 },
+    .{ "SPEC1 per-rate table: the 2^12 folded into the stores", 23 },
+    .{ "BF16 prefill on the simdgroup-matrix body", 20 },
+    .{ "Sushi GPU decode and prefill match scalar truth", 19 },
+    .{ "the shared expert as a one-expert fused chain", 19 },
+    .{ "GLM serves spec1 and std1 on group2's routed chain", 18 },
+    .{ "GLM serves spec1 and std1 on its lane chain", 17 },
+    .{ "512-row production-shape sorted gemm", 16 },
+    .{ "GLM GPU windows preserve 288 expert bytes at every admitted rate", 15 },
+    .{ "multi-row projection holds the bar at every admitted rate", 14 },
+    .{ "PAIR1 weight readers decode every K1.5 to K4 rate", 14 },
+    .{ "SPEC1 per-rate table: decode and prefill rows hold", 12 },
+    .{ "GLM down lane exact staged and fused bytes", 11 },
+    .{ "the simdgroup-matrix body and the scalar body both match", 10 },
+    .{ "multi-row projection matches projectIndexed per row", 10 },
+    .{ "MCG n48 BF16 decode and NAX preserve f32 truth", 9 },
+};
+const exl3_test_bins = 6;
+
+const Exl3Test = struct { filter: []const u8, weight: u16, bin: usize = 0 };
+
+/// The exl3 tests compile and run as several binaries. A filter matches `<file stem>.test.<name>`,
+/// so each test is a filter of its own, found by scanning src/exl3, and the tests are balanced by weight.
+fn addExl3TestBins(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
+    const io = b.graph.io;
+    var tests: std.ArrayList(Exl3Test) = .empty;
+    var dir = buildRootHandle(b).openDir(io, "src/exl3", .{ .iterate = true }) catch |e| std.debug.panic("src/exl3/: {t}", .{e});
+    defer dir.close(io);
+    var files = dir.iterate();
+    while (files.next(io) catch |e| std.debug.panic("src/exl3/: {t}", .{e})) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        const stem = entry.name[0 .. entry.name.len - ".zig".len];
+        const source = dir.readFileAlloc(io, entry.name, b.allocator, .limited(8 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "test \"")) continue;
+            // A name this scan cannot cut out would drop its test from every binary.
+            if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
+                std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
+            const name = line["test \"".len .. line.len - "\" {".len];
+            var weight: u16 = 1;
+            for (exl3_test_weights) |w| if (std.mem.indexOf(u8, name, w[0]) != null) {
+                weight = w[1];
+            };
+            tests.append(b.allocator, .{ .filter = b.fmt("{s}.test.{s}", .{ stem, name }), .weight = weight }) catch @panic("OOM");
+        }
+    }
+    std.mem.sortUnstable(Exl3Test, tests.items, {}, struct {
+        fn lt(_: void, x: Exl3Test, y: Exl3Test) bool {
+            return if (x.weight != y.weight) x.weight > y.weight else std.mem.lessThan(u8, x.filter, y.filter);
+        }
+    }.lt);
+    var load: [exl3_test_bins]u32 = @splat(0);
+    for (tests.items) |*t| {
+        t.bin = std.mem.indexOfMin(u32, &load);
+        load[t.bin] += t.weight;
+    }
+    // A filter matches anywhere in a name, so a test whose name holds another's runs in that one's binary.
+    var moved = true;
+    while (moved) {
+        moved = false;
+        for (tests.items, 0..) |a, i| {
+            for (tests.items, 0..) |*c, j| {
+                if (i == j or a.bin == c.bin or std.mem.indexOf(u8, c.filter, a.filter) == null) continue;
+                c.bin = a.bin;
+                moved = true;
+            }
+        }
+    }
+    var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
+    for (0..exl3_test_bins) |i| {
+        var filters: std.ArrayList([]const u8) = .empty;
+        for (tests.items) |t| if (t.bin == i) filters.append(b.allocator, t.filter) catch @panic("OOM");
+        if (filters.items.len == 0) continue;
+        out.append(b.allocator, b.addTest(.{ .name = b.fmt("exl3-test-{d}", .{i + 1}), .root_module = root, .filters = filters.items })) catch @panic("OOM");
+    }
+    return out.items;
 }
 
 fn addCHeaderModule(

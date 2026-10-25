@@ -199,6 +199,7 @@ fn testProj(o: *Owned, s: mlx.mlx_stream, input: c_int, output: c_int, rate: c_i
 fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode) !void {
     const s = mlx.gpuStream();
     if (!support.available()) return error.SkipZigTest;
+    defer base.setDecodeParams(.mul1);
     // Each rate allocates several GB of trellis; return it before the next case.
     defer _ = mlx.mlx_clear_cache();
     var o: Owned = .{};

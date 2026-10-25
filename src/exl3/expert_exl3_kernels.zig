@@ -4205,6 +4205,7 @@ test "exl3 K3 Metal inner GEMV matches host on production shape" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    setDecodeParams(.mul1);
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -4246,6 +4247,7 @@ test "exl3 K4 Metal inner GEMV matches the host tile decode" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    setDecodeParams(.mul1);
     const fixture = exl3.fixtures.k4;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();

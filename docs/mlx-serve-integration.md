@@ -56,7 +56,7 @@ existing struct literals keep working), `format.Codebook` gains `std1`, `spec1` 
 A `Decode` that names std1 or spec1 without its table is refused by name (`Exl3CodebookTableUnknown`) at the dispatch, never
 decoded. A host that only ever sees MCG and MUL1 packs needs no change.
 
-The module's tests run as their own artifact (`exl3-test`) on `zig build test`; a change that
+The module's tests run as their own artifacts (`exl3-test-N`) on `zig build test`; a change that
 passes them and keeps the names above is safe to hand over.
 
 ## What the host owes the module
@@ -101,7 +101,7 @@ mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#76
 
 ## Handing a new engine to mlx-serve
 
-1. Land the change on Sushi `main` with `zig build test` green, `exl3-test` included.
+1. Land the change on Sushi `main` with `zig build test` green, the `exl3-test-N` artifacts included.
 2. Make the commit reachable from the submodule's url (`ddalcu/sushi`): the fork must fetch it
    from this repo, or the change must go through it.
 3. Give mlx-serve the full commit hash. mlx-serve bumps the gitlink

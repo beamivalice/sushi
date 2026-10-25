@@ -23,7 +23,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 **`src/exl3` is a module** (`sushi_exl3`), so another MLX host (mlx-serve) can serve EXL3 packs through the same code.
 It reaches `mlx`, `log` and `io_util` through an `mlx_host` import whose root file exposes them as `pub const`; here that
 root is `src/main.zig` (and `src/tests.zig` for tests), and it can never import a Sushi file by path. Its tests run as
-their own artifact (`exl3-test`) on `zig build test`.
+their own artifacts (`exl3-test-1` to `-6`, balanced by `exl3_test_weights` in `build.zig`) on `zig build test`.
 
 The NAX compile-probe regression test checks hardware capability independently
 of the runtime failure latch. It deliberately latches dispatch off before
