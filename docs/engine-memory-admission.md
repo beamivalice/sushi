@@ -310,17 +310,15 @@ checkpoints captured) the request peaked 105 MB above a run with the SSD tier of
 The README's 64 GB `--ctx-size` values are checked with the engine's own full-context admission bill
 (`prefillNeededAtChunk` through the per-request ladder) at a 59,000 MB ceiling: a prompt that fills the context, MTP
 on, `--mtp-head-kv-quant`, the 1 GiB hot cache pinned (not evictable). No live boot: the wired limit has only test
-seams (`wired_limit_mb_override`, `static_ceiling_override`), so the bill was computed in a scratch test at `ad5e6be8`.
-The rows below are re-derived for the checkpoint release: the bill at the same width less 13 checkpoints (912 MiB at
-bf16), the largest admitted by the same scratch (2000-token steps, 32000 new tokens) with the SSD tier on. The widths
-are not re-picked.
+seams (`wired_limit_mb_override`, `static_ceiling_override`), so the bill is computed in a scratch test: here at `ed8fe174`,
+`--qwen-gdn 16`, the SSD tier on, the largest admitted in 2000-token steps with 32000 new tokens, and
+available = 59,000 MB less the pack's 49,784,531,962 resident bytes (trunk, vision tower, MTP head and its rerank copy)
+less the hot cache.
 
 | pack, KV | `--ctx-size` | bill (MiB) | width | available (MiB) | weights + bill (GiB) | largest admitted |
 |---|---:|---:|---:|---:|---:|---:|
-| Sushi-2.6bpw, kv8 | 250000 | 10954 | 4096 | 12975 | 54.6 | 516000 |
-| Sushi-2.6bpw, kv4 | 450000 | 11807 | 4096 | 12975 | 55.5 | 862000 |
-| Sushi-3bpw, kv8 | 128000 | 6417 | 2048 | 7463 | 55.6 | 242000 |
-| Sushi-3bpw, kv4 | 248000 | 6075 | 1024 | 7463 | 55.3 | 398000 |
+| Sushi-STQ-2.75bpw, kv8 | 250000 | 9135 | 2048 | 10497 | 55.3 | 392000 |
+| Sushi-STQ-2.75bpw, kv4 | 450000 | 10004 | 2048 | 10497 | 56.1 | 654000 |
 
 The 48 GB recipe is the same check at a 43,000 MB ceiling (probe at `eab60060`, weights 37,552,413,730 bytes):
 

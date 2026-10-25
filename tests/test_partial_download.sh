@@ -35,7 +35,7 @@ check() {
 # The state an interrupted pull leaves behind (live capture 2026-07-03): small
 # files complete, weights only .partial, no tokenizer. The config only has to
 # parse: B fails at tokenizer load, before any architecture code runs.
-MODEL_DIR="$SCRATCH/home/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-3bpw"
+MODEL_DIR="$SCRATCH/home/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
 mkdir -p "$MODEL_DIR"
 printf '{"model_type": "gemma4"}\n' > "$MODEL_DIR/config.json"
 printf '{{ messages }}\n' > "$MODEL_DIR/chat_template.jinja"
@@ -48,7 +48,7 @@ HOME="$SCRATCH/home" "$BIN" pull qwen3.8-flash-next > "$OUT" 2>&1 &
 PID=$!
 SEEN=1
 for _ in $(seq 1 40); do
-    if grep -q "pulling manifest for beamster/Qwen3.8-Flash-Next-Sushi-3bpw" "$OUT"; then SEEN=0; break; fi
+    if grep -q "pulling manifest for beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw" "$OUT"; then SEEN=0; break; fi
     kill -0 "$PID" 2>/dev/null || break
     sleep 0.5
 done
@@ -62,7 +62,7 @@ check "interrupted pull is resumed, not treated as already-present" "$SEEN"
 # ── C. an explicit pull checks a dir that looks complete against the manifest ──
 # A pull refused mid-way (HTTP 429) leaves whole files and no .partial; a dir an older version left that way has no
 # marker to tell, so `sushi pull` must fetch the manifest rather than take the fast path.
-SHORT_DIR="$SCRATCH/home2/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-3bpw"
+SHORT_DIR="$SCRATCH/home2/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
 mkdir -p "$SHORT_DIR"
 printf '{"model_type": "qwen4_exp"}\n' > "$SHORT_DIR/config.json"
 printf 'x' > "$SHORT_DIR/model-00001.safetensors"
@@ -77,7 +77,7 @@ done
 kill -9 "$PID" 2>/dev/null
 wait "$PID" 2>/dev/null
 SEEN=1
-if grep -q "pulling manifest for beamster/Qwen3.8-Flash-Next-Sushi-3bpw" "$OUT"; then SEEN=0; fi
+if grep -q "pulling manifest for beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw" "$OUT"; then SEEN=0; fi
 check "explicit pull of a complete-looking dir checks the manifest" "$SEEN"
 
 # ── B. loading the partial dir fails cleanly (no SIGSEGV) ──

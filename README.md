@@ -9,8 +9,7 @@ A local AI server for low-bit, very high quality Sushi quants, using custom EXL3
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming-on-a-32-gb-mac))
-* [Qwen3.8-Flash-Next-Sushi-2.6bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw) (requires 64 GB+)
-* [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
+* [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (requires 64 GB+ and sushi 1.3.0 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
 * [GLM-5.3-Flash-Sushi-2bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2bpw) (requires 96 GB+, text, image and video input)
@@ -42,27 +41,27 @@ GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MT
 with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
 The Qwen columns are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 0.2 GiB off each Qwen cell.
 
-| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+| context | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
 |---|---:|---:|---:|---:|---:|---:|
-| weights only | 35.2 | 44.2 | 63.9 | 89.7 | 78.3 | 89.8 |
-| 128k | 40.3 | 49.3 | 69.0 | 93.7 | 82.6 | 94.1 |
-| 256k | 43.2 | 52.1 | 71.9 | 95.8 | 83.8 | 95.2 |
-| 512k | 48.2 | 57.2 | 76.9 | 99.9 | 86.0 | 97.5 |
-| 1M | 58.4 | 67.4 | 87.1 | 108.2 | 90.5 | 102.0 |
+| weights only | 35.2 | 46.4 | 63.9 | 89.7 | 78.3 | 89.8 |
+| 128k | 40.3 | 51.4 | 69.0 | 93.7 | 82.6 | 94.1 |
+| 256k | 43.2 | 54.3 | 71.9 | 95.8 | 83.8 | 95.2 |
+| 512k | 48.2 | 59.4 | 76.9 | 99.9 | 86.0 | 97.5 |
+| 1M | 58.4 | 69.5 | 87.1 | 108.2 | 90.5 | 102.0 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
 the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no
 4-bit KV):
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+| Mac | GPU limit | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
 |---|---|---|---|---|---|---|---|
 | 48 GB † | 43,000 MB (42.0 GiB) | 200k / 304k | — | — | — | — | — |
-| 64 GB † | 59,000 MB (57.6 GiB) | 976k / 1M | 528k / 840k | — | — | — | — |
+| 64 GB † | 59,000 MB (57.6 GiB) | 976k / 1M | 416k / 664k | — | — | — | — |
 | 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | — | 696k / — | — |
 | 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — |
 
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
-less: 192k / 288k at 48 GB, and 968k / 1M and 520k / 824k at 64 GB.
+less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-STQ-2.75bpw) at 64 GB.
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load

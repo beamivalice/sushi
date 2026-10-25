@@ -206,6 +206,9 @@ the mean KLD to the first EOS against the BF16 teacher.
 | Sushi-2.6bpw | 0.0090 | 0.0088 | 0.0255 | 0.0266 | 0.1445 | 0.0380 | 0.0471 | 0.0155 | 0.0342 | 94.63% |
 | Sushi-4bpw | 0.0042 | 0.0030 | 0.0128 | 0.0116 | 0.0490 | 0.0137 | 0.0187 | 0.0074 | 0.0135 | 96.14% |
 
+- Sushi-STQ-2.75bpw (scored on the released v1.3.0 binary, the same settings and BF16 teacher): `all` 0.0295, top-1
+  94.73%, against 0.0342 and 94.63% for Sushi-2.6bpw; its 16x512 first-EOS reading is 0.0692 and 92.76%. Peak GPU memory
+  while scoring 49.6 GB. The per-category cells are not in this table.
 - Raw wikitext is the hardest category for every pack, 3-4x its `all`. The prose-only standard reading measures each pack
   where it is weakest.
 - Code (thinking off) and math (thinking on, low effort) are the easiest. At 2bpw, story loses 6x and multilingual 5x

@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen3.8-Flash-Next Sushi-STQ-2.75bpw**: a new pack that replaces Sushi-2.6bpw and Sushi-3bpw as the 64 GB recommendation (`sushi pull qwen3.8-flash-next` now fetches it, 75.9 GB download); it scores KLD 0.0692 (top-1 agreement 92.76%) on 16x512 prompts at bf16 KV and runs on sushi 1.3.0 and later.
 - **Qwen now thinks at medium effort by default**: Qwen3.8-Flash-Next answers a request that names no thinking field with thinking on at `medium` (capped at 8192 thinking tokens), where it used to answer without thinking. `enable_thinking: false`, `reasoning_effort: none`, `--think` and `--reasoning-budget` still win.
 - **Qwen tool calls written in Claude's `<function_calls><invoke>` markup are executed**: Qwen3.8-Flash-Next sometimes answers in that shape, which used to end an agent's turn as plain text; it now becomes a tool call when it names a declared tool.
 - **`frequency_penalty` follows OpenAI's definition**: it is subtracted from a token's logit once per time the token has been generated, instead of being read as `repeat_penalty` 1 + x (which halved every seen logit at 1.0), and `presence_penalty` and `frequency_penalty` accept -2 to 2 on chat, completions and Responses.

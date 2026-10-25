@@ -25144,7 +25144,7 @@ test "--drop-expert is refused on every arch but deepseek_v41, before the weight
     }
 }
 
-test "the 64 GB Sushi-2.6bpw recipe's bills at both GDN widths: 250000 context, kv8, MTP, 32000 new tokens" {
+test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 context, kv8, MTP, 32000 new tokens" {
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
     var cfg = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
@@ -25163,12 +25163,14 @@ test "the 64 GB Sushi-2.6bpw recipe's bills at both GDN widths: 250000 context, 
     defer configured_mtp = saved_mtp;
     configured_mtp = true;
     const warm = WarmPrefix{ .mtp_on = true };
-    // The load bill's context term is the narrowest rung; a request runs the 4096 rung in 13,734 MB.
-    // With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
+    // The load bill's context term is the narrowest rung; at this pack's weights the 59,000 MB ceiling admits
+    // the 2048 rung. With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
     try t.expectEqual(@as(u64, 7_844), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_337), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
     try t.expectEqual(@as(u64, 11_157), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
     cfg.gdn_state_f32 = false;
     try t.expectEqual(@as(u64, 7_641), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_135), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
     try t.expectEqual(@as(u64, 10_954), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
 }
 

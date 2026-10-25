@@ -2,7 +2,7 @@
 //! ergonomics for the terminal.
 //!
 //!   sushi run qwen3.8-flash-next          # download if missing, serve, drop into a REPL
-//!   sushi pull qwen3.8-flash-next:2.6bpw  # download only
+//!   sushi pull qwen3.8-flash-next:2.75bpw  # download only
 //!   sushi run mimo-v2.6-flash             # MiMo-V2.6-Flash (128 GB)
 //!   sushi list                            # the Sushi packs for this Mac, and what's on disk
 //!
@@ -119,13 +119,12 @@ pub const Alias = struct {
 pub const HF_ORG = "beamster";
 
 /// The published Sushi packs, with the memory tiers the README and docs/usage.md state. The bare Qwen
-/// name picks 3bpw: 2.6bpw needs the same 64 GB and scores worse on KLD; 4bpw needs 96 GB. MiMo's pack and
+/// name picks 2.75bpw (64 GB); 4bpw needs 96 GB. MiMo's pack and
 /// GLM's default 2.4bpw need 128 GB, GLM's 2bpw 96 GB. Qwen 2bpw also streams on a 32 GB Mac (README, "Streaming on a 32 GB Mac").
 /// A new pack lands here, in docs/usage.md and, once its repo is live, in the README.
 pub const aliases = [_]Alias{
     .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32 },
-    .{ .name = "qwen3.8-flash-next", .tag = "2.6bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", .tier_gb = 64, .recommend_gb = 64 },
-    .{ .name = "qwen3.8-flash-next", .tag = "3bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-3bpw", .is_default = true, .tier_gb = 64 },
+    .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64 },
     .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96 },
     .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
     .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
@@ -198,7 +197,7 @@ fn stripTag(name: []const u8) []const u8 {
 }
 
 /// Short name / repo ref → HF repo id. Accepts:
-///   "qwen3.8-flash-next" / "qwen3.8-flash-next:2.6bpw"  (alias table)
+///   "qwen3.8-flash-next" / "qwen3.8-flash-next:2.75bpw"  (alias table)
 ///   "org/repo" / "org/repo:tag"       (direct, tag stripped; `checkPullable` refuses any org but beamster)
 ///   "hf.co/org/repo", "huggingface.co/org/repo"
 /// Returns null for unknown alias-shaped names (no '/').
@@ -1949,12 +1948,15 @@ test "cli: --no-mtp-lookup is its own flag, not --no-mtp" {
 
 test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Bare alias picks the family default.
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-3bpw", resolveShortName("qwen3.8-flash-next").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", resolveShortName("qwen3.8-flash-next").?.repo);
     // Tagged alias, case-insensitive.
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", resolveShortName("qwen3.8-flash-next:2.6bpw").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", resolveShortName("qwen3.8-flash-next:2.75bpw").?.repo);
+    // The packs the 2.75bpw one replaced are no longer short names.
+    try testing.expect(resolveShortName("qwen3.8-flash-next:2.6bpw") == null);
+    try testing.expect(resolveShortName("qwen3.8-flash-next:3bpw") == null);
     try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-4bpw", resolveShortName("QWEN3.8-FLASH-NEXT:4BPW").?.repo);
     // :latest behaves like bare.
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-3bpw", resolveShortName("qwen3.8-flash-next:latest").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", resolveShortName("qwen3.8-flash-next:latest").?.repo);
     // MiMo's one published pack, bare or tagged.
     try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("mimo-v2.6-flash").?.repo);
     try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("MiMo-V2.6-Flash:2.3bpw").?.repo);
@@ -1974,7 +1976,7 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", (try checkPullable("qwen3.8-flash-next:2.6bpw")).repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", (try checkPullable("qwen3.8-flash-next:2.75bpw")).repo);
     try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("beamster/Some-Pack")).repo);
     try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("hf.co/beamster/Some-Pack:latest")).repo);
     try testing.expectEqualStrings("Beamster/Some-Pack", (try checkPullable("Beamster/Some-Pack")).repo);
@@ -2006,12 +2008,10 @@ test "memory tiers: installed RAM rounds down to whole GB and picks fits or may 
     try testing.expectEqual(Verdict.may_stream, verdictFor(a2, 32));
     try testing.expectEqual(Verdict.may_stream, verdictFor(a2, 47));
     try testing.expectEqual(Verdict.fits, verdictFor(a2, 48));
-    const a26 = aliasForRepo(resolveShortName("qwen3.8-flash-next:2.6bpw").?.repo).?;
-    const a3 = aliasForRepo(resolveShortName("qwen3.8-flash-next:3bpw").?.repo).?;
+    const a275 = aliasForRepo(resolveShortName("qwen3.8-flash-next:2.75bpw").?.repo).?;
     const a4 = aliasForRepo(resolveShortName("qwen3.8-flash-next:4bpw").?.repo).?;
-    try testing.expectEqual(Verdict.may_stream, verdictFor(a26, 63));
-    try testing.expectEqual(Verdict.fits, verdictFor(a26, 64));
-    try testing.expectEqual(Verdict.fits, verdictFor(a3, 64));
+    try testing.expectEqual(Verdict.may_stream, verdictFor(a275, 63));
+    try testing.expectEqual(Verdict.fits, verdictFor(a275, 64));
     try testing.expectEqual(Verdict.may_stream, verdictFor(a4, 95));
     try testing.expectEqual(Verdict.fits, verdictFor(a4, 96));
     for ([_][]const u8{ "mimo-v2.6-flash", "glm-5.3-flash" }) |name| {
@@ -2029,8 +2029,8 @@ test "list recommends one pack per family from the tier table" {
     try testing.expect(recommendedAlias(q, 16) == null);
     try testing.expectEqualStrings("2bpw", recommendedAlias(q, 32).?.tag);
     try testing.expectEqualStrings("2bpw", recommendedAlias(q, 48).?.tag);
-    try testing.expectEqualStrings("2.6bpw", recommendedAlias(q, 64).?.tag);
-    try testing.expectEqualStrings("2.6bpw", recommendedAlias(q, 95).?.tag);
+    try testing.expectEqualStrings("2.75bpw", recommendedAlias(q, 64).?.tag);
+    try testing.expectEqualStrings("2.75bpw", recommendedAlias(q, 95).?.tag);
     try testing.expectEqualStrings("4bpw", recommendedAlias(q, 96).?.tag);
     try testing.expectEqualStrings("4bpw", recommendedAlias(q, 128).?.tag);
     try testing.expect(recommendedAlias("mimo-v2.6-flash", 96) == null);
@@ -2043,9 +2043,9 @@ test "list recommends one pack per family from the tier table" {
 
 test "pull warns only below the documented tier, naming --ssd-budget-gb" {
     var buf: [256]u8 = undefined;
-    try testing.expect(tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", 64) == null);
+    try testing.expect(tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", 64) == null);
     try testing.expect(tierWarning(&buf, "beamster/unlisted-pack", 8) == null);
-    const warn = tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", 48).?;
+    const warn = tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", 48).?;
     try testing.expect(std.mem.indexOf(u8, warn, "documented 64 GB") != null);
     try testing.expect(std.mem.indexOf(u8, warn, "--ssd-budget-gb") != null);
 }
@@ -2103,7 +2103,7 @@ test "pull: Hugging Face's 401/403/404 mean a missing repo, other failures mean 
     try testing.expect(statusKind(503) == .failed);
 }
 
-test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.6bpw recommended" {
+test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended" {
     var rows: [aliases.len]CatalogRow = undefined;
     for (aliases, 0..) |a, i| rows[i] = .{ .alias = a, .size = (@as(u64, i) + 1) << 30, .downloaded = i == 1 };
     var buf: [2048]u8 = undefined;
@@ -2116,7 +2116,7 @@ test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.6bpw recommen
     while (lines.next()) |line| {
         if (std.mem.indexOf(u8, line, "<- recommended") == null) continue;
         recommended += 1;
-        try testing.expect(std.mem.startsWith(u8, line, "qwen3.8-flash-next:2.6bpw"));
+        try testing.expect(std.mem.startsWith(u8, line, "qwen3.8-flash-next:2.75bpw"));
         try testing.expect(std.mem.indexOf(u8, line, "yes") != null);
         try testing.expect(std.mem.indexOf(u8, line, "fits") != null);
     }
