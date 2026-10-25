@@ -386,9 +386,10 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     Modifications: scoped to the common prelude, the qwen4_exp branch and
     discovery; qwen4_exp adds a geometry refusal, and the fixtures are the
     served packs' configs.
-  * The DeepSeek-V4.1-Flash arm (`src/dsv41_*.zig`, `src/fixtures/dsv41_chat_template.jinja`,
+  * The DeepSeek-V4.1-Flash arm (`src/dsv41_{borrow,config,engram,kernels,model,prefix,qat,scope,source,stream,vision}.zig`,
+    `src/fixtures/dsv41_chat_template.jinja`,
     `src/fixtures/dsv41_engram_token_map.bin`, the spaced DSML tags in `src/chat.zig`), from
-    mlx-serve's `src/deepseek_v41.zig`, `src/dsv41_engram.zig` and `src/chat.zig` at f1c3276f
+    mlx-serve's `deepseek_v41.zig`, `src/dsv41_engram.zig` and `src/chat.zig` at f1c3276f
     by David Dalcu. Modifications: the MLX-native path only (no embedded ds4 engine); the
     op scope, Engram lookup, attention and indexer formulation were rewritten against the
     release's `inference/model.py` and pinned to it by a tiny-model oracle, the expert
@@ -400,7 +401,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     to the original checkpoint layout. The release itself is MIT, Copyright (c) 2023
     DeepSeek.
   * The DSpark speculative decoder of that arm (`dspark`, `draft`, `verify` and `finishVerify`
-    in `src/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `src/deepseek_v41.zig`
+    in `src/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `deepseek_v41.zig`
     at 49bb6be0 (`dsparkDraft`, `dsparkBeginWith`, `dsparkFinish` and their rollback of a
     verify chunk) by David Dalcu. Modifications: the stages and heads load from the original
     `mtp.*` tensors with resident mxfp4 experts, the draft attention and the attention-output
