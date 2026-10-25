@@ -632,9 +632,9 @@ pub const Model = struct {
     /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
     /// reads its picks (`Experts.Spec`); off, it waits for them.
     route_spec: bool = true,
-    /// Layers ahead whose picks a layer's router input predicts for the expert prefetch (`Experts.Hook.prefetch`), at one
-    /// row and at several; 0 turns it off. Each row asks for its `prefetch_m` best uncached of its `prefetch_n` ranked.
-    prefetch_lead_one: u8 = 0,
+    /// Layers ahead whose picks a layer's router input predicts for the expert prefetch (`Experts.Hook.prefetch`), for a
+    /// forward of 2 or more rows (a one-row step pays more for the prediction than it saves); 0 turns it off. Each row
+    /// asks for its `prefetch_m` best uncached of its `prefetch_n` ranked.
     prefetch_lead_rows: u8 = 0,
     prefetch_n: u8 = 12,
     prefetch_m: u8 = 1,
@@ -2630,8 +2630,8 @@ fn prefetchTarget(m: *const Model, li: usize, rows: usize) ?usize {
         .resident => return null,
         .hook => |hk| hk,
     };
-    if (hk.prefetch == null or rows > NARROW_ROWS) return null;
-    const lead: usize = if (rows == 1) m.prefetch_lead_one else m.prefetch_lead_rows;
+    if (hk.prefetch == null or rows < 2 or rows > NARROW_ROWS) return null;
+    const lead: usize = m.prefetch_lead_rows;
     if (lead == 0 or li + lead >= m.cfg.layers) return null;
     return li + lead;
 }

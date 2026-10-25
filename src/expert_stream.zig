@@ -1772,6 +1772,7 @@ pub const Prefetcher = struct {
     quit: bool = false,
     /// Jobs queued or running; zero lets the host skip the lock.
     live: std.atomic.Value(u32) = .init(0),
+    jobs_queued: std.atomic.Value(u64) = .init(0),
     jobs_run: std.atomic.Value(u64) = .init(0),
     experts_read: std.atomic.Value(u64) = .init(0),
     host_wait_ns: std.atomic.Value(u64) = .init(0),
@@ -2315,6 +2316,7 @@ pub const Engine = struct {
         for (0..rows) |r| @memcpy(job.cand[r][0..n], cand[r * n ..][0..n]);
         pf.len += 1;
         _ = pf.live.fetchAdd(1, .release);
+        _ = pf.jobs_queued.fetchAdd(1, .monotonic);
         pf.cv.broadcast(io);
     }
 

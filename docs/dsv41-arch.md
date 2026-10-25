@@ -348,16 +348,17 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   ran 2x slower), trunk weight prefetch under the small stages gained nothing in a process bench, and the rows geometry
   policy is within 2-5% of the best of a sweep.
 
-- **Expert prefetch** (same setup, forced R4 and serial `--no-mtp`, reqC, 600 tokens; measured on perf/dspark-picker
-  `c42b60a5` + the prefetch): a missed expert rebuilds its layer (~1.9 ms), and 6-9 of 40 layers did per R4 round. A layer's
-  router input (V1) times the gate matrix of the layer `d` ahead ranks its experts; on the diag build the first uncached of
-  each row's top 8 at d=2 covered 40-49% of the experts that missed (reads 1.0-1.3 a layer at R4, 0.24-0.29 serial), but the
-  experts it reads also serve the next passes: with the reads completed ahead of the layer, layers with a miss fell 43-46%
-  at R4 (0.7 reads a layer) and 56-58% serial (0.2 reads). The router input of an earlier layer is as good as the layer's
-  stream (V2 +3 points) for one GEMV. Recency and frequency of the uncached experts cover 1-4%. Timed, 4 fill workers: forced
-  R4 round 59.0 -> 54 ms (46.4 -> 50.4 tok/s) at d=2..4, top 8; top 12 at d=3 53.2 ms (51.5 tok/s); serial 41.0 -> 42.4
-  tok/s at d=4, top 12 (rebuilt layers 2048 -> 1029 of 24.6k). The predictor costs ~0.6 ms a token serial and ~0.9 ms a round
-  at R4 (a 7.9 MB f32 gate read a layer); 2 workers instead of 4 gave 55.8 ms at R4, more than 4 nothing.
+- **Expert prefetch** (forwards of 2 to 16 rows, i.e. DSpark verify; a one-row step does nothing extra): a missed expert
+  rebuilds its layer (~1.9 ms), and 6-9 of 40 layers did per R4 round. A layer's router input (V1) times the gate matrix of
+  the layer `d` = 3 ahead ranks its experts, and the first uncached of each row's top 12 is read ahead of the layer. On the
+  diag build (perf/dspark-picker `c42b60a5`, forced R4, reqC, 600 tokens) the first uncached of each row's top 8 at d=2
+  covered 40-49% of the experts that missed at 1.0-1.3 reads a layer, but the experts it reads also serve the next passes:
+  layers with a miss fell 43-46% with the reads completed ahead (0.7 reads a layer). The layer's output stream as the
+  predictor is only 3 points better for ~8 more ops; recency and frequency of the uncached experts cover 1-4%. Timed on that
+  base, 4 fill workers: forced R4 round 59.0 -> 53.2 ms (46.4 -> 51.5 tok/s) at d=3, top 12 (d=2..4 and top 8 within 1 ms;
+  2 workers 55.8 ms, more than 4 nothing). The predictor costs ~0.9 ms a round at R4 (a 7.9 MB f32 gate read a layer). At one
+  row it measured 41.0 -> 42.4 tok/s on a cold cache but lost on a warmed one (46.6/49.8 -> 46.0/46.1 on main `d810c50c`), so
+  a one-row forward is left alone.
 
 Differences from mlx-serve: the attention-output fp8 round trip stays (upstream drops it), the verify block takes the same
 masked argmax as serial decode, and a verify is not split from the draft with a host sync per Markov step (the chain is

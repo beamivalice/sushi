@@ -1266,9 +1266,8 @@ test "dsv41 stq: queued routed chains leave a verify round's kept rows, the DSpa
     }
 }
 
-fn enablePrefetch(served: *StqServed, lead_one: u8, lead_rows: u8, n: u8, m: u8) !void {
+fn enablePrefetch(served: *StqServed, lead_rows: u8, n: u8, m: u8) !void {
     try served.engine.startPrefetch();
-    served.m.prefetch_lead_one = lead_one;
     served.m.prefetch_lead_rows = lead_rows;
     served.m.prefetch_n = n;
     served.m.prefetch_m = m;
@@ -1333,11 +1332,11 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
         var wide: StqServed = undefined;
         try wide.init(dir, .bfloat16, true, true, slots, s);
         defer wide.deinit();
-        try enablePrefetch(&wide, 2, 2, 8, 2);
+        try enablePrefetch(&wide, 2, 8, 2);
         var narrow: StqServed = undefined;
         try narrow.init(dir, .bfloat16, true, true, slots, s);
         defer narrow.deinit();
-        try enablePrefetch(&narrow, 3, 2, 3, 1);
+        try enablePrefetch(&narrow, 2, 3, 1);
         const pa = try model.extend(plain.m, ids[0..20], .last);
         _ = mlx.mlx_array_free(pa);
         for ([_]*StqServed{ &wide, &narrow }) |served| {
@@ -1366,6 +1365,35 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
         try testing.expect(wide.engine.prefetcher.?.experts_read.load(.monotonic) > 0);
         try testing.expect(narrow.engine.prefetcher.?.experts_read.load(.monotonic) > 0);
     }
+}
+
+test "dsv41 prefetch: one-row decode steps ask for nothing and keep the bytes (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var plain: StqServed = undefined;
+    try plain.init(dir, .bfloat16, true, false, 3, s);
+    defer plain.deinit();
+    var armed: StqServed = undefined;
+    try armed.init(dir, .bfloat16, true, false, 3, s);
+    defer armed.deinit();
+    try enablePrefetch(&armed, 2, 8, 2);
+    var at: usize = 0;
+    for ([_]usize{ 20, 1, 1, 1, 1, 1, 1 }) |n| {
+        const a = try model.extend(plain.m, ids[at..][0..n], .all);
+        defer _ = mlx.mlx_array_free(a);
+        const b = try model.extend(armed.m, ids[at..][0..n], .all);
+        defer _ = mlx.mlx_array_free(b);
+        try expectSameBits(&sc, a, b);
+        at += n;
+    }
+    try testing.expectEqual(@as(u64, 0), armed.engine.prefetcher.?.jobs_queued.load(.monotonic));
 }
 
 test "dsv41 drop: the STQ pack with experts dropped gives the logits of the full pools under the same router mask, bit for bit, and never reads or caches a dropped expert (DSV41_STQ_TINY)" {

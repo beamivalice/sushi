@@ -201,7 +201,7 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   `SUSHI_DSV41_READ_DIAG=1` counts the blocking host reads of a decode forward by site (`settle`, `settle_last`,
   `picks_sync`, `engram`, `state`, `head`) and logs their mean per forward at debug level every 64 forwards.
 - DeepSeek-V4.1 STQ also reads experts ahead (`Engine.prefetch`, `Prefetcher`): a layer's router input times the gate
-  matrix of the layer `d` ahead (d = 4 at one row, 3 at several; `Model.prefetch_lead_*`) ranks that layer's experts, the
+  matrix of the layer `d` ahead (d = 3, for forwards of 2 or more rows only: at one row the GEMV and the waits cost more than the misses they save; `Model.prefetch_lead_rows`) ranks that layer's experts, the
   host passes each row's first uncached one of its top 12 to a thread that reads them into the pool before the layer's
   chain is queued, so the miss becomes a hit. Rules: a job owns its layer's cache and slabs until `prefetchWait(layer)`
   returns (`specGrouped`, `prepareHost*`, `swapGroupedMisses`, `borrowLayer`, `restoreLayer` call it, `warmCache` and
