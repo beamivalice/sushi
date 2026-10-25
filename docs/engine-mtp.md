@@ -32,6 +32,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 - `--no-mtp` gates the IN-CHECKPOINT head too (`entry.mtp` reads `mtpChoiceFor`, logged `[mtp] on|off (<source>)`);
   an explicit `--mtp`/`--no-mtp` beats `model-settings.json` `mtp`. A streamed Sushi EXL3 Qwen pack keeps the head resident by
   default ([engine-expert-streaming](engine-expert-streaming.md)); other streamed models resolve it off.
+- An MTP-off Qwen load (resident or streamed) never reads the head's `language_model.mtp.*` tensors
+  (`loadWeightsFromOpenDirMode`'s `drop_mtp`), so a head stored as its own shard (`mtp-0.safetensors`, 1.18 GiB on Sushi-STQ-2.75bpw)
+  costs no transient and the bill (`indexedResidentSplit`, `mtp_on`) matches. Nothing turns the head on afterwards: a request's
+  `enable_mtp:true` is ignored without a loaded head, and the launch flag outranks `model-settings.json`. MiMo's heads
+  (`loadMimoHeads`) and DeepSeek's DSpark stages (`dsparkOn`) already load only when MTP is on.
 
 ## MiMo's three heads
 

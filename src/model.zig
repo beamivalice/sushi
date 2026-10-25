@@ -2943,14 +2943,10 @@ pub fn loadWeightsForConfig(
     }
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision, config.stream_mtp_head);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
-    var weights = if (load_vision)
-        try loadWeightsWithVision(io, allocator, model_dir)
-    else
-        try loadWeights(io, allocator, model_dir);
-    errdefer weights.deinit();
-    if (std.mem.eql(u8, config.model_type, "qwen4_exp") and config.mtp_override == false)
-        try weights.dropPrefix("language_model.mtp.");
-    return weights;
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    const mtp_off = std.mem.eql(u8, config.model_type, "qwen4_exp") and config.mtp_override == false;
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null, mtp_off);
 }
 
 /// deepseek_v41's resident trunk from the release's shards, and its vision tower when asked for; its routed experts stream.
@@ -2967,7 +2963,7 @@ pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir:
     if (layout == .mxfp4_individual) return loadWeightsMimoSource(io, allocator, model_dir, vision);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, vision, .{ .layout = layout, .keep_mtp = keep_mtp });
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, vision, .{ .layout = layout, .keep_mtp = keep_mtp }, false);
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3007,10 +3003,11 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
 /// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
 fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool) !Weights {
-    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null);
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null, false);
 }
 
-fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?StreamingLoad) !Weights {
+/// `drop_mtp` skips the MTP head's tensors before they are read; a streamed load drops them unless `keep_mtp`.
+fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?StreamingLoad, drop_mtp: bool) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
@@ -3059,7 +3056,7 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 
         log.info("Loading {s}...\n", .{entry.name});
         const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .present = &present, .file = entry.name } else null;
-        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, shard);
+        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, drop_mtp, shard);
         file_count += 1;
     }
 
@@ -3134,7 +3131,7 @@ pub fn loadSafetensorsFile(
 ) !void {
     var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
-    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, null);
+    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, false, null);
 }
 
 fn qwen4NormFold(key: []const u8) bool {
@@ -3345,12 +3342,14 @@ fn loadSafetensorsFileMode(
     s: mlx.mlx_stream,
     load_vision: bool,
     streaming: ?StreamingLoad,
+    drop_mtp: bool,
     shard: ?ShardOwners,
 ) !void {
     // Only the dense HF layout needs the converter's work at load time: the
     // fused bank split, the delta norms and the conv transpose. An MLX pack
     // ships every resident tensor in its serving layout already.
     const fused_streaming = streaming != null and streaming.?.layout == .bf16_fused;
+    const drops_mtp = drop_mtp or (streaming != null and !streaming.?.keep_mtp);
     // Read here rather than through MLX's loader, whose descriptor cannot take F_NOCACHE:
     // filtered tensors are never read, kept ones bypass the file cache (`readTensorArray`).
     const fd = try expert_io.openHinted(std.mem.span(path), .{ .readahead_off = false });
@@ -3370,7 +3369,7 @@ fn loadSafetensorsFileMode(
         else
             key_str_raw;
 
-        if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and !streaming.?.keep_mtp and streamingDropsWeightKey(key_str))) continue;
+        if (!shouldKeepWeightKey(key_str, load_vision) or (drops_mtp and streamingDropsWeightKey(key_str))) continue;
         const value = try readSafetensor(reader, fd, &header, entry.value_ptr.*);
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's
@@ -4743,6 +4742,35 @@ test "the streamed load drops the MTP head the ledger bills at zero" {
     var it = weights.map.iterator();
     while (it.next()) |entry| {
         try t.expect(!std.mem.startsWith(u8, entry.key_ptr.*, "language_model.mtp."));
+    }
+}
+
+test "a resident load with MTP off never reads the head's bytes; with MTP on it keeps them" {
+    const t = std.testing;
+    const io = t.io;
+    const allocator = t.allocator;
+    const header = "{\"language_model.model.layers.0.mlp.gate.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]},\"language_model.mtp.fc_hidden.weight\":{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[2,4]}}";
+    const padded_header_len = std.mem.alignForward(usize, header.len, 8);
+    const tensor_data = [_]u16{ 0x3f80, 0x4000 };
+    // The MTP-off file ends inside the head's range, so reading the head fails.
+    for ([_]struct { mtp: bool, payload: usize }{ .{ .mtp = false, .payload = 2 }, .{ .mtp = true, .payload = 4 } }) |c| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try tmp.dir.realPath(io, &path_buf);
+        const file_bytes = try allocator.alloc(u8, 8 + padded_header_len + c.payload);
+        defer allocator.free(file_bytes);
+        std.mem.writeInt(u64, file_bytes[0..8], padded_header_len, .little);
+        @memset(file_bytes[8 .. 8 + padded_header_len], ' ');
+        @memcpy(file_bytes[8 .. 8 + header.len], header);
+        @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data)[0..c.payload]);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
+
+        var config = ModelConfig{ .model_type = "qwen4_exp", .mtp_override = c.mtp };
+        var weights = try loadWeightsForConfig(io, allocator, path_buf[0..path_len], &config, false);
+        defer weights.deinit();
+        try t.expect(weights.get("language_model.model.layers.0.mlp.gate.weight") != null);
+        try t.expectEqual(c.mtp, weights.get("language_model.mtp.fc_hidden.weight") != null);
     }
 }
 

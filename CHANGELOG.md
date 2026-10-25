@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`--no-mtp` no longer reads the MTP head**: a Qwen3.8-Flash-Next load with MTP off skips the head's tensors while reading the pack, so the 1.2 GB head no longer passes through memory at load, which matters on a 64 GB Mac.
 - **`sushi convert exl3 --codebook` is now `--expert-codebook`** (breaking): `--codebook mcg` is now `--expert-codebook exl3-mcg` and `--codebook mul1` is `--expert-codebook exl3-mul1`; the old flag and the bare names are refused, and packs and resumable runs are unchanged.
 - **Qwen3.8-Flash-Next Sushi-STQ-2.75bpw**: a new pack that replaces Sushi-2.6bpw and Sushi-3bpw as the 64 GB recommendation (`sushi pull qwen3.8-flash-next` now fetches it, 75.9 GB download); it scores KLD 0.0692 (top-1 agreement 92.76%) on 16x512 prompts at bf16 KV and runs on sushi 1.3.0 and later.
 - **Qwen now thinks at medium effort by default**: Qwen3.8-Flash-Next answers a request that names no thinking field with thinking on at `medium` (capped at 8192 thinking tokens), where it used to answer without thinking. `enable_thinking: false`, `reasoning_effort: none`, `--think` and `--reasoning-budget` still win.
