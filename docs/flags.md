@@ -150,7 +150,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `convert exl3`: `--model` | required → source checkpoint directory (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--out` | required → new pack directory, refused when non-empty unless `--resume` (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--experts-k` | `2.5` → routed-expert rate, 1.5 to 8 in steps of 0.125 (encoder/cli.zig) | user | help, encoder | keep |
-| `convert exl3`: `--codebook` | `mcg` → `mcg` or `mul1` (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--expert-codebook` | `exl3-mcg` → `exl3-mcg` or `exl3-mul1` (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--window` | `15` → trellis search window, 12 to 16 (encoder/cli.zig) | dev | help, encoder | keep: the window is part of the pack's stamp |
 | `convert exl3`: `--calib` | built-in 64k mix → calibration text file (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--calib-tokens` | `65536` → calibration tokens, at least 2048 (encoder/cli.zig) | user | help, encoder | keep |

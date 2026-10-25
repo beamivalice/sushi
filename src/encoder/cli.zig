@@ -27,7 +27,7 @@ pub const Options = struct {
     model: []const u8 = "",
     out: []const u8 = "",
     experts_n: u32 = 40,
-    codebook: format.Codebook = .mcg,
+    expert_codebook: format.Codebook = .mcg,
     window: format.Window = .w15,
     calib: []const u8 = "",
     calib_tokens: u32 = 65536,
@@ -40,13 +40,13 @@ pub const Options = struct {
 
 pub const Diag = struct { flag: []const u8 = "" };
 
-const Flag = enum { model, out, experts_k, codebook, window, calib, calib_tokens, trunk_bits, trunk_group, batch, factor_precision };
+const Flag = enum { model, out, experts_k, expert_codebook, window, calib, calib_tokens, trunk_bits, trunk_group, batch, factor_precision };
 
 pub const value_flags = [_]struct { []const u8, Flag }{
     .{ "--model", .model },
     .{ "--out", .out },
     .{ "--experts-k", .experts_k },
-    .{ "--codebook", .codebook },
+    .{ "--expert-codebook", .expert_codebook },
     .{ "--window", .window },
     .{ "--calib", .calib },
     .{ "--calib-tokens", .calib_tokens },
@@ -75,7 +75,9 @@ pub const USAGE =
     \\                        files, except with --resume
     \\  --experts-k <K>       routed-expert rate in bits per weight, 1.5 to 8 in
     \\                        steps of 0.125 (default 2.5)
-    \\  --codebook <name>     mcg or mul1 (default mcg)
+    \\  --expert-codebook <name>
+    \\                        the routed experts' codebook: exl3-mcg (default) or
+    \\                        exl3-mul1
     \\  --window <n>          trellis search window, 12 to 16 (default 15)
     \\  --calib <file>        calibration text (default: a built-in 64k-token mix
     \\                        of prose and code)
@@ -93,6 +95,13 @@ pub const USAGE =
     \\  -h, --help            print this text
     \\
 ;
+
+/// The CLI spelling of a codebook is `exl3-<name>`; the pack stamps keep the bare name.
+fn parseCodec(text: []const u8) ?format.Codebook {
+    if (!std.mem.startsWith(u8, text, "exl3-")) return null;
+    const cb = format.Codebook.fromName(text["exl3-".len..]) orelse return null;
+    return if (encode.searchable(cb)) cb else null;
+}
 
 fn parseExpertsN(text: []const u8) ?u32 {
     const k = std.fmt.parseFloat(f64, text) catch return null;
@@ -167,9 +176,8 @@ pub fn parseArgs(args: []const []const u8, diag: ?*Diag) ArgError!Options {
                 o.experts_n = parseExpertsN(v) orelse break :blk true;
                 break :blk false;
             },
-            .codebook => blk: {
-                o.codebook = format.Codebook.fromName(v) orelse break :blk true;
-                if (!encode.searchable(o.codebook)) break :blk true;
+            .expert_codebook => blk: {
+                o.expert_codebook = parseCodec(v) orelse break :blk true;
                 break :blk false;
             },
             .window => blk: {
@@ -288,7 +296,7 @@ pub fn cmdConvert(allocator: std.mem.Allocator, io: std.Io, args: []const []cons
         .model_dir = model_abs,
         .out_dir = opts.out,
         .rate = .{ .n = opts.experts_n },
-        .dec = .{ .codebook = opts.codebook, .window = opts.window },
+        .dec = .{ .codebook = opts.expert_codebook, .window = opts.window },
         .trunk_bits = opts.trunk_bits,
         .trunk_group = opts.trunk_group,
         .batch = opts.batch,
@@ -312,7 +320,7 @@ test "convert cli: defaults and every flag parse" {
     const t = std.testing;
     const o = try expectParse(&.{ "exl3", "--model", "m", "--out", "o" });
     try t.expectEqual(@as(u32, 40), o.experts_n);
-    try t.expectEqual(format.Codebook.mcg, o.codebook);
+    try t.expectEqual(format.Codebook.mcg, o.expert_codebook);
     try t.expectEqual(format.Window.w15, o.window);
     try t.expectEqual(@as(u32, 65536), o.calib_tokens);
     try t.expect(!o.resuming);
@@ -320,9 +328,9 @@ test "convert cli: defaults and every flag parse" {
     try t.expectEqual(@as(u32, 16), o.batch);
     try t.expectEqual(gpu_factor.Precision.f64, o.factor_precision);
 
-    const all = try expectParse(&.{ "exl3", "--model", "m", "--out", "o", "--experts-k", "1.5", "--codebook", "mul1", "--window", "12", "--calib", "c.txt", "--calib-tokens", "4096", "--trunk-bits", "6", "--trunk-group", "128", "--batch", "4", "--factor-precision", "32", "--resume" });
+    const all = try expectParse(&.{ "exl3", "--model", "m", "--out", "o", "--experts-k", "1.5", "--expert-codebook", "exl3-mul1", "--window", "12", "--calib", "c.txt", "--calib-tokens", "4096", "--trunk-bits", "6", "--trunk-group", "128", "--batch", "4", "--factor-precision", "32", "--resume" });
     try t.expectEqual(@as(u32, 24), all.experts_n);
-    try t.expectEqual(format.Codebook.mul1, all.codebook);
+    try t.expectEqual(format.Codebook.mul1, all.expert_codebook);
     try t.expectEqual(format.Window.w12, all.window);
     try t.expectEqualStrings("c.txt", all.calib);
     try t.expectEqual(@as(u32, 4096), all.calib_tokens);
@@ -342,7 +350,7 @@ test "convert cli: a bad value, an unknown flag or a missing piece is refused be
     const base = [_][]const u8{ "exl3", "--model", "m", "--out", "o" };
     const bad_values = [_][2][]const u8{
         .{ "--experts-k", "1.25" },       .{ "--experts-k", "8.125" },   .{ "--experts-k", "2.51" },      .{ "--experts-k", "x" },
-        .{ "--experts-k", "nan" },        .{ "--codebook", "tiny" },     .{ "--codebook", "x" },          .{ "--window", "11" },
+        .{ "--experts-k", "nan" },        .{ "--expert-codebook", "tiny" }, .{ "--expert-codebook", "x" }, .{ "--window", "11" },
         .{ "--window", "17" },            .{ "--window", "x" },          .{ "--calib-tokens", "2047" },   .{ "--calib-tokens", "-1" },
         .{ "--trunk-bits", "7" },         .{ "--trunk-bits", "1" },      .{ "--trunk-group", "48" },      .{ "--batch", "0" },
         .{ "--batch", "65" },             .{ "--batch", "x" },           .{ "--factor-precision", "16" }, .{ "--factor-precision", "x" },
@@ -362,6 +370,21 @@ test "convert cli: a bad value, an unknown flag or a missing piece is refused be
     try t.expectError(error.MissingOut, parseArgs(&.{ "exl3", "--model", "m" }, null));
     try t.expectError(error.UnknownSubcommand, parseArgs(&.{"gguf"}, null));
     try t.expectError(error.MissingSubcommand, parseArgs(&.{}, null));
+}
+
+test "convert cli: codec values carry exl3-, and the old flag name is gone" {
+    const t = std.testing;
+    const base = [_][]const u8{ "exl3", "--model", "m", "--out", "o" };
+    try t.expectEqual(format.Codebook.mcg, (try expectParse(&(base ++ [_][]const u8{ "--expert-codebook", "exl3-mcg" }))).expert_codebook);
+    try t.expectEqual(format.Codebook.mul1, (try expectParse(&(base ++ [_][]const u8{ "--expert-codebook", "exl3-mul1" }))).expert_codebook);
+    for ([_][]const u8{ "mcg", "mul1", "stq-mcg", "stq-mul1", "exl3-std1", "exl3-spec1", "exl3-pair1", "exl3-alpha", "exl3-" }) |bad| {
+        var diag = Diag{};
+        try t.expectError(error.BadFlagValue, parseArgs(&(base ++ [_][]const u8{ "--expert-codebook", bad }), &diag));
+        try t.expectEqualStrings("--expert-codebook", diag.flag);
+    }
+    var diag = Diag{};
+    try t.expectError(error.UnknownFlag, parseArgs(&(base ++ [_][]const u8{ "--codebook", "mcg" }), &diag));
+    try t.expectEqualStrings("--codebook", diag.flag);
 }
 
 test "convert cli: --help works after convert and after exl3, and lists every flag" {

@@ -19,7 +19,7 @@ sushi convert exl3 --model <source dir> --out <pack dir> [options]
 | `--model <dir>` | required | Qwen3.8-Flash-Next BF16 source checkpoint; any other architecture is refused by name |
 | `--out <dir>` | required | pack directory; refused when it already holds files, except with `--resume` |
 | `--experts-k <K>` | 2.5 | routed-expert rate in bits per weight, 1.5 to 8 in steps of 0.125 |
-| `--codebook mcg\|mul1` | mcg | |
+| `--expert-codebook exl3-mcg\|exl3-mul1` | exl3-mcg | the routed experts' codebook; the pack stamp keeps the bare `mcg` / `mul1` |
 | `--window <12..16>` | 15 | trellis search window |
 | `--calib <file>` | built-in mix | calibration text |
 | `--calib-tokens <n>` | 65536 | calibration tokens, at least 2048 |
