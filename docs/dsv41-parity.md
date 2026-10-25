@@ -20,7 +20,8 @@ item).
 | Batched decode, several slots | gap | `ownsModuleDecodeState`: one request at a time; `/props` `batching.reason = exclusive` |
 | Hot / SSD prefix cache | works | restore points of the whole state, RAM and SSD tiers, bit-identical to cold ([dsv41-arch](dsv41-arch.md#prefix-cache)) |
 | Per-request prefill chunk ladder | works | `perRequestPrefillChunk` is true for the arch; each request takes the widest rung its bill admits ([dsv41-arch](dsv41-arch.md#ced)) |
-| `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-min/max-depth` | N/A, refused | no KV cache, GDN or draft depth; a launch flag refuses the load before the weights (`archFlagRefusal`, `LaunchFlagUnsupported`), a model-settings `kv_quant` is ignored with one log line (`settingsKvQuantIgnoredLine`) |
+| `--mtp-min-depth` / `--mtp-max-depth` | works | bound the DSpark verify width to depth + 1 rows; the boot log prints `[spec] DSpark verifies a..b rows a round` when either is given |
+| `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant` | N/A, refused | no KV cache or GDN; a launch flag refuses the load before the weights (`archFlagRefusal`, `LaunchFlagUnsupported`), a model-settings `kv_quant` is ignored with one log line (`settingsKvQuantIgnoredLine`) |
 | Image input | works | the release's processor and tower, on by default (`--no-vision` skips them) ([dsv41-arch](dsv41-arch.md#image-input)) |
 | Video / audio input | N/A | refused by name (`mediaRejectReason`) |
 | Image token spelled in text-only input | works | `deepseek_v41: the image token spelled in a text-only prompt is text`: no media, no placeholder check |
@@ -72,8 +73,7 @@ number), under the GPU lock.
 4. Thinking bound: Anthropic `/v1/messages` with `thinking: {type: enabled, budget_tokens: 256}`. Expect
    `[think-bound] reasoning budget 256 reached ...; thought closed` and `[spec-stats] mode=dspark` for the rounds before it.
 5. Penalties: `repeat_penalty 1.2` request; expect `mode=dspark` in its stats line and no repeated-token run.
-6. Boot log: `[kv-cache] off (default)`, no `[mtp] depth range` line; `--kv-quant 4` (and `--qwen-gdn 16`, `--mtp-head-kv-quant`,
-   `--mtp-min-depth 2`) each exit at start with the named error before any weights load; a settings `kv_quant` boots with
+6. Boot log: `[kv-cache] off (default)`, no `[mtp] depth range` line; `--kv-quant 4` (and `--qwen-gdn 16`, `--mtp-head-kv-quant`) each exit at start with the named error before any weights load; a settings `kv_quant` boots with
    one ignored line. A request with no thinking field returns `reasoning_content`.
 7. Forced tool call: `tool_choice` naming a declared function; expect the `[tool-choice] forced call` line and a parsed call.
 8. `tests/test_dsv41_media.sh`: image input live.

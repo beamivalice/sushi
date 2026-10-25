@@ -62,8 +62,8 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
 | `--mtp` / `--no-mtp` | on for Qwen and MiMo, off for GLM → force the head on (required for a streamed pack) or off; also `mtp` in settings (main.zig:754) | user | help, usage, engine-mtp; 22 tests | keep |
-| `--mtp-min-depth` | `1` → fewest tokens a round drafts, 1..8; DeepSeek-V4.1 refuses it at load, its DSpark block is fixed (main.zig:771) | machine | help, engine-mtp; 5 tests | keep: depth range is a property of the chip; launch-only by design |
-| `--mtp-max-depth` | adaptive, up to 8 on eligible M5 → most tokens a round drafts, 1..8; DeepSeek-V4.1 refuses it at load (main.zig:771) | machine | help, engine-mtp; 5 tests | keep |
+| `--mtp-min-depth` | `1` → fewest tokens a round drafts, 1..8; DeepSeek-V4.1: DSpark verifies at least min + 1 rows (above 1 it takes no plain step or back-off; past the 5-draft block it clamps) | machine | help, engine-mtp; 5 tests | keep: depth range is a property of the chip; launch-only by design |
+| `--mtp-max-depth` | adaptive, up to 8 on eligible M5 → most tokens a round drafts, 1..8; DeepSeek-V4.1: caps DSpark at max + 1 verified rows (the block is 5 drafts, a larger value clamps with one log line) | machine | help, engine-mtp; 5 tests | keep |
 | `--mtp-typical` | off, exact → typical acceptance, d > 0, lossy for sampled requests; also `mtp_acceptance` in settings (main.zig:780) | user | help, engine-mtp; 1 test | keep: measured 15-20% on sampled decode; docs warn it has looped |
 | `--mtp-tokenv3` | off → TokenV3 cascade acceptance, 0..1, lossy (main.zig:783) | user | help; 2 tests | owner call |
 | `--mtp-greedy-tail` | off → sampled requests draft only the first token by sampling; also in settings (main.zig:786) | user | help, engine-mtp, mimo2-perf; 1 test | keep: measured to pay only beside `--mtp-typical` |

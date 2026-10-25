@@ -3493,6 +3493,7 @@ pub const Generator = struct {
                 .prompt_ids_alloc = allocator,
                 .dspark = options.dspark_enabled and dsparkEligible(sampling, options.logprobs_n),
                 .dspark_diag = dsparkDiag(),
+                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, if (xfm.dsv41) |m| m.cfg.dspark.block else 5),
             };
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
@@ -20295,6 +20296,29 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
         try testing.expectEqual(serial.items[0], got.items[0]);
         try testing.expect(w.dspark_stats.drafted <= w.dspark_stats.rounds * (width - 1));
         if (width == 1) try testing.expectEqualSlices(u32, serial.items, got.items);
+    }
+
+    // `--mtp-min-depth` / `--mtp-max-depth` set the width a DSpark request may verify: depth + 1 rows.
+    {
+        const saved = depth_bounds.active;
+        defer depth_bounds.active = saved;
+        depth_bounds.active = .{ .min = 2, .max = 2 };
+        try xfm.resetCache();
+        var pin = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer pin.deinit(a);
+        try testing.expectEqual(@as(u32, 3), pin.dspark_policy.range.min_rows);
+        try testing.expectEqual(@as(u32, 3), pin.dspark_policy.range.max_rows);
+        while (try pin.nextDspark(a)) |r| a.free(r.tokens);
+        try testing.expect(pin.dspark_stats.rounds > 0);
+        // Only the closing round, cut to the tokens the budget still allows, may verify fewer rows.
+        try testing.expect(pin.dspark_stats.plain <= 1);
+        for (pin.dspark_stats.rows_hist, 0..) |n, rows| if (rows > 3) try testing.expectEqual(@as(u32, 0), n);
+        depth_bounds.active = .{ .max = 1 };
+        try xfm.resetCache();
+        var cap = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer cap.deinit(a);
+        while (try cap.nextDspark(a)) |r| a.free(r.tokens);
+        try testing.expect(cap.dspark_stats.drafted <= cap.dspark_stats.rounds);
     }
 
     // A repeat penalty shifts the verify rows by the ids before them, as a serial tick does: no id repeats.

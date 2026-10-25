@@ -12,7 +12,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 - It serves `deepseek_v41` from the ORIGINAL checkpoint (`config.json`, `model-*.safetensors`, the index). Text in,
   text out, one request at a time (the model holds the request's state: `ownsModuleDecodeState`).
 - Off, by name: `--kv-quant` (the state is the activation dtype;
-  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant` or depth flag refuses the load, a settings `kv_quant` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
+  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16` or `--mtp-head-kv-quant` refuses the load, a settings `kv_quant` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
 - Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
   model-settings) is required, as on every streamed load; without one the load fails with `ExpertStreamingRequired`.
@@ -287,7 +287,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   (`dsparkHeldBytes` test), so the earlier "3.7 GB" figure of the audit was low by the experts' scales and half the experts.
 - **Wiring.** The checkpoint's DSpark is the model's MTP head: `MtpHeadRef.dsv41`, kept under streaming
   (`expert_stream.streamedMtpHeadSupported`) when the pack ships the stages (`dsv41_source.shipsDspark`), so the engine-default MTP
-  is on and `--no-mtp` / `mtp: false` drop it. No flag was added; the depth flags do not apply (the block is fixed at 5, the verify width is chosen per round).
+  is on and `--no-mtp` / `mtp: false` drop it. `--mtp-min-depth` / `--mtp-max-depth` bound the verify width (below); the block is fixed at 5 drafts.
   The boot line reads `[spec] DeepSeek-V4.1-Flash decodes with DSpark (...)` or `... plain ticks (...)`, and a request that
   drafted logs `[spec-stats] mode=dspark` with acceptance, draft and verify ms.
 
@@ -297,14 +297,22 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   (`dflash_policy.chooseRows`). `p_j` is the confidence head's logit through a sigmoid and the per-bin calibration of
   `dflash_policy.Calibration`, seeded with the identity (the head is a calibrated probability: bins of it measured 0.26 for
   0.1-0.2, 0.61 for 0.5-0.6, 1.00 for the 287 positions above 0.9, and the conditional rate is flat across positions, so one
-  calibration serves all five). The cost is `plain + step * (R-1)` (+ the draft from R=2): both from the request's own rounds, each
-  moving a bounded share per sample (a cold expert cache cost 100-250 ms for a one-row step and 2 s for a first wide verify, and the
-  unbounded fit it replaced never chose a wide verify again), the step drifting back to 13 ms while unmeasured. A block the choice
-  dismisses (R=1) owes the next drafts plain steps, 1, 2, 4 .. 16, cleared by a block that pays. The stop switch is GLM's
+  calibration serves all five). The cost is `plain + step * (R-1) + draft` for every R, the one-row round included: `rows` runs on
+  a block already drafted, so the draft is spent whatever R is and a dismissed block is not a free plain step (a break-even second
+  row then needs `p > (draft + step) / plain` only against drafting at all, which the back-off below judges). Plain and step come from
+  the request's own rounds, each moving a bounded share per sample (a cold expert cache cost 100-250 ms for a one-row step and 2 s
+  for a first wide verify, and the unbounded fit it replaced never chose a wide verify again), the step drifting back to its prior
+  (9 ms a row, plain 28 ms) while unmeasured. Drafts that lose back the next ones off: `Policy.edge`, a decayed mean of
+  `(1 + accepted) * plain - (draft + verify)` ms per drafted round, turns negative and the next drafts owe plain steps 1, 2, 4 .. 16,
+  cleared by a round that pays. One dismissed block does not back off: blocks are bimodal (on the sweep prompt 26% accept
+  nothing and 24% all five), the next block pays whatever happened between, and the earlier per-block rule (R=1 owes the next
+  `period` plain steps) turned 25% dismissals into 55% one-row rounds once the verify got cheap (replay of the sweep's 68 blocks
+  through the policy: 44.8 tok/s with it, 50.4 without; the gate ended 12-18 ticks of 3000 either way). Live (the shipped STQ pack, budget 110, `--ctx-size 65536`, one A then one B, die under 50 °C, commit c42b60a5): the 5.4k harbour prompt 45.1 -> 47.9 tok/s, a novel story 44.0 -> 47.6 (the old rule made 590 of 595 rounds plain there, the new one drafts a third). Greedy text depends on which rounds were plain: verify rows agree bit for bit at every width from 2 up, and a 1-row round is the serial step bit for bit, but the 1-row kernels (the trunk's SIMD rows arm, the one-row expert arms) sum in another order than the multi-row NAX arms. The stop switch is GLM's
   (`spec_cost_gate.zig`: 8-round windows against a probed plain step, 5% margin); the plain step is the 1-row round, so the state
   is the engine's and no other drafter runs. Sampled requests use the same choice and the acceptance rule above (a 1-row round draws
-  its token from the filtered row). `SUSHI_DSV41_DSPARK_ROWS` forces or sweeps R. The adaptive R follows measured ms, so a seeded sampled request repeats only at a forced R: under GPU load the
-  round widths differ and the draws with them (the Generator test pins R=3 for its repeat check).
+  its token from the filtered row). `--mtp-max-depth n` caps R at n+1 and `--mtp-min-depth n` floors it at n+1 with no plain step or back-off below it (equal values pin R; a depth past the 5-draft block clamps to it, logged once at load; `--mtp-min-depth 1` is the default). `model-settings.json` has no depth keys. `SUSHI_DSV41_DSPARK_ROWS` forces or sweeps R. The adaptive R follows measured ms, so a seeded sampled
+  request repeats only at a forced R: under GPU load the round widths differ and the draws with them (the Generator test pins R=3
+  for its repeat check).
 - **Verify cost** (an STQ pack, M5 Max, `taskpolicy -a`, budget 88, one boot, attention arms interleaved, trimmed means, ms per
   verify): `v(R) = v(1) + step * (R-1)`, v(1) 37 / 42 / 53 and step 12.5 / 13 / 13.5 at 1k / 4k / 16k of context; the 6-row verify
   of today's fixed block is 106 / 106 / 110 ms against a 37-53 ms serial step. The routed experts are most of the step: a pick is its

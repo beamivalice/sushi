@@ -216,7 +216,10 @@ fn printUsage(io: std.Io) void {
         \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
         \\                        (default 1). Every depth the planner picks
         \\                        stays inside --mtp-min-depth..--mtp-max-depth;
-        \\                        equal values pin one depth.
+        \\                        equal values pin one depth. DeepSeek-V4.1:
+        \\                        DSpark verifies depth + 1 rows (its block
+        \\                        is 5 drafts); a min above 1 never takes a
+        \\                        plain step.
         \\  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,

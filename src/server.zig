@@ -6624,7 +6624,7 @@ pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const 
 }
 
 /// The launch flags a load can be refused for, as the process was started.
-pub const LaunchFlagUse = struct { kv_quant: bool = false, qwen_gdn_16: bool = false, mtp_head_kv_quant: bool = false, mtp_depth: bool = false, drop_expert: bool = false };
+pub const LaunchFlagUse = struct { kv_quant: bool = false, qwen_gdn_16: bool = false, mtp_head_kv_quant: bool = false, drop_expert: bool = false };
 
 /// A launch flag with nothing to act on in this arch, named with the reason; null when every flag given applies.
 /// An explicit flag is refused rather than ignored, before the weights load.
@@ -6634,7 +6634,6 @@ pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse)
     if (use.kv_quant) return "--kv-quant has no effect on deepseek_v41: its compressed state is stored as the QAT round trips left it, so there is no KV cache to quantize; drop the flag";
     if (use.qwen_gdn_16) return "--qwen-gdn has no effect on deepseek_v41: it has no GatedDeltaNet layers; drop the flag";
     if (use.mtp_head_kv_quant) return "--mtp-head-kv-quant has no effect on deepseek_v41: its DSpark stages keep their own windows; drop the flag";
-    if (use.mtp_depth) return "--mtp-min-depth/--mtp-max-depth have no effect on deepseek_v41: the DSpark block is fixed by the checkpoint; drop the flags";
     return null;
 }
 
@@ -25116,13 +25115,12 @@ test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a mode
     var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
     const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
     try t.expect(archFlagRefusal(&dsv41, .{}) == null);
-    const all = LaunchFlagUse{ .kv_quant = true, .qwen_gdn_16 = true, .mtp_head_kv_quant = true, .mtp_depth = true };
+    const all = LaunchFlagUse{ .kv_quant = true, .qwen_gdn_16 = true, .mtp_head_kv_quant = true };
     try t.expect(archFlagRefusal(&qwen4, all) == null);
     for ([_]struct { use: LaunchFlagUse, flag: []const u8 }{
         .{ .use = .{ .kv_quant = true }, .flag = "--kv-quant" },
         .{ .use = .{ .qwen_gdn_16 = true }, .flag = "--qwen-gdn" },
         .{ .use = .{ .mtp_head_kv_quant = true }, .flag = "--mtp-head-kv-quant" },
-        .{ .use = .{ .mtp_depth = true }, .flag = "--mtp-min-depth/--mtp-max-depth" },
     }) |c| {
         const why = archFlagRefusal(&dsv41, c.use) orelse return error.TestExpectedRefusal;
         try t.expect(std.mem.startsWith(u8, why, c.flag));

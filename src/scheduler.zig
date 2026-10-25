@@ -42,6 +42,7 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
+const dspark_rows = @import("dspark_rows.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
@@ -4197,7 +4198,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .kv_quant = params.kv_quant_explicit,
         .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
-        .mtp_depth = depth_bounds.active.explicit(),
         .drop_expert = params.config.drop_expert != 0,
     })) |why| {
         log.err("{s}\n", .{why});
@@ -4448,6 +4448,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("[dsv41] {d} bytes/token of compressed state\n", .{params.config.kvBytesPerToken()});
         if (params.config.dsparkOn()) {
             log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s})\n", .{ c.n_mtp, c.dspark.block, mtp.sourceName() });
+            if (depth_bounds.active.explicit()) {
+                const range = dspark_rows.Range.of(depth_bounds.active, c.dspark.block);
+                log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth{s})\n", .{ range.min_rows, range.max_rows, if (range.clamped) "; a depth past the block clamps to it" else "" });
+            }
         } else {
             const why: []const u8 = if (c.dspark.block == 0 or !@import("dsv41_source.zig").shipsDspark(sch.io, sch.allocator, params.model_dir)) "no DSpark stages in this checkpoint" else "--no-mtp or model-settings mtp:false";
             log.info("[spec] DeepSeek-V4.1-Flash decodes with plain ticks ({s})\n", .{why});
