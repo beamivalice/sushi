@@ -27789,6 +27789,10 @@ fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const 
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg };
         mdl.experts = .{ .hook = experts.hook() };
         shell.dsv41_stq_experts = experts;
+        if (engine.startPrefetch()) {
+            mdl.prefetch_lead_one = 4;
+            mdl.prefetch_lead_rows = 3;
+        } else |e| log.warn("[dsv41] expert prefetch off: {s}\n", .{@errorName(e)});
     } else {
         const experts = try allocator.create(dsv41_stream.Stream);
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };

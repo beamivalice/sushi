@@ -26,6 +26,7 @@ const dim = sc_mod.dim;
 const ci = sc_mod.ci;
 const evalAll = sc_mod.evalAll;
 const Config = cfg_mod.Config;
+const prefetch_cand_max = @import("expert_stream.zig").Prefetcher.cand_max;
 
 /// Rows one attention span handles: the compressed rows each query gathers are its largest
 /// transient (`[span, index_topk, head_dim]` in f32).
@@ -173,6 +174,9 @@ pub const Experts = union(enum) {
         release: *const fn (ctx: *anyopaque) void,
         /// Profiling: the stream's cumulative host time (SSD reads and cache copies), in ns.
         host_ns: ?*const fn (ctx: *anyopaque) u64 = null,
+        /// Experts layer `layer` is expected to pick, read into its pool before its chain is queued: for each of `rows` rows,
+        /// `n` ranked candidates, of which the first `m` the pool lacks are read.
+        prefetch: ?*const fn (ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
         spec: ?Spec = null,
     };
@@ -628,6 +632,12 @@ pub const Model = struct {
     /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
     /// reads its picks (`Experts.Spec`); off, it waits for them.
     route_spec: bool = true,
+    /// Layers ahead whose picks a layer's router input predicts for the expert prefetch (`Experts.Hook.prefetch`), at one
+    /// row and at several; 0 turns it off. Each row asks for its `prefetch_m` best uncached of its `prefetch_n` ranked.
+    prefetch_lead_one: u8 = 0,
+    prefetch_lead_rows: u8 = 0,
+    prefetch_n: u8 = 12,
+    prefetch_m: u8 = 1,
     /// Layers a pass may rebuild, plus a third of the layers built so far, before it stops queueing: a cold pool misses
     /// on most layers, and each miss costs the successor's work twice.
     route_spec_rebuilds: u32 = 3,
@@ -1987,9 +1997,17 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
         };
         if (sh.spec_on) {
             const sy = try sharedExpert(sc, m, ly, h);
+            const target = prefetchTarget(m, li, dim(h, 0));
+            // Submitted ahead of the chain, so the host's read of it waits for nothing but the router.
+            const pred = if (target) |j| try predictLogits(sc, m, h, j) else none;
+            if (pred.ctx != null) try submit(pred);
             const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, sy);
             const out = try sc.astype(q.out, m.act);
             sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts), .sy = sc.out(sy) };
+            if (pred.ctx != null) {
+                sh.spec.?.pred = sc.out(pred);
+                sh.spec.?.pred_layer = target.?;
+            }
             try submit(out);
             return out;
         }
@@ -2516,9 +2534,12 @@ const Unresolved = struct {
     post: A = none,
     comb: A = none,
     pre: A = none,
+    /// The router logits of layer `pred_layer` over this layer's router input, for the expert prefetch.
+    pred: A = none,
+    pred_layer: usize = 0,
 
     fn deinit(self: *Unresolved) void {
-        for ([_]A{ self.h, self.idx, self.wts, self.sy, self.x1, self.post, self.comb, self.pre }) |a| if (a.ctx != null) {
+        for ([_]A{ self.h, self.idx, self.wts, self.sy, self.x1, self.post, self.comb, self.pre, self.pred }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
     }
@@ -2603,9 +2624,63 @@ fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
     return sp.can(hk.ctx, li);
 }
 
+/// The layer whose picks layer `li`'s router input is used to predict, or null where nothing is prefetched.
+fn prefetchTarget(m: *const Model, li: usize, rows: usize) ?usize {
+    const hk = switch (m.experts) {
+        .resident => return null,
+        .hook => |hk| hk,
+    };
+    if (hk.prefetch == null or rows > NARROW_ROWS) return null;
+    const lead: usize = if (rows == 1) m.prefetch_lead_one else m.prefetch_lead_rows;
+    if (lead == 0 or li + lead >= m.cfg.layers) return null;
+    return li + lead;
+}
+
+/// Layer `j`'s router logits over `h`, the input of an earlier layer's router: the stream drifts slowly enough that
+/// its top picks are mostly the ones `j` will make.
+fn predictLogits(sc: *Scope, m: *const Model, h: A, j: usize) !A {
+    const w = m.layers[j].gate_w;
+    if (fusedOn(sc, m) and m.cfg.dim % 8 == 0) return kernels.gateLogits(sc, h, w);
+    return sc.matmul(try sc.astype(h, .float32), try sc.t2(w));
+}
+
+/// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias), best first.
+fn rankPicks(logits: []const f32, bias: []const f32, out: []u16) void {
+    var best: [prefetch_cand_max]f32 = undefined;
+    var filled: usize = 0;
+    for (logits, bias, 0..) |x, b, e| {
+        const soft = if (x > 20) x else std.math.log1p(std.math.exp(x));
+        const score = @sqrt(soft) + b;
+        if (filled == out.len and score <= best[filled - 1]) continue;
+        var at = if (filled < out.len) filled else filled - 1;
+        while (at > 0 and best[at - 1] < score) : (at -= 1) {
+            best[at] = best[at - 1];
+            out[at] = out[at - 1];
+        }
+        best[at] = score;
+        out[at] = @intCast(e);
+        if (filled < out.len) filled += 1;
+    }
+}
+
+/// Hands the stream the experts the prefetch layer's router is expected to pick, ranked from `u.pred`.
+fn issuePrefetch(m: *const Model, u: *const Unresolved) !void {
+    const hk = m.experts.hook;
+    const prefetch = hk.prefetch orelse return;
+    const logits = try sc_mod.hostF32(u.pred);
+    const bias = try sc_mod.hostF32(m.layers[u.pred_layer].gate_bias);
+    const rows = dim(u.pred, 0);
+    const E = bias.len;
+    const n: usize = @min(m.prefetch_n, prefetch_cand_max, E);
+    var cand: [16 * prefetch_cand_max]u16 = undefined;
+    for (0..rows) |r| rankPicks(logits[r * E ..][0..E], bias, cand[r * n ..][0..n]);
+    prefetch(hk.ctx, u.pred_layer, cand[0 .. rows * n], rows, n, m.prefetch_m);
+}
+
 /// The host's check of an unresolved layer: null when its queued chain stands, else the layer's exact output stream.
 fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     const hk = m.experts.hook;
+    if (u.pred.ctx != null) issuePrefetch(m, u) catch {};
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const t0 = readStart();

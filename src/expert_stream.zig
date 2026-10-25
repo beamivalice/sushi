@@ -47,6 +47,7 @@ pub fn fillPeakBytes(expert_bytes: u64, union_size: u16, slots_per_layer: u16, b
     return workspace +| layer +| workspace +| @min(workspace, batch_bytes);
 }
 
+/// The fill pools' bounce buffers: the serving pool's `FILL_WORKERS` and the prefetch pool's, each at `bounce_size`.
 pub const BOUNCE_BYTES: u64 = 8 * 64 * 1024 * 1024;
 
 pub fn expertBytes(gate_up_rows: u32, hidden: u32, intermediate: u32) !u64 {
@@ -1745,6 +1746,38 @@ const FusedViews = struct {
     down: mlx.mlx_array,
 };
 
+/// Reads experts a later layer is expected to pick into that layer's pool, on a thread of its own, so a miss the router
+/// has not made yet is a hit when the layer is queued. A job owns its layer's cache until `Engine.prefetchWait` returns.
+pub const Prefetcher = struct {
+    pub const rows_max = 16;
+    pub const cand_max = 12;
+    const jobs_max = 32;
+
+    const Job = struct {
+        layer: u16,
+        rows: u8,
+        n: u8,
+        m: u8,
+        cand: [rows_max][cand_max]u16,
+    };
+
+    pool: *io_mod.FillPool,
+    thread: std.Thread,
+    mu: std.Io.Mutex = .init,
+    cv: std.Io.Condition = .init,
+    jobs: [jobs_max]Job = undefined,
+    head: usize = 0,
+    len: usize = 0,
+    busy: i32 = -1,
+    quit: bool = false,
+    /// Jobs queued or running; zero lets the host skip the lock.
+    live: std.atomic.Value(u32) = .init(0),
+    jobs_run: std.atomic.Value(u64) = .init(0),
+    experts_read: std.atomic.Value(u64) = .init(0),
+    host_wait_ns: std.atomic.Value(u64) = .init(0),
+    job_ns: std.atomic.Value(u64) = .init(0),
+};
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     geometry: Geometry,
@@ -1757,6 +1790,7 @@ pub const Engine = struct {
     s: mlx.mlx_stream,
     forward_count: u64 = 0,
     io_pool: ?*io_mod.FillPool = null,
+    prefetcher: ?*Prefetcher = null,
     fds: []std.c.fd_t = &.{},
     union_slabs: []SlabOperand = &.{},
     /// The union workspace of the rate-grouped layers: sized for the largest of them. A resident pack makes it only
@@ -1964,6 +1998,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        self.stopPrefetch();
         self.drainPendingReaders();
         self.releaseSlabs();
         for (self.layers) |*layer| if (layer.active) layer.cache.deinit();
@@ -2176,6 +2211,7 @@ pub const Engine = struct {
     /// resident (its own GPU map) or not rate-grouped.
     pub fn specGrouped(self: *Engine, layer_index: u16) !?GroupedSpec {
         if (layer_index >= self.layers.len) return null;
+        self.prefetchWait(layer_index);
         const layer = &self.layers[layer_index];
         const gl = layer.grouped orelse return null;
         if (!layer.active or layer.borrowed or layer.resident_map.ctx != null or layer.slabs.len != quant.component_count) return null;
@@ -2186,6 +2222,7 @@ pub const Engine = struct {
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
         if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
         if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
+        self.prefetchWait(layer_index);
         self.drainPendingReaders();
         return self.prepareSlab(layer_index, occurrences, false);
     }
@@ -2195,6 +2232,7 @@ pub const Engine = struct {
     pub fn prepareHostWide(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
         if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
         if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
+        self.prefetchWait(layer_index);
         self.drainPendingReaders();
         return self.prepareSlab(layer_index, occurrences, true);
     }
@@ -2226,11 +2264,203 @@ pub const Engine = struct {
         self.fill_bytes_total += bytes;
     }
 
+
+    /// Starts the prefetch thread; a no-op where one runs already.
+    pub fn startPrefetch(self: *Engine) !void {
+        if (self.prefetcher != null) return;
+        const pf = try self.allocator.create(Prefetcher);
+        errdefer self.allocator.destroy(pf);
+        const serving = (self.io_pool orelse return error.MissingFillPool).opts;
+        const pool = try io_mod.FillPool.create(self.allocator, .{ .workers = @min(serving.workers, FILL_WORKERS), .bounce_cap = serving.bounce_cap, .coalesce_max = COALESCE_MAX });
+        errdefer pool.destroy();
+        pf.* = .{ .pool = pool, .thread = undefined };
+        pf.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, prefetchMain, .{ self, pf });
+        self.prefetcher = pf;
+    }
+
+    fn stopPrefetch(self: *Engine) void {
+        const pf = self.prefetcher orelse return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.mu.lockUncancelable(io);
+        pf.quit = true;
+        pf.cv.broadcast(io);
+        pf.mu.unlock(io);
+        pf.thread.join();
+        pf.pool.destroy();
+        self.allocator.destroy(pf);
+        self.prefetcher = null;
+    }
+
+    /// Whether `layer` can be prefetched: a rate-grouped pool that is neither released nor resident.
+    pub fn canPrefetch(self: *const Engine, layer: u16) bool {
+        if (self.prefetcher == null or layer >= self.layers.len) return false;
+        const state = &self.layers[layer];
+        return state.grouped != null and state.active and !state.borrowed and state.resident_map.ctx == null and state.slabs.len == quant.component_count;
+    }
+
+    /// Queues the experts `layer` is expected to pick: for each of `rows` rows, the first `m` of its `n` ranked candidates
+    /// (`cand`, `n` per row) that the pool does not hold. Best effort and never blocking; a full queue drops the job.
+    pub fn prefetch(self: *Engine, layer: u16, cand: []const u16, rows: usize, n: usize, m: usize) void {
+        const pf = self.prefetcher orelse return;
+        if (!self.canPrefetch(layer) or rows == 0 or rows > Prefetcher.rows_max or n == 0 or n > Prefetcher.cand_max or cand.len != rows * n) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.mu.lockUncancelable(io);
+        defer pf.mu.unlock(io);
+        if (pf.len == Prefetcher.jobs_max) return;
+        const job = &pf.jobs[(pf.head + pf.len) % Prefetcher.jobs_max];
+        job.layer = layer;
+        job.rows = @intCast(rows);
+        job.n = @intCast(n);
+        job.m = @intCast(@min(m, n));
+        for (0..rows) |r| @memcpy(job.cand[r][0..n], cand[r * n ..][0..n]);
+        pf.len += 1;
+        _ = pf.live.fetchAdd(1, .release);
+        pf.cv.broadcast(io);
+    }
+
+    /// Blocks until no prefetch job reads or writes `layer`'s cache.
+    pub fn prefetchWait(self: *Engine, layer: u16) void {
+        const pf = self.prefetcher orelse return;
+        if (pf.live.load(.acquire) == 0) return;
+        var clock = Clock.init();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.mu.lockUncancelable(io);
+        while (prefetchTouches(pf, layer)) pf.cv.wait(io, &pf.mu) catch {};
+        pf.mu.unlock(io);
+        _ = pf.host_wait_ns.fetchAdd(clock.lap(), .monotonic);
+    }
+
+    fn prefetchTouches(pf: *const Prefetcher, layer: u16) bool {
+        if (pf.busy == layer) return true;
+        for (0..pf.len) |i| {
+            if (pf.jobs[(pf.head + i) % Prefetcher.jobs_max].layer == layer) return true;
+        }
+        return false;
+    }
+
+    /// Blocks until every prefetch job is done.
+    pub fn prefetchQuiesce(self: *Engine) void {
+        const pf = self.prefetcher orelse return;
+        if (pf.live.load(.acquire) == 0) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.mu.lockUncancelable(io);
+        while (pf.len != 0 or pf.busy >= 0) pf.cv.wait(io, &pf.mu) catch {};
+        pf.mu.unlock(io);
+    }
+
+    fn prefetchMain(self: *Engine, pf: *Prefetcher) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        while (true) {
+            pf.mu.lockUncancelable(io);
+            while (pf.len == 0 and !pf.quit) pf.cv.wait(io, &pf.mu) catch {};
+            if (pf.len == 0) {
+                pf.mu.unlock(io);
+                return;
+            }
+            const job = pf.jobs[pf.head];
+            pf.head = (pf.head + 1) % Prefetcher.jobs_max;
+            pf.len -= 1;
+            pf.busy = job.layer;
+            pf.mu.unlock(io);
+            var clock = Clock.init();
+            self.prefetchFill(pf, &job) catch {};
+            _ = pf.job_ns.fetchAdd(clock.lap(), .monotonic);
+            pf.mu.lockUncancelable(io);
+            pf.busy = -1;
+            _ = pf.live.fetchSub(1, .release);
+            pf.cv.broadcast(io);
+            pf.mu.unlock(io);
+        }
+    }
+
+    /// Reads the job's uncached experts into their pools. Where anything fails the pool is left as it was.
+    fn prefetchFill(self: *Engine, pf: *Prefetcher, job: *const Prefetcher.Job) !void {
+        const layer = &self.layers[job.layer];
+        const gl = layer.grouped orelse return;
+        const n = quant.component_count;
+        const count: usize = gl.groups.count;
+        var want: [Prefetcher.rows_max * Prefetcher.cand_max]u16 = undefined;
+        var wanted: usize = 0;
+        for (0..job.rows) |r| {
+            var taken: usize = 0;
+            for (job.cand[r][0..job.n]) |expert| {
+                if (expert >= gl.expertCount() or self.isDropped(job.layer, expert)) continue;
+                const g = gl.groups.groupOf(expert);
+                const raw = gl.caches[g].expert_to_slot[expert - gl.groups.base[g]];
+                if (raw >= 0 and gl.caches[g].ready[@intCast(raw)]) continue;
+                taken += 1;
+                if (std.mem.indexOfScalar(u16, want[0..wanted], expert) == null) {
+                    want[wanted] = expert;
+                    wanted += 1;
+                }
+                if (taken == job.m) break;
+            }
+        }
+        if (wanted == 0) return;
+
+        var snapshots: [quant.rate_group_limit]CacheSnapshot = undefined;
+        var snapshotted: usize = 0;
+        defer for (snapshots[0..snapshotted]) |*snapshot| snapshot.deinit(self.allocator);
+        while (snapshotted < count) : (snapshotted += 1) snapshots[snapshotted] = try self.snapshotCache(&gl.caches[snapshotted]);
+        var committed = false;
+        errdefer if (!committed) for (0..count) |g| snapshots[g].restore(&gl.caches[g]);
+
+        var resolutions: [quant.rate_group_limit]GroupResolution = undefined;
+        var resolved: usize = 0;
+        defer for (resolutions[0..resolved]) |*resolution| resolution.deinit(self.allocator);
+        var local: std.ArrayList(u16) = .empty;
+        defer local.deinit(self.allocator);
+        while (resolved < count) {
+            local.clearRetainingCapacity();
+            for (want[0..wanted]) |expert| {
+                if (gl.groups.groupOf(expert) == resolved) try local.append(self.allocator, expert - gl.groups.base[resolved]);
+            }
+            resolutions[resolved] = try gl.caches[resolved].resolve(self.allocator, local.items);
+            resolved += 1;
+            if (resolutions[resolved - 1].workspace) return error.PrefetchTooWide;
+        }
+
+        var begun: usize = 0;
+        errdefer if (!committed) for (layer.slabs[0..begun]) |*operand| abortFill(operand);
+        while (begun < n) : (begun += 1) {
+            const slab = layer.slabs[begun].slab orelse return error.MissingExpertSlab;
+            _ = try slab.tryBeginFill();
+        }
+
+        var spans: std.ArrayList(io_mod.FillSpan) = .empty;
+        defer spans.deinit(self.allocator);
+        for (resolutions[0..count], 0..) |resolution, g| {
+            for (resolution.bindings) |binding| {
+                if (binding.hit) continue;
+                for (0..n) |ci| {
+                    const source = self.store.spanAt(job.layer, gl.groups.base[g] + binding.expert, ci);
+                    const dst = gl.cacheRegion(&layer.slabs[ci], g, ci, binding.slot orelse return error.ExpertBindingMissing);
+                    try spans.append(self.allocator, .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr });
+                }
+            }
+        }
+        {
+            var plan = try io_mod.FillPlan.init(self.allocator, spans.items, COALESCE_MAX, pf.pool.opts.workers, false);
+            defer plan.deinit();
+            try pf.pool.run(self.fds, &plan);
+        }
+        for (resolutions[0..count], 0..) |resolution, g| {
+            for (resolution.bindings) |binding| {
+                if (!binding.hit) gl.caches[g].markReady(binding.slot.?);
+            }
+        }
+        committed = true;
+        for (layer.slabs) |*operand| abortFill(operand);
+        _ = pf.jobs_run.fetchAdd(1, .monotonic);
+        _ = pf.experts_read.fetchAdd(wanted, .monotonic);
+    }
+
     pub fn cancelFills(self: *Engine) void {
         if (self.io_pool) |pool| pool.requestCancel();
     }
 
     pub fn warmCache(self: *Engine) !void {
+        self.prefetchQuiesce();
         const warm_count = self.warmSlotsPerLayer();
         if (warm_count == 0) return;
 
@@ -2383,6 +2613,7 @@ pub const Engine = struct {
     /// The lossy pick on a rate-grouped layer: a missed expert may take any expert already in one of the layer's pools,
     /// read through that expert's own group, with the missed expert's weight (`substituteMisses`). Returns the swaps.
     pub fn swapGroupedMisses(self: *Engine, li: u16, ids: []u16, scores: []const f32, tolerance: f32, k: usize) !u32 {
+        self.prefetchWait(li);
         const layer = &self.layers[li];
         const gl = layer.grouped orelse return 0;
         if (layer.borrowed) return 0;
@@ -2431,6 +2662,7 @@ pub const Engine = struct {
     /// once MLX lets go of them. Until `restoreLayer` its routes read through the union workspace. Returns the bytes
     /// MLX gave back (a slab whose release timed out stays mapped and is not counted).
     pub fn borrowLayer(self: *Engine, li: u16) !u64 {
+        self.prefetchWait(li);
         const layer = &self.layers[li];
         const gl = layer.grouped orelse return error.ExpertLayerNotGrouped;
         if (layer.borrowed) return 0;
@@ -2473,6 +2705,7 @@ pub const Engine = struct {
 
     /// Gives a released layer its pool back and reads into it the experts it held when released.
     pub fn restoreLayer(self: *Engine, li: u16) !void {
+        self.prefetchWait(li);
         const layer = &self.layers[li];
         const gl = layer.grouped orelse return error.ExpertLayerNotGrouped;
         if (!layer.borrowed) return;

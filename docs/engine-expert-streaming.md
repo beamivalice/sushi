@@ -200,6 +200,14 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   `[dsv41] route-spec: N layers kept, M rebuilt` is the engagement line ([dsv41-arch](dsv41-arch.md#stq)).
   `SUSHI_DSV41_READ_DIAG=1` counts the blocking host reads of a decode forward by site (`settle`, `settle_last`,
   `picks_sync`, `engram`, `state`, `head`) and logs their mean per forward at debug level every 64 forwards.
+- DeepSeek-V4.1 STQ also reads experts ahead (`Engine.prefetch`, `Prefetcher`): a layer's router input times the gate
+  matrix of the layer `d` ahead (d = 4 at one row, 3 at several; `Model.prefetch_lead_*`) ranks that layer's experts, the
+  host passes each row's first uncached one of its top 12 to a thread that reads them into the pool before the layer's
+  chain is queued, so the miss becomes a hit. Rules: a job owns its layer's cache and slabs until `prefetchWait(layer)`
+  returns (`specGrouped`, `prepareHost*`, `swapGroupedMisses`, `borrowLayer`, `restoreLayer` call it, `warmCache` and
+  `deinit` drain the thread); only layers `d >= 2` ahead are targeted, so no queued chain reads a slot the job writes;
+  the prefetch pool has its own fill workers (inside `BOUNCE_BYTES`, so no new bill); it changes what is cached, never
+  the arithmetic. `[expert-stream] prefetch: ...` is the engagement line. Measurements: [dsv41-arch](dsv41-arch.md#stq).
 - At decode widths each layer's experts are queued from a GPU copy of the cache map (`Engine.specRoute`: expert →
   slot, -1 where not ready) before the host reads the router ids. The host keeps that result only when every routed
   id resolved to the slot the GPU gathered (`specMatches`), else rebuilds it; a union workspace always rebuilds. The
