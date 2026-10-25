@@ -87,9 +87,9 @@ pub const VisionChoice = struct {
     on: bool,
     source: Source,
 
-    /// A streamed load defaults off: its tower and encode reserve come out of the expert cache.
-    pub fn resolve(flag: ?bool, setting: ?bool, streamed: bool) VisionChoice {
-        const p = pick(bool, flag, setting, !streamed);
+    /// `default_on` is false for a streamed load, whose tower and encode reserve come out of the expert cache.
+    pub fn resolve(flag: ?bool, setting: ?bool, default_on: bool) VisionChoice {
+        const p = pick(bool, flag, setting, default_on);
         return .{ .on = p.value, .source = p.source };
     }
 
@@ -400,18 +400,18 @@ test "logit bias CPU: file setting is a populated override" {
 
 test "vision: a streamed load leaves the tower off unless --vision or the per-model vision asks; resident keeps it on" {
     const t = std.testing;
-    try t.expect(VisionChoice.resolve(null, null, false).on);
-    try t.expect(!VisionChoice.resolve(null, null, true).on);
-    try t.expectEqualStrings("default", VisionChoice.resolve(null, null, true).sourceName());
-    const asked = VisionChoice.resolve(true, null, true);
+    try t.expect(VisionChoice.resolve(null, null, true).on);
+    try t.expect(!VisionChoice.resolve(null, null, false).on);
+    try t.expectEqualStrings("default", VisionChoice.resolve(null, null, false).sourceName());
+    const asked = VisionChoice.resolve(true, null, false);
     try t.expect(asked.on);
     try t.expectEqualStrings("--vision", asked.sourceName());
-    const from_file = VisionChoice.resolve(null, true, true);
+    const from_file = VisionChoice.resolve(null, true, false);
     try t.expect(from_file.on);
     try t.expectEqualStrings("model-settings.json", from_file.sourceName());
-    try t.expect(!VisionChoice.resolve(false, true, false).on);
-    try t.expectEqualStrings("--no-vision", VisionChoice.resolve(false, true, false).sourceName());
-    try t.expect(!VisionChoice.resolve(null, false, false).on);
+    try t.expect(!VisionChoice.resolve(false, true, true).on);
+    try t.expectEqualStrings("--no-vision", VisionChoice.resolve(false, true, true).sourceName());
+    try t.expect(!VisionChoice.resolve(null, false, true).on);
 }
 
 test "vision: --vision and --no-vision together are refused; either alone is the flag" {

@@ -65,7 +65,7 @@ less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-ST
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
-serves text unless `--vision` loads the vision tower, whose weights then come out of the N GiB.
+serves text unless `--vision` loads the vision tower, whose weights then come out of the N GiB (DeepSeek-V4.1-Flash loads it by default; `--no-vision` skips it).
 
 ## Streaming on a 32 GB Mac
 

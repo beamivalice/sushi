@@ -8,6 +8,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **`--no-mtp` no longer reads the MTP head**: a Qwen3.8-Flash-Next load with MTP off skips the head's tensors while reading the pack, so the 1.2 GB head no longer passes through memory at load, which matters on a 64 GB Mac.
 - **`sushi convert exl3 --codebook` is now `--expert-codebook`** (breaking): `--codebook mcg` is now `--expert-codebook exl3-mcg` and `--codebook mul1` is `--expert-codebook exl3-mul1`; the old flag and the bare names are refused, and packs and resumable runs are unchanged.
+- **DeepSeek-V4.1-Flash loads its vision tower by default**: images work without `--vision`, on a streamed and a resident load, and `--no-vision` (or `vision: false` in `model-settings.json`) saves its ~1 GB.
 - **Qwen3.8-Flash-Next Sushi-STQ-2.75bpw**: a new pack that replaces Sushi-2.6bpw and Sushi-3bpw as the 64 GB recommendation (`sushi pull qwen3.8-flash-next` now fetches it, 75.9 GB download); it scores KLD 0.0692 (top-1 agreement 92.76%) on 16x512 prompts at bf16 KV and runs on sushi 1.3.0 and later.
 - **Qwen now thinks at medium effort by default**: Qwen3.8-Flash-Next answers a request that names no thinking field with thinking on at `medium` (capped at 8192 thinking tokens), where it used to answer without thinking. `enable_thinking: false`, `reasoning_effort: none`, `--think` and `--reasoning-budget` still win.
 - **Qwen tool calls written in Claude's `<function_calls><invoke>` markup are executed**: Qwen3.8-Flash-Next sometimes answers in that shape, which used to end an agent's turn as plain text; it now becomes a tool call when it names a declared tool.
@@ -18,7 +19,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Qwen with DFlash2 reserves the memory it uses**: the MTP head's cache is no longer reserved for requests DFlash2 serves and the drafter counts at its loaded size, so about 2.8 GB more fits at 1M context, while a model swap now reserves the drafter's per-request memory it used to miss.
 - **DFlash2 speeds up image, video and sampled requests on Qwen3.8-Flash-Next**: a request with images now decodes with the drafter (about 1.7-2x plain decoding, output unchanged) instead of falling back to plain decoding, and the speed gate judges a request on its steady rounds against today's verify cost, so it no longer stops DFlash2 where it is winning.
 - **Adaptive DFlash2 for GLM-5.3-Flash**: GLM verifies 2 to 8 draft rows per round as the drafter's confidence pays, and a request whose drafts stop paying falls back to plain decoding and retries later (`--drafter-min-depth` / `--drafter-max-depth`).
-- **DeepSeek-V4.1-Flash**: serves the original checkpoint and STQ packs of it with the routed experts streamed from SSD, DSpark speculative decoding, image input (`--vision`), the prefix cache on RAM and SSD, DSML tool calls and `--drop-expert` to trade a few re-routed experts for memory.
+- **DeepSeek-V4.1-Flash**: serves the original checkpoint and STQ packs of it with the routed experts streamed from SSD, DSpark speculative decoding, image input, the prefix cache on RAM and SSD, DSML tool calls and `--drop-expert` to trade a few re-routed experts for memory.
 
 ## v1.3.0 — Qwen EXL3 Quantizer, Adaptive DFlash2, KV6, Dashboard
 

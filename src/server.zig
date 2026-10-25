@@ -7736,7 +7736,8 @@ const TextGenTarget = struct {
 /// model answered the text alone (a 200 with a hallucinated "Sky" for a house).
 /// A streamed load left its tower off only because nothing asked for it (not `--no-vision`).
 fn streamedTowerOffByDefault(config: *const model_mod.ModelConfig) bool {
-    return config.expert_streaming and config.has_vision and scheduler_mod.visionChoiceFor(config, true).source == .default;
+    const choice = scheduler_mod.visionChoiceFor(config, true);
+    return config.expert_streaming and config.has_vision and !choice.on and choice.source == .default;
 }
 
 fn mediaRejectReason(messages: []const chat_mod.Message, streamed_tower_off: bool) ?[]const u8 {
@@ -7783,6 +7784,11 @@ test "only a streamed load whose tower is off by default names --vision in its m
     cfg.expert_streaming = true;
     cfg.has_vision = false;
     try t.expect(!streamedTowerOffByDefault(&cfg));
+    // DeepSeek-V4.1 streams WITH its tower, so there is nothing to name.
+    var ds = model_mod.ModelConfig{ .has_vision = true, .expert_streaming = true, .model_type = "deepseek_v41" };
+    try t.expect(!streamedTowerOffByDefault(&ds));
+    model_settings.vision_flag = false;
+    try t.expect(!streamedTowerOffByDefault(&ds));
 }
 
 /// Reason a text-generation route must reject this model with a 400, or null
@@ -13725,7 +13731,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3CodebookTableLegacyConfig => .{ .type = "exl3_codebook_table_legacy_config", .message = "This pack's expert_quant names a codebook table by a digest from before the table grew (spec1-w15 2ac2594d, now 37f72431). Re-convert the pack." },
         error.Exl3CodebookTableUndecodable => .{ .type = "exl3_codebook_table_undecodable", .message = "This STQ pack's codebook table holds PAIR1 constants this build's kernels have not compiled." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
-        error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = "--ssd-budget-gb cannot hold the vision tower that --vision asks for beside the minimum expert cache. Raise the budget or drop --vision." },
+        error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = "--ssd-budget-gb cannot hold the vision tower (--vision, or the default on DeepSeek-V4.1) beside the minimum expert cache. Raise the budget or pass --no-vision." },
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache (and, under --vision, the largest image encode) exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
         else => null,
     };

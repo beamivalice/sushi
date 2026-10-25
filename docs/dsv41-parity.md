@@ -21,7 +21,7 @@ item).
 | Hot / SSD prefix cache | works | restore points of the whole state, RAM and SSD tiers, bit-identical to cold ([dsv41-arch](dsv41-arch.md#prefix-cache)) |
 | Per-request prefill chunk ladder | works | `perRequestPrefillChunk` is true for the arch; each request takes the widest rung its bill admits ([dsv41-arch](dsv41-arch.md#ced)) |
 | `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-min/max-depth` | N/A, refused | no KV cache, GDN or draft depth; a launch flag refuses the load before the weights (`archFlagRefusal`, `LaunchFlagUnsupported`), a model-settings `kv_quant` is ignored with one log line (`settingsKvQuantIgnoredLine`) |
-| Image input | works | the release's processor and tower under `--vision` ([dsv41-arch](dsv41-arch.md#image-input)) |
+| Image input | works | the release's processor and tower, on by default (`--no-vision` skips them) ([dsv41-arch](dsv41-arch.md#image-input)) |
 | Video / audio input | N/A | refused by name (`mediaRejectReason`) |
 | Image token spelled in text-only input | works | `deepseek_v41: the image token spelled in a text-only prompt is text`: no media, no placeholder check |
 | Chat template | works | 14 byte-exact cases against the release's `encode_messages`; V4.1 is in the format-corpus family matrices (late system, forced tool_choice, continuation, tool traffic, non-object arguments, forced call parse-back, string value round trip) |

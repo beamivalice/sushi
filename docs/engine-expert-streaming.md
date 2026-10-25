@@ -40,7 +40,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - Rate-group (`.gN`) EXL3 packs stream on Flash-Next ([below](#rate-groups)); on MiMo, and for pruned layers, they are
   refused by name (`Exl3RateGroupsStreamingUnsupported`, `Exl3RaggedStreamingUnsupported`) and serve resident. GLM
   serves no rate groups at all (`Exl3RateGroupsUnsupported`).
-- Vision is off under streaming unless asked for ([below](#vision)); a streamed model then serves text only.
+- Vision is off under streaming unless asked for, except DeepSeek-V4.1, which loads it by default ([below](#vision)); a streamed model without the tower serves text only.
 - GLM's routed experts go through `glm5_stream.Stream`: BF16 source experts through the clamped `gather_mm`
   composite, EXL3 banks through the resident `routedExl3` dispatch; router ids become slot ids, scores, clamps and
   the FP32 reduction are untouched, and each layer completes before its slabs are reused.
@@ -65,10 +65,12 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 <a id="vision"></a>
 ## Vision (`--vision`)
 
-- **A streamed load leaves the tower off by default** and logs what it would cost (`[vision] off under expert
+- **A streamed load leaves the tower off by default (DeepSeek-V4.1 excepted)** and logs what it would cost (`[vision] off under expert
   streaming; pass --vision to load the tower (+X GB, -N slots/layer)`); an image is then a 400 naming `--vision`.
   `--vision` or a per-model `vision: true` loads it (`--no-vision` > `--vision`/`vision` > default; both flags at
-  once are refused). A resident load keeps its tower on by default and takes `--vision` as a no-op.
+  once are refused). A resident load keeps its tower on by default and takes `--vision` as a no-op. DeepSeek-V4.1 is the
+  exception: its streamed default is ON (`visionChoiceFor`), billed in the same `vision` term, and a budget too small for
+  it is refused (`SsdBudgetBelowVision`) until raised or `--no-vision` is passed.
 - **The tower is resident and billed in the ledger** (`vision` term, `resolveStreamedVision`): the expert cache
   shrinks by its weights. A budget that cannot hold it beside two slots per layer is `SsdBudgetBelowVision` (503).
 - **The encode transient is not reserved.** The load proves the largest single image the tower's processor admits

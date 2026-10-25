@@ -31,7 +31,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 | FFN | every layer MoE: 384 routed experts, top-6, width 2304, one shared expert; `sqrtsoftplus` scores, the f32 bias picks only, normalized, ×1.5; gate clamp 10 |
 | Hyper-connections | 4 streams, 20 Sinkhorn iterations, `hc_eps` 1e-6; two collapses and expansions per layer |
 | Engram | layers 1 and 14: 384M rows × 256 FP8 each (~100 GB per table), 8 heads, 4-grams over a 99092-entry compressed vocabulary, hashed with numpy-seeded multipliers and primes |
-| Loaded only on request | the vision tower (`vision.*`, `aligner.*`, `image_*`, bf16, 0.97 GB) and each layer's `bias_vl`, only under `--vision` ([image input](#image-input)); the 3 DSpark stages (`mtp.*`) only without `--no-mtp` |
+| Loaded by default, skippable | the vision tower (`vision.*`, `aligner.*`, `image_*`, bf16, 0.97 GB) and each layer's `bias_vl`, unless `--no-vision` ([image input](#image-input)); the 3 DSpark stages (`mtp.*`) only without `--no-mtp` |
 
 Storage in the checkpoint: trunk linears `F8_E4M3` with `F8_E8M0` scales on 32×32 blocks; routed experts `I8` holding
 two e2m1 nibbles (low first) with `F8_E8M0` scales per 32 columns; `embed`, `head`, gate bf16; hyper-connection
@@ -40,7 +40,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
 ## What loads
 
 - **Resident trunk** (`src/dsv41_source.zig`, ONE decision in `model.loadWeightsForConfig`): every tensor but the experts,
-  the Engram rows, the MTP/DSpark tensors and (unless `--vision`) the vision/aligner/image tensors and `bias_vl`, read by name from the shard headers. FP8
+  the Engram rows, the MTP/DSpark tensors and (under `--no-vision`) the vision/aligner/image tensors and `bias_vl`, read by name from the shard headers. FP8
   linears become MLX `mxfp8`: the u8 codes viewed as u32 and each 32-row scale row repeated down its 32 rows. FP4 experts
   are MLX `mxfp4` exactly (the int8 viewed as u32, low nibble first; proven bit for bit against a numpy decode of a real
   expert). The head is widened to f32; the embedding stays bf16.
@@ -463,8 +463,9 @@ as the GLM and Qwen verify kernels have); it is not in this port.
 <a id="image-input"></a>
 ## Image input
 
-Images are served under `--vision` (or `vision` in model-settings): a streamed load leaves the tower off unless asked,
-as for MiMo and GLM, and an image without it is a 400 naming the flag. One image is `[start] + ([n_w aligner rows] +
+Images are served by default: the tower loads on every DeepSeek-V4.1 load, streamed or resident, unlike MiMo and GLM
+whose streamed loads leave it off. `--no-vision` (or `vision: false` in model-settings) skips it and saves its 0.97 GB,
+and an image without it is a 400; an explicit flag outranks the setting, which outranks the default. One image is `[start] + ([n_w aligner rows] +
 [newline]) * n_h + [end]`, every position of which is `image_token_id` (`<｜deepseek_image｜>`) in the prompt.
 
 - **Processor** (`src/dsv41_vision.zig`, the release's `inference/image_processor.py`): `planGrid` picks the canvas
@@ -490,7 +491,7 @@ as for MiMo and GLM, and an image without it is a 400 naming the flag. One image
   where it sat, blank-line joined with its text (the release's `process_image_messages`); `placeMedia` expands the atom
   to `spanRows` tokens.
 - **Bill**: the tower and the image biases (0.97 GB) are the budget line's `vision` term (`dsv41_source.visionBytes`,
-  `streamingResidentSplit`), a request's encode is billed by `visionEncodeBill`, and a `--vision` load keeps
+  `streamingResidentSplit`), a request's encode is billed by `visionEncodeBill`, and a load with the tower keeps
   `largestImageEncodeBytes` beside the budget ([engine-memory-admission](engine-memory-admission.md)).
 
 Proof: `python3 tests/dump_dsv41_vision_fixtures.py --ref-dir <release>/inference --pack <pack>` runs the release's

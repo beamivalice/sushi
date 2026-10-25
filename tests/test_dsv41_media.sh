@@ -1,13 +1,13 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
-# DeepSeek-V4.1-Flash image input, live on the served pack (streamed: the tower is opt-in). The tower's
+# DeepSeek-V4.1-Flash image input, live on the served pack (streamed: the tower loads by default). The tower's
 # numerics are pinned by the fixture tests in src/dsv41_vision.zig; this checks what only a running
 # server shows:
-#   [1] the tower loads under --vision, bills the ssd budget's `vision` term and /v1/models advertises images;
+#   [1] the tower loads with no flag, bills the ssd budget's `vision` term and /v1/models advertises images;
 #   [2] the answer reads what only the pixels hold (quadrant colors), on chat/completions and /v1/messages;
 #   [3] the image request decodes with DSpark, never plain ticks (`[spec-stats] mode=dspark`);
 #   [4] a stream and a non-stream answer are the same bytes;
-#   [5] without --vision an image is a 400 naming the flag.
+#   [5] under --no-vision the tower is skipped, billed 0, and an image is a 400 naming --no-vision.
 # What the model says is a checkpoint expectation: the color check accepts any answer that names what is there.
 # Hold the GPU lock around the run: scripts/gpu-lock.sh acquire <owner>.
 #   DSV41_MEDIA_MODEL=<pack> DSV41_MEDIA_BUDGET=<GiB> ./tests/test_dsv41_media.sh [port]
@@ -92,8 +92,8 @@ colors_named() { local n=0; for c in red blue green yellow; do n=$((n + $(hits "
 Q="Name the color of each of the four quadrants, top-left first. Colors only."
 
 LOG="$RUNS/server-$PORT.log"
-echo "[boot] $MODEL --vision --ssd-budget-gb $BUDGET"
-boot "$LOG" --vision
+echo "[boot] $MODEL --ssd-budget-gb $BUDGET"
+boot "$LOG"
 
 echo "[1] the tower loads, is billed and is advertised"
 check "tower load line" "$(grep -c 'Vision encoder: DeepSeek-V4.1 ViT' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
@@ -118,13 +118,15 @@ streamed=$(body "$Q" true | ask_stream)
 check "same bytes" "$([ "$plain" = "$streamed" ] && echo 1 || echo 0)" "1"
 
 stop_server
-echo "[5] without --vision"
+echo "[5] --no-vision"
 LOG2="$RUNS/server-$PORT-novision.log"
-boot "$LOG2"
+boot "$LOG2" --no-vision
 check "no tower load line" "$(grep -c 'Vision encoder: DeepSeek-V4.1 ViT' "$LOG2")" "0"
+check "[vision] off (--no-vision)" "$(grep -c '^\[vision\] off (--no-vision)' "$LOG2" | sed 's/^[1-9][0-9]*$/1/')" "1"
+check "the budget's vision term is 0.00" "$(hits "$(grep -m1 'ssd budget .* GiB: trunk' "$LOG2")" 'vision 0\.00 GB')" "1"
 code=$(body "$Q" false | curl -s -o "$WORK/refusal.json" -w '%{http_code}' -m 300 "$U/v1/chat/completions" -H 'content-type: application/json' -d @-)
 check "image refused with 400" "$code" "400"
-check "refusal names --vision" "$(hits "$(cat "$WORK/refusal.json")" '\-\-vision')" "1"
+check "refusal names --no-vision" "$(hits "$(cat "$WORK/refusal.json")" '\-\-no-vision')" "1"
 
 echo "passed $pass, failed $fail"
 [ "$fail" -eq 0 ]

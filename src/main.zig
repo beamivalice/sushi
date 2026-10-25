@@ -176,7 +176,8 @@ fn printUsage(io: std.Io) void {
         \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --vision            Load the vision tower on an SSD-streamed load too (off by
-        \\                      default there: its weights come out of the expert cache)
+        \\                      default there, except for DeepSeek-V4.1: its weights
+        \\                      come out of the expert cache)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that

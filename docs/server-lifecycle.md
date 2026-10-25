@@ -220,7 +220,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `server.RequestMedia`; `Message` BORROWS. Ownership by PROVENANCE (`{slice, owned}` returns), never
   free-unless-equals-literal.
 - **A media placeholder id occurs in ordinary TEXT**, so a media boundary is gated on the request CARRYING media
-  (`firstMediaPlaceholder(has_media)`); media on a tower-less load is refused by NAME (`mediaRejectReason`; a streamed load without `--vision` names the flag).
+  (`firstMediaPlaceholder(has_media)`); media on a tower-less load is refused by NAME (`mediaRejectReason`; a streamed load that left the tower off by default names `--vision`).
 - **Every message's media is decoded and placed where it was sent**: user parts, OpenAI `tool` messages, Anthropic
   `tool_result` blocks, Responses `input_image` (tool outputs too). The wire walk (`readOpenAiMessages`,
   `readAnthropicMessages`, `responses.parseInput`) records each part's offset in the joined text

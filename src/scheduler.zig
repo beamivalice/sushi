@@ -2889,7 +2889,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
     const per_expert = bill.expert_bytes;
     streamed.expert_shape = bill.shape;
     const picked = resolveStreamedVision(budget_bytes, &streamed, split, per_expert, vision) catch |err| {
-        if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
+        if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or pass --no-vision\n", .{
             budget_bytes >> 30,
             @as(f64, @floatFromInt(split.vision)) / 1e9,
         });
@@ -3450,9 +3450,10 @@ pub fn coldLoadDrafterDir(
 }
 
 /// The load's vision choice: `--vision`/`--no-vision` (process-wide, so cold loads honour it
-/// too) > the per-model `vision` > on resident, off streamed.
+/// too) > the per-model `vision` > on, except off on a streamed load that is not DeepSeek-V4.1
+/// (its tower comes out of the expert cache; DeepSeek-V4.1 always streams and keeps images on).
 pub fn visionChoiceFor(config: *const ModelConfig, streamed: bool) model_settings.VisionChoice {
-    return model_settings.VisionChoice.resolve(model_settings.vision_flag, config.vision_override, streamed);
+    return model_settings.VisionChoice.resolve(model_settings.vision_flag, config.vision_override, !streamed or config.isDsv41());
 }
 
 /// Should a cold load bring up the checkpoint's vision tower?
@@ -3574,6 +3575,31 @@ test "streamed vision: the tower comes out of the ssd budget only when asked, re
     var bare = split;
     bare.vision = 0;
     try t.expect(!(try resolveStreamedVision(60 * GiB, &cfg, bare, fused, true)).cost.on);
+}
+
+test "a default-on DeepSeek-V4.1 tower is billed in the ssd budget exactly as a --vision load bills it" {
+    const t = testing;
+    const saved = model_settings.vision_flag;
+    defer model_settings.vision_flag = saved;
+    model_settings.vision_flag = null;
+    const cfg = model_mod.ModelConfig{
+        .model_type = "deepseek_v41",
+        .num_hidden_layers = 48,
+        .num_experts = 512,
+        .num_experts_per_tok = 10,
+        .hidden_size = 2560,
+        .moe_intermediate_size = 640,
+        .has_vision = true,
+    };
+    const split = model_mod.ResidentSplit{ .trunk = 9_900_000_000, .mtp = 0, .vision = 970_000_000 };
+    const GiB: u64 = 1 << 30;
+    const by_default = try resolveStreamedVision(60 * GiB, &cfg, split, 9_830_400, coldLoadVision(&cfg, true));
+    model_settings.vision_flag = true;
+    const by_flag = try resolveStreamedVision(60 * GiB, &cfg, split, 9_830_400, coldLoadVision(&cfg, true));
+    try t.expect(by_default.cost.on);
+    try t.expectEqual(split.vision, by_default.resolved.ledger.?.vision_bytes);
+    try t.expectEqual(by_flag.resolved.ledger.?, by_default.resolved.ledger.?);
+    try t.expectEqual(by_flag.cost, by_default.cost);
 }
 
 test "the vision load line names its source, and what --vision would cost a streamed load" {
@@ -3745,6 +3771,32 @@ test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never
         try testing.expect(std.mem.indexOf(u8, window, "params.prefix_cache_mem_bytes") == null);
     }
     try testing.expect(found >= 1);
+}
+
+test "visionChoiceFor: DeepSeek-V4.1 loads its tower by default streamed or resident; --no-vision and the per-model vision:false skip it; other archs keep the streamed default off" {
+    const saved = model_settings.vision_flag;
+    defer model_settings.vision_flag = saved;
+    var ds = ModelConfig{ .has_vision = true, .model_type = "deepseek_v41" };
+    var qwen = ModelConfig{ .has_vision = true, .model_type = "qwen4_exp" };
+    model_settings.vision_flag = null;
+    try std.testing.expect(visionChoiceFor(&ds, true).on);
+    try std.testing.expectEqualStrings("default", visionChoiceFor(&ds, true).sourceName());
+    try std.testing.expect(coldLoadVision(&ds, true));
+    try std.testing.expect(visionChoiceFor(&ds, false).on);
+    try std.testing.expect(!visionChoiceFor(&qwen, true).on);
+    try std.testing.expect(visionChoiceFor(&qwen, false).on);
+    model_settings.vision_flag = false;
+    try std.testing.expect(!visionChoiceFor(&ds, true).on);
+    try std.testing.expect(!coldLoadVision(&ds, true));
+    model_settings.vision_flag = null;
+    ds.vision_override = false;
+    try std.testing.expect(!visionChoiceFor(&ds, true).on);
+    try std.testing.expectEqualStrings("model-settings.json", visionChoiceFor(&ds, true).sourceName());
+    model_settings.vision_flag = true;
+    try std.testing.expect(visionChoiceFor(&ds, true).on);
+    try std.testing.expectEqualStrings("--vision", visionChoiceFor(&ds, true).sourceName());
+    qwen.vision_override = false;
+    try std.testing.expect(visionChoiceFor(&qwen, true).on);
 }
 
 test "coldLoadVision honors --no-vision, --vision and the per-model vision, resident and streamed" {
