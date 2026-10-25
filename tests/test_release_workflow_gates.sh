@@ -131,8 +131,9 @@ def sh(script, *args):
     return r.returncode, r.stdout.strip()
 
 zon = re.search(r'\.version\s*=\s*"([^"]*)"', open("build.zig.zon").read())
-check(zon is not None and sh('is_semver "$1"', zon.group(1))[0] == 0,
-      "build.zig.zon's version is MAJOR.MINOR.PATCH")
+# Between releases the version may carry `-dev`; release.sh and release.yml refuse it until the release step drops it.
+check(zon is not None and sh('is_semver "$1"', re.sub(r"-dev$", "", zon.group(1)))[0] == 0,
+      "build.zig.zon's version is MAJOR.MINOR.PATCH, or that plus -dev")
 
 with tempfile.TemporaryDirectory() as d:
     def release_version(heading, zon_version):

@@ -161,8 +161,8 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 
 ## Releases & benchmarking
 
-`/release` for process, SemVer, CHANGELOG. Perf gate = the `docs/bench/v<ver>/` run on the FINAL tree (Qwen 2.6bpw,
-Qwen 4bpw, MiMo 2.3bpw, GLM 2.4bpw) vs the previous report; ONE new `benchmarks.md` column per release. `/bench` for
+`/release` for process, SemVer, CHANGELOG. Perf gate = the `docs/bench/v<ver>/` run on the FINAL tree (Qwen STQ 2.75bpw,
+Qwen 4bpw, GLM 2.4bpw, DeepSeek STQ 1.75bpw) vs the previous report; ONE new `benchmarks.md` column per release. `/bench` for
 methodology: same-methodology cells only, spec cells are variance (sample across boots), an A/B arm is proven by
 ENGAGEMENT lines in its log. Interleave A/B kernels in ONE process (separate runs drift 15%); same-boot medians per
 cell; sub-2% calls need an IDLE box.

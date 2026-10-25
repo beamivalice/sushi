@@ -12,8 +12,8 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 | # | Step | Command | Pass |
 |---|---|---|---|
 | 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
-| 2 | **Perf gate** | the `docs/bench/<ver>/` run (below) on Qwen3.8-Flash-Next-Sushi-2.6bpw, Sushi-4bpw, MiMo-V2.6-Flash-Sushi-2.3bpw and GLM-5.3-Flash-Sushi-2.4bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
-| 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on one Sushi pack and MiMo | within ~1% of its row in `docs/quality-kld.md` |
+| 2 | **Perf gate** | the `docs/bench/<ver>/` run (below) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
+| 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
 | 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh`, plus the live test of each area the release changed (no `llmprobe --quick`: step 2's full bench covers it) | all pass |
 | 5 | CI | none to dispatch: `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft. To check a tree without cutting: `gh workflow run release.yml -f dry_run=true` | green (the macOS 26.2 build gate) |
 | 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
@@ -25,7 +25,7 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 - **The perf gate times on AC power only.** Check `pmset -g batt` right before each model's run and log the power
   source beside it. A run that touched battery is discarded and rerun on AC: battery cost GLM 8–18% decode on 2026-10-11.
   - All other GPU work keeps the battery-above-30% rule.
-- **The perf gate is four models: Qwen 2.6bpw, Qwen 4bpw, MiMo 2.3bpw, GLM 2.4bpw.** It is ONE run per model whose
+- **The perf gate is four models: Qwen STQ 2.75bpw, Qwen MCG 4bpw, GLM MCG 2.4bpw, DeepSeek STQ 1.75bpw.** It is ONE run per model whose
   output IS the published `docs/bench/v<ver>/` report, in the format of `docs/bench/v1.2.0-dev/` (`summary.md` plus
   one `<model>.md` per run): pinned `npx llmprobe@<ver> --bench-only --rungs 2k,4k,8k,16k,32k,64k,128k --runs 2`, one
   model per server, GPU lock per model, fans at max and 3 min idle before the first server and after each one (60 s let heat
