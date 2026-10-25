@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 177 vars. By kind: tradeoff levers 13, diagnostics 46, microbenches 67, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
+**Summary.** 178 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 67, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -47,6 +47,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DECODE_PROFILE` | `transformer.zig:22353, transformer.zig:22361` | arms the decode sub-block profiler; `=<rows>` also times verify widths | once | no |
 | `SUSHI_DSV41_ENGRAM_REUSE` | `dsv41_engram.zig` (test) | `<u32 tokens file>`: the Engram row cache's hit rate by capacity over a token stream | test | yes: dsv41-arch |
 | `SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD` | `transformer.zig` | TEMPORARY A/B: decode-width passes read their Engram rows at the layer; deleted after the live measurement | load | no |
+| `SUSHI_DSV41_READ_DIAG` | `transformer.zig`, `dsv41_model.zig` | `1` counts the blocking host reads of decode-width DeepSeek forwards by site (route-spec settle, settle before a successor, waiting-schedule picks, Engram rows, DSpark state, logits) and logs `[dsv41] reads/forward <site>` per 64 forwards at debug level | load | yes: engine-expert-streaming |
 | `SUSHI_DSV41_COMPOSED` | `transformer.zig`, `dsv41_model.zig` | `1` runs deepseek_v41 on the op chains instead of the fused kernels (the KLD A/B's teacher arm; the load logs `[dsv41] fused kernels on\|off`) | load | yes: dsv41-arch |
 | `SUSHI_DSV41_DSPARK_ROWS` | `generate.zig` | deepseek_v41 DSpark diagnostic: `sweep` cycles the verify width 1..8 per round, `<n>` forces it, `log` keeps the policy; each round logs `[dspark-round]` (ctx, rows, draft and verify ms, confidence logits) | request | yes: dsv41-arch |
 | `SUSHI_DSV41_VERIFY_PROFILE` | `transformer.zig`, `dsv41_model.zig` | `1` times every stage of decode-width chunks (a verify) as `[dsv41-prof]` lines, each stage evaluated before the next (the absolute ms inflate about 2x) | load | yes: dsv41-arch |

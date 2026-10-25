@@ -1206,6 +1206,20 @@ pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
 /// Drafts a sampled DSpark round can verify; the checkpoint's block is 5.
 const dsv41_max_drafts = 16;
 
+/// Verify rows that end a round at the first `id` among `ids`; the trunk's own token after it is still the pending one.
+fn rowsThroughId(ids: []const u32, id: ?u32) usize {
+    const want = id orelse return ids.len;
+    return if (std.mem.indexOfScalar(u32, ids, want)) |at| at + 1 else ids.len;
+}
+
+test "rowsThroughId: a round ends on the id, or runs whole without one" {
+    try testing.expectEqual(@as(usize, 5), rowsThroughId(&.{ 1, 2, 3, 4, 5 }, null));
+    try testing.expectEqual(@as(usize, 5), rowsThroughId(&.{ 1, 2, 3, 4, 5 }, 9));
+    try testing.expectEqual(@as(usize, 3), rowsThroughId(&.{ 1, 2, 3, 4, 3 }, 3));
+    try testing.expectEqual(@as(usize, 1), rowsThroughId(&.{ 3, 2, 3 }, 3));
+    try testing.expectEqual(@as(usize, 0), rowsThroughId(&.{}, 3));
+}
+
 /// `SUSHI_DSV41_DSPARK_ROWS` (diagnostic): `sweep` cycles the verify width over `dspark_sweep_rows`, a number forces
 /// it (rows past the block repeat its last draft, so only their cost means anything), `log` keeps the policy; each
 /// round logs a `[dspark-round]` line.
@@ -1832,6 +1846,9 @@ pub const Generator = struct {
     /// Forces the verify width (the `SUSHI_DSV41_DSPARK_ROWS` diagnostic, and the tests).
     dspark_diag: DsparkDiag = .off,
     dspark_policy: dspark_rows.Policy = .{},
+    /// A DSpark round commits through the first draft with this id and no further, so the request's state
+    /// stands right behind it for the scheduler to checkpoint. The scheduler clears it once taken.
+    dspark_round_ends_at: ?u32 = null,
     dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dsv41_max_drafts + 2]u32 = @splat(0) } = .{},
     /// Per-phase wall-time trace (SUSHI_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
@@ -4388,7 +4405,7 @@ pub const Generator = struct {
         };
         // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
         const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
-        const rows: usize = @min(wanted, self.max_tokens - self.completion_tokens);
+        const rows: usize = rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at);
         const ctx_before = self.ctx.cache.step;
         var logits = try xfm.dsv41Verify(&self.ctx, ids_buf[0..rows]);
         defer _ = mlx.mlx_array_free(logits);
@@ -20357,6 +20374,235 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     try testing.expectEqual(@as(usize, want), single[0].items.len);
     try testing.expectEqualSlices(u32, single[0].items, single[1].items);
     try testing.expect(std.mem.count(u32, single[0].items, &.{single[0].items[1]}) < want - 1);
+}
+
+test "dsv41 generator: a DSpark round ends right behind the id it is told to, at any verify width, with the state standing there (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const prompt = ids[0..30];
+    const want: u32 = 30;
+
+    for ([_]u8{ 2, 4, 6 }) |width| {
+        var plain: std.ArrayList(u32) = .empty;
+        defer plain.deinit(a);
+        try xfm.resetCache();
+        {
+            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+            defer gen.deinit(a);
+            gen.dspark_diag = .{ .rows = width };
+            while (try gen.nextDspark(a)) |r| {
+                defer a.free(r.tokens);
+                try plain.appendSlice(a, r.tokens);
+            }
+        }
+        const end_id = plain.items[9];
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .{ .rows = width };
+        gen.dspark_round_ends_at = end_id;
+        var total: usize = 0;
+        var ended_rounds: usize = 0;
+        while (true) {
+            const armed = gen.dspark_round_ends_at != null;
+            const r = (try gen.nextDspark(a)) orelse break;
+            defer a.free(r.tokens);
+            total += r.tokens.len;
+            // No round runs past the id, and the state stands on the committed tokens, so a restore point can be taken there.
+            if (armed) if (std.mem.indexOfScalar(u32, r.tokens, end_id)) |at| {
+                try testing.expectEqual(r.tokens.len - 1, at);
+                var cp = try dsv41_prefix.capture(a, xfm.dsv41.?, prompt.len + total);
+                cp.deinit(a);
+                ended_rounds += 1;
+                gen.dspark_round_ends_at = null;
+            };
+        }
+        try testing.expectEqual(@as(usize, 1), ended_rounds);
+        try testing.expectEqual(@as(usize, want), total);
+    }
+}
+
+test "dsv41 generator: the restore point behind a thought's closer, written mid-decode, restores from an SSD file to the live state's continuation bit for bit (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const prefix_cache = @import("prefix_cache.zig");
+    const kv_disk_cache = @import("kv_disk_cache.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const s = xfm.s;
+    var prompt: [600]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
+    const want: u32 = 40;
+    // The suffix is what the next turn adds after the thought.
+    var suffix: [50]u32 = undefined;
+    for (&suffix, 0..) |*t, i| t.* = (ids[(i * 3 + 1) % ids.len] + 1) % 90;
+    const greedy = SamplingParams{ .temperature = 0.0 };
+
+    // The id a round is told to end behind: a token the plain run emits early.
+    var plain: std.ArrayList(u32) = .empty;
+    defer plain.deinit(a);
+    {
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .{ .rows = 4 };
+        while (try gen.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try plain.appendSlice(a, r.tokens);
+        }
+    }
+    const end_id = plain.items[11];
+
+    // The live state's continuation: the request stops where the round ended and the suffix runs on its state.
+    var point: usize = 0;
+    var next_buf: [600 + 40 + 50]u32 = undefined;
+    var want_logits: ?mlx.mlx_array = null;
+    defer if (want_logits) |w| {
+        _ = mlx.mlx_array_free(w);
+    };
+    {
+        try xfm.resetCache();
+        var cache = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+        defer cache.deinit();
+        if (config.swaRingTokens() > 0) cache.setSwaRing(config.sliding_window);
+        var off: usize = 0;
+        var ctx = xfm.defaultCtx();
+        ctx.cache = &cache;
+        ctx.moe_seq_offset = &off;
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .ctx = ctx, .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .{ .rows = 4 };
+        gen.dspark_round_ends_at = end_id;
+        while (try gen.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            if (r.tokens[r.tokens.len - 1] != end_id) continue;
+            point = prompt.len + gen.generated_ids.items.len;
+            @memcpy(next_buf[0..prompt.len], &prompt);
+            @memcpy(next_buf[prompt.len..point], gen.generated_ids.items);
+            @memcpy(next_buf[point .. point + suffix.len], &suffix);
+            want_logits = try dsv41_model.extend(xfm.dsv41.?, &suffix, .all);
+            break;
+        }
+    }
+    try testing.expect(point > prompt.len);
+    const next = next_buf[0 .. point + suffix.len];
+
+    // The same request again, writing the point where the round ends and decoding on to the end.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    {
+        var hc = prefix_cache.HotPrefixCache.initWithMem(a, 0, 0);
+        defer hc.deinit();
+        hc.ssd_first = true;
+        hc.hybrid = true;
+        hc.cp_thin = .min_span_recency;
+        hc.disk = try kv_disk_cache.DiskTier.init(a, testing.io, base, "dsv41-thought", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.cp_thin = .min_span_recency;
+        hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+        hc.disk.?.enableBackgroundWriter();
+
+        try xfm.resetCache();
+        var cache = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+        defer cache.deinit();
+        if (config.swaRingTokens() > 0) cache.setSwaRing(config.sliding_window);
+        var off: usize = 0;
+        var ctx = xfm.defaultCtx();
+        ctx.cache = &cache;
+        ctx.moe_seq_offset = &off;
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .ctx = ctx, .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .{ .rows = 4 };
+        gen.dspark_round_ends_at = end_id;
+        var written = false;
+        while (true) {
+            const armed = gen.dspark_round_ends_at != null;
+            const r = (try gen.nextDspark(a)) orelse break;
+            defer a.free(r.tokens);
+            if (!armed or r.tokens[r.tokens.len - 1] != end_id) continue;
+            gen.dspark_round_ends_at = null;
+            try testing.expectEqual(point, prompt.len + gen.generated_ids.items.len);
+            try hc.writeDecodePointDsv41(&cache, xfm.dsv41.?, next[0..point], false, .{}, s);
+            written = true;
+        }
+        try testing.expect(written);
+        // The end-of-request commit: the generator's own points (none here) and the whole token record.
+        try dsv41_prefix.markRows(&cache);
+        var all = std.ArrayList(u32).empty;
+        defer all.deinit(a);
+        try all.appendSlice(a, &prompt);
+        try all.appendSlice(a, gen.generated_ids.items);
+        const st = try hc.commitWithRing(&cache, all.items, false, 0, 0, null, null, null, null, prompt.len, .{});
+        try testing.expect(st == .disk_only);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqualSlices(u32, &.{@intCast(point)}, hc.disk.?.entries.items[0].ssm_positions);
+    }
+
+    // A tier that never saw the write restores the point and runs the suffix to the same bits.
+    var hc = prefix_cache.HotPrefixCache.initWithMem(a, 0, 0);
+    defer hc.deinit();
+    hc.ssd_first = true;
+    hc.hybrid = true;
+    hc.cp_thin = .min_span_recency;
+    hc.disk = try kv_disk_cache.DiskTier.init(a, testing.io, base, "dsv41-thought", 0, 128);
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.cp_thin = .min_span_recency;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+    try xfm.resetCache();
+    var target = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &moe, xfm.dsv41.?, s, next, false, 0, null, &.{}, 9, false);
+    try testing.expectEqual(point, res.matched);
+    try testing.expect(hc.last_restored_disk_id != null);
+    const got = try dsv41_model.extend(xfm.dsv41.?, &suffix, .all);
+    defer _ = mlx.mlx_array_free(got);
+    try glm5_forward.expectArrayBits(want_logits.?, got);
 }
 
 test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_TINY)" {

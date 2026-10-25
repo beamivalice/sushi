@@ -171,10 +171,14 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
     | K6 | 1.21 | 1.15-1.23 | 1.27-1.29 |
     | K7 | 1.56 | 1.55-1.61 | 1.26-1.27 |
     | K8 | 1.56 | 1.29-1.60 | 1.06-1.17 |
-- **MiMo verify rows share an expert's weight reads** (`PAIR_GEMV_GROUPED_SOURCE`, `DOWN_PREPARED_GROUPED_SOURCE`;
-  prepared-mid geometry, 2+ rows): among an expert's slots, each even-ranked slot leads itself and the next one,
-  decodes each weight once and feeds both members in the single-slot order, so every row's bytes are its one-row
-  decode tick's. Two members only: four spill their accumulators. Not on Flash-Next, whose rows share too few experts.
+- **Verify rows share an expert's weight reads** (`pairGroupedSource`, `downGroupedSource`; prepared-mid geometry,
+  2+ rows): among an expert's slots, each slot whose rank is a multiple of the bucket leads itself and the next
+  bucket - 1, decodes each weight once and feeds every member in the single-slot order, so every row's bytes are its
+  one-row decode tick's. Served: buckets of 2 on MiMo only. Built and byte-tested at 2, 4, 8 and 16 members for any
+  slot count up to 512 (one ballot per 32 slots), on every codec: a bucket above 2 runs one output tile per
+  threadgroup, a block of `m` members takes the smallest rung (1, 2, 3, 4, 6, 8, 12, 16) that holds it, and rungs
+  above 8 decode a weight once and sweep the members over it. `SUSHI_EXL3_GROUP_UBENCH=1` on the exl3 test binary times
+  ungrouped, pairs and the member arms in one process at 1-8 rows on Flash-Next and DeepSeek geometry.
 - **A decode GEMV slot is bound by its own FMA and input path**, not the weight decode or DRAM, so deduplicating
   shared experts recovers only 4-7% of the expert kernels at 3-4 rows.
 - **GLM's one-row decode GEMVs are latency-bound, not ALU-bound**: two tiles per group and two k-tiles per iteration
@@ -324,6 +328,18 @@ the DSpark stage bank; about 5 ms off a 6-row verify. Live, interleaved per swee
 the ubench, every row picks the same six: 273/395/515/734/1065 us at rows 2..6, level with distinct experts), so the slot
 is bound by its own prepare and FMA path and a grouped-by-expert kernel can only save the weight-decode share (about 1.6 us
 of ~26 us a pick), as MiMo's two-member grouping found (4-7%). The one-row chain keeps the fused prepare.
+
+**Verify rows decode each distinct expert once** (`groupFor` in `rate_groups.zig`; prepared chain, 2 to 16 rows, up to 512
+slots): the pair and down kernels of the chain are the expert-grouped ones (see "Verify rows share an expert's weight reads" above),
+rewritten per rate class like the one-slot kernels. The slots of one expert share a slot id and so a rate class; the
+threadgroup that leads them reads and decodes each weight once and feeds every member in the one-slot order, as a pair
+(bucket 2, two output tiles per threadgroup): an expert picked by three rows is led twice. Buckets 4 and 8 halve the
+tiles per threadgroup and measured live (real pack, DSpark sweep, median verify ms, grouped / per-slot) 5 / 7 / 14%
+slower at 5 / 6 / 8 rows, level at 2 to 4, so they are built and byte-tested but not served.
+Tested bit-exact against the one-slot chain (`group_force = 0`) at 2 to 16 rows, random, all-rows-equal, disjoint and
+core-plus-private routes, PAIR1 and SPEC1, four rate groups with a mixed gate/up/down class, every bucket forced.
+The saving is the weight
+decode and trellis read of the repeats, bounded by the unit measurement above (decode is about 1.6 us of a ~26 us pick).
 
 Every row has a kernel; nothing falls to a generic reader (`every admitted rate takes the fast arms` covers n26). The
 indexer's `weights_proj` (32 x 5120) stays FP8 off the 128 grid.

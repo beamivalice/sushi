@@ -318,6 +318,15 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   for about 1.3 accepted tokens; the adaptive round matches serial there (the drafts of a novel text are worth about what their rows
   cost) and takes 70-90% of the rounds as 1-row steps. A one-row step through the verify path decodes at 32 tok/s warm at 1k, 4k and
   16k, above the 27.5 of `--no-mtp` (different boots: unconfirmed).
+- **Queued routed chains and paired verify rows** (the shipped STQ 1.75bpw pack, M5 Max, budget 110, `--ctx-size 65536`,
+  `taskpolicy -a`, one A then one B per boot, die under 50 °C, a 5.4k-token prompt, 600 greedy tokens; base main `0e165e29`):
+  `--no-mtp` serial 31.7 -> 39.8 tok/s (28-32 -> 22-24 ms a token), greedy text byte-identical. A Metal trace of the
+  serial step before: GPU busy 61%, one idle gap of ~280 us per layer (~110 us host turnaround, ~170 us from commit to
+  GPU start on an empty queue); with the queued chains 72% and ~16 gaps a token (38.4 tok/s), and with the head, Engram
+  layers, DSpark commit and rebuild cap no longer settling first, 39.8. Verify ms by forced R (DSpark
+  sweep, same prompt, text byte-identical across arms) before / after: R1 36.8 / 24.9, R2 47.5 / 36.4, R3 53.8 / 44.0,
+  R4 63.2 / 53.5, R5 72.0 / 61.9, R6 80.5 / 68.2, R8 97.6 / 84.9. Pairing rows that share an expert gives 3-7% of that at
+  2-8 rows. 200 MLX ops per command buffer instead of 50 changed nothing (28.3 vs 27.8 tok/s).
 
 Differences from mlx-serve: the attention-output fp8 round trip stays (upstream drops it), the verify block takes the same
 masked argmax as serial decode, and a verify is not split from the draft with a host sync per Markov step (the chain is
@@ -347,7 +356,26 @@ so the host builds the next layer while the GPU runs this one. On an STQ pack th
 the shared expert is queued behind them (the GPU runs it while the host reads the picks and fills the misses). The next
 layer's picks depend on this layer, so their read is the one host wait per layer and no union slab is refilled under a
 reader. `Model.sync_layers` (tests) waits at every layer instead; the two schedules give the same bytes through hits,
-misses and the union. Kernel shapes, arms and timings:
+misses and the union.
+
+STQ decode also queues the routed chain before the picks are read (`Model.route_spec`, `Experts.Spec`, the Qwen schedule
+of [engine-expert-streaming](engine-expert-streaming.md#decode-schedule)): `StqStream.queue` takes the slot of each pick
+from the layer's GPU map (expert to global slot of its rate group's pool, -1 as slot 0 where not cached) and builds the
+chain at once, so the host is a layer ahead of its reads. `passLayer` settles the previous layer after submitting the
+current one (`settleRecord`): `StqStream.settle` reads the picks, resolves them in the pools and returns null when every
+pick sat in the slot the GPU read, else the exact sum. A miss rebuilds the layer's output (`hcExpand` over the saved
+stream, `Unresolved`), restores what the successor's pass changed (`Undo`: the open pooling group, the verify copies, the
+compressed/index row counts and, over several rows, the window ring, because a later row's write can land on a slot an
+earlier row still reads; a one-row pass's ring slot and appended rows are written again at the same places) and runs the
+successor again. Only the settle touches the cache, so a discarded route moves no LRU or stat. The picks of a layer
+are verified against the pool before any later layer's, so a DSpark target, a verify round's rows and the state arrays
+of a kept layer never come from a wrong sum. An Engram layer is rebuilt from the rows its pass read once
+(`Pass.engram_rows`). A layer the stream cannot queue (resident, released, lossy pick) settles its predecessor first; a
+pass that rebuilt 3 layers plus a third of those built (`Model.route_spec_rebuilds`) stops queueing. A decode pass does
+not wait for its embedding, and queues the head from the last layer's queued sum before settling it (a rebuild builds the
+head again), so the GPU's only idle points are the logits read and the host's sampling. The bytes equal
+the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
+round's kept rows ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
 
 | Proof (`DSV41_STQ_TINY`, a pack made from the `--geometry stq` fixture) | Bar |
@@ -425,7 +453,37 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
 - **Checkpoints** come from the Qwen schedule: absolute multiples of the stride (at least the prefill chunk, 8192 by
   default) and the prompt-end snapshot 30 tokens before the end, where the next turn's re-rendered generation prefix
   still matches. At most 4 per entry, per prefill and per SSD entry (`dsv41_prefix.checkpoint_cap`): each is a full
-  copy, about 890 B a token plus the fixed rings.
+  copy, about 890 B a token plus the fixed rings. The thinning drops the interior point whose neighbours are closest
+  and always keeps the oldest and the newest, so the newest point written (below) survives until a later turn adds one.
+- **A thinking request with tools writes one more point mid-decode, right behind its `</think>`**
+  (`scheduler.writeDsv41ThoughtPoint`; DSpark rounds and an SSD-first tier only). With tools the template re-renders an
+  earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the
+  generated tokens through the closer and the 5-20k tokens of a long thought need no re-prefill. A round that would
+  commit past the closer is cut to end on it (`Generator.dspark_round_ends_at`: fewer verify rows, the pending token
+  still the trunk's own), so the state stands exactly behind it; the point is staged like an SSD-first prefill point
+  (`HotPrefixCache.writeDecodePointDsv41`: shared rows, released before the next forward) and logs
+  `[dsv41-prefix] restore points to SSD at P: X GB staged, decode held T ms`. Its bill is the prefill's
+  (`dsv41CheckpointReserve`: the writer permit and one set of fixed rings, held by the request's admission bill), so it
+  needs a prompt of the SSD floor (512 tokens) and checkpointing on. It is skipped for a thought under 512 tokens (the
+  prompt-end snapshot's re-prefill is cheaper) and for one whose first or last token is `\n` or a space, which the
+  server trims off the delivered `reasoning_content`. A client must send `reasoning_content` back verbatim, as the
+  server delivered it. Serial decode (no DSpark) leaves the state one
+  token ahead of the emitted ones and a RAM tier keeps points on the commit's list, so neither writes it.
+  What a later prompt repeats of a generated turn (`dsv41 replay` test, the pack's `tokenizer.json`, the real template,
+  `splitThinkBlock` and `parseToolCalls`):
+
+  | turn | generated tokens the next prompt repeats |
+  |---|---|
+  | thinking, tools: content, a call with string parameters (code, quotes, backslashes included), a plain answer | all |
+  | thinking, tools: a call with a JSON array parameter | through the call's first parameter; `tojson` spaces the items |
+  | thinking, tools: the thought ends in `\n` | up to the `\n`, one token short of the closer |
+  | thinking, no tools | none: the earlier turn is opened `</think>`, not `<think>` |
+  | chat mode | all |
+
+  So the closer is the one position every tools turn shares. The end of the generation is no second point: a tail
+  that differs voids the whole point (a restore cannot pass the first differing token), whether it differs depends on
+  the call's parameter types, the server's argument coercion and the client, and under the cap of 4 the end point
+  would thin the thought point out (the smallest span), turning a miss into the loss of the whole thought.
 - **Equal to cold** means bit for bit when both run the same chunks from the restore point on: the tiny pack's logits
   (bf16, QAT on and off) over odd-width prefill chunks, decode, a verify round and its rollback, and the state they end
   in, are identical bytes, from RAM and from an SSD file written by one tier and read by a fresh one. A restore off the

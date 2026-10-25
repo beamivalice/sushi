@@ -173,6 +173,25 @@ pub const Experts = union(enum) {
         release: *const fn (ctx: *anyopaque) void,
         /// Profiling: the stream's cumulative host time (SSD reads and cache copies), in ns.
         host_ns: ?*const fn (ctx: *anyopaque) u64 = null,
+        /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
+        spec: ?Spec = null,
+    };
+
+    pub const Spec = struct {
+        /// Whether layer `layer` can queue its chain from the stream's cache map.
+        can: *const fn (ctx: *anyopaque, layer: usize) bool,
+        /// The routed sum plus `shared` (as `Hook.apply`) over the slots the map holds for the picks `idx`, with no host
+        /// read; `map` is the host copy of that map, kept until the layer is settled.
+        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) anyerror!Queued,
+        /// The host's side of a queued layer: null when every pick sat in the slot the GPU read, else the exact sum.
+        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A, map: []const i32) anyerror!?A,
+    };
+
+    pub const Queued = struct {
+        out: A,
+        /// The picks as int32, already submitted: the settle reads this array, never a node built after the layer.
+        idx: A,
+        map: []const i32,
     };
 
     pub const Lease = struct { banks: BankSet, local: A };
@@ -606,6 +625,12 @@ pub const Model = struct {
     pack_kv: bool = true,
     /// Tests: each layer completes on the GPU before the next is built, the decode schedule's reference.
     sync_layers: bool = false,
+    /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
+    /// reads its picks (`Experts.Spec`); off, it waits for them.
+    route_spec: bool = true,
+    /// Layers a pass may rebuild, plus a third of the layers built so far, before it stops queueing: a cold pool misses
+    /// on most layers, and each miss costs the successor's work twice.
+    route_spec_rebuilds: u32 = 3,
     /// CED: the decoder's first layer (`Config.cedSplit`); null where the layout has none (and in tests, the full
     /// forward a CED prefill's encoder state is checked against).
     ced_split: ?usize = null,
@@ -1540,6 +1565,9 @@ const Shared = struct {
     floor: ?usize = null,
     /// `[L]` bool, the chunk's rows inside an image span (none for text): borrowed from the pass.
     img: A = none,
+    /// The layer being built queues its routed chain from the cache map, and the record it leaves for `settleRecord`.
+    spec_on: bool = false,
+    spec: ?Unresolved = null,
 
     fn init(gpa: std.mem.Allocator, spans: usize) !Shared {
         const t = try gpa.alloc(A, spans);
@@ -1551,6 +1579,7 @@ const Shared = struct {
     }
 
     fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
+        if (self.spec) |*u| u.deinit();
         for (self.topk) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
@@ -1937,7 +1966,8 @@ fn sharedExpert(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !A {
     return ly.shared[2].apply(sc, act);
 }
 
-fn moe(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !A {
+fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
+    const img = sh.img;
     const c = &m.cfg;
     const ly = &m.layers[li];
     const r = try router(sc, m, li, h, img);
@@ -1952,6 +1982,14 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !A {
             .resident => return error.Dsv41StqExpertsStream,
             .hook => |hk| hk,
         };
+        if (sh.spec_on) {
+            const sy = try sharedExpert(sc, m, ly, h);
+            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, sy);
+            const out = try sc.astype(q.out, m.act);
+            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts), .sy = sc.out(sy) };
+            try submit(out);
+            return out;
+        }
         // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
@@ -2069,8 +2107,14 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     const y = blk: {
         var fsc = Scope.init(sc.a, sc.s);
         defer fsc.deinit();
-        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh.img)));
+        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh)));
     };
+    if (sh.spec) |*u| {
+        u.x1 = sc.out(x1);
+        u.post = sc.out(sf.post);
+        u.comb = sc.out(sf.comb);
+        u.pre = sc.out(sf.pre);
+    }
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
     return .{ .x = sc.out(try hcExpand(sc, x1, y, sf.post, sf.comb)), .pre = sc.out(sf.pre) };
 }
@@ -2315,8 +2359,18 @@ pub const Pass = struct {
     engram_pf: ?*engram.Prefetch = null,
     /// `[L]` bool, the rows inside an image span (none for text): they route by the image bias and take no Engram write.
     img: A = none,
+    /// The last layer built, when its routed chain was queued from the cache map and the host has not checked it yet.
+    unresolved: ?Unresolved = null,
+    /// Each Engram layer's rows, read once per pass: a rebuilt layer reuses them.
+    engram_rows: [cfg_mod.max_engram]A = @splat(none),
+    /// Layers this pass rebuilt after a pick missed the map: past `Model.route_spec_rebuilds` it waits for every layer's picks.
+    rollbacks: u32 = 0,
 
     pub fn deinit(self: *Pass, gpa: std.mem.Allocator) void {
+        if (self.unresolved) |*u| u.deinit();
+        for (self.engram_rows) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
         if (self.engram_pf) |pf| pf.finish();
         if (self.img.ctx != null) _ = mlx.mlx_array_free(self.img);
         gpa.free(self.rows);
@@ -2397,12 +2451,212 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     const first = try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0));
     const cpre = sc.out(try sc.broadcast(try sc.astype(first, .float32), &.{ ci(L), ci(hc) }));
     errdefer _ = mlx.mlx_array_free(cpre);
-    try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
+    // A decode-width pass builds layer 0 on these lazily: the embedding is a few microseconds of GPU work.
+    if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
     return .{ .st = st, .ids = ids, .p0 = p0, .span = span, .rows = rows, .x = x, .cpre = cpre, .sh = try Shared.init(gpa, (L + span - 1) / span), .img = img };
 }
 
-/// Layer `li` over the pass's rows, evaluated, with the new state arrays.
+/// Diagnostic (`SUSHI_DSV41_READ_DIAG`): the blocking host reads of decode-width forwards by site, printed at debug
+/// level as the mean of 64 forwards. `settle_last` is a layer settled before its successor was built.
+pub const ReadSite = enum { settle, settle_last, picks_sync, engram, state, head };
+const read_sites = std.meta.tags(ReadSite).len;
+var read_diag = false;
+var read_n: [read_sites]u64 = @splat(0);
+var read_ns: [read_sites]u64 = @splat(0);
+var read_forwards: u64 = 0;
+/// The site the next settle read is booked to.
+pub var settle_site: ReadSite = .settle;
+
+pub fn setReadDiag(on: bool) void {
+    read_diag = on;
+}
+
+/// A timestamp for `readDone`, 0 while the diagnostic is off.
+pub fn readStart() u64 {
+    if (!read_diag) return 0;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(std.Io.Timestamp.now(io, .boot).nanoseconds);
+}
+
+pub fn readDone(site: ReadSite, t0: u64) void {
+    if (!read_diag) return;
+    read_n[@intFromEnum(site)] += 1;
+    read_ns[@intFromEnum(site)] += readStart() -| t0;
+}
+
+fn reportReads(L: usize) void {
+    if (!read_diag or L > exl3.kernels.DECODE_ROWS_MAX) return;
+    read_forwards += 1;
+    if (read_forwards < 64) return;
+    if (log.isDebug()) {
+        const f: f64 = @floatFromInt(read_forwards);
+        inline for (std.meta.tags(ReadSite), 0..) |site, i| {
+            log.debug("[dsv41] reads/forward {s}: {d:.2} blocking, {d:.3} ms (mean of 64)\n", .{ @tagName(site), @as(f64, @floatFromInt(read_n[i])) / f, @as(f64, @floatFromInt(read_ns[i])) / 1e6 / f });
+        }
+    }
+    read_n = @splat(0);
+    read_ns = @splat(0);
+    read_forwards = 0;
+}
+
+/// A decode-width layer whose routed chain was queued from the stream's cache map before the host read its picks. The
+/// host checks it once the next layer is submitted (`Experts.Spec.settle`); a miss rebuilds the layer from its exact sum
+/// and the successor from there. The arrays are what that rebuild reads.
+const Unresolved = struct {
+    li: usize,
+    map: []const i32,
+    h: A,
+    idx: A,
+    wts: A,
+    sy: A,
+    x1: A = none,
+    post: A = none,
+    comb: A = none,
+    pre: A = none,
+
+    fn deinit(self: *Unresolved) void {
+        for ([_]A{ self.h, self.idx, self.wts, self.sy, self.x1, self.post, self.comb, self.pre }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+    }
+};
+
+pub var spec_kept: u64 = 0;
+pub var spec_rebuilt: u64 = 0;
+
+fn handle(x: A) A {
+    if (x.ctx == null) return none;
+    var o = mlx.mlx_array_new();
+    _ = mlx.mlx_array_set(&o, x);
+    return o;
+}
+
+/// What a successor of an unresolved layer changes that its rebuild does not overwrite: the open pooling group (replaced,
+/// not written in place), the row counts and, for a chunk of several rows, the window ring (a row's write can land on a
+/// slot an earlier row of the chunk still reads). A one-row pass writes only the slot of a position that left the window,
+/// and the rows it appends are written again at the same places.
+const Undo = struct {
+    st: *State,
+    li: usize,
+    ring: A,
+    comp_used: usize,
+    idx_used: usize,
+    pend_kv: A,
+    pend_gate: A,
+    verify_kv: A,
+    verify_gate: A,
+
+    fn take(st: *State, li: usize, rows: usize) Undo {
+        const ls = &st.layers[li];
+        const v = if (st.verify) |*vv| vv else null;
+        return .{
+            .st = st,
+            .li = li,
+            .ring = if (rows > 1) handle(ls.win.buf) else none,
+            .comp_used = if (ls.comp) |r| r.used else 0,
+            .idx_used = if (ls.idx_k) |r| r.used else 0,
+            .pend_kv = handle(ls.pend_kv),
+            .pend_gate = handle(ls.pend_gate),
+            .verify_kv = if (v) |vv| handle(vv.pend_kv[li]) else none,
+            .verify_gate = if (v) |vv| handle(vv.pend_gate[li]) else none,
+        };
+    }
+
+    fn give(slot: *A, saved: *A) void {
+        if (slot.ctx != null) _ = mlx.mlx_array_free(slot.*);
+        slot.* = saved.*;
+        saved.* = none;
+    }
+
+    fn restore(self: *Undo) void {
+        const ls = &self.st.layers[self.li];
+        if (self.ring.ctx != null) give(&ls.win.buf, &self.ring);
+        if (ls.comp) |*r| r.used = self.comp_used;
+        if (ls.idx_k) |*r| r.used = self.idx_used;
+        give(&ls.pend_kv, &self.pend_kv);
+        give(&ls.pend_gate, &self.pend_gate);
+        if (self.st.verify) |*v| {
+            give(&v.pend_kv[self.li], &self.verify_kv);
+            give(&v.pend_gate[self.li], &self.verify_gate);
+        }
+    }
+
+    fn deinit(self: *Undo) void {
+        for ([_]A{ self.ring, self.pend_kv, self.pend_gate, self.verify_kv, self.verify_gate }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+    }
+};
+
+/// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
+fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
+    if (!m.route_spec or m.sync_layers or p.ids.len > exl3.kernels.DECODE_ROWS_MAX or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
+    if (m.trace != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
+    const hk = switch (m.experts) {
+        .resident => return false,
+        .hook => |hk| hk,
+    };
+    const sp = hk.spec orelse return false;
+    return sp.can(hk.ctx, li);
+}
+
+/// The host's check of an unresolved layer: null when its queued chain stands, else the layer's exact output stream.
+fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
+    const hk = m.experts.hook;
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    const t0 = readStart();
+    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, u.sy, u.map);
+    readDone(settle_site, t0);
+    if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
+    if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });
+    if (sum == null) return null;
+    return sc.out(try hcExpand(&sc, u.x1, try sc.astype(sum.?, m.act), u.post, u.comb));
+}
+
+/// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
+fn settleLast(m: *const Model, p: *Pass) !bool {
+    var u = p.unresolved orelse return false;
+    p.unresolved = null;
+    defer u.deinit();
+    settle_site = .settle_last;
+    defer settle_site = .settle;
+    const exact = try settleRecord(m, &u) orelse return false;
+    _ = mlx.mlx_array_free(p.x);
+    p.x = exact;
+    return true;
+}
+
+/// Layer `li` over the pass's rows, evaluated, with the new state arrays. At decode widths the layer's routed chain is
+/// queued from the stream's cache map and the previous layer's is checked after this one is submitted, so the host
+/// never waits on a layer's own picks; a miss in the previous layer rebuilds this one from its exact output.
 pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
+    const on = specOn(m, p, li);
+    // A layer that cannot queue from the map starts from its predecessor's exact output.
+    if (p.unresolved != null and !on) _ = try settleLast(m, p);
+    var prior = p.unresolved;
+    p.unresolved = null;
+    defer if (prior) |*u| u.deinit();
+    var undo: ?Undo = if (prior != null) Undo.take(p.st, li, p.ids.len) else null;
+    defer if (undo) |*u| u.deinit();
+    p.sh.spec_on = on;
+    try buildLayer(m, p, li);
+    if (prior == null) return;
+    const u = &prior.?;
+    const exact = try settleRecord(m, u) orelse return;
+    if (p.unresolved) |*next| next.deinit();
+    p.unresolved = null;
+    undo.?.restore();
+    _ = mlx.mlx_array_free(p.x);
+    _ = mlx.mlx_array_free(p.cpre);
+    p.x = exact;
+    p.cpre = handle(u.pre);
+    p.rollbacks += 1;
+    try submit(p.x);
+    return passLayer(m, p, li);
+}
+
+fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     const gpa = m.gpa;
     if (p.tail) |t| if (li == m.ced_split.?) {
         try cedReplay(m, p, li, t);
@@ -2425,11 +2679,16 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
         const t0 = std.Io.Timestamp.now(io, .boot);
         defer m.engram_wait_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
-        const table_rows = if (p.engram_pf) |pf| blk: {
-            const raw = try pf.take(p.p0, ei, 0);
-            defer raw.deinit(gpa);
-            break :blk try sc.keep(try e.table.dequant(raw, mine.len, m.s));
-        } else try sc.keep(try e.table.gather(gpa, mine, m.s)); // [L * cols, head_dim]
+        if (p.engram_rows[ei].ctx == null) {
+            const rt = readStart();
+            defer readDone(.engram, rt);
+            p.engram_rows[ei] = if (p.engram_pf) |pf| blk: {
+                const raw = try pf.take(p.p0, ei, 0);
+                defer raw.deinit(gpa);
+                break :blk sc.out(try sc.keep(try e.table.dequant(raw, mine.len, m.s)));
+            } else sc.out(try sc.keep(try e.table.gather(gpa, mine, m.s))); // [L * cols, head_dim]
+        }
+        const table_rows = p.engram_rows[ei];
         const nx = sc.out(try engramWrite(&sc, m, e, p.x, table_rows, p.img));
         _ = mlx.mlx_array_free(p.x);
         p.x = nx;
@@ -2439,6 +2698,7 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
     // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
     const wait = m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX;
     if (p.st.ds.len > 0) for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| if (tl == li) {
+        if (p.targets[t].ctx != null) _ = mlx.mlx_array_free(p.targets[t]);
         p.targets[t] = sc.out(try sc.astype(try sc.mean(try sc.astype(p.x, .float32), 1, false), m.act));
         try if (wait) mlx.check(mlx.mlx_array_eval(p.targets[t])) else submit(p.targets[t]);
     };
@@ -2448,6 +2708,8 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
     _ = mlx.mlx_array_free(p.cpre);
     p.x = out.x;
     p.cpre = out.pre;
+    p.unresolved = p.sh.spec;
+    p.sh.spec = null;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, p.x);
@@ -2467,6 +2729,17 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
 pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
     const c = &m.cfg;
     const L = p.ids.len;
+    // The head is queued before the host checks the last layer, so the GPU goes from that layer to the logits; a miss
+    // there builds the head again from the exact stream.
+    const queued = p.unresolved != null and prof(m, L) == null;
+    var res = if (queued) try queuedHead(m, p, want) else none;
+    errdefer if (res.ctx != null) {
+        _ = mlx.mlx_array_free(res);
+    };
+    if (try settleLast(m, p) and queued) {
+        _ = mlx.mlx_array_free(res);
+        res = none;
+    }
     reportEngramWait(m, L);
     p.st.n = p.p0 + L;
     if (p.st.ds.len > 0) {
@@ -2475,23 +2748,39 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         const main_rows = try msc.concat(p.targets[0..c.dspark.n_targets], -1); // [L, targets * dim]
         if (p.st.verify) |*v| {
             v.mh = msc.out(main_rows);
+            const t0 = readStart();
+            defer readDone(.state, t0);
             try mlx.check(mlx.mlx_array_eval(v.mh));
-        } else try commitMain(&msc, m, p.st, main_rows, p.p0);
+        } else try commitMain(&msc, m, p.st, main_rows, p.p0, L > exl3.kernels.DECODE_ROWS_MAX);
     }
-    var sc = Scope.init(m.gpa, m.s);
-    defer sc.deinit();
-    const xs = if (want == .last) try sc.slice(p.x, 0, L - 1, L) else p.x;
-    const ps = if (want == .last) try sc.slice(p.cpre, 0, L - 1, L) else p.cpre;
-    const hn = try sc.rms(try hcCollapse(&sc, xs, ps), m.norm, c.eps);
-    const logits = try m.head.apply(&sc, try sc.astype(hn, .float32));
-    const res = sc.out(logits);
-    errdefer _ = mlx.mlx_array_free(res);
+    if (res.ctx == null) res = try headLogits(m, p, want);
     if (prof(m, L)) |pf| {
         pf.restart();
         try pf.mark(.head, &.{res});
         pf.report(L, p.p0);
     }
+    const t0 = readStart();
+    defer readDone(.head, t0);
     try mlx.check(mlx.mlx_array_eval(res));
+    reportReads(L);
+    return res;
+}
+
+fn headLogits(m: *Model, p: *const Pass, want: Want) !A {
+    const L = p.ids.len;
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    const xs = if (want == .last) try sc.slice(p.x, 0, L - 1, L) else p.x;
+    const ps = if (want == .last) try sc.slice(p.cpre, 0, L - 1, L) else p.cpre;
+    const hn = try sc.rms(try hcCollapse(&sc, xs, ps), m.norm, m.cfg.eps);
+    return sc.out(try m.head.apply(&sc, try sc.astype(hn, .float32)));
+}
+
+/// `headLogits`, submitted.
+fn queuedHead(m: *Model, p: *const Pass, want: Want) !A {
+    const res = try headLogits(m, p, want);
+    errdefer _ = mlx.mlx_array_free(res);
+    try submit(res);
     return res;
 }
 
@@ -2596,7 +2885,7 @@ pub fn extend(m: *Model, ids: []const u32, want: Want) !A {
 
 /// The stages' window rows for the committed positions [p0, p0 + n): the target layers' main stream
 /// `main_norm(main_proj(rows))`, `rows` `[n, targets * dim]`, through each stage's own key path.
-fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize) !void {
+fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, wait: bool) !void {
     const ds = &m.dspark.?;
     const n = dim(rows, 0);
     const main_x = try sc.rms(try ds.main_proj.apply(sc, rows), ds.main_norm, m.cfg.eps);
@@ -2609,6 +2898,13 @@ fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize) !void {
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(sc.a);
     for (st.ds) |r| try ev.append(sc.a, r.buf);
+    if (!wait) {
+        const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        return mlx.check(mlx.mlx_async_eval(vec));
+    }
+    const t0 = readStart();
+    defer readDone(.state, t0);
     try evalAll(ev.items);
 }
 
@@ -2755,7 +3051,7 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
         st.n = end;
         if (st.hist.items.len > end) st.hist.shrinkRetainingCapacity(end);
     }
-    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep), v.n0);
+    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep), v.n0, true);
 }
 
 /// DSpark stage `si`'s routed experts as trellis banks, `mtp.<si>.mlp.switch_mlp.<P>[.g<N>].{trellis,suh,svh}`, held as one
@@ -3282,11 +3578,11 @@ test "dsv41 DSpark: with the QAT round trips on, the stages draft the reference'
     // The trunk's own rounding flips would move the main rows, so the reference's rows feed the stages directly.
     const st = try ensureState(m);
     const prefill_rows = fx.get("ds_mh_prefill").?;
-    try commitMain(&sc, m, st, prefill_rows, 0);
+    try commitMain(&sc, m, st, prefill_rows, 0, true);
     st.n = dim(prefill_rows, 0);
     const step_rows = fx.get("ds_mh").?;
     for (0..dim(step_rows, 0)) |k| {
-        try commitMain(&sc, m, st, try sc.slice(step_rows, 0, k, k + 1), st.n);
+        try commitMain(&sc, m, st, try sc.slice(step_rows, 0, k, k + 1), st.n, true);
         st.n += 1;
         var d = try draft(m, t1[k], true);
         defer d.deinit();

@@ -173,9 +173,10 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 - The breakdown line's `copy_ms` / `unions` time the host copies of a union route: cached hits copied into the
   workspace and admitted misses copied back. A read-ahead (the next router on this layer's rows) was measured and cut:
   it guessed about a quarter of a 1024-row chunk's picks and did not move cold prefill.
-- **Off for grouped layers**: the speculative expert queue (`specRoute`) runs on a uniform cache map only; a grouped
-  layer takes the non-speculative path. The lossy pick reaches DeepSeek's grouped layers through
-  `Engine.swapGroupedMisses` (below). The load-time warm preloads the lowest expert ids, which fill group 0 first.
+- **Grouped layers queue from their own map**: `specRoute` serves a uniform cache map only; a rate-grouped layer's map
+  is `Engine.specGrouped` (the global slot of each ready expert of its pools, one GPU copy per layer, refreshed with
+  its host copy), used by DeepSeek-V4.1 STQ ([dsv41-arch](dsv41-arch.md#stq)). The lossy pick reaches DeepSeek's grouped
+  layers through `Engine.swapGroupedMisses` (below) and keeps the waiting schedule. The load-time warm preloads the lowest expert ids, which fill group 0 first.
 - Rate groups on MiMo stay resident-only; GLM serves none.
 
 ## Decode schedule
@@ -184,10 +185,17 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   submitted with `mlx_async_eval` as soon as it is built, and at decode widths (<= 16 rows) the shared expert is
   submitted between the ids and the blocking read, so the GPU runs it during the host round trip. Same ops, same
   order; output is bit-identical.
-- DeepSeek-V4.1 STQ (`dsv41_stream.StqStream`) keeps the same one wait per layer without the speculative queue: picks
-  submitted, shared expert queued behind them, routed chain and layer output submitted ([dsv41-arch](dsv41-arch.md#stq)).
-  Its breakdown line carries the picks wait as `idswait_ms` (the GPU's attention of the layer) and the routed chain's
-  host build as `compute_ms`; `fill_ms` is the SSD reads, `other_ms` the rest of the host's build and the GPU's tail.
+- DeepSeek-V4.1 STQ (`dsv41_stream.StqStream`) at decode widths queues each layer's routed chain from its GPU map
+  (`Engine.specGrouped`) and the host settles it one layer late, after the next layer is submitted: it reads the picks,
+  resolves them in the pools (`prepareHost`: fills, LRU and stats move here only) and keeps the queued chain when
+  `specMatches` holds, else builds the exact chain and the successor is rebuilt from it. At most one layer is
+  unresolved; a union route, a wide chunk, `sync_layers`, tracing/profiling, a lossy pick and a pass that has already
+  rebuilt 3 layers plus a third of the layers built take the waiting schedule (picks submitted, shared expert queued behind them, one
+  host read per layer). The breakdown line's `idswait_ms` is the settle's wait
+  for a layer's picks, `compute_ms` the exact chain's build (miss only), `fill_ms` the SSD reads.
+  `[dsv41] route-spec: N layers kept, M rebuilt` is the engagement line ([dsv41-arch](dsv41-arch.md#stq)).
+  `SUSHI_DSV41_READ_DIAG=1` counts the blocking host reads of a decode forward by site (`settle`, `settle_last`,
+  `picks_sync`, `engram`, `state`, `head`) and logs their mean per forward at debug level every 64 forwards.
 - At decode widths each layer's experts are queued from a GPU copy of the cache map (`Engine.specRoute`: expert →
   slot, -1 where not ready) before the host reads the router ids. The host keeps that result only when every routed
   id resolved to the slot the GPU gathered (`specMatches`), else rebuilds it; a union workspace always rebuilds. The

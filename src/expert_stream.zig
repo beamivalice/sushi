@@ -1379,6 +1379,11 @@ const GroupedLayer = struct {
         return self;
     }
 
+    fn expertCount(self: *const GroupedLayer) usize {
+        const last = self.groups.count - 1;
+        return @as(usize, self.groups.base[last]) + self.groups.experts[last];
+    }
+
     fn expertBytes(self: *const GroupedLayer, g: usize) u64 {
         return self.groups.expertBytes(g, self.hidden, self.inter);
     }
@@ -1524,14 +1529,15 @@ const LayerState = struct {
     /// changes together: a failure leaves no GPU map and a host map that forces
     /// the next call to rebuild.
     fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator) !void {
-        const experts = self.cache.expert_to_slot.len;
+        const experts = if (self.grouped) |gl| gl.expertCount() else self.cache.expert_to_slot.len;
         if (self.spec_host.len != experts) {
             if (self.spec_host.len != 0) allocator.free(self.spec_host);
             self.spec_host = &.{};
             self.spec_host = try allocator.alloc(i32, experts);
             @memset(self.spec_host, -2);
         }
-        if (!refreshSpecMap(self.cache.expert_to_slot, self.cache.ready, self.spec_host) and self.spec_slots.ctx != null) return;
+        const changed = if (self.grouped) |gl| refreshGroupedSpecMap(gl, self.spec_host) else refreshSpecMap(self.cache.expert_to_slot, self.cache.ready, self.spec_host);
+        if (!changed and self.spec_slots.ctx != null) return;
         errdefer {
             if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
             self.spec_slots = .{ .ctx = null };
@@ -1569,6 +1575,23 @@ pub fn refreshSpecMap(expert_to_slot: []const i32, ready: []const bool, out: []i
         if (cached.* != now) {
             cached.* = now;
             changed = true;
+        }
+    }
+    return changed;
+}
+
+/// `refreshSpecMap` for a rate-grouped layer: the GLOBAL slot of each expert (its pool's base plus its slot).
+fn refreshGroupedSpecMap(gl: *const GroupedLayer, out: []i32) bool {
+    var changed = false;
+    for (0..gl.groups.count) |g| {
+        const cache = &gl.caches[g];
+        const base = gl.groups.base[g];
+        for (cache.expert_to_slot, 0..) |raw, local| {
+            const now: i32 = if (raw >= 0 and cache.ready[@intCast(raw)]) @as(i32, @intCast(gl.slot_base[g])) + raw else -1;
+            if (out[base + local] != now) {
+                out[base + local] = now;
+                changed = true;
+            }
         }
     }
     return changed;
@@ -2104,6 +2127,26 @@ pub const Engine = struct {
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
         return .{ .slots = layer.spec_slots, .raw = layer.spec_raw, .starved = layer.cache.swap_starved, .host = layer.spec_host, .operands = operands };
+    }
+
+    pub const GroupedSpec = struct {
+        /// int32 [experts]: the global slot per expert, 0 where the host map says -1.
+        slots: mlx.mlx_array,
+        /// The host map the check reads: -1 where an expert is not a ready hit of its pool.
+        host: []const i32,
+        bank: *const Ragged,
+    };
+
+    /// A rate-grouped layer's cache map on the GPU and the bank it indexes, so a decode forward can queue the routed
+    /// chain before the host reads the router ids (`specMatches` checks it). Null for a layer that is released,
+    /// resident (its own GPU map) or not rate-grouped.
+    pub fn specGrouped(self: *Engine, layer_index: u16) !?GroupedSpec {
+        if (layer_index >= self.layers.len) return null;
+        const layer = &self.layers[layer_index];
+        const gl = layer.grouped orelse return null;
+        if (!layer.active or layer.borrowed or layer.resident_map.ctx != null or layer.slabs.len != quant.component_count) return null;
+        try layer.refreshSpec(self.allocator);
+        return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &gl.cache_ragged };
     }
 
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
@@ -4777,6 +4820,34 @@ test "spec map follows the ready cache slots and reports changes" {
     try t.expect(refreshSpecMap(&expert_to_slot, &ready, &out));
     try t.expectEqualSlices(i32, &.{ 2, -1, 0, -1 }, &out);
     try t.expect(!refreshSpecMap(&expert_to_slot, &ready, &out));
+}
+
+test "a rate-grouped spec map holds the global slot of each ready expert of its pool and nothing else" {
+    const t = std.testing;
+    var groups: quant.LayerGroups = .{ .count = 2 };
+    groups.experts[0..2].* = .{ 3, 5 };
+    groups.base[1] = 3;
+    var gl: GroupedLayer = .{ .groups = groups, .hidden = 0, .inter = 0 };
+    gl.slots[0..2].* = .{ 2, 3 };
+    gl.slot_base[1] = 2;
+    gl.caches[0] = try GroupCache.init(t.allocator, 2, 3);
+    gl.caches[1] = try GroupCache.init(t.allocator, 3, 5);
+    gl.caches_made = 2;
+    defer gl.deinitCaches();
+    try t.expectEqual(@as(usize, 8), gl.expertCount());
+    var first = try gl.caches[0].resolve(t.allocator, &.{1});
+    defer first.deinit(t.allocator);
+    var second = try gl.caches[1].resolve(t.allocator, &.{ 0, 3 });
+    defer second.deinit(t.allocator);
+    var out: [8]i32 = @splat(-2);
+    // Admitted but not yet read from the SSD: no GPU read may use the slot.
+    try t.expect(refreshGroupedSpecMap(&gl, &out));
+    try t.expectEqualSlices(i32, &@as([8]i32, @splat(-1)), &out);
+    markResolvedReady(&gl.caches[0], &first);
+    markResolvedReady(&gl.caches[1], &second);
+    try t.expect(refreshGroupedSpecMap(&gl, &out));
+    try t.expectEqualSlices(i32, &.{ -1, 0, -1, 2, -1, -1, 3, -1 }, &out);
+    try t.expect(!refreshGroupedSpecMap(&gl, &out));
 }
 
 test "spec result is kept only when every id resolved to its gathered slot" {

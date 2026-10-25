@@ -27773,6 +27773,7 @@ fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const 
     errdefer mdl.deinit();
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
+    dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
     if (mdl.ced_split) |split|
         log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });
     const verify_profile = diagEnvOn("SUSHI_DSV41_VERIFY_PROFILE");

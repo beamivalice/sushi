@@ -48,6 +48,7 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const dsv41_prefix = @import("dsv41_prefix.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -6885,7 +6886,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
     // A chunk record covers a prefix, so it may claim only the media blocks inside it.
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, abs_kv_pos);
     if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s);
-    if (slot.model.transformer.?.dsv41 != null) return hc.writeThroughDsv41(&slot.cache, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s);
+    if (slot.model.transformer.?.dsv41 != null) return hc.writeThroughDsv41(&slot.cache, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s, "prefill");
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     hc.writeThroughHybrid(
@@ -7576,6 +7577,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    armDsv41ThoughtPoint(slot, &slot.legacy_gen.?, write_through_on and cp_stride > 0);
     publishHandoverToken(slot, &slot.legacy_gen.?);
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
@@ -8073,6 +8075,54 @@ fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []c
     return false;
 }
 
+/// DeepSeek: a thinking request with tools is re-rendered with its thought, so the state right behind the generated
+/// `</think>` is a restore point the next turn's prompt shares (docs/dsv41-arch.md#prefix-cache). Only a DSpark round
+/// leaves the state on the emitted tokens, and only an SSD-first prefill has a tier to hand the point to.
+fn armDsv41ThoughtPoint(slot: *Slot, gen: *Generator, tier_takes_points: bool) void {
+    if (!tier_takes_points or !gen.dspark or !slot.has_tools or !slot.enable_thinking) return;
+    if (slot.full_prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+    const tok = slot.model.tokenizer orelse return;
+    const open = tok.specialTokenId("<think>") orelse return;
+    const close = tok.specialTokenId("</think>") orelse return;
+    if (slot.full_prompt[slot.full_prompt.len - 1] != open) return;
+    gen.dspark_round_ends_at = close;
+}
+
+/// The round that committed `</think>` ended right behind it: its state goes to the SSD tier as one restore point.
+fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) void {
+    const close = gen.dspark_round_ends_at orelse return;
+    if (block.len == 0 or block[block.len - 1] != close) return;
+    gen.dspark_round_ends_at = null;
+    const generated = gen.generated_ids.items;
+    const thought = generated.len - 1;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
+    const xfm = slot.model.transformer orelse return;
+    const tok = slot.model.tokenizer orelse return;
+    const dsv = xfm.dsv41 orelse return;
+    if (thought < dsv41_prefix.min_thought_tokens) {
+        log.debug("[dsv41-prefix] no decode restore point: a {d}-token thought is cheaper to prefill than to keep\n", .{thought});
+        return;
+    }
+    const first = tok.decode(slot.allocator, generated[0..1], false) catch return;
+    defer slot.allocator.free(first);
+    const last = tok.decode(slot.allocator, generated[thought - 1 .. thought], false) catch return;
+    defer slot.allocator.free(last);
+    if (!dsv41_prefix.thoughtEdgesSurviveTrim(first, last)) {
+        log.info("[dsv41-prefix] no decode restore point: the thought starts or ends in whitespace the next prompt trims\n", .{});
+        return;
+    }
+    const pos = slot.full_prompt.len + generated.len;
+    if (slot.cache.step != pos) return;
+    const tokens = slot.allocator.alloc(u32, pos) catch return;
+    defer slot.allocator.free(tokens);
+    @memcpy(tokens[0..slot.full_prompt.len], slot.full_prompt);
+    @memcpy(tokens[slot.full_prompt.len..], generated);
+    const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, pos);
+    hc.writeDecodePointDsv41(&slot.cache, dsv, tokens, slot.has_tools, media, xfm.s) catch |err| {
+        log.warn("[dsv41-prefix] decode restore point not written: {s}\n", .{@errorName(err)});
+    };
+}
+
 fn thinkBoundFired(gen: *const Generator) bool {
     if (gen.think_closed_by_loop) return true;
     const tb = gen.sampling.think_bound orelse return false;
@@ -8126,6 +8176,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         }
         defer slot.allocator.free(result.?.tokens);
         publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
+        writeDsv41ThoughtPoint(slot, gen, result.?.tokens);
         return;
     }
     if (tick_mode == .mtp) {

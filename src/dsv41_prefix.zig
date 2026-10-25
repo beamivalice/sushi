@@ -92,6 +92,30 @@ pub fn namespaceTag(dspark: bool) []const u8 {
     return if (dspark) "dsv41-state-v1-dspark" else "dsv41-state-v1";
 }
 
+/// Thought tokens under which the prompt-end snapshot's re-prefill is cheap enough to skip a decode restore point.
+pub const min_thought_tokens: usize = 512;
+
+/// Whether the point behind a finished thought can match the next prompt. The server delivers the thought with
+/// "\n" and " " trimmed off both ends and the template re-renders it as delivered, so a thought whose first or last
+/// token carries one diverges from the generated tokens there.
+pub fn thoughtEdgesSurviveTrim(first_token: []const u8, last_token: []const u8) bool {
+    const trimmed = "\n ";
+    if (first_token.len > 0 and std.mem.indexOfScalar(u8, trimmed, first_token[0]) != null) return false;
+    if (last_token.len > 0 and std.mem.indexOfScalar(u8, trimmed, last_token[last_token.len - 1]) != null) return false;
+    return true;
+}
+
+test "thoughtEdgesSurviveTrim: a thought the server trims leaves no point" {
+    try std.testing.expect(thoughtEdgesSurviveTrim("The", "."));
+    try std.testing.expect(thoughtEdgesSurviveTrim("<", "tools"));
+    try std.testing.expect(!thoughtEdgesSurviveTrim("\nThe", "."));
+    try std.testing.expect(!thoughtEdgesSurviveTrim(" The", "."));
+    try std.testing.expect(!thoughtEdgesSurviveTrim("The", ".\n"));
+    try std.testing.expect(!thoughtEdgesSurviveTrim("The", " "));
+    // A tab is not trimmed.
+    try std.testing.expect(thoughtEdgesSurviveTrim("\tThe", ".\t"));
+}
+
 /// Checkpoints one entry or one prefill keeps: each is a full copy of the request's state.
 pub const checkpoint_cap: u32 = 4;
 

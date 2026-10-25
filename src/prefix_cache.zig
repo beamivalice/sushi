@@ -3250,10 +3250,11 @@ pub const HotPrefixCache = struct {
         if (floor) d.settleCheckpoints(d.last_store_id, cps);
     }
 
-    /// DeepSeek's prefill write-through: the request's restore points so far go to the SSD tier and every one of them
+    /// DeepSeek's write-through: the request's restore points so far go to the SSD tier and every one of them
     /// leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
     /// commit returns. Below the tier's floor nothing is written and the points stay for the commit.
-    pub fn writeThroughDsv41(self: *HotPrefixCache, cache: *transformer_mod.KVCache, prompt: []const u32, has_tools: bool, media: MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream) void {
+    /// `held` names the phase that waited on the writer, for the log.
+    pub fn writeThroughDsv41(self: *HotPrefixCache, cache: *transformer_mod.KVCache, prompt: []const u32, has_tools: bool, media: MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
         if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
         var pending = false;
         for (cps) |*cp| pending = pending or !cp.isReleased();
@@ -3270,7 +3271,15 @@ pub const HotPrefixCache = struct {
         self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
         for (cps) |*cp| cp.release();
         // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
-        log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, prefill held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
+        log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
+    }
+
+    /// The request's state at `tokens.len`, which must be where the model stands, as one restore point straight to the
+    /// SSD tier: shared rows, staged and released before the next forward appends.
+    pub fn writeDecodePointDsv41(self: *HotPrefixCache, cache: *transformer_mod.KVCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: MediaStamp, s: mlx.mlx_stream) !void {
+        var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(self.allocator, m, tokens.len)};
+        defer cps[0].deinit(self.allocator);
+        self.writeThroughDsv41(cache, tokens, has_tools, media, &cps, s, "decode");
     }
 
     /// Write the pending record whole and release it: its rows may be a finished request's own
@@ -14240,7 +14249,7 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
             _ = mlx.mlx_get_active_memory(&before);
             try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
             cache.step = at;
-            hc.writeThroughDsv41(&cache, first[0..at], false, .{}, cps.items, s);
+            hc.writeThroughDsv41(&cache, first[0..at], false, .{}, cps.items, s, "prefill");
             try testing.expect(cps.items[0].isReleased());
             _ = mlx.mlx_synchronize(s);
             var after: usize = 0;
@@ -14276,6 +14285,115 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[0..512], .last));
     const cold = try dsv41_model.extend(net.m, next[512..], .all);
     defer _ = mlx.mlx_array_free(cold);
+    try glm5_forward.expectArrayBits(cold, warm);
+}
+
+test "DeepSeek decode point: a restore point taken mid-decode serves the next turn from RAM and from an SSD file, like cold on the same grid (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    const first_len = 600;
+    var first_buf: [first_len]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    // The turn generates 40 tokens one forward at a time; the thought ends after 24 and the reply goes on to 40.
+    var gen: [40]u32 = undefined;
+    for (&gen, 0..) |*t, i| t.* = (net.ids[(i * 7 + 1) % net.ids.len] + 3) % 90;
+    const point = first_len + 24;
+    // The next turn re-renders the thought, then goes its own way.
+    var next_buf: [point + 60]u32 = undefined;
+    @memcpy(next_buf[0..first_len], first);
+    @memcpy(next_buf[first_len..point], gen[0..24]);
+    for (next_buf[point..], point..) |*t, i| t.* = (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    var want_point: SSMCheckpoint = undefined;
+    var ram = HotPrefixCache.init(testing.allocator, 4);
+    defer ram.deinit();
+    {
+        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-decode");
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[0..512], .last));
+        try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, 512));
+        cache.step = 512;
+        hc.writeThroughDsv41(&cache, first[0..512], false, .{}, cps.items, s, "prefill");
+        try testing.expect(cps.items[0].isReleased());
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[512..], .last));
+        for (gen[0..24]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
+
+        cache.step = point;
+        var tokens: [point]u32 = undefined;
+        @memcpy(tokens[0..first_len], first);
+        @memcpy(tokens[first_len..], gen[0..24]);
+        want_point = try dsv41_prefix.capture(testing.allocator, net.m, point);
+        // The RAM tier gets the same point as an owned copy.
+        var ram_cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer ram_cache.deinit();
+        ram_cache.step = point;
+        const ram_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+        ram_cps[0] = try dsv41_prefix.capture(testing.allocator, net.m, point);
+        try testing.expectEqual(CommitStatus{ .ok = point }, try ram.commitWithState(&ram_cache, &tokens, false, 0, ram_cps, null, null));
+
+        try hc.writeDecodePointDsv41(&cache, net.m, &tokens, false, .{}, s);
+        // The writer has the state; the request goes on decoding from where it stood.
+        for (gen[24..]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
+
+        cache.step = first_len + gen.len;
+        var all: [first_len + 40]u32 = undefined;
+        @memcpy(all[0..first_len], first);
+        @memcpy(all[first_len..], &gen);
+        try dsv41_prefix.markRows(&cache);
+        // The end-of-request commit hands over the prefill's released point and adds none of its own.
+        try testing.expectEqual(CommitStatus{ .disk_only = all.len }, try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        const e = &hc.disk.?.entries.items[0];
+        try testing.expectEqualSlices(u32, &.{ 512, point }, e.ssm_positions);
+    }
+    defer want_point.deinit(testing.allocator);
+
+    // The cold run replays turn one's forwards up to the point, then the suffix.
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[0..512], .last));
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[512..], .last));
+    for (gen[0..24]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
+    const cold = try dsv41_model.extend(net.m, next[point..], .all);
+    defer _ = mlx.mlx_array_free(cold);
+
+    // From RAM: the point is the highest under the match, and the suffix runs like cold.
+    const from_ram = try dsv41Lookup(&ram, &net, next);
+    try testing.expectEqual(point, from_ram.matched);
+    const ram_warm = try dsv41_model.extend(net.m, next[point..], .all);
+    defer _ = mlx.mlx_array_free(ram_warm);
+    try glm5_forward.expectArrayBits(cold, ram_warm);
+
+    // From the file, by a tier that never saw it written.
+    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-decode");
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
+    try testing.expectEqual(point, res.matched);
+    try testing.expect(hc.last_restored_disk_id != null);
+    var got_point = try dsv41_prefix.capture(testing.allocator, net.m, point);
+    defer got_point.deinit(testing.allocator);
+    try expectCheckpointBits(&want_point, &got_point);
+    const warm = try dsv41_model.extend(net.m, next[point..], .all);
+    defer _ = mlx.mlx_array_free(warm);
     try glm5_forward.expectArrayBits(cold, warm);
 }
 
