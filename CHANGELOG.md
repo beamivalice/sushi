@@ -6,7 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
-- **`--no-mtp` no longer reads the MTP head**: a Qwen3.8-Flash-Next load with MTP off skips the head's tensors while reading the pack, so the 1.2 GB head no longer passes through memory at load, which matters on a 64 GB Mac.
+- **`--no-mtp` no longer reads the MTP head**: a Qwen3.8-Flash-Next load with MTP off skips the head's tensors while reading the pack, so the 1.2 GB head no longer passes through memory at load, which matters on a 64 GB Mac, and the log no longer prints `Loading model-mtp.safetensors...` for a shard that loads nothing.
 - **`sushi convert exl3 --codebook` is now `--expert-codebook`** (breaking): `--codebook mcg` is now `--expert-codebook exl3-mcg` and `--codebook mul1` is `--expert-codebook exl3-mul1`; the old flag and the bare names are refused, and packs and resumable runs are unchanged.
 - **DeepSeek-V4.1-Flash loads its vision tower by default**: images work without `--vision`, on a streamed and a resident load, and `--no-vision` (or `vision: false` in `model-settings.json`) saves its ~1 GB.
 - **Qwen3.8-Flash-Next Sushi-STQ-2.75bpw**: a new pack that replaces Sushi-2.6bpw and Sushi-3bpw as the 64 GB recommendation (`sushi pull qwen3.8-flash-next` now fetches it, 75.9 GB download); it scores KLD 0.0692 (top-1 agreement 92.76%) on 16x512 prompts at bf16 KV and runs on sushi 1.3.0 and later.

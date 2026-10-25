@@ -3054,9 +3054,8 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         const path = try allocator.dupeSentinel(u8, path_slice, 0);
         defer allocator.free(path);
 
-        log.info("Loading {s}...\n", .{entry.name});
         const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .present = &present, .file = entry.name } else null;
-        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, drop_mtp, shard);
+        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, drop_mtp, shard, entry.name);
         file_count += 1;
     }
 
@@ -3131,7 +3130,7 @@ pub fn loadSafetensorsFile(
 ) !void {
     var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
-    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, false, null);
+    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, false, null, null);
 }
 
 fn qwen4NormFold(key: []const u8) bool {
@@ -3334,6 +3333,25 @@ pub fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header:
     return (try readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype)).array;
 }
 
+/// The resident key a shard tensor loads under, or null when it is skipped.
+fn loadedKey(
+    key_raw: []const u8,
+    key_buf: []u8,
+    load_vision: bool,
+    streaming: ?StreamingLoad,
+    drops_mtp: bool,
+    shard: ?ShardOwners,
+) ?[]const u8 {
+    if (std.mem.eql(u8, key_raw, "__metadata__")) return null;
+    if (shard) |sh| if (sh.map.get(key_raw)) |owner| {
+        if (owner == .string and !std.mem.eql(u8, owner.string, sh.file) and sh.present.contains(owner.string)) return null;
+    };
+    const key = if (streaming) |load| streamedResidentKey(load, key_buf, key_raw) orelse return null else key_raw;
+    if (!shouldKeepWeightKey(key, load_vision) or (drops_mtp and streamingDropsWeightKey(key))) return null;
+    return key;
+}
+
+/// `announce` names the shard in the log once its first tensor loads; a shard that loads nothing stays silent.
 fn loadSafetensorsFileMode(
     allocator: std.mem.Allocator,
     reader: *expert_io.ParallelReader,
@@ -3344,6 +3362,7 @@ fn loadSafetensorsFileMode(
     streaming: ?StreamingLoad,
     drop_mtp: bool,
     shard: ?ShardOwners,
+    announce: ?[]const u8,
 ) !void {
     // Only the dense HF layout needs the converter's work at load time: the
     // fused bank split, the delta norms and the conv transpose. An MLX pack
@@ -3357,19 +3376,14 @@ fn loadSafetensorsFileMode(
     var header = try expert_io.SafetensorsHeader.read(allocator, fd);
     defer header.deinit();
     var tensors = header.parsed.value.object.iterator();
+    var pending_announce = announce;
     while (tensors.next()) |entry| {
-        const key_str_raw = entry.key_ptr.*;
-        if (std.mem.eql(u8, key_str_raw, "__metadata__")) continue;
-        if (shard) |sh| if (sh.map.get(key_str_raw)) |owner| {
-            if (owner == .string and !std.mem.eql(u8, owner.string, sh.file) and sh.present.contains(owner.string)) continue;
-        };
         var key_buf: [512]u8 = undefined;
-        const key_str = if (streaming) |load|
-            streamedResidentKey(load, &key_buf, key_str_raw) orelse continue
-        else
-            key_str_raw;
-
-        if (!shouldKeepWeightKey(key_str, load_vision) or (drops_mtp and streamingDropsWeightKey(key_str))) continue;
+        const key_str = loadedKey(entry.key_ptr.*, &key_buf, load_vision, streaming, drops_mtp, shard) orelse continue;
+        if (pending_announce) |name| {
+            log.info("Loading {s}...\n", .{name});
+            pending_announce = null;
+        }
         const value = try readSafetensor(reader, fd, &header, entry.value_ptr.*);
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's
@@ -6463,4 +6477,23 @@ test "deepseek_v41 thinks by default, at its native high effort" {
     // A checkpoint that declares thinking off still outranks the arch default.
     const declared_off = ModelConfig{ .model_type = "deepseek_v41", .gen_enable_thinking = false };
     try testing.expect(!declared_off.defaultEnableThinking());
+}
+
+test "a shard loads only when one of its tensors survives the filter" {
+    const mtp_only = [_][]const u8{ "__metadata__", "language_model.mtp.fc.weight", "language_model.mtp.layers.0.mlp.gate.weight" };
+    const mixed = [_][]const u8{ "language_model.mtp.fc.weight", "language_model.model.norm.weight" };
+    var buf: [512]u8 = undefined;
+    const Case = struct { keys: []const []const u8, drop_mtp: bool, loads: bool };
+    const cases = [_]Case{
+        .{ .keys = &mtp_only, .drop_mtp = true, .loads = false },
+        .{ .keys = &mtp_only, .drop_mtp = false, .loads = true },
+        .{ .keys = &mixed, .drop_mtp = true, .loads = true },
+    };
+    for (cases) |c| {
+        var any = false;
+        for (c.keys) |k| {
+            if (loadedKey(k, &buf, true, null, c.drop_mtp, null) != null) any = true;
+        }
+        try testing.expectEqual(c.loads, any);
+    }
 }
