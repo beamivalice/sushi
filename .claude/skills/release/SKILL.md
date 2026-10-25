@@ -28,7 +28,7 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 - **The perf gate is four models: Qwen STQ 2.75bpw, Qwen MCG 4bpw, GLM MCG 2.4bpw, DeepSeek STQ 1.75bpw.** It is ONE run per model whose
   output IS the published `docs/bench/v<ver>/` report, in the format of `docs/bench/v1.2.0-dev/` (`summary.md` plus
   one `<model>.md` per run): pinned `npx llmprobe@<ver> --bench-only --rungs 2k,4k,8k,16k,32k,64k,128k --runs 2`, one
-  model per server, GPU lock per model, fans at max and 3 min idle before the first server and after each one (60 s let heat
+  model per server, GPU lock per model, fans at max and an idle before each server until the die is under 50 °C, at most 3 min (60 s once let heat
   carry into the next model), commit, binary SHA-256 and mtime in
   the header. A model whose speculative mode (MTP, DFlash2) did not engage is chased before shipping; a low cell gets
   one rerun on a quiet box before anyone bisects.

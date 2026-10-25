@@ -249,8 +249,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Quiet window: a timed run first touches `~/.sushi/runs/QUIET` and waits until no `zig`/`clang` runs; no worker
   starts a build or test while that file exists. The GPU lock does not stop compiles.
 - Measure only what the diff touches: no arm whose code path is unchanged, no metric the change cannot move.
-- Bench thermal: fans to max; 3 min idle first if the die is over 90 °C after heavy GPU work, else 10 s; fans back to
-  auto after. One A then one B suffices; A B B A only when the expected difference is within a few percent.
+- Bench thermal: fans to max; before each server, idle until the hottest die sensor (`fanctl status`) is under 50 °C,
+  at most 3 min; fans back to auto after. One A then one B suffices; A B B A only when the expected difference is within a few percent.
 - Never slot a GPU job into a bench's cooldown idle: the next server starts throttled.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
 - **The box is macOS, with no `setsid` binary.** To detach a long job, run `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
