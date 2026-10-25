@@ -482,6 +482,12 @@ pub fn parsePickTolerance(raw: []const u8) error{InvalidPickTolerance}!f32 {
 
 pub const PICK_STARVE_LIMIT: u8 = 3;
 
+/// The line for a lossy pick asked of a resident load: every expert is pooled, so no route misses and none is swapped.
+pub fn pickInertLine(resident: bool, tolerance: f32) ?[]const u8 {
+    if (!resident or tolerance <= 0) return null;
+    return "[expert-swap] --expert-pick-tolerance has no effect: every routed expert is resident, so nothing misses";
+}
+
 pub fn substituteMisses(ids: []u16, logits: []const f32, cached: []const bool, tolerance: f32, k: usize, taken: []bool, loading: []bool, starved: []u8) u32 {
     if (!(tolerance > 0) or k == 0 or k > 32) return 0;
     const experts = cached.len;
@@ -1845,6 +1851,7 @@ pub const Engine = struct {
             };
         }
         if (plan.resident) try engine.loadResident();
+        if (pickInertLine(plan.resident, pick_tolerance)) |line| log.warn("{s}\n", .{line});
         var split_buf: [96]u8 = undefined;
         log.info("{s}", .{cacheSplitLine(&split_buf, allot != null, min_slots, max_slots)});
         if (geometry.drop) |d| {
@@ -2942,6 +2949,12 @@ pub const Engine = struct {
 };
 
 const expectError = @import("test_expect.zig").expectError;
+
+test "a lossy pick on a resident load is named, never silent" {
+    try std.testing.expect(pickInertLine(true, 0.2) != null);
+    try std.testing.expect(pickInertLine(true, 0) == null);
+    try std.testing.expect(pickInertLine(false, 0.2) == null);
+}
 
 test "expert stream span adapter derives fused first middle and last slices" {
     const t = std.testing;

@@ -1622,6 +1622,16 @@ test "dsv41 lossy pick: on rate-grouped layers a missed expert takes the best po
         }
         try testing.expectEqual(tol > 0, engine.swap_seen_ids > seen);
     }
+
+    // A DSpark verify block (2..16 rows) picks too; a wider span (prefill) stays exact.
+    stream.pick_tolerance = 0.6;
+    for ([_]struct { rows: usize, acts: bool }{ .{ .rows = 4, .acts = true }, .{ .rows = 17, .acts = false } }) |case| {
+        const seen = engine.swap_seen_ids;
+        // `.all` keeps a wide pass whole: the CED tail of a `.last` pass is a decode-width span on its own.
+        const out = try model.extendSpan(served.m, ids[0..case.rows], .all, 64);
+        _ = mlx.mlx_array_free(out);
+        try testing.expectEqual(case.acts, engine.swap_seen_ids > seen);
+    }
 }
 
 /// ||a - t|| / ||t||.

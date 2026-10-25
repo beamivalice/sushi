@@ -219,7 +219,11 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 - On a rate-grouped layer (DeepSeek-V4.1 STQ, `dsv41_stream.StqStream`, decode widths): a missed expert may take an
   expert held in any of the layer's pools, which its own group's pool serves; the scores compared are the router's
   sqrt-softplus scores, the weights' own scale. Same starvation limit; the `[expert-swap]` lines count it
-  (`Engine.swapped_ids`). A resident layer never misses, so it never swaps.
+  (`Engine.swapped_ids`). A resident layer never misses, so it never swaps: a load whose budget holds every expert
+  (the Resident bullet above) logs `[expert-swap] --expert-pick-tolerance has no effect` at boot, and an identical
+  KLD with no `[expert-swap] engaged` line means that. A DSpark verify block (2..16 rows) picks like a decode step;
+  a span over `DECODE_ROWS_MAX` (16) rows, a prefill chunk, stays exact. `kld compare` takes the pick on the
+  one-row steps that score the generated tokens; its prompt prefill is exact.
 - Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
   non-zero tolerance: the teacher is exact routing. Numbers: [quality-kld](quality-kld.md#lossy-expert-pick).
 
