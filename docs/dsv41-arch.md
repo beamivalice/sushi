@@ -68,11 +68,16 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   kernel's key tile). A decode-width block (up to 16 rows) scores the packed index keys directly
   (`indexScoresPacked`), with no unpacked copy. A trace run keeps the whole scores.
 - **Decode indexer cost, by context** (`SUSHI_DSV41_INDEX_UBENCH=1 -Dtest-filter="dsv41 decode index stage timing"`): the
-  score pass is one thread a key and linear in keys AND rows (a verify of R rows re-reads the keys R times); the top-k is one
-  threadgroup a row. A plain step at 209k tokens costs ~4 ms more than at 5k (serial, 40.0 against 47.8 tok/s), nearly all of
-  it the eight index sources. A decode block's later index sources (layers 24-36) score only the candidate source's picked
-  blocks (`indexScoresGather` over the block ids `candidateBlockIds` hands down, then `candidateKeys` maps the picks back):
-  the picks are the masked whole scan's, ties included, while the blocks hold more reachable keys than a query keeps.
+  score pass is one thread a key and linear in keys AND rows (the FMAs and threadgroup loads of q, not the key reads, bound
+  it); the top-k is one threadgroup a row. A plain step at 209k tokens cost ~4 ms more than at 5k (serial `--no-mtp`, 46079949:
+  40.0 against 47.8 tok/s), nearly all of it the eight index sources. A decode block's later index sources (layers 24-36)
+  score only the candidate source's picked blocks (`indexScoresGather` over the block ids `candidateBlockIds` hands down,
+  then `candidateKeys` maps the picks back): the picks are the masked whole scan's, ties included, while the blocks hold
+  more reachable keys than a query keeps (05779ced: 42.0 tok/s at 209k, 47.6 at 4.7k, the same 600 greedy tokens).
+  The packed and gathered score kernels read q four channels a load (each head adds the channels in the same order):
+  262144 keys, 1 row 0.74 to 0.44 ms, 4 rows 2.35 to 1.27 ms per eval (about 0.2 ms of each is the eval floor); live serial b349f67e 42.8 tok/s at 209k, 47.8 at 4.7k, the same 600
+  greedy tokens (one boot, GPU lock, QUIET, fans max, die 49 C, taskpolicy -a). Ruled out
+  on the ubench: a 512-thread score threadgroup and a replicated top-k histogram (both unchanged).
 
 ### QAT round trips
 

@@ -1062,10 +1062,42 @@ const IDX_SCORE_DOT =
     \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
 ;
 
-const IDX_SCORE_LAST = IDX_SCORE_DOT ++
+/// `IDX_SCORE_SECOND` with q in four-wide rows, for `IDX_SCORE_DOT4`.
+const IDX_SCORE_SECOND4 =
+    \\threadgroup float4 qs[IH * IHD / 4];
+    \\for (uint k = tid; k < IH * IHD / 4; k += tgn) {
+    \\  const device float* qp = q + size_t(l) * IH * IHD + 4 * k;
+    \\  qs[k] = float4(qp[0], qp[1], qp[2], qp[3]);
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (n >= nb) return;
+    \\float dots[IH];
+    \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
+;
+
+/// `IDX_SCORE_DOT` reading four channels of q a threadgroup load: each head still adds channel j, j + 1, j + 2, j + 3 in
+/// that order, so the scores keep their bits.
+const IDX_SCORE_DOT4 =
+    \\for (int j = 0; j < IHD; j += 4) {
+    \\  const float k0 = KEY(j), k1 = KEY(j + 1), k2 = KEY(j + 2), k3 = KEY(j + 3);
+    \\  for (int h = 0; h < IH; ++h) {
+    \\    const float4 qv = qs[(h * IHD + j) / 4];
+    \\    dots[h] += qv.x * k0;
+    \\    dots[h] += qv.y * k1;
+    \\    dots[h] += qv.z * k2;
+    \\    dots[h] += qv.w * k3;
+    \\  }
+    \\}
+    \\float s = 0.0f;
+    \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
+;
+
+const IDX_SCORE_TAIL =
     \\const int seen = (meta[0] + l + 1) / meta[1];
     \\scores[size_t(l) * nb + n] = n < seen ? s : -INFINITY;
 ;
+
+const IDX_SCORE_LAST = IDX_SCORE_DOT ++ IDX_SCORE_TAIL;
 
 const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const int nb = keys_shape[0];
@@ -1081,12 +1113,12 @@ const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
 const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const int nb = codes_shape[0];
     \\
-++ IDX_SCORE_SECOND ++
+++ IDX_SCORE_SECOND4 ++
     \\const auto kc = codes + size_t(n) * (IHD / 2);
     \\const auto ks = scales + size_t(n) * (IHD / G);
     \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
     \\
-++ IDX_SCORE_LAST;
+++ IDX_SCORE_DOT4 ++ IDX_SCORE_TAIL;
 
 /// The packed scores of candidate blocks only: score c of row l is key `blocks[l, c / BS] * BS + c % BS` (`blocks`
 /// `[L, KB]` int32, ascending, < 0 = none), -inf for no block or a key the query cannot see. A key scores the bits it
@@ -1094,7 +1126,7 @@ const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
 const IDX_GATHER_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const int nb = blocks_shape[1] * BS;
     \\
-++ IDX_SCORE_SECOND ++
+++ IDX_SCORE_SECOND4 ++
     \\const int blk = blocks[l * blocks_shape[1] + n / BS];
     \\const int key = blk * BS + n % BS;
     \\if (blk < 0 || key >= (meta[0] + l + 1) / meta[1]) {
@@ -1105,7 +1137,7 @@ const IDX_GATHER_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const auto ks = scales + size_t(key) * (IHD / G);
     \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
     \\
-++ IDX_SCORE_DOT ++
+++ IDX_SCORE_DOT4 ++
     \\scores[size_t(l) * nb + n] = s;
 ;
 
@@ -2424,7 +2456,7 @@ test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked 
     defer sc.deinit();
     const ratio = 1;
     // A few keys, one scale byte a key: arrays MLX passes in the constant address space.
-    for ([_]struct { ih: usize, ihd: usize }{ .{ .ih = 32, .ihd = 128 }, .{ .ih = 8, .ihd = 32 } }) |g| for ([_]usize{ 4, 1537 }) |nb| for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 5, 16 }) |L| {
+    for ([_]struct { ih: usize, ihd: usize }{ .{ .ih = 32, .ihd = 128 }, .{ .ih = 8, .ihd = 32 } }) |g| for ([_]usize{ 4, 1537 }) |nb| for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 2, 3, 4, 5, 8, 16 }) |L| {
         const x = try qat_mod.qat(&sc, try sc.astype(try randn(&sc, &.{ ci(nb), ci(g.ihd) }, .float32, 151, 2.0), dt), .fp4_ue8m0, 32);
         const packed_keys = try qat_mod.packFp4(&sc, x, .fp4_ue8m0, 32);
         const keys = try qat_mod.unpackFp4(&sc, packed_keys, .fp4_ue8m0, 32, dt);
