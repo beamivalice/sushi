@@ -2097,27 +2097,46 @@ pub fn engramGateOps(sc: *Scope, c: *const Config, qk: A, x: A, kv: A) !A {
 
 const Pair = struct { x: A, pre: A };
 
-const HcPre = struct { sp: qat_mod.Split, h: A, x1: A };
+/// A stage's coefficients: the split, or the mixes `z` of a narrow stage, which splits them in the next stage's kernel
+/// and in `split` only for a reader of the arrays.
+const HcMix = struct {
+    sp: ?qat_mod.Split = null,
+    z: A = none,
 
-/// The coefficients of the stream `x` (of `hcExpand(x, ex.y, ex.post, ex.comb)` with `ex`, returned as `x1`) and its
-/// collapse by the previous mix `cpre`, rms-normed by `norm_w`: one stage and one split kernel at a few rows, the
-/// mix and norm kernels on a wide block, else the op chains.
-fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?kernels.HcExpand, cpre: A, hc: *const Hc, norm_w: A) !HcPre {
+    fn split(self: HcMix, sc: *Scope, m: *const Model) !qat_mod.Split {
+        if (self.sp) |s| return s;
+        const c = &m.cfg;
+        const s = try kernels.hcSplitZ(sc, self.z, c.hc_mult, c.hc_iters, try kernels.hcEps(sc, c.eps, c.hc_eps));
+        return .{ .pre = s.pre, .post = s.post, .comb = s.comb };
+    }
+};
+
+const HcPre = struct { mix: HcMix, h: A, x1: A };
+
+/// The stream `hcExpand(x, y, prev.post, prev.comb)`, collapsed by `prev.pre`.
+const HcPrev = struct { y: A, prev: HcMix };
+
+/// The coefficients of the stream `x` (of `hcExpand(x, ex.y, previous post, previous comb)` with `ex`, returned as
+/// `x1`) and its collapse by the previous pre (`cpre` without `ex`), rms-normed by `norm_w`: one stage kernel at a few
+/// rows, the mix and norm kernels on a wide block, else the op chains.
+fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?HcPrev, cpre: A, hc: *const Hc, norm_w: A) !HcPre {
     const c = &m.cfg;
     if (fusedOn(sc, m) and dim(hc.fn_w, 0) == (2 + c.hc_mult) * c.hc_mult and dim(x, 2) % 32 == 0) {
         const eps = try kernels.hcEps(sc, c.eps, c.hc_eps);
         const hw = kernels.HcWeights{ .fn_w = hc.fn_w, .scale = hc.scale, .base = hc.base };
         if (dim(x, 0) <= NARROW_ROWS) {
-            const st = try kernels.hcStage(sc, x, ex, cpre, norm_w, hw, eps);
-            const sp = try kernels.hcSplitZ(sc, st.z, c.hc_mult, c.hc_iters, eps);
-            return .{ .sp = .{ .pre = sp.pre, .post = sp.post, .comb = sp.comb }, .h = st.h, .x1 = st.x1 };
+            const kex: ?kernels.HcExpand = if (ex) |e| .{ .y = e.y, .prev = if (e.prev.sp) |s| .{ .split = .{ .pre = s.pre, .post = s.post, .comb = s.comb } } else .{ .z = .{ .z = e.prev.z, .iters = c.hc_iters } } } else null;
+            const st = try kernels.hcStage(sc, x, kex, cpre, norm_w, hw, eps);
+            return .{ .mix = .{ .z = st.z }, .h = st.h, .x1 = st.x1 };
         }
-        const x1 = if (ex) |e| try hcExpand(sc, x, e.y, e.post, e.comb) else x;
-        const n = try kernels.hcNorm(sc, try kernels.hcMix(sc, x1, hw, eps), x1, cpre, norm_w, c.hc_iters, eps);
-        return .{ .sp = .{ .pre = n.sp.pre, .post = n.sp.post, .comb = n.sp.comb }, .h = n.h, .x1 = x1 };
+        const sp = if (ex) |e| try e.prev.split(sc, m) else null;
+        const x1 = if (ex) |e| try hcExpand(sc, x, e.y, sp.?.post, sp.?.comb) else x;
+        const n = try kernels.hcNorm(sc, try kernels.hcMix(sc, x1, hw, eps), x1, if (sp) |s| s.pre else cpre, norm_w, c.hc_iters, eps);
+        return .{ .mix = .{ .sp = .{ .pre = n.sp.pre, .post = n.sp.post, .comb = n.sp.comb } }, .h = n.h, .x1 = x1 };
     }
-    const x1 = if (ex) |e| try hcExpand(sc, x, e.y, e.post, e.comb) else x;
-    return .{ .sp = try hcMixes(sc, m, x1, hc), .h = try sc.rms(try hcCollapse(sc, x1, cpre), norm_w, c.eps), .x1 = x1 };
+    const sp = if (ex) |e| try e.prev.split(sc, m) else null;
+    const x1 = if (ex) |e| try hcExpand(sc, x, e.y, sp.?.post, sp.?.comb) else x;
+    return .{ .mix = .{ .sp = try hcMixes(sc, m, x1, hc) }, .h = try sc.rms(try hcCollapse(sc, x1, if (sp) |s| s.pre else cpre), norm_w, c.eps), .x1 = x1 };
 }
 
 /// A block: attention, then the FFN, each between a collapse of the stream and an expand back. The
@@ -2126,10 +2145,13 @@ fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?kernels.HcExpand, cpre: A, hc: 
 fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: usize, sh: *Shared, span: usize, ds: ?DsKeys) !Pair {
     const ly = &m.layers[li];
     const pa = try hcPre(sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
-    const sa = pa.sp;
     const h = pa.h;
-    if (prof(m, dim(x, 0))) |p| try p.mark(.hc_attn, &.{ h, sa.pre, sa.post, sa.comb });
+    if (prof(m, dim(x, 0))) |p| {
+        const s = pa.mix.sp orelse qat_mod.Split{ .pre = pa.mix.z, .post = pa.mix.z, .comb = pa.mix.z };
+        try p.mark(.hc_attn, &.{ h, s.pre, s.post, s.comb });
+    }
     if (m.trace) |t| {
+        const sa = try pa.mix.split(sc, m);
         try t.put("hc_pre_{d}", .{li}, sa.pre);
         try t.put("hc_post_{d}", .{li}, sa.post);
         try t.put("hc_comb_{d}", .{li}, sa.comb);
@@ -2143,9 +2165,9 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         break :blk try sc.keep(asc.out(o));
     };
     if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
-    const pf = try hcPre(sc, m, x, .{ .y = a, .post = sa.post, .comb = sa.comb }, sa.pre, &ly.hc_ffn, ly.ffn_norm);
+    const pf = try hcPre(sc, m, x, .{ .y = a, .prev = pa.mix }, none, &ly.hc_ffn, ly.ffn_norm);
     const x1 = pf.x1;
-    const sf = pf.sp;
+    const sf = try pf.mix.split(sc, m);
     const h2 = pf.h;
     if (prof(m, dim(x, 0))) |p| try p.mark(.hc_ffn, &.{ h2, x1, sf.pre, sf.post, sf.comb });
     if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);

@@ -1355,10 +1355,11 @@ const HC_MIX_SOURCE =
     \\}
 ;
 
-/// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`cpre`), so in
+/// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`HC_PRE`), so in
 /// `HC_STAGE_SOURCE` threadgroup 0 collapses and rms-norms the stream without waiting for this stage's mixes, while
 /// threadgroups 1..MIX each take one mix's dot; the FFN side rebuilds the stream from the block output in every
-/// threadgroup and threadgroup 0 stores it. The split (`HC_SPLIT_SOURCE`) is read only later.
+/// threadgroup and threadgroup 0 stores it. The split (`HC_SPLIT_SOURCE`) is read only later, except where
+/// `HC_STAGE_Z_SOURCE` derives the previous split itself.
 const HC_STAGE_HEAD =
     \\#pragma clang fp contract(off)
     \\const uint role = threadgroup_position_in_grid.x;
@@ -1368,9 +1369,43 @@ const HC_STAGE_HEAD =
     \\threadgroup float t_a[TG / 32], t_b[TG / 32];
     \\const device auto* xr = x + size_t(l) * HC * D;
     \\float v[HC][ND];
+    \\
+;
+
+const HC_STAGE_LOOP =
     \\for (int c = 0; c < ND; ++c) {
     \\  const int d = int(tid) + c * TG;
     \\  for (int i = 0; i < HC; ++i) v[i][c] = 0.0f;
+;
+
+/// The collapse weights are `cpre`.
+const HC_COEF_PLAIN =
+    \\#define HC_PRE(j) cpre[l * HC + (j)]
+    \\
+;
+
+/// The previous split arrives as arrays.
+const HC_COEF_ARRAYS = HC_COEF_PLAIN ++
+    \\#define HC_POST(i) spost[l * HC + (i)]
+    \\#define HC_COMB(j, i) scomb[l * HC * HC + (j) * HC + (i)]
+    \\
+;
+
+/// The previous mixes `za` arrive unsplit: simdgroup 0 splits them into threadgroup memory.
+const HC_COEF_Z =
+    \\threadgroup float t_pre[HC], t_post[HC], t_comb[HC * HC];
+    \\#define HC_PRE(j) t_pre[(j)]
+    \\#define HC_POST(i) t_post[(i)]
+    \\#define HC_COMB(j, i) t_comb[(j) * HC + (i)]
+    \\#define HC_SPLIT_PRE(i, v) t_pre[(i)] = (v)
+    \\#define HC_SPLIT_POST(i, v) t_post[(i)] = (v)
+    \\#define HC_SPLIT_COMB(i, v) t_comb[(i)] = (v)
+    \\if (sg == 0) {
+    \\  const device float* zr = za + l * ((2 + HC) * HC);
+++ "\n" ++ HC_SPLIT_BODY ++
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
 ;
 
 /// The stream is `x` itself.
@@ -1382,15 +1417,13 @@ const HC_STAGE_LOAD_PLAIN =
 /// The stream is `hcExpand(x, y, previous split)`, rounded to T where the expand rounds it.
 const HC_STAGE_LOAD_EXPAND =
     \\  if (d < D) {
-    \\    const auto pr = spost + l * HC;
-    \\    const auto cb = scomb + l * HC * HC;
     \\    float sv[HC];
     \\    for (int j = 0; j < HC; ++j) sv[j] = float(xr[j * D + d]);
     \\    const float yv = float(y[size_t(l) * D + d]);
     \\    for (int i = 0; i < HC; ++i) {
     \\      float acc = 0.0f;
-    \\      for (int j = 0; j < HC; ++j) acc = metal::fma(cb[j * HC + i], sv[j], acc);
-    \\      const T o = T(metal::fma(pr[i], yv, acc));
+    \\      for (int j = 0; j < HC; ++j) acc = metal::fma(HC_COMB(j, i), sv[j], acc);
+    \\      const T o = T(metal::fma(HC_POST(i), yv, acc));
     \\      v[i][c] = float(o);
     \\      if (role == 0) x1[(size_t(l) * HC + i) * D + d] = o;
     \\    }
@@ -1401,7 +1434,7 @@ const HC_STAGE_LOAD_EXPAND =
 const HC_STAGE_TAIL =
     \\if (role == 0) {
     \\  float cp[HC];
-    \\  for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
+    \\  for (int j = 0; j < HC; ++j) cp[j] = HC_PRE(j);
     \\  float ss = 0.0f;
     \\  T hv[ND];
     \\  #pragma clang loop unroll(full)
@@ -1446,16 +1479,14 @@ const HC_STAGE_TAIL =
     \\}
 ;
 
-/// The hc split of the mixes `z` (pre = sigmoid + eps, post = 2 sigmoid, Sinkhorn comb); one simdgroup a row, lane
-/// a * HC + b holding comb[a][b] and each sum gathering its HC terms in the serial order.
+/// The hc split of the mixes `zr` (pre = sigmoid + eps, post = 2 sigmoid, Sinkhorn comb); one simdgroup a row, lane
+/// a * HC + b holding comb[a][b] and each sum gathering its HC terms in the serial order. The includer declares
+/// `lane` and `zr` and defines the stores `HC_SPLIT_PRE`, `HC_SPLIT_POST` and `HC_SPLIT_COMB`.
 const HC_SPLIT_BODY =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\constexpr int MIX = (2 + HC) * HC;
     \\const float e = eps[1];
-    \\const device float* zr = z + l * MIX;
     \\if (lane < HC) {
-    \\  pre[l * HC + lane] = 1.0f / (1.0f + metal::precise::exp(-zr[lane])) + e;
-    \\  post[l * HC + lane] = 2.0f / (1.0f + metal::precise::exp(-zr[HC + lane]));
+    \\  HC_SPLIT_PRE(lane, 1.0f / (1.0f + metal::precise::exp(-zr[lane])) + e);
+    \\  HC_SPLIT_POST(lane, 2.0f / (1.0f + metal::precise::exp(-zr[HC + lane])));
     \\}
     \\const bool act = lane < HC * HC;
     \\const ushort a = act ? lane / HC : 0, b = act ? lane % HC : 0;
@@ -1472,9 +1503,19 @@ const HC_SPLIT_BODY =
     \\  for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, rows ? a * HC + k : k * HC + b);
     \\  v = v / (sm + e);
     \\}
-    \\if (act) comb[l * HC * HC + lane] = v;
+    \\if (act) HC_SPLIT_COMB(lane, v);
 ;
-const HC_SPLIT_SOURCE = "#pragma clang fp contract(off)\nconst int l = threadgroup_position_in_grid.y;\n" ++ HC_SPLIT_BODY;
+
+/// The split of row `l` of `z` into the output arrays.
+const HC_SPLIT_GLOBAL =
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const device float* zr = z + l * ((2 + HC) * HC);
+    \\#define HC_SPLIT_PRE(i, v) pre[l * HC + (i)] = (v)
+    \\#define HC_SPLIT_POST(i, v) post[l * HC + (i)] = (v)
+    \\#define HC_SPLIT_COMB(i, v) comb[l * HC * HC + (i)] = (v)
+    \\
+;
+const HC_SPLIT_SOURCE = "#pragma clang fp contract(off)\nconst int l = threadgroup_position_in_grid.y;\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY;
 
 /// The hc split, then the stream collapsed with `cpre` (f32, rounded to T like `hcCollapse`) and rms-normed like
 /// MLX's `rms_norm`. One threadgroup a row.
@@ -1484,7 +1525,7 @@ const HC_NORM_SOURCE =
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
     \\const int D = x_shape[2];
     \\if (sg == 0) {
-++ "\n" ++ HC_SPLIT_BODY ++
+++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
     \\}
     \\float cp[HC];
     \\for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
@@ -1509,12 +1550,14 @@ const HC_NORM_SOURCE =
     \\}
 ;
 
-const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
-const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
+const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_COEF_PLAIN ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
+const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_COEF_ARRAYS ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
+const HC_STAGE_Z_SOURCE = HC_STAGE_HEAD ++ HC_COEF_Z ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
 
 var hc_mix_def = Def{ .name = "dsv41_hc_mix", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_SOURCE, .header = HC_HEADER };
 var hc_stage_def = Def{ .name = "dsv41_hc_stage", .ins = &.{ "x", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z" }, .source = HC_STAGE_SOURCE, .header = HC_HEADER };
 var hc_stage_x_def = Def{ .name = "dsv41_hc_stage_x", .ins = &.{ "x", "y", "spost", "scomb", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_X_SOURCE, .header = HC_HEADER };
+var hc_stage_z_def = Def{ .name = "dsv41_hc_stage_z", .ins = &.{ "x", "y", "za", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_Z_SOURCE, .header = HC_HEADER };
 var hc_split_def = Def{ .name = "dsv41_hc_split", .ins = &.{ "z", "eps" }, .outs = &.{ "pre", "post", "comb" }, .source = HC_SPLIT_SOURCE };
 var hc_norm_def = Def{ .name = "dsv41_hc_norm", .ins = &.{ "z", "x", "cpre", "w", "eps" }, .outs = &.{ "pre", "post", "comb", "h_out" }, .source = HC_NORM_SOURCE };
 
@@ -1526,8 +1569,11 @@ const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
 pub const HcWeights = struct { fn_w: A, scale: A, base: A };
 pub const HcSplit = struct { pre: A, post: A, comb: A };
 pub const HcStaged = struct { h: A, z: A, x1: A };
-/// The stream `hcExpand(x, y, post, comb)` that a stage rebuilds in place of `x`.
-pub const HcExpand = struct { y: A, post: A, comb: A };
+/// The previous mixes of a stage that expands: their split, or the mixes `z` it splits itself.
+pub const HcPrev = union(enum) { split: HcSplit, z: struct { z: A, iters: usize } };
+/// The stream `hcExpand(x, y, previous post, previous comb)` that a stage rebuilds in place of `x` and collapses with
+/// the previous pre.
+pub const HcExpand = struct { y: A, prev: HcPrev };
 
 pub fn hcEps(sc: *Scope, rms_eps: f32, hc_eps: f32) !A {
     return f32Const(sc, &.{ rms_eps, hc_eps });
@@ -1551,7 +1597,12 @@ pub fn hcStage(sc: *Scope, x: A, ex: ?HcExpand, cpre: A, norm_w: A, hw: HcWeight
     const ints = [_]Tmpl{ .{ .name = "TG", .v = ci(tg) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ND", .v = ci((D + tg - 1) / tg) } };
     const dts = [_]TDtype{.{ .name = "T", .dt = dt }};
     if (ex) |e| {
-        try launch(sc, &hc_stage_x_def, &.{ x, try sc.astype(e.y, dt), e.post, e.comb, cpre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, .{ (mix + 1) * tg, L, 1 }, .{ tg, 1, 1 }, &ints, &dts, &o);
+        const grid: Grid = .{ (mix + 1) * tg, L, 1 };
+        const y = try sc.astype(e.y, dt);
+        switch (e.prev) {
+            .split => |sp| try launch(sc, &hc_stage_x_def, &.{ x, y, sp.post, sp.comb, sp.pre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &ints, &dts, &o),
+            .z => |p| try launch(sc, &hc_stage_z_def, &.{ x, y, p.z, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &(ints ++ [_]Tmpl{.{ .name = "ITERS", .v = ci(p.iters) }}), &dts, &o),
+        }
         return .{ .h = o[0], .z = o[1], .x1 = o[2] };
     }
     try launch(sc, &hc_stage_def, &.{ x, cpre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, outs3[0..2], .{ (mix + 1) * tg, L, 1 }, .{ tg, 1, 1 }, &ints, &dts, o[0..2]);
@@ -1625,12 +1676,14 @@ fn probeHcOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
     const w = try sc.zeros(&.{ci(D)}, dt);
     const eps = try hcEps(&sc, 1e-6, 1e-6);
     const plain = try hcStage(&sc, x, null, cpre, w, hw, eps);
-    const ex = HcExpand{ .y = try sc.zeros(&.{ 1, ci(D) }, dt), .post = try sc.zeros(&.{ 1, ci(hc) }, .float32), .comb = try sc.zeros(&.{ 1, ci(hc), ci(hc) }, .float32) };
-    const expanded = try hcStage(&sc, x, ex, cpre, w, hw, eps);
+    const y = try sc.zeros(&.{ 1, ci(D) }, dt);
+    const prev = HcSplit{ .pre = cpre, .post = try sc.zeros(&.{ 1, ci(hc) }, .float32), .comb = try sc.zeros(&.{ 1, ci(hc), ci(hc) }, .float32) };
+    const expanded = try hcStage(&sc, x, .{ .y = y, .prev = .{ .split = prev } }, sc_mod.none, w, hw, eps);
+    const expanded_z = try hcStage(&sc, x, .{ .y = y, .prev = .{ .z = .{ .z = plain.z, .iters = iters } } }, sc_mod.none, w, hw, eps);
     const wide_z = try hcMix(&sc, x, hw, eps);
     const wide = try hcNorm(&sc, wide_z, x, cpre, w, iters, eps);
     const sp = try hcSplitZ(&sc, plain.z, hc, iters, eps);
-    try sc_mod.evalAll(&.{ plain.h, expanded.h, expanded.x1, wide.h, wide.sp.comb, sp.comb });
+    try sc_mod.evalAll(&.{ plain.h, expanded.h, expanded.x1, expanded_z.h, expanded_z.x1, wide.h, wide.sp.comb, sp.comb });
 }
 
 // ── Engram ───────────────────────────────────────────────────────────────
@@ -2470,7 +2523,7 @@ test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked 
     };
 }
 
-const HcData = struct { x: A, y: A, cpre: A, w: A, hw: HcWeights, ex: HcExpand, eps: A, L: usize, hc: usize, d: usize };
+const HcData = struct { x: A, y: A, cpre: A, w: A, hw: HcWeights, prev: HcSplit, eps: A, L: usize, hc: usize, d: usize };
 
 fn hcData(sc: *Scope, L: usize, dt: mlx.mlx_dtype) !HcData {
     const hc = 4;
@@ -2478,13 +2531,14 @@ fn hcData(sc: *Scope, L: usize, dt: mlx.mlx_dtype) !HcData {
     const mix = (2 + hc) * hc;
     const f32t = mlx.mlx_dtype.float32;
     const l: c_int = ci(L);
+    const cpre = try sc.op1(mlx.mlx_abs, try randn(sc, &.{ l, hc }, f32t, 133, 0.6));
     return .{
         .x = try sc.astype(try randn(sc, &.{ l, hc, D }, f32t, 131, 1.5), dt),
         .y = try sc.astype(try randn(sc, &.{ l, D }, f32t, 132, 1.0), dt),
-        .cpre = try sc.op1(mlx.mlx_abs, try randn(sc, &.{ l, hc }, f32t, 133, 0.6)),
+        .cpre = cpre,
         .w = try sc.astype(try sc.add(try randn(sc, &.{D}, f32t, 134, 0.2), try sc.f(1.0)), dt),
         .hw = .{ .fn_w = try randn(sc, &.{ mix, hc * D }, f32t, 135, 0.02), .scale = try f32Const(sc, &.{ 0.3, 0.5, 0.7 }), .base = try randn(sc, &.{mix}, f32t, 136, 0.5) },
-        .ex = .{ .y = undefined, .post = try randn(sc, &.{ l, hc }, f32t, 137, 0.7), .comb = try randn(sc, &.{ l, hc, hc }, f32t, 138, 0.5) },
+        .prev = .{ .pre = cpre, .post = try randn(sc, &.{ l, hc }, f32t, 137, 0.7), .comb = try randn(sc, &.{ l, hc, hc }, f32t, 138, 0.5) },
         .eps = try hcEps(sc, 1e-6, 1e-6),
         .L = L,
         .hc = hc,
@@ -2540,8 +2594,7 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
-    var d = try hcData(&sc, 1, .float32);
-    d.ex.y = d.y;
+    const d = try hcData(&sc, 1, .float32);
     const z_truth = try testing.allocator.alloc(f64, 24);
     defer testing.allocator.free(z_truth);
     const h_truth = try testing.allocator.alloc(f64, d.d);
@@ -2552,12 +2605,12 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     try expectLe("stage z", relErr(try hostOf(&sc, st.z), z_truth), @max(relErr(try hostOf(&sc, ref.z), z_truth), 2e-6));
     try expectLe("stage h", relErr(try hostOf(&sc, st.h), h_truth), @max(relErr(try hostOf(&sc, ref.h), h_truth), 2e-6));
     // the expanded stream: the chain's `hcExpand`, then the same two outputs of its mixes
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.ex.post, d.ex.comb);
-    const sx = try hcStage(&sc, d.x, d.ex, d.cpre, d.w, d.hw, d.eps);
+    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     const xh = try hostOf(&sc, d.x);
     const yh = try hostOf(&sc, d.y);
-    const ph = try sc_mod.hostF32(d.ex.post);
-    const ch = try sc_mod.hostF32(d.ex.comb);
+    const ph = try sc_mod.hostF32(d.prev.post);
+    const ch = try sc_mod.hostF32(d.prev.comb);
     const x1_truth = try testing.allocator.alloc(f64, d.hc * d.d);
     defer testing.allocator.free(x1_truth);
     for (0..d.hc) |i| for (0..d.d) |c| {
@@ -2576,13 +2629,29 @@ test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and ex
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
-    var d = try hcData(&sc, 1, .bfloat16);
-    d.ex.y = d.y;
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.ex.post, d.ex.comb);
-    const sx = try hcStage(&sc, d.x, d.ex, d.cpre, d.w, d.hw, d.eps);
+    const d = try hcData(&sc, 1, .bfloat16);
+    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     try expectLe("bf16 expanded stream", relErrF(try hostOf(&sc, sx.x1), try hostOf(&sc, x1_ref)), 1.0 / 128.0);
     const ref = try composedHc(&sc, &d, x1_ref);
     try expectLe("bf16 normed collapse", relErrF(try hostOf(&sc, sx.h), try hostOf(&sc, ref.h)), 1.0 / 64.0);
+}
+
+test "dsv41 hc stage: a stage that splits its previous mixes gives the split kernel's and the array stage's bytes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const iters = 20;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 3, 16 }) |L| {
+        const d = try hcData(&sc, L, dt);
+        const za = try randn(&sc, &.{ ci(L), 24 }, .float32, 161, 2.0);
+        const sp = try hcSplitZ(&sc, za, d.hc, iters, d.eps);
+        const want = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = sp } }, sc_mod.none, d.w, d.hw, d.eps);
+        const got = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .z = .{ .z = za, .iters = iters } } }, sc_mod.none, d.w, d.hw, d.eps);
+        try expectBitEqual("stage z h", try hostOf(&sc, got.h), try hostOf(&sc, want.h));
+        try expectBitEqual("stage z mixes", try sc_mod.hostF32(got.z), try sc_mod.hostF32(want.z));
+        try expectBitEqual("stage z x1", try hostOf(&sc, got.x1), try hostOf(&sc, want.x1));
+    };
 }
 
 test "dsv41 hc split: the lane-per-element split gives the thread-per-row split of the mixes" {
