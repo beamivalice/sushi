@@ -3140,6 +3140,7 @@ pub fn capMlxPool(bytes: u64) void {
         _ = mlx.mlx_set_cache_limit(&tmp, prev);
         return;
     }
+    dsv41_borrow.poolCapped(prev);
     log.info("[mem] MLX buffer-pool cap {d} MB from the ssd-budget ledger (was {d} MB)\n", .{ bytes >> 20, prev >> 20 });
 }
 
@@ -3197,7 +3198,8 @@ fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
     // this check, so the load must only prove the ladder's floor fits.
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
     const chunk: u64 = if (explicit > 0) (perRequestFloorWidth(config) orelse explicit) else if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else floor;
-    return prefillNeededAtChunk(config, @max(seq, chunk), 2048, defaultKvBits(config), chunk, .{}) -| config.expert_fill_peak_bytes;
+    // The load's own staging term already holds the decode pool.
+    return prefillNeededAtChunk(config, @max(seq, chunk), 2048, defaultKvBits(config), chunk, .{}) -| config.expert_fill_peak_bytes -| config.expertPoolBytes();
 }
 
 /// What a streamed load holds beside its ssd budget: the planned KV and, under `--vision`, its largest image encode.
@@ -4722,6 +4724,20 @@ test "a streamed DeepSeek bills its workspace at load and no fill peak at load o
     try std.testing.expect(!expertStreamingConfigFits(&config, held + serving - 1, 0, resident));
 }
 
+test "DeepSeek's live headroom and its load fit each count the decode pool the ledger parks once" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.max_position_embeddings = 1_048_576;
+    // The parked pool is in MLX's cache, not its active bytes, so `ceiling - active` does not see it.
+    try t.expectEqual(@as(u64, 10 << 30) - config.expertPoolBytes(), dsv41HeadroomOf(10 << 30, &config));
+    try t.expectEqual(@as(u64, 0), dsv41HeadroomOf(1 << 20, &config));
+    // The load fit holds the pool in its staging term, so the serving term it adds is the bill without it.
+    config.expert_borrow_bytes = 60_000_000_000;
+    const bill = prefillNeededAtChunk(&config, expertStreamingPlannedSeq(&config), 2048, defaultKvBits(&config), 512, .{});
+    try t.expectEqual(bill - config.expertPoolBytes(), expertStreamingServingBytes(&config));
+}
+
 test "DeepSeek's request bill takes its prefill working set out of the decoder pools a prefill may release" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
@@ -4737,15 +4753,15 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     // Pools that cover part of it: admission pays only the rest.
     config.expert_borrow_bytes = work / 2;
     try t.expectEqual(state + work - work / 2, prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
-    // Pools that cover all of it: the state and a decode forward, at any chunk.
+    // Pools that cover all of it: the state, a decode forward and the decode pool it leaves parked, at any chunk.
     config.expert_borrow_bytes = 60_000_000_000;
     for ([_]u64{ 512, 1024, 2048 }) |chunk| {
         const ck = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + dsv41CheckpointReserve(&config, seq, chunk)) * 5 / 4;
-        try t.expectEqual(ck + decode, prefillNeededAtChunk(&config, seq, 2048, 16, chunk, .{}));
+        try t.expectEqual(ck + decode + config.expertPoolBytes(), prefillNeededAtChunk(&config, seq, 2048, 16, chunk, .{}));
     }
     // The widest rung is then always affordable, and a chunk boundary never steps down for the working set.
     const MB: u64 = 1 << 20;
-    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode, 512, 0, .{}));
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode + config.expertPoolBytes(), 512, 0, .{}));
     var st: generate_mod.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st));
     config.expert_borrow_bytes = 0;
@@ -4770,7 +4786,8 @@ test "with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpa
     const MB: u64 = 1 << 20;
     // The budget-100 boot on wired 124000 read a 122,170 MiB ceiling and 100,328 MiB active; 17 GiB more at 117.
     const ceiling: u64 = 122_170 * MB;
-    const active: u64 = (100_328 + 17 * 1024) * MB;
+    // The budget now holds the decode pool, parked in MLX's cache: the same budget leaves active that much lower.
+    const active: u64 = (100_328 + 17 * 1024) * MB - (1 << 30);
     // Its expert cache, 13.57 GB under the budget (94% of the experts), split evenly: the decoder half is lendable.
     config.expert_borrow_bytes = (117 * (1 << 30) - 13_570_000_000) / 2;
     try t.expectEqual(@as(u32, 974_848), advertisedContextAt(&config, 16, ceiling, active, 2048));
@@ -7174,7 +7191,10 @@ pub fn prefillNeededAtChunk(
     if (config.dsv41) |c| {
         const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
         // The prefill's working set comes out of the decoder pools it may release (`dsv41_borrow`); a decode forward's never does.
-        const work = @max(c.decodeTransientBytes(dsv41_borrow.verify_rows, seq) *| 5 / 4, (c.transientBytes(chunk, seq) *| 5 / 4 +| config.prefillPoolBytes()) -| dsv41BorrowableBytes(config));
+        // The decode pool is parked beside either, and a prefill's pool bill is its growth above it.
+        const decode_pool = config.expertPoolBytes();
+        const grown = c.transientBytes(chunk, seq) *| 5 / 4 +| (config.prefillPoolBytes() -| decode_pool);
+        const work = @max(c.decodeTransientBytes(dsv41_borrow.verify_rows, seq) *| 5 / 4, grown -| dsv41BorrowableBytes(config)) +| decode_pool;
         return (held +| dsv41CheckpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
     }
     if (config.isGlm5()) {
@@ -7351,7 +7371,13 @@ fn dsv41BorrowableBytes(config: *const model_mod.ModelConfig) u64 {
 fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
-    return admissionAvailable(currentGpuMemoryCeiling(config, active_mem), active_mem);
+    return dsv41HeadroomOf(admissionAvailable(currentGpuMemoryCeiling(config, active_mem), active_mem), config);
+}
+
+/// The decode pool the ledger parks in MLX's cache is no part of its active bytes, so every live check (decode and
+/// prefill width) takes it off here once; `prefillNeededAtChunk` bills it once for the same reason.
+fn dsv41HeadroomOf(available: u64, config: *const model_mod.ModelConfig) u64 {
+    return available -| config.expertPoolBytes();
 }
 
 /// The width the next chunk runs at. Asymmetric because a Metal abort is uncatchable: HOLD

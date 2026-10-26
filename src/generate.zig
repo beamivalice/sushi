@@ -1205,6 +1205,8 @@ pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
 
 /// Drafts a sampled DSpark round can verify; the checkpoint's block is 5.
 const dsv41_max_drafts = 16;
+/// The widest verify `dsv41Verify` accepts, a ring slack's rows.
+const dsv41_max_verify_rows: u8 = @intCast(@import("dsv41_config.zig").ring_slack);
 
 /// Verify rows that end a round at the first `id` among `ids`; the trunk's own token after it is still the pending one.
 fn rowsThroughId(ids: []const u32, id: ?u32) usize {
@@ -1228,17 +1230,27 @@ const DsparkDiag = union(enum) { off, log, sweep, rows: u8 };
 const dspark_sweep_rows = [_]u8{ 1, 2, 3, 4, 5, 6, 8 };
 var dspark_diag_cache: ?DsparkDiag = null;
 
+fn parseDsparkDiag(v: []const u8) DsparkDiag {
+    if (std.mem.eql(u8, v, "sweep")) return .sweep;
+    if (std.mem.eql(u8, v, "log")) return .log;
+    return if (std.fmt.parseInt(u8, v, 10)) |n| .{ .rows = std.math.clamp(n, 1, dsv41_max_verify_rows) } else |_| .off;
+}
+
 fn dsparkDiag() DsparkDiag {
     if (dspark_diag_cache) |d| return d;
-    const raw = std.c.getenv("SUSHI_DSV41_DSPARK_ROWS");
-    const d: DsparkDiag = if (raw) |r| blk: {
-        const v = std.mem.span(r);
-        if (std.mem.eql(u8, v, "sweep")) break :blk .sweep;
-        if (std.mem.eql(u8, v, "log")) break :blk .log;
-        break :blk if (std.fmt.parseInt(u8, v, 10)) |n| .{ .rows = std.math.clamp(n, 1, dsv41_max_drafts + 1) } else |_| .off;
-    } else .off;
+    const d: DsparkDiag = if (std.c.getenv("SUSHI_DSV41_DSPARK_ROWS")) |r| parseDsparkDiag(std.mem.span(r)) else .off;
     dspark_diag_cache = d;
     return d;
+}
+
+test "SUSHI_DSV41_DSPARK_ROWS never forces a verify wider than dsv41Verify accepts" {
+    const limit = dsv41_max_verify_rows;
+    try testing.expectEqual(DsparkDiag{ .rows = limit }, parseDsparkDiag("17"));
+    try testing.expectEqual(DsparkDiag{ .rows = limit }, parseDsparkDiag("255"));
+    try testing.expectEqual(DsparkDiag{ .rows = 7 }, parseDsparkDiag("7"));
+    try testing.expectEqual(DsparkDiag{ .rows = 1 }, parseDsparkDiag("0"));
+    try testing.expectEqual(DsparkDiag.sweep, parseDsparkDiag("sweep"));
+    try testing.expectEqual(DsparkDiag.off, parseDsparkDiag("wide"));
 }
 
 /// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the

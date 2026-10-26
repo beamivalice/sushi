@@ -354,7 +354,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - **DeepSeek STQ bills a request's state, not its prefill working set**: the working set comes out of decoder-layer
   expert pools each prefill forward releases when its need passes the live headroom, refused before anything is released
   where the pools cannot cover it; the MLX pool a prefill parks (8 GiB at a 2048-row chunk) rides in that working set; admission bills that term only past the lendable bytes, plus a decode forward's
-  working set, and SSD-first its restore points' in-flight bytes ([dsv41-memory](dsv41-memory.md#borrow)).
+  working set and the decode pool parked in MLX's cache (1 GiB, outside the active bytes admission reads; counted once, in the bill, and taken off the live headroom), and SSD-first its restore points' in-flight bytes ([dsv41-memory](dsv41-memory.md#borrow)).
 - qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill. The SSD
   tier fills buffers the slot owns (`LookupResult.slot_owned`), so its rows are credited like a checkout's: the
   first append grows each layer and its old rows are freed at that layer's eval window, which is all the bill keeps

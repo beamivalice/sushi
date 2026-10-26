@@ -6233,6 +6233,7 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
         victim.unloadResident();
+        if (victim.config) |c| @import("dsv41_borrow.zig").unloadModelMlx(c);
         evicted_bytes +|= victim_bytes;
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -6308,6 +6309,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     });
     const wired_before = status.getWiredMemBytes();
     entry.unloadResident();
+    if (entry.config) |c| @import("dsv41_borrow.zig").unloadModelMlx(c);
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
     // of the load→generate→unload flow).

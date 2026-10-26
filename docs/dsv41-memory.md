@@ -38,16 +38,24 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
     the cache gives up ~3 slots a layer instead of ~24.
   - **Prefill** (a wider forward): `dsv41_prefill_pool_bytes`, 8 GiB at a default 2048-row chunk and `rows / 2048` of it
     below, never under the decode cap and never above the RAM-wide cap (31 rows 1 GiB, 512 rows 2 GiB, 1024 rows 4 GiB).
-    The cap set is the bill: `prefillNeed` carries the same number, and a lower cap clears the pool, so what is parked
-    never exceeds what was billed. 4 MiB a row is the measured pool spread over the chunk (~7.7 GB parked at 2048 rows,
+    The cap set is the bill, once: the decode cap is a standing term of the live headroom (`server.dsv41Headroom` takes
+    it off ceiling less active, since the parked pool sits in MLX's cache, not its active bytes), so `prefillNeed`
+    carries only the growth above it (`poolGrowth`); a lower cap clears the pool, so what is parked never exceeds what
+    was billed. 4 MiB a row is the measured pool spread over the chunk (~7.7 GB parked at 2048 rows,
     3.8 MB a row) and twice the forward's own row term (`dim x 400` = 2.05 MB a row; active grew 3.3-4 GB above rest).
-    The pool is not in the ledger: the decoder pools a prefill releases pay for it (`expert_borrow_bytes`), not the
-    decode cache. A pack with no pools to lend (non-STQ) bills it to the request; admission bills the full cap.
+    The growth is not in the ledger: the decoder pools a prefill releases pay for it (`expert_borrow_bytes`), not the
+    decode cache. A pack with no pools to lend (non-STQ) bills it to the request. Admission (`prefillNeededAtChunk`)
+    bills the decode cap beside every request, plus the growth to the prefill cap; at load `expertStreamingServingBytes`
+    leaves the decode cap out, the ledger's staging term already holds it.
+  - Unloading a DeepSeek model gives the next model the process-wide cap `applyMlxCacheLimit` installed and forgets the
+    raised cap (`dsv41_borrow.unloadModel`, in the scheduler's unload and eviction paths).
   - A request that ends, by finish, cancel or error, drops the cap to the decode cap (`endRequest`, in the scheduler's
     slot cleanup), so a prefill with no decode forward after it does not leave the raised pool parked.
   - Why scale: at `--ssd-budget-gb 115` (280 slots a layer, 8.95 GB headroom) a 31-row restore tail billed the full pool,
     a 12.17 GB need, and released two decoder pools (5.40 GB, ~1.2 s with the read back). Its need is 3.58 GB of working
-    set plus the pool; with the pool at the decode cap it is 4.65 GB and nothing is released. The working set prices a
+    set plus the growth over the decode cap, which is nothing at 31 rows; billing the whole cap (4.65 GB) counted the
+    decode cap twice, and failed the tiny STQ borrow test. At a 14,766-token position the need is 3.58 / 4.65 / 15.03 GB
+    at 31 / 512 / 2048 rows (1 / 2 / 8 GiB cap). The working set prices a
     forward under 512 rows as a 511-row one (`transientBytes` floors at the tail merge): 2.86 GB at 31 rows against ~0.5 GB
     by the same formula at 31 rows. That floor is conservative, not measured at short forwards, and unchanged.
   - Measured (STQ-1.75bpw, M5 Max, one cold 14,766-token prefill, three live-state repeats with a 31-row tail, one turn
@@ -99,7 +107,7 @@ engine) do not cover it. At 1M: 3.69 GB in all.
 
 **The borrow** (`src/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
 - Before every forward wider than 17 rows, its need, `(transientBytes(rows - 511, seq) + rows x 890) x 5/4` plus the
-  forward's pool cap, 8 GiB at a 2048-row chunk ([above](#the-ledger-an-stq-pack---ssd-budget-gb-96--10308-gb-no-vision-tower)), is checked
+  forward's pool growth over the decode cap, 7 GiB at a 2048-row chunk ([above](#the-ledger-an-stq-pack---ssd-budget-gb-96--10308-gb-no-vision-tower)), is checked
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the
   pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released, and the live headroom is re-read after each
