@@ -262,6 +262,8 @@ pub const Sample = struct {
     /// Median active GPU clock of the request's busy samples (0 = none) and its worst thermal pressure (null = not monitored).
     gpu_mhz: f64 = 0,
     gpu_pressure: ?gpu_clock.Pressure = null,
+    /// The server ended the request through its repetition-loop stop, so fewer tokens than asked is expected.
+    loop_stop: bool = false,
 
     pub fn newTokens(s: Sample) u32 {
         return s.prompt_n -| s.cached_n;
@@ -295,7 +297,7 @@ pub fn check(s: Sample) ?Problem {
         if (s.cached_n != 0) return .restore_missed;
     } else if (s.cached_n + restore_slack < s.base or s.cached_n > s.base) return .restore_missed;
     if (!s.restore_logged) return .no_restore_line;
-    if (s.max_tokens > 1 and s.completion_n < s.max_tokens) return .short_decode;
+    if (s.max_tokens > 1 and s.completion_n < s.max_tokens and !s.loop_stop) return .short_decode;
     return null;
 }
 
@@ -335,6 +337,7 @@ pub const Completion = struct {
     completion_n: u32,
     prompt_ms: f64,
     predicted_ms: f64,
+    loop_stop: bool = false,
 };
 
 fn jsonNum(v: ?std.json.Value) ?f64 {
@@ -346,6 +349,16 @@ fn jsonNum(v: ?std.json.Value) ?f64 {
     };
 }
 
+/// `choices[0].finish_details.type == "repetition_loop"`, the shape server.zig's `finishDetailsField` emits.
+fn loopStopped(root: std.json.ObjectMap) bool {
+    const choices = root.get("choices") orelse return false;
+    if (choices != .array or choices.array.items.len == 0 or choices.array.items[0] != .object) return false;
+    const d = choices.array.items[0].object.get("finish_details") orelse return false;
+    if (d != .object) return false;
+    const ty = d.object.get("type") orelse return false;
+    return ty == .string and std.mem.eql(u8, ty.string, "repetition_loop");
+}
+
 pub fn parseCompletion(allocator: std.mem.Allocator, body: []const u8) !Completion {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
@@ -354,6 +367,7 @@ pub fn parseCompletion(allocator: std.mem.Allocator, body: []const u8) !Completi
     if (t != .object) return error.NoTimings;
     const o = t.object;
     return .{
+        .loop_stop = loopStopped(parsed.value.object),
         .prompt_n = @intFromFloat(jsonNum(o.get("prompt_n")) orelse return error.NoTimings),
         .cached_n = @intFromFloat(jsonNum(o.get("cached_n")) orelse return error.NoTimings),
         .completion_n = @intFromFloat(jsonNum(o.get("predicted_n")) orelse return error.NoTimings),
@@ -618,6 +632,14 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
             .gpu_throttled => "the GPU clock or thermal pressure failed the abort rule (see the GPU columns)",
         } });
     }
+
+    var noted = false;
+    for (rep.samples) |s| {
+        if (!s.loop_stop or s.completion_n >= s.max_tokens) continue;
+        if (!noted) try w.writeAll("\n## Notes\n\nThe server's loop stop cut a greedy repetition loop. The sample counts: its tok/s is a real decode.\n\n");
+        noted = true;
+        try w.print("- {s}, {d} tokens ({s}): the loop stop ended it at {d} tokens\n", .{ @tagName(s.arm), s.prompt_len, @tagName(s.kind), s.completion_n });
+    }
     return out.toOwnedSlice();
 }
 
@@ -726,6 +748,7 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
         .mode = mode orelse "",
         .gpu_mhz = gpu.mhz,
         .gpu_pressure = gpu.pressure,
+        .loop_stop = c.loop_stop,
     };
 }
 
@@ -928,6 +951,9 @@ test "bench samples: the restore comes out of the prefill time, and a missed res
     s.restore_logged = true;
     s.max_tokens = 512;
     try testing.expectEqual(Problem.short_decode, check(s).?);
+    s.loop_stop = true;
+    try testing.expect(check(s) == null);
+    s.loop_stop = false;
     s.max_tokens = 1;
     s.base = 0;
     try testing.expectEqual(Problem.restore_missed, check(s).?);
@@ -963,6 +989,17 @@ test "bench wire: a completion's timings, and a reply without them is refused" {
     try testing.expectEqual(@as(u32, 512), c.completion_n);
     try testing.expectApproxEqAbs(@as(f64, 4000.5), c.prompt_ms, 0.001);
     try testing.expectError(error.NoTimings, parseCompletion(a, "{\"usage\":{}}"));
+    try testing.expect(!c.loop_stop);
+}
+
+test "bench wire: a loop stop is read from the choice's finish_details" {
+    const a = testing.allocator;
+    const timings = "\"timings\":{\"prompt_n\":8223,\"cached_n\":31,\"prompt_ms\":4000.5,\"predicted_n\":390,\"predicted_ms\":6000.0}";
+    const loop = try parseCompletion(a, "{\"choices\":[{\"index\":0,\"text\":\"x\",\"finish_reason\":\"stop\",\"finish_details\":{\"type\":\"repetition_loop\"}}]," ++ timings ++ "}");
+    try testing.expect(loop.loop_stop);
+    try testing.expectEqual(@as(u32, 390), loop.completion_n);
+    const plain = try parseCompletion(a, "{\"choices\":[{\"index\":0,\"text\":\"x\",\"finish_reason\":\"stop\"}]," ++ timings ++ "}");
+    try testing.expect(!plain.loop_stop);
 }
 
 test "bench log: the restore line the scheduler writes and the last spec mode parse back" {
@@ -1010,6 +1047,16 @@ test "bench report: decode rows, the window table, the summary row and the warni
     const md2 = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &bad });
     defer a.free(md2);
     try testing.expect(std.mem.indexOf(u8, md2, "## Warnings") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## Notes") == null);
+
+    var looped = samples;
+    looped[1].completion_n = 390;
+    looped[1].loop_stop = true;
+    const md3 = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &looped });
+    defer a.free(md3);
+    try testing.expect(std.mem.indexOf(u8, md3, "## Warnings") == null);
+    try testing.expect(std.mem.indexOf(u8, md3, "## Notes") != null);
+    try testing.expect(std.mem.indexOf(u8, md3, "the loop stop ended it at 390 tokens") != null);
 }
 
 test "bench prose: the embedded novel is clean, whole, and cut into paragraph-aligned pieces" {

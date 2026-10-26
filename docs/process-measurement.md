@@ -126,7 +126,8 @@ The protocol, fixed for every model and release:
   directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Without a passwordless `sudo -n powermetrics` both say the clock is not monitored and
   go on; a decode number from a run that was not monitored needs a `powermetrics` look beside it before it is recorded.
 - **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
-  short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement.
+  short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement. A decode the
+  server's loop stop ended (`finish_details.type` = `repetition_loop`) is valid: it counts and is listed under Notes.
 
 Cross-engine comparison is not this bench: start the other engine, run llmprobe by hand
 (`npx -y llmprobe@latest <host:port> -m <id> --bench-only`) and name the engine beside every number.
