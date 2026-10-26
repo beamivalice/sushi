@@ -439,6 +439,8 @@ pub const State = struct {
     hist: std.ArrayList(u32) = .empty,
     /// Per DSpark stage: the window of the main stream's keys for the committed positions.
     ds: []Ring = &.{},
+    /// The stage rings hold a commit no pass has submitted yet (`commitMain` lazy); `flushMain` submits it.
+    main_lazy: bool = false,
     verify: ?Verify = null,
 
     pub fn deinit(self: *State) void {
@@ -2469,6 +2471,7 @@ pub fn imageRows(m: *const Model, ids: []const u32) usize {
 
 /// `beginPass` with the images of the request: the span positions of `ids` take `vision`'s rows.
 pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: usize, vision: ?VisionRows) !Pass {
+    try flushMain(st);
     const gpa = m.gpa;
     const c = &m.cfg;
     const L = ids.len;
@@ -2876,7 +2879,7 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
             const t0 = readStart();
             defer readDone(.state, t0);
             try mlx.check(mlx.mlx_array_eval(v.mh));
-        } else try commitMain(&msc, m, p.st, main_rows, p.p0, L > exl3.kernels.DECODE_ROWS_MAX);
+        } else try commitMain(&msc, m, p.st, main_rows, p.p0, if (L > exl3.kernels.DECODE_ROWS_MAX) .wait else .lazy);
     }
     if (res.ctx == null) res = try headLogits(m, p, want);
     if (prof(m, L)) |pf| {
@@ -3008,9 +3011,13 @@ pub fn extend(m: *Model, ids: []const u32, want: Want) !A {
 
 // ── DSpark ───────────────────────────────────────────────────────────────
 
+/// How `commitMain` leaves the stage rings: evaluated before it returns, or as a graph the next pass submits (a draft
+/// or a capture reading a ring evaluates it on its own).
+const Commit = enum { wait, lazy };
+
 /// The stages' window rows for the committed positions [p0, p0 + n): the target layers' main stream
 /// `main_norm(main_proj(rows))`, `rows` `[n, targets * dim]`, through each stage's own key path.
-fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, wait: bool) !void {
+fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, how: Commit) !void {
     const ds = &m.dspark.?;
     const n = dim(rows, 0);
     const main_x = try sc.rms(try ds.main_proj.apply(sc, rows), ds.main_norm, m.cfg.eps);
@@ -3020,17 +3027,26 @@ fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, wait: bool)
         const ly = &m.layers[m.cfg.layers + si];
         try ring.write(try windowRow(sc, m, ly, try ly.wkv.apply(sc, main_x), m.rope_plain.freqs, pos), p0, sc.s);
     }
+    st.main_lazy = how == .lazy;
+    if (how == .lazy) return;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(sc.a);
     for (st.ds) |r| try ev.append(sc.a, r.buf);
-    if (!wait) {
-        const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        return mlx.check(mlx.mlx_async_eval(vec));
-    }
     const t0 = readStart();
     defer readDone(.state, t0);
     try evalAll(ev.items);
+}
+
+/// Submits the commit a step left lazy, so the GPU runs it while the host builds the next pass.
+fn flushMain(st: *State) !void {
+    if (!st.main_lazy) return;
+    st.main_lazy = false;
+    var bufs: [cfg_mod.max_targets]A = undefined;
+    if (st.ds.len > bufs.len) return error.Dsv41NoDspark;
+    for (st.ds, bufs[0..st.ds.len]) |r, *b| b.* = r.buf;
+    const vec = mlx.mlx_vector_array_new_data(&bufs, st.ds.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_async_eval(vec));
 }
 
 /// A drafted block: `ids[0]` the token the draft started from and `ids[1..]` its `block` picks; with the heads' rows
@@ -3124,6 +3140,7 @@ pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
 pub fn verify(m: *Model, ids: []const u32) !A {
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
+    if (ids.len == 1) return extend(m, ids, .all);
     const nl = m.cfg.layers;
     var v: Verify = .{
         .n0 = st.n,
@@ -3150,7 +3167,8 @@ pub fn verify(m: *Model, ids: []const u32) !A {
 pub fn finishVerify(m: *Model, accepted: usize) !void {
     const st = try ensureState(m);
     defer st.dropVerify();
-    const v = &(st.verify orelse return error.Dsv41NoVerify);
+    // A one-row chunk opens no verify: it keeps its row and had nothing to give back.
+    const v = &(st.verify orelse return if (accepted == 0) {} else error.Dsv41NoVerify);
     const keep = accepted + 1;
     if (keep > v.rows) return error.Dsv41VerifyTooWide;
     var sc = Scope.init(m.gpa, m.s);
@@ -3176,7 +3194,7 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
         st.n = end;
         if (st.hist.items.len > end) st.hist.shrinkRetainingCapacity(end);
     }
-    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep), v.n0, true);
+    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep), v.n0, .lazy);
 }
 
 /// DSpark stage `si`'s routed experts as trellis banks, `mtp.<si>.mlp.switch_mlp.<P>[.g<N>].{trellis,suh,svh}`, held as one
@@ -3703,11 +3721,11 @@ test "dsv41 DSpark: with the QAT round trips on, the stages draft the reference'
     // The trunk's own rounding flips would move the main rows, so the reference's rows feed the stages directly.
     const st = try ensureState(m);
     const prefill_rows = fx.get("ds_mh_prefill").?;
-    try commitMain(&sc, m, st, prefill_rows, 0, true);
+    try commitMain(&sc, m, st, prefill_rows, 0, .wait);
     st.n = dim(prefill_rows, 0);
     const step_rows = fx.get("ds_mh").?;
     for (0..dim(step_rows, 0)) |k| {
-        try commitMain(&sc, m, st, try sc.slice(step_rows, 0, k, k + 1), st.n, true);
+        try commitMain(&sc, m, st, try sc.slice(step_rows, 0, k, k + 1), st.n, .wait);
         st.n += 1;
         var d = try draft(m, t1[k], true);
         defer d.deinit();
@@ -3855,6 +3873,120 @@ test "dsv41 DSpark: after a rollback the next draft is the serial model's draft 
         try compare("draft after rollback", got.logits, want.logits, 2e-3);
         t1 = next;
     }
+}
+
+fn expectDraftsEqual(want: Draft, got: Draft) !void {
+    try testing.expectEqualSlices(u32, want.ids, got.ids);
+    try testing.expectEqualSlices(f32, want.logits, got.logits);
+    try testing.expectEqualSlices(f32, want.conf, got.conf);
+}
+
+/// Forces the stage rings now, as a commit that is not left to the next pass does.
+fn settleRings(m: *Model) !void {
+    const st = try ensureState(m);
+    for (st.ds) |r| try mlx.check(mlx.mlx_array_eval(r.buf));
+    st.main_lazy = false;
+}
+
+test "dsv41 DSpark: a one-row verify round is the serial step, opens no verify and leaves the rings for the next pass (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const P = TINY_S - 5;
+    var l0: []f32 = undefined;
+    const serial = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l0);
+    defer serial.deinit();
+    defer testing.allocator.free(l0);
+    var l1: []f32 = undefined;
+    const one = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l1);
+    defer one.deinit();
+    defer testing.allocator.free(l1);
+    var t = argmaxRow(l0);
+    for (0..6) |_| {
+        const want = try extend(serial, &.{t}, .last);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try verify(one, &.{t});
+        defer _ = mlx.mlx_array_free(got);
+        const st = try ensureState(one);
+        try testing.expect(st.verify == null);
+        try testing.expect(st.main_lazy);
+        const row = try sc_mod.hostF32(want);
+        try testing.expectEqualSlices(f32, row, try sc_mod.hostF32(got));
+        try finishVerify(one, 0);
+        try testing.expectEqual((try ensureState(serial)).n, st.n);
+        t = argmaxRow(row);
+    }
+    var want = try draft(serial, t, true);
+    defer want.deinit();
+    var got = try draft(one, t, true);
+    defer got.deinit();
+    try expectDraftsEqual(want, got);
+    try testing.expectError(error.Dsv41NoVerify, finishVerify(one, 1));
+}
+
+test "dsv41 DSpark: plain rounds whose commit is left lazy give the drafts and verify rows of the eager commit, where the drafter re-engages (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const P = TINY_S - 7;
+    var l0: []f32 = undefined;
+    const lazy = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l0);
+    defer lazy.deinit();
+    defer testing.allocator.free(l0);
+    var l1: []f32 = undefined;
+    const eager = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l1);
+    defer eager.deinit();
+    defer testing.allocator.free(l1);
+    const B = lazy.cfg.dspark.block;
+    const V = lazy.cfg.vocab;
+    var t1 = argmaxRow(l0);
+    // a wide round, then a plain run of 5, 1 and 3 rounds; the eager model forces its rings after every pass
+    for ([_]usize{ 5, 1, 3 }) |plain| {
+        var want = try draft(eager, t1, true);
+        defer want.deinit();
+        var got = try draft(lazy, t1, true);
+        defer got.deinit();
+        try expectDraftsEqual(want, got);
+        const vl = try verify(lazy, got.ids[0 .. B + 1]);
+        defer _ = mlx.mlx_array_free(vl);
+        const ve = try verify(eager, got.ids[0 .. B + 1]);
+        defer _ = mlx.mlx_array_free(ve);
+        const rows = try sc_mod.hostF32(vl);
+        try testing.expectEqualSlices(f32, try sc_mod.hostF32(ve), rows);
+        var accepted: usize = 0;
+        while (accepted < B and argmaxRow(rows[accepted * V ..][0..V]) == got.ids[1 + accepted]) accepted += 1;
+        try finishVerify(lazy, accepted);
+        try finishVerify(eager, accepted);
+        try settleRings(eager);
+        t1 = argmaxRow(rows[accepted * V ..][0..V]);
+        for (0..plain) |_| {
+            const a = try verify(lazy, &.{t1});
+            defer _ = mlx.mlx_array_free(a);
+            const b = try verify(eager, &.{t1});
+            defer _ = mlx.mlx_array_free(b);
+            try settleRings(eager);
+            const row = try sc_mod.hostF32(a);
+            try testing.expectEqualSlices(f32, try sc_mod.hostF32(b), row);
+            try finishVerify(lazy, 0);
+            try finishVerify(eager, 0);
+            t1 = argmaxRow(row);
+        }
+    }
+    var want = try draft(eager, t1, true);
+    defer want.deinit();
+    var got = try draft(lazy, t1, true);
+    defer got.deinit();
+    try expectDraftsEqual(want, got);
 }
 
 /// Bytes of every array a DSpark load holds beyond the trunk.

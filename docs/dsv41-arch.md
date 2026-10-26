@@ -343,6 +343,14 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   for about 1.3 accepted tokens; the adaptive round matches serial there (the drafts of a novel text are worth about what their rows
   cost) and takes 70-90% of the rounds as 1-row steps. A one-row step through the verify path decodes at 32 tok/s warm at 1k, 4k and
   16k, above the 27.5 of `--no-mtp` (different boots: unconfirmed).
+- **A one-row round is the serial step.** It opens no verify (nothing to give back), and the stage windows' commit
+  (`commitMain`, per row, never batched across rows: the 1-row and multi-row `main_proj` arms may differ in bits) is left
+  lazy and submitted when the next pass begins, instead of a second host wait after the verdict. Greedy text of a forced
+  one-row run is byte-identical to `--no-mtp` over 600 tokens. Measured on `353f8f79` (shipped STQ 1.75bpw, `--ssd-budget-gb 108
+  --ctx-size 1000000`, 4754-token prompt, 600 greedy tokens, first request of a cold boot, lock, QUIET, fans max, die 49.5 C,
+  `taskpolicy -a`): forced one-row 21.8 -> 21.2 ms a token (verify median 21.4 -> 21.0) against 20.9 serial (`d57f8ea8`, other
+  boots, so unpaired); adaptive 62.5 -> 63.8 tok/s. What is left (~0.3 ms) is the commit's own GPU time plus the 7.9 GB
+  DSpark residency taken out of the expert cache, which `--no-mtp` does not pay (not separated).
 - **Queued routed chains and paired verify rows** (the shipped STQ 1.75bpw pack, M5 Max, budget 110, `--ctx-size 65536`,
   `taskpolicy -a`, one A then one B per boot, die under 50 °C, a 5.4k-token prompt, 600 greedy tokens; base main `0e165e29`):
   `--no-mtp` serial 31.7 -> 39.8 tok/s (28-32 -> 22-24 ms a token), greedy text byte-identical. A Metal trace of the
