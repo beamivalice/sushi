@@ -53,12 +53,14 @@ OUT="$HOME/.sushi/runs/bench-$TAG"
 mkdir -p "$OUT"
 QUIET="$HOME/.sushi/runs/QUIET"
 pid=""
+fans=""
 have_lock=0
 owner="bench-$TAG"
 
 cleanup() {
     local rc=$?
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null
+    [[ -n "$fans" ]] && kill "$fans" 2>/dev/null
     fanctl auto >/dev/null 2>&1
     [[ "$have_lock" -eq 1 ]] && "$LOCK" release "$owner" >/dev/null 2>&1
     rm -f "$QUIET"
@@ -89,7 +91,10 @@ STAMP="$STAMP\\nServer flags: ${SERVER_FLAGS[*]:-defaults}. Private SSD prefix c
 # ── Lock, then cool ──
 "$LOCK" acquire "$owner" || die "could not take the GPU lock"
 have_lock=1
-fanctl max --ttl 10800 >/dev/null 2>&1 || echo "bench.sh: fanctl max failed; the run is not thermally controlled" >&2
+fanctl max --ttl 900 >/dev/null 2>&1 || echo "bench.sh: fanctl max failed; the run is not thermally controlled" >&2
+# The fan daemon grants at most 15 min of max whatever the ttl asked, then goes back to auto: renew it for the whole run.
+( while sleep 300; do fanctl max --ttl 900 >/dev/null 2>&1; done ) &
+fans=$!
 hottest() {
     fanctl status 2>/dev/null | python3 -c 'import json,sys; print(max(t["celsius"] for t in json.load(sys.stdin)["topTemps"]))' 2>/dev/null || echo 99
 }
