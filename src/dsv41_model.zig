@@ -1335,9 +1335,26 @@ fn blockMax(sc: *Scope, scores: A, bs: usize) !A {
     return sc.max(try sc.reshape(padded, &.{ ci(L), ci(n_blocks), ci(bs) }), -1, false);
 }
 
+/// `candidateBlocks` as the picked block ids `[L, kb]` int32 (ascending, -1 = a block no query reaches), or none when
+/// every block is kept.
+fn candidateBlockIds(sc: *Scope, m: *const Model, li: usize, scores: A, lens: A, bs: usize, kb: usize) !A {
+    if ((dim(scores, 1) + bs - 1) / bs <= kb) return none;
+    const p = try candidatePicks(sc, m, li, try blockMax(sc, scores, bs), lens, bs, kb);
+    return sc.where(p.reach, p.chosen, try sc.i(-1));
+}
+
 /// `candidateBlocks` from the block maxima `blocks_in` `[L, n_blocks]`, more than `kb` of them.
 fn candidateMask(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A, bs: usize, kb: usize) !A {
-    const L = dim(blocks_in, 0);
+    const p = try candidatePicks(sc, m, li, blocks_in, lens, bs, kb);
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_put_along_axis(&o, try sc.zeros(&.{ ci(dim(blocks_in, 0)), ci(dim(blocks_in, 1)) }, .bool_), p.chosen, p.reach, -1, sc.s), &o);
+}
+
+const CandPicks = struct { chosen: A, reach: A };
+
+/// The `kb` blocks of the maxima `blocks_in` `[L, n_blocks]` a query keeps (the one holding its newest group pinned), and
+/// which of them it reaches.
+fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A, bs: usize, kb: usize) !CandPicks {
     const n_blocks = dim(blocks_in, 1);
     const ninf = try sc.f(-std.math.inf(f32));
     var blocks = blocks_in;
@@ -1349,9 +1366,7 @@ fn candidateMask(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A, 
         try t.put("cand_scores_{d}", .{li}, blocks);
         try t.put("cand_idx_{d}", .{li}, chosen);
     }
-    const reach = try sc.op2(mlx.mlx_greater, try sc.takeAlong(blocks, chosen, -1), ninf);
-    var o = mlx.mlx_array_new();
-    return sc.res(mlx.mlx_put_along_axis(&o, try sc.zeros(&.{ ci(L), ci(n_blocks) }, .bool_), chosen, reach, -1, sc.s), &o);
+    return .{ .chosen = chosen, .reach = try sc.op2(mlx.mlx_greater, try sc.takeAlong(blocks, chosen, -1), ninf) };
 }
 
 /// The indexer's scores `[Ls, nb]` of `q` (f32 `[Ls, ih, ihd]`) against `keys`: sum over heads of the weight (the
@@ -1508,15 +1523,25 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
             cand.* = if (kb > 0) sc.out(got.cand) else none;
         }
         idx = got.idx;
+    } else if (masked and mlx.mlx_array_dtype(cand.*) == .int32) {
+        const pk = rows.pack.?;
+        const scores = try kernels.indexScoresGather(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, pk.mode, pk.group, cand.*, bs);
+        idx = try kernels.candidateKeys(sc, try topkRows(sc, m, scores, kk), cand.*, bs);
     } else {
-        var scores = if (rows.pack != null and narrowIndex(sc, m, Ls, nb)) // [Ls, nb]
+        const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
+        var scores = if (packed_scan) // [Ls, nb]
             try kernels.indexScoresPacked(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, rows.pack.?.mode, rows.pack.?.group)
         else
             try indexScores(sc, m, q, try rows.rows(sc, nb), wts, wscale, p0, r);
         if (is_source) {
-            const mask = try candidateBlocks(sc, m, li, scores, lens, bs, c.cand_blocks);
+            // A decode block's later layers score only the picked blocks' keys, so they get the ids; the picks are the
+            // masked whole scan's while the blocks hold more reachable keys than a query keeps.
+            const picks = if (packed_scan and m.trace == null and (c.cand_blocks -| 1) * bs >= c.index_topk)
+                try candidateBlockIds(sc, m, li, scores, lens, bs, c.cand_blocks)
+            else
+                try candidateBlocks(sc, m, li, scores, lens, bs, c.cand_blocks);
             if (cand.ctx != null) _ = mlx.mlx_array_free(cand.*);
-            cand.* = if (mask.ctx != null) sc.out(mask) else none;
+            cand.* = if (picks.ctx != null) sc.out(picks) else none;
         } else if (masked) {
             var o = mlx.mlx_array_new();
             const rep = try sc.res(mlx.mlx_repeat_axis(&o, cand.*, ci(bs), -1, sc.s), &o);
@@ -4484,6 +4509,111 @@ test "dsv41 index stream peak bytes by context (SUSHI_DSV41_INDEX_UBENCH=1)" {
         const plain = try peakOf(&sc, indexNarrowArm, .{ a, none });
         const masked = try peakOf(&sc, indexNarrowArm, .{ a, mask });
         std.debug.print("dsv41-index narrow L {d} ctx {d}: packed keys {d} MB, with the mask {d} MB\n", .{ L, ctx, plain >> 20, masked >> 20 });
+    }
+}
+
+fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
+}
+
+// A decode block's indexer stages per context (release shapes, packed keys), each evaluated alone, best of 15 ms.
+// Prints only under SUSHI_DSV41_INDEX_UBENCH.
+test "dsv41 decode index stage timing by context (SUSHI_DSV41_INDEX_UBENCH=1)" {
+    if (!@import("transformer.zig").diagEnvOn("SUSHI_DSV41_INDEX_UBENCH")) return error.SkipZigTest;
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sc = Scope.init(testing.allocator, gpu);
+    defer sc.deinit();
+    var fake: Model = undefined;
+    fake.fused = true;
+    fake.trace = null;
+    for ([_]usize{ 32768, 65536, 131072, 262144 }) |nb| {
+        var rows = try streamKeys(&sc, nb, 4096, 0x4d0);
+        defer rows.deinit();
+        const pk = rows.pack.?;
+        for ([_]usize{ 1, 2, 4 }) |L| {
+            const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0), .float32);
+            const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32 }, 0x6d0), .bfloat16);
+            const lens_h = try testing.allocator.alloc(i32, L);
+            defer testing.allocator.free(lens_h);
+            for (lens_h, 0..) |*v, i| v.* = @intCast(nb - L + i + 1);
+            const lens = try sc.ints(lens_h, &.{ ci(L), 1 });
+            const codes = try sc.slice(rows.buf, 0, 0, nb);
+            const scl = try sc.slice(rows.sbuf, 0, 0, nb);
+            const full = try kernels.indexScoresPacked(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+            const mask = try candidateBlocks(&sc, &fake, 0, full, lens, 8, 2048);
+            try evalAll(&.{ q, w, lens, codes, scl, full, mask });
+            var best: [5]f64 = @splat(std.math.inf(f64));
+            for (0..16) |rep| {
+                var t = Scope.init(testing.allocator, gpu);
+                defer t.deinit();
+                var t0 = std.Io.Timestamp.now(io, .boot);
+                const scores = try kernels.indexScoresPacked(&t, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+                try evalAll(&.{scores});
+                const a = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                var o = mlx.mlx_array_new();
+                const rep_m = try t.res(mlx.mlx_repeat_axis(&o, mask, 8, -1, t.s), &o);
+                const masked = try t.where(try t.slice(rep_m, -1, 0, nb), scores, try t.f(-std.math.inf(f32)));
+                try evalAll(&.{masked});
+                const b = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                const idx = try topkRows(&t, &fake, masked, 512);
+                try evalAll(&.{idx});
+                const c = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                const cand = try candidateBlocks(&t, &fake, 0, scores, lens, 8, 2048);
+                try evalAll(&.{cand});
+                const d = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                const s2 = try kernels.indexScoresPacked(&t, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+                const ix2 = try topkRows(&t, &fake, s2, 512);
+                try evalAll(&.{ix2});
+                const e = msSince(io, t0);
+                if (rep > 0) for ([_]f64{ a, b, c, d, e }, 0..) |v, i| {
+                    best[i] = @min(best[i], v);
+                };
+            }
+            std.debug.print("dsv41-index-decode nb {d} L {d}: scores {d:.3} ms, mask {d:.3}, topk {d:.3}, cand-source blocks {d:.3}, scores+topk {d:.3}\n", .{ nb, L, best[0], best[1], best[2], best[3], best[4] });
+        }
+    }
+}
+
+// A later index source's picks over the candidate blocks' keys alone are the masked whole scan's, ties included (the
+// keys repeat every 4096, so scores tie across blocks).
+test "dsv41 index decode: scoring the candidate blocks' keys picks what the masked whole scan picks" {
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, gpu);
+    defer sc.deinit();
+    var fake: Model = undefined;
+    fake.fused = true;
+    fake.trace = null;
+    const nb: usize = 65536;
+    var rows = try streamKeys(&sc, nb, 4096, 0x4d0);
+    defer rows.deinit();
+    const pk = rows.pack.?;
+    const codes = try sc.slice(rows.buf, 0, 0, nb);
+    const scl = try sc.slice(rows.sbuf, 0, 0, nb);
+    for ([_]usize{ 1, 2, 4, 16 }) |L| {
+        const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0 + L), .float32);
+        const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32 }, 0x6d0), .bfloat16);
+        const lens_h = try testing.allocator.alloc(i32, L);
+        defer testing.allocator.free(lens_h);
+        for (lens_h, 0..) |*v, i| v.* = @intCast(nb - L + i + 1);
+        const lens = try sc.ints(lens_h, &.{ ci(L), 1 });
+        const scores = try kernels.indexScoresPacked(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+        const mask = try candidateBlocks(&sc, &fake, 0, scores, lens, 8, 2048);
+        const ids = try candidateBlockIds(&sc, &fake, 0, scores, lens, 8, 2048);
+        var o = mlx.mlx_array_new();
+        const rep = try sc.res(mlx.mlx_repeat_axis(&o, mask, 8, -1, sc.s), &o);
+        const masked = try sc.where(try sc.slice(rep, -1, 0, nb), scores, try sc.f(-std.math.inf(f32)));
+        const want = try sc.where(try sc.lt(try topkRows(&sc, &fake, masked, 512), lens), try topkRows(&sc, &fake, masked, 512), try sc.i(-1));
+        const gathered = try kernels.indexScoresGather(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group, ids, 8);
+        const keys = try kernels.candidateKeys(&sc, try topkRows(&sc, &fake, gathered, 512), ids, 8);
+        const got = try sc.where(try sc.lt(keys, lens), keys, try sc.i(-1));
+        try expectSameInts(want, got);
     }
 }
 

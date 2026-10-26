@@ -67,6 +67,12 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   tile scores the bits of the whole list's columns (`indexScoresTile` takes the tile's key offset, a multiple of the
   kernel's key tile). A decode-width block (up to 16 rows) scores the packed index keys directly
   (`indexScoresPacked`), with no unpacked copy. A trace run keeps the whole scores.
+- **Decode indexer cost, by context** (`SUSHI_DSV41_INDEX_UBENCH=1 -Dtest-filter="dsv41 decode index stage timing"`): the
+  score pass is one thread a key and linear in keys AND rows (a verify of R rows re-reads the keys R times); the top-k is one
+  threadgroup a row. A plain step at 209k tokens costs ~4 ms more than at 5k (serial, 40.0 against 47.8 tok/s), nearly all of
+  it the eight index sources. A decode block's later index sources (layers 24-36) score only the candidate source's picked
+  blocks (`indexScoresGather` over the block ids `candidateBlockIds` hands down, then `candidateKeys` maps the picks back):
+  the picks are the masked whole scan's, ties included, while the blocks hold more reachable keys than a query keeps.
 
 ### QAT round trips
 

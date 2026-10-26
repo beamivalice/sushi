@@ -1053,13 +1053,16 @@ const IDX_SCORE_SECOND =
     \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
 ;
 
-const IDX_SCORE_LAST =
+const IDX_SCORE_DOT =
     \\for (int j = 0; j < IHD; ++j) {
     \\  const float kv = KEY(j);
     \\  for (int h = 0; h < IH; ++h) dots[h] += qs[h * IHD + j] * kv;
     \\}
     \\float s = 0.0f;
     \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
+;
+
+const IDX_SCORE_LAST = IDX_SCORE_DOT ++
     \\const int seen = (meta[0] + l + 1) / meta[1];
     \\scores[size_t(l) * nb + n] = n < seen ? s : -INFINITY;
 ;
@@ -1084,6 +1087,37 @@ const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
     \\
 ++ IDX_SCORE_LAST;
+
+/// The packed scores of candidate blocks only: score c of row l is key `blocks[l, c / BS] * BS + c % BS` (`blocks`
+/// `[L, KB]` int32, ascending, < 0 = none), -inf for no block or a key the query cannot see. A key scores the bits it
+/// does in `IDX_SCORE_PACKED_SOURCE`.
+const IDX_GATHER_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
+    \\const int nb = blocks_shape[1] * BS;
+    \\
+++ IDX_SCORE_SECOND ++
+    \\const int blk = blocks[l * blocks_shape[1] + n / BS];
+    \\const int key = blk * BS + n % BS;
+    \\if (blk < 0 || key >= (meta[0] + l + 1) / meta[1]) {
+    \\  scores[size_t(l) * nb + n] = -INFINITY;
+    \\  return;
+    \\}
+    \\const auto kc = codes + size_t(key) * (IHD / 2);
+    \\const auto ks = scales + size_t(key) * (IHD / G);
+    \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
+    \\
+++ IDX_SCORE_DOT ++
+    \\scores[size_t(l) * nb + n] = s;
+;
+
+/// Key ids of the picks `pos` (`[L, K]` positions into a gathered score row) of `blocks`; ids of no block are past any query.
+const CAND_KEYS_SOURCE =
+    \\const int j = thread_position_in_grid.x, l = thread_position_in_grid.y;
+    \\const int k = pos_shape[1];
+    \\if (j >= k) return;
+    \\const int p = pos[l * k + j];
+    \\const int blk = blocks[l * blocks_shape[1] + p / BS];
+    \\out[l * k + j] = blk < 0 ? 0x7fffffff : blk * BS + p % BS;
+;
 
 const IDX_PACKED_HEADER: [:0]const u8 = qat_mod.PACK_HEADER ++
     \\template <typename C, typename S>
@@ -1166,6 +1200,8 @@ const IDX_TILE_SOURCE =
 var idx_score_def = Def{ .name = "dsv41_index_scores", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_SCORE_SOURCE };
 var idx_packed_def = Def{ .name = "dsv41_index_scores_fp4", .ins = &.{ "q", "codes", "scales", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_SCORE_PACKED_SOURCE, .header = IDX_PACKED_HEADER };
 var idx_tile_def = Def{ .name = "dsv41_index_tile", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_TILE_SOURCE };
+var idx_gather_def = Def{ .name = "dsv41_index_scores_gather", .ins = &.{ "q", "codes", "scales", "w", "meta", "wsc", "blocks" }, .outs = &.{"scores"}, .source = IDX_GATHER_SOURCE, .header = IDX_PACKED_HEADER };
+var cand_keys_def = Def{ .name = "dsv41_cand_keys", .ins = &.{ "pos", "blocks" }, .outs = &.{"out"}, .source = CAND_KEYS_SOURCE };
 
 /// Keys one threadgroup of `indexScoresTile` scores for keys of `dt`: a slice scored at an offset must start on one.
 pub fn indexKeyTile(dt: mlx.mlx_dtype) usize {
@@ -1201,6 +1237,27 @@ pub fn indexScoresPacked(sc: *Scope, q: A, codes: A, scales: A, w: A, wscale: f3
     try launch(sc, &idx_packed_def, &.{ q, codes, scales, w, meta, try f32Const(sc, &.{wscale}) }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + tg - 1) / tg * tg, L, 1 }, .{ tg, 1, 1 }, &.{
         .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(codes, 1) * 2) }, .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) },
     }, &.{}, &o);
+    return o[0];
+}
+
+/// `indexScoresPacked` over the keys of `blocks` (`[L, KB]` int32 block ids of `bs` keys, ascending, < 0 = none) only:
+/// `[L, KB * bs]`, column c the key `blocks[l, c / bs] * bs + c % bs`, each the bits the whole scan gives that key.
+pub fn indexScoresGather(sc: *Scope, q: A, codes: A, scales: A, w: A, wscale: f32, p0: usize, ratio: usize, mode: qat_mod.Qat, group: usize, blocks: A, bs: usize) !A {
+    const L = dim(q, 0);
+    const nc = dim(blocks, 1) * bs;
+    const meta = try sc.ints(&.{ ci(p0), ci(ratio) }, &.{2});
+    const tg: usize = 256;
+    var o: [1]A = undefined;
+    try launch(sc, &idx_gather_def, &.{ q, codes, scales, w, meta, try f32Const(sc, &.{wscale}), blocks }, &.{.{ .shape = &.{ ci(L), ci(nc) }, .dt = .float32 }}, .{ (nc + tg - 1) / tg * tg, L, 1 }, .{ tg, 1, 1 }, &.{
+        .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(codes, 1) * 2) }, .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) }, .{ .name = "BS", .v = ci(bs) },
+    }, &.{}, &o);
+    return o[0];
+}
+
+/// The key ids of `pos` (`[L, K]` int32 columns of `indexScoresGather`'s scores): a block id of none maps to past any query.
+pub fn candidateKeys(sc: *Scope, pos: A, blocks: A, bs: usize) !A {
+    var o: [1]A = undefined;
+    try launch(sc, &cand_keys_def, &.{ pos, blocks }, &.{.{ .shape = mlx.getShape(pos), .dt = .int32 }}, .{ (dim(pos, 1) + 255) / 256 * 256, dim(pos, 0), 1 }, .{ 256, 1, 1 }, &.{.{ .name = "BS", .v = ci(bs) }}, &.{}, &o);
     return o[0];
 }
 
