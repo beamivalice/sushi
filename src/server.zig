@@ -6581,9 +6581,10 @@ fn dsv41CheckpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk:
     if (stride == 0) return 0;
     const one = c.stateFixedBytes(config.dsparkOn()) +| seq *| c.stateBytesPerToken();
     // SSD-first, a point the tier takes shares the request's rows and leaves RAM as the writer copies it: what is in
-    // flight is the writer's bounded host buffer, and the fixed rings each point copies.
+    // flight is the writer's bounded host buffer, and the fixed rings each point copies; the deepest few of those
+    // stay in RAM as the next turn's rollback points (`dsv41_prefix.Live`).
     if (seq >= kv_disk_cache.MIN_PERSIST_TOKENS and prefix_cache_mod.ssdFirstActive(config, diskTierOn(config), prefix_cache_ram_enabled))
-        return @min(disk_writer_permit_bytes, one) +| c.stateFixedBytes(config.dsparkOn());
+        return @min(disk_writer_permit_bytes, one) +| (1 + @as(u64, dsv41_prefix.live_point_cap)) *| c.stateFixedBytes(config.dsparkOn());
     const held = @min(@as(u64, dsv41_prefix.checkpointMax(ssm_checkpoint_max)), seq / stride + 1) + 1;
     return held *| one;
 }
@@ -27893,9 +27894,11 @@ test "dsv41 bills: a prefill holds its restore points beside the state with a RA
     prefix_cache_ram_enabled = false;
     prefix_cache_disk_bytes = 20 << 30;
     const rings = c.stateFixedBytes(cfg.dsparkOn());
-    try t.expectEqual(one + rings, dsv41CheckpointReserve(&cfg, seq, 512));
+    // The rollback points the next turn keeps in RAM are billed with it: each is one set of fixed rings.
+    const kept = @as(u64, dsv41_prefix.live_point_cap) * rings;
+    try t.expectEqual(one + rings + kept, dsv41CheckpointReserve(&cfg, seq, 512));
     const big: u64 = 1 << 40;
-    try t.expectEqual(@min(disk_writer_permit_bytes, rings + big * c.stateBytesPerToken()) + rings, dsv41CheckpointReserve(&cfg, big, 512));
+    try t.expectEqual(@min(disk_writer_permit_bytes, rings + big * c.stateBytesPerToken()) + rings + kept, dsv41CheckpointReserve(&cfg, big, 512));
     try t.expect(dsv41CheckpointReserve(&cfg, 100, 512) == 2 * (rings + 100 * c.stateBytesPerToken()));
     // An entry on disk keeps its rows once and the fixed rings of one point per grid step.
     try t.expectEqual(c.stateBytesPerToken() + (rings + dsv41_prefix.row_span - 1) / dsv41_prefix.row_span, diskBytesPerToken(&cfg, 8));

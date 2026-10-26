@@ -6237,6 +6237,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
     @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
+    if (slot.model.transformer) |t| if (t.dsv41) |dsv| hc.publishLiveDsv41(dsv, total_tokens, slot.has_tools, prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start));
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-
@@ -6910,7 +6911,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
     // A chunk record covers a prefix, so it may claim only the media blocks inside it.
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, abs_kv_pos);
     if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s);
-    if (slot.model.transformer.?.dsv41 != null) return hc.writeThroughDsv41(&slot.cache, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s, "prefill");
+    if (slot.model.transformer.?.dsv41) |dsv| return hc.writeThroughDsv41(dsv, &slot.cache, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s, "prefill");
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     hc.writeThroughHybrid(
@@ -7300,7 +7301,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
             if (xfm_ptr.dsv41 != null) log.info("[dsv41-prefix] reused {d} of {d} prompt tokens from {s}, prefilling {d}; lookup and restore {d} ms\n", .{
-                lookup.matched, slot.full_prompt.len, if (lookup.matched == 0) "nothing" else if (hc.last_restored_disk_id != null) "SSD" else "RAM", slot.full_prompt.len - lookup.matched, lookup_sw.read() / std.time.ns_per_ms,
+                lookup.matched, slot.full_prompt.len, if (lookup.matched == 0) "nothing" else if (hc.last_restored_live) "the live state" else if (hc.last_restored_disk_id != null) "SSD" else "RAM", slot.full_prompt.len - lookup.matched, lookup_sw.read() / std.time.ns_per_ms,
             });
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);

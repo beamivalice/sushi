@@ -69,6 +69,136 @@ pub fn restore(m: *model.Model, cp: *const transformer.SSMCheckpoint, ids: []con
     try model.restoreState(m, slots, cp.pos, ids);
 }
 
+/// Restore points a finished request keeps in RAM beside its live state: the deepest few, a point's fixed arrays only.
+pub const live_point_cap: u32 = 8;
+
+/// One kept restore point: the fixed arrays (`captureState`'s non-row slots) at `pos`.
+pub const LivePoint = struct { pos: usize, slots: []model.Slot };
+
+/// The slot's last request, as the next one can roll its live state back into: the points it took and the tokens the
+/// state covers. The rows are the live state's own, append-only, so a point costs its fixed arrays alone. Held only
+/// while the model's state is the one it was recorded for (`model.Model.state_epoch`).
+pub const Live = struct {
+    points: std.ArrayList(LivePoint) = .empty,
+    tokens: []u32 = &.{},
+    has_tools: bool = false,
+    vision_key: u64 = 0,
+    media_start: ?u32 = null,
+    epoch: u64 = 0,
+    /// A request finished over it; false while one is running, whose state is moving past the points.
+    ready: bool = false,
+
+    pub fn deinit(self: *Live, allocator: std.mem.Allocator) void {
+        self.clear(allocator);
+        self.points.deinit(allocator);
+    }
+
+    pub fn clear(self: *Live, allocator: std.mem.Allocator) void {
+        for (self.points.items) |*p| freePoint(allocator, p);
+        self.points.clearRetainingCapacity();
+        allocator.free(self.tokens);
+        self.tokens = &.{};
+        self.ready = false;
+    }
+
+    fn freePoint(allocator: std.mem.Allocator, p: *LivePoint) void {
+        for (p.slots) |*sl| model.freeSlot(sl);
+        allocator.free(p.slots);
+    }
+
+    /// RAM the record holds beyond the model's own state: the points' arrays and the token ids.
+    pub fn bytes(self: *const Live) u64 {
+        var n: u64 = @as(u64, self.tokens.len) * @sizeOf(u32);
+        for (self.points.items) |p| for (p.slots) |sl| for (sl) |a| {
+            n += model.arrayBytes(a);
+        };
+        return n;
+    }
+
+    /// Keeps the fixed arrays of `cp`, a point of the request now running, and drops the shallowest past the cap.
+    pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint) !void {
+        if (self.ready) self.clear(allocator);
+        const n_slots = model.slotCount(m);
+        if (cp.layers.len != 2 * n_slots) return error.Dsv41CheckpointMismatch;
+        while (self.points.items.len > 0 and self.points.items[self.points.items.len - 1].pos >= cp.pos) {
+            var p = self.points.pop().?;
+            freePoint(allocator, &p);
+        }
+        if (self.points.items.len >= live_point_cap) {
+            var p = self.points.orderedRemove(0);
+            freePoint(allocator, &p);
+        }
+        const slots = try allocator.alloc(model.Slot, n_slots);
+        @memset(slots, model.nil_slot);
+        errdefer {
+            for (slots) |*sl| model.freeSlot(sl);
+            allocator.free(slots);
+        }
+        for (slots, 0..) |*sl, j| {
+            if (j < 2 * m.cfg.layers and j % 2 == 1) continue;
+            const lo = cp.layers[2 * j];
+            const hi = cp.layers[2 * j + 1];
+            for ([4]mlx.mlx_array{ lo.conv_state, lo.ssm_state, hi.conv_state, hi.ssm_state }, 0..) |a, k| {
+                if (!model.present(a)) continue;
+                sl[k] = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&sl[k], a));
+            }
+        }
+        try self.points.append(allocator, .{ .pos = cp.pos, .slots = slots });
+    }
+
+    /// The request over the state finished with `tokens` as its history: its points become what the next one may roll back to.
+    pub fn publish(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, tokens: []const u32, has_tools: bool, vision_key: u64, media_start: ?u32) void {
+        const st = m.dec_state orelse return self.clear(allocator);
+        const covered = @min(st.n, tokens.len);
+        while (self.points.items.len > 0 and self.points.items[self.points.items.len - 1].pos > covered) {
+            var p = self.points.pop().?;
+            freePoint(allocator, &p);
+        }
+        allocator.free(self.tokens);
+        self.tokens = &.{};
+        if (self.points.items.len == 0) return self.clear(allocator);
+        self.tokens = allocator.dupe(u32, tokens[0..covered]) catch return self.clear(allocator);
+        self.has_tools = has_tools;
+        self.vision_key = vision_key;
+        self.media_start = media_start;
+        self.epoch = m.state_epoch;
+        self.ready = true;
+    }
+
+    /// The deepest point a request over `prompt` may roll the live state back to: at most `media_cap` tokens in,
+    /// short of the prompt's end, and only while the state's rows outside the request's own bill would still fit it.
+    pub fn pick(self: *const Live, m: *const model.Model, prompt: []const u32, has_tools: bool, media_cap: usize) ?usize {
+        if (!self.ready or self.epoch != m.state_epoch or self.has_tools != has_tools) return null;
+        const st = m.dec_state orelse return null;
+        var shared: usize = 0;
+        const max_shared = @min(self.tokens.len, prompt.len);
+        while (shared < max_shared and self.tokens[shared] == prompt[shared]) shared += 1;
+        const limit = @min(@min(shared, st.n), @min(media_cap, prompt.len -| 1));
+        // The request bills its own prompt's state: rows kept past that are memory nobody paid for.
+        if (!model.liveRowsFit(m, prompt.len)) return null;
+        var i = self.points.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.points.items[i].pos <= limit) return i;
+        }
+        return null;
+    }
+
+    /// Rolls the live state back to point `idx`; the points past it go, and the record is open until its request publishes.
+    pub fn rollback(self: *Live, allocator: std.mem.Allocator, m: *model.Model, idx: usize, prompt: []const u32) !void {
+        const p = self.points.items[idx];
+        try model.rollbackState(m, p.slots, p.pos, prompt);
+        while (self.points.items.len > idx + 1) {
+            var q = self.points.pop().?;
+            freePoint(allocator, &q);
+        }
+        allocator.free(self.tokens);
+        self.tokens = &.{};
+        self.ready = false;
+    }
+};
+
 /// The SSD tier indexes a prefix by its KV rows, and this cache holds none: layer 0 carries one byte per token
 /// so the tier's chunk files, sizes and scan cover the entry. Done before a commit; the forward never reads it.
 pub fn markRows(cache: *transformer.KVCache) !void {

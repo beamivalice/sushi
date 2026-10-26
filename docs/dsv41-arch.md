@@ -533,6 +533,16 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   store about 890 B a token (`diskBytesPerToken` = rows plus the rings' share per span). Thinning a point never touches
   a segment, and the store is not trimmed when the point that reached furthest goes. An entry at 393k tokens holds the
   48 spans (350 MB) and 49 points (about 300 MB), against four full copies of 28 to 357 MB.
+- **A follow-up turn rolls the live state back instead of reading SSD** (`dsv41_prefix.Live`, `dsv41_model.rollbackState`):
+  rows are append-only, so a point at `p` is the fixed arrays at `p` (window rings, open pooling groups, DSpark
+  windows, about 6 MB) plus each row buffer's `used = p / ratio`. A request keeps those arrays for its deepest 8 points
+  (`live_point_cap`; those it writes through and the point it restored from) and publishes them at its commit with its
+  tokens. The next prompt rolls back to the deepest point at or below its shared prefix (under the prompt's end, the
+  media rule's ceiling, equal `has_tools`) unless a stored point reaches further; the result is byte-identical to an
+  SSD restore of that point. It is skipped when the state was replaced (`state_epoch`), the request never finished,
+  or a row buffer exceeds what the prompt's own state would be billed with its quarter (`liveRowsFit`): the live rows
+  past the point stay allocated, so they must fit that bill. The admission reserve adds 8 sets of fixed rings
+  (`dsv41CheckpointReserve`). Log: `[dsv41-prefix] reused N of M prompt tokens from the live state`.
 - **A thinking request with tools writes one more point mid-decode, right behind its `</think>`**
   (`scheduler.writeDsv41ThoughtPoint`; DSpark rounds and an SSD-first tier only). With tools the template re-renders an
   earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the

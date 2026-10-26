@@ -87,6 +87,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   past the store. The manifest lists the segments' bytes (`grown`, v11, which an older reader drops); a scan keeps the
   contiguous valid segments and drops each point that leans on a lost one. Segment bytes ride the entry's bill
   (`nonChunkBytes`, `bytesFreedByRemoving`, `billChunksOnce`) and the pre-write estimate (`entryBytesAt`).
+- **DeepSeek rolls its live state back before any stored restore** (`HotPrefixCache.rollbackLiveDsv41`,
+  `dsv41_prefix.Live`; [dsv41-arch](dsv41-arch.md#prefix-cache)): the slot's last request keeps the fixed arrays of its
+  deepest 8 points in RAM, and a prompt sharing its history rolls the model's state back to the deepest one it reaches
+  unless a stored point reaches further. Valid only while `Model.state_epoch` is unchanged and a request finished over it.
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
   (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
   tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves

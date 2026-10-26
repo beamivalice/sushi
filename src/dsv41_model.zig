@@ -469,7 +469,7 @@ pub const State = struct {
     }
 };
 
-fn arrayBytes(a: A) u64 {
+pub fn arrayBytes(a: A) u64 {
     if (a.ctx == null) return 0;
     return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
 }
@@ -612,6 +612,8 @@ pub const Model = struct {
     /// Arrays made at load (casts, views, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
     dec_state: ?State = null,
+    /// Counts the states dropped: a record of the live state (`dsv41_prefix.Live`) holds only while it is unchanged.
+    state_epoch: u64 = 0,
     /// Tests: named intermediates of a chunk.
     trace: ?*Trace = null,
     /// The fused Metal kernels of `dsv41_kernels.zig` serve where they apply; off, the op chains they replace
@@ -2215,6 +2217,7 @@ pub fn ensureState(m: *Model) !*State {
 pub fn resetState(m: *Model) void {
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
+    m.state_epoch +%= 1;
 }
 
 /// Every decode width a request can take (1..16 rows, after a short prefill so compressed rows exist), with DSpark a
@@ -2319,7 +2322,7 @@ fn ownedRows(x: A, n: usize, s: S) !A {
 }
 
 /// A slot array the checkpoint holds; every real one is 2-D, and an absent one is stored as a one-byte placeholder.
-fn present(a: A) bool {
+pub fn present(a: A) bool {
     return a.ctx != null and mlx.mlx_array_ndim(a) == 2 and mlx.mlx_array_size(a) > 0;
 }
 
@@ -2414,6 +2417,49 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
         try st.hist.ensureTotalCapacity(m.gpa, n);
         for (ids[0..n]) |t| st.hist.appendAssumeCapacity(m.compressedId(t));
     }
+}
+
+/// Whether no row buffer of the live state is larger than a `prompt_len`-token request's own would be, with the
+/// quarter its bill adds (`server.prefillNeededAtChunk`): the live buffers are kept whole by `rollbackState`, so only then are they paid for.
+pub fn liveRowsFit(m: *const Model, prompt_len: usize) bool {
+    const st = m.dec_state orelse return false;
+    for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
+        const own = (prompt_len / m.ratio(li) + 1) * 5 / 4;
+        if (r.cap > @max(own, 64)) return false;
+    };
+    return true;
+}
+
+/// Makes the live state its own earlier self at `n`: `slots` are the fixed arrays a restore point of the same
+/// request held there (`captureState`'s rows are not needed), and the compressed and index rows keep their first
+/// `n / ratio`, because rows are append-only. The arrays are shared, never written. Checked whole before anything
+/// changes; the caller guarantees the first `n` of `ids` are the tokens the state was built from.
+pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) !void {
+    const st = &(m.dec_state orelse return error.Dsv41NoLiveState);
+    if (st.verify != null or slots.len != slotCount(m) or ids.len < n or st.n < n) return error.Dsv41CheckpointMismatch;
+    if (m.hash != null and st.hist.items.len < n) return error.Dsv41CheckpointMismatch;
+    for (st.layers, 0..) |*ls, li| {
+        const a = slots[2 * li];
+        if (!present(a[0]) or dim(a[0], 0) != ls.win.cap) return error.Dsv41CheckpointMismatch;
+        for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |rows| if (rows.used < n / m.ratio(li)) return error.Dsv41CheckpointMismatch;
+    }
+    for (st.ds, 0..) |*ring, si| {
+        const a = slots[2 * st.layers.len + si][0];
+        if (!present(a) or dim(a, 0) != ring.cap) return error.Dsv41CheckpointMismatch;
+    }
+    errdefer resetState(m);
+    for (st.layers, 0..) |*ls, li| {
+        const a = slots[2 * li];
+        try shareInto(&ls.win.buf, a[0]);
+        try shareInto(&ls.pend_kv, a[1]);
+        try shareInto(&ls.pend_gate, a[2]);
+        if (ls.comp) |*rows| rows.used = n / m.ratio(li);
+        if (ls.idx_k) |*rows| rows.used = n / m.ratio(li);
+    }
+    for (st.ds, 0..) |*ring, si| try shareInto(&ring.buf, slots[2 * st.layers.len + si][0]);
+    st.n = n;
+    st.main_lazy = false;
+    if (m.hash != null) st.hist.shrinkRetainingCapacity(n);
 }
 
 /// Sets the kernels off (the diagnostic `SUSHI_DSV41_COMPOSED`, the KLD A/B's teacher arm) or on, and says which.
@@ -4257,7 +4303,6 @@ test "dsv41 restore point: a checkpoint of another position or shape is refused 
     try testing.expectError(error.Dsv41CheckpointMismatch, restoreState(m, cp[1..], 9, ids));
     try testing.expectError(error.Dsv41CheckpointMismatch, restoreState(m, cp, 9, ids[0..4]));
 }
-
 /// Cosine and the largest absolute difference over the peak of two rows.
 fn rowDiff(a: []const f32, b: []const f32) struct { cos: f64, err: f64, same_max: bool } {
     var dot: f64 = 0;
@@ -4303,6 +4348,8 @@ fn cedArm(m: *Model, sc: *Scope, ids: []const u32, chunks: []const usize, steps:
 
 test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are the full forward's bits, and the same prompt in other chunks gives the same state and logits (DSV41_TINY)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+
+
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4348,7 +4395,6 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
         }
     }
 }
-
 
 test "dsv41 Engram: each table keeps a row cache of exactly the bytes the load bills (DSV41_TINY)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
