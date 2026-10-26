@@ -222,14 +222,16 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
 - **On a 128 GB Mac, 108 is the recommended budget.** 96 also serves, with fewer slots; 114, the largest run, needs
   `sudo sysctl iogpu.wired_limit_mb=124000`.
 
-  | `--ssd-budget-gb` | expert slots a layer (of 384) | expert hits | decode 4k | decode 128k | prefill 4k |
+  | `--ssd-budget-gb` | expert slots a layer (of 384) | expert hits | decode 4k code / prose | decode 128k code / prose | prefill 8k window code / prose |
   |---|---:|---:|---:|---:|---:|
-  | 96 | 227 | TODO | TODO | TODO | TODO |
-  | 108 | 260 | TODO | 80.0 | 69.5 | 788 |
-  | 114 | 277 | TODO | TODO | TODO | TODO |
+  | 96 | 227 | 98.96% | 74.1 / 47.2 | 60.1 / 44.0 | 938 / 690 |
+  | 108 | 260 | 99.49% | 80.7 / 47.0 | 69.9 / 50.9 | 977 / 773 |
+  | 114 | 277 | 99.16% | 83.3 / 48.3 | 72.7 / 46.0 | 681 / 544 |
 
-  Slots are the plan from the pack's headers. The 108 row is the [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md)
-  (tok/s, speculative decode on, one request).
+  Slots are the plan from the pack's headers. Every row is one `sushi bench` run on the same binary (tok/s, DSpark on,
+  one request, code and prose corpora); the 114 row is the [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md).
+  At 114 each 8k prefill window pays the layer lending below, which is why its prefill reads lower and its hits, read
+  back after every prefill, sit under 108's.
 - **The cost of 114.** The cache is bigger, so a long prompt has less memory beside it: a prefill of 2048 or more new
   tokens lends the last decoder layers (37 to 39, 8.15 GB) and reads them back before decode, about 1.4 s a request.
   A short agent turn (measured up to 1,000 new tokens) lends nothing and pays nothing. A lower budget leaves more
