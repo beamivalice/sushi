@@ -63,7 +63,9 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
     The 1,000-row turn parks ~4 GB of pool on top of decode, which is the peak. A 2 GiB prefill pool cost 12% of cold
     prefill (666 against 760-781 tok/s), so the full chunk keeps 8 GiB.
 - The per-request state (890 B a token, 0.93 GB at 1M) and the prefill transient are not in the SSD budget. They come
-  from the serving budget (the GPU ceiling less everything resident), billed per request.
+  from the serving budget (the GPU ceiling less everything resident), billed per request. `/props`
+  `memory.kv_cache_bytes` and a live `/metrics` row's `state_bytes` count it (`dsv41_model.stateBytes` plus the live
+  points) while the request runs.
 
 ## Plans that lost
 

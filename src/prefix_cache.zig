@@ -14876,6 +14876,51 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
     try testing.expect(hc.last_restored_live);
 }
 
+// A cancelled request publishes its live record when the scheduler culls it, before the next exclusive request is
+// admitted (`cullDecodingWith`); its tokens are never paired with that request's state, whatever happens to it.
+test "DeepSeek live rollback: a cancelled request's record, published at the cull, never serves a request that continues it from the next one's state (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var a_buf: [60]u32 = undefined;
+    const turn_a = dsv41LongPrompt(&net, &a_buf, null, 0);
+    var b_buf: [60]u32 = undefined;
+    for (&b_buf, 0..) |*t, i| t.* = if (i < 10) turn_a[i] else (net.ids[(i * 3 + 1) % net.ids.len] + 7) % 90;
+    var live: dsv41_prefix.Live = .{};
+    defer live.deinit(a);
+
+    // A: a prefill point at 20, decodes to 40, is cancelled, and publishes at the cull.
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn_a[0..20], .last));
+    {
+        var cp = try dsv41_prefix.capture(a, net.m, 20);
+        defer cp.deinit(a);
+        try live.keep(a, net.m, &cp);
+    }
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn_a[20..40], .last));
+    live.publish(a, net.m, turn_a[0..40], false, 0, null);
+
+    // B shares 10 tokens, short of every point: its lookup drops the record, it prefills cold to a point at 30 and
+    // is cancelled mid-prefill, which publishes nothing.
+    try testing.expectEqual(@as(?usize, null), live.pick(net.m, &b_buf, false, std.math.maxInt(u32)));
+    live.clear(a);
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, b_buf[0..30], .last));
+    {
+        var cp = try dsv41_prefix.capture(a, net.m, 30);
+        defer cp.deinit(a);
+        try live.keep(a, net.m, &cp);
+    }
+
+    // C continues A's conversation: B's state is no state for it.
+    var c_buf: [50]u32 = undefined;
+    @memcpy(c_buf[0..40], turn_a[0..40]);
+    for (c_buf[40..]) |*t| t.* = 93;
+    try testing.expectEqual(@as(?usize, null), live.pick(net.m, &c_buf, false, std.math.maxInt(u32)));
+}
+
 test "DeepSeek SSD tier: the namespace names the layout, and another layout's entries are never read (DSV41_TINY)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const io = std.testing.io;

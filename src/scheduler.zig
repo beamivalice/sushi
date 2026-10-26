@@ -657,6 +657,8 @@ pub const Slot = struct {
     /// echo is not published twice (`takeHandoverEcho`).
     handover_token: ?u32 = null,
     cancelled: std.atomic.Value(bool),
+    /// Inference thread only: `cullDecodingWith` committed this cancelled slot, so its cleanup drain must not.
+    committed_at_cull: bool = false,
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
     /// Set by the connection thread when the request's own stop sequence completed, before it cancels
@@ -1863,7 +1865,8 @@ pub const Scheduler = struct {
             }
         }
         // No new pass can take it (cancelled); wait out the one that has it. It stays in `decoding`
-        // meanwhile, so exclusive admission sees it until it reaches the cleanup queue.
+        // meanwhile, so exclusive admission sees it until it reaches the cleanup queue, unless a cull
+        // already dropped it, which commits first (`commitsAtCull`).
         waitPassesOut(self.io, &self.queue_mu, &slot.in_pass);
         i = 0;
         while (i < self.decoding.items.len) : (i += 1) {
@@ -5676,7 +5679,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     g.logSpecStats();
                     g.logQsaArms();
                 }
-                commitSlotIfApplicable(sch, s);
+                commitCancelledAtCleanup(sch, s, commitSlotIfApplicable);
                 if (s.model.prefix_cache) |*hc| {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
@@ -5927,9 +5930,26 @@ fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) void)
     // A GLM decode-phase cancel commits before its native state is released; the cleanup drain's
     // commit would read a reset request and add nothing.
     for (dropped.items) |s| {
-        if (s.glm5_request != null and s.cancelled.load(.acquire) and !s.finished and s.error_code == null) commit(sch, s);
+        if (commitsAtCull(s)) {
+            commit(sch, s);
+            s.committed_at_cull = true;
+        }
         releaseNativeState(s);
     }
+}
+
+/// A cancelled decode-phase slot commits at the cull when its state is GLM's native request, which resets right
+/// after, or DeepSeek's live record: the next exclusive request is admitted as soon as the slot leaves `decoding`
+/// and takes that record over, so a commit at the cleanup drain would publish onto its state.
+fn commitsAtCull(s: *const Slot) bool {
+    if (!s.cancelled.load(.acquire) or s.finished or s.error_code != null) return false;
+    if (s.glm5_request != null) return true;
+    const xfm = s.model.transformer orelse return false;
+    return xfm.dsv41 != null;
+}
+
+fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*Scheduler, *Slot) void) void {
+    if (!s.committed_at_cull) commit(sch, s);
 }
 
 /// Native GLM has no reusable prefix snapshot: a slot the inference thread stops touching
@@ -5988,7 +6008,16 @@ fn slotStateBytes(s: *const Slot) u64 {
     if (s.ssm_entries) |ents| for (ents) |*e| {
         bytes += transformer_mod.ssmEntryBytes(e);
     };
-    return bytes + s.ring_cps.bytes();
+    return bytes + s.ring_cps.bytes() + dsv41StateBytes(s);
+}
+
+/// DeepSeek's request state lives in the model, not in `slot.cache` (a one-byte-a-token row marker): its window
+/// rings, compressed and index rows, DSpark windows, and the live restore points the request keeps.
+fn dsv41StateBytes(s: *const Slot) u64 {
+    const dsv = (s.model.transformer orelse return 0).dsv41 orelse return 0;
+    var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
+    if (s.model.prefix_cache) |*hc| bytes += hc.live_dsv41.bytes();
+    return bytes;
 }
 
 /// The part of `slotStateBytes` that `resident_hot_cache_bytes` already bills: a donated checkout's
@@ -8292,6 +8321,8 @@ fn armDsv41ThoughtPoint(slot: *Slot, gen: *Generator, tier_takes_points: bool) v
 
 /// The round that committed `</think>` ended right behind it: its state goes to the SSD tier as one restore point.
 fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) void {
+    // The round's own finish committed and published the live record; a point written now would clear it.
+    if (slot.finished or slot.error_code != null) return;
     const close = gen.dspark_round_ends_at orelse return;
     if (block.len == 0 or block[block.len - 1] != close) return;
     gen.dspark_round_ends_at = null;
@@ -13338,4 +13369,144 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     try testing.expect(reg.mutex.tryLock());
     reg.mutex.unlock(io);
     resident.refcount.store(0, .release);
+}
+
+fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xfm: *Transformer, slot: *Slot) void {
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.metrics = null;
+    sch.live_session_count = 0;
+    sch.decoding = .empty;
+    model.id = "org/dsv41-cull";
+    model.prefix_cache = null;
+    model.transformer = xfm;
+    slot.model = model;
+    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+    slot.ssm_entries = null;
+    slot.ring_cps = .{};
+    slot.restored_entry = 0;
+    slot.full_prompt = &.{};
+    slot.prompt_tokens = 4;
+    slot.completion_tokens = 0;
+    slot.cached_tokens = 0;
+    slot.request_id = 0;
+    slot.max_tokens = 8;
+    slot.legacy_gen = null;
+    slot.glm5_request = null;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.cancelled = .init(false);
+    slot.committed_at_cull = false;
+}
+
+test "a cancelled DeepSeek slot commits when it is culled and not again at the cleanup drain" {
+    const Hook = struct {
+        var commits: usize = 0;
+        fn commit(_: *Scheduler, _: *Slot) void {
+            commits += 1;
+        }
+    };
+    var sch: Scheduler = undefined;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var xfm: Transformer = undefined;
+    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    var slot: Slot = undefined;
+    dsv41CullScaffold(&sch, &model, &xfm, &slot);
+    defer sch.decoding.deinit(testing.allocator);
+    try sch.decoding.append(testing.allocator, &slot);
+    Hook.commits = 0;
+    slot.cancelled.store(true, .release);
+
+    // The slot leaves `decoding` here, and the next exclusive request is admitted over the model's state at once:
+    // its live record has to be published before that, not at the drain behind `complete()`.
+    cullDecodingWith(&sch, Hook.commit);
+    try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
+    try testing.expectEqual(@as(usize, 1), Hook.commits);
+    commitCancelledAtCleanup(&sch, &slot, Hook.commit);
+    try testing.expectEqual(@as(usize, 1), Hook.commits);
+}
+
+test "a finished DeepSeek slot is not committed again by the cull" {
+    const Hook = struct {
+        var commits: usize = 0;
+        fn commit(_: *Scheduler, _: *Slot) void {
+            commits += 1;
+        }
+    };
+    var sch: Scheduler = undefined;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var xfm: Transformer = undefined;
+    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    var slot: Slot = undefined;
+    dsv41CullScaffold(&sch, &model, &xfm, &slot);
+    defer sch.decoding.deinit(testing.allocator);
+    try sch.decoding.append(testing.allocator, &slot);
+    Hook.commits = 0;
+    slot.finished = true;
+    slot.cancelled.store(true, .release);
+    cullDecodingWith(&sch, Hook.commit);
+    try testing.expectEqual(@as(usize, 0), Hook.commits);
+}
+
+test "a DSpark round that finished the slot leaves the thought point to the commit" {
+    var slot: Slot = undefined;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.prefix_cache = null;
+    slot.model = &model;
+    slot.error_code = null;
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    defer gen.generated_ids.deinit(testing.allocator);
+    try gen.generated_ids.appendSlice(testing.allocator, &.{ 5, 6, 7, 9 });
+    const block = [_]u32{ 7, 9 };
+
+    // The round's finish already committed and published the live record, which a point written now would clear.
+    slot.finished = true;
+    gen.dspark_round_ends_at = 9;
+    writeDsv41ThoughtPoint(&slot, &gen, &block);
+    try testing.expectEqual(@as(?u32, 9), gen.dspark_round_ends_at);
+
+    slot.finished = false;
+    writeDsv41ThoughtPoint(&slot, &gen, &block);
+    try testing.expectEqual(@as(?u32, null), gen.dspark_round_ends_at);
+}
+
+test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const a = testing.allocator;
+    const dir = try dsv41_model.fixtureDir();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    const m = try dsv41_model.tinyModel(dir, .{ .act = .bfloat16, .dspark = true }, mlx.gpuStream());
+    defer m.deinit();
+    _ = mlx.mlx_array_free(try dsv41_model.extend(m, ids[0..40], .last));
+
+    var xfm: Transformer = undefined;
+    xfm.dsv41 = m;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);
+    defer model.prefix_cache.?.deinit();
+    model.transformer = &xfm;
+    const hc = &model.prefix_cache.?;
+    var cp = try dsv41_prefix.capture(a, m, 40);
+    defer cp.deinit(a);
+    try hc.live_dsv41.keep(a, m, &cp);
+    var slot: Slot = undefined;
+    slot.model = &model;
+    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
+    slot.ssm_entries = null;
+    slot.ring_cps = .{};
+    slot.glm5_request = null;
+    slot.legacy_gen = null;
+
+    const rows_and_windows = dsv41_model.stateBytes(&m.dec_state.?);
+    try testing.expect(rows_and_windows > 0);
+    try testing.expect(hc.live_dsv41.bytes() > 0);
+    try testing.expectEqual(rows_and_windows + hc.live_dsv41.bytes(), slotStateBytes(&slot));
 }

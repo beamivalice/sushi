@@ -181,6 +181,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An exclusive slot blocks admission until the inference thread releases it** (`heldExclusive`: `decoding` plus
   `cleanup_queue`; `complete()` keeps a slot in `decoding` until its pass is out): a disconnect must not let the next
   request prefill while the slot still owns the stream (`GlmStreamRequestBusy`).
+- **A cancelled slot commits at the cull when its state is not the slot's own** (`commitsAtCull`: GLM's native request,
+  DeepSeek's live record), and its cleanup drain skips the commit (`committed_at_cull`). The cull drops the slot from
+  `decoding` before `complete()` queues it, so the next exclusive request is admitted in between; a DeepSeek commit
+  run after that publishes onto the next request's state.
 - **A plain batched tick stop-checks a slot with no pipeline state** (`batchEntryStops`) before forwarding its pending
   token: a fresh DFlash2 slot whose prefill sampled EOS finishes `stop` with nothing published, as solo does.
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel

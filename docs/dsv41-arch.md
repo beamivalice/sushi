@@ -557,6 +557,9 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   or a row buffer exceeds what the prompt's own state would be billed with its quarter (`liveRowsFit`): the live rows
   past the point stay allocated, so they must fit that bill. The admission reserve adds 8 sets of fixed rings
   (`dsv41CheckpointReserve`). Log: `[dsv41-prefix] reused N of M prompt tokens from the live state`.
+  A cancelled request (stop sequence, disconnect) publishes at the scheduler's cull (`commitsAtCull`), not at the cleanup
+  drain: the cull drops it from `decoding`, so the next request is admitted over the model's state before `complete()`,
+  and a later publish would pair this request's tokens with that request's points and epoch.
 - **A thinking request with tools writes one more point mid-decode, right behind its `</think>`**
   (`scheduler.writeDsv41ThoughtPoint`; DSpark rounds and an SSD-first tier only). With tools the template re-renders an
   earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the
@@ -586,6 +589,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   that differs voids the whole point (a restore cannot pass the first differing token), whether it differs depends on
   the call's parameter types, the server's argument coercion and the client, and under the cap of 4 the end point
   would thin the thought point out (the smallest span), turning a miss into the loss of the whole thought.
+  A round that finished the request (`length` on the closer) writes none: its commit published the live record, and
+  `Live.keep` would clear it.
 - **Equal to cold** means bit for bit when both run the same chunks from the restore point on: the tiny pack's logits
   (bf16, QAT on and off) over odd-width prefill chunks, decode, a verify round and its rollback, and the state they end
   in, are identical bytes, from RAM and from an SSD file written by one tier and read by a fresh one. A restore off the

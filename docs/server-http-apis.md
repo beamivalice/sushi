@@ -242,7 +242,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   `phase`, `context_tokens` (prompt + decoded; the FULL prompt on a prefill row), `context_length` (the model's
   effective limit, 0 = not ready/unknown), `cached_tokens`, `generated_tokens`, `max_tokens` (the request's own
   output cap), `elapsed_seconds` (age since arrival, refreshed every publish) and `state_bytes` (GPU bytes of the
-  slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row).
+  slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row; a DeepSeek
+  slot's is the model-held state, rows and rings, plus the live restore points).
 - A live row's `state_bytes` is at capacity: a ringed layer's ring, each QSA bank by its capacity buffer (never also
   its view), and the ring restore points the slot holds.
 - After the live rows come `cached` rows, one per hot-cache entry of every ready model (cap 32, published under
