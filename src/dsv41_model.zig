@@ -2267,7 +2267,19 @@ pub const nil_slot: Slot = @splat(none);
 /// Slots a restore point holds: per layer the window ring with the open pooling group, then the compressed and
 /// index rows; then one per DSpark stage window.
 pub fn slotCount(m: *const Model) usize {
-    return 2 * m.cfg.layers + (if (m.dspark != null) m.cfg.n_mtp else 0);
+    return slotCountFor(&m.cfg, m.dspark != null);
+}
+
+/// Tokens per row of layer `li`'s compressed rows and of its index keys; 0 where the layer keeps none. A restore
+/// point at position `n` holds `n / ratio` rows of each.
+pub fn rowRatios(c: *const cfg_mod.Config, li: usize) [2]u32 {
+    const r: u32 = c.ratios[li];
+    return .{ if (c.isKvSource(li)) r else 0, if (c.isOwner(li)) r else 0 };
+}
+
+/// `slotCount` for a config.
+pub fn slotCountFor(c: *const cfg_mod.Config, dspark: bool) usize {
+    return 2 * c.layers + (if (dspark) c.n_mtp else 0);
 }
 
 /// An owned copy of rows [0, n) that keeps every bit (a float add of zero would turn -0.0 into +0.0).

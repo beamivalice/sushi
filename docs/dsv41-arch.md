@@ -508,21 +508,31 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   writes them.
 - **The SSD tier indexes by KV rows and this arch has none**: before a commit `dsv41_prefix.markRows` gives layer 0 of
   the slot's cache one zero byte per token, so the tier's chunk files, sizes, scan and eviction cover the entry
-  (about 2 B a token); the forward never reads it. A restore (`DiskTier.restoreCheckpointInto`) loads the one checkpoint
-  file and proves the chunks cover its position. SSD-first, a prefill's points go to the tier as it takes them
+  (about 2 B a token); the forward never reads it. A restore (`DiskTier.restoreCheckpointInto`) loads the checkpoint
+  file and its row segments and proves the chunks cover its position. SSD-first, a prefill's points go to the tier as it takes them
   (`HotPrefixCache.writeThroughDsv41`, armed whatever the new span): a point at or past the tier's 512-token floor shares
   the request's rows (`dsv41_prefix.captureShared`), is staged into the writer's bounded host buffers and released before
   the next forward appends, the newest and the prompt-end snapshot included. Each logs `[dsv41-prefix] restore points to
-  SSD at P: X GB staged, prefill held T ms`. With a RAM tier they wait for the commit's flush after the response.
-- **Namespace**: `ModelConfig.cacheLayoutNamespace` returns `dsv41_prefix.namespaceTag` (`dsv41-state-v1`, plus
+  SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
+- **Namespace**: `ModelConfig.cacheLayoutNamespace` returns `dsv41_prefix.namespaceTag` (`dsv41-state-v2`, plus
   `-dspark` when the stages are resident), hashed into the tier's fingerprint beside the pack's shard names, sizes and
   mtimes and `config.json`: another pack, another slot set or a bumped tag never reads these entries. Any change to what
   a stored state means bumps the tag in the same landing.
 - **Checkpoints** come from the Qwen schedule: absolute multiples of the stride (at least the prefill chunk, 8192 by
   default) and the prompt-end snapshot 30 tokens before the end, where the next turn's re-rendered generation prefix
-  still matches. At most 4 per entry, per prefill and per SSD entry (`dsv41_prefix.checkpoint_cap`): each is a full
-  copy, about 890 B a token plus the fixed rings. The thinning drops the interior point whose neighbours are closest
-  and always keeps the oldest and the newest, so the newest point written (below) survives until a later turn adds one.
+  still matches. In RAM (a RAM entry, a prefill's list) at most 4 (`dsv41_prefix.checkpoint_cap`): each is a full copy,
+  about 890 B a token plus the fixed rings. An SSD entry keeps up to 160 (`disk_checkpoint_cap`): the 8192-token grid
+  to 1M tokens with room for earlier turns' prompt ends and thought points. The thinning drops the interior point whose
+  neighbours are closest and always keeps the oldest and the newest, so the newest point written (below) survives until
+  a later turn adds one.
+- **An SSD entry stores the rows once** (`dsv41_prefix.row_span` = 8192, `rowDivisors`, `DiskTier.setGrownSpec`): the
+  compressed rows and index keys of every 8192 tokens are one `g<n>.safetensors` segment, appended as the entry grows;
+  a point's `s<pos>.safetensors` keeps the window rings, open pooling groups, DSpark windows and the rows past its last
+  whole span (a grid point none, a prompt end under 8192 tokens). A restore reads the point and its first `pos / 8192`
+  segments and joins them into the arrays a full capture holds, byte for byte. A grid point costs about 6 MB; the
+  store about 890 B a token (`diskBytesPerToken` = rows plus the rings' share per span). Thinning a point never touches
+  a segment, and the store is not trimmed when the point that reached furthest goes. An entry at 393k tokens holds the
+  48 spans (350 MB) and 49 points (about 300 MB), against four full copies of 28 to 357 MB.
 - **A thinking request with tools writes one more point mid-decode, right behind its `</think>`**
   (`scheduler.writeDsv41ThoughtPoint`; DSpark rounds and an SSD-first tier only). With tools the template re-renders an
   earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the

@@ -5128,11 +5128,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isGlm5())
                 @import("glm5_prefix.zig").checkpoint_cap
             else if (params.config.isDsv41())
-                @import("dsv41_prefix.zig").checkpoint_cap
+                @import("dsv41_prefix.zig").disk_checkpoint_cap
             else if (params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+            if (params.config.dsv41) |c| {
+                const dsv41_pfx = @import("dsv41_prefix.zig");
+                const divs = try dsv41_pfx.rowDivisors(sch.allocator, &c, params.config.dsparkOn());
+                defer sch.allocator.free(divs);
+                try entry.prefix_cache.?.disk.?.setGrownSpec(dsv41_pfx.row_span, divs, c.stateBytesPerToken());
+            }
         }
         // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(

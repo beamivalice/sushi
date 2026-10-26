@@ -3263,12 +3263,10 @@ pub const HotPrefixCache = struct {
             log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
             return;
         };
-        var bytes: u64 = 0;
-        for (cps) |*cp| if (!cp.isReleased()) {
-            bytes += ssmCheckpointBytes(cp);
-        };
+        const staged_before = self.disk.?.point_bytes_written;
         var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
+        const bytes = self.disk.?.point_bytes_written - staged_before;
         for (cps) |*cp| cp.release();
         // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
         log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
@@ -14286,6 +14284,173 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
     const cold = try dsv41_model.extend(net.m, next[512..], .all);
     defer _ = mlx.mlx_array_free(cold);
     try glm5_forward.expectArrayBits(cold, warm);
+}
+
+/// `dsv41SsdOnlyCache` as the scheduler arms it: restore points split into a row store per entry, on a grid of `span` tokens.
+fn dsv41SplitCache(io: std.Io, base: []const u8, fp: []const u8, net: *const Dsv41Net, span: u32) !HotPrefixCache {
+    var hc = try dsv41SsdOnlyCache(io, base, fp);
+    errdefer hc.deinit();
+    const divs = try dsv41_prefix.rowDivisors(testing.allocator, &net.m.cfg, true);
+    defer testing.allocator.free(divs);
+    hc.disk.?.ssm_max_per_entry = dsv41_prefix.disk_checkpoint_cap;
+    try hc.disk.?.setGrownSpec(span, divs, net.m.cfg.stateBytesPerToken());
+    return hc;
+}
+
+test "DeepSeek SSD tier split: the layers the tier treats as rows are the arrays a capture holds as rows (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    dsv41_model.resetState(net.m);
+    var first_buf: [512]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first, .last));
+    var cp = try dsv41_prefix.capture(testing.allocator, net.m, first.len);
+    defer cp.deinit(testing.allocator);
+    const divs = try dsv41_prefix.rowDivisors(testing.allocator, &net.m.cfg, true);
+    defer testing.allocator.free(divs);
+    try testing.expectEqual(cp.layers.len, divs.len);
+    var rows_layers: usize = 0;
+    for (cp.layers, divs) |l, d| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state }) |a| {
+        const sh = mlx.getShape(a);
+        if (d == 0) {
+            // A fixed layer's arrays are never rows of a compressed history: either a ring or a placeholder.
+            continue;
+        }
+        try testing.expectEqual(@as(usize, 2), sh.len);
+        try testing.expectEqual(@as(c_int, @intCast(first.len / d)), sh[0]);
+        rows_layers += 1;
+    };
+    try testing.expect(rows_layers > 0);
+    // The window rings and DSpark windows are not rows.
+    for (0..net.m.cfg.layers) |li| try testing.expectEqual(@as(u32, 0), divs[4 * li]);
+    for (divs[4 * net.m.cfg.layers ..]) |d| try testing.expectEqual(@as(u32, 0), d);
+}
+
+test "DeepSeek SSD tier split: every restore point on the grid reads back the bytes a full capture holds, and a restore between two points prefills like cold (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [700]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    // The next turn repeats 400 tokens: between the points at 384 and 512.
+    var next_buf: [760]u32 = undefined;
+    for (&next_buf, 0..) |*t, i| t.* = if (i < 400) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    const points = [_]usize{ 128, 256, 384, 512, 700 };
+    var want: [points.len]SSMCheckpoint = undefined;
+    var made: usize = 0;
+    defer for (want[0..made]) |*cp| cp.deinit(testing.allocator);
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-split", &net, 128);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(first, &.{ 128, 128, 128, 128, 188 }, 0, &.{ 0, 1, 2, 3, 4 }, &cps);
+        for (cps.items, 0..) |*cp, i| {
+            want[i] = try cloneCheckpointForTest(cp);
+            made += 1;
+        }
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        const e = &hc.disk.?.entries.items[0];
+        try testing.expectEqualSlices(u32, &.{ 128, 256, 384, 512, 700 }, e.ssm_positions);
+        // 700 / 128 whole spans, stored once; the points past them keep the rest.
+        try testing.expectEqual(@as(usize, 5), e.grown.len);
+        // A point on the grid keeps its fixed arrays only: no bigger than the one before it plus the rings' share of a prompt end.
+        try testing.expect(e.ssm_bytes[3] <= e.ssm_bytes[0]);
+    }
+
+    var hc = try dsv41SplitCache(io, base, "dsv41-split", &net, 128);
+    defer hc.deinit();
+    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    for (points, 0..) |p, i| {
+        var one = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer one.deinit();
+        var got = try hc.disk.?.restoreCheckpointInto(&one, 0, @intCast(p), dsv41_prefix.snapshotLayers(net.m), s);
+        defer got.deinit(testing.allocator);
+        try expectCheckpointBits(&want[i], &got);
+    }
+
+    dsv41_model.resetState(net.m);
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
+    try testing.expectEqual(@as(usize, 384), res.matched);
+    const warm = try dsv41_model.extend(net.m, next[384..], .all);
+    defer _ = mlx.mlx_array_free(warm);
+    dsv41_model.resetState(net.m);
+    // Cold on the grid the points were taken on.
+    for (0..3) |c| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[c * 128 ..][0..128], .last));
+    const cold = try dsv41_model.extend(net.m, next[384..], .all);
+    defer _ = mlx.mlx_array_free(cold);
+    try glm5_forward.expectArrayBits(cold, warm);
+}
+
+test "DeepSeek SSD tier split: a write-through prefill stages each point with only the rows past the store, and reports the bytes it staged (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [700]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+
+    var hc = try dsv41SplitCache(io, base, "dsv41-split-wt", &net, 128);
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (cps.items) |*cp| cp.deinit(testing.allocator);
+        cps.deinit(testing.allocator);
+    }
+    var at: usize = 0;
+    var seen_ssm: usize = 0;
+    var seen_grown: usize = 0;
+    // Under the tier's floor nothing is written, so the first point is at 512.
+    for ([_]usize{ 512, 188 }, 0..) |n, step| {
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at .. at + n], .last));
+        at += n;
+        try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
+        cache.step = at;
+        const before = hc.disk.?.point_bytes_written;
+        hc.writeThroughDsv41(&cache, first[0..at], false, .{}, cps.items, s, "prefill");
+        hc.disk.?.drainWriter();
+        const e = &hc.disk.?.entries.items[0];
+        // What the call reports is what the entry's files gained: the new point and the new segments.
+        var gained: u64 = 0;
+        for (e.ssm_bytes[seen_ssm..]) |b| gained += b;
+        for (e.grown[seen_grown..]) |b| gained += b;
+        try testing.expectEqual(gained, hc.disk.?.point_bytes_written - before);
+        // The first point stores four spans; the second only the one past them, not the rows from 0.
+        try testing.expectEqual(@as(usize, if (step == 0) 4 else 1), e.grown.len - seen_grown);
+        seen_ssm = e.ssm_bytes.len;
+        seen_grown = e.grown.len;
+        try testing.expect(cps.items[cps.items.len - 1].isReleased());
+    }
+    try testing.expectEqual(@as(usize, 2), hc.disk.?.entries.items[0].ssm_positions.len);
 }
 
 test "DeepSeek decode point: a restore point taken mid-decode serves the next turn from RAM and from an SSD file, like cold on the same grid (DSV41_TINY)" {

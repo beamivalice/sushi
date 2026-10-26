@@ -78,6 +78,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
   `RING_DISK_MAX_PER_ENTRY` = 8 kept, thinned as in RAM, salvaged per file at scan; manifest v9, which an older reader
   drops; a media-bearing record stamps v10 for the same reason) ([mimo2-arch](mimo2-arch.md#sliding-layers-the-ring)).
+- **A tier can split a restore point's growing rows into one store per entry** (`DiskTier.setGrownSpec`, armed for
+  DeepSeek only; [dsv41-arch](dsv41-arch.md#prefix-cache)): every `span` tokens of rows go once into `g<n>.safetensors`
+  (append-only, never rewritten), and a point's `s<pos>.safetensors` holds its fixed arrays plus the rows past its last
+  whole span, naming the segments it leans on in its `grown` metadata. A point written whole (no spec, or no growing
+  array) keeps the layout every other arch reads. Retention and a thinned point never delete a segment; the store stays
+  as long as the longest point ever kept until the entry is evicted. An extending commit writes only the segments
+  past the store. The manifest lists the segments' bytes (`grown`, v11, which an older reader drops); a scan keeps the
+  contiguous valid segments and drops each point that leans on a lost one. Segment bytes ride the entry's bill
+  (`nonChunkBytes`, `bytesFreedByRemoving`, `billChunksOnce`) and the pre-write estimate (`entryBytesAt`).
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
   (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
   tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves

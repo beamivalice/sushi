@@ -4219,8 +4219,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
 /// and history where the head is on. Execution state (the QSA score bank) is
 /// RAM-only and never enters it; GLM's KDA checkpoints, DFlash2 window and MiMo's rings are fixed per entry.
 pub fn diskBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
-    // An entry keeps up to `checkpoint_cap` restore points, each a full copy of the state.
-    if (config.dsv41) |c| return c.stateBytesPerToken() *| dsv41_prefix.checkpointMax(ssm_checkpoint_max);
+    if (config.dsv41) |c| return dsv41_prefix.diskBytesPerToken(&c, config.dsparkOn());
     const rows = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken();
     if (config.isGlm5() or !config.longCtxGated() or !mtpHeadDefaultOn(config)) return rows;
     const layers = config.attnCacheLayerCount();
@@ -27898,8 +27897,8 @@ test "dsv41 bills: a prefill holds its restore points beside the state with a RA
     const big: u64 = 1 << 40;
     try t.expectEqual(@min(disk_writer_permit_bytes, rings + big * c.stateBytesPerToken()) + rings, dsv41CheckpointReserve(&cfg, big, 512));
     try t.expect(dsv41CheckpointReserve(&cfg, 100, 512) == 2 * (rings + 100 * c.stateBytesPerToken()));
-    // An entry on disk keeps up to the cap of full states.
-    try t.expectEqual(c.stateBytesPerToken() * 4, diskBytesPerToken(&cfg, 8));
+    // An entry on disk keeps its rows once and the fixed rings of one point per grid step.
+    try t.expectEqual(c.stateBytesPerToken() + (rings + dsv41_prefix.row_span - 1) / dsv41_prefix.row_span, diskBytesPerToken(&cfg, 8));
     ssm_checkpoint_stride = 0;
     try t.expectEqual(@as(u64, 0), dsv41CheckpointReserve(&cfg, seq, 512));
 }

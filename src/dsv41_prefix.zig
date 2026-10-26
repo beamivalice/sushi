@@ -91,7 +91,33 @@ pub fn markRows(cache: *transformer.KVCache) !void {
 /// Names the stored layout for the SSD cache namespace: a restore point written under another layout, or
 /// with a different set of slots, is never read.
 pub fn namespaceTag(dspark: bool) []const u8 {
-    return if (dspark) "dsv41-state-v1-dspark" else "dsv41-state-v1";
+    return if (dspark) "dsv41-state-v2-dspark" else "dsv41-state-v2";
+}
+
+/// Tokens of compressed rows and index keys one `g<n>` segment of an SSD entry holds.
+pub const row_span: u32 = 8192;
+
+/// Restore points one SSD entry keeps: the `row_span` grid out to a million tokens, with room for the prompt-end
+/// and thought points of earlier turns. A point holds only its fixed arrays, so the cap bills a few MB apiece.
+pub const disk_checkpoint_cap: u32 = 160;
+
+/// SSD bytes one cached token adds to an entry: its rows once, and its share of the fixed arrays of the restore
+/// point on each `row_span`.
+pub fn diskBytesPerToken(c: *const @import("dsv41_config.zig").Config, dspark: bool) u64 {
+    return c.stateBytesPerToken() +| (c.stateFixedBytes(dspark) +| row_span - 1) / row_span;
+}
+
+/// The SSD tier's split of this model's restore points (`kv_disk_cache.GrownSpec`): per snapshot layer the tokens
+/// per row of the rows it holds, 0 for a layer of fixed arrays. Caller frees.
+pub fn rowDivisors(allocator: std.mem.Allocator, c: *const @import("dsv41_config.zig").Config, dspark: bool) ![]u32 {
+    const divs = try allocator.alloc(u32, 2 * model.slotCountFor(c, dspark));
+    @memset(divs, 0);
+    for (0..c.layers) |li| {
+        const r = model.rowRatios(c, li);
+        divs[4 * li + 2] = r[0];
+        divs[4 * li + 3] = r[1];
+    }
+    return divs;
 }
 
 /// The SSD namespace of one boot: `namespaceTag` plus what changes the numbers a stored state was computed
@@ -168,7 +194,7 @@ test "thoughtEdgesSurviveTrim: a thought the server trims leaves no point" {
     try std.testing.expect(thoughtEdgesSurviveTrim("\tThe", ".\t"));
 }
 
-/// Checkpoints one entry or one prefill keeps: each is a full copy of the request's state.
+/// Checkpoints one RAM entry or one prefill keeps in memory: each is a full copy of the request's state.
 pub const checkpoint_cap: u32 = 4;
 
 pub fn checkpointMax(global: u32) u32 {

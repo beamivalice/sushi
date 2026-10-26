@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash keeps a restore point every 8192 tokens on the SSD prefix cache**: an entry stores its compressed rows once and each point only its fixed state, so a long session keeps the whole grid instead of four far-apart points and a changed history re-prefills from the nearest 8k mark; entries written by earlier builds are not read.
 - **A request may carry up to 1024 images**: long agent sessions that keep every screenshot in their history are no longer refused at the 65th image; memory stays bounded by the per-request encode bill and the context size.
 - **`--no-mtp` no longer reads the MTP head**: a Qwen3.8-Flash-Next load with MTP off skips the head's tensors while reading the pack, so the 1.2 GB head no longer passes through memory at load, which matters on a 64 GB Mac, and the log no longer prints `Loading model-mtp.safetensors...` for a shard that loads nothing.
 - **`sushi convert exl3 --codebook` is now `--expert-codebook`** (breaking): `--codebook mcg` is now `--expert-codebook exl3-mcg` and `--codebook mul1` is `--expert-codebook exl3-mul1`; the old flag and the bare names are refused, and packs and resumable runs are unchanged.
