@@ -19,7 +19,7 @@ To download a pack and see which one suits your Mac: [`sushi pull` and `sushi li
 ## `sushi pull` and `sushi list`
 
 `sushi pull <model>` downloads a Sushi pack into `~/.sushi/models/beamster/<repo>`; `sushi serve` and `sushi run`
-then load it by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`)
+then load it by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`, `deepseek-v4.1-flash`)
 or `beamster/<repo>`. Only packs of the Hugging Face org `beamster` are accepted; any other `org/repo` exits with an
 error before anything downloads (`sushi run <model>` follows the same rule when it has to download).
 `sushi pull` checks every file of the pack against its Hugging Face listing and downloads only what is missing or short,
@@ -38,8 +38,11 @@ installed RAM in whole GB (a 64 GB Mac reports 68.7e9 bytes and counts as 64):
 | GLM-5.3-Flash-Sushi-2bpw | 96 GB | 96 GB |
 | GLM-5.3-Flash-Sushi-2.4bpw | 128 GB | 128 GB |
 | MiMo-V2.6-Flash-Sushi-2.3bpw | 128 GB | 128 GB |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 128 GB (experts streamed) | 128 GB |
 
-Each family recommends its largest pack the Mac reaches in the last column. `fits` means the Mac meets the pack's tier.
+Each family recommends its largest pack the Mac reaches in the last column. `fits` means the Mac meets the pack's tier
+(DeepSeek's routed experts stream on every Mac: its tier is the Mac that admits the `--ssd-budget-gb 96` to `114` launch
+[below](#deepseek-launch)).
 Below it the pack is labelled `may stream (--ssd-budget-gb)`: it may still run with `--ssd-budget-gb`
 ([README, Streaming on a 32 GB Mac](../README.md#streaming-on-a-32-gb-mac)), and nothing promises it does.
 `sushi pull` prints that warning before it downloads a pack below its tier, then pulls anyway. A pack whose repo
@@ -58,10 +61,12 @@ qwen3.8-flash-next:4bpw         159.0 GB  no          may stream (--ssd-budget-g
 mimo-v2.6-flash:2.3bpw          100.7 GB  no          may stream (--ssd-budget-gb)
 glm-5.3-flash:2bpw               81.5 GB  no          may stream (--ssd-budget-gb)
 glm-5.3-flash:2.4bpw             93.2 GB  no          may stream (--ssd-budget-gb)
+deepseek-v4.1-flash:1.75bpw     332.1 GB  no          may stream (--ssd-budget-gb)
 ```
 
 Sizes are the whole Hugging Face download and differ per release. A Qwen pack's size includes its n-gram table, which
-stays on the SSD and is not loaded into memory. With Hugging Face unreachable (no network, or no answer within a few
+stays on the SSD and is not loaded into memory; the DeepSeek pack's includes 189 GiB of Engram tables, read from the SSD
+the same way. With Hugging Face unreachable (no network, or no answer within a few
 seconds), `sushi list` prints one line saying so and lists only the models on disk, without sizes or recommendations.
 
 ## Recommended launch
@@ -192,6 +197,71 @@ hf download beamster/GLM-5.3-Flash-Sushi-2.4bpw --local-dir ~/.sushi/models/GLM-
 - `--drafter <dir>` points at an assistant stored elsewhere and `--no-drafter` turns it off; without it GLM decodes
   one token at a time.
 - Up to four requests decode together.
+
+<a id="deepseek-launch"></a>
+**128 GB Mac, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw**
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=120000
+hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.sushi/models/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw
+# or: sushi pull deepseek-v4.1-flash   (lands in ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw)
+
+# images, DSpark, thinking at high, the full 1M context; the routed experts stream from the SSD
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
+  --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000
+```
+
+- **Disk.** The pack is 332.1 GB: 120 GiB of weights and 189 GiB of Engram tables, which are read from the SSD a row at
+  a time and never loaded. The routed experts (119.6 GB of the weights) stream from the SSD within `--ssd-budget-gb`.
+  The prefix cache's SSD tier, up to 20GB, comes on top.
+- **`--ssd-budget-gb` is required** (without it the load fails with `ExpertStreamingRequired`). It is the total GiB the
+  load keeps resident: the trunk, the DSpark stages, the vision tower, the prefill's expert workspace and the expert
+  cache, which is what is left. A higher budget gives more expert slots a layer and fewer misses; a miss is an SSD
+  read. The budget and the request's own state (0.93 GB at 1M tokens, 3.7 GB billed to a 1M request) plus the largest
+  image's encode (1.6 GB) must sit under the GPU limit, so the budget tops out about 5 GiB under it at 1M context.
+- **On a 128 GB Mac, 108 is the recommended budget.** 96 also serves, with fewer slots; 114, the largest run, needs
+  `sudo sysctl iogpu.wired_limit_mb=124000`.
+
+  | `--ssd-budget-gb` | expert slots a layer (of 384) | expert hits | decode 4k | decode 128k | prefill 4k |
+  |---|---:|---:|---:|---:|---:|
+  | 96 | 227 | TODO | TODO | TODO | TODO |
+  | 108 | 260 | TODO | 80.0 | 69.5 | 788 |
+  | 114 | 277 | TODO | TODO | TODO | TODO |
+
+  Slots are the plan from the pack's headers. The 108 row is the [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md)
+  (tok/s, speculative decode on, one request).
+- **The cost of 114.** The cache is bigger, so a long prompt has less memory beside it: a prefill of 2048 or more new
+  tokens lends the last decoder layers (37 to 39, 8.15 GB) and reads them back before decode, about 1.4 s a request.
+  A short agent turn (measured up to 1,000 new tokens) lends nothing and pays nothing. A lower budget leaves more
+  headroom, so it borrows later ([dsv41-memory](dsv41-memory.md#borrow)).
+- **Other Macs.** Only the 128 GB Mac has been run. Below it the ledger admits a budget as low as 17 GiB (16 with
+  `--no-vision`; a lower one is refused, `ssd_budget_below_resident` or `ssd_budget_below_vision`), and the slots a budget
+  buys are fixed by the pack, so these are plan numbers and no speed is promised:
+
+  | `--ssd-budget-gb` | expert slots a layer | smallest Mac at 1M context | GPU limit to set |
+  |---|---:|---|---|
+  | 32 | 48 | 48 GB | `iogpu.wired_limit_mb=43000` |
+  | 48 | 93 | 64 GB | `iogpu.wired_limit_mb=59000` |
+  | 76 | 171 | 96 GB | `iogpu.wired_limit_mb=90000` |
+
+  A shorter `--ctx-size` shrinks the request bill and lowers the Mac that admits a budget; at 17 to 20 GiB the cache
+  holds 6 to 14 slots of 384 and nearly every expert is an SSD read.
+- **Context** runs to 1M tokens (`--ctx-size 1000000`; set it, since auto-context reads free memory). The state is 890 B
+  a token and the prefix cache keeps seen prompts on the SSD by default, so a repeated prompt skips its prefill. One
+  request decodes at a time.
+- **DSpark**, the checkpoint's own drafter, is on by default; `--no-mtp` turns it off. It accepts drafts by the exact rule
+  only. Greedy output can differ from `--no-mtp` at a near-tie, never between a stream and a non-stream reply.
+- **Thinking** is `high` by default. A request names `reasoning_effort` `low`, `high` or `max` (`medium` is served as
+  `high`); `enable_thinking: false` or effort `off` answers without thinking.
+- **Images** are served by default. `--no-vision` leaves the tower out, saves its 0.97 GB for the expert cache and turns
+  an image into a 400.
+- **`--drop-expert n`** (a multiple of 8) never loads or picks the `n` least-used experts of every layer, by the pack's
+  `expert_usage.json`: it frees 2.1 to 2.5 GB at 8 and 4.3 to 5.0 GB at 16, enough to hold every kept expert resident at
+  a budget of 116. It is lossy: score it with `sushi kld compare` first ([dsv41-arch](dsv41-arch.md#drop-expert)).
+- **Refused flags.** The model has no KV cache, GatedDeltaNet layers or MTP head to configure, so `--kv-quant`,
+  `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` and `--mtp-greedy-tail` stop the load with a
+  message naming the flag. A `model-settings.json` `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored, with one
+  log line.
 
 ## Coding agents
 

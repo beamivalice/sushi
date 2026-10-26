@@ -12,7 +12,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 - It serves `deepseek_v41` from the ORIGINAL checkpoint (`config.json`, `model-*.safetensors`, the index). Text in,
   text out, one request at a time (the model holds the request's state: `ownsModuleDecodeState`).
 - Off, by name: `--kv-quant` (the state is the activation dtype;
-  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
+  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
 - Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
   model-settings) is required, as on every streamed load; without one the load fails with `ExpertStreamingRequired`.

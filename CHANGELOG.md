@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash-1017 Sushi-STQ-1.75bpw**: a new pack, `sushi pull deepseek-v4.1-flash` (332.1 GB, of which 189 GiB of Engram tables are read from the SSD), recommended on a 128 GB Mac, with its routed experts streamed from the SSD within `--ssd-budget-gb`; the launch is in [docs/usage.md](docs/usage.md#deepseek-launch).
+- **DeepSeek-V4.1 logs a `model-settings.json` `mtp_acceptance` or `mtp_greedy_tail` as ignored**: as it already did for `kv_quant`, one line at load says DSpark takes neither.
 - **DeepSeek-V4.1 counts MLX's buffer pool inside `--ssd-budget-gb`**: decode keeps the pool to 1 GiB, which the ledger bills as an `mlx pool` term, and a prefill chunk raises it to 8 GiB in proportion to its rows and pays for it from the decoder pools it borrows, and a short restore tail takes none, so the process stays inside the budget it was given.
 - **`sushi bench` drives a running server through the release bench**: one cold prefill in 8k restore windows and three decode samples at each rung from 4k to 128k, on a code corpus and a prose corpus (Pride and Prejudice), and a non-streaming `/v1/completions` reply now carries the same `timings` as chat. It reads the GPU clock and thermal pressure through `sudo -n powermetrics`, reports them beside every request, and stops when the GPU clock is throttled.
 - **DeepSeek-V4.1 decodes faster at long context**: the indexer's top-k splits each row over several threadgroups past 131072 scores and picks the same keys in the same order.

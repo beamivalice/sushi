@@ -6948,6 +6948,17 @@ pub fn settingsKvQuantIgnoredLine(config: *const model_mod.ModelConfig) ?[]const
     return "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 }
 
+/// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` on deepseek_v41 is ignored with this one line, as `kv_quant` is.
+pub fn settingsMtpIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
+    if (!config.isDsv41()) return null;
+    const acceptance = config.mtp_acceptance_override != null;
+    const tail = config.mtp_greedy_tail_override != null;
+    if (acceptance and tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)";
+    if (acceptance) return "model-settings.json mtp_acceptance is ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only)";
+    if (tail) return "model-settings.json mtp_greedy_tail is ignored on deepseek_v41 (DSpark has no MTP tail)";
+    return null;
+}
+
 /// What `--qwen-gdn 16` does on this arch, for the boot log; null at the f32 default.
 /// GLM and MiMo have no GatedDeltaNet arm, so the flag has no effect there.
 pub fn qwenGdnLine(config: *const model_mod.ModelConfig, f32_state: bool) ?[]const u8 {
@@ -25597,6 +25608,23 @@ test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a mode
     try t.expect(std.mem.indexOf(u8, settingsKvQuantIgnoredLine(&dsv41).?, "model-settings.json kv_quant is ignored") != null);
     try t.expect(settingsKvQuantIgnoredLine(&qwen4) == null);
     try t.expectEqualStrings("off", kvCacheForLaunch(&dsv41, transformer_mod.KVQuantConfig.engine_default, false).label());
+}
+
+test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set" {
+    const t = std.testing;
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(settingsMtpIgnoredLine(&dsv41) == null);
+    dsv41.mtp_acceptance_override = .{ .typical = .{ .delta = 0.3 } };
+    try t.expectEqualStrings("model-settings.json mtp_acceptance is ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only)", settingsMtpIgnoredLine(&dsv41).?);
+    dsv41.mtp_acceptance_override = null;
+    dsv41.mtp_greedy_tail_override = true;
+    try t.expectEqualStrings("model-settings.json mtp_greedy_tail is ignored on deepseek_v41 (DSpark has no MTP tail)", settingsMtpIgnoredLine(&dsv41).?);
+    dsv41.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
+    try t.expectEqualStrings("model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)", settingsMtpIgnoredLine(&dsv41).?);
+    qwen4.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
+    qwen4.mtp_greedy_tail_override = true;
+    try t.expect(settingsMtpIgnoredLine(&qwen4) == null);
 }
 
 test "--drop-expert is refused on every arch but deepseek_v41, before the weights load" {

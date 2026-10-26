@@ -129,6 +129,7 @@ pub const aliases = [_]Alias{
     .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
     .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
     .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
+    .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
 };
 
 pub const Resolved = struct {
@@ -1964,6 +1965,8 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("glm-5.3-flash").?.repo);
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2bpw", resolveShortName("glm-5.3-flash:2bpw").?.repo);
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("GLM-5.3-Flash:2.4bpw").?.repo);
+    try testing.expectEqualStrings("beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", resolveShortName("deepseek-v4.1-flash").?.repo);
+    try testing.expectEqualStrings("beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", resolveShortName("DeepSeek-V4.1-Flash:1.75bpw").?.repo);
     // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo:latest").?.repo);
@@ -2019,6 +2022,10 @@ test "memory tiers: installed RAM rounds down to whole GB and picks fits or may 
         try testing.expectEqual(Verdict.may_stream, verdictFor(a, 96));
         try testing.expectEqual(Verdict.fits, verdictFor(a, 128));
     }
+    // The 96 GiB expert-cache launch needs the 128 GB Mac's 120,000 MB GPU limit; a 96 GB Mac (90,000 MB) may stream it.
+    const dsv41 = aliasForRepo(resolveShortName("deepseek-v4.1-flash").?.repo).?;
+    try testing.expectEqual(Verdict.may_stream, verdictFor(dsv41, 96));
+    try testing.expectEqual(Verdict.fits, verdictFor(dsv41, 128));
     const glm2 = aliasForRepo(resolveShortName("glm-5.3-flash:2bpw").?.repo).?;
     try testing.expectEqual(Verdict.may_stream, verdictFor(glm2, 95));
     try testing.expectEqual(Verdict.fits, verdictFor(glm2, 96));
@@ -2039,6 +2046,8 @@ test "list recommends one pack per family from the tier table" {
     try testing.expectEqualStrings("2bpw", recommendedAlias("glm-5.3-flash", 96).?.tag);
     try testing.expectEqualStrings("2bpw", recommendedAlias("glm-5.3-flash", 127).?.tag);
     try testing.expectEqualStrings("2.4bpw", recommendedAlias("glm-5.3-flash", 128).?.tag);
+    try testing.expect(recommendedAlias("deepseek-v4.1-flash", 96) == null);
+    try testing.expectEqualStrings("1.75bpw", recommendedAlias("deepseek-v4.1-flash", 128).?.tag);
 }
 
 test "pull warns only below the documented tier, naming --ssd-budget-gb" {
@@ -2048,6 +2057,8 @@ test "pull warns only below the documented tier, naming --ssd-budget-gb" {
     const warn = tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", 48).?;
     try testing.expect(std.mem.indexOf(u8, warn, "documented 64 GB") != null);
     try testing.expect(std.mem.indexOf(u8, warn, "--ssd-budget-gb") != null);
+    const dsv41_warn = tierWarning(&buf, "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", 64).?;
+    try testing.expect(std.mem.indexOf(u8, dsv41_warn, "documented 128 GB") != null);
 }
 
 const FakeFetch = struct {
@@ -2136,7 +2147,8 @@ test "cli: every short name is a published Sushi pack" {
     for (aliases) |a| try testing.expect(isBeamsterRepo(a.repo));
     for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-") or
         std.mem.startsWith(u8, a.repo, "beamster/MiMo-V2.6-Flash-Sushi-") or
-        std.mem.startsWith(u8, a.repo, "beamster/GLM-5.3-Flash-Sushi-"));
+        std.mem.startsWith(u8, a.repo, "beamster/GLM-5.3-Flash-Sushi-") or
+        std.mem.startsWith(u8, a.repo, "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-"));
 }
 
 test "cli: modelDestPath layout" {

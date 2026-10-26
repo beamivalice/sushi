@@ -195,7 +195,8 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
         \\                        rounds and GLM DFlash2 (default: ON).
         \\  --no-mtp            Disable the native MTP head. Qwen and MiMo load it
-        \\                        and run it by default; GLM's stays off.
+        \\                        and run it by default; GLM's stays off. On
+        \\                        DeepSeek-V4.1 it turns DSpark off.
         \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
         \\                        default, GLM does not; an SSD-streamed pack
         \\                        that cannot stream its head refuses --mtp.
@@ -268,7 +269,9 @@ fn printUsage(io: std.Io) void {
         \\                      change, so score it with `sushi kld compare`.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8, 6 or 4 — affine group quant; default 8 on
-        \\                          every model (GLM refuses 4). 16 (or `off`)
+        \\                          every model but DeepSeek-V4.1, which has no
+        \\                          KV cache and refuses the flag (GLM refuses
+        \\                          4). 16 (or `off`)
         \\                          keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`

@@ -4387,6 +4387,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         return error.LaunchFlagUnsupported;
     }
     if (@import("server.zig").settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
+    if (@import("server.zig").settingsMtpIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());
     const streamed = expert_stream_mod.expertStreamingEngaged(
         params.config.supportsExpertStreaming(),
