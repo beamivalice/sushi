@@ -388,6 +388,15 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## v1.4.0 release context ladder
+
+[Version summary and per-model reports](bench/v1.4.0/summary.md), 2026-10-27, Apple M5 Max 128 GB. `sushi bench`
+(`./tests/bench.sh`, code and prose arms, one cold prefill in 8k restore windows to 128K, 3 decode samples a rung), AC
+power, `iogpu.wired_limit_mb=125000`, `taskpolicy -a`, per-model GPU lock, fans max and idle under 50 °C before each server.
+Not comparable with the llmprobe ladders below.
+- Qwen STQ 2.75bpw and 4bpw: binary SHA `fcb8ee2f` (source of `846863bd`). GLM: `d361c70b` (SHA `4d25c2d7`); its 128K code
+  samples are loop-stopped at 390 tokens. DeepSeek: `a2337236` (SHA `f3fc6fbb`), `--ssd-budget-gb 114`; 96 and 108 in usage.md.
+
 ## v1.3.0 release context ladder
 
 [Version summary and per-model reports](bench/v1.3.0/summary.md), 2026-10-21, Apple M5 Max 128 GB. llmprobe 0.6.15,
