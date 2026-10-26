@@ -72,7 +72,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **Off NAX (M1-M4) a qwen4 verify row is ~47% of a forward** (~16 ms of ~34 on an M2 Max; the M5 Max ~26%), spread
   over experts, GDN, HC and attention, so MTP nets ~1.1-1.35x there ([perf-baselines](qwen4-perf.md#m2max-decode)).
 - Acceptance is a PROMPT-TYPE property (code ≫ prose; `--mtp-min-depth n --mtp-max-depth n` + `acc_idx=` on `[mtp-trace]`).
-- **MTP is ON by default for both served models** (owner policy, `server.defaultEnableMtp` `served`): a request
+- **MTP is ON by default for Qwen and MiMo** (GLM keeps its head off and drafts with DFlash2; DeepSeek drafts with DSpark) (owner policy, `server.defaultEnableMtp` `served`): a request
   that omits `enable_mtp` runs the loaded head. `--no-mtp`, `"mtp": false` in `model-settings.json` or
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
   `scheduler.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the

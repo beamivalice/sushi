@@ -80,9 +80,7 @@ passes them and keeps the names above is safe to hand over.
 ## MLX pins
 
 Each repo builds its own MLX and mlx-c; the module adds no pin of its own. Both repos pin the
-same commits: MLX d73eb752 (v0.32.2 plus the sorted `gather_qmm` NAX 32K-row fix,
-ml-explore/mlx#3922) and mlx-c 56b2d39. Move both pins together. MLX v0.32.3 needs a newer
-mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does not pass.
+same commits: MLX 64ea011 (v0.32.3) and mlx-c 56b2d39. Move both pins together.
 
 ## Recommended pin
 

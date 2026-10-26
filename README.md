@@ -80,8 +80,8 @@ sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-g
 `--qwen-gdn 16` stores Qwen's recurrent state in bf16 instead of the f32 default, which halves the state in every cache
 checkpoint (about 54 MB each) and is what the 32, 48 and 64 GB recipes run.
 
-`--ssd-budget-gb 18` keeps 18 GiB resident (trunk, KV cache and an expert cache) and reads the remaining experts from
-the SSD. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert
+`--ssd-budget-gb 18` keeps 18 GiB resident (the trunk, the MTP head and an expert cache) and reads the remaining experts
+from the SSD; the KV cache is billed on top of it. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert
 whose router probability is at least 0.7 of the missed one's, which saves an SSD read; leave it out for replies
 identical to a resident load. The plan may come within 1 GiB of the GPU limit
 (`--wired-margin-gib N`, 1 to 32). The GPU limit resets at reboot.
