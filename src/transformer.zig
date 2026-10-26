@@ -17286,7 +17286,7 @@ pub const Transformer = struct {
         };
         var geometry = config.expertGeometry();
         geometry.drop = drop;
-        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop });
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = config.isDsv41() and config.expert_layout == .exl3_k4 });
         return engine;
     }
 

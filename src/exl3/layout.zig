@@ -105,3 +105,28 @@ pub const Layout = struct {
         return error.ExpertOutOfRange;
     }
 };
+
+/// One expert's projection from the pack's `[IT][OT][n]` tile order into `[OT/2][IT][2][n]`: an output tile pair's whole
+/// K range is one contiguous run, which the decode and prefill kernels stream. `n` is `T`s per tile.
+pub fn tileMajor(comptime T: type, dst: []T, src: []const T, it: usize, ot: usize, n: usize) void {
+    std.debug.assert(ot % 2 == 0 and dst.len == it * ot * n and src.len == dst.len);
+    for (0..ot / 2) |pair| for (0..it) |tk| for (0..2) |o| {
+        const from = (tk * ot + pair * 2 + o) * n;
+        const to = ((pair * it + tk) * 2 + o) * n;
+        @memcpy(dst[to..][0..n], src[from..][0..n]);
+    };
+}
+
+test "exl3 layout: tile-major puts an output pair's k range in one run" {
+    const it = 5;
+    const ot = 4;
+    const n = 3;
+    var src: [it * ot * n]u16 = undefined;
+    for (&src, 0..) |*v, i| v.* = @intCast(i);
+    var dst: [src.len]u16 = undefined;
+    tileMajor(u16, &dst, &src, it, ot, n);
+    for (0..ot / 2) |pair| for (0..it) |tk| for (0..2) |o| {
+        const want = src[(tk * ot + pair * 2 + o) * n ..][0..n];
+        try std.testing.expectEqualSlices(u16, want, dst[((pair * it + tk) * 2 + o) * n ..][0..n]);
+    };
+}

@@ -254,6 +254,10 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 
 - `FillPool` = F_NOCACHE + F_RDAHEAD 0 positioned preads, fd cache validated by (dev, ino, size, mtime), spans sorted
   and coalesced to 64 MiB, page-aligned bounce otherwise.
+- **A tile span** (`FillSpan.tile`, DeepSeek-V4.1 STQ pools) is read through the worker's bounce buffer and permuted
+  into the slab by `layout.tileMajor`, in place of the direct read or the bounce copy. It is never coalesced with a
+  neighbour, so a job is one projection of one expert (at most ~6 MB) and the bounce the ledger already bills
+  (`BOUNCE_BYTES`) is the only scratch. A pool-to-union or union-to-pool copy stays a memcpy: both are tile-major.
 - `FillPool` workers park on their condition without broadcasting: `submit` signals after every push, and a
   broadcast before the wait makes idle workers wake each other forever.
 - `PageSlab` epoch leases (`free → filling → ready → leased → readers_complete → reclaimable`, CPU writes only in

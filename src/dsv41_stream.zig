@@ -395,6 +395,9 @@ fn stqDir() ![]const u8 {
     return std.mem.span(raw);
 }
 
+/// Test seam: the pools of the next `StqServed` land trellis tiles in the pack's order instead of tile-major.
+var stq_tile_major: bool = true;
+
 const StqServed = struct {
     engine: stream.Engine,
     hook: StqStream,
@@ -434,6 +437,7 @@ const StqServed = struct {
             .layout = .exl3_k4,
             .io_workers = 2,
             .bounce_size = 1 << 20,
+            .tile_major = stq_tile_major,
         });
         errdefer self.engine.deinit();
         self.m = try model.tinyModel(dir, .{ .act = act, .qat = qat, .experts = false, .dspark = dspark, .drop = drop }, s);
@@ -1080,6 +1084,44 @@ test "dsv41 stq: verify rows that decode each distinct expert once give the per-
             defer _ = mlx.mlx_array_free(a);
             groups.group_force = null;
             const b = try model.extend(grouped.m, ids[at..][0..take], .all);
+            defer _ = mlx.mlx_array_free(b);
+            at += take;
+            const ga = try model.hostRows(&sc, a);
+            defer testing.allocator.free(ga);
+            const gb = try model.hostRows(&sc, b);
+            defer testing.allocator.free(gb);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ga), std.mem.sliceAsBytes(gb));
+        }
+    }
+}
+
+test "dsv41 stq: tile-major pools give the pack-order pools' bytes, through hits, misses, the union and prefill rows (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    defer stq_tile_major = true;
+    for ([_]u64{ 8, 3 }) |slots| {
+        stq_tile_major = false;
+        var pack: StqServed = undefined;
+        try pack.init(dir, .bfloat16, true, true, slots, s);
+        defer pack.deinit();
+        stq_tile_major = true;
+        var major: StqServed = undefined;
+        try major.init(dir, .bfloat16, true, true, slots, s);
+        defer major.deinit();
+        var at: usize = 0;
+        for ([_]usize{ 20, 2, 5, 3, 4, 6, 1, 9 }) |n| {
+            const take = @min(n, ids.len - at);
+            if (take == 0) break;
+            const a = try model.extend(pack.m, ids[at..][0..take], .all);
+            defer _ = mlx.mlx_array_free(a);
+            const b = try model.extend(major.m, ids[at..][0..take], .all);
             defer _ = mlx.mlx_array_free(b);
             at += take;
             const ga = try model.hostRows(&sc, a);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const layout = @import("sushi_exl3").group_layout;
 
 pub const align_bytes: usize = std.heap.page_size_max;
 
@@ -161,11 +162,15 @@ pub fn openHinted(path: [:0]const u8, hints: ReadHints) !std.c.fd_t {
     return fd;
 }
 
+/// A trellis span's tile grid: the fill lands it in `layout.tileMajor` order instead of the file's.
+pub const TileShape = struct { it: u32, ot: u32, n: u32 };
+
 pub const FillSpan = struct {
     file: u16,
     offset: u64,
     len: u64,
     dst: [*]u8,
+    tile: ?TileShape = null,
 };
 
 pub const ReadJob = struct {
@@ -223,6 +228,7 @@ pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_
             const next = spans[i];
             if (next.len == 0) return error.InvalidFillSpan;
             if (next.file != file or next.offset != offset + len) break;
+            if (next.tile != null or spans[first].tile != null) break;
             if (len + next.len > max_bytes) break;
             len += next.len;
         }
@@ -236,6 +242,7 @@ fn jobIsDirect(spans: []const FillSpan, job: ReadJob, page: u64) bool {
     var k: usize = 0;
     while (k < job.count) : (k += 1) {
         const s = spans[job.first + k];
+        if (s.tile != null) return false;
         if (s.dst != expect) return false;
         expect = s.dst + @as(usize, @intCast(s.len));
     }
@@ -605,6 +612,12 @@ pub const FillPool = struct {
                 const s1 = plan.spans[job.first + k];
                 const sl: usize = @intCast(s1.len);
                 const take = @min(sl, delivered - written);
+                if (s1.tile) |tile| if (take == sl) {
+                    const bytes = 2 * @as(usize, tile.n);
+                    layout.tileMajor(u8, s1.dst[0..sl], target[head + written ..][0..sl], tile.it, tile.ot, bytes);
+                    written += sl;
+                    continue;
+                };
                 @memcpy(s1.dst[0..take], target[head + written .. head + written + take]);
                 written += sl;
             }
@@ -1089,6 +1102,35 @@ test "expert io fill scatters one coalesced read into disjoint destinations" {
     try pool.run(&.{fd}, &plan);
     try t.expectEqualSlices(u8, file.bytes[512..640], &left);
     try t.expectEqualSlices(u8, file.bytes[640..768], &right);
+}
+
+test "expert io fill lands a tile span in tile-major order and leaves its neighbour as read" {
+    const t = std.testing;
+    var file = try TestFile.make(t.allocator, "tiles.bin", 4096, 0x77);
+    defer file.deinit(t.allocator);
+    const fd = try file.open(t.allocator);
+    defer _ = std.c.close(fd);
+
+    const it = 3;
+    const ot = 4;
+    const n = 2;
+    var tiled: [it * ot * n * 2]u8 = @splat(0);
+    var plain: [16]u8 = @splat(0);
+    const spans = [_]FillSpan{
+        .{ .file = 0, .offset = 515, .len = tiled.len, .dst = &tiled, .tile = .{ .it = it, .ot = ot, .n = n } },
+        .{ .file = 0, .offset = 515 + tiled.len, .len = plain.len, .dst = &plain },
+    };
+    var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 1, false);
+    defer plan.deinit();
+    try t.expectEqual(@as(usize, 2), plan.jobs.len);
+    const pool = try FillPool.create(t.allocator, .{ .workers = 1 });
+    defer pool.destroy();
+    try pool.run(&.{fd}, &plan);
+
+    var want: [tiled.len]u8 = undefined;
+    layout.tileMajor(u8, &want, file.bytes[515..][0..tiled.len], it, ot, n * 2);
+    try t.expectEqualSlices(u8, &want, &tiled);
+    try t.expectEqualSlices(u8, file.bytes[515 + tiled.len ..][0..plain.len], &plain);
 }
 
 test "expert io fill attributes a span past eof while other spans complete" {

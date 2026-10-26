@@ -476,6 +476,8 @@ pub const Options = struct {
     layout: quant.Layout = .bf16_fused,
     /// A drop the engine frees with itself once `initWithOptions` returns; `geometry.drop` must point at it.
     drop_owned: ?*expert_usage.Drop = null,
+    /// Rate-grouped trellis tiles land in the pools in `layout.tileMajor` order, which the rate-group kernels read.
+    tile_major: bool = false,
 };
 
 pub const Binding = struct {
@@ -1386,9 +1388,10 @@ const GroupedLayer = struct {
     caches_made: usize = 0,
     cache_ragged: Ragged = .{},
     union_ragged: Ragged = .{},
+    tile_major: bool = false,
 
-    fn init(allocator: std.mem.Allocator, groups: quant.LayerGroups, hidden: u32, inter: u32, allot_bytes: u64) !GroupedLayer {
-        var self: GroupedLayer = .{ .groups = groups, .hidden = hidden, .inter = inter };
+    fn init(allocator: std.mem.Allocator, groups: quant.LayerGroups, hidden: u32, inter: u32, allot_bytes: u64, tile_major: bool) !GroupedLayer {
+        var self: GroupedLayer = .{ .groups = groups, .hidden = hidden, .inter = inter, .tile_major = tile_major };
         errdefer self.deinitCaches();
         try self.sizePools(allot_bytes);
         var union_at: [3]u64 = @splat(0);
@@ -1494,6 +1497,19 @@ const GroupedLayer = struct {
         return bytes[@intCast(at)..][0..@intCast(len)];
     }
 
+    /// The fill of component `ci` of one expert of group `g` from `source` into `dst`; a trellis lands tile-major
+    /// when the layer is.
+    fn fillSpan(self: *const GroupedLayer, source: SourceSpan, dst: []u8, g: usize, ci: usize) io_mod.FillSpan {
+        var span: io_mod.FillSpan = .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr };
+        if (self.tile_major and ci % 3 == 0) {
+            const pi = ci / 3;
+            const it: u32 = (if (pi == 2) self.inter else self.hidden) / 16;
+            const ot: u32 = (if (pi == 2) self.hidden else self.inter) / 16;
+            span.tile = .{ .it = it, .ot = ot, .n = self.groups.n[g][pi] };
+        }
+        return span;
+    }
+
     fn cacheRegion(self: *const GroupedLayer, operand: *const SlabOperand, g: usize, ci: usize, slot: u64) []u8 {
         return self.region(operand, g, ci, slot, true);
     }
@@ -1512,11 +1528,13 @@ const GroupedLayer = struct {
         errdefer self.cache_ragged.deinit();
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
         self.union_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(true, &pool_buf), slabTriple(union_set, 0), slabTriple(union_set, 1), slabTriple(union_set, 2));
+        self.union_ragged.tile_major = self.tile_major;
     }
 
     fn buildCacheBank(self: *GroupedLayer, s: mlx.mlx_stream, cache: []const SlabOperand) !void {
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
         self.cache_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(false, &pool_buf), slabTriple(cache, 0), slabTriple(cache, 1), slabTriple(cache, 2));
+        self.cache_ragged.tile_major = self.tile_major;
     }
 
     fn initCaches(self: *GroupedLayer, allocator: std.mem.Allocator) !void {
@@ -1892,7 +1910,7 @@ pub const Engine = struct {
                 const layer_allot = if (plan.resident)
                     groups.allBytes(geometry.hidden, geometry.intermediate)
                 else if (allot) |bytes| bytes[layer_index] else @as(u64, plan.slots_per_layer) * plan.expert_bytes;
-                grouped.* = GroupedLayer.init(allocator, groups.*, geometry.hidden, geometry.intermediate, layer_allot) catch |err| {
+                grouped.* = GroupedLayer.init(allocator, groups.*, geometry.hidden, geometry.intermediate, layer_allot, opts.tile_major) catch |err| {
                     allocator.destroy(grouped);
                     return err;
                 };
@@ -2437,7 +2455,7 @@ pub const Engine = struct {
                 for (0..n) |ci| {
                     const source = self.store.spanAt(job.layer, gl.groups.base[g] + binding.expert, ci);
                     const dst = gl.cacheRegion(&layer.slabs[ci], g, ci, binding.slot orelse return error.ExpertBindingMissing);
-                    try spans.append(self.allocator, .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr });
+                    try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
                 }
             }
         }
@@ -2557,6 +2575,7 @@ pub const Engine = struct {
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
         for (self.layers[self.borrow_from..]) |*layer| if (layer.grouped) |g| {
             g.union_ragged = try Ragged.initPools(self.s, g.hidden, g.inter, g.pools(true, &pool_buf), slabTriple(self.grouped_union, 0), slabTriple(self.grouped_union, 1), slabTriple(self.grouped_union, 2));
+            g.union_ragged.tile_major = g.tile_major;
         };
     }
 
@@ -2770,7 +2789,7 @@ pub const Engine = struct {
             for (0..n) |ci| {
                 const source = self.store.spanAt(layer_index, expert, ci);
                 const dst = gl.unionRegion(&self.grouped_union[ci], g, ci, next[g]);
-                try spans.append(self.allocator, .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr });
+                try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
             }
             next[g] += 1;
         }
@@ -2897,7 +2916,7 @@ pub const Engine = struct {
                         gl.unionRegion(&read_set[ci], g, ci, position)
                     else
                         gl.cacheRegion(&layer.slabs[ci], g, ci, binding.slot orelse return error.ExpertBindingMissing);
-                    try spans.append(self.allocator, .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr });
+                    try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
                 }
             }
         }
@@ -3029,7 +3048,7 @@ pub const Engine = struct {
                 for (0..n) |ci| {
                     const source = self.store.spanAt(layer_index, global, ci);
                     const dst = if (binding.slot) |slot| gl.cacheRegion(&layer.slabs[ci], g, ci, slot) else gl.unionRegion(&self.grouped_union[ci], g, ci, spilled);
-                    try spans.append(self.allocator, .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr });
+                    try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
                 }
                 if (binding.slot == null) spilled += 1;
             }
@@ -3425,7 +3444,7 @@ test "expert stream rate-grouped pools and the union hold the kept experts of ea
     groups.n[1] = .{ 32, 32, 40 };
     groups.n[2] = .{ 24, 24, 24 };
     groups.base[0..3].* = .{ 0, 3, 33 };
-    var layer = try GroupedLayer.init(t.allocator, groups, 2560, 640, 1 << 40);
+    var layer = try GroupedLayer.init(t.allocator, groups, 2560, 640, 1 << 40, false);
     defer layer.deinitCaches();
     // A bill that holds everything caps every pool at its kept experts, never its stored ones.
     try t.expectEqualSlices(u32, &.{ 3, 20, 94 }, layer.slots[0..3]);

@@ -161,3 +161,92 @@ test "dsv41 expert timing at the pack's geometry (SUSHI_DSV41_EXPERT_UBENCH=1)" 
         }
     }
 }
+
+fn medianOf(v: []f64) f64 {
+    std.mem.sort(f64, v, {}, std.sort.asc(f64));
+    return v[v.len / 2];
+}
+
+test "dsv41 routed decode chain over pack-order and tile-major tiles, interleaved (SUSHI_DSV41_REPACK_UBENCH=1)" {
+    if (!bench.diagOn("SUSHI_DSV41_REPACK_UBENCH")) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0xd54e);
+    const rnd = prng.random();
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    for (LAYOUTS[0..3]) |lay| {
+        var banks: [8]root.Bank = undefined;
+        for (lay.groups, 0..) |g, i| banks[i] = try bench.makeBank(rnd, HIDDEN, INTER, g.n, g.experts, 0.02, 0.9);
+        var rb = try rate_groups.Ragged.init(s, banks[0..lay.groups.len]);
+        defer rb.deinit();
+        const st = rb.storage();
+        const vec = mlx.mlx_vector_array_new_data(&st, st.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
+        var tm = try rate_groups.tileMajorCopy(s, &rb);
+        defer tm.deinit();
+        const tst = tm.storage();
+        const tvec = mlx.mlx_vector_array_new_data(&tst, tst.len);
+        defer _ = mlx.mlx_vector_array_free(tvec);
+        try mlx.check(mlx.mlx_eval(tvec));
+        for ([_]usize{ 1, 4 }) |rows| {
+            var routes: [ROUTE_SETS]mlx.mlx_array = undefined;
+            const bytes = makeRoutes(rnd, &rb, rows, lay.topk, .uniform, &routes);
+            defer for (routes) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            const xh = try std.heap.page_allocator.alloc(u16, rows * HIDDEN);
+            defer std.heap.page_allocator.free(xh);
+            for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
+            const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(HIDDEN) }, 2, .bfloat16);
+            defer _ = mlx.mlx_array_free(x0);
+            var scv: [256 * 6]f32 = undefined;
+            for (&scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+            const scores = mlx.mlx_array_new_data(&scv, &[_]c_int{@intCast(rows * lay.topk)}, 1, .float32);
+            defer _ = mlx.mlx_array_free(scores);
+            const arms = [2]Ctx{
+                .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = false },
+                .{ .rb = &tm, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = false },
+            };
+            for (0..ROUTE_SETS) |i| {
+                const a = try step(arms[0], s, i, x0);
+                defer _ = mlx.mlx_array_free(a);
+                const b = try step(arms[1], s, i, x0);
+                defer _ = mlx.mlx_array_free(b);
+                var ca = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(ca);
+                var cb = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(cb);
+                try mlx.check(mlx.mlx_contiguous(&ca, a, false, s));
+                try mlx.check(mlx.mlx_contiguous(&cb, b, false, s));
+                try mlx.check(mlx.mlx_array_eval(ca));
+                try mlx.check(mlx.mlx_array_eval(cb));
+                const n_bytes = mlx.mlx_array_size(ca) * mlx.mlx_array_itemsize(ca);
+                const pa: [*]const u8 = @ptrCast(mlx.mlx_array_data_uint8(ca) orelse return error.Unreadable);
+                const pb: [*]const u8 = @ptrCast(mlx.mlx_array_data_uint8(cb) orelse return error.Unreadable);
+                if (!std.mem.eql(u8, pa[0..n_bytes], pb[0..n_bytes])) {
+                    std.debug.print("dsv41-repack {s} rows {d}: BYTES DIFFER at route set {d}\n", .{ lay.name, rows, i });
+                    return error.TestUnexpectedResult;
+                }
+            }
+            const steps = bench.envUsize("SUSHI_UBENCH_STEPS", 16);
+            const rounds = bench.envUsize("SUSHI_UBENCH_ROUNDS", 9);
+            var us: [2][]f64 = undefined;
+            for (&us) |*u| u.* = try std.heap.page_allocator.alloc(f64, rounds);
+            defer for (us) |u| std.heap.page_allocator.free(u);
+            for (0..rounds + 1) |round| {
+                const fl = try bench.chainNs(s, x0, steps, {}, bench.linkOnly);
+                for (arms, 0..) |c, ai| {
+                    const ns = try bench.chainNs(s, x0, steps, c, step);
+                    if (round > 0) us[ai][round - 1] = (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(fl))) / 1e3 / @as(f64, @floatFromInt(steps));
+                }
+            }
+            var best: [2]f64 = undefined;
+            for (us, 0..) |u, ai| best[ai] = std.mem.min(f64, u);
+            const med = [2]f64{ medianOf(us[0]), medianOf(us[1]) };
+            std.debug.print("dsv41-repack {s} rows {d}: pack-order {d:.1} us (best {d:.1}), tile-major {d:.1} us (best {d:.1}), {d:.3}x median, {d:.1} MB read, {d:.0} -> {d:.0} GB/s, bytes equal\n", .{ lay.name, rows, med[0], best[0], med[1], best[1], med[1] / med[0], bytes / 1e6, bench.gbps(bytes, med[0]), bench.gbps(bytes, med[1]) });
+        }
+    }
+}

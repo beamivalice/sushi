@@ -237,6 +237,14 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   over the slabs (`Ragged.initPools`); MiMo and GLM refuse it ([engine-expert-streaming](engine-expert-streaming.md#rate-groups)).
   A wide route through an overflowing group gets a prefill-only bank (`Ragged.initSplit`): the group's cache pool
   and its spill in the union workspace as two pools, scales concatenated per route; the decode kernels refuse it.
+- **Tile-major pools** (`Ragged.tile_major`, DeepSeek-V4.1 STQ streaming only): the fill lands each trellis projection
+  of an expert as `[OT/2][IT][2][n]` (`layout.tileMajor`) instead of the pack's `[IT][OT][n]`, so an output tile pair's
+  whole K range is one run. Only the first tile and the k stride of a reader change (`retile` over the decode funnel
+  arms, `GEMM_NAX_TM_SOURCE`, `GEMM_SIMDMAT_TM_SOURCE`, `GEMM_SORTED_TM_SOURCE`, `TileOrder`); the words, the decode and
+  the FMA order are the pack order's, so every plane is the same bytes (held at 1-16 and 256 rows, every body, PAIR1
+  and SPEC1). The pack on disk is unchanged; the DSpark stage's resident bank and every other pack keep the pack order.
+  A kernel keyed on a tile-major bank carries a `_tm` name. The non-funnel decode arms and a bank made by `Ragged.init`
+  stay in pack order; `moeDecodeClamped` refuses a tile-major bank when the funnel is off (`Exl3TileMajorNeedsFunnel`).
 - Timing: `SUSHI_EXL3_RG_UBENCH=1` (decode) and `SUSHI_EXL3_RG_PREFILL_UBENCH=1` (prefill) on the exl3 test binary;
   `SUSHI_EXL3_RG_ROWS_UBENCH=1` times a DeepSeek layer with every expert routed the same 1 to 48 rows.
 

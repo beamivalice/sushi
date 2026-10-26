@@ -78,6 +78,17 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   262144 keys, 1 row 0.74 to 0.44 ms, 4 rows 2.35 to 1.27 ms per eval (about 0.2 ms of each is the eval floor); live serial b349f67e 42.8 tok/s at 209k, 47.8 at 4.7k, the same 600
   greedy tokens (one boot, GPU lock, QUIET, fans max, die 49 C, taskpolicy -a). Ruled out
   on the ubench: a 512-thread score threadgroup and a replicated top-k histogram (both unchanged).
+- **Tile-major expert pools**: the streamed STQ pools hold each trellis projection per output tile pair
+  (`layout.tileMajor`, [engine-exl3-experts](engine-exl3-experts.md#rate-groups)), filled through the bounce buffers and
+  read by the decode GEMVs and the three prefill GEMM bodies with a new first tile and k stride; the pack on disk and every
+  plane's bytes are unchanged. The chain is 1.6-3.3% faster than pack order, not the ~25% the no-trellis-loads ablation
+  allowed: the scatter of the 96-192 B chunks was not the limit (`SUSHI_DSV41_REPACK_UBENCH=1`, exl3 test binary, pack order
+  against tile-major interleaved per round: 1 row 130.2 to 128.1 us at L2, 134.0 to 130.6 at L23, 4 rows 464 to 449 us at
+  L23; GPU lock, QUIET, fans max, die 49 C, `taskpolicy -a`, e4c87be5). Live, ba4abafc, serial `--no-mtp` at 4.7k, the same
+  600 greedy tokens: 48.3 tok/s against 47.9 (d57f8ea8, one boot each); the first request's first prefill chunk and
+  last-token step ran 0.5 s and 0.7 s longer (595.6 against 700.9 tok/s; chunks 2 and 3 equal at 2508 and 1019 ms; not
+  isolated, likely the new kernels' first compile); a cold prefill fill reads 6.9-8.8 GB/s against 7.5-9.3. Adaptive DSpark 61.0 against 62.5 with a
+  different row mix (1.46 against 1.71 tokens a round), inside the boot-to-boot spread.
 - **Hyper-connection folds**: the FFN stage (`dsv41_hc_stage_z`) splits the attention's mixes itself, one simdgroup in each
   threadgroup, so the attention side has no `dsv41_hc_split` dispatch (a layer less; on e4c87be5 serial `--no-mtp` 47.9
   tok/s at 4.7k against 47.8, the same 600 greedy tokens: a tie that removes 40 dispatches; one boot, GPU lock, QUIET,
