@@ -6,6 +6,8 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer = @import("transformer.zig");
 const model = @import("dsv41_model.zig");
+const expert_usage = @import("expert_usage.zig");
+const testing = std.testing;
 
 /// Snapshot layers a restore point holds: each model slot's four arrays ride two layers' conv and ssm fields
 /// (the aux and pooled fields mean a QSA history to the cache, so they stay empty). A slot array the
@@ -90,6 +92,56 @@ pub fn markRows(cache: *transformer.KVCache) !void {
 /// with a different set of slots, is never read.
 pub fn namespaceTag(dspark: bool) []const u8 {
     return if (dspark) "dsv41-state-v1-dspark" else "dsv41-state-v1";
+}
+
+/// The SSD namespace of one boot: `namespaceTag` plus what changes the numbers a stored state was computed
+/// under. `drop` is the ranked list in use; a non-zero `pick_tolerance` stores states built on cache-dependent
+/// picks, so no exact boot reads them. A boot with neither keeps `namespaceTag`.
+pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, drop: ?*const expert_usage.Drop, pick_tolerance: f32) ![]u8 {
+    var key = std.ArrayList(u8).empty;
+    errdefer key.deinit(allocator);
+    try key.appendSlice(allocator, namespaceTag(dspark));
+    if (drop) |d| try key.print(allocator, "-drop{d}-{x:0>16}", .{ d.n, d.digest() });
+    if (pick_tolerance > 0) try key.print(allocator, "-pick{x:0>8}", .{@as(u32, @bitCast(pick_tolerance))});
+    return key.toOwnedSlice(allocator);
+}
+
+test "layoutKey: a boot that drops other experts or picks leniently has its own namespace" {
+    const a = testing.allocator;
+    const full = try layoutKey(a, false, null, 0);
+    defer a.free(full);
+    try testing.expectEqualStrings(namespaceTag(false), full);
+
+    var d8 = try expert_usage.fixedDrop(a, 1, &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 8, 9, 10, 11, 12, 13, 14, 15 } });
+    defer d8.deinit();
+    var d8_same = try expert_usage.fixedDrop(a, 1, &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 8, 9, 10, 11, 12, 13, 14, 15 } });
+    defer d8_same.deinit();
+    // Same count, another list: still another namespace.
+    var d8_other = try expert_usage.fixedDrop(a, 1, &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 9, 8, 10, 11, 12, 13, 14, 16 } });
+    defer d8_other.deinit();
+    var d16 = try expert_usage.fixedDrop(a, 1, &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &.{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } });
+    defer d16.deinit();
+
+    const k8 = try layoutKey(a, false, &d8, 0);
+    defer a.free(k8);
+    const k8_same = try layoutKey(a, false, &d8_same, 0);
+    defer a.free(k8_same);
+    const k8_other = try layoutKey(a, false, &d8_other, 0);
+    defer a.free(k8_other);
+    const k16 = try layoutKey(a, false, &d16, 0);
+    defer a.free(k16);
+    const k8_dspark = try layoutKey(a, true, &d8, 0);
+    defer a.free(k8_dspark);
+    const k_lossy = try layoutKey(a, false, null, 0.3);
+    defer a.free(k_lossy);
+    const k_lossier = try layoutKey(a, false, null, 0.4);
+    defer a.free(k_lossier);
+    const k8_lossy = try layoutKey(a, false, &d8, 0.3);
+    defer a.free(k8_lossy);
+
+    try testing.expectEqualStrings(k8, k8_same);
+    const distinct = [_][]const u8{ full, k8, k8_other, k16, k8_dspark, k_lossy, k_lossier, k8_lossy };
+    for (distinct, 0..) |x, i| for (distinct[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x, y));
 }
 
 /// Thought tokens under which the prompt-end snapshot's re-prefill is cheap enough to skip a decode restore point.

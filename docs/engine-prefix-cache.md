@@ -376,7 +376,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed. A Qwen GDN model adds a layout tag
   (`ModelConfig.cacheLayoutNamespace`): `gdn-f32-state-v1` for the default f32 state, `gdn-gate-f32-v1` for
   `--qwen-gdn 16`, so the two widths never restore each other's checkpoints and entries written under the old bf16
-  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. KV width is not in the namespace: `bestMatch` skips an
+  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. DeepSeek's tag (`dsv41_prefix.layoutKey`) also names `--drop-expert`'s dropped list (count and a digest of the per-layer ids) and a non-zero `--expert-pick-tolerance` (decode-width picks read the cache, so the states built on them are not an exact boot's); a boot with neither keeps the plain tag. KV width is not in the namespace: `bestMatch` skips an
   entry whose manifest quant differs from the live one.
 
 - `prefix_cache.ssdFirstActive` = a disk tier AND (capable arch OR RAM retention disabled), mirrored onto `HotPrefixCache.ssd_first` +

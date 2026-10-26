@@ -86,6 +86,7 @@ test {
     _ = @import("dsv41_model.zig");
     _ = @import("dsv41_stream.zig");
     _ = @import("dsv41_borrow.zig");
+    _ = @import("dsv41_prefix.zig");
     _ = @import("dsv41_kernels.zig");
     _ = @import("glm5_next.zig");
     _ = @import("glm5_model.zig");

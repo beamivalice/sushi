@@ -123,6 +123,15 @@ pub const Drop = struct {
         self.allocator.free(self.source);
     }
 
+    /// Names the dropped set: two drops with the same digest leave out the same experts in every layer.
+    pub fn digest(self: *const Drop) u64 {
+        var h = std.hash.XxHash64.init(0x6472_6f70_6578_7031);
+        h.update(std.mem.asBytes(&self.n));
+        h.update(std.mem.asBytes(&self.first_layer));
+        h.update(std.mem.sliceAsBytes(self.rows));
+        return h.final();
+    }
+
     /// How many of `lo..hi` this layer drops.
     pub fn droppedIn(self: *const Drop, layer: usize, lo: usize, hi: usize) usize {
         var count: usize = 0;
