@@ -233,6 +233,8 @@ ORIGINAL checkpoint layout, and dumps logits, per-layer streams and sub-module c
 `fixture_noqat.safetensors`, off). The reference's GPU kernels are stubbed on the CPU. `DSV41_TINY=<dir>` points the Zig
 tests at the output; `zig build test` caches a passing env-gated run, so re-run the test binary to re-execute.
 
+`DSV41_TINY` takes the DEFAULT-geometry dump (no `--geometry`); a `--geometry stq` dump there fails `dsv41 fused: prefill ...` at `attn_2` (diff 0.39, bar 0.010). `DSV41_STQ_TINY` takes the STQ PACK built from the `--geometry stq` dump, not the dump itself.
+
 | Test | Bar |
 |---|---|
 | prefill, whole and in 13-row chunks over 5-row spans, QAT off, CPU stream | every layer's trace within 1e-4 of its peak, logits 2e-3 |
