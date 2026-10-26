@@ -115,7 +115,7 @@ pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList
 }
 
 /// The most images one request may carry, counted across every message.
-pub const MAX_REQUEST_IMAGES: usize = 64;
+pub const MAX_REQUEST_IMAGES: usize = 1024;
 
 /// Where one image or video sits in `Message.content`: the template renders
 /// its placeholder at byte offset `at`. Parts of a kind consume the message's

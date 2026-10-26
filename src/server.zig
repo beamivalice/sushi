@@ -15940,6 +15940,21 @@ test "a body past the image limit is refused with both counts" {
     try std.testing.expectEqualStrings(want, t.wire.media.refusal().?.text());
 }
 
+test "a long agent session's 65 images pass the image limit" {
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try body.appendSlice(std.testing.allocator, "{\"messages\":[{\"role\":\"user\",\"content\":[");
+    for (0..65) |i| {
+        if (i > 0) try body.append(std.testing.allocator, ',');
+        try body.appendSlice(std.testing.allocator, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACQAAAAUCAIAAABqGAhiAAAALUlEQVR42mM4ISdHBpIjSxvDqGWjlo1aNswsI0/fhw8iZKBRy0YtG7VsmFkGAGi0hC5b6HVfAAAAAElFTkSuQmCC\"}}");
+    }
+    try body.appendSlice(std.testing.allocator, "]}]}");
+    var t = try testWire(body.items, .openai);
+    defer t.parsed.deinit();
+    defer t.wire.deinit();
+    try std.testing.expect(t.wire.media.refusal() == null);
+}
+
 test "an input_audio part sent to a vision-only model is refused by name" {
     // In the walk, where the part is named...
     var t = try testWire("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"listen\"},{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"AAAAAA==\",\"format\":\"wav\"}}]}]}", .openai);
