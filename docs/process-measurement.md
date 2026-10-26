@@ -117,6 +117,14 @@ The protocol, fixed for every model and release:
 - **The report** puts code and prose decode side by side per rung (with the prose/code ratio), one window table per
   arm, and a summary row set: the code rows keep the old shape and stay comparable across releases, and the prose rows
   are added beneath them as `<pack> (prose)`.
+- **The GPU clock is read, and a throttled run stops.** `sushi bench` runs `sudo -n powermetrics --samplers gpu_power,thermal`
+  (500 ms) beside the run and keeps, for each request, the median active MHz of the samples with at least 50% GPU
+  residency and the worst thermal pressure level; both are columns beside the tok/s and the header gives the run's
+  minimum and median. A request at `Heavy` or worse pressure, or at 1100 MHz or under (the top clock is 1620 MHz; a
+  throttled run sat at 1025 to 1120 under `Heavy`), aborts the bench with an error naming it; `Moderate` is only
+  recorded in the columns. The partial report is `bench-aborted.md` in the run directory, never `docs/bench`. `bench.sh`
+  refuses to boot when the pressure after the cooldown is `Heavy` or worse and prints a note on `Moderate`. Without a passwordless `sudo -n powermetrics` both say the clock is not monitored and
+  go on; a decode number from a run that was not monitored needs a `powermetrics` look beside it before it is recorded.
 - **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
   short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement.
 

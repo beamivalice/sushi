@@ -5,6 +5,7 @@
 const std = @import("std");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
+const gpu_clock = @import("gpu_clock.zig");
 const testing = std.testing;
 
 pub const window: usize = 8192;
@@ -26,7 +27,9 @@ pub const USAGE =
     \\
     \\Drives a running server through the release bench, once on a code corpus and once on prose: a cold 4k
     \\request, 16 windows of 8192 tokens each restoring the previous prompt end, and 3 decode samples at
-    \\4k, 8k, 16k, 32k, 64k and 128k.
+    \\4k, 8k, 16k, 32k, 64k and 128k. It reads the GPU clock and thermal pressure through `sudo -n powermetrics`
+    \\beside every request and stops with an error when the clock is throttled (at most 1100 MHz, or pressure
+    \\Heavy or worse); without a passwordless sudo rule it says so and runs unmonitored.
     \\Boot the server and take the box rules with tests/bench.sh.
     \\
     \\Options:
@@ -256,6 +259,9 @@ pub const Sample = struct {
     restore_ms: f64,
     restore_logged: bool,
     mode: []const u8,
+    /// Median active GPU clock of the request's busy samples (0 = none) and its worst thermal pressure (null = not monitored).
+    gpu_mhz: f64 = 0,
+    gpu_pressure: ?gpu_clock.Pressure = null,
 
     pub fn newTokens(s: Sample) u32 {
         return s.prompt_n -| s.cached_n;
@@ -281,9 +287,10 @@ pub const Sample = struct {
     }
 };
 
-pub const Problem = enum { restore_missed, no_restore_line, short_decode };
+pub const Problem = enum { restore_missed, no_restore_line, short_decode, gpu_throttled };
 
 pub fn check(s: Sample) ?Problem {
+    if (gpu_clock.verdict(s.gpu_mhz, s.gpu_pressure) != .ok) return .gpu_throttled;
     if (s.base == 0) {
         if (s.cached_n != 0) return .restore_missed;
     } else if (s.cached_n + restore_slack < s.base or s.cached_n > s.base) return .restore_missed;
@@ -392,6 +399,9 @@ pub const Report = struct {
     stamp: []const u8,
     decode_tokens: u32,
     samples: []const Sample,
+    clock: gpu_clock.RunSummary = .{},
+    /// Why the run stopped early; empty for a complete run.
+    aborted: []const u8 = "",
 };
 
 fn writeThousands(w: *std.Io.Writer, v: f64) !void {
@@ -414,7 +424,29 @@ const RungRow = struct {
     tps: [samples_per_rung]f64 = @splat(0),
     cached: [samples_per_rung]u32 = @splat(0),
     modes: [samples_per_rung][]const u8 = @splat(""),
+    mhz: [samples_per_rung]f64 = @splat(0),
+    pressure: [samples_per_rung]?gpu_clock.Pressure = @splat(null),
 };
+
+/// The worst of the pressure levels, null when none was read.
+fn worstPressure(levels: []const ?gpu_clock.Pressure) ?gpu_clock.Pressure {
+    var worst: ?gpu_clock.Pressure = null;
+    for (levels) |l| {
+        const p = l orelse continue;
+        if (worst == null or @intFromEnum(p) > @intFromEnum(worst.?)) worst = p;
+    }
+    return worst;
+}
+
+fn writeGpuCells(w: *std.Io.Writer, mhz: f64, pressure: ?gpu_clock.Pressure) !void {
+    if (mhz > 0) try w.print(" {d:.0} |", .{mhz}) else try w.writeAll(" · |");
+    if (pressure) |p| try w.print(" {s} |", .{gpu_clock.pressureLabel(p)}) else try w.writeAll(" · |");
+}
+
+fn armHasGpu(samples: []const Sample, arm: Arm) bool {
+    for (samples) |s| if (s.arm == arm and s.gpu_pressure != null) return true;
+    return false;
+}
 
 fn modeLabel(row: RungRow) []const u8 {
     const first = if (row.modes[0].len == 0) "none" else row.modes[0];
@@ -436,20 +468,32 @@ fn rungRows(allocator: std.mem.Allocator, samples: []const Sample, arm: Arm) !st
         row.tps[row.n] = s.decodeTps();
         row.cached[row.n] = s.cached_n;
         row.modes[row.n] = s.mode;
+        row.mhz[row.n] = s.gpu_mhz;
+        row.pressure[row.n] = s.gpu_pressure;
         row.n += 1;
     }
     return rows;
 }
 
-fn writeDecodeCells(w: *std.Io.Writer, row: ?RungRow) !void {
+fn writeDecodeCells(w: *std.Io.Writer, row: ?RungRow, gpu: bool) !void {
     const r = row orelse {
         try w.writeAll(" · | · | · | · | · |");
+        if (gpu) try w.writeAll(" · | · |");
         return;
     };
     for (0..samples_per_rung) |i| {
         if (i < r.n) try w.print(" {d:.1} |", .{r.tps[i]}) else try w.writeAll(" · |");
     }
     try w.print(" {d:.1} | {s} |", .{ median(r.tps[0..r.n]), modeLabel(r) });
+    if (gpu) {
+        var seen: [samples_per_rung]f64 = undefined;
+        var n: usize = 0;
+        for (r.mhz[0..r.n]) |m| if (m > 0) {
+            seen[n] = m;
+            n += 1;
+        };
+        try writeGpuCells(w, median(seen[0..n]), worstPressure(r.pressure[0..r.n]));
+    }
 }
 
 fn findRow(rows: []const RungRow, len: usize) ?RungRow {
@@ -458,7 +502,8 @@ fn findRow(rows: []const RungRow, len: usize) ?RungRow {
 }
 
 fn writeWindows(w: *std.Io.Writer, samples: []const Sample, arm: Arm) !void {
-    try w.print("\n## Prefill by window, {s} (tok/s)\n\n| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s |\n|---|---:|---:|---:|---:|---:|\n", .{@tagName(arm)});
+    const gpu = armHasGpu(samples, arm);
+    try w.print("\n## Prefill by window, {s} (tok/s)\n\n| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s |{s}\n|---|---:|---:|---:|---:|---:|{s}\n", .{ @tagName(arm), if (gpu) " GPU MHz | Pressure |" else "", if (gpu) "---:|---|" else "" });
     for (samples) |s| {
         if (s.arm != arm or s.kind != .ladder) continue;
         try w.writeAll("| ");
@@ -471,7 +516,9 @@ fn writeWindows(w: *std.Io.Writer, samples: []const Sample, arm: Arm) !void {
         try writeThousands(w, @floatFromInt(s.newTokens()));
         try w.writeAll(" | ");
         try writeThousands(w, s.prefillTps());
-        try w.print(" | {d:.0} | {d:.2} |\n", .{ s.restore_ms, s.ttftMs() / 1000.0 });
+        try w.print(" | {d:.0} | {d:.2} |", .{ s.restore_ms, s.ttftMs() / 1000.0 });
+        if (gpu) try writeGpuCells(w, s.gpu_mhz, s.gpu_pressure);
+        try w.writeAll("\n");
     }
 }
 
@@ -503,6 +550,8 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
     try w.writeAll("\n\n");
     var lines = std.mem.splitSequence(u8, rep.stamp, "\\n");
     while (lines.next()) |l| if (l.len > 0) try w.print("{s}\n\n", .{l});
+    if (rep.aborted.len > 0) try w.print("**Aborted, not a measurement:** {s}\n\n", .{rep.aborted});
+    try gpu_clock.writeRunHeader(w, rep.clock);
     try w.print(
         "Protocol: token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample. The code arm is one fixed seeded TypeScript corpus; " ++
             "the prose arm is Pride and Prejudice (public domain), where speculative acceptance is lower. " ++
@@ -511,19 +560,27 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
         .{rep.decode_tokens},
     );
 
+    const code_gpu = armHasGpu(rep.samples, .code);
+    const prose_gpu = armHasGpu(rep.samples, .prose);
     try w.writeAll("## Decode (tok/s)\n\n| Rung | Code 1 | Code 2 | Code 3 | Code median | Code mode |");
-    if (has_prose) try w.writeAll(" Prose 1 | Prose 2 | Prose 3 | Prose median | Prose mode | Prose / code |");
+    if (code_gpu) try w.writeAll(" Code MHz | Code pressure |");
+    if (has_prose) try w.writeAll(" Prose 1 | Prose 2 | Prose 3 | Prose median | Prose mode |");
+    if (prose_gpu) try w.writeAll(" Prose MHz | Prose pressure |");
+    if (has_prose) try w.writeAll(" Prose / code |");
     try w.writeAll("\n|---|---:|---:|---:|---:|---|");
-    if (has_prose) try w.writeAll("---:|---:|---:|---:|---|---:|");
+    if (code_gpu) try w.writeAll("---:|---|");
+    if (has_prose) try w.writeAll("---:|---:|---:|---:|---|");
+    if (prose_gpu) try w.writeAll("---:|---|");
+    if (has_prose) try w.writeAll("---:|");
     try w.writeAll("\n");
     for (code.items) |row| {
         try w.writeAll("| ");
         try writeRungLabel(w, row.len);
         try w.writeAll(" |");
-        try writeDecodeCells(w, row);
+        try writeDecodeCells(w, row, code_gpu);
         if (has_prose) {
             const p = findRow(prose.items, row.len);
-            try writeDecodeCells(w, p);
+            try writeDecodeCells(w, p, prose_gpu);
             const cm = median(row.tps[0..row.n]);
             if (p != null and cm > 0) try w.print(" {d:.2} |", .{median(p.?.tps[0..p.?.n]) / cm}) else try w.writeAll(" · |");
         }
@@ -558,6 +615,7 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
             .restore_missed => "restored fewer tokens than the previous prompt end holds",
             .no_restore_line => "no restore line in the server log, so the restore time was not taken out",
             .short_decode => "decoded fewer tokens than asked",
+            .gpu_throttled => "the GPU clock or thermal pressure failed the abort rule (see the GPU columns)",
         } });
     }
     return out.toOwnedSlice();
@@ -622,10 +680,12 @@ fn printOut(io: std.Io, text: []const u8) !void {
 
 /// One request of the plan: send the prompt, then read what the server logged for it (the restore line always
 /// lands, the speculative mode only on a decode) a moment after the response.
-fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, model: []const u8, log_path: []const u8, ids: []const u32, req: Request, arm: Arm, log_len: *usize) !Sample {
+fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, model: []const u8, log_path: []const u8, ids: []const u32, req: Request, arm: Arm, log_len: *usize, sampler: ?*gpu_clock.Sampler) !Sample {
     const body = try promptBody(a, model, ids[0..req.prompt_len], req.max_tokens);
     var wall = io_util.Stopwatch.init(io);
+    const started_ms = io_util.nowMsMonotonic(io);
     const resp = try post(a, client, url, body);
+    const ended_ms = io_util.nowMsMonotonic(io);
     const wall_ms = @as(f64, @floatFromInt(wall.read())) / std.time.ns_per_ms;
     const c = try parseCompletion(a, resp);
 
@@ -642,6 +702,13 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
     }
     log_len.* = (try readLog(a, io, log_path)).len;
 
+    var gpu: gpu_clock.Summary = .{};
+    if (sampler) |s| {
+        // The sample that covers the request's last moments is printed at the end of its interval.
+        _ = s.waitPast(ended_ms, 2 * gpu_clock.interval_ms);
+        gpu = try s.summarizeWindow(a, started_ms, ended_ms);
+    }
+
     return .{
         .arm = arm,
         .prompt_len = req.prompt_len,
@@ -657,7 +724,28 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
         .restore_ms = if (restore) |r| r.ms else 0,
         .restore_logged = restore != null,
         .mode = mode orelse "",
+        .gpu_mhz = gpu.mhz,
+        .gpu_pressure = gpu.pressure,
     };
+}
+
+fn startSampler(gpa: std.mem.Allocator, io: std.Io) ?*gpu_clock.Sampler {
+    const s = gpu_clock.Sampler.start(gpa, io, &gpu_clock.powermetrics_argv) catch |e| {
+        log.warn("[bench] the GPU clock is not monitored: cannot run powermetrics ({s})\n", .{@errorName(e)});
+        return null;
+    };
+    if (!s.waitFirst(5000)) {
+        s.stop();
+        log.warn("[bench] the GPU clock is not monitored: `sudo -n powermetrics` gave no reading (it needs a passwordless sudo rule)\n", .{});
+        return null;
+    }
+    return s;
+}
+
+fn throttleMessage(a: std.mem.Allocator, s: Sample) ![]u8 {
+    return std.fmt.allocPrint(a, "the GPU was throttled during the {s} {d}-token {s} request: median {d:.0} MHz (abort at {d:.0} MHz or under), thermal pressure {s}", .{
+        @tagName(s.arm), s.prompt_len, @tagName(s.kind), s.gpu_mhz, gpu_clock.throttle_mhz, gpu_clock.pressureLabel(s.gpu_pressure orelse .nominal),
+    });
 }
 
 pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -693,7 +781,10 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     var samples: std.ArrayList(Sample) = .empty;
     const url = try std.fmt.allocPrint(a, "{s}/v1/completions", .{base});
     var log_len: usize = (try readLog(a, io, opts.log_path)).len;
-    for ([_]Arm{ .code, .prose }) |arm| {
+    const sampler = startSampler(gpa, io);
+    defer if (sampler) |s| s.stop();
+    var aborted: []const u8 = "";
+    arms: for ([_]Arm{ .code, .prose }) |arm| {
         var ids: std.ArrayList(u32) = .empty;
         switch (arm) {
             .code => {
@@ -713,21 +804,39 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         }
         log.info("[bench] {s} corpus: {d} tokens, model {s}\n", .{ @tagName(arm), ids.items.len, model });
         for (reqs) |req| {
-            const s = try runRequest(a, io, &client, url, model, opts.log_path, ids.items, req, arm, &log_len);
+            const s = try runRequest(a, io, &client, url, model, opts.log_path, ids.items, req, arm, &log_len, sampler);
             try samples.append(a, s);
-            log.info("[bench] {s} {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}{s}\n", .{
+            log.info("[bench] {s} {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}, gpu {d:.0} MHz {s}{s}\n", .{
                 @tagName(arm),                     s.prompt_len,  @tagName(s.kind), s.cached_n, s.newTokens(), s.prefillTps(), s.ttftMs() / 1000.0, s.decodeTps(),
-                if (s.mode.len > 0) s.mode else "none", if (check(s) != null) " WARNING" else "",
+                if (s.mode.len > 0) s.mode else "none", s.gpu_mhz, if (s.gpu_pressure) |p| gpu_clock.pressureLabel(p) else "unmonitored", if (check(s) != null) " WARNING" else "",
             });
+            if (check(s) == .gpu_throttled) {
+                aborted = try throttleMessage(a, s);
+                break :arms;
+            }
         }
     }
 
-    const rep: Report = .{ .model = model, .version = opts.version, .stamp = opts.stamp, .decode_tokens = opts.decode_tokens, .samples = samples.items };
-    const raw = try std.json.Stringify.valueAlloc(a, .{ .model = model, .url = opts.url, .decode_tokens = opts.decode_tokens, .corpus_seed = corpus_seed, .stamp = opts.stamp, .samples = samples.items }, .{ .whitespace = .indent_2 });
+    const rep: Report = .{
+        .model = model,
+        .version = opts.version,
+        .stamp = opts.stamp,
+        .decode_tokens = opts.decode_tokens,
+        .samples = samples.items,
+        .clock = if (sampler) |s| try s.summarizeAll(a) else .{},
+        .aborted = aborted,
+    };
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .model = model, .url = opts.url, .decode_tokens = opts.decode_tokens, .corpus_seed = corpus_seed, .stamp = opts.stamp, .aborted = aborted, .samples = samples.items }, .{ .whitespace = .indent_2 });
     try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench.json" }), raw);
     const md = try render(a, rep);
-    if (opts.report.len > 0) try writeFile(io, opts.report, md);
     try printOut(io, md);
+    if (aborted.len > 0) {
+        // The partial report stays in the run directory: a docs/bench report is a finished measurement.
+        try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench-aborted.md" }), md);
+        log.err("sushi bench: aborted, {s}\n", .{aborted});
+        return error.BenchGpuThrottled;
+    }
+    if (opts.report.len > 0) try writeFile(io, opts.report, md);
     for (samples.items) |s| if (check(s) != null) return error.BenchInvalidSamples;
 }
 
@@ -958,4 +1067,46 @@ test "bench report: a prose arm sits beside the code arm and gets its own summar
     const md2 = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &bad });
     defer a.free(md2);
     try testing.expect(std.mem.indexOf(u8, md2, "- prose, 8192 tokens (ladder)") != null);
+}
+
+test "bench report: GPU clock columns beside the tok/s, the header line, and an abort notice" {
+    const a = testing.allocator;
+    const mk = struct {
+        fn s(arm: Arm, len: usize, kind: Kind, base: usize, max: u32, cached: u32, decode_ms: f64, mhz: f64, p: gpu_clock.Pressure) Sample {
+            return .{ .arm = arm, .prompt_len = len, .kind = kind, .base = base, .max_tokens = max, .prompt_n = @intCast(len), .cached_n = cached, .completion_n = if (max > 1) 512 else 1, .prompt_ms = 4000, .predicted_ms = decode_ms, .wall_ms = 4500 + decode_ms, .restore_ms = 0, .restore_logged = true, .mode = "dspark", .gpu_mhz = mhz, .gpu_pressure = p };
+        }
+    }.s;
+    const samples = [_]Sample{
+        mk(.code, 4096, .ladder, 0, 512, 0, 10_000, 1600, .nominal),
+        mk(.code, 4096, .repeat, 4096, 512, 4065, 10_000, 1580, .nominal),
+        mk(.code, 4096, .repeat, 4096, 512, 4065, 10_000, 1620, .nominal),
+        mk(.code, 8192, .ladder, 4096, 1, 4065, 50, 1050, .heavy),
+    };
+    try testing.expectEqual(Problem.gpu_throttled, check(samples[3]).?);
+    try testing.expect(check(samples[0]) == null);
+    const msg = try throttleMessage(a, samples[3]);
+    defer a.free(msg);
+    try testing.expectEqualStrings("the GPU was throttled during the code 8192-token ladder request: median 1050 MHz (abort at 1100 MHz or under), thermal pressure Heavy", msg);
+    const clock: gpu_clock.RunSummary = .{ .monitored = true, .min_mhz = 1050, .median_mhz = 1590, .busy_samples = 40, .seen = 0b101 };
+    const md = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &samples, .clock = clock, .aborted = msg });
+    defer a.free(md);
+    try testing.expect(std.mem.indexOf(u8, md, "**Aborted, not a measurement:** the GPU was throttled during the code 8192-token") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "GPU clock, sampled every 500 ms: median 1590 MHz, minimum 1050 MHz over 40 busy samples; thermal pressure seen: Nominal, Heavy.") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| Rung | Code 1 | Code 2 | Code 3 | Code median | Code mode | Code MHz | Code pressure |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| 4k | 51.2 | 51.2 | 51.2 | 51.2 | dspark | 1600 | Nominal |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s | GPU MHz | Pressure |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| 4,065 to 8,192 | 4,065 | 4,127 | 1,032 | 0 | 4.50 | 1050 | Heavy |\n") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "- code, 8192 tokens (ladder): the GPU clock or thermal pressure failed the abort rule") != null);
+    // Without a reading nothing is added: no columns, and the header says it was not monitored.
+    var plain = samples;
+    for (&plain) |*s| {
+        s.gpu_mhz = 0;
+        s.gpu_pressure = null;
+    }
+    const md2 = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &plain });
+    defer a.free(md2);
+    try testing.expect(std.mem.indexOf(u8, md2, "GPU clock: not monitored") != null);
+    try testing.expect(std.mem.indexOf(u8, md2, "Code MHz") == null);
+    try testing.expect(std.mem.indexOf(u8, md2, "GPU MHz") == null);
+    try testing.expect(std.mem.indexOf(u8, md2, "## Warnings") == null);
 }

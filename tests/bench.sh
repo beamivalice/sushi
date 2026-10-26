@@ -9,7 +9,7 @@
 # the order rule and the report format are in docs/process-measurement.md (release bench).
 #
 # What it takes on for the box rules: a clean tree and a fresh ReleaseFast build, the QUIET marker, AC power, the GPU
-# lock for the whole model, fans at max with an idle under 50 C (at most 3 min) before the boot, `taskpolicy -a`,
+# lock for the whole model, fans at max with an idle under 50 C (at most 3 min) and no Heavy thermal pressure before the boot, `taskpolicy -a`,
 # and a private SSD prefix cache. It refuses to start while another sushi, sushi-repack or sushi-grid runs.
 #
 # Another engine: this script does not drive one. Start it yourself and run llmprobe by hand,
@@ -99,6 +99,18 @@ for _ in $(seq 1 36); do
     sleep 5
 done
 echo "bench.sh: die at ${t%.*} C at the boot" | tee -a "$OUT/bench.log"
+# The GPU clock is read by `sushi bench` itself; a box already at Heavy thermal pressure or worse fails the run before the boot.
+pressure="$(sudo -n powermetrics --samplers thermal -i 1000 -n 1 2>/dev/null | sed -n 's/^Current pressure level: *//p')"
+if [[ -z "$pressure" ]]; then
+    echo "bench.sh: thermal pressure not read (no passwordless sudo -n powermetrics); the GPU clock is not monitored" | tee -a "$OUT/bench.log"
+else
+    echo "bench.sh: thermal pressure $pressure at the boot" | tee -a "$OUT/bench.log"
+    case "$pressure" in
+        Nominal) ;;
+        Moderate) echo "bench.sh: note: thermal pressure is Moderate; the run is recorded and aborts only at Heavy or worse" | tee -a "$OUT/bench.log" ;;
+        *) die "thermal pressure is $pressure after the cooldown: the GPU would run throttled; let the box rest and rerun" ;;
+    esac
+fi
 
 # ── Boot, run, stop ──
 export SUSHI_PREFIX_CACHE_DIR="$OUT/cache"
