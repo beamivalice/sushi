@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A long image history no longer re-runs the vision tower every turn**: a request whose prefix is restored from the cache encodes only the images the restore does not already hold, so a coding agent that keeps dozens of screenshots in its context no longer waits for them to be encoded again before the first token, and its encode is billed for those images alone.
+- **A request with many images decodes them in parallel**: a long screenshot history is decoded on up to eight threads instead of one, which cuts the wait before the first token several times over on a request that carries dozens of images.
 - **DeepSeek-V4.1-Flash serves a follow-up turn from the live state with no SSD read when the new prompt diverges inside the last turn's generation**: the state rolls back in place to the deepest restore point of the previous request that the prompt shares.
 - **DeepSeek-V4.1-Flash keeps a restore point every 8192 tokens on the SSD prefix cache**: an entry stores its compressed rows once and each point only its fixed state, so a long session keeps the whole grid instead of four far-apart points and a changed history re-prefills from the nearest 8k mark; entries written by earlier builds are not read.
 - **A request may carry up to 1024 images**: long agent sessions that keep every screenshot in their history are no longer refused at the 65th image; memory stays bounded by the per-request encode bill and the context size.

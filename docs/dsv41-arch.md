@@ -632,7 +632,8 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   already hold the image rows, so an image request keeps DSpark.
 - **Prefix cache**: the lookup takes the request's media key and boundary (`lookupAndRestoreDsv41`), so ids that
   repeat under another image restore only the text before it; the splice resumes at the image rows inside the restored
-  prefix.
+  prefix; the tower encodes only the images the restored prefix does not hold whole, so a 450k-token history of
+  screenshots costs no tower pass.
 - **Chat**: the template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image as the atom
   where it sat, blank-line joined with its text (the release's `process_image_messages`); `placeMedia` expands the atom
   to `spanRows` tokens.

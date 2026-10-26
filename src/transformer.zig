@@ -45764,6 +45764,53 @@ test "spliceVisionRows: two chunks with row offsets equal the whole-prompt splic
     }
 }
 
+test "spliceVisionRows: the rows of a skipped leading block are not needed once the offset drops by their count" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const img_id: u32 = 99;
+    // [7, 99, 99, 8, 99, 9]: the first block holds one row; a prefix of three tokens restores it
+    // and the second block's first row, so the tail splices from row 2 of the whole array.
+    const ids = [_]i32{ 8, 99, 9 };
+    var h_data: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        h_data[r * 4 + c] = @floatFromInt(r + 1);
+    };
+    var ve_data: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        ve_data[r * 4 + c] = @floatFromInt(100 + r);
+    };
+    const h_shape = [_]c_int{ 1, 3, 4 };
+    const ids_shape = [_]c_int{ 1, 3 };
+    const tid = mlx.mlx_array_new_data(&ids, &ids_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(tid);
+
+    const whole = mlx.mlx_array_new_data(&ve_data, &[_]c_int{ 1, 3, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(whole);
+    const tail_only = mlx.mlx_array_new_data(ve_data[4..].ptr, &[_]c_int{ 1, 2, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(tail_only);
+
+    const h_a = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+    const via_whole = try Transformer.spliceVisionRows(h_a, tid, whole, img_id, 0, 2, s);
+    defer _ = mlx.mlx_array_free(via_whole);
+    const h_b = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+    const via_tail = try Transformer.spliceVisionRows(h_b, tid, tail_only, img_id, 0, 1, s);
+    defer _ = mlx.mlx_array_free(via_tail);
+
+    for ([_]mlx.mlx_array{ via_whole, via_tail }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+    var f_whole = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f_whole);
+    var f_tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f_tail);
+    try mlx.check(mlx.mlx_astype(&f_whole, via_whole, .float32, s));
+    try mlx.check(mlx.mlx_astype(&f_tail, via_tail, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f_whole));
+    try mlx.check(mlx.mlx_array_eval(f_tail));
+    const a = mlx.mlx_array_data_float32(f_whole).?[0..12];
+    const b = mlx.mlx_array_data_float32(f_tail).?[0..12];
+    try std.testing.expectEqualSlices(f32, a, b);
+    try std.testing.expectEqual(@as(f32, 102), b[4]);
+}
+
 test "spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)" {
     // Live 2026-08-26 (qwen4_exp, 4-frame clip): 690 <|video_pad|> tokens were
     // inserted and the tower encoded 690 rows, but the mask keyed on image |

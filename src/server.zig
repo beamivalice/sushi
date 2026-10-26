@@ -1891,6 +1891,8 @@ pub fn serve(
     scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
     defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
     scheduler_mod.vision_encode_available = &visionEncodeAvailable;
+    scheduler_mod.vision_encode_bill = &visionEncodeBillBytes;
+    scheduler_mod.vision_fit_fault = &towerFitFaultText;
     defer scheduler_mod.vision_encode_available = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
@@ -3712,6 +3714,78 @@ test "Sushi quant memory request refusal carries the actual KV width MTP and max
     try std.testing.expect(std.mem.indexOf(u8, wire.message, "Maximum context: 64000 tokens") != null);
     try std.testing.expectEqual(@as(?model_registry_mod.MemoryContextRefusal, null), slot_memory_context_refusal);
     try std.testing.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
+}
+
+const predecode_png_0 = "data:image/png;base64,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";
+const predecode_png_1 = "data:image/png;base64,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";
+const predecode_png_2 = "data:image/png;base64,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";
+
+test "decoding a request's images concurrently gives the pixels, grids and chain key of a serial decode" {
+    const a = std.testing.allocator;
+    const urls = [_][]const u8{ predecode_png_0, predecode_png_1, predecode_png_2, predecode_png_1, "data:image/png;base64,AAAA", predecode_png_0 };
+    const vp = chat_mod.VisionPreproc{ .mode = .qwen, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 65536, .max_pixels = 1048576 };
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(a);
+    try body.append(a, '[');
+    for (urls, 0..) |u, i| {
+        if (i > 0) try body.append(a, ',');
+        try body.print(a, "{{\"image_url\":\"{s}\"}}", .{u});
+    }
+    try body.append(a, ']');
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body.items, .{});
+    defer parsed.deinit();
+
+    var serial: [urls.len]?chat_mod.ImageData = undefined;
+    for (urls, &serial) |u, *out| out.* = parseImageUrlContent(a, u, vp);
+    defer for (serial) |m| if (m) |img| a.free(img.pixels);
+
+    var pre = PredecodedImages{ .allocator = a };
+    defer pre.deinit();
+    pre.run(parsed.value, vp);
+    try std.testing.expect(predecoded != null);
+    try std.testing.expectEqual(@as(u32, 3), pre.entries.count());
+    var parallel: [urls.len]?chat_mod.ImageData = undefined;
+    for (urls, &parallel) |u, *out| out.* = parseImageUrlContent(a, u, vp);
+    defer for (parallel) |m| if (m) |img| a.free(img.pixels);
+    try std.testing.expectEqual(@as(u32, 0), pre.entries.count());
+
+    var all_serial: [urls.len]chat_mod.ImageData = undefined;
+    var all_parallel: [urls.len]chat_mod.ImageData = undefined;
+    var n_ok: usize = 0;
+    for (serial, parallel) |s, p| {
+        try std.testing.expectEqual(s == null, p == null);
+        const si = s orelse continue;
+        const pi = p.?;
+        try std.testing.expectEqualSlices(u8, si.pixels, pi.pixels);
+        try std.testing.expectEqual(si.width, pi.width);
+        try std.testing.expectEqual(si.grid_h, pi.grid_h);
+        try std.testing.expectEqual(si.grid_w, pi.grid_w);
+        all_serial[n_ok] = si;
+        all_parallel[n_ok] = pi;
+        n_ok += 1;
+    }
+    var items: [5]PlacedMedia = undefined;
+    for (&items, 0..) |*it, i| it.* = .{ .kind = .image, .start = 3 + 10 * i, .rows = 1 };
+    const chain_serial = try mediaChain(a, &items, all_serial[0..n_ok], &.{});
+    defer a.free(chain_serial);
+    const chain_parallel = try mediaChain(a, &items, all_parallel[0..n_ok], &.{});
+    defer a.free(chain_parallel);
+    try std.testing.expectEqualSlices(prefix_cache_mod.MediaSpan, chain_serial, chain_parallel);
+}
+
+test "a media encode refused after the restore reaches the client with the text and status it was given" {
+    var buf: [320]u8 = undefined;
+    const fit = scheduler_mod.MediaRefusal{ .server_error = false, .buf = undefined, .len = 0 };
+    var refused = fit;
+    refused.len = (std.fmt.bufPrint(&refused.buf, "needs ~9 MB, ~1 MB is available", .{}) catch unreachable).len;
+    slot_media_refusal = refused;
+    const wire = mapGenerationError(error.MediaRefused, &buf);
+    try std.testing.expectEqual(@as(u32, 400), wire.code);
+    try std.testing.expectEqualStrings("needs ~9 MB, ~1 MB is available", wire.message);
+    try std.testing.expectEqual(@as(?scheduler_mod.MediaRefusal, null), slot_media_refusal);
+    refused.server_error = true;
+    slot_media_refusal = refused;
+    try std.testing.expectEqual(@as(u32, 500), mapGenerationError(error.MediaRefused, &buf).code);
 }
 
 test "Sushi quant memory rejects an oversized context with an exact maximum at KV8" {
@@ -6812,11 +6886,14 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
 
 // Numeric slot diagnostics cross to error mapping only on this connection's thread.
 threadlocal var slot_memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
+threadlocal var slot_media_refusal: ?scheduler_mod.MediaRefusal = null;
 
 /// A slot that errored reports why: the MLX error latch's `error.OutOfMemory` is a memory
 /// failure the operator can act on. One helper for the three slot-drain sites.
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     slot_memory_context_refusal = slot.memory_context_refusal;
+    slot_media_refusal = slot.media_refusal;
+    if (slot.errorNameIs("MediaRefused")) return error.MediaRefused;
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
     if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
@@ -6866,7 +6943,24 @@ pub const GenErrorWire = struct {
 pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
     const context_refusal = slot_memory_context_refusal;
     slot_memory_context_refusal = null;
+    const media_refusal = slot_media_refusal;
+    slot_media_refusal = null;
     return switch (err) {
+        // The media encode the prefix restore left to do could not run: the same text and status the
+        // connection thread gave before the encode moved behind the restore.
+        error.MediaRefused => if (media_refusal) |r| .{
+            .status_line = if (r.server_error) "500 Internal Server Error" else "400 Bad Request",
+            .code = if (r.server_error) 500 else 400,
+            .openai_type = if (r.server_error) "server_error" else "invalid_request_error",
+            .anthropic_type = if (r.server_error) "api_error" else "invalid_request_error",
+            .message = std.fmt.bufPrint(buf, "{s}", .{r.text()}) catch "media refused",
+        } else .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = "media refused",
+        },
         // The MLX working-set latch (#353): a memory 503.
         error.GenerationOutOfMemory, error.OutOfMemory => .{
             .status_line = "503 Service Unavailable",
@@ -9588,6 +9682,9 @@ fn handleChatCompletions(
 
     var wire = WireMessages.init(allocator);
     defer wire.deinit();
+    var predecode = PredecodedImages{ .allocator = allocator };
+    defer predecode.deinit();
+    predecode.run(messages_val, visionPreprocFromConfig(config));
     try readOpenAiMessages(&wire, messages_val.array.items, visionPreprocFromConfig(config));
     const messages = &wire.messages;
     if (wire.media.refusal()) |fault| {
@@ -9953,7 +10050,7 @@ fn handleChatCompletions(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -10028,8 +10125,8 @@ fn handleChatCompletions(
 
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
-    const sub_ve = req_media.embeddings;
-    req_media.embeddings = null;
+    const sub_ve = req_media.deferred;
+    req_media.deferred = null;
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
@@ -10637,10 +10734,9 @@ fn drainSettled(sch: *scheduler_mod.Scheduler, slot: *scheduler_mod.Slot, conn: 
 /// shape as `generate.generate` so the calling handler's response builder
 /// is unchanged.
 ///
-/// `vision_embeddings` (Phase A4/A8): when non-null, ownership transfers
-/// into the slot — the slot's deinit frees the array. Each handler holds a
-/// per-request `?mlx_array` local; it nulls its copy before passing here so
-/// its own `defer` doesn't double-free.
+/// `deferred_media`: when non-null, ownership transfers into the slot, which
+/// encodes it after the prefix restore. Each handler holds a per-request local;
+/// it nulls its copy before passing here so its own `defer` doesn't double-free.
 fn nonStreamingViaScheduler(
     allocator: std.mem.Allocator,
     sch: *scheduler_mod.Scheduler,
@@ -10658,7 +10754,7 @@ fn nonStreamingViaScheduler(
     enable_mtp: bool,
     allow_batch_mtp: bool,
     timeout_ns: u64,
-    vision_embeddings: ?mlx.mlx_array,
+    deferred_media: ?*scheduler_mod.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -10689,7 +10785,7 @@ fn nonStreamingViaScheduler(
         .enable_mtp = enable_mtp and mtpCapable(lm),
         .mtp = if (enable_mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .vision_embeddings = vision_embeddings,
+        .deferred_media = deferred_media,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
         .media_chain = media_chain,
         .cache_key = cache_key,
@@ -10881,7 +10977,7 @@ fn handleNonStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    vision_embeddings: ?mlx.mlx_array,
+    deferred_media: ?*scheduler_mod.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -10894,8 +10990,8 @@ fn handleNonStreamingGeneration(
     // Phase A8: this handler owns the vision array on entry; ownership
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
     // it). Nulled before transfer so the early-return defer is a no-op.
-    var ve_local = vision_embeddings;
-    defer if (ve_local) |arr| disposeVision(arr);
+    var ve_local = deferred_media;
+    defer if (ve_local) |d| d.deinit();
 
     var timer = Stopwatch.init(stream.io);
 
@@ -10910,7 +11006,7 @@ fn handleNonStreamingGeneration(
     const use_drafter = spec.use_drafter;
 
     // Transfer vision ownership into the slot via the scheduler.
-    const slot_ve: ?mlx.mlx_array = blk: {
+    const slot_ve: ?*scheduler_mod.DeferredMedia = blk: {
         const v = ve_local;
         ve_local = null;
         break :blk v;
@@ -11544,7 +11640,7 @@ fn handleStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    vision_embeddings: ?mlx.mlx_array,
+    deferred_media: ?*scheduler_mod.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -11559,8 +11655,8 @@ fn handleStreamingGeneration(
     // Vision array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer so
     // the early-return defer is a no-op.
-    var ve_local = vision_embeddings;
-    defer if (ve_local) |arr| disposeVision(arr);
+    var ve_local = deferred_media;
+    defer if (ve_local) |d| d.deinit();
 
     const config = lm.config.?;
     const chat_id = nextCompletionId(&completion_id_counter, nowMs(stream.io));
@@ -11616,7 +11712,7 @@ fn handleStreamingGeneration(
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
         .logprobs_n = logprobs_n,
-        .vision_embeddings = slot_ve_s,
+        .deferred_media = slot_ve_s,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
         .media_chain = media_chain,
         .cache_key = cache_key,
@@ -14822,6 +14918,18 @@ fn towerFitFault(config: *const model_mod.ModelConfig, images: []const chat_mod.
     return MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ needed / mb, worst, available / mb });
 }
 
+fn visionEncodeBillBytes(config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize) u64 {
+    return visionEncodeBill(config, images, videos, rows).bytes;
+}
+
+fn towerFitFaultText(out: []u8, config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize, available: u64) ?[]const u8 {
+    const fault = towerFitFault(config, images, videos, rows, available) orelse return null;
+    const text = fault.text();
+    const n = @min(text.len, out.len);
+    @memcpy(out[0..n], text[0..n]);
+    return out[0..n];
+}
+
 /// What `scheduler_mod.vision_encode_available` reads on the inference thread, right before an encode.
 fn visionEncodeAvailable(config: *const model_mod.ModelConfig) u64 {
     var active_mem: usize = 0;
@@ -14963,21 +15071,15 @@ fn mediaChain(
     return out;
 }
 
-/// An embeddings array a handler still owns when its request ends without a slot taking it. The
-/// inference thread is the sole mlx caller, so this hands it over instead of freeing.
-fn disposeVision(arr: mlx.mlx_array) void {
-    global_scheduler.?.orphanVision(arr);
-}
-
 /// What a request's media hands its slot. Whatever the slot has not taken is
 /// freed by `deinit`.
 const PreparedMedia = struct {
-    embeddings: ?mlx.mlx_array = null,
+    deferred: ?*scheduler_mod.DeferredMedia = null,
     chain: []const prefix_cache_mod.MediaSpan = &.{},
     mrope: MropeData = .{},
 
     fn deinit(self: *PreparedMedia, allocator: std.mem.Allocator) void {
-        if (self.embeddings) |arr| disposeVision(arr);
+        if (self.deferred) |d| d.deinit();
         allocator.free(self.chain);
         if (self.mrope.pos) |p| allocator.free(p);
         self.* = .{};
@@ -14987,8 +15089,9 @@ const PreparedMedia = struct {
 const MediaOutcome = union(enum) { ready: PreparedMedia, refused: MediaFault };
 
 /// Place every message's media at its template placeholder, refuse by name
-/// what cannot be served, then encode it on the inference thread and key it
-/// for the prefix cache. On `.ready`, `ids` holds the expanded prompt.
+/// what cannot be served and key it for the prefix cache. The slot encodes it
+/// once the prefix restore says which blocks it still needs. On `.ready`,
+/// `ids` holds the expanded prompt.
 fn prepareRequestMedia(
     allocator: std.mem.Allocator,
     lm: *LoadedModel,
@@ -15014,53 +15117,21 @@ fn prepareRequestMedia(
     if (placed.ids.len > ctx_limit) {
         return .{ .refused = MediaFault.init(false, "prompt ({d} tokens, {d} of them from {d} images and {d} videos) exceeds the {d}-token context", .{ placed.ids.len, placed.rows, flat.images.len, flat.videos.len, ctx_limit }) };
     }
-    if (towerFitFault(config, flat.images, flat.videos, placed.rows, visionEncodeAvailable(config))) |fault| return .{ .refused = fault };
-
     const chain = try mediaChain(allocator, placed.items, flat.images, flat.videos);
     var ready: PreparedMedia = .{ .chain = chain };
     errdefer ready.deinit(allocator);
 
-    const order = try allocator.alloc(chat_mod.MediaPart.Kind, placed.items.len);
-    defer allocator.free(order);
-    for (placed.items, order) |p, *k| k.* = p.kind;
-    const pix = try allocator.alloc(scheduler_mod.VisionImagePixels, flat.images.len);
-    defer allocator.free(pix);
-    for (flat.images, pix) |img, *p| p.* = .{
-        .pixels = img.pixels,
-        .width = @intCast(img.width),
-        .height = @intCast(img.height),
-        .grid_h = img.grid_h,
-        .grid_w = img.grid_w,
-    };
-    const vids = try allocator.alloc(scheduler_mod.VisionVideoPixels, flat.videos.len);
-    defer allocator.free(vids);
-    for (flat.videos, vids) |vid, *v| v.* = .{ .pixels = vid.pixels, .grid_t = vid.grid_t, .grid_h = vid.grid_h, .grid_w = vid.grid_w };
-
     log.info("Multimodal: processing {d} image(s), {d} video(s)\n", .{ flat.images.len, flat.videos.len });
-    var req = scheduler_mod.VisionEncodeRequest{
-        .model = lm,
-        .images = pix,
-        .videos = vids,
-        .order = order,
-        .bill_bytes = if (config.qv_heads == 0) 0 else visionEncodeBill(config, flat.images, flat.videos, placed.rows).bytes,
-        .allocator = allocator,
-    };
-    const arr = global_scheduler.?.encodeVision(&req) catch |err| {
-        const name = req.error_name orelse @errorName(err);
-        const fault = if (std.mem.eql(u8, name, scheduler_mod.vision_headroom_error))
-            towerFitFault(config, flat.images, flat.videos, placed.rows, req.available_bytes) orelse MediaFault.init(true, "vision encoding failed: {s}", .{name})
-        else
-            MediaFault.init(true, "vision encoding failed: {s}", .{name});
-        if (req.error_name) |e| allocator.free(e);
-        ready.deinit(allocator);
-        return .{ .refused = fault };
-    };
-    ready.embeddings = arr;
-    if (req.n_vision_tokens + req.n_video_tokens != placed.rows) {
-        const fault = MediaFault.init(true, "vision encoder produced {d} rows for {d} placeholder tokens", .{ req.n_vision_tokens + req.n_video_tokens, placed.rows });
-        ready.deinit(allocator);
-        return .{ .refused = fault };
-    }
+    const images = try allocator.dupe(chat_mod.ImageData, flat.images);
+    errdefer allocator.free(images);
+    const videos = try allocator.dupe(chat_mod.VideoData, flat.videos);
+    errdefer allocator.free(videos);
+    const blocks = try allocator.alloc(scheduler_mod.MediaBlock, placed.items.len);
+    errdefer allocator.free(blocks);
+    for (placed.items, blocks) |p, *blk| blk.* = .{ .kind = p.kind, .rows = p.rows };
+    const deferred = try allocator.create(scheduler_mod.DeferredMedia);
+    deferred.* = .{ .allocator = allocator, .images = images, .videos = videos, .blocks = blocks, .decode_ns = takeMediaDecodeNs() };
+    ready.deferred = deferred;
     ready.mrope = computeQwenMrope(allocator, placed.ids, flat.images, flat.videos, config) catch MropeData{};
     log.info("  Multimodal: {d} soft tokens placed in a {d}-token prompt\n", .{ placed.rows, placed.ids.len });
 
@@ -15068,6 +15139,20 @@ fn prepareRequestMedia(
     ids.* = placed.ids;
     placed.ids = placed.ids[0..0];
     return .{ .ready = ready };
+}
+
+/// Image decode time this connection thread has spent since the last request took it.
+threadlocal var media_decode_ns: u64 = 0;
+
+fn takeMediaDecodeNs() u64 {
+    defer media_decode_ns = 0;
+    return media_decode_ns;
+}
+
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Qwen3-VL interleaved M-RoPE position-id table for a request. `pos` (owned) is
@@ -15254,6 +15339,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
 fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
     const b64_data = url[sep + 8 ..];
+    if (isDecodedImageMime(url[0..sep])) if (predecoded) |pre| if (pre.take(allocator, b64_data)) |img| return img;
     const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch return null;
     const raw_buf = allocator.alloc(u8, decoded_size) catch return null;
     std.base64.standard.Decoder.decode(raw_buf, b64_data) catch {
@@ -15289,7 +15375,9 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
     if (std.mem.startsWith(u8, mime, "data:image/")) {
         // JPEG/PNG/WebP — decode + resize + convert to float32 CHW (Gemma) or
         // smart-resized merge-order pixel_values (Qwen3-VL).
+        const started = monotonicNs();
         const img = decodeImageToPixels(allocator, raw_buf, vp);
+        media_decode_ns += monotonicNs() - started;
         allocator.free(raw_buf);
         return img;
     }
@@ -15304,6 +15392,136 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
 /// leaking quietly.
 inline fn mediaBuffer(item: anytype) []const u8 {
     return if (@hasField(@TypeOf(item), "pixels")) item.pixels else item.samples;
+}
+
+fn isDecodedImageMime(mime: []const u8) bool {
+    return std.mem.startsWith(u8, mime, "data:image/") and !std.mem.eql(u8, mime, "data:image/x-mlx-pixels");
+}
+
+/// Most workers one request's image decode fans out to.
+const predecode_workers = 8;
+
+/// The images of one request body, decoded concurrently before the wire walk reads them. The walk
+/// then takes each result by the hash of its base64 payload, so order, bytes and the media keys are
+/// those of a serial decode; an image missing here (a failed decode, a duplicate past its uses)
+/// decodes serially where it is read.
+const PredecodedImages = struct {
+    const Entry = struct { img: chat_mod.ImageData, uses: usize };
+    allocator: std.mem.Allocator,
+    entries: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+
+    const Job = struct { payload: []const u8, key: u64, uses: usize = 1, result: ?chat_mod.ImageData = null };
+
+    const Pool = struct {
+        allocator: std.mem.Allocator,
+        jobs: []Job,
+        vp: chat_mod.VisionPreproc,
+        next: std.atomic.Value(usize) = .init(0),
+
+        fn work(self: *Pool) void {
+            while (true) {
+                const i = self.next.fetchAdd(1, .monotonic);
+                if (i >= self.jobs.len) return;
+                self.jobs[i].result = decodeBase64Image(self.allocator, self.jobs[i].payload, self.vp);
+            }
+        }
+    };
+
+    fn key(payload: []const u8) u64 {
+        return std.hash.Wyhash.hash(payload.len, payload);
+    }
+
+    /// Decode every image the body names into `self` and make them the thread's source for
+    /// `parseImageUrlContent` until `deinit`.
+    fn run(self: *PredecodedImages, root: std.json.Value, vp: chat_mod.VisionPreproc) void {
+        var jobs = std.ArrayList(Job).empty;
+        defer jobs.deinit(self.allocator);
+        var seen: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        defer seen.deinit(self.allocator);
+        collectImagePayloads(self.allocator, root, &jobs, &seen);
+        if (jobs.items.len < 2) return;
+        const started = monotonicNs();
+        var pool = Pool{ .allocator = self.allocator, .jobs = jobs.items, .vp = vp };
+        var threads: [predecode_workers - 1]std.Thread = undefined;
+        var n_threads: usize = 0;
+        for (0..@min(predecode_workers, jobs.items.len) - 1) |_| {
+            threads[n_threads] = std.Thread.spawn(.{}, Pool.work, .{&pool}) catch break;
+            n_threads += 1;
+        }
+        pool.work();
+        for (threads[0..n_threads]) |t| t.join();
+        media_decode_ns += monotonicNs() - started;
+        for (jobs.items) |j| {
+            const img = j.result orelse continue;
+            self.entries.put(self.allocator, j.key, .{ .img = img, .uses = j.uses }) catch self.allocator.free(img.pixels);
+        }
+        predecoded = self;
+    }
+
+    /// The decode of `payload` for one reader: the last reader takes the buffer, earlier ones a copy.
+    fn take(self: *PredecodedImages, allocator: std.mem.Allocator, payload: []const u8) ?chat_mod.ImageData {
+        const e = self.entries.getPtr(key(payload)) orelse return null;
+        if (e.uses > 1) {
+            e.uses -= 1;
+            var img = e.img;
+            img.pixels = allocator.dupe(u8, e.img.pixels) catch return null;
+            return img;
+        }
+        const img = e.img;
+        _ = self.entries.remove(key(payload));
+        return img;
+    }
+
+    fn deinit(self: *PredecodedImages) void {
+        if (predecoded == self) predecoded = null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| self.allocator.free(e.img.pixels);
+        self.entries.deinit(self.allocator);
+    }
+};
+
+threadlocal var predecoded: ?*PredecodedImages = null;
+
+fn decodeBase64Image(allocator: std.mem.Allocator, b64: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+    const size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
+    const raw = allocator.alloc(u8, size) catch return null;
+    defer allocator.free(raw);
+    std.base64.standard.Decoder.decode(raw, b64) catch return null;
+    return decodeImageToPixels(allocator, raw, vp);
+}
+
+/// Every base64 image payload in a request body, once each with its use count, in body order: an
+/// OpenAI/Responses `data:image/...;base64,` string or an Anthropic `base64` source.
+fn collectImagePayloads(allocator: std.mem.Allocator, v: std.json.Value, jobs: *std.ArrayList(PredecodedImages.Job), seen: *std.AutoHashMapUnmanaged(u64, usize)) void {
+    switch (v) {
+        .string => |str| if (std.mem.startsWith(u8, str, "data:image/")) {
+            if (std.mem.indexOf(u8, str, ";base64,")) |sep| if (isDecodedImageMime(str[0..sep])) addPayload(allocator, str[sep + 8 ..], jobs, seen);
+        },
+        .array => |a| for (a.items) |item| collectImagePayloads(allocator, item, jobs, seen),
+        .object => |o| {
+            if (o.get("type")) |t| if (t == .string and std.mem.eql(u8, t.string, "base64")) {
+                const mt = if (o.get("media_type")) |m| (if (m == .string) m.string else "image/png") else "image/png";
+                if (o.get("data")) |d| if (d == .string and std.mem.startsWith(u8, mt, "image/") and !std.mem.eql(u8, mt, "image/x-mlx-pixels")) {
+                    addPayload(allocator, d.string, jobs, seen);
+                    return;
+                };
+            };
+            var it = o.iterator();
+            while (it.next()) |kv| collectImagePayloads(allocator, kv.value_ptr.*, jobs, seen);
+        },
+        else => {},
+    }
+}
+
+fn addPayload(allocator: std.mem.Allocator, payload: []const u8, jobs: *std.ArrayList(PredecodedImages.Job), seen: *std.AutoHashMapUnmanaged(u64, usize)) void {
+    if (jobs.items.len >= chat_mod.MAX_REQUEST_IMAGES) return;
+    const k = PredecodedImages.key(payload);
+    if (seen.get(k)) |i| {
+        jobs.items[i].uses += 1;
+        return;
+    }
+    seen.put(allocator, k, jobs.items.len) catch return;
+    jobs.append(allocator, .{ .payload = payload, .key = k }) catch {};
 }
 
 /// One modality's decoded entries, grouped per message. Slots are INDICES, not
@@ -16421,6 +16639,9 @@ fn handleAnthropicMessages(
     defer wire.deinit();
     const messages = &wire.messages;
 
+    var predecode = PredecodedImages{ .allocator = allocator };
+    defer predecode.deinit();
+    predecode.run(messages_val, visionPreprocFromConfig(config));
     try readAnthropicConversation(&wire, root.get("system"), messages_val.array.items, visionPreprocFromConfig(config));
 
     if (wire.media.refusal()) |fault| {
@@ -16698,7 +16919,7 @@ fn handleAnthropicMessages(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -16755,8 +16976,8 @@ fn handleAnthropicMessages(
     if (call_force) |*cf| sampling.call_force = cf;
 
     // Hand vision ownership to the sub-handler (slot takes it on submit).
-    const sub_ve = req_media.embeddings;
-    req_media.embeddings = null;
+    const sub_ve = req_media.deferred;
+    req_media.deferred = null;
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
@@ -16796,7 +17017,7 @@ fn handleAnthropicNonStreaming(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    vision_embeddings: ?mlx.mlx_array,
+    deferred_media: ?*scheduler_mod.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -16809,8 +17030,8 @@ fn handleAnthropicNonStreaming(
 ) !void {
     // Vision-array ownership: nulled below before scheduler.submit so the
     // early-return defer doesn't double-free.
-    var ve_local = vision_embeddings;
-    defer if (ve_local) |arr| disposeVision(arr);
+    var ve_local = deferred_media;
+    defer if (ve_local) |d| d.deinit();
 
     var timer = Stopwatch.init(stream.io);
 
@@ -16823,7 +17044,7 @@ fn handleAnthropicNonStreaming(
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
     // the slot.
-    const slot_ve: ?mlx.mlx_array = blk: {
+    const slot_ve: ?*scheduler_mod.DeferredMedia = blk: {
         const v = ve_local;
         ve_local = null;
         break :blk v;
@@ -17053,7 +17274,7 @@ fn handleAnthropicStreaming(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    vision_embeddings: ?mlx.mlx_array,
+    deferred_media: ?*scheduler_mod.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -17068,8 +17289,8 @@ fn handleAnthropicStreaming(
     _ = tokenize_ns; // reserved; see doc comment
     // Vision-array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer.
-    var ve_local = vision_embeddings;
-    defer if (ve_local) |arr| disposeVision(arr);
+    var ve_local = deferred_media;
+    defer if (ve_local) |d| d.deinit();
 
     // Pick speculative-decoding mode (regular / drafter / MTP). The token-
     // stream adapter below feeds the per-token Anthropic state machine the
@@ -17106,7 +17327,7 @@ fn handleAnthropicStreaming(
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
         .logprobs_n = 0,
-        .vision_embeddings = slot_ve_anth,
+        .deferred_media = slot_ve_anth,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
         .media_chain = media_chain,
         .cache_key = cache_key,
@@ -18299,6 +18520,9 @@ fn handleResponsesInner(
     }
 
     // ── parse input → messages ──
+    var predecode = PredecodedImages{ .allocator = allocator };
+    defer predecode.deinit();
+    predecode.run(input_val, visionPreprocFromConfig(config));
     var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, decodeImageUrlInto, visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
@@ -18431,7 +18655,7 @@ fn handleResponsesInner(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -18597,8 +18821,8 @@ fn handleResponsesInner(
         defer if (slot_handle) |s| global_scheduler.?.complete(s);
 
         // Transfer vision ownership into the slot.
-        const slot_ve_resp = req_media.embeddings;
-        req_media.embeddings = null;
+        const slot_ve_resp = req_media.deferred;
+        req_media.deferred = null;
         const slot_mrope_resp = req_media.mrope;
         req_media.mrope = .{};
         const sch = global_scheduler.?;
@@ -18620,7 +18844,7 @@ fn handleResponsesInner(
             .enable_mtp = stream_mode == .mtp,
             .mtp = if (stream_mode == .mtp) lm.mtp else null,
             .mtp_depth = lm.mtp_depth,
-            .vision_embeddings = slot_ve_resp,
+            .deferred_media = slot_ve_resp,
             .vision_key = prefix_cache_mod.chainKey(req_media.chain),
             .media_chain = req_media.chain,
             .cache_key = cache_key,
@@ -18919,8 +19143,8 @@ fn handleResponsesInner(
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         // Transfer vision ownership into the slot.
-        const slot_ve_ns = req_media.embeddings;
-        req_media.embeddings = null;
+        const slot_ve_ns = req_media.deferred;
+        req_media.deferred = null;
         const slot_mrope_ns = req_media.mrope;
         req_media.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
@@ -24046,9 +24270,9 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
     // that chunks (over-refusal), and one passing false under the kill
     // switch under-bills straight into an uncatchable Metal OOM.
     const src = @embedFile("server.zig");
-    const raw = "kv_quant_override, req_media.embeddings" ++ " != null,";
+    const raw = "kv_quant_override, req_media.deferred" ++ " != null,";
     try std.testing.expect(std.mem.indexOf(u8, src, raw) == null);
-    const routed = "kv_quant_override, generate_mod.visionPrefill" ++ "Unchunked(req_media.embeddings != null),";
+    const routed = "kv_quant_override, generate_mod.visionPrefill" ++ "Unchunked(req_media.deferred != null),";
     var n: usize = 0;
     var at: usize = 0;
     while (std.mem.indexOfPos(u8, src, at, routed)) |i| {
@@ -27493,57 +27717,6 @@ test "GLM admission credits the hot cache, so an eviction lets a long prefill in
     const bill = creditedAdmissionBill(&cfg, 20 * gb, 19 * gb, 3 * gb / 2, 3 * gb / 2, 2048);
     try std.testing.expectEqual(AdmissionVerdict.evict, admissionVerdict(bill));
     try std.testing.expectEqual(AdmissionVerdict.refuse, admissionVerdict(creditedAdmissionBill(&cfg, 21 * gb, 19 * gb, 3 * gb / 2, 3 * gb / 2, 2048)));
-}
-
-test "a request refused after its media was encoded hands the embeddings to the inference thread" {
-    const Probe = struct {
-        var inference_id: std.Thread.Id = undefined;
-        var frees: usize = 0;
-        var off_thread_frees: usize = 0;
-        fn free(_: mlx.mlx_array) void {
-            frees += 1;
-            if (std.Thread.getCurrentId() != inference_id) off_thread_frees += 1;
-        }
-        /// A pre-submit refusal: `req_media.deinit` or a sub-handler's early-return defer.
-        fn refuse(via_media: bool) void {
-            const embeddings = mlx.mlx_array_new();
-            if (via_media) {
-                var media = PreparedMedia{ .embeddings = embeddings };
-                media.deinit(std.testing.allocator);
-            } else {
-                disposeVision(embeddings);
-            }
-        }
-    };
-    var sch: scheduler_mod.Scheduler = undefined;
-    sch.io = std.testing.io;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.orphan_vision_n = 0;
-    global_scheduler = &sch;
-    defer global_scheduler = null;
-    Probe.inference_id = std.Thread.getCurrentId();
-    scheduler_mod.slot_vision_free_test_hook = Probe.free;
-    defer scheduler_mod.slot_vision_free_test_hook = null;
-
-    for ([_]bool{ true, false }) |via_media| {
-        Probe.frees = 0;
-        Probe.off_thread_frees = 0;
-        const conn = try std.Thread.spawn(.{}, Probe.refuse, .{via_media});
-        conn.join();
-        var parked: [scheduler_mod.orphan_vision_cap]mlx.mlx_array = undefined;
-        const n = scheduler_mod.takeOrphanedVisionLocked(&sch, &parked);
-        try std.testing.expectEqual(@as(usize, 1), n);
-        try std.testing.expectEqual(@as(usize, 0), Probe.frees);
-        for (parked[0..n]) |ve| {
-            scheduler_mod.freeVisionArray(ve);
-            _ = mlx.mlx_array_free(ve);
-        }
-        try std.testing.expectEqual(@as(usize, 1), Probe.frees);
-        try std.testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
-    }
 }
 
 /// Plays the inference thread's decode tick: publishes `n` tokens, then accounts them one by one

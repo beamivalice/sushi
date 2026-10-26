@@ -388,14 +388,15 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   clear, both on `reservesKvCapacity`): the request-end clear runs before the slot is freed, so its KV parked there
   (MiMo: 1.6 GiB after a 128k request, 3.2 after 256k) and the next admission read it as spent.
 - MiMo MTP adds a constant per-request and load-time reserve (`mimo_mtp.State.billedBytes`) for all three sliding head KVs, retained hiddens, and catch-up/concatenation buffers; it is zero with MTP off and never scales with context.
-- **A vision encode is billed before it runs** (`towerFitFault`, `server.visionEncodeBill`): the largest block's tower
+- **A vision encode is billed before it runs** (`towerFitFault`, `server.visionEncodeBill`), for the blocks the prefix
+  restore leaves to encode, never the whole history: the largest block's tower
   scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what
   the GPU has left it is a named 400. The tower evaluates per block, so the peak is one block's f32 score sheet
   (heads x N^2) and rows; table in [qwen4-arch](qwen4-arch.md#vision-tower).
-- **A queued vision encode is billed again on the inference thread** (`runVisionEncode`, `vision_encode_available`),
-  right before the tower runs: a prefill's cache growth or an earlier encode's resident output may have taken the
-  headroom since the connection thread's check, and the refusal is that same named 400.
+- **A vision encode is checked on the inference thread** (`runVisionEncode`, `vision_encode_available`), right before
+  the tower runs and after the restore: a prefill's cache growth or an earlier encode's resident output may have taken
+  the headroom, and the refusal is a named 400 (`MediaRefused`).
 - **A streamed `--vision` load bills its tower in the ssd budget and proves its largest image beside it**: the load
   admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
   ([engine-expert-streaming](engine-expert-streaming.md#vision)).

@@ -225,16 +225,23 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `tool_result` blocks, Responses `input_image` (tool outputs too). The wire walk (`readOpenAiMessages`,
   `readAnthropicMessages`, `responses.parseInput`) records each part's offset in the joined text
   (`Message.media_parts`); the serializer hands the template a typed part list, so the TEMPLATE renders each
-  placeholder; `prepareRequestMedia` expands every pad to its block's rows and encodes all blocks in prompt order.
+  placeholder; `prepareRequestMedia` expands every pad to its block's rows and keys each block for the prefix cache.
   The engine never inserts pads itself: a template that renders fewer placeholders than blocks is a named 400.
   DeepSeek-V4.1's template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image's atom at
   its offset instead, and `placeMedia` expands it to the image's whole span (`dsv41_vision.spanRows`: aligner rows,
   newlines, start and end), not a merged-grid count.
+- **The tower runs after the prefix restore, on the inference thread** (`encodeMediaAfterRestore`, `DeferredMedia`):
+  a leading block whose every placeholder row sits inside the restored prefix is not encoded (its KV is restored),
+  the encode and its bill (`visionEncodeBill`) cover the blocks after it, and a block the restore cuts through is
+  encoded whole. The slot's splice offset is the placeholder rows in the prefix less the rows skipped. Decode stays
+  before the restore (the media key hashes the pixels), run by up to 8 threads over the body's base64 payloads
+  (`PredecodedImages`; the wire walk takes each by payload hash, so order and bytes are the serial decode's); the `Multimodal: encoded N of M` line gives decode and
+  encode ms, and the encode counts in the request's prefill time.
 - **Media refusals are named**: an undecodable image is a 400 naming `messages[i]`/`input[i]` and the reason
   (`imageRejectReason`), an `input_audio` part a 400 unless the model encodes audio (`RequestMedia.accepts_audio`),
   more than `chat.MAX_REQUEST_IMAGES` (1024) a 400 with both counts, a prompt the media pushes past the context a 400
   naming the media's tokens, an encode that does not fit a 400 (`towerFitFault`), a failed encode a 500
-  (`MediaFault`); never a text-only answer.
+  (`MediaFault`); both of the last two are raised after the restore as the slot's `MediaRefused`; never a text-only answer.
 - Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen_vision.zig` / `src/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
   image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
   `src/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));

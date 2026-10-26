@@ -224,6 +224,9 @@ pub const SubmitParams = struct {
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
+    /// The request's media, encoded after the prefix restore. Ownership transfers to the slot on a
+    /// successful submit; a failed one frees it.
+    deferred_media: ?*DeferredMedia = null,
     /// Prefix-cache key for the media under the placeholder tokens (0 = none).
     vision_key: u64 = 0,
     /// Per media block of `full_prompt`, its start and chained key
@@ -358,6 +361,130 @@ pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 =
 /// The `VisionEncodeRequest.error_name` of an encode whose bill no longer fits when its turn comes.
 pub const vision_headroom_error = "VisionHeadroomExceeded";
 
+/// `server.visionEncodeBill`: the GPU bytes an encode of these blocks peaks at.
+pub var vision_encode_bill: ?*const fn (*const model_mod.ModelConfig, []const chat_mod.ImageData, []const chat_mod.VideoData, usize) u64 = null;
+
+/// `server.towerFitFault`: the refusal text when `available` bytes do not hold the encode, written into `out`.
+pub var vision_fit_fault: ?*const fn ([]u8, *const model_mod.ModelConfig, []const chat_mod.ImageData, []const chat_mod.VideoData, usize, u64) ?[]const u8 = null;
+
+/// One media block of the prompt, in prompt order: the soft-token rows it takes from the encoded array.
+pub const MediaBlock = struct { kind: chat_mod.MediaPart.Kind, rows: usize };
+
+/// A request's media, encoded on the inference thread once the prefix restore has fixed how much of it
+/// the restored KV already holds. `images`/`videos` borrow pixel buffers the handler keeps alive until
+/// `Scheduler.complete`; `deinit` frees only the lists.
+pub const DeferredMedia = struct {
+    allocator: std.mem.Allocator,
+    images: []const chat_mod.ImageData,
+    videos: []const chat_mod.VideoData,
+    blocks: []const MediaBlock,
+    /// Connection-thread time spent decoding this request's images, for the `Multimodal:` line.
+    decode_ns: u64 = 0,
+
+    pub fn deinit(self: *DeferredMedia) void {
+        const allocator = self.allocator;
+        allocator.free(self.images);
+        allocator.free(self.videos);
+        allocator.free(self.blocks);
+        allocator.destroy(self);
+    }
+};
+
+/// A media encode the engine could not run: what the client is told, and with which status.
+pub const MediaRefusal = struct {
+    server_error: bool,
+    buf: [320]u8 = undefined,
+    len: usize = 0,
+
+    fn init(server_error: bool, comptime fmt: []const u8, args: anytype) MediaRefusal {
+        var r: MediaRefusal = .{ .server_error = server_error };
+        r.len = (std.fmt.bufPrint(&r.buf, fmt, args) catch @as([]u8, &r.buf)).len;
+        return r;
+    }
+
+    pub fn text(self: *const MediaRefusal) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// What a restored prefix lets the encode leave out.
+pub const MediaSkip = struct { blocks: usize = 0, images: usize = 0, videos: usize = 0, rows: usize = 0 };
+
+/// The leading blocks whose every soft-token row lies inside the restored prefix (`consumed_rows`
+/// placeholders): their KV is restored, so their embeddings are never read. A block the restore point
+/// cuts through is not skipped.
+pub fn skippedMedia(blocks: []const MediaBlock, consumed_rows: usize) MediaSkip {
+    var skip: MediaSkip = .{};
+    for (blocks) |b| {
+        if (skip.rows + b.rows > consumed_rows) break;
+        skip.rows += b.rows;
+        skip.blocks += 1;
+        switch (b.kind) {
+            .image => skip.images += 1,
+            .video => skip.videos += 1,
+        }
+    }
+    return skip;
+}
+
+const EncodedMedia = struct { embeddings: ?mlx.mlx_array, skipped_rows: usize };
+
+/// Encodes what `consumed_rows` of restored prefix leaves uncovered. `embeddings` is null when the
+/// restore covers every block; its row 0 is placeholder row `skipped_rows` of the prompt.
+fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const DeferredMedia, consumed_rows: usize, refusal: *?MediaRefusal) !EncodedMedia {
+    const skip = skippedMedia(d.blocks, consumed_rows);
+    const blocks = d.blocks[skip.blocks..];
+    const images = d.images[skip.images..];
+    const videos = d.videos[skip.videos..];
+    var rows: usize = 0;
+    for (blocks) |b| rows += b.rows;
+    const sw = io_util.Stopwatch.init(sch.io);
+    defer log.info("  Multimodal: encoded {d} of {d} image(s) and {d} of {d} video(s), {d} of {d} soft tokens (the restored prefix holds {d}): decode {d} ms, encode {d} ms\n", .{
+        images.len, d.images.len,
+        videos.len, d.videos.len,
+        rows,       rows + skip.rows,
+        skip.rows,  d.decode_ns / std.time.ns_per_ms,
+        sw.read() / std.time.ns_per_ms,
+    });
+    if (blocks.len == 0) return .{ .embeddings = null, .skipped_rows = skip.rows };
+
+    const allocator = sch.allocator;
+    const pix = try allocator.alloc(VisionImagePixels, images.len);
+    defer allocator.free(pix);
+    for (images, pix) |img, *p| p.* = .{ .pixels = img.pixels, .width = @intCast(img.width), .height = @intCast(img.height), .grid_h = img.grid_h, .grid_w = img.grid_w };
+    const vids = try allocator.alloc(VisionVideoPixels, videos.len);
+    defer allocator.free(vids);
+    for (videos, vids) |vid, *v| v.* = .{ .pixels = vid.pixels, .grid_t = vid.grid_t, .grid_h = vid.grid_h, .grid_w = vid.grid_w };
+    const order = try allocator.alloc(chat_mod.MediaPart.Kind, blocks.len);
+    defer allocator.free(order);
+    for (blocks, order) |b, *k| k.* = b.kind;
+
+    const cfg = model.config.?;
+    var req = VisionEncodeRequest{
+        .model = model,
+        .images = pix,
+        .videos = vids,
+        .order = order,
+        .bill_bytes = if (cfg.qv_heads == 0) 0 else if (vision_encode_bill) |bill| bill(cfg, images, videos, rows) else 0,
+        .allocator = allocator,
+    };
+    runVisionEncode(sch, &req);
+    if (req.error_name) |name| {
+        defer allocator.free(name);
+        var text: [320]u8 = undefined;
+        const fit = if (std.mem.eql(u8, name, vision_headroom_error)) (if (vision_fit_fault) |f| f(&text, cfg, images, videos, rows, req.available_bytes) else null) else null;
+        refusal.* = if (fit) |msg| MediaRefusal.init(false, "{s}", .{msg}) else MediaRefusal.init(true, "vision encoding failed: {s}", .{name});
+        return error.MediaRefused;
+    }
+    const arr = req.result orelse return error.MediaRefused;
+    if (req.n_vision_tokens + req.n_video_tokens != rows) {
+        refusal.* = MediaRefusal.init(true, "vision encoder produced {d} rows for {d} placeholder tokens", .{ req.n_vision_tokens + req.n_video_tokens, rows });
+        _ = mlx.mlx_array_free(arr);
+        return error.MediaRefused;
+    }
+    return .{ .embeddings = arr, .skipped_rows = skip.rows };
+}
+
 /// Tests only: stands in for the tower on one image block.
 var vision_block_test_hook: ?*const fn (VisionImagePixels) anyerror!mlx.mlx_array = null;
 
@@ -442,6 +569,10 @@ pub const Slot = struct {
     /// ownership, `deinit` frees them otherwise.
     ring_cps: prefix_cache_mod.SlotRingCps = .{},
     vision_embeddings: ?mlx.mlx_array,
+    /// Kept to the slot's end: a retried cold prefill encodes it again from the start.
+    deferred_media: ?*DeferredMedia = null,
+    /// Set with `error.MediaRefused`, which the connection thread answers as a 4xx/5xx.
+    media_refusal: ?MediaRefusal = null,
     vision_key: u64,
     cache_key: u64 = 0,
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
@@ -647,7 +778,7 @@ pub const Slot = struct {
         const media_chain_owned = try allocator.dupe(prefix_cache_mod.MediaSpan, params.media_chain);
         errdefer allocator.free(media_chain_owned);
         const media_start = firstMediaPlaceholder(
-            params.vision_embeddings != null,
+            params.vision_embeddings != null or params.deferred_media != null,
             full_prompt_owned,
             config.image_token_id,
             config.video_token_id,
@@ -664,6 +795,7 @@ pub const Slot = struct {
             .ssm_entries = ssm_entries,
             .glm5_request = glm5_request,
             .vision_embeddings = params.vision_embeddings,
+            .deferred_media = params.deferred_media,
             .vision_key = params.vision_key,
             .cache_key = params.cache_key,
             .media_start = media_start,
@@ -761,6 +893,7 @@ pub const Slot = struct {
             self.allocator.free(entries);
         }
         if (self.vision_embeddings) |ve| freeVisionArray(ve);
+        if (self.deferred_media) |d| d.deinit();
         if (self.mrope_pos) |mp| self.allocator.free(mp);
         self.allocator.free(self.prompt_ids);
         self.allocator.free(self.full_prompt);
@@ -1642,6 +1775,7 @@ pub const Scheduler = struct {
         // share one scheduler.
         const slot = self.initSlot(params) catch |err| {
             if (params.vision_embeddings) |ve| self.orphanVision(ve);
+            if (params.deferred_media) |d| d.deinit();
             return err;
         };
         // The slot may own GPU arrays that only the inference thread frees.
@@ -2491,7 +2625,7 @@ fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         const s = sch.pending.items[idx];
         const cfg = s.model.config orelse continue;
         if (s.model.transformer == null) continue;
-        bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, generate_mod.visionPrefillUnchunked(s.vision_embeddings != null), s.enable_mtp);
+        bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, generate_mod.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp);
     }
     const admitted = admitsWithinMemory(bills[0..n], live, outstanding);
     for (admit_idx[0..admitted], bills[0..admitted]) |idx, bill| sch.pending.items[idx].growth_commit = if (bill) |b| b.commit else 0;
@@ -6627,7 +6761,7 @@ fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics
 fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     const m = metrics orelse return;
     if (slot.metrics_recorded) return;
-    if (slot.error_code) |name| if (std.mem.eql(u8, name, "PrefillDoesNotFit")) {
+    if (slot.error_code) |name| if (std.mem.eql(u8, name, "PrefillDoesNotFit") or std.mem.eql(u8, name, "MediaRefused")) {
         slot.metrics_recorded = true;
         m.recordRejected();
         return;
@@ -7342,6 +7476,27 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         }
     }
 
+    // Placeholder rows the restored prefix already holds: their embeddings are never read, so the
+    // media is encoded only now that the restore is known.
+    const vision_consumed: usize = if (hot_matched > 0)
+        generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.video_token_id)
+    else
+        0;
+    var vision_skipped: usize = 0;
+    if (slot.deferred_media) |d| {
+        if (slot.vision_embeddings) |old| {
+            freeVisionArray(old);
+            slot.vision_embeddings = null;
+        }
+        const encoded = encodeMediaAfterRestore(sch, slot.model, d, vision_consumed, &slot.media_refusal) catch |err| {
+            if (err == error.MediaRefused) log.warn("[scheduler] media refused: {s}\n", .{if (slot.media_refusal) |*r| r.text() else "no text"});
+            return err;
+        };
+        slot.vision_embeddings = encoded.embeddings;
+        vision_skipped = encoded.skipped_rows;
+        slot.ctx.vision_embeddings = slot.vision_embeddings;
+    }
+
     // Phase 1 (perf-plan): forward the SSM-checkpoint stride from the
     // LoadedModel so the prefill loop snapshots SSM state at stride-aligned
     // positions for hybrid archs. Plain-attn models have empty ssm_entries
@@ -7553,12 +7708,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
-            // A restored prefix already holds its image rows: the splice
-            // resumes at the placeholder count inside the matched prefix.
-            .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)
-                generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.video_token_id)
-            else
-                0,
+            // The encoded rows start at the first block the restore does not cover: the splice
+            // resumes at the placeholder rows the restored prefix holds of them.
+            .vision_rows_before = if (slot.vision_embeddings != null) vision_consumed - vision_skipped else 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = req_prefill_chunk,
             .decode_share_width_cap = prefillShareCapFor(&xfm_ptr.config, liveDecodingCount(sch), prefillDecodeShare()),
@@ -12925,6 +13077,154 @@ test "a queued vision encode is refused when its bill no longer fits, and an ear
         _ = mlx.mlx_array_free(r);
     };
     try testing.expect(unbilled.error_name == null);
+}
+
+test "skippedMedia leaves out only the leading blocks the restored prefix holds whole" {
+    const blocks = [_]MediaBlock{ .{ .kind = .image, .rows = 4 }, .{ .kind = .video, .rows = 2 }, .{ .kind = .image, .rows = 3 } };
+    const none = skippedMedia(&blocks, 0);
+    try testing.expectEqual(@as(usize, 0), none.blocks);
+    try testing.expectEqual(@as(usize, 0), none.rows);
+    // A 5-row prefix ends inside the video: it is encoded.
+    const straddle = skippedMedia(&blocks, 5);
+    try testing.expectEqual(MediaSkip{ .blocks = 1, .images = 1, .videos = 0, .rows = 4 }, straddle);
+    try testing.expectEqual(MediaSkip{ .blocks = 2, .images = 1, .videos = 1, .rows = 6 }, skippedMedia(&blocks, 6));
+    try testing.expectEqual(MediaSkip{ .blocks = 2, .images = 1, .videos = 1, .rows = 6 }, skippedMedia(&blocks, 8));
+    try testing.expectEqual(MediaSkip{ .blocks = 3, .images = 2, .videos = 1, .rows = 9 }, skippedMedia(&blocks, 9));
+}
+
+test "a restored prefix lets the encode skip its images, and the rest match a full encode byte for byte" {
+    const Probe = struct {
+        var tower_runs: usize = 0;
+        var billed_images: usize = 0;
+        var billed_rows: usize = 0;
+        /// One row per `width`, four floats each: the image's first byte, then the row index.
+        fn tower(img: VisionImagePixels) anyerror!mlx.mlx_array {
+            tower_runs += 1;
+            var data: [64]f32 = undefined;
+            const rows: usize = img.width;
+            for (0..rows) |r| {
+                data[r * 4 + 0] = @floatFromInt(img.pixels[0]);
+                data[r * 4 + 1] = @floatFromInt(r);
+                data[r * 4 + 2] = @floatFromInt(img.pixels[0] * 3);
+                data[r * 4 + 3] = 0.1 * @as(f32, @floatFromInt(img.pixels[0]));
+            }
+            return mlx.mlx_array_new_data(&data, &[_]c_int{ 1, @intCast(rows), 4 }, 3, .float32);
+        }
+        fn available(_: *const ModelConfig) u64 {
+            return std.math.maxInt(u64);
+        }
+        fn bill(_: *const ModelConfig, images: []const chat_mod.ImageData, _: []const chat_mod.VideoData, rows: usize) u64 {
+            billed_images = images.len;
+            billed_rows = rows;
+            return 1;
+        }
+        fn rowsOf(arr: mlx.mlx_array) []const f32 {
+            _ = mlx.mlx_array_eval(arr);
+            const shape = mlx.getShape(arr);
+            return mlx.mlx_array_data_float32(arr).?[0 .. @as(usize, @intCast(shape[1])) * 4];
+        }
+    };
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    var cfg = ModelConfig{ .num_hidden_layers = 0, .qv_heads = 1 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    var encoder: VisionEncoder = .{ .allocator = testing.allocator, .s = mlx.mlx_default_cpu_stream_new() };
+    model.vision_encoder = &encoder;
+    vision_block_test_hook = Probe.tower;
+    vision_encode_available = Probe.available;
+    vision_encode_bill = Probe.bill;
+    defer {
+        vision_block_test_hook = null;
+        vision_encode_available = null;
+        vision_encode_bill = null;
+    }
+
+    const images = [_]chat_mod.ImageData{
+        .{ .pixels = "\x01", .width = 4, .height = 1 },
+        .{ .pixels = "\x02", .width = 2, .height = 1 },
+        .{ .pixels = "\x03", .width = 3, .height = 1 },
+    };
+    const blocks = [_]MediaBlock{ .{ .kind = .image, .rows = 4 }, .{ .kind = .image, .rows = 2 }, .{ .kind = .image, .rows = 3 } };
+    const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
+    var refusal: ?MediaRefusal = null;
+
+    const full = try encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal);
+    defer _ = mlx.mlx_array_free(full.embeddings.?);
+    try testing.expectEqual(@as(usize, 3), Probe.tower_runs);
+    try testing.expectEqual(@as(usize, 3), Probe.billed_images);
+    try testing.expectEqual(@as(usize, 9), Probe.billed_rows);
+    const all_rows = Probe.rowsOf(full.embeddings.?);
+
+    // The first image is inside the 4-row prefix: the tower runs twice and the bill sees two images.
+    Probe.tower_runs = 0;
+    const tail = try encodeMediaAfterRestore(&sch, &model, &media, 4, &refusal);
+    defer _ = mlx.mlx_array_free(tail.embeddings.?);
+    try testing.expectEqual(@as(usize, 2), Probe.tower_runs);
+    try testing.expectEqual(@as(usize, 2), Probe.billed_images);
+    try testing.expectEqual(@as(usize, 5), Probe.billed_rows);
+    try testing.expectEqual(@as(usize, 4), tail.skipped_rows);
+    try testing.expectEqualSlices(f32, all_rows[4 * 4 ..], Probe.rowsOf(tail.embeddings.?));
+
+    // The prefix ends inside the second image: it is encoded whole, and the splice resumes at its row 1.
+    Probe.tower_runs = 0;
+    const straddled = try encodeMediaAfterRestore(&sch, &model, &media, 5, &refusal);
+    defer _ = mlx.mlx_array_free(straddled.embeddings.?);
+    try testing.expectEqual(@as(usize, 2), Probe.tower_runs);
+    try testing.expectEqual(@as(usize, 4), straddled.skipped_rows);
+    try testing.expectEqualSlices(f32, all_rows[4 * 4 ..], Probe.rowsOf(straddled.embeddings.?));
+
+    // A prefix holding every image encodes nothing.
+    Probe.tower_runs = 0;
+    const covered = try encodeMediaAfterRestore(&sch, &model, &media, 9, &refusal);
+    try testing.expect(covered.embeddings == null);
+    try testing.expectEqual(@as(usize, 9), covered.skipped_rows);
+    try testing.expectEqual(@as(usize, 0), Probe.tower_runs);
+}
+
+test "an encode refused for headroom after the restore names the bill of what it encodes" {
+    const Probe = struct {
+        fn available(_: *const ModelConfig) u64 {
+            return 10;
+        }
+        fn bill(_: *const ModelConfig, images: []const chat_mod.ImageData, _: []const chat_mod.VideoData, _: usize) u64 {
+            return 100 * images.len;
+        }
+        fn fault(out: []u8, _: *const ModelConfig, images: []const chat_mod.ImageData, _: []const chat_mod.VideoData, _: usize, free: u64) ?[]const u8 {
+            return std.fmt.bufPrint(out, "{d} images, {d} free", .{ images.len, free }) catch null;
+        }
+        fn tower(_: VisionImagePixels) anyerror!mlx.mlx_array {
+            return error.TowerMustNotRun;
+        }
+    };
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    var cfg = ModelConfig{ .num_hidden_layers = 0, .qv_heads = 1 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.vision_encoder = @ptrFromInt(@alignOf(VisionEncoder));
+    vision_block_test_hook = Probe.tower;
+    vision_encode_available = Probe.available;
+    vision_encode_bill = Probe.bill;
+    vision_fit_fault = Probe.fault;
+    defer {
+        vision_block_test_hook = null;
+        vision_encode_available = null;
+        vision_encode_bill = null;
+        vision_fit_fault = null;
+    }
+    const images = [_]chat_mod.ImageData{ .{ .pixels = "\x01", .width = 4, .height = 1 }, .{ .pixels = "\x02", .width = 2, .height = 1 } };
+    const blocks = [_]MediaBlock{ .{ .kind = .image, .rows = 4 }, .{ .kind = .image, .rows = 2 } };
+    const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
+    var refusal: ?MediaRefusal = null;
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectEqualStrings("2 images, 10 free", refusal.?.text());
+    try testing.expect(!refusal.?.server_error);
+    refusal = null;
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 4, &refusal));
+    try testing.expectEqualStrings("1 images, 10 free", refusal.?.text());
 }
 
 test "a failed cold load drops the MLX error it latched and keeps one latched before it" {
