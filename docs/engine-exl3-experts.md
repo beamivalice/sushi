@@ -298,6 +298,34 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
 - DeepSeek shapes at 2 to 8 rows (`SUSHI_EXL3_ROWS_SWEEP=dsv41`, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
   two-row cells, by less than the noise. The policy stands.
 
+- **DeepSeek trunk by width** (`SUSHI_DSV41_TRUNK_UBENCH=1 MLX_MAX_OPS_PER_BUFFER=16`, exl3 test binary at `d810c50c`, M5 Max, GPU
+  lock, QUIET, fans max, die under 50 °C, `taskpolicy -a`, best of 7 rounds of 96 calls chained over distinct banks): us a call,
+  finish included, the served arm (SIMD at 1 row, NAX from 2) and the NAX arm at 1 row, against the same bytes streamed by
+  16-byte loads. Without the buffer cap the host's encode time reads as kernel time.
+
+  | shape (MB) | floor | R1 SIMD | R1 NAX | R2 | R4 | R8 |
+  |---|---|---|---|---|---|---|
+  | `wq_b` (21.0) | 36.6 | 43.8 | 45.4 | 47.9 | 53.1 | 61.3 |
+  | `wo_a` (16.8) | 29.8 | 38.2 | 45.5 | 46.8 | 49.9 | 55.3 |
+  | `wo_b` (21.0) | 36.5 | 46.1 | 49.1 | 50.2 | 53.0 | 58.2 |
+  | `wq_a`+`wkv` (4.6) | 9.2 | 16.7 | 19.4 | 20.0 | 22 | 23.3 |
+  | `idx_wq_b` (2.6) | 5.9 | 10.9 | 11.3 | 11.9 | 12.7 | 14.3 |
+  | head n96 (496) | 838 | | | 1001 | | 1137 |
+
+  A layer's four trunk calls sum to 145 / 165 / 178 / 198 us at R1 (SIMD) / R2 / R4 / R8, so the trunk over 40 layers is 5.8 /
+  6.6 / 7.1 / 7.9 ms: the SIMD-to-NAX switch costs 0.8 ms of the R1-to-R2 step, not the whole step (the routed experts grow
+  faster). `wq_a`+`wkv` is host-bound in a chain and reads ±3 us.
+- **What bounds the NAX rows kernel.** At 2 rows `wq_b` with decode, MMA and prepare ablated (loads only) takes 46.9 us against 47.9
+  for the whole kernel: decode and MMA hide behind the loads, whatever the load width (8+4 bytes, 8, 16) or batch depth. The
+  gap to the floor is launch, the partial stores and the finish dispatch. From 2 to 8 rows `wq_b` grows 13 us: finish 7, partial
+  stores 5.5, prepare 1.5. The k split is fixed by the output bytes (the finish sums the partials in split order), so the
+  levers below keep it.
+  - Ruled out, bit-identical, no gain: weight loads issued 2/4/8 tiles ahead (0 / +15-45% / +30-100% worse), 8- and 16-simdgroup
+    threadgroups (±1%), float4 partial stores (0), one coalesced word load plus `simd_shuffle` for the fragment words
+    (+8 us), the finish folded into the launch (the last threadgroup of an output block sums its partials in split order,
+    arrival counters in a persistent buffer: 0 of 9e7 values differ, `wq_b` -1.1 / -2.6 us at 2 / 8 rows, `wo_b` ±1,
+    `wq_a`+`wkv` +2.4 us at 8 rows with 40 splits).
+
 <a id="dsv41-stq"></a>
 ## DeepSeek-V4.1 STQ pack: shapes, arms, status
 

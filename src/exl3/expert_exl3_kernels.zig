@@ -8410,6 +8410,182 @@ test "exl3 multi-row launch geometry sweep (SUSHI_EXL3_ROWS_SWEEP=qwen4|glm5|dsv
     }
 }
 
+const TrunkBenchShape = struct { name: []const u8, out: c_int, in: c_int, groups: c_int = 1, bounds: ?[3]c_int = null, segs: usize = 1 };
+const TRUNK_BENCH_SHAPES = [_]TrunkBenchShape{
+    .{ .name = "wq_a|wkv", .out = 1792, .in = 5120, .bounds = .{ 1280, 1792, 1792 }, .segs = 2 },
+    .{ .name = "wq_b", .out = 32768, .in = 1280 },
+    .{ .name = "wo_a", .out = 1024, .in = 4096, .groups = 8 },
+    .{ .name = "wo_b", .out = 5120, .in = 8192 },
+    .{ .name = "idx_wq_b", .out = 4096, .in = 1280 },
+    .{ .name = "head", .out = 129280, .in = 5120 },
+};
+
+// Prints only under SUSHI_DSV41_TRUNK_UBENCH (`1` or a shape-name filter; `_ROWS=1,2,..` the widths): DeepSeek's trunk
+// linears at the real shapes (SPEC1 n64, the head n96) under the served launch geometry, chained over distinct banks
+// like a forward (cold weights), and at one row also the NAX arm beside the served SIMD one. Best of the rounds, us
+// per call including the finish, then the same bytes streamed by 16-byte coalesced loads as the memory floor. Run with
+// MLX_MAX_OPS_PER_BUFFER=16 so the GPU starts before the host has encoded the whole chain; without it the host's
+// encode time reads as kernel time.
+test "dsv41 trunk rows by width (SUSHI_DSV41_TRUNK_UBENCH)" {
+    const raw = std.c.getenv("SUSHI_DSV41_TRUNK_UBENCH");
+    if (!diagEnvValueOn(raw)) return error.SkipZigTest;
+    const only = std.mem.span(raw.?);
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    try dec.requireTable();
+    setDecodeParams(dec);
+    defer setDecodeParams(.mul1);
+    const rounds: usize = if (std.c.getenv("SUSHI_UBENCH_ROUNDS")) |v| @min(std.fmt.parseInt(usize, std.mem.span(v), 10) catch 5, 16) else 5;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var prng = std.Random.DefaultPrng.init(0x7a);
+    const rnd = prng.random();
+    var rows_list: [8]c_int = undefined;
+    var nrows: usize = 0;
+    if (std.c.getenv("SUSHI_DSV41_TRUNK_UBENCH_ROWS")) |rv| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(rv), ',');
+        while (it.next()) |tok| : (nrows += 1) rows_list[nrows] = try std.fmt.parseInt(c_int, tok, 10);
+    } else for (&rows_list, 0..) |*r, i| {
+        r.* = @intCast(i + 1);
+        nrows += 1;
+    }
+    for (TRUNK_BENCH_SHAPES) |sh| {
+        if (!std.mem.eql(u8, only, "1")) {
+            var picked = false;
+            var tokens = std.mem.tokenizeScalar(u8, only, ',');
+            while (tokens.next()) |tok| picked = picked or std.mem.indexOf(u8, sh.name, tok) != null;
+            if (!picked) continue;
+        }
+        const n: c_int = if (std.mem.eql(u8, sh.name, "head")) 96 else 64;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const out: usize = @intCast(sh.out);
+        const in: usize = @intCast(sh.in);
+        const G: usize = @intCast(sh.groups);
+        const copies: usize = std.math.clamp((768 << 20) / (out * in * G), 4, 64);
+        const calls: usize = @max(copies, 96);
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer for (owned.items) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const words = try alloc.alloc(u16, copies * G * (in / 16) * (out / 16) * @as(usize, @intCast(n)));
+        rnd.bytes(std.mem.sliceAsBytes(words));
+        const bank = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ @intCast(copies * G), @divExact(sh.in, 16), @divExact(sh.out, 16), n }, 4, .uint16);
+        try owned.append(alloc, bank);
+        alloc.free(words);
+        const views = try alloc.alloc(mlx.mlx_array, copies);
+        for (views, 0..) |*v, c| {
+            v.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(v, bank, &.{ @as(c_int, @intCast(c * G)), 0, 0, 0 }, 4, &.{ @as(c_int, @intCast((c + 1) * G)), @divExact(sh.in, 16), @divExact(sh.out, 16), n }, 4, &.{ 1, 1, 1, 1 }, 4, s));
+            try mlx.check(mlx.mlx_array_eval(v.*));
+            try owned.append(alloc, v.*);
+        }
+        // A chain keeps its magnitude: suh = 1/sqrt(in) cancels the inner sum's growth.
+        const ones = try alloc.alloc(u16, G * @max(out, in * sh.segs));
+        @memset(ones, exl3.f32ToF16Bits(1.0));
+        const scaled = try alloc.alloc(u16, G * in * sh.segs);
+        @memset(scaled, exl3.f32ToF16Bits(1.0 / @sqrt(@as(f32, @floatFromInt(in)))));
+        const suh_shape: []const c_int = if (G > 1) &.{ sh.groups, sh.in } else &.{ @intCast(sh.segs), sh.in };
+        const svh_shape: []const c_int = if (G > 1) &.{ sh.groups, sh.out } else &.{sh.out};
+        const suh = mlx.mlx_array_new_data(scaled.ptr, suh_shape.ptr, @intCast(suh_shape.len), .float16);
+        const svh = mlx.mlx_array_new_data(ones.ptr, svh_shape.ptr, @intCast(svh_shape.len), .float16);
+        try owned.appendSlice(alloc, &.{ suh, svh });
+        for (rows_list[0..nrows]) |rows| {
+            var cands: std.ArrayList(RowsGeom) = .empty;
+            try cands.append(alloc, rowsGeometry(sh.in, sh.out, rows, sh.groups));
+            if (rows == 1 and gemmNaxOn()) {
+                var g = rowsGeometry(sh.in, sh.out, 2, sh.groups);
+                g.chunk = rowsChunk(sh.in, rows, g.nsplit);
+                try cands.append(alloc, g);
+            }
+            const xv = try alloc.alloc(f32, G * @as(usize, @intCast(rows)) * in);
+            for (xv) |*v| v.* = (rnd.float(f32) - 0.5) * 0.2;
+            const x32 = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ sh.groups * rows, sh.in }, 2, .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var x0 = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&x0, x32, .bfloat16, s));
+            try mlx.check(mlx.mlx_array_eval(x0));
+            try owned.append(alloc, x0);
+            const nc = cands.items.len;
+            const us = try alloc.alloc([16]f64, nc);
+            for (0..rounds + 1) |round| {
+                for (0..nc) |j| {
+                    const a = (round + j) % nc;
+                    const g = cands.items[a];
+                    const ys = try alloc.alloc(mlx.mlx_array, calls);
+                    var made: usize = 0;
+                    defer for (ys[0..made]) |y| {
+                        _ = mlx.mlx_array_free(y);
+                    };
+                    for (ys, 0..) |*y, c| {
+                        const x = if (c > 0) try chainInput(s, ys[c - 1], sh.groups * rows, sh.in, sh.out) else x0;
+                        defer if (c > 0) {
+                            _ = mlx.mlx_array_free(x);
+                        };
+                        y.* = try projectRowsWith(s, x, views[c % copies], suh, svh, g, try rowsKernel(g), sh.bounds);
+                        made += 1;
+                    }
+                    var sw = io_util.Stopwatch.init(io);
+                    try mlx.check(mlx.mlx_array_eval(ys[calls - 1]));
+                    const t = sw.read();
+                    if (round > 0) us[a][round - 1] = @as(f64, @floatFromInt(t)) / 1e3 / @as(f64, @floatFromInt(calls));
+                }
+            }
+            std.debug.print("[trunk] {s} {d}x{d} G{d} n{d} rows {d}:", .{ sh.name, sh.out, sh.in, sh.groups, n, rows });
+            for (cands.items, us) |g, row| {
+                std.debug.print(" {s}-s{d} {d:.1}", .{ if (g.nax) "nax" else "simd", g.nsplit, std.mem.min(f64, row[0..rounds]) });
+            }
+            std.debug.print("\n", .{});
+            if (rows != rows_list[0]) continue;
+            const bytes: usize = out * in * G * @as(usize, @intCast(n)) / 128;
+            const nthreads: c_int = @intCast(bytes / 16 / 4);
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{@divExact(nthreads, 32)}, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, nthreads, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+            const k = try getNamedKernel(&stream_ref_kernel, "sushi_stream_ref", &.{"w"}, &.{"y"},
+                \\const uint tid = uint(thread_position_in_grid.x);
+                \\const device uint4 *p = (const device uint4 *)w;
+                \\const uint total = uint(threads_per_grid.x);
+                \\const uint4 a = p[tid];
+                \\const uint4 b = p[tid + total];
+                \\const uint4 c = p[tid + 2u * total];
+                \\const uint4 d = p[tid + 3u * total];
+                \\uint v = (a.x ^ a.y ^ a.z ^ a.w) + (b.x ^ b.y ^ b.z ^ b.w) + (c.x ^ c.y ^ c.z ^ c.w) + (d.x ^ d.y ^ d.z ^ d.w);
+                \\v = simd_sum(v);
+                \\if ((tid & 31u) == 0u) y[tid >> 5u] = v;
+            , "");
+            var best: f64 = std.math.inf(f64);
+            for (0..rounds + 1) |round| {
+                const ys = try alloc.alloc(mlx.mlx_array, calls);
+                var made: usize = 0;
+                defer for (ys[0..made]) |y| {
+                    _ = mlx.mlx_array_free(y);
+                };
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                for (ys, 0..) |*y, c| {
+                    const ov = try applyOuts(s, k, &.{views[c % copies]}, cfg, 1);
+                    defer _ = mlx.mlx_vector_array_free(ov);
+                    y.* = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_vector_array_get(y, ov, 0));
+                    _ = mlx.mlx_vector_array_append_value(vec, y.*);
+                    made += 1;
+                }
+                var sw = io_util.Stopwatch.init(io);
+                try mlx.check(mlx.mlx_eval(vec));
+                const t = @as(f64, @floatFromInt(sw.read())) / 1e3 / @as(f64, @floatFromInt(calls));
+                if (round > 0) best = @min(best, t);
+            }
+            std.debug.print("[trunk] {s} memory floor: {d:.1} us for {d:.1} MB ({d:.0} GB/s)\n", .{ sh.name, best, @as(f64, @floatFromInt(bytes)) / 1e6, @as(f64, @floatFromInt(bytes)) / best / 1e3 });
+        }
+    }
+}
+
+var stream_ref_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
 /// The multi-row kernels preparing each row from the next row's activations: the defect the
 /// multi-row parity bar must convict.
 const ROWS_ROW_MUTANT = .{ "x + (size_t)r * uint(IDIM) + k;", "x + (size_t)((r + 1u) % uint(ROWS)) * uint(IDIM) + k;" };
