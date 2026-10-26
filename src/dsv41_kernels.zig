@@ -297,11 +297,10 @@ const ROUTE_SOURCE =
 
 /// The K largest of each row of `x` [L, n] f32 (K <= n), as their indices in ascending order, ties to the lower
 /// index: a radix select of the order-preserving uint keys, 8 bits a pass, then one pass writing every key above
-/// the threshold and the first ties. One threadgroup a row.
-const TOPK_SOURCE =
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
-    \\const auto xr = x + size_t(l) * n;
+/// the threshold and the first ties. One threadgroup a row; the split variant runs it on G chunks of a row, then on
+/// the chunks' candidates (ascending in the row's index, so a tie still goes to the lower index). A variant defines
+/// `n`, `xr`, `ELEM(i)` (the key of element i) and `EMIT(p, i)` (pick p is element i).
+const TOPK_BODY =
     \\threadgroup atomic_uint hist[256];
     \\threadgroup uint t_sel[2], t_part[TG / 32];
     \\const uint K = uint(kk[0]);
@@ -312,7 +311,7 @@ const TOPK_SOURCE =
     \\  for (uint b = tid; b < 256; b += TG) atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  for (int i = int(tid); i < n; i += TG) {
-    \\    const uint key = dsv41_key(xr[i]);
+    \\    const uint key = ELEM(i);
     \\    if ((key & hmask) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, metal::memory_order_relaxed);
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -336,7 +335,7 @@ const TOPK_SOURCE =
     \\}
     \\const int C = (n + TG - 1) / TG, i0 = int(tid) * C, i1 = metal::min(n, i0 + C);
     \\uint gt = 0, eq = 0;
-    \\for (int i = i0; i < i1; ++i) { const uint key = dsv41_key(xr[i]); gt += key > prefix; eq += key == prefix; }
+    \\for (int i = i0; i < i1; ++i) { const uint key = ELEM(i); gt += key > prefix; eq += key == prefix; }
     \\uint s = metal::simd_prefix_exclusive_sum(eq);
     \\if (lane == 31) t_part[sg] = s + eq;
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -353,13 +352,47 @@ const TOPK_SOURCE =
     \\for (uint g = 0; g < sg; ++g) off += t_part[g];
     \\uint pos = s + off, taken = 0;
     \\for (int i = i0; i < i1; ++i) {
-    \\  const uint key = dsv41_key(xr[i]);
+    \\  const uint key = ELEM(i);
     \\  if (key > prefix || (key == prefix && taken < take)) {
     \\    taken += key == prefix;
-    \\    out[size_t(l) * K + pos++] = i;
+    \\    EMIT(pos, i);
+    \\    ++pos;
     \\  }
     \\}
 ;
+
+const TOPK_PRE =
+    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+;
+
+const TOPK_SOURCE = TOPK_PRE ++
+    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
+    \\const auto xr = x + size_t(l) * n;
+    \\#define ELEM(i) dsv41_key(xr[i])
+    \\#define EMIT(p, i) out[size_t(l) * K + (p)] = (i)
+    \\
+++ TOPK_BODY;
+
+/// Chunk g of G of each row: its K picks as row indices, `[L, G * K]`; kk = {K, G}.
+const TOPK_CHUNK_SOURCE = TOPK_PRE ++
+    \\const int l = threadgroup_position_in_grid.y, g = threadgroup_position_in_grid.x, G = kk[1], N = x_shape[1];
+    \\const size_t c0 = size_t(N) * g / G;
+    \\const int n = int(size_t(N) * (g + 1) / G - c0);
+    \\const auto xr = x + size_t(l) * N + c0;
+    \\#define ELEM(i) dsv41_key(xr[i])
+    \\#define EMIT(p, i) out[(size_t(l) * G + g) * kk[0] + (p)] = int(c0) + (i)
+    \\
+++ TOPK_BODY;
+
+/// The K largest of each row of `x` among its candidate indices `ids` `[L, C]` (ascending).
+const TOPK_MERGE_SOURCE = TOPK_PRE ++
+    \\const int l = threadgroup_position_in_grid.y, n = ids_shape[1];
+    \\const auto xr = x + size_t(l) * x_shape[1];
+    \\const auto ir = ids + size_t(l) * n;
+    \\#define ELEM(i) dsv41_key(xr[ir[i]])
+    \\#define EMIT(p, i) out[size_t(l) * kk[0] + (p)] = ir[i]
+    \\
+++ TOPK_BODY;
 
 const TOPK_HEADER =
     \\inline uint dsv41_key(float f) {
@@ -393,6 +426,8 @@ const DENSE_F32X_SOURCE =
 var gate_def = Def{ .name = "dsv41_gate", .ins = &.{ "x", "w" }, .outs = &.{"logits"}, .source = GATE_SOURCE };
 var route_def = Def{ .name = "dsv41_route", .ins = &.{ "logits", "bias", "scal" }, .outs = &.{ "idx", "wts" }, .source = ROUTE_SOURCE };
 var topk_def = Def{ .name = "dsv41_topk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_SOURCE, .header = TOPK_HEADER };
+var topk_chunk_def = Def{ .name = "dsv41_topk_chunk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_CHUNK_SOURCE, .header = TOPK_HEADER };
+var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk" }, .outs = &.{"out"}, .source = TOPK_MERGE_SOURCE, .header = TOPK_HEADER };
 var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE };
 
 const gate_sgs = 8;
@@ -425,13 +460,38 @@ pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !
     return .{ .idx = o[0], .wts = o[1] };
 }
 
+/// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
+/// below them, or at a wide k, the merge costs what the split saves (`dsv41 topk split timing`).
+pub fn topkSplits(rows: usize, n: usize, k: usize) usize {
+    if (rows > topk_split_rows or k > topk_split_max_k) return 1;
+    return if (n >= (if (rows == 1) topk_split_min_n_one_row else topk_split_min_n)) topk_splits else 1;
+}
+
+const topk_split_rows = 16;
+const topk_split_max_k = 512;
+const topk_split_min_n_one_row: usize = 131072;
+const topk_split_min_n: usize = 262144;
+const topk_splits: usize = 8;
+
 /// The indices of the `k` largest of each row of `x` `[L, n]` (f32), ascending, ties to the lower index.
 pub fn topkIndices(sc: *Scope, x: A, k: usize) !A {
+    return topkIndicesSplit(sc, x, k, topkSplits(dim(x, 0), dim(x, 1), k));
+}
+
+/// `topkIndices` over `splits` chunks of each row (1: one threadgroup a row); each chunk holds at least `k` scores.
+pub fn topkIndicesSplit(sc: *Scope, x: A, k: usize, splits: usize) !A {
+    const L = dim(x, 0);
     var o: [1]A = undefined;
+    const tmpl: []const Tmpl = &.{.{ .name = "TG", .v = topk_tg }};
+    const spec: []const OutSpec = &.{.{ .shape = &.{ ci(L), ci(k) }, .dt = .int32 }};
     // k rides in a buffer: as a template arg every index width up to index_topk was its own Metal compile.
-    try launch(sc, &topk_def, &.{ x, try sc.ints(&.{ci(k)}, &.{1}) }, &.{.{ .shape = &.{ ci(dim(x, 0)), ci(k) }, .dt = .int32 }}, .{ topk_tg, dim(x, 0), 1 }, .{ topk_tg, 1, 1 }, &.{
-        .{ .name = "TG", .v = topk_tg },
-    }, &.{}, &o);
+    if (splits <= 1) {
+        try launch(sc, &topk_def, &.{ x, try sc.ints(&.{ci(k)}, &.{1}) }, spec, .{ topk_tg, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &o);
+        return o[0];
+    }
+    var cand: [1]A = undefined;
+    try launch(sc, &topk_chunk_def, &.{ x, try sc.ints(&.{ ci(k), ci(splits) }, &.{2}) }, &.{.{ .shape = &.{ ci(L), ci(splits * k) }, .dt = .int32 }}, .{ topk_tg * splits, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &cand);
+    try launch(sc, &topk_merge_def, &.{ x, cand[0], try sc.ints(&.{ci(k)}, &.{1}) }, spec, .{ topk_tg, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &o);
     return o[0];
 }
 
@@ -2088,6 +2148,87 @@ test "dsv41 topk: the picks are the k largest in index order, ties to the lower 
     tie[7] = -std.math.inf(f32);
     const t = try sc_mod.hostI32(try topkIndices(&sc, try sc.floats(&tie, &.{ 1, n }), 10));
     try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 4, 5, n - 4, n - 3, n - 2, n - 1 }, t[0..10]);
+}
+
+test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long rows, ties and -inf included" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const k = 512;
+    var prng = std.Random.DefaultPrng.init(0x70b1);
+    const rnd = prng.random();
+    for ([_]usize{ 4099, 20000, 100003, 262144 }) |n| {
+        const L = 3;
+        const h = try testing.allocator.alloc(f32, L * n);
+        defer testing.allocator.free(h);
+        for (h[0..n]) |*v| v.* = rnd.floatNorm(f32);
+        // Row 1: eight score levels, so ties run across every chunk edge and the pick cut falls inside one level.
+        for (h[n .. 2 * n]) |*v| v.* = @floatFromInt(rnd.uintLessThan(u32, 8));
+        // Row 2: all equal but a -inf run and a few large scores in the last chunk.
+        @memset(h[2 * n ..][0..n], 1.0);
+        @memset(h[2 * n ..][0 .. n / 3], -std.math.inf(f32));
+        for (h[3 * n - 5 ..][0..5], 0..) |*v, i| v.* = 9.0 + @as(f32, @floatFromInt(i));
+        const x = try sc.floats(h, &.{ L, @intCast(n) });
+        const want = try testing.allocator.dupe(i32, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
+        defer testing.allocator.free(want);
+        for ([_]usize{ 2, 3, 8, 32 }) |g| {
+            if (n / g < k) continue;
+            try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, g)));
+        }
+        try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndices(&sc, x, k)));
+    }
+}
+
+// Decode top-k at the release shapes by split count, arms interleaved per rep; best and median of 15 evals, and eight
+// independent rows of work in one eval (a decode token's eight index sources). Prints only under SUSHI_DSV41_TOPK_UBENCH.
+test "dsv41 topk split timing by context (SUSHI_DSV41_TOPK_UBENCH=1)" {
+    if (!@import("transformer.zig").diagEnvOn("SUSHI_DSV41_TOPK_UBENCH")) return error.SkipZigTest;
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sc = Scope.init(testing.allocator, gpu);
+    defer sc.deinit();
+    const Shape = struct { n: usize, k: usize };
+    const splits = [_]usize{ 1, 2, 4, 8, 16, 32 };
+    for ([_]usize{ 65536, 262144, 524288 }) |ctx| {
+        // Index scores at ratio 2 and ratio 1, the candidate source's block maxima, a later source's gathered keys.
+        for ([_]Shape{ .{ .n = ctx / 2, .k = 512 }, .{ .n = ctx, .k = 512 }, .{ .n = ctx / 8, .k = 2048 }, .{ .n = 16384, .k = 512 } }) |sh| {
+            for ([_]usize{ 1, 4, 16 }) |L| {
+                var xs: [8]A = undefined;
+                for (&xs, 0..) |*x, i| x.* = try sc.add(try randn(&sc, &.{ @intCast(L), @intCast(sh.n) }, .float32, 90 + i, 1.0), try sc.f(@floatFromInt(i)));
+                try sc_mod.evalAll(&xs);
+                var tm: [splits.len][2][16]f64 = undefined;
+                var skip: [splits.len]bool = undefined;
+                for (splits, 0..) |g, gi| skip[gi] = sh.n / g < sh.k;
+                for (0..16) |rep| {
+                    for (splits, 0..) |g, gi| {
+                        if (skip[gi]) continue;
+                        var t = Scope.init(testing.allocator, gpu);
+                        defer t.deinit();
+                        var t0 = std.Io.Timestamp.now(io, .boot);
+                        const one = try topkIndicesSplit(&t, xs[0], sh.k, g);
+                        try sc_mod.evalAll(&.{one});
+                        tm[gi][0][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
+                        var outs: [8]A = undefined;
+                        t0 = std.Io.Timestamp.now(io, .boot);
+                        for (&outs, xs) |*o, x| o.* = try topkIndicesSplit(&t, x, sh.k, g);
+                        try sc_mod.evalAll(&outs);
+                        tm[gi][1][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
+                    }
+                }
+                for (splits, 0..) |g, gi| {
+                    if (skip[gi]) continue;
+                    var line: [2][2]f64 = undefined;
+                    for (0..2) |w| {
+                        const v = tm[gi][w][1..];
+                        std.mem.sort(f64, v, {}, std.sort.asc(f64));
+                        line[w] = .{ v[0], v[v.len / 2] };
+                    }
+                    std.debug.print("dsv41-topk ctx {d} n {d} k {d} L {d} splits {d}: one eval best {d:.3} med {d:.3} ms; x8 per row-of-work best {d:.3} med {d:.3} ms\n", .{ ctx, sh.n, sh.k, L, g, line[0][0], line[0][1], line[1][0] / 8, line[1][1] / 8 });
+                }
+            }
+        }
+    }
 }
 
 test "dsv41 dense f32x: the product is no further from the f64 truth than the widened f32 matmul" {

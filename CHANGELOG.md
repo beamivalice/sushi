@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1 decodes faster at long context**: the indexer's top-k splits each row over several threadgroups past 131072 scores and picks the same keys in the same order.
 - **A long image history no longer re-runs the vision tower every turn**: a request whose prefix is restored from the cache encodes only the images the restore does not already hold, so a coding agent that keeps dozens of screenshots in its context no longer waits for them to be encoded again before the first token, and its encode is billed for those images alone.
 - **A request with many images decodes them in parallel**: a long screenshot history is decoded on up to eight threads instead of one, which cuts the wait before the first token several times over on a request that carries dozens of images.
 - **DeepSeek-V4.1-Flash serves a follow-up turn from the live state with no SSD read when the new prompt diverges inside the last turn's generation**: the state rolls back in place to the deepest restore point of the previous request that the prompt shares.

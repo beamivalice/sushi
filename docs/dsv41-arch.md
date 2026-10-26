@@ -78,6 +78,18 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   262144 keys, 1 row 0.74 to 0.44 ms, 4 rows 2.35 to 1.27 ms per eval (about 0.2 ms of each is the eval floor); live serial b349f67e 42.8 tok/s at 209k, 47.8 at 4.7k, the same 600
   greedy tokens (one boot, GPU lock, QUIET, fans max, die 49 C, taskpolicy -a). Ruled out
   on the ubench: a 512-thread score threadgroup and a replicated top-k histogram (both unchanged).
+- **Decode top-k, split** (`topkIndicesSplit`, `topkSplits`): a decode block (up to 16 rows) of at least 131072 scores (262144 past
+  one row) with k <= 512 splits each row over 8 chunks; each chunk's threadgroup selects its own top-k and one merge
+  threadgroup selects over the chunks' picks, which are ascending in row index, so the indices, their order and the ties
+  (lower index) are the one-threadgroup kernel's (`dsv41 topk split` test: random, 8-level tied and -inf rows, n to
+  262144). `SUSHI_DSV41_TOPK_UBENCH=1 -Dtest-filter="dsv41 topk split timing"`, per row of work with eight scans in one eval,
+  best of 15, splits 1 to 8: n 262144 1 row 0.065 to 0.041 ms, 16 rows 0.186 to 0.149; n 524288 1 row 0.127 to 0.051
+  (16 rows 0.413 to 0.279); n 131072 1 row 0.055 to 0.042, 4 and 16 rows a tie. n up to 65536 and the k = 2048 block maxima
+  tie or lose a little at any split (the merge costs what the split saves); 32 splits lose everywhere. Output is
+  bit-identical, so the gate is the unit test (47f5d3c1's timing run, 487ecb62's kernel; GPU lock, QUIET, fans max, die
+  under 50 C, `taskpolicy -a`, server down). Eight chunks is the best count at every size that splits; 16 is 5-10% slower.
+  The matrix-unit decode index score kernel that the same run timed (20-30% slower than the scalar one) is ruled out.
+
 - **Tile-major expert pools**: the streamed STQ pools hold each trellis projection per output tile pair
   (`layout.tileMajor`, [engine-exl3-experts](engine-exl3-experts.md#rate-groups)), filled through the bounce buffers and
   read by the decode GEMVs and the three prefill GEMM bodies with a new first tile and k stride; the pack on disk and every
@@ -253,7 +265,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 |---|---|---|---|
 | `dsv41_moe_gu`, `dsv41_moe_dn` | routed gate/up/SwiGLU/down, sum, shared expert, hyper-connection expand | one token (decode) | no further from an f64 truth than the chain; bf16 within 2 ulps of its peak |
 | `dsv41_moe_act`, `dsv41_moe_combine` | the SwiGLU x weight and the unsort/sum/shared add of the sorted-gather MoE | many rows (prefill) | bit for bit |
-| `dsv41_gate`, `dsv41_route`, `dsv41_topk` | router logits, softplus scores/top-k/normalize, the indexer's top-k | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index |
+| `dsv41_gate`, `dsv41_route`, `dsv41_topk`, `dsv41_topk_chunk`, `dsv41_topk_merge` | router logits, softplus scores/top-k/normalize, the indexer's top-k (a decode block over 131072+ scores splits each row over 8 chunks and merges their picks) | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index, the split the one-threadgroup picks in the same order |
 | `dsv41_dense_f32x` | the f32 matmul of the compressor projections | decode rows | vs f64 truth |
 | `dsv41_rope_tail`, `dsv41_kv_row` | `rotate` plus the QAT round trip (q, indexer q/k, compressed latent, inverse rotation of the heads); the window row's rms norm, rotation and fp8 round trip | every width | bit for bit (rms in MLX's accumulation order) |
 | `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
