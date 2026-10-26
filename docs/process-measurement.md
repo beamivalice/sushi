@@ -94,9 +94,14 @@ and stops it. The raw `bench.json` (every request), the server log and `bench.lo
 `docs/bench/v<ver>/<pack>.md` carries the commit, binary SHA-256 and mtime, flags and hardware.
 
 The protocol, fixed for every model and release:
-- **One corpus.** A seeded synthetic TypeScript codebase (`bench.Corpus`, seed fixed), tokenized once through the
-  server's `/tokenize`, sent as token ids on `/v1/completions`: greedy, `ignore_eos`, 512 decoded tokens, the server's
-  default speculative mode (the `[spec-stats] mode=` lines of each request name it in the report).
+- **Two corpora, two arms.** The code arm is a seeded synthetic TypeScript codebase (`bench.Corpus`, seed fixed). The prose
+  arm is Pride and Prejudice (`src/fixtures/prose_pride_and_prejudice.txt`, Project Gutenberg #1342, public domain, header
+  and footer removed): speculative decoding accepts fewer tokens on prose than on code (1.95 against 2.9 a round on a 209k
+  DSpark trace), so code decode alone flatters it. Each is tokenized through the server's `/tokenize`, sent as token ids
+  on `/v1/completions`: greedy, `ignore_eos`, 512 decoded tokens, the server's default speculative mode (the
+  `[spec-stats] mode=` lines of each request name it in the report). One `sushi bench` run does the code arm, then the
+  prose arm, each with the whole schedule below, on one server and one private prefix-cache directory: the two prompts
+  share no prefix, so the prose arm's 4k request is cold. It is not expert-cache cold: the code arm has run before it.
 - **One cold prefill.** A cold 4k request, then `corpus[:8192k]` for k = 1..16. Each request restores the previous
   prompt-end point and prefills only the new tokens: the report's window table is the continuous prefill curve, 0 to 128k.
   Windows hold about 8,223 new tokens, not 8,192: the prompt-end checkpoint trails the prompt end by 30 tokens (GLM 31 to
@@ -109,6 +114,9 @@ The protocol, fixed for every model and release:
   forward). Order rule, the one for every rung and release: ladder step, its two repeats, next ladder step, ascending.
   Repeating a rung straight away keeps its restore point from being thinned by the per-entry checkpoint cap (Qwen,
   GLM) that a 128k entry would apply to it later. Expert-cache warmth is whatever the preceding requests left.
+- **The report** puts code and prose decode side by side per rung (with the prose/code ratio), one window table per
+  arm, and a summary row set: the code rows keep the old shape and stay comparable across releases, and the prose rows
+  are added beneath them as `<pack> (prose)`.
 - **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
   short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement.
 

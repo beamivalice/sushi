@@ -1,6 +1,6 @@
 //! `sushi bench`: the release bench client. It drives a server somebody else booted (tests/bench.sh does the
-//! hygiene and the boot) with one fixed token-id corpus: a 4k cold request, then 16 windows of 8192 tokens,
-//! each restoring the previous request's prompt-end point. Docs: process-measurement.md#release-bench.
+//! hygiene and the boot) with two fixed token-id corpora, a code arm and a prose arm, one after the other: each is
+//! a 4k cold request, then 16 windows of 8192 tokens, each restoring the previous request's prompt-end point. Docs: process-measurement.md#release-bench.
 
 const std = @import("std");
 const io_util = @import("io_util.zig");
@@ -12,6 +12,8 @@ pub const first_rung: usize = 4096;
 pub const ladder_steps: usize = 16;
 pub const samples_per_rung: usize = 3;
 pub const corpus_seed: u64 = 0x5a5a_c0de;
+/// Pride and Prejudice, public domain (Project Gutenberg #1342) with the Project Gutenberg header and footer removed.
+const prose_text = @embedFile("fixtures/prose_pride_and_prejudice.txt");
 /// The ladder must reach 128k tokens, plus a margin so the last window is never short.
 const corpus_tokens: usize = 132_000;
 /// A request counts as restored when its cached tokens fall this close below the point it should restore
@@ -22,8 +24,9 @@ const rungs = [_]usize{ 4096, 8192, 16384, 32768, 65536, 131072 };
 pub const USAGE =
     \\Usage: sushi bench --out <dir> --log <server.log> [options]
     \\
-    \\Drives a running server through the release bench: a cold 4k request, 16 windows of 8192 tokens
-    \\each restoring the previous prompt end, and 3 decode samples at 4k, 8k, 16k, 32k, 64k and 128k.
+    \\Drives a running server through the release bench, once on a code corpus and once on prose: a cold 4k
+    \\request, 16 windows of 8192 tokens each restoring the previous prompt end, and 3 decode samples at
+    \\4k, 8k, 16k, 32k, 64k and 128k.
     \\Boot the server and take the box rules with tests/bench.sh.
     \\
     \\Options:
@@ -180,6 +183,27 @@ pub const Corpus = struct {
     }
 };
 
+/// The text of the prose arm in pieces of at most about 24 KB, each ending at a blank line, so the server tokenizes
+/// the same bytes on every box.
+pub const ProseChunks = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *ProseChunks) ?[]const u8 {
+        if (self.pos >= self.text.len) return null;
+        const limit = 24 * 1024;
+        var end = @min(self.pos + limit, self.text.len);
+        if (end < self.text.len) {
+            if (std.mem.lastIndexOf(u8, self.text[self.pos..end], "\n\n")) |at| end = self.pos + at + 2;
+        }
+        const piece = self.text[self.pos..end];
+        self.pos = end;
+        return piece;
+    }
+};
+
+pub const Arm = enum { code, prose };
+
 // ── The plan ────────────────────────────────────────────────────────────
 
 pub const Kind = enum { ladder, repeat };
@@ -218,6 +242,7 @@ pub fn plan(allocator: std.mem.Allocator, decode_tokens: u32) ![]Request {
 // ── Samples ─────────────────────────────────────────────────────────────
 
 pub const Sample = struct {
+    arm: Arm = .code,
     prompt_len: usize,
     kind: Kind,
     base: usize,
@@ -400,15 +425,11 @@ fn modeLabel(row: RungRow) []const u8 {
     return first;
 }
 
-pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const w = &out.writer;
-
+fn rungRows(allocator: std.mem.Allocator, samples: []const Sample, arm: Arm) !std.ArrayList(RungRow) {
     var rows: std.ArrayList(RungRow) = .empty;
-    defer rows.deinit(allocator);
-    for (rep.samples) |s| {
-        if (s.max_tokens <= 1) continue;
+    errdefer rows.deinit(allocator);
+    for (samples) |s| {
+        if (s.arm != arm or s.max_tokens <= 1) continue;
         if (rows.items.len == 0 or rows.items[rows.items.len - 1].len != s.prompt_len) try rows.append(allocator, .{ .len = s.prompt_len });
         const row = &rows.items[rows.items.len - 1];
         if (row.n >= samples_per_rung) continue;
@@ -417,38 +438,29 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
         row.modes[row.n] = s.mode;
         row.n += 1;
     }
+    return rows;
+}
 
-    try w.print("# {s} bench", .{rep.model});
-    if (rep.version.len > 0) try w.print(" (Sushi {s})", .{rep.version});
-    try w.writeAll("\n\n");
-    var lines = std.mem.splitSequence(u8, rep.stamp, "\\n");
-    while (lines.next()) |l| if (l.len > 0) try w.print("{s}\n\n", .{l});
-    try w.print(
-        "Protocol: one fixed seeded TypeScript corpus as token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample. " ++
-            "The 4k request is cold; each later request restores the previous prompt-end point. A decode rung's samples 2 and 3 run right after its ladder request, and the first request counts. " ++
-            "The server's own prefill time, the restore time (logged apart) taken out; TTFT is the request wall time minus its decode time. The server's default speculative mode stays on.\n\n",
-        .{rep.decode_tokens},
-    );
-
-    try w.writeAll("## Decode (tok/s)\n\n| Rung | Sample 1 | Sample 2 | Sample 3 | Median | Speculative mode | Restored tokens |\n|---|---:|---:|---:|---:|---|---|\n");
-    for (rows.items) |row| {
-        try w.writeAll("| ");
-        try writeRungLabel(w, row.len);
-        try w.writeAll(" |");
-        for (0..samples_per_rung) |i| {
-            if (i < row.n) try w.print(" {d:.1} |", .{row.tps[i]}) else try w.writeAll(" · |");
-        }
-        try w.print(" {d:.1} | {s} |", .{ median(row.tps[0..row.n]), modeLabel(row) });
-        for (0..row.n) |i| {
-            try w.writeAll(if (i == 0) " " else " / ");
-            try writeThousands(w, @floatFromInt(row.cached[i]));
-        }
-        try w.writeAll(" |\n");
+fn writeDecodeCells(w: *std.Io.Writer, row: ?RungRow) !void {
+    const r = row orelse {
+        try w.writeAll(" · | · | · | · | · |");
+        return;
+    };
+    for (0..samples_per_rung) |i| {
+        if (i < r.n) try w.print(" {d:.1} |", .{r.tps[i]}) else try w.writeAll(" · |");
     }
+    try w.print(" {d:.1} | {s} |", .{ median(r.tps[0..r.n]), modeLabel(r) });
+}
 
-    try w.writeAll("\n## Prefill by window (tok/s)\n\n| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s |\n|---|---:|---:|---:|---:|---:|\n");
-    for (rep.samples) |s| {
-        if (s.kind != .ladder) continue;
+fn findRow(rows: []const RungRow, len: usize) ?RungRow {
+    for (rows) |r| if (r.len == len) return r;
+    return null;
+}
+
+fn writeWindows(w: *std.Io.Writer, samples: []const Sample, arm: Arm) !void {
+    try w.print("\n## Prefill by window, {s} (tok/s)\n\n| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s |\n|---|---:|---:|---:|---:|---:|\n", .{@tagName(arm)});
+    for (samples) |s| {
+        if (s.arm != arm or s.kind != .ladder) continue;
         try w.writeAll("| ");
         try writeThousands(w, @floatFromInt(s.cached_n));
         try w.writeAll(" to ");
@@ -461,31 +473,88 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
         try writeThousands(w, s.prefillTps());
         try w.print(" | {d:.0} | {d:.2} |\n", .{ s.restore_ms, s.ttftMs() / 1000.0 });
     }
+}
 
-    try w.writeAll("\n## Summary row\n\nPrefill is the window that ends at the rung; decode is the median of the samples.\n\n| Sushi |  |");
-    for (rows.items) |row| {
+fn writeSummaryRows(w: *std.Io.Writer, name: []const u8, rows: []const RungRow, samples: []const Sample, arm: Arm) !void {
+    try w.print("| **{s}** | Prefill |", .{name});
+    for (rows) |row| {
+        try w.writeAll(" ");
+        for (samples) |s| if (s.arm == arm and s.kind == .ladder and s.prompt_len == row.len) try writeThousands(w, s.prefillTps());
+        try w.writeAll(" |");
+    }
+    try w.writeAll("\n|  | Decode |");
+    for (rows) |row| try w.print(" {d:.1} |", .{median(row.tps[0..row.n])});
+    try w.writeAll("\n");
+}
+
+pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    var code = try rungRows(allocator, rep.samples, .code);
+    defer code.deinit(allocator);
+    var prose = try rungRows(allocator, rep.samples, .prose);
+    defer prose.deinit(allocator);
+    const has_prose = prose.items.len > 0;
+
+    try w.print("# {s} bench", .{rep.model});
+    if (rep.version.len > 0) try w.print(" (Sushi {s})", .{rep.version});
+    try w.writeAll("\n\n");
+    var lines = std.mem.splitSequence(u8, rep.stamp, "\\n");
+    while (lines.next()) |l| if (l.len > 0) try w.print("{s}\n\n", .{l});
+    try w.print(
+        "Protocol: token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample. The code arm is one fixed seeded TypeScript corpus; " ++
+            "the prose arm is Pride and Prejudice (public domain), where speculative acceptance is lower. " ++
+            "Each arm runs in turn on the same server: the 4k request is cold; each later request restores the previous prompt-end point. A decode rung's samples 2 and 3 run right after its ladder request, and the first request counts. " ++
+            "The server's own prefill time, the restore time (logged apart) taken out; TTFT is the request wall time minus its decode time. The server's default speculative mode stays on.\n\n",
+        .{rep.decode_tokens},
+    );
+
+    try w.writeAll("## Decode (tok/s)\n\n| Rung | Code 1 | Code 2 | Code 3 | Code median | Code mode |");
+    if (has_prose) try w.writeAll(" Prose 1 | Prose 2 | Prose 3 | Prose median | Prose mode | Prose / code |");
+    try w.writeAll("\n|---|---:|---:|---:|---:|---|");
+    if (has_prose) try w.writeAll("---:|---:|---:|---:|---|---:|");
+    try w.writeAll("\n");
+    for (code.items) |row| {
+        try w.writeAll("| ");
+        try writeRungLabel(w, row.len);
+        try w.writeAll(" |");
+        try writeDecodeCells(w, row);
+        if (has_prose) {
+            const p = findRow(prose.items, row.len);
+            try writeDecodeCells(w, p);
+            const cm = median(row.tps[0..row.n]);
+            if (p != null and cm > 0) try w.print(" {d:.2} |", .{median(p.?.tps[0..p.?.n]) / cm}) else try w.writeAll(" · |");
+        }
+        try w.writeAll("\n");
+    }
+
+    try writeWindows(w, rep.samples, .code);
+    if (has_prose) try writeWindows(w, rep.samples, .prose);
+
+    try w.writeAll("\n## Summary rows\n\nPrefill is the window that ends at the rung; decode is the median of the samples. The code rows are the ones to compare across releases.\n\n| Sushi |  |");
+    for (code.items) |row| {
         try w.writeAll(" ");
         try writeRungLabel(w, row.len);
         try w.writeAll(" |");
     }
     try w.writeAll("\n|---|---|");
-    for (rows.items) |_| try w.writeAll("---:|");
-    try w.print("\n| **{s}** | Prefill |", .{rep.model});
-    for (rows.items) |row| {
-        try w.writeAll(" ");
-        for (rep.samples) |s| if (s.kind == .ladder and s.prompt_len == row.len) try writeThousands(w, s.prefillTps());
-        try w.writeAll(" |");
-    }
-    try w.writeAll("\n|  | Decode |");
-    for (rows.items) |row| try w.print(" {d:.1} |", .{median(row.tps[0..row.n])});
+    for (code.items) |_| try w.writeAll("---:|");
     try w.writeAll("\n");
+    try writeSummaryRows(w, rep.model, code.items, rep.samples, .code);
+    if (has_prose) {
+        const pname = try std.fmt.allocPrint(allocator, "{s} (prose)", .{rep.model});
+        defer allocator.free(pname);
+        try writeSummaryRows(w, pname, prose.items, rep.samples, .prose);
+    }
 
     var any = false;
     for (rep.samples) |s| {
         const p = check(s) orelse continue;
         if (!any) try w.writeAll("\n## Warnings\n\nA row with a warning is not a valid measurement.\n\n");
         any = true;
-        try w.print("- {d} tokens ({s}): {s}\n", .{ s.prompt_len, @tagName(s.kind), switch (p) {
+        try w.print("- {s}, {d} tokens ({s}): {s}\n", .{ @tagName(s.arm), s.prompt_len, @tagName(s.kind), switch (p) {
             .restore_missed => "restored fewer tokens than the previous prompt end holds",
             .no_restore_line => "no restore line in the server log, so the restore time was not taken out",
             .short_decode => "decoded fewer tokens than asked",
@@ -551,6 +620,46 @@ fn printOut(io: std.Io, text: []const u8) !void {
     try w.interface.flush();
 }
 
+/// One request of the plan: send the prompt, then read what the server logged for it (the restore line always
+/// lands, the speculative mode only on a decode) a moment after the response.
+fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, model: []const u8, log_path: []const u8, ids: []const u32, req: Request, arm: Arm, log_len: *usize) !Sample {
+    const body = try promptBody(a, model, ids[0..req.prompt_len], req.max_tokens);
+    var wall = io_util.Stopwatch.init(io);
+    const resp = try post(a, client, url, body);
+    const wall_ms = @as(f64, @floatFromInt(wall.read())) / std.time.ns_per_ms;
+    const c = try parseCompletion(a, resp);
+
+    var restore: ?Restore = null;
+    var mode: ?[]const u8 = null;
+    var tries: usize = 0;
+    while (tries < 20) : (tries += 1) {
+        const text = try readLog(a, io, log_path);
+        const seg = text[@min(log_len.*, text.len)..];
+        restore = parseRestore(seg);
+        mode = parseSpecMode(seg);
+        if (restore != null and (mode != null or req.max_tokens <= 1)) break;
+        std.Io.sleep(io, .fromMilliseconds(500), .real) catch {};
+    }
+    log_len.* = (try readLog(a, io, log_path)).len;
+
+    return .{
+        .arm = arm,
+        .prompt_len = req.prompt_len,
+        .kind = req.kind,
+        .base = req.base,
+        .max_tokens = req.max_tokens,
+        .prompt_n = c.prompt_n,
+        .cached_n = c.cached_n,
+        .completion_n = c.completion_n,
+        .prompt_ms = c.prompt_ms,
+        .predicted_ms = c.predicted_ms,
+        .wall_ms = wall_ms,
+        .restore_ms = if (restore) |r| r.ms else 0,
+        .restore_logged = restore != null,
+        .mode = mode orelse "",
+    };
+}
+
 pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = parseArgs(args) catch |err| {
         log.err("sushi bench: {s}\n\n{s}", .{ @errorName(err), USAGE });
@@ -580,56 +689,37 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         model = parsed.value.data[0].id;
     }
 
-    var ids: std.ArrayList(u32) = .empty;
-    var corpus = Corpus.init(corpus_seed);
-    while (ids.items.len < corpus_tokens) try tokenizeChunk(a, &client, base, try corpus.nextChunk(a), &ids);
-    log.info("[bench] corpus: {d} tokens, model {s}\n", .{ ids.items.len, model });
-
     const reqs = try plan(a, opts.decode_tokens);
     var samples: std.ArrayList(Sample) = .empty;
     const url = try std.fmt.allocPrint(a, "{s}/v1/completions", .{base});
     var log_len: usize = (try readLog(a, io, opts.log_path)).len;
-    for (reqs) |req| {
-        const body = try promptBody(a, model, ids.items[0..req.prompt_len], req.max_tokens);
-        var wall = io_util.Stopwatch.init(io);
-        const resp = try post(a, &client, url, body);
-        const wall_ms = @as(f64, @floatFromInt(wall.read())) / std.time.ns_per_ms;
-        const c = try parseCompletion(a, resp);
-
-        // The log lines land a moment after the response; the restore line always comes, the mode only on a decode.
-        var restore: ?Restore = null;
-        var mode: ?[]const u8 = null;
-        var tries: usize = 0;
-        while (tries < 20) : (tries += 1) {
-            const text = try readLog(a, io, opts.log_path);
-            const seg = text[@min(log_len, text.len)..];
-            restore = parseRestore(seg);
-            mode = parseSpecMode(seg);
-            if (restore != null and (mode != null or req.max_tokens <= 1)) break;
-            std.Io.sleep(io, .fromMilliseconds(500), .real) catch {};
+    for ([_]Arm{ .code, .prose }) |arm| {
+        var ids: std.ArrayList(u32) = .empty;
+        switch (arm) {
+            .code => {
+                var corpus = Corpus.init(corpus_seed);
+                while (ids.items.len < corpus_tokens) try tokenizeChunk(a, &client, base, try corpus.nextChunk(a), &ids);
+            },
+            .prose => {
+                var chunks: ProseChunks = .{ .text = prose_text };
+                while (ids.items.len < corpus_tokens) {
+                    const piece = chunks.next() orelse {
+                        log.err("sushi bench: the prose corpus holds {d} tokens, short of the {d} the ladder needs\n", .{ ids.items.len, corpus_tokens });
+                        return error.BenchProseTooShort;
+                    };
+                    try tokenizeChunk(a, &client, base, piece, &ids);
+                }
+            },
         }
-        log_len = (try readLog(a, io, opts.log_path)).len;
-
-        const s: Sample = .{
-            .prompt_len = req.prompt_len,
-            .kind = req.kind,
-            .base = req.base,
-            .max_tokens = req.max_tokens,
-            .prompt_n = c.prompt_n,
-            .cached_n = c.cached_n,
-            .completion_n = c.completion_n,
-            .prompt_ms = c.prompt_ms,
-            .predicted_ms = c.predicted_ms,
-            .wall_ms = wall_ms,
-            .restore_ms = if (restore) |r| r.ms else 0,
-            .restore_logged = restore != null,
-            .mode = mode orelse "",
-        };
-        try samples.append(a, s);
-        log.info("[bench] {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}{s}\n", .{
-            s.prompt_len, @tagName(s.kind), s.cached_n, s.newTokens(), s.prefillTps(), s.ttftMs() / 1000.0, s.decodeTps(), if (s.mode.len > 0) s.mode else "none",
-            if (check(s) != null) " WARNING" else "",
-        });
+        log.info("[bench] {s} corpus: {d} tokens, model {s}\n", .{ @tagName(arm), ids.items.len, model });
+        for (reqs) |req| {
+            const s = try runRequest(a, io, &client, url, model, opts.log_path, ids.items, req, arm, &log_len);
+            try samples.append(a, s);
+            log.info("[bench] {s} {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}{s}\n", .{
+                @tagName(arm),                     s.prompt_len,  @tagName(s.kind), s.cached_n, s.newTokens(), s.prefillTps(), s.ttftMs() / 1000.0, s.decodeTps(),
+                if (s.mode.len > 0) s.mode else "none", if (check(s) != null) " WARNING" else "",
+            });
+        }
     }
 
     const rep: Report = .{ .model = model, .version = opts.version, .stamp = opts.stamp, .decode_tokens = opts.decode_tokens, .samples = samples.items };
@@ -801,13 +891,71 @@ test "bench report: decode rows, the window table, the summary row and the warni
     try testing.expect(std.mem.indexOf(u8, md, "# Pack-X bench (Sushi 1.4.0)") != null);
     try testing.expect(std.mem.indexOf(u8, md, "commit abc\n\nM5 Max") != null);
     // 512 tokens in 10 s, 8 s and 16 s is 51.2, 64.0 and 32.0 tok/s; the median is 51.2.
-    try testing.expect(std.mem.indexOf(u8, md, "| 4k | 51.2 | 64.0 | 32.0 | 51.2 | dspark | 0 / 4,065 / 4,065 |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| 4k | 51.2 | 64.0 | 32.0 | 51.2 | dspark |") != null);
     try testing.expect(std.mem.indexOf(u8, md, "| 4,065 to 8,192 | 4,065 | 4,127 | 1,032 |") != null);
     try testing.expect(std.mem.indexOf(u8, md, "| **Pack-X** | Prefill |") != null);
     try testing.expect(std.mem.indexOf(u8, md, "## Warnings") == null);
+    try testing.expect(std.mem.indexOf(u8, md, "Prose") == null);
     var bad = samples;
     bad[3].cached_n = 0;
     const md2 = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &bad });
     defer a.free(md2);
     try testing.expect(std.mem.indexOf(u8, md2, "## Warnings") != null);
+}
+
+test "bench prose: the embedded novel is clean, whole, and cut into paragraph-aligned pieces" {
+    try testing.expect(prose_text.len > 600 * 1024);
+    // The Project Gutenberg header, footer and trademark terms are not part of the corpus.
+    try testing.expect(std.mem.indexOf(u8, prose_text, "Gutenberg") == null);
+    try testing.expect(std.mem.indexOf(u8, prose_text, "It is a truth universally acknowledged") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, prose_text, '\r') == null);
+    var chunks: ProseChunks = .{ .text = prose_text };
+    var total: usize = 0;
+    var n: usize = 0;
+    var rebuilt = std.ArrayList(u8).empty;
+    defer rebuilt.deinit(testing.allocator);
+    while (chunks.next()) |piece| : (n += 1) {
+        try testing.expect(piece.len > 0 and piece.len <= 24 * 1024);
+        total += piece.len;
+        try rebuilt.appendSlice(testing.allocator, piece);
+        // A cut lands on a blank line unless it is the last piece.
+        if (total < prose_text.len) try testing.expect(std.mem.endsWith(u8, piece, "\n\n"));
+    }
+    try testing.expectEqual(prose_text.len, total);
+    try testing.expectEqualStrings(prose_text, rebuilt.items);
+    try testing.expect(n > 25);
+    try testing.expect(chunks.next() == null);
+}
+
+test "bench report: a prose arm sits beside the code arm and gets its own summary rows" {
+    const a = testing.allocator;
+    const mk = struct {
+        fn s(arm: Arm, len: usize, kind: Kind, base: usize, max: u32, cached: u32, decode_ms: f64) Sample {
+            return .{ .arm = arm, .prompt_len = len, .kind = kind, .base = base, .max_tokens = max, .prompt_n = @intCast(len), .cached_n = cached, .completion_n = if (max > 1) 512 else 1, .prompt_ms = 4000, .predicted_ms = decode_ms, .wall_ms = 4500 + decode_ms, .restore_ms = 0, .restore_logged = true, .mode = "dspark" };
+        }
+    }.s;
+    const samples = [_]Sample{
+        mk(.code, 4096, .ladder, 0, 512, 0, 10_000),
+        mk(.code, 4096, .repeat, 4096, 512, 4065, 10_000),
+        mk(.code, 4096, .repeat, 4096, 512, 4065, 10_000),
+        mk(.prose, 4096, .ladder, 0, 512, 0, 20_000),
+        mk(.prose, 4096, .repeat, 4096, 512, 4065, 20_000),
+        mk(.prose, 4096, .repeat, 4096, 512, 4065, 20_000),
+        mk(.prose, 8192, .ladder, 4096, 1, 4065, 50),
+    };
+    const md = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &samples });
+    defer a.free(md);
+    // 512 tokens in 10 s is 51.2 tok/s on code and 25.6 on prose: a ratio of 0.50.
+    try testing.expect(std.mem.indexOf(u8, md, "| 4k | 51.2 | 51.2 | 51.2 | 51.2 | dspark | 25.6 | 25.6 | 25.6 | 25.6 | dspark | 0.50 |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## Prefill by window, code") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## Prefill by window, prose") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| **Pack-X** | Prefill |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| **Pack-X (prose)** | Prefill |") != null);
+    // The code row keeps its place ahead of the prose row.
+    try testing.expect(std.mem.indexOf(u8, md, "| **Pack-X** |").? < std.mem.indexOf(u8, md, "| **Pack-X (prose)** |").?);
+    var bad = samples;
+    bad[6].cached_n = 0;
+    const md2 = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &bad });
+    defer a.free(md2);
+    try testing.expect(std.mem.indexOf(u8, md2, "- prose, 8192 tokens (ladder)") != null);
 }

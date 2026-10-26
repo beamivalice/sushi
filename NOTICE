@@ -654,6 +654,10 @@ and they are listed because they made that work possible.
 Model weights downloaded at runtime carry their own licenses from their
 publishers. sushi does not redistribute them.
 
+`src/fixtures/prose_pride_and_prejudice.txt` is Jane Austen's Pride and Prejudice (1813), in the public domain,
+as Project Gutenberg eBook #1342 with the Project Gutenberg header and footer removed (its license allows that for a
+public-domain work once every reference to Project Gutenberg is gone). `sushi bench` embeds it as its prose corpus.
+
 WikiText-103 (Merity et al., CC BY-SA 3.0) is downloaded at runtime by
 `sushi convert exl3` as calibration text. sushi does not redistribute it.
 

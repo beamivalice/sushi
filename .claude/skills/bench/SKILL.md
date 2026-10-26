@@ -5,13 +5,13 @@ description: sushi benchmarking methodology — bench.sh/llmprobe usage, compari
 
 ## Benchmarking
 
-**`sushi bench` is the measurement layer.** `tests/bench.sh` boots one model, drives it with `sushi bench` and stops it. The protocol (one fixed token-id corpus, one cold prefill in 8k restore windows, three decode samples per rung 4k to 128k, restore time taken out of the prefill rate, the order rule) is in `docs/process-measurement.md#release-bench`; read it before changing anything. The wrapper takes the box rules itself, so a perf-gate run is one command:
+**`sushi bench` is the measurement layer.** `tests/bench.sh` boots one model, drives it with `sushi bench` and stops it. The protocol (a code corpus and a prose corpus, each one cold prefill in 8k restore windows, three decode samples per rung 4k to 128k, restore time taken out of the prefill rate, the order rule) is in `docs/process-measurement.md#release-bench`; read it before changing anything. The wrapper takes the box rules itself, so a perf-gate run is one command:
 
 ```
 ./tests/bench.sh --version 1.4.0 DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw -- --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000
 ```
 
-**Each cell is the shipping default**: the server's own speculative mode (DSpark, MTP, DFlash2) stays on, and the mode that actually engaged is read off each request's `[spec-stats] mode=` line and named in the report. A rung with `none` or `mixed` there is the regression signal; a request that did not restore from the previous prompt end is listed under Warnings and the run fails.
+**Each cell is the shipping default**: the server's own speculative mode (DSpark, MTP, DFlash2) stays on, and the mode that actually engaged is read off each request's `[spec-stats] mode=` line and named in the report. Read the prose rows beside the code rows: code decode flatters speculation (prose accepts fewer tokens a round), and only the code rows compare with earlier releases. A rung with `none` or `mixed` there is the regression signal; a request that did not restore from the previous prompt end is listed under Warnings and the run fails.
 
 **Another engine = llmprobe by hand.** Start LM Studio / oMLX / MTPLX / llama-server yourself and run `npx -y llmprobe@latest <host:port> -m <id> --bench-only`. llmprobe's cold-prefill-per-rung numbers are a different methodology from the release bench: never diff the two.
 
