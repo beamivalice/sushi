@@ -10409,8 +10409,11 @@ fn handleNonStreamingCompletion(
         "null";
     defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
 
+    const timings_field = try completionTimingsField(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    defer allocator.free(timings_field);
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
     , .{
         nextCompletionId(&completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
@@ -10422,10 +10425,19 @@ fn handleNonStreamingCompletion(
         result.prompt_tokens,
         result.completion_tokens,
         result.prompt_tokens + result.completion_tokens,
+        timings_field,
     });
     defer allocator.free(response);
 
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+/// `,"timings":{...}` for a non-streaming completion, empty when nothing was timed. The same object a chat reply carries.
+fn completionTimingsField(allocator: std.mem.Allocator, prompt_tokens: u32, cached_tokens: u32, completion_tokens: u32, prefill_ns: u64, decode_ns: u64) ![]u8 {
+    const obj = try formatTimingsObject(allocator, prompt_tokens, cached_tokens, completion_tokens, prefill_ns, decode_ns, 0);
+    defer allocator.free(obj);
+    if (obj.len == 0) return allocator.alloc(u8, 0);
+    return std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{obj});
 }
 
 fn handleStreamingCompletion(
@@ -28122,4 +28134,16 @@ test "DeepSeek vision serving: the processor carries the release's budgets, a pl
         largest = @max(largest, one);
     }
     try std.testing.expect(largest * 10 >= reserve * 8);
+}
+
+test "completionTimingsField: a non-streaming completion reports cached and prefill timings" {
+    const a = testing.allocator;
+    const field = try completionTimingsField(a, 8223, 31, 512, 2_000_000_000, 4_000_000_000);
+    defer a.free(field);
+    try testing.expect(std.mem.startsWith(u8, field, ",\"timings\":{"));
+    try testing.expect(std.mem.indexOf(u8, field, "\"cached_n\":31") != null);
+    try testing.expect(std.mem.indexOf(u8, field, "\"prompt_ms\":2000.000") != null);
+    const none = try completionTimingsField(a, 1, 0, 1, 0, 0);
+    defer a.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }

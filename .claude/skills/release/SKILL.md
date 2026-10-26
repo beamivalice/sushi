@@ -12,12 +12,12 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 | # | Step | Command | Pass |
 |---|---|---|---|
 | 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
-| 2 | **Perf gate** | the `docs/bench/<ver>/` run (below) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
+| 2 | **Perf gate** | `tests/bench.sh --version <ver> <pack>` (below) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
-| 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh`, plus the live test of each area the release changed (no `llmprobe --quick`: step 2's full bench covers it) | all pass |
+| 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh`, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
 | 5 | CI | none to dispatch: `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft. To check a tree without cutting: `gh workflow run release.yml -f dry_run=true` | green (the macOS 26.2 build gate) |
 | 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
-| 7 | Cross-engine (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
+| 7 | Cross-engine (only before a public claim) | start each engine yourself, `npx -y llmprobe@latest <host:port> -m <id> --bench-only` by hand | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
 
 **Rules:**
 - **Steps 2 and 7 are different questions.** 2 = "did our code regress", sushi only, every release. 7 = the public
@@ -25,24 +25,20 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 - **The perf gate times on AC power only.** Check `pmset -g batt` right before each model's run and log the power
   source beside it. A run that touched battery is discarded and rerun on AC: battery cost GLM 8–18% decode on 2026-10-11.
   - All other GPU work keeps the battery-above-30% rule.
-- **The perf gate is four models: Qwen STQ 2.75bpw, Qwen MCG 4bpw, GLM MCG 2.4bpw, DeepSeek STQ 1.75bpw.** It is ONE run per model whose
-  output IS the published `docs/bench/v<ver>/` report, in the format of `docs/bench/v1.2.0-dev/` (`summary.md` plus
-  one `<model>.md` per run): pinned `npx llmprobe@<ver> --bench-only --rungs 2k,4k,8k,16k,32k,64k,128k --runs 2`, one
-  model per server, GPU lock per model, fans at max and an idle before each server until the die is under 50 °C, at most 3 min (60 s once let heat
-  carry into the next model), commit, binary SHA-256 and mtime in
-  the header. A model whose speculative mode (MTP, DFlash2) did not engage is chased before shipping; a low cell gets
-  one rerun on a quiet box before anyone bisects.
-- **Each model's server starts on an EMPTY SSD prefix cache**: a fresh `HOME` per server (or `~/.sushi/kv-cache`
-  emptied right before it). A shared cache over its cap made every boot evict other models' entries during the probe:
-  MiMo prefill read 8–17% low on 2026-10-15, and an empty-cache A/B put v1.2.3 and 1.2.4 within 1%.
-- **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k.
+- **The perf gate is four models: Qwen STQ 2.75bpw, Qwen MCG 4bpw, GLM MCG 2.4bpw, DeepSeek STQ 1.75bpw.** It is ONE
+  `tests/bench.sh --version <ver> <pack> [-- <serve flags>]` run per model whose output IS the published
+  `docs/bench/v<ver>/` report (`summary.md` plus one `<model>.md` per run; protocol in
+  `docs/process-measurement.md#release-bench`). The wrapper holds the GPU lock per model, fans max and an idle under 50 °C
+  (at most 3 min), a private SSD prefix cache per server, and stamps commit, binary SHA-256 and mtime in the header. A
+  model whose speculative mode (MTP, DFlash2, DSpark) did not engage is chased before shipping; a low cell gets one rerun on a
+  quiet box before anyone bisects. A run with Warnings (a window that did not restore) is not a measurement: rerun it.
 - **Never quote a win without naming the engine it is over.**
 - **`benchmarks.md` gets one new column per release**, from step 2's report. Obey its header rules: tables
   only, M5 Max only.
 
 ## Release artifacts
 
-The release record is `docs/bench/v<ver>/` and `benchmarks.md`, plus the raw llmprobe reports (JSON and HTML) under
+The release record is `docs/bench/v<ver>/` and `benchmarks.md`, plus the raw `sushi bench` JSON and server logs under
 `~/.sushi/runs/bench-<tag>/`; no CSVs or charts land in `docs/`. The working baselines agents inherit between releases live in
 `docs/perf-baselines.md` (the release column is also added there as a cited row). A number taken mid-cycle is stale the
 moment another perf round lands: run the gate on the final tree.

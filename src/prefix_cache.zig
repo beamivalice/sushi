@@ -4388,6 +4388,11 @@ pub const HotPrefixCache = struct {
 
 // ── Tests ──
 
+/// The line every request logs once its prefix lookup is done; `sushi bench` parses it to take the restore out of the prefill time.
+pub fn restoreLogLine(buf: []u8, tag: []const u8, matched: usize, prompt_len: usize, tier: []const u8, restore_ms: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s} reused {d} of {d} prompt tokens from {s}, prefilling {d}; lookup and restore {d} ms", .{ tag, matched, prompt_len, tier, prompt_len - matched, restore_ms });
+}
+
 const testing = std.testing;
 
 test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
@@ -15016,4 +15021,12 @@ test "DeepSeek SSD tier under the engine's default KV scheme, which every slot c
     const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
     try testing.expectEqual(@as(usize, 512), res.matched);
     try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
+}
+
+test "restoreLogLine: one shape for every arch, the tag aside" {
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings(
+        "[prefix] reused 8161 of 16384 prompt tokens from SSD, prefilling 8223; lookup and restore 42 ms",
+        try restoreLogLine(&buf, "[prefix]", 8161, 16384, "SSD", 42),
+    );
 }

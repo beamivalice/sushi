@@ -595,7 +595,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   permit (or one point, when smaller) and one point's fixed rings. An SSD restore holds in RAM only what the model then owns: the checkpoint's arrays become the request's state
   (the state bill), and its file read is transient. The disk budget formula prices an entry at the cap of full states
   (`diskBytesPerToken`).
-- Every request logs `[dsv41-prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms`.
+- Every request logs `[dsv41-prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms`; every other arch logs the same line tagged `[prefix]`.
 
 **Real pack.** `DeepSeek-V4.1-Flash-1017`, M5 Max, `--ssd-budget-gb 76` (100, 92 and 84 are refused with `ExpertCacheDoesNotFit`: the
 stages' 8 GB sit beside the serving bytes the load check adds), bf16 KV, 160 greedy tokens, no GPU lock held by

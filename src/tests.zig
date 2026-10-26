@@ -128,6 +128,7 @@ test {
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
     _ = @import("kld.zig");
+    _ = @import("bench.zig");
     _ = @import("cli.zig");
     _ = @import("repl_tools.zig");
     _ = @import("repl_input.zig");

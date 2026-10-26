@@ -4,11 +4,11 @@ A flag exists for a setting a user picks: a real tradeoff (`--kv-quant 4` for co
 
 Precedence: an explicit flag outranks `model-settings.json`, which outranks the default ([server-lifecycle](server-lifecycle.md#settings)). A flag that mirrors a settings key adds the precedence and nothing else; that is not bloat by itself.
 
-The map is the code's: every argument the parsers accept, at `main` 393228b9 less the flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update`, `kld` and `convert` parse their own. `pull` and `list` take no flags and reject extra arguments.
+The map is the code's: every argument the parsers accept, at `main` 393228b9 less the flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update`, `kld`, `bench` and `convert` parse their own. `pull` and `list` take no flags and reject extra arguments.
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 106 rows: 58 shared by `run`, `serve` and the bare form, 48 in `run`, `launch`, `update`, `kld` and `convert`. By who: user 33, operator 28, machine 17, dev 27, dead 1. By recommendation: keep 98, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
+**Summary.** 114 rows: 58 shared by `run`, `serve` and the bare form, 56 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 33, operator 28, machine 17, dev 35, dead 1. By recommendation: keep 106, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -138,6 +138,14 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--ctx-size` | model max → context override (kld.zig:108) | dev | help | keep |
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
 | `kld`: `--qwen-gdn` | `32` → `16` scores a bf16-state student against the f32 teacher; a GLM capture refuses it (kld.zig:107) | dev | help, quality-kld; 2 tests | keep |
+| `bench`: `--url` | `127.0.0.1:8080` → `host:port` of the running server to drive (bench.zig `parseArgs`) | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--model` | first id of `/v1/models` → model id sent in each request | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--out` | required → directory for `bench.json`, the raw samples | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--log` | required → the server's log, read for `[spec-stats] mode=` and the restore line | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--report` | none → write the `docs/bench/v<ver>/<model>.md` report here | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--version` | none → release version in the report title | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--stamp` | none → header lines for the report (`\n` separates), which `tests/bench.sh` fills | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--decode-tokens` | `512` → tokens decoded per sample, at least 2 | dev | help, process-measurement; 1 test | keep |
 | `kld`: `--drop-expert` | `0` → compare only, the student drops n experts a layer by the pack's usage list; a capture refuses it (the teacher is exact) (kld.zig:112) | dev | help, dsv41-arch; 1 test | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |

@@ -48,6 +48,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **A restore is not bit-identical on a HYBRID** (≤ 0.047 nats; the chunking class ~0.3 nats top-5 for QSA state) ⇒
   byte-stable greedy needs `--prefix-cache-entries 0`. A hybrid cache hit moves the top logprob ~0.2 nats, so any
   scorer boots with the cache off.
+- Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
   span (`ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**

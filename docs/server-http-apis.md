@@ -134,6 +134,7 @@ before reading a completed stream and requires clean EOF.
   constantly; `ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`applyTopP` floors at `floatMin(f32)`).
 - A sampler never draws a RESERVED special or PADDING row (`installSuppressMask`; logprobs stay RAW).
+- **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
   (`requestEosSlice`); stop sequences and the loop stops still end it, and its text skips `special: true` tokens
   (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400

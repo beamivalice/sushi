@@ -7,6 +7,7 @@ const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 pub const tokenizer = tokenizer_mod;
 pub const kld = kld_mod;
+pub const bench = bench_mod;
 pub const imatrix = @import("imatrix.zig");
 pub const transformer = transformer_mod;
 const transformer_mod = @import("transformer.zig");
@@ -26,6 +27,7 @@ const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const bench_mod = @import("bench.zig");
 const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
@@ -124,6 +126,9 @@ fn printUsage(io: std.Io) void {
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
+        \\  bench               Drive a running server through the release bench
+        \\                      (tests/bench.sh boots it and takes the box rules).
+        \\                      `sushi bench --help` for options
         \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
         \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
         \\                      (routed experts as EXL3). `sushi convert --help`
@@ -476,6 +481,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "kld")) {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "bench")) {
+            try bench_mod.cmdBench(allocator, io, args[2..]);
+            return;
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
             return;
@@ -483,7 +491,7 @@ pub fn main(init: std.process.Init) !void {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, convert, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }

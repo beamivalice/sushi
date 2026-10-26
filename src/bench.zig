@@ -1,0 +1,813 @@
+//! `sushi bench`: the release bench client. It drives a server somebody else booted (tests/bench.sh does the
+//! hygiene and the boot) with one fixed token-id corpus: a 4k cold request, then 16 windows of 8192 tokens,
+//! each restoring the previous request's prompt-end point. Docs: process-measurement.md#release-bench.
+
+const std = @import("std");
+const io_util = @import("io_util.zig");
+const log = @import("log.zig");
+const testing = std.testing;
+
+pub const window: usize = 8192;
+pub const first_rung: usize = 4096;
+pub const ladder_steps: usize = 16;
+pub const samples_per_rung: usize = 3;
+pub const corpus_seed: u64 = 0x5a5a_c0de;
+/// The ladder must reach 128k tokens, plus a margin so the last window is never short.
+const corpus_tokens: usize = 132_000;
+/// A request counts as restored when its cached tokens fall this close below the point it should restore
+/// (the prompt-end checkpoint trails the prompt end by up to 34 tokens).
+const restore_slack: usize = 64;
+const rungs = [_]usize{ 4096, 8192, 16384, 32768, 65536, 131072 };
+
+pub const USAGE =
+    \\Usage: sushi bench --out <dir> --log <server.log> [options]
+    \\
+    \\Drives a running server through the release bench: a cold 4k request, 16 windows of 8192 tokens
+    \\each restoring the previous prompt end, and 3 decode samples at 4k, 8k, 16k, 32k, 64k and 128k.
+    \\Boot the server and take the box rules with tests/bench.sh.
+    \\
+    \\Options:
+    \\  --url <host:port>      Server to drive (default 127.0.0.1:8080)
+    \\  --model <id>           Model id to send (default: the first id of /v1/models)
+    \\  --out <dir>            Directory for bench.json, the raw samples (required)
+    \\  --log <path>           The server's log, for the speculative mode and the restore time (required)
+    \\  --report <path>        Write the docs/bench/v<ver>/<model>.md report here
+    \\  --version <ver>        Release version for the report title
+    \\  --stamp <text>         Header lines for the report (commit, binary, hardware); \n separates lines
+    \\  --decode-tokens <n>    Tokens decoded per sample (default 512)
+    \\  --help                 Show this help
+    \\
+;
+
+pub const Options = struct {
+    help: bool = false,
+    url: []const u8 = "127.0.0.1:8080",
+    model: []const u8 = "",
+    out_dir: []const u8 = "",
+    log_path: []const u8 = "",
+    report: []const u8 = "",
+    version: []const u8 = "",
+    stamp: []const u8 = "",
+    decode_tokens: u32 = 512,
+};
+
+pub const ParseError = error{ UnknownArgument, MissingValue, BadValue, MissingRequired };
+
+/// Every flag that takes a value, for the parser and the help-lists-every-flag test.
+const value_flags = [_][]const u8{ "--url", "--model", "--out", "--log", "--report", "--version", "--stamp", "--decode-tokens" };
+
+pub fn parseArgs(args: []const []const u8) ParseError!Options {
+    var o: Options = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            o.help = true;
+            continue;
+        }
+        const idx = for (value_flags, 0..) |f, n| {
+            if (std.mem.eql(u8, a, f)) break n;
+        } else return error.UnknownArgument;
+        i += 1;
+        if (i >= args.len) return error.MissingValue;
+        const v = args[i];
+        switch (idx) {
+            0 => {
+                if (std.mem.indexOfScalar(u8, v, ':') == null or std.mem.indexOfScalar(u8, v, '/') != null) return error.BadValue;
+                o.url = v;
+            },
+            1 => o.model = v,
+            2 => o.out_dir = v,
+            3 => o.log_path = v,
+            4 => o.report = v,
+            5 => o.version = v,
+            6 => o.stamp = v,
+            7 => {
+                o.decode_tokens = std.fmt.parseInt(u32, v, 10) catch return error.BadValue;
+                if (o.decode_tokens < 2) return error.BadValue;
+            },
+            else => unreachable,
+        }
+    }
+    if (!o.help and (o.out_dir.len == 0 or o.log_path.len == 0)) return error.MissingRequired;
+    return o;
+}
+
+// ── The corpus ──────────────────────────────────────────────────────────
+
+const Rng = struct {
+    s: u64,
+
+    fn next(self: *Rng) u64 {
+        self.s +%= 0x9e3779b97f4a7c15;
+        var z = self.s;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        return z ^ (z >> 31);
+    }
+
+    fn below(self: *Rng, n: usize) usize {
+        return @intCast(self.next() % n);
+    }
+
+    fn pick(self: *Rng, comptime list: []const []const u8) []const u8 {
+        return list[self.below(list.len)];
+    }
+};
+
+const nouns = [_][]const u8{ "order", "invoice", "session", "token", "cart", "user", "ledger", "queue", "cache", "route", "tenant", "webhook", "report", "schedule", "policy", "metric", "stream", "batch", "index", "profile" };
+const verbs = [_][]const u8{ "load", "save", "parse", "merge", "drop", "fetch", "retry", "emit", "build", "verify", "resolve", "flush", "rotate", "sync", "encode" };
+const ts_types = [_][]const u8{ "string", "number", "boolean", "Date", "Uint8Array", "Record<string, unknown>", "string[]", "number | null" };
+
+fn cap(buf: []u8, word: []const u8) []const u8 {
+    @memcpy(buf[0..word.len], word);
+    buf[0] = std.ascii.toUpper(buf[0]);
+    return buf[0..word.len];
+}
+
+/// A seeded stream of synthetic TypeScript modules in an agent session's style: imports, interfaces,
+/// a service class, helpers. The same seed gives the same bytes on every box.
+pub const Corpus = struct {
+    rng: Rng,
+    module: usize = 0,
+
+    pub fn init(seed: u64) Corpus {
+        return .{ .rng = .{ .s = seed } };
+    }
+
+    /// Whole modules up to about 24 KB; the caller frees.
+    pub fn nextChunk(self: *Corpus, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        while (out.written().len < 24 * 1024) {
+            try self.writeModule(&out.writer);
+            try out.writer.writeAll("\n\n");
+        }
+        return out.toOwnedSlice();
+    }
+
+    fn writeModule(self: *Corpus, w: *std.Io.Writer) !void {
+        const r = &self.rng;
+        const n = self.module;
+        self.module += 1;
+        const noun = r.pick(&nouns);
+        const other = r.pick(&nouns);
+        var nb: [32]u8 = undefined;
+        var ob: [32]u8 = undefined;
+        const Noun = cap(&nb, noun);
+        const Other = cap(&ob, other);
+        try w.print("// src/{s}/{s}-{d}.ts\n", .{ noun, noun, n });
+        try w.print("import {{ {s}Record{d}, {s}Options }} from \"../{s}/{s}-{d}\";\n", .{ Other, r.below(900), Other, other, other, r.below(900) });
+        try w.writeAll("import type { Logger } from \"../core/logger\";\n\n");
+        try w.print("export interface {s}Record{d} {{\n  id: string;\n", .{ Noun, n });
+        for (0..3 + r.below(4)) |_| try w.print("  {s}{s}: {s};\n", .{ r.pick(&verbs), r.pick(&nouns), r.pick(&ts_types) });
+        try w.writeAll("}\n\n");
+        try w.print("export class {s}Service{d} {{\n  private readonly cache = new Map<string, {s}Record{d}>();\n", .{ Noun, n, Noun, n });
+        try w.print("  constructor(private readonly log: Logger, private readonly limit = {d}) {{}}\n", .{ 16 + r.below(4096) });
+        for (0..3 + r.below(3)) |_| {
+            const verb = r.pick(&verbs);
+            var vb: [32]u8 = undefined;
+            const Verb = cap(&vb, verb);
+            try w.print("\n  async {s}{s}(id: string, attempt = {d}): Promise<{s}Record{d} | undefined> {{\n", .{ verb, Noun, r.below(5), Noun, n });
+            try w.print("    const hit = this.cache.get(id);\n    if (hit && attempt < {d}) return hit;\n", .{ 1 + r.below(9) });
+            try w.print("    try {{\n      const next = await {s}{s}(id, {{ timeoutMs: {d} }});\n", .{ verb, Other, 50 * (1 + r.below(200)) });
+            try w.print("      this.cache.set(id, next);\n      this.log.info(`{s}{s} ${{id}} size=${{this.cache.size}}`);\n      return next;\n", .{ Verb, Noun });
+            try w.print("    }} catch (err) {{\n      if (attempt >= {d}) throw new Error(`{s} failed for ${{id}}: ${{String(err)}}`);\n", .{ 2 + r.below(6), verb });
+            try w.print("      return this.{s}{s}(id, attempt + 1);\n    }}\n  }}\n", .{ verb, Noun });
+        }
+        try w.writeAll("}\n\n");
+        try w.print("export function {s}Key{d}(parts: string[]): string {{\n  return parts.map((p) => p.trim().toLowerCase()).filter(Boolean).join(\"{s}\");\n}}", .{ noun, n, r.pick(&.{ ":", "/", "-", "|" }) });
+    }
+};
+
+// ── The plan ────────────────────────────────────────────────────────────
+
+pub const Kind = enum { ladder, repeat };
+
+pub const Request = struct {
+    prompt_len: usize,
+    max_tokens: u32,
+    kind: Kind,
+    /// The prompt length whose end point this request should restore; 0 = cold.
+    base: usize,
+};
+
+fn isRung(len: usize) bool {
+    return std.mem.indexOfScalar(usize, &rungs, len) != null;
+}
+
+/// The 4k cold request, then every 8192-token window; a rung is followed by its two repeats at once so
+/// a checkpoint cap cannot thin the point a repeat restores.
+pub fn plan(allocator: std.mem.Allocator, decode_tokens: u32) ![]Request {
+    var list: std.ArrayList(Request) = .empty;
+    errdefer list.deinit(allocator);
+    var prev: usize = 0;
+    var len: usize = first_rung;
+    var step: usize = 0;
+    while (true) : (step += 1) {
+        const decode = isRung(len);
+        try list.append(allocator, .{ .prompt_len = len, .max_tokens = if (decode) decode_tokens else 1, .kind = .ladder, .base = prev });
+        if (decode) for (1..samples_per_rung) |_| try list.append(allocator, .{ .prompt_len = len, .max_tokens = decode_tokens, .kind = .repeat, .base = len });
+        prev = len;
+        if (step >= ladder_steps) break;
+        len = window * (step + 1);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+// ── Samples ─────────────────────────────────────────────────────────────
+
+pub const Sample = struct {
+    prompt_len: usize,
+    kind: Kind,
+    base: usize,
+    max_tokens: u32,
+    prompt_n: u32,
+    cached_n: u32,
+    completion_n: u32,
+    prompt_ms: f64,
+    predicted_ms: f64,
+    wall_ms: f64,
+    restore_ms: f64,
+    restore_logged: bool,
+    mode: []const u8,
+
+    pub fn newTokens(s: Sample) u32 {
+        return s.prompt_n -| s.cached_n;
+    }
+
+    /// The server's prefill time includes the restore; the restore is logged apart and never counted.
+    pub fn prefillMs(s: Sample) f64 {
+        return @max(s.prompt_ms - s.restore_ms, 0);
+    }
+
+    pub fn prefillTps(s: Sample) f64 {
+        const ms = s.prefillMs();
+        return if (ms > 0) @as(f64, @floatFromInt(s.newTokens())) * 1000.0 / ms else 0;
+    }
+
+    pub fn decodeTps(s: Sample) f64 {
+        return if (s.predicted_ms > 0) @as(f64, @floatFromInt(s.completion_n)) * 1000.0 / s.predicted_ms else 0;
+    }
+
+    /// Request wall time up to the first token: everything but the decode after it.
+    pub fn ttftMs(s: Sample) f64 {
+        return @max(s.wall_ms - s.predicted_ms, 0);
+    }
+};
+
+pub const Problem = enum { restore_missed, no_restore_line, short_decode };
+
+pub fn check(s: Sample) ?Problem {
+    if (s.base == 0) {
+        if (s.cached_n != 0) return .restore_missed;
+    } else if (s.cached_n + restore_slack < s.base or s.cached_n > s.base) return .restore_missed;
+    if (!s.restore_logged) return .no_restore_line;
+    if (s.max_tokens > 1 and s.completion_n < s.max_tokens) return .short_decode;
+    return null;
+}
+
+pub fn median(vals: []const f64) f64 {
+    var buf: [16]f64 = undefined;
+    const n = @min(vals.len, buf.len);
+    if (n == 0) return 0;
+    @memcpy(buf[0..n], vals[0..n]);
+    std.mem.sort(f64, buf[0..n], {}, std.sort.asc(f64));
+    return if (n % 2 == 1) buf[n / 2] else (buf[n / 2 - 1] + buf[n / 2]) / 2;
+}
+
+// ── Wire formats ────────────────────────────────────────────────────────
+
+pub fn promptBody(allocator: std.mem.Allocator, model: []const u8, ids: []const u32, max_tokens: u32) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{");
+    if (model.len > 0) {
+        try w.writeAll("\"model\":");
+        try std.json.Stringify.value(model, .{}, w);
+        try w.writeAll(",");
+    }
+    try w.print("\"max_tokens\":{d},\"temperature\":0,\"ignore_eos\":true,\"stream\":false,\"prompt\":[", .{max_tokens});
+    for (ids, 0..) |id, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("{d}", .{id});
+    }
+    try w.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+pub const Completion = struct {
+    prompt_n: u32,
+    cached_n: u32,
+    completion_n: u32,
+    prompt_ms: f64,
+    predicted_ms: f64,
+};
+
+fn jsonNum(v: ?std.json.Value) ?f64 {
+    const x = v orelse return null;
+    return switch (x) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+pub fn parseCompletion(allocator: std.mem.Allocator, body: []const u8) !Completion {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadCompletion;
+    const t = parsed.value.object.get("timings") orelse return error.NoTimings;
+    if (t != .object) return error.NoTimings;
+    const o = t.object;
+    return .{
+        .prompt_n = @intFromFloat(jsonNum(o.get("prompt_n")) orelse return error.NoTimings),
+        .cached_n = @intFromFloat(jsonNum(o.get("cached_n")) orelse return error.NoTimings),
+        .completion_n = @intFromFloat(jsonNum(o.get("predicted_n")) orelse return error.NoTimings),
+        .prompt_ms = jsonNum(o.get("prompt_ms")) orelse return error.NoTimings,
+        .predicted_ms = jsonNum(o.get("predicted_ms")) orelse return error.NoTimings,
+    };
+}
+
+pub const Restore = struct { matched: usize, total: usize, ms: f64 };
+
+/// The last `... reused N of M prompt tokens from T, prefilling K; lookup and restore X ms` line of a log segment.
+pub fn parseRestore(segment: []const u8) ?Restore {
+    const key = " reused ";
+    const at = std.mem.lastIndexOf(u8, segment, key) orelse return null;
+    const line_end = std.mem.indexOfScalarPos(u8, segment, at, '\n') orelse segment.len;
+    const line = segment[at + key.len .. line_end];
+    var it = std.mem.tokenizeAny(u8, line, " ,;");
+    const matched = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    if (!std.mem.eql(u8, it.next() orelse return null, "of")) return null;
+    const total = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    const marker = "lookup and restore ";
+    const m = std.mem.indexOf(u8, line, marker) orelse return null;
+    var ms_it = std.mem.tokenizeScalar(u8, line[m + marker.len ..], ' ');
+    const ms = std.fmt.parseFloat(f64, ms_it.next() orelse return null) catch return null;
+    return .{ .matched = matched, .total = total, .ms = ms };
+}
+
+/// The speculative mode of the last `[spec-stats] mode=<m>` line of a log segment.
+pub fn parseSpecMode(segment: []const u8) ?[]const u8 {
+    const key = "[spec-stats] mode=";
+    const at = std.mem.lastIndexOf(u8, segment, key) orelse return null;
+    const rest = segment[at + key.len ..];
+    var n: usize = 0;
+    while (n < rest.len and std.ascii.isAlphanumeric(rest[n])) n += 1;
+    return if (n == 0) null else rest[0..n];
+}
+
+// ── The report ──────────────────────────────────────────────────────────
+
+pub const Report = struct {
+    model: []const u8,
+    version: []const u8,
+    stamp: []const u8,
+    decode_tokens: u32,
+    samples: []const Sample,
+};
+
+fn writeThousands(w: *std.Io.Writer, v: f64) !void {
+    const n: u64 = @intFromFloat(@round(@max(v, 0)));
+    var buf: [24]u8 = undefined;
+    const digits = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
+    for (digits, 0..) |c, i| {
+        if (i > 0 and (digits.len - i) % 3 == 0) try w.writeAll(",");
+        try w.writeByte(c);
+    }
+}
+
+fn writeRungLabel(w: *std.Io.Writer, len: usize) !void {
+    try w.print("{d}k", .{len / 1024});
+}
+
+const RungRow = struct {
+    len: usize,
+    n: usize = 0,
+    tps: [samples_per_rung]f64 = @splat(0),
+    cached: [samples_per_rung]u32 = @splat(0),
+    modes: [samples_per_rung][]const u8 = @splat(""),
+};
+
+fn modeLabel(row: RungRow) []const u8 {
+    const first = if (row.modes[0].len == 0) "none" else row.modes[0];
+    for (row.modes[1..row.n]) |m| {
+        const mm = if (m.len == 0) "none" else m;
+        if (!std.mem.eql(u8, mm, first)) return "mixed";
+    }
+    return first;
+}
+
+pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    var rows: std.ArrayList(RungRow) = .empty;
+    defer rows.deinit(allocator);
+    for (rep.samples) |s| {
+        if (s.max_tokens <= 1) continue;
+        if (rows.items.len == 0 or rows.items[rows.items.len - 1].len != s.prompt_len) try rows.append(allocator, .{ .len = s.prompt_len });
+        const row = &rows.items[rows.items.len - 1];
+        if (row.n >= samples_per_rung) continue;
+        row.tps[row.n] = s.decodeTps();
+        row.cached[row.n] = s.cached_n;
+        row.modes[row.n] = s.mode;
+        row.n += 1;
+    }
+
+    try w.print("# {s} bench", .{rep.model});
+    if (rep.version.len > 0) try w.print(" (Sushi {s})", .{rep.version});
+    try w.writeAll("\n\n");
+    var lines = std.mem.splitSequence(u8, rep.stamp, "\\n");
+    while (lines.next()) |l| if (l.len > 0) try w.print("{s}\n\n", .{l});
+    try w.print(
+        "Protocol: one fixed seeded TypeScript corpus as token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample. " ++
+            "The 4k request is cold; each later request restores the previous prompt-end point. A decode rung's samples 2 and 3 run right after its ladder request, and the first request counts. " ++
+            "The server's own prefill time, the restore time (logged apart) taken out; TTFT is the request wall time minus its decode time. The server's default speculative mode stays on.\n\n",
+        .{rep.decode_tokens},
+    );
+
+    try w.writeAll("## Decode (tok/s)\n\n| Rung | Sample 1 | Sample 2 | Sample 3 | Median | Speculative mode | Restored tokens |\n|---|---:|---:|---:|---:|---|---|\n");
+    for (rows.items) |row| {
+        try w.writeAll("| ");
+        try writeRungLabel(w, row.len);
+        try w.writeAll(" |");
+        for (0..samples_per_rung) |i| {
+            if (i < row.n) try w.print(" {d:.1} |", .{row.tps[i]}) else try w.writeAll(" · |");
+        }
+        try w.print(" {d:.1} | {s} |", .{ median(row.tps[0..row.n]), modeLabel(row) });
+        for (0..row.n) |i| {
+            try w.writeAll(if (i == 0) " " else " / ");
+            try writeThousands(w, @floatFromInt(row.cached[i]));
+        }
+        try w.writeAll(" |\n");
+    }
+
+    try w.writeAll("\n## Prefill by window (tok/s)\n\n| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s |\n|---|---:|---:|---:|---:|---:|\n");
+    for (rep.samples) |s| {
+        if (s.kind != .ladder) continue;
+        try w.writeAll("| ");
+        try writeThousands(w, @floatFromInt(s.cached_n));
+        try w.writeAll(" to ");
+        try writeThousands(w, @floatFromInt(s.prompt_n));
+        try w.writeAll(" | ");
+        try writeThousands(w, @floatFromInt(s.cached_n));
+        try w.writeAll(" | ");
+        try writeThousands(w, @floatFromInt(s.newTokens()));
+        try w.writeAll(" | ");
+        try writeThousands(w, s.prefillTps());
+        try w.print(" | {d:.0} | {d:.2} |\n", .{ s.restore_ms, s.ttftMs() / 1000.0 });
+    }
+
+    try w.writeAll("\n## Summary row\n\nPrefill is the window that ends at the rung; decode is the median of the samples.\n\n| Sushi |  |");
+    for (rows.items) |row| {
+        try w.writeAll(" ");
+        try writeRungLabel(w, row.len);
+        try w.writeAll(" |");
+    }
+    try w.writeAll("\n|---|---|");
+    for (rows.items) |_| try w.writeAll("---:|");
+    try w.print("\n| **{s}** | Prefill |", .{rep.model});
+    for (rows.items) |row| {
+        try w.writeAll(" ");
+        for (rep.samples) |s| if (s.kind == .ladder and s.prompt_len == row.len) try writeThousands(w, s.prefillTps());
+        try w.writeAll(" |");
+    }
+    try w.writeAll("\n|  | Decode |");
+    for (rows.items) |row| try w.print(" {d:.1} |", .{median(row.tps[0..row.n])});
+    try w.writeAll("\n");
+
+    var any = false;
+    for (rep.samples) |s| {
+        const p = check(s) orelse continue;
+        if (!any) try w.writeAll("\n## Warnings\n\nA row with a warning is not a valid measurement.\n\n");
+        any = true;
+        try w.print("- {d} tokens ({s}): {s}\n", .{ s.prompt_len, @tagName(s.kind), switch (p) {
+            .restore_missed => "restored fewer tokens than the previous prompt end holds",
+            .no_restore_line => "no restore line in the server log, so the restore time was not taken out",
+            .short_decode => "decoded fewer tokens than asked",
+        } });
+    }
+    return out.toOwnedSlice();
+}
+
+// ── The run ─────────────────────────────────────────────────────────────
+
+fn post(allocator: std.mem.Allocator, client: *std.http.Client, url: []const u8, body: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const res = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .keep_alive = false,
+        .response_writer = &out.writer,
+    });
+    if (res.status != .ok) {
+        log.err("sushi bench: {s} answered HTTP {d}: {s}\n", .{ url, @backingInt(res.status), out.written() });
+        return error.BenchHttpStatus;
+    }
+    return out.toOwnedSlice();
+}
+
+fn get(allocator: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const res = try client.fetch(.{ .location = .{ .url = url }, .keep_alive = false, .response_writer = &out.writer });
+    if (res.status != .ok) return error.BenchHttpStatus;
+    return out.toOwnedSlice();
+}
+
+fn readLog(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 30));
+}
+
+fn tokenizeChunk(allocator: std.mem.Allocator, client: *std.http.Client, base: []const u8, text: []const u8, ids: *std.ArrayList(u32)) !void {
+    const url = try std.fmt.allocPrint(allocator, "{s}/tokenize", .{base});
+    const body = try std.json.Stringify.valueAlloc(allocator, .{ .content = text }, .{});
+    const resp = try post(allocator, client, url, body);
+    const parsed = try std.json.parseFromSlice(struct { tokens: []const u32 }, allocator, resp, .{ .ignore_unknown_fields = true });
+    try ids.appendSlice(allocator, parsed.value.tokens);
+}
+
+fn writeFile(io: std.Io, path: []const u8, body: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    var buf: [16 * 1024]u8 = undefined;
+    var fw = f.writer(io, &buf);
+    try fw.interface.writeAll(body);
+    try fw.interface.flush();
+}
+
+fn printOut(io: std.Io, text: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(text);
+    try w.interface.flush();
+}
+
+pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    const opts = parseArgs(args) catch |err| {
+        log.err("sushi bench: {s}\n\n{s}", .{ @errorName(err), USAGE });
+        return err;
+    };
+    if (opts.help) {
+        try printOut(io, USAGE);
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const base = try std.fmt.allocPrint(a, "http://{s}", .{opts.url});
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+
+    _ = get(a, &client, try std.fmt.allocPrint(a, "{s}/health", .{base})) catch {
+        log.err("sushi bench: no server answers at {s}\n", .{base});
+        return error.BenchServerDown;
+    };
+    var model = opts.model;
+    if (model.len == 0) {
+        const body = try get(a, &client, try std.fmt.allocPrint(a, "{s}/v1/models", .{base}));
+        const parsed = try std.json.parseFromSlice(struct { data: []const struct { id: []const u8 } }, a, body, .{ .ignore_unknown_fields = true });
+        if (parsed.value.data.len == 0) return error.BenchNoModel;
+        model = parsed.value.data[0].id;
+    }
+
+    var ids: std.ArrayList(u32) = .empty;
+    var corpus = Corpus.init(corpus_seed);
+    while (ids.items.len < corpus_tokens) try tokenizeChunk(a, &client, base, try corpus.nextChunk(a), &ids);
+    log.info("[bench] corpus: {d} tokens, model {s}\n", .{ ids.items.len, model });
+
+    const reqs = try plan(a, opts.decode_tokens);
+    var samples: std.ArrayList(Sample) = .empty;
+    const url = try std.fmt.allocPrint(a, "{s}/v1/completions", .{base});
+    var log_len: usize = (try readLog(a, io, opts.log_path)).len;
+    for (reqs) |req| {
+        const body = try promptBody(a, model, ids.items[0..req.prompt_len], req.max_tokens);
+        var wall = io_util.Stopwatch.init(io);
+        const resp = try post(a, &client, url, body);
+        const wall_ms = @as(f64, @floatFromInt(wall.read())) / std.time.ns_per_ms;
+        const c = try parseCompletion(a, resp);
+
+        // The log lines land a moment after the response; the restore line always comes, the mode only on a decode.
+        var restore: ?Restore = null;
+        var mode: ?[]const u8 = null;
+        var tries: usize = 0;
+        while (tries < 20) : (tries += 1) {
+            const text = try readLog(a, io, opts.log_path);
+            const seg = text[@min(log_len, text.len)..];
+            restore = parseRestore(seg);
+            mode = parseSpecMode(seg);
+            if (restore != null and (mode != null or req.max_tokens <= 1)) break;
+            std.Io.sleep(io, .fromMilliseconds(500), .real) catch {};
+        }
+        log_len = (try readLog(a, io, opts.log_path)).len;
+
+        const s: Sample = .{
+            .prompt_len = req.prompt_len,
+            .kind = req.kind,
+            .base = req.base,
+            .max_tokens = req.max_tokens,
+            .prompt_n = c.prompt_n,
+            .cached_n = c.cached_n,
+            .completion_n = c.completion_n,
+            .prompt_ms = c.prompt_ms,
+            .predicted_ms = c.predicted_ms,
+            .wall_ms = wall_ms,
+            .restore_ms = if (restore) |r| r.ms else 0,
+            .restore_logged = restore != null,
+            .mode = mode orelse "",
+        };
+        try samples.append(a, s);
+        log.info("[bench] {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}{s}\n", .{
+            s.prompt_len, @tagName(s.kind), s.cached_n, s.newTokens(), s.prefillTps(), s.ttftMs() / 1000.0, s.decodeTps(), if (s.mode.len > 0) s.mode else "none",
+            if (check(s) != null) " WARNING" else "",
+        });
+    }
+
+    const rep: Report = .{ .model = model, .version = opts.version, .stamp = opts.stamp, .decode_tokens = opts.decode_tokens, .samples = samples.items };
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .model = model, .url = opts.url, .decode_tokens = opts.decode_tokens, .corpus_seed = corpus_seed, .stamp = opts.stamp, .samples = samples.items }, .{ .whitespace = .indent_2 });
+    try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench.json" }), raw);
+    const md = try render(a, rep);
+    if (opts.report.len > 0) try writeFile(io, opts.report, md);
+    try printOut(io, md);
+    for (samples.items) |s| if (check(s) != null) return error.BenchInvalidSamples;
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+test "bench args: defaults, every flag, and a refusal for the rest" {
+    const o = try parseArgs(&.{ "--out", "/tmp/o", "--log", "/tmp/l", "--decode-tokens", "256", "--url", "127.0.0.1:9", "--version", "1.4.0" });
+    try testing.expectEqual(@as(u32, 256), o.decode_tokens);
+    try testing.expectEqualStrings("127.0.0.1:9", o.url);
+    try testing.expectEqual(@as(u32, 512), (try parseArgs(&.{ "--out", "o", "--log", "l" })).decode_tokens);
+    try testing.expectError(error.UnknownArgument, parseArgs(&.{ "--out", "o", "--log", "l", "--fast" }));
+    try testing.expectError(error.MissingValue, parseArgs(&.{ "--out", "o", "--log" }));
+    try testing.expectError(error.BadValue, parseArgs(&.{ "--out", "o", "--log", "l", "--decode-tokens", "0" }));
+    try testing.expectError(error.BadValue, parseArgs(&.{ "--out", "o", "--log", "l", "--decode-tokens", "x" }));
+    try testing.expectError(error.BadValue, parseArgs(&.{ "--out", "o", "--log", "l", "--url", "http://h:1" }));
+    try testing.expectError(error.MissingRequired, parseArgs(&.{ "--url", "h:1" }));
+    try testing.expect((try parseArgs(&.{"--help"})).help);
+}
+
+test "bench: --help lists every flag the parser accepts" {
+    for (value_flags) |f| try testing.expect(std.mem.indexOf(u8, USAGE, f) != null);
+    try testing.expect(std.mem.indexOf(u8, USAGE, "--help") != null);
+}
+
+test "bench corpus: the same seed gives the same bytes, a chunk is whole modules" {
+    const a = testing.allocator;
+    var c1 = Corpus.init(corpus_seed);
+    var c2 = Corpus.init(corpus_seed);
+    var c3 = Corpus.init(corpus_seed + 1);
+    const x = try c1.nextChunk(a);
+    defer a.free(x);
+    const y = try c2.nextChunk(a);
+    defer a.free(y);
+    const z = try c3.nextChunk(a);
+    defer a.free(z);
+    try testing.expectEqualStrings(x, y);
+    try testing.expect(!std.mem.eql(u8, x, z));
+    try testing.expect(x.len >= 24 * 1024 and x.len < 40 * 1024);
+    try testing.expect(std.mem.indexOf(u8, x, "export class") != null);
+    try testing.expect(std.mem.endsWith(u8, x, "\n\n"));
+    const next = try c1.nextChunk(a);
+    defer a.free(next);
+    try testing.expect(!std.mem.eql(u8, x, next));
+}
+
+test "bench plan: a cold 4k, 16 windows, two repeats after each of the six decode rungs" {
+    const reqs = try plan(testing.allocator, 512);
+    defer testing.allocator.free(reqs);
+    try testing.expectEqual(@as(usize, 1 + ladder_steps + 6 * 2), reqs.len);
+    try testing.expectEqual(@as(usize, 4096), reqs[0].prompt_len);
+    try testing.expectEqual(@as(usize, 0), reqs[0].base);
+    try testing.expectEqual(@as(u32, 512), reqs[0].max_tokens);
+    // The 4k repeats come before the first window, which restores the 4k request's point.
+    try testing.expectEqual(Kind.repeat, reqs[1].kind);
+    try testing.expectEqual(@as(usize, 4096), reqs[2].base);
+    try testing.expectEqual(@as(usize, 8192), reqs[3].prompt_len);
+    try testing.expectEqual(@as(usize, 4096), reqs[3].base);
+    // A non-rung window decodes one token and restores the window before it.
+    const w3 = for (reqs) |r| {
+        if (r.prompt_len == 3 * window) break r;
+    } else unreachable;
+    try testing.expectEqual(@as(u32, 1), w3.max_tokens);
+    try testing.expectEqual(2 * window, w3.base);
+    const last = reqs[reqs.len - 1];
+    try testing.expectEqual(@as(usize, 131072), last.prompt_len);
+    try testing.expectEqual(Kind.repeat, last.kind);
+    var ladder: usize = 0;
+    for (reqs) |r| {
+        if (r.kind == .ladder) ladder += 1;
+        try testing.expect(r.prompt_len <= window * ladder_steps);
+    }
+    try testing.expectEqual(@as(usize, 1 + ladder_steps), ladder);
+}
+
+test "bench samples: the restore comes out of the prefill time, and a missed restore is flagged" {
+    var s: Sample = .{
+        .prompt_len = 16384, .kind = .ladder, .base = 8192, .max_tokens = 1, .prompt_n = 16384, .cached_n = 8161,
+        .completion_n = 1, .prompt_ms = 5000, .predicted_ms = 50, .wall_ms = 5100, .restore_ms = 1000, .restore_logged = true, .mode = "",
+    };
+    try testing.expectEqual(@as(u32, 8223), s.newTokens());
+    try testing.expectApproxEqAbs(@as(f64, 2055.75), s.prefillTps(), 0.01);
+    try testing.expectApproxEqAbs(@as(f64, 5050), s.ttftMs(), 0.01);
+    try testing.expect(check(s) == null);
+    s.cached_n = 4000;
+    try testing.expectEqual(Problem.restore_missed, check(s).?);
+    s.cached_n = 8161;
+    s.restore_logged = false;
+    try testing.expectEqual(Problem.no_restore_line, check(s).?);
+    s.restore_logged = true;
+    s.max_tokens = 512;
+    try testing.expectEqual(Problem.short_decode, check(s).?);
+    s.max_tokens = 1;
+    s.base = 0;
+    try testing.expectEqual(Problem.restore_missed, check(s).?);
+}
+
+test "bench median: odd, even and empty" {
+    try testing.expectEqual(@as(f64, 3), median(&.{ 5, 1, 3 }));
+    try testing.expectEqual(@as(f64, 2.5), median(&.{ 4, 1 }));
+    try testing.expectEqual(@as(f64, 0), median(&.{}));
+}
+
+test "bench wire: a prompt body is valid JSON with greedy ignore_eos token ids" {
+    const a = testing.allocator;
+    const body = try promptBody(a, "m\"x", &.{ 1, 22, 333 }, 512);
+    defer a.free(body);
+    const p = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer p.deinit();
+    const o = p.value.object;
+    try testing.expectEqualStrings("m\"x", o.get("model").?.string);
+    try testing.expectEqual(@as(i64, 512), o.get("max_tokens").?.integer);
+    try testing.expect(o.get("ignore_eos").?.bool);
+    try testing.expectEqual(@as(usize, 3), o.get("prompt").?.array.items.len);
+    const bare = try promptBody(a, "", &.{7}, 1);
+    defer a.free(bare);
+    try testing.expect(std.mem.indexOf(u8, bare, "\"model\"") == null);
+}
+
+test "bench wire: a completion's timings, and a reply without them is refused" {
+    const a = testing.allocator;
+    const c = try parseCompletion(a, "{\"usage\":{},\"timings\":{\"prompt_n\":8223,\"cached_n\":31,\"prompt_ms\":4000.5,\"predicted_n\":512,\"predicted_ms\":8000.0,\"tokenize_ms\":1.0}}");
+    try testing.expectEqual(@as(u32, 8223), c.prompt_n);
+    try testing.expectEqual(@as(u32, 31), c.cached_n);
+    try testing.expectEqual(@as(u32, 512), c.completion_n);
+    try testing.expectApproxEqAbs(@as(f64, 4000.5), c.prompt_ms, 0.001);
+    try testing.expectError(error.NoTimings, parseCompletion(a, "{\"usage\":{}}"));
+}
+
+test "bench log: the restore line the scheduler writes and the last spec mode parse back" {
+    const prefix_cache = @import("prefix_cache.zig");
+    var buf: [192]u8 = undefined;
+    const line = try prefix_cache.restoreLogLine(&buf, "[prefix]", 8161, 16384, "SSD", 42);
+    const seg = try std.fmt.allocPrint(testing.allocator, "noise\n{s}\n  [spec-stats] mode=mtp attempts=1\n  [spec-stats] mode=dspark attempts=2 x\n", .{line});
+    defer testing.allocator.free(seg);
+    const r = parseRestore(seg).?;
+    try testing.expectEqual(@as(usize, 8161), r.matched);
+    try testing.expectEqual(@as(usize, 16384), r.total);
+    try testing.expectEqual(@as(f64, 42), r.ms);
+    try testing.expectEqualStrings("dspark", parseSpecMode(seg).?);
+    try testing.expect(parseRestore("nothing here\n") == null);
+    try testing.expect(parseSpecMode("nothing here\n") == null);
+    const dsv = try prefix_cache.restoreLogLine(&buf, "[dsv41-prefix]", 0, 4096, "nothing", 0);
+    try testing.expectEqual(@as(usize, 0), parseRestore(dsv).?.matched);
+}
+
+test "bench report: decode rows, the window table, the summary row and the warnings" {
+    const a = testing.allocator;
+    const mk = struct {
+        fn s(len: usize, kind: Kind, base: usize, max: u32, cached: u32, tps_ms: f64) Sample {
+            return .{ .prompt_len = len, .kind = kind, .base = base, .max_tokens = max, .prompt_n = @intCast(len), .cached_n = cached, .completion_n = if (max > 1) 512 else 1, .prompt_ms = 4000, .predicted_ms = tps_ms, .wall_ms = 4500 + tps_ms, .restore_ms = 0, .restore_logged = true, .mode = "dspark" };
+        }
+    }.s;
+    const samples = [_]Sample{
+        mk(4096, .ladder, 0, 512, 0, 10_000),
+        mk(4096, .repeat, 4096, 512, 4065, 8_000),
+        mk(4096, .repeat, 4096, 512, 4065, 16_000),
+        mk(8192, .ladder, 4096, 512, 4065, 10_000),
+    };
+    const md = try render(a, .{ .model = "Pack-X", .version = "1.4.0", .stamp = "commit abc\\nM5 Max", .decode_tokens = 512, .samples = &samples });
+    defer a.free(md);
+    try testing.expect(std.mem.indexOf(u8, md, "# Pack-X bench (Sushi 1.4.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "commit abc\n\nM5 Max") != null);
+    // 512 tokens in 10 s, 8 s and 16 s is 51.2, 64.0 and 32.0 tok/s; the median is 51.2.
+    try testing.expect(std.mem.indexOf(u8, md, "| 4k | 51.2 | 64.0 | 32.0 | 51.2 | dspark | 0 / 4,065 / 4,065 |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| 4,065 to 8,192 | 4,065 | 4,127 | 1,032 |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| **Pack-X** | Prefill |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## Warnings") == null);
+    var bad = samples;
+    bad[3].cached_n = 0;
+    const md2 = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &bad });
+    defer a.free(md2);
+    try testing.expect(std.mem.indexOf(u8, md2, "## Warnings") != null);
+}

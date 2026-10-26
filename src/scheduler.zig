@@ -7434,9 +7434,15 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
-            if (xfm_ptr.dsv41 != null) log.info("[dsv41-prefix] reused {d} of {d} prompt tokens from {s}, prefilling {d}; lookup and restore {d} ms\n", .{
-                lookup.matched, slot.full_prompt.len, if (lookup.matched == 0) "nothing" else if (hc.last_restored_live) "the live state" else if (hc.last_restored_disk_id != null) "SSD" else "RAM", slot.full_prompt.len - lookup.matched, lookup_sw.read() / std.time.ns_per_ms,
-            });
+            var restore_line_buf: [192]u8 = undefined;
+            if (prefix_cache_mod.restoreLogLine(
+                &restore_line_buf,
+                if (xfm_ptr.dsv41 != null) "[dsv41-prefix]" else "[prefix]",
+                lookup.matched,
+                slot.full_prompt.len,
+                if (lookup.matched == 0) "nothing" else if (hc.last_restored_live) "the live state" else if (hc.last_restored_disk_id != null) "SSD" else "RAM",
+                lookup_sw.read() / std.time.ns_per_ms,
+            )) |line| log.info("{s}\n", .{line}) else |_| {}
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
