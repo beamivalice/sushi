@@ -329,6 +329,29 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
     (+8 us), the finish folded into the launch (the last threadgroup of an output block sums its partials in split order,
     arrival counters in a persistent buffer: 0 of 9e7 values differ, `wq_b` -1.1 / -2.6 us at 2 / 8 rows, `wo_b` ±1,
     `wq_a`+`wkv` +2.4 us at 8 rows with 40 splits).
+- **k sliced across the simdgroups of a threadgroup (sum order changes).** The NAX rows kernel takes `kph` slices of
+  four simdgroups each: slice j walks the k-tiles with `(tk - tk0) % kph == j`, the slices sum in threadgroup memory in
+  slice order, and `nsplit` 1 folds the finish into the launch (one dispatch, no partials). A row's bytes still do not
+  depend on the row count: the geometry reads the shape alone (`NAX_TUNED`: wq_a+wkv k4 s5, wq_b k4 s1, wo_a k4 s8,
+  wo_b k2 s4, head k1 s2; other shapes keep one slice and the split policy). Test: a row has the same bytes at widths 2
+  to 8 under kph 1/2/3/4/8 (kph 3 convicted a slice assignment read from the row-dependent chunk).
+  Sweep (`SUSHI_DSV41_TRUNK_UBENCH`, 642d8ba6, `MLX_MAX_OPS_PER_BUFFER=16`, GPU lock, QUIET, fans max, `kph` 1/2/4/8 x
+  every divisor `nsplit`, 7-12 rounds, same session as the "before"): the spread inside a shape is
+  2 to 3 us at the top, so only the shapes below move.
+
+  | us a call, R2 / R4 / R8 | before | after | floor |
+  |---|---|---|---|
+  | `wq_a`+`wkv` | 20.1 / 21.2 / 23.5 | 17.3 / 19.0 / 20.3 | 9.2 |
+  | `wq_b` | 48.5 / 53.6 / 61.8 | 48.1 / 49.9 / 54.0 | 35-37 |
+  | `wo_a` | 47.5 / 50.8 / 55.8 | 41.5 / 44.6 / 49.8 | 29.8 |
+  | `wo_b` | 50.8 / 54.2 / 59.5 | 48.1 / 51.2 / 57.0 | 36.5 |
+  | `idx_wq_b` (not tuned: 8 layers, best arm -0.7 us) | 11.9 / 12.6 / 14.2 | 11.9 / 12.7 / 14.1 | 5.9 |
+  | head n96 | 1040 / 1112 / 1204 | 1011 / 1030 / 1089 | 853 |
+
+  A layer's four calls: 167 / 180 / 201 us before, 155 / 165 / 181 after (40 layers: -0.5 / -0.6 / -0.8 ms). The rest of the
+  gap to the floor is the load pattern (1 KB runs at a 256 KB stride), not the sum. `idx_wq_b` stacked with `wq_b` would
+  save a launch in 8 of 40 layers, about 0.06 ms a token: not taken. The NAX arm at one row is no faster than the SIMD
+  arm (wq_b 47.7 vs 43.8 us), so one row stays SIMD.
 
 <a id="dsv41-stq"></a>
 ## DeepSeek-V4.1 STQ pack: shapes, arms, status

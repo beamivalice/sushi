@@ -2673,10 +2673,10 @@ const ROWS_BODY: [:0]const u8 =
 /// A threadgroup owns one 128-wide output block; FOLD as in `ROWS_SOURCE`.
 const ROWS_NAX_SOURCE: [:0]const u8 = metalReplaceFound(ROWS_NAX_BODY, "PREP_SLOT", "lane");
 const ROWS_NAX_BODY: [:0]const u8 =
-    \\constexpr uint SGS = 4u;
-    \\constexpr uint KPARTS = 1u;
+    \\constexpr uint SGS = 4u * uint(KPH);
+    \\constexpr uint KPARTS = uint(KPH);
     \\constexpr uint TGT = 8u;
-    \\constexpr uint PART_F = uint(ROWS) * 128u;
+    \\constexpr uint PART_F = uint(ROWS) * KPARTS * 128u;
     \\
 ++ ROWS_HEAD ++
     \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
@@ -2687,11 +2687,15 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\nax_zero(destination);
     \\const short2 origin = nax_origin(lane);
     \\const uint xrow = min(uint(origin.y), uint(ROWS) - 1u);
-    \\const device uint *wp = (const device uint *)trellis + ((size_t)tk0 * OT + ot0 + 2u * sg) * PACKED_W;
+    \\const uint lid = uint(thread_index_in_threadgroup);
+    \\const uint col0 = sg & 3u;
+    \\const uint kslice = sg >> 2u;
+    \\const device uint *wcol = (const device uint *)trellis + ((size_t)tk0 * OT + ot0 + 2u * col0) * PACKED_W;
     \\
 ++ ROWS_CHUNK_OPEN ++
     \\  const threadgroup half *pl = prep + xrow * uint(CHUNK) + uint(origin.x);
-    \\  for (uint tk = c0; tk < c1; tk++) {
+    \\  for (uint tk = c0 + (kslice + uint(KPH) - (c0 - tk0) % uint(KPH)) % uint(KPH); tk < c1; tk += uint(KPH)) {
+    \\    const device uint *wp = wcol + (size_t)(tk - tk0) * OT * PACKED_W;
     \\    const nfrag w0 = nax_wfrag_k<N>(wp, lane);
     \\    const nfrag w1 = nax_wfrag_k<N>(wp + PACKED_W, lane);
     \\    for (short s = 0; s < 8; s++) {
@@ -2704,15 +2708,14 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\      left[4 + c] = half(0.0h);
     \\    }
     \\    op.run(left, right, destination);
-    \\    wp += OT * PACKED_W;
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if (uint(origin.y) < uint(ROWS)) {
     \\  for (uint ct = 0u; ct < 2u; ct++) {
     \\    for (uint c = 0u; c < 4u; c++) {
-    \\      const uint col = sg * 32u + ct * 16u + uint(origin.x) + c;
-    \\      if constexpr (FOLD) tgm[uint(origin.y) * 128u + col] = destination[ct * 8u + c];
+    \\      const uint col = col0 * 32u + ct * 16u + uint(origin.x) + c;
+    \\      if constexpr (FOLD || KPARTS > 1u) tgm[(uint(origin.y) * KPARTS + kslice) * 128u + col] = destination[ct * 8u + c];
     \\      else exl3_store(y + (size_t)(uint(origin.y) * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + c]));
     \\    }
     \\  }
@@ -2721,6 +2724,15 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
 ++ ROWS_FOLD ++
+    \\} else if constexpr (KPARTS > 1u) {
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (uint i = lid; i < uint(ROWS) * 128u; i += SGS * 32u) {
+    \\    const uint r = i / 128u;
+    \\    const uint c = i - r * 128u;
+    \\    float sum = 0.0f;
+    \\    for (uint k = 0u; k < KPARTS; k++) sum += tgm[(r * KPARTS + k) * 128u + c];
+    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, sum);
+    \\  }
     \\}
 ;
 
@@ -2782,7 +2794,23 @@ fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int) RowsG
     return rowsGeometryFor(in_dim, out_dim, rows, groups, rows >= 2 and gemmNaxOn());
 }
 
+/// DeepSeek's trunk linears on the NAX arm: `kph` simdgroups split a threadgroup's k range and sum in threadgroup
+/// memory, so a launch needs fewer k-split partials (none, and no finish dispatch, at `nsplit` 1). The geometry never
+/// depends on the row count, which keeps a row's bytes equal at every width.
+const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int };
+const NAX_TUNED = [_]NaxTuned{
+    .{ .in_dim = 5120, .out_dim = 1792, .groups = 1, .kph = 4, .nsplit = 5 },
+    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1 },
+    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8 },
+    .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4 },
+    .{ .in_dim = 5120, .out_dim = 129280, .groups = 1, .kph = 1, .nsplit = 2 },
+};
+
 fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, nax: bool) RowsGeom {
+    if (nax) for (NAX_TUNED) |t| {
+        if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups)
+            return .{ .tgrp = 4, .kph = t.kph, .nsplit = t.nsplit, .chunk = rowsChunk(in_dim, rows, t.nsplit), .nax = true };
+    };
     if (@divExact(out_dim, 128) * groups >= 1024) return .{ .tgrp = 4, .kph = if (nax) 1 else 2, .nsplit = 1, .chunk = rowsChunk(in_dim, rows, 1), .nax = nax };
     const blocks = @divExact(in_dim, 128);
     const tgs = groups * @divExact(out_dim, @as(c_int, if (nax) 128 else 32));
@@ -8568,7 +8596,7 @@ test "dsv41 trunk rows by width (SUSHI_DSV41_TRUNK_UBENCH)" {
             }
             std.debug.print("[trunk] {s} {d}x{d} G{d} n{d} rows {d}:", .{ sh.name, sh.out, sh.in, sh.groups, n, rows });
             for (cands.items, us) |g, row| {
-                std.debug.print(" {s}-s{d} {d:.1}", .{ if (g.nax) "nax" else "simd", g.nsplit, std.mem.min(f64, row[0..rounds]) });
+                std.debug.print(" {s}-k{d}s{d} {d:.1}", .{ if (g.nax) "nax" else "simd", g.kph, g.nsplit, std.mem.min(f64, row[0..rounds]) });
             }
             std.debug.print("\n", .{});
             if (rows != rows_list[0]) continue;
@@ -8806,6 +8834,10 @@ test "exl3 multi-row projection holds the bar on every launch geometry and at ei
         .{ .tgrp = 2, .kph = 1, .nsplit = 6, .chunk = 128 },
         .{ .tgrp = 4, .kph = 1, .nsplit = 1, .chunk = 256, .nax = true },
         .{ .tgrp = 4, .kph = 1, .nsplit = 3, .chunk = 256, .nax = true },
+        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256, .nax = true },
+        .{ .tgrp = 4, .kph = 2, .nsplit = 3, .chunk = 256, .nax = true },
+        .{ .tgrp = 4, .kph = 3, .nsplit = 2, .chunk = 384, .nax = true },
+        .{ .tgrp = 4, .kph = 8, .nsplit = 1, .chunk = 256, .nax = true },
     };
     for (geoms, 0..) |g, gi| {
         if (g.nax and !gemmNaxOn()) continue;
@@ -8920,6 +8952,46 @@ test "exl3 SIMD multi-row: every row equals the one-row launch bit for bit" {
             }
         }
     }
+}
+
+// A NAX multi-row launch sums a row in an order set by its k slicing alone, so a verify row has the same bytes at every
+// width from two up; the served geometry may not read the row count.
+test "exl3 NAX multi-row: a row has the same bytes at widths 2 to 8 under every k slicing" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s) or !gemmNaxOn()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    defer setDecodeParams(.mul1);
+    var failed: usize = 0;
+    for (SIMD_ROWS_DECODES) |d| {
+        try d.dec.requireTable();
+        setDecodeParams(d.dec);
+        for ([_][3]usize{ .{ 1280, 512, 1 }, .{ 1024, 256, 2 } }) |sh| {
+            const rig = try RowsRig.init(alloc, 0x4a58 + sh[0], sh[0], sh[1], sh[2], d.n);
+            const in: c_int = @intCast(sh[0]);
+            var served: [2]RowsGeom = undefined;
+            for ([_]c_int{ 2, 8 }, &served) |rows, *g| g.* = rowsGeometry(in, @intCast(sh[1]), rows, @intCast(sh[2]));
+            try std.testing.expectEqual(served[0].kph, served[1].kph);
+            try std.testing.expectEqual(served[0].nsplit, served[1].nsplit);
+            const blocks = @divExact(in, 128);
+            for ([_]c_int{ 1, 2, 3, 4, 8 }) |kph| for ([_]c_int{ 1, 2, 4, 5 }) |nsplit| {
+                if (@rem(blocks, nsplit) != 0) continue;
+                const at = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = nsplit, .chunk = rowsChunk(in, 8, nsplit), .nax = true };
+                const ref = try rig.run(alloc, 0, 8, at, try rowsKernel(at));
+                for (2..8) |rows| {
+                    const g = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = nsplit, .chunk = rowsChunk(in, @intCast(rows), nsplit), .nax = true };
+                    const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
+                    for (0..sh[2]) |grp| for (0..rows) |r| {
+                        if (std.mem.eql(u16, ref[(grp * 8 + r) * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]])) continue;
+                        std.debug.print("NAX rows differ: n{d} {d}x{d} g{d} kph {d} nsplit {d} rows {d} row {d}\n", .{ d.n, sh[0], sh[1], sh[2], kph, nsplit, rows, r });
+                        failed += 1;
+                    };
+                }
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failed);
 }
 
 /// `ROWS_K_LOOP` as it was before the row loops split: every row in one loop, each row's activations loaded ahead of

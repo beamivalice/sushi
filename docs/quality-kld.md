@@ -97,6 +97,9 @@ resident, logs that the flag has no effect, and scores the exact KLD; a real str
 `SUSHI_DSV41_COMPOSED=1` runs the op chains in place of the fused kernels, the
 teacher arm of a fused-kernel A/B.
 A tiny-model test (`DSV41_TINY`) captures a teacher and compares it in both arms.
+`compare` scores prefill chunks on the GEMM and the generated tokens on one-row steps, so it never runs the NAX 2 to 8 row
+arm: a change to that arm's sum order leaves the KLD identical to the last digit (0.186614243 on the STQ 1.75bpw pack for
+main and for the reordered trunk rows) and is gated by the f32-truth bars and the width-invariance byte test instead.
 
 ## Bundled four-prompt screen
 
