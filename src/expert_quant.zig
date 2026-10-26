@@ -21,6 +21,8 @@ pub const StoreShape = struct {
     /// Every routed expert with each layer's cache meta table, when every routed layer is rate-grouped; else 0. A
     /// budget that holds it beside the trunk serves the pack resident (`expert_stream.budgetLedger`).
     all_bytes: u64 = 0,
+    /// MLX's freed-buffer pool, capped for the load and billed beside the resident terms (`Config.expertPoolBytes`).
+    pool_bytes: u64 = 0,
 };
 
 pub const Geometry = struct {

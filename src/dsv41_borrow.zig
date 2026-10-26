@@ -26,10 +26,74 @@ pub fn forwardBytes(c: *const Config, rows: u64, seq: u64) u64 {
     return work +| rows *| c.stateBytesPerToken();
 }
 
-/// What a prefill-width forward must find free before it runs: `forwardBytes` with the request bill's quarter.
-pub fn prefillNeed(c: *const Config, rows: u64, seq: u64) u64 {
-    return forwardBytes(c, rows, seq) *| 5 / 4;
+/// What a prefill-width forward must find free before it runs: `forwardBytes` with the request bill's quarter, and the
+/// buffer pool the chunk run may park.
+pub fn prefillNeed(c: *const Config, rows: u64, seq: u64, pool_bytes: u64) u64 {
+    return forwardBytes(c, rows, seq) *| 5 / 4 +| pool_bytes;
 }
+
+/// PURE: the MLX buffer-pool cap of a forward of `rows`, and the pool its need bills: the decode cap up to a verify
+/// block, then growing with the rows to the prefill cap at a default chunk (`prefill_width`), never above the RAM-wide
+/// cap. A 2048-row chunk parks ~3.8 MB a row (twice the forward's own ~2 MB a row), so the cap spreads evenly over it.
+pub fn poolCap(rows: u64, decode_cap: u64, prefill_cap: u64, ram_cap: u64) u64 {
+    const decode = @min(ram_cap, decode_cap);
+    if (rows <= verify_rows) return decode;
+    const full = @min(ram_cap, @max(prefill_cap, decode_cap));
+    return @max(decode, @min(full, full *| rows / cfg_mod.prefill_width));
+}
+
+/// The RAM-wide pool cap, installed by the server. Unset (tests, `sushi kld`), the pool is never moved.
+pub var pool_ram_cap: u64 = 0;
+/// The cap in force while it is above the decode cap; null at the decode cap the ledger set at load.
+var pool_now: ?u64 = null;
+
+pub const PoolOps = struct {
+    set_limit: *const fn (bytes: u64) void,
+    clear: *const fn () void,
+};
+
+fn rowsCap(rows: u64, config: *const ModelConfig) u64 {
+    return poolCap(rows, config.expertPoolBytes(), config.prefillPoolBytes(), if (pool_ram_cap == 0) std.math.maxInt(u64) else pool_ram_cap);
+}
+
+fn moveCap(want: u64, config: *const ModelConfig, ops: PoolOps) bool {
+    const decode = config.expertPoolBytes();
+    const have = pool_now orelse decode;
+    if (want == have) return false;
+    pool_now = if (want > decode) want else null;
+    ops.set_limit(want);
+    // A lower cap trims lazily; the clear makes the parked pool what was billed.
+    if (want < have) ops.clear();
+    return true;
+}
+
+/// Moves the pool cap to the one `rows` bills, on the inference thread. True on a change.
+pub fn enterForward(rows: u64, config: *const ModelConfig, ops: PoolOps) bool {
+    if (pool_ram_cap == 0 or !config.isDsv41()) return false;
+    return moveCap(rowsCap(rows, config), config, ops);
+}
+
+/// A request is over: whatever forward ran last, the cap drops back to the decode cap.
+pub fn endRequest(config: *const ModelConfig, ops: PoolOps) bool {
+    if (pool_ram_cap == 0 or !config.isDsv41()) return false;
+    return moveCap(config.expertPoolBytes(), config, ops);
+}
+
+/// The request-end hook on the real MLX pool.
+pub fn endRequestMlx(config: *const ModelConfig) void {
+    _ = endRequest(config, mlx_ops);
+}
+
+fn mlxSetLimit(bytes: u64) void {
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, @intCast(bytes));
+}
+
+fn mlxClear() void {
+    _ = mlx.mlx_clear_cache();
+}
+
+const mlx_ops: PoolOps = .{ .set_limit = &mlxSetLimit, .clear = &mlxClear };
 
 /// The pools a prefill may release when `cache_bytes` is split evenly over the layers: the load-time estimate the
 /// engine's own count replaces once it is built.
@@ -54,10 +118,11 @@ pub fn releaseCount(pools: []const u64, need: u64, headroom: u64) ?usize {
 /// its need fits the live headroom, and is refused when all of them do not cover it. A decode forward reads released
 /// pools back while each fits beside its own working set.
 pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: u64, seq: u64) !void {
+    _ = enterForward(rows, config, mlx_ops);
     const headroom = headroom_fn orelse return;
     if (engine.borrow_from >= engine.layers.len) return;
     if (rows <= verify_rows) return restore(engine, config, headroom, forwardBytes(c, rows, seq));
-    const need = prefillNeed(c, rows, seq);
+    const need = prefillNeed(c, rows, seq, rowsCap(rows, config));
     if (headroom(config) >= need) return;
     _ = mlx.mlx_clear_cache();
     const before = headroom(config);
@@ -159,15 +224,143 @@ test "dsv41 borrow: a forward releases pools in order until the headroom covers 
 test "dsv41 borrow: a prefill chunk's need is its working set and its rows' state with the quarter, a decode forward's is far smaller" {
     const c = try cfg_mod.parseText(cfg_mod.release_config);
     const ctx: u64 = 1 << 20;
-    try testing.expectEqual((c.transientBytes(2048 - cfg_mod.tail_merge_rows, ctx) + 2048 * c.stateBytesPerToken()) * 5 / 4, prefillNeed(&c, 2048, ctx));
+    try testing.expectEqual((c.transientBytes(2048 - cfg_mod.tail_merge_rows, ctx) + 2048 * c.stateBytesPerToken()) * 5 / 4, prefillNeed(&c, 2048, ctx, 0));
     // A last chunk that absorbed its tail is priced at its own rows.
-    try testing.expect(prefillNeed(&c, 2048 + 511, ctx) > prefillNeed(&c, 2048, ctx));
+    try testing.expect(prefillNeed(&c, 2048 + 511, ctx, 0) > prefillNeed(&c, 2048, ctx, 0));
     try testing.expectEqual(c.decodeTransientBytes(6, ctx) + 6 * c.stateBytesPerToken(), forwardBytes(&c, 6, ctx));
-    try testing.expect(forwardBytes(&c, verify_rows, ctx) * 3 < prefillNeed(&c, 512, ctx));
+    try testing.expect(forwardBytes(&c, verify_rows, ctx) * 3 < prefillNeed(&c, 512, ctx, 0));
 }
 
 test "dsv41 borrow: the load-time estimate is the decoder layers' even share of the cache, STQ packs only" {
     const c = try cfg_mod.parseText(cfg_mod.release_config);
     try testing.expectEqual(@as(u64, 20 * 2_000_000_000), plannedBytes(&c, true, 80_000_000_000));
     try testing.expectEqual(@as(u64, 0), plannedBytes(&c, false, 80_000_000_000));
+}
+
+test "dsv41 borrow: a prefill chunk's need carries the pool it may park, and the decoder pools cover both at 1M" {
+    const c = try cfg_mod.parseText(cfg_mod.release_config);
+    const ctx: u64 = 1 << 20;
+    const pool = @import("model.zig").dsv41_prefill_pool_bytes;
+    try testing.expectEqual(prefillNeed(&c, 2048, ctx, 0) + pool, prefillNeed(&c, 2048, ctx, pool));
+    // A 60 GB cache leaves the decoder layers this many bytes to lend.
+    const lend = plannedBytes(&c, true, 60_000_000_000);
+    try testing.expect(lend >= prefillNeed(&c, 2048 + 511, ctx, pool));
+}
+
+test "dsv41 borrow: the pool cap scales with the forward's rows, from the decode cap up to the prefill cap and never past the RAM-wide cap" {
+    const decode: u64 = 1 << 30;
+    const prefill: u64 = 8 << 30;
+    const ram: u64 = 8 << 30;
+    try testing.expectEqual(decode, poolCap(1, decode, prefill, ram));
+    try testing.expectEqual(decode, poolCap(verify_rows, decode, prefill, ram));
+    // A short tail parks the decode pool and no more; the bill and the MLX cap are the same number.
+    try testing.expectEqual(decode, poolCap(31, decode, prefill, ram));
+    try testing.expectEqual(@as(u64, 2 << 30), poolCap(512, decode, prefill, ram));
+    try testing.expectEqual(@as(u64, 4 << 30), poolCap(1024, decode, prefill, ram));
+    try testing.expectEqual(prefill, poolCap(cfg_mod.prefill_width, decode, prefill, ram));
+    try testing.expectEqual(prefill, poolCap(2048 + 511, decode, prefill, ram));
+    try testing.expectEqual(prefill, poolCap(1 << 20, decode, prefill, ram));
+    var rows: u64 = 1;
+    while (rows < 1 << 21) : (rows += 97) {
+        try testing.expect(poolCap(rows, decode, prefill, ram) <= ram);
+        try testing.expect(poolCap(rows, decode, prefill, 4 << 30) <= 4 << 30);
+        try testing.expect(poolCap(rows, decode, prefill, ram) >= poolCap(rows -| 1, decode, prefill, ram));
+    }
+    try testing.expectEqual(@as(u64, 4 << 30), poolCap(2048, decode, prefill, 4 << 30));
+    try testing.expectEqual(@as(u64, 512 << 20), poolCap(31, decode, prefill, 512 << 20));
+    try testing.expectEqual(decode, poolCap(4096, decode, 1 << 20, ram));
+}
+
+test "dsv41 borrow: at the budget-115 geometry a 31-row tail fits the headroom with no release, a 2048-row chunk releases three pools" {
+    const c = try cfg_mod.parseText(cfg_mod.release_config);
+    const decode = @import("model.zig").dsv41_pool_bytes;
+    const prefill = @import("model.zig").dsv41_prefill_pool_bytes;
+    const ram: u64 = 8 << 30;
+    // Live at `--ssd-budget-gb 115` (280 slots a layer): the decoder pools a prefill may release, and the headroom there.
+    const pools = [_]u64{ 2_700_000_000, 2_700_000_000, 2_760_000_000 };
+    const headroom: u64 = 8_950_000_000;
+    const tail = prefillNeed(&c, 31, 14766, poolCap(31, decode, prefill, ram));
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, tail, headroom));
+    const chunk = prefillNeed(&c, 2048, 2048, poolCap(2048, decode, prefill, ram));
+    try testing.expectEqual(@as(?usize, 3), releaseCount(&pools, chunk, headroom));
+    // The same tail with the full pool billed is what forced the borrow.
+    try testing.expectEqual(@as(?usize, 2), releaseCount(&pools, prefillNeed(&c, 31, 14766, prefill), headroom));
+}
+
+const PoolProbe = struct {
+    var limits: [8]u64 = undefined;
+    var n: usize = 0;
+    var cleared: usize = 0;
+    fn reset() void {
+        n = 0;
+        cleared = 0;
+    }
+    fn set(bytes: u64) void {
+        limits[n] = bytes;
+        n += 1;
+    }
+    fn clear() void {
+        cleared += 1;
+    }
+    const ops: PoolOps = .{ .set_limit = &set, .clear = &clear };
+};
+
+fn withPoolState(ram_cap: u64, body: *const fn () anyerror!void) !void {
+    const saved = .{ pool_ram_cap, pool_now };
+    defer {
+        pool_ram_cap = saved[0];
+        pool_now = saved[1];
+    }
+    pool_ram_cap = ram_cap;
+    pool_now = null;
+    PoolProbe.reset();
+    try body();
+}
+
+test "dsv41 borrow: a forward moves the pool cap to its rows' cap, and lowering it clears the pool" {
+    const config = ModelConfig{ .model_type = "deepseek_v41" };
+    const Body = struct {
+        fn run() anyerror!void {
+            const decode = config.expertPoolBytes();
+            // A decode forward finds the ledger's cap in force: nothing to move.
+            try testing.expect(!enterForward(1, &config, PoolProbe.ops));
+            try testing.expect(!enterForward(31, &config, PoolProbe.ops));
+            try testing.expectEqual(@as(usize, 0), PoolProbe.n);
+            try testing.expect(enterForward(2048, &config, PoolProbe.ops));
+            try testing.expect(!enterForward(2048, &config, PoolProbe.ops));
+            try testing.expectEqual(config.prefillPoolBytes(), PoolProbe.limits[0]);
+            try testing.expectEqual(@as(usize, 0), PoolProbe.cleared);
+            // A narrower forward after a wide one cannot leave the wide pool parked.
+            try testing.expect(enterForward(1024, &config, PoolProbe.ops));
+            try testing.expectEqual(@as(usize, 1), PoolProbe.cleared);
+            try testing.expect(enterForward(1, &config, PoolProbe.ops));
+            try testing.expectEqual(decode, PoolProbe.limits[PoolProbe.n - 1]);
+            try testing.expectEqual(@as(usize, 2), PoolProbe.cleared);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+    // Unset (tests, `sushi kld`), the pool is never moved.
+    PoolProbe.reset();
+    try testing.expect(!enterForward(2048, &config, PoolProbe.ops));
+    try testing.expectEqual(@as(usize, 0), PoolProbe.n);
+}
+
+test "dsv41 borrow: a request that ends without a decode forward still lowers the pool cap" {
+    const config = ModelConfig{ .model_type = "deepseek_v41" };
+    const Body = struct {
+        fn run() anyerror!void {
+            try testing.expect(enterForward(2048, &config, PoolProbe.ops));
+            try testing.expect(endRequest(&config, PoolProbe.ops));
+            try testing.expectEqual(config.expertPoolBytes(), PoolProbe.limits[PoolProbe.n - 1]);
+            try testing.expectEqual(@as(usize, 1), PoolProbe.cleared);
+            // Already at the decode cap: nothing to do.
+            try testing.expect(!endRequest(&config, PoolProbe.ops));
+            try testing.expectEqual(@as(usize, 2), PoolProbe.n);
+            // Another architecture's request never touches the pool.
+            try testing.expect(enterForward(2048, &config, PoolProbe.ops));
+            const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+            try testing.expect(!endRequest(&qwen, PoolProbe.ops));
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
 }

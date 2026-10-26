@@ -95,7 +95,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   carry the same numeric diagnostic; generation error mapping consumes the slot's diagnostic on its connection
   thread so it cannot leak into another request.
 - **A streamed load bills what it holds** (`streamedLoadRequirementBytes`): resident trunk, MTP and vision + the expert
-  cache + the whole-layer fill union + the bounce buffers + the net; `expertCacheFitForLoad` separately proves the
+  cache + the whole-layer fill union + the bounce buffers + the MLX pool's decode cap (DeepSeek, `ModelConfig.expertPoolBytes`, 1 GiB) + the net; `expertCacheFitForLoad` separately proves the
   planned KV against the wired limit. GLM allocates KV row by row per request, so its load bill carries no context
   term; request admission bills it.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
@@ -353,7 +353,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
 - **DeepSeek STQ bills a request's state, not its prefill working set**: the working set comes out of decoder-layer
   expert pools each prefill forward releases when its need passes the live headroom, refused before anything is released
-  where the pools cannot cover it; admission bills that term only past the lendable bytes, plus a decode forward's
+  where the pools cannot cover it; the MLX pool a prefill parks (8 GiB at a 2048-row chunk) rides in that working set; admission bills that term only past the lendable bytes, plus a decode forward's
   working set, and SSD-first its restore points' in-flight bytes ([dsv41-memory](dsv41-memory.md#borrow)).
 - qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill. The SSD
   tier fills buffers the slot owns (`LookupResult.slot_owned`), so its rows are credited like a checkout's: the

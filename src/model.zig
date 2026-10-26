@@ -147,6 +147,12 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 
 pub const isExpertStreamingArch = expert_quant.isExpertStreamingArch;
 
+/// DeepSeek-V4.1's MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
+pub const dsv41_pool_bytes: u64 = 1 << 30;
+/// The pool a prefill may park: it fills the 8 GB RAM-wide cap at every depth. Admission bills it against the decoder
+/// pools a prefill releases (`dsv41_borrow`), not against the expert cache.
+pub const dsv41_prefill_pool_bytes: u64 = 8 << 30;
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -887,6 +893,16 @@ pub const ModelConfig = struct {
 
     pub fn isGlm5(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "glm5_next");
+    }
+
+    /// The MLX buffer pool a streamed load is allowed to hold, billed in its ssd-budget ledger; 0 keeps the RAM-wide cap.
+    pub fn expertPoolBytes(self: *const ModelConfig) u64 {
+        return if (self.isDsv41()) dsv41_pool_bytes else 0;
+    }
+
+    /// The pool cap of a DeepSeek prefill chunk run; 0 elsewhere.
+    pub fn prefillPoolBytes(self: *const ModelConfig) u64 {
+        return if (self.isDsv41()) dsv41_prefill_pool_bytes else 0;
     }
 
     pub fn isDsv41(self: *const ModelConfig) bool {

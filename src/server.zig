@@ -1885,6 +1885,8 @@ pub fn serve(
     defer scheduler_mod.prefill_chunk_adapt = null;
     dsv41_borrow.headroom_fn = &dsv41Headroom;
     defer dsv41_borrow.headroom_fn = null;
+    dsv41_borrow.pool_ram_cap = mlxCacheLimitBytes(metrics.getTotalMemBytes());
+    defer dsv41_borrow.pool_ram_cap = 0;
     scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
     defer scheduler_mod.prefill_chunk_widen_ok = null;
     // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
@@ -3127,6 +3129,18 @@ pub fn applyMlxCacheLimit() void {
         return;
     }
     log.info("[mem] MLX buffer-pool cap {d} MB (was {d} MB)\n", .{ cap >> 20, prev >> 20 });
+}
+
+/// Lowers MLX's buffer-pool cap to a per-model ledger term; never raises the RAM-wide cap.
+pub fn capMlxPool(bytes: u64) void {
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, @intCast(bytes));
+    if (prev < bytes) {
+        var tmp: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&tmp, prev);
+        return;
+    }
+    log.info("[mem] MLX buffer-pool cap {d} MB from the ssd-budget ledger (was {d} MB)\n", .{ bytes >> 20, prev >> 20 });
 }
 
 /// Impure wrapper: current GPU allocation ceiling from live MLX + system
@@ -4611,6 +4625,8 @@ test "DeepSeek's streamed request bill brackets the prefill peaks measured on th
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.max_position_embeddings = 1_048_576;
     config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    // The decoder pools lend the pool a prefill parks, so the bill is the working set's, as measured.
+    config.expert_borrow_bytes = config.prefillPoolBytes();
     try std.testing.expectEqual(generate_mod.TAIL_MERGE_MAX - 1, dsv41_config.tail_merge_rows);
     // Live per-chunk `peak_bytes - active_bytes` (`SUSHI_PREFILL_CHUNK_PEAK`), CED prefill, `--ssd-budget-gb 94`, the STQ d4
     // pack, DSpark on: `chunk` is the configured width, `seq` where the chunk ended (a last chunk absorbs its tail).
@@ -4638,6 +4654,8 @@ test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
     config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    // The decoder pools lend the pool a prefill parks, so the bill is the working set's, as measured.
+    config.expert_borrow_bytes = config.prefillPoolBytes();
     const MB: u64 = 1 << 20;
     // What `--ssd-budget-gb 96` on the 128 GB M5 Max leaves to serve, as its pin measured it.
     const at96: u64 = 110_100 * MB - 97_080 * MB;
@@ -4664,6 +4682,8 @@ test "DeepSeek advertises the longest context its own request bill admits" {
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
     config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    // The decoder pools lend the pool a prefill parks, so the bill is the working set's, as measured.
+    config.expert_borrow_bytes = config.prefillPoolBytes();
     const GB: u64 = 1_000_000_000;
     // The request bill grows with the prompt (the state and the rows' growth), so a serving budget of exactly one
     // prompt's bill advertises that prompt and not one token less.
@@ -4677,6 +4697,9 @@ test "DeepSeek advertises the longest context its own request bill admits" {
     // At 96 the whole 1M context fits the fallback width's bill.
     const MB: u64 = 1 << 20;
     try t.expectEqual(@as(u32, 1_048_576), memoryContextAtChunk(&config, 16, 110_100 * MB, 97_080 * MB, 512));
+    // A pack with no decoder pools to lend bills the prefill pool to the request.
+    config.expert_borrow_bytes = 0;
+    try t.expect(memoryContextAtChunk(&config, 16, 110_100 * MB, 97_080 * MB, 512) < 1_048_576);
 }
 
 test "a streamed DeepSeek bills its workspace at load and no fill peak at load or per request" {
@@ -4688,10 +4711,12 @@ test "a streamed DeepSeek bills its workspace at load and no fill peak at load o
     config.expert_workspace_bytes = 3_525 << 20;
     config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
     const mib: u64 = 1 << 20;
+    // The decoder pools lend the pool a prefill parks, so the bill is the working set's, as measured.
+    config.expert_borrow_bytes = config.prefillPoolBytes();
     // A 100-token request pays its own transient, not the cache layer and a second workspace.
     try std.testing.expect(prefillNeededAtChunk(&config, 100, 512, 16, 512, .{}) < 2048 * mib);
     const resident: u64 = 8_295 * mib;
-    const held = resident + config.expert_cache_bytes + config.expert_bounce_bytes + config.expert_workspace_bytes;
+    const held = resident + config.expert_cache_bytes + config.expert_bounce_bytes + config.expert_workspace_bytes + config.expertPoolBytes();
     const serving = expertStreamingServingBytes(&config);
     try std.testing.expect(expertStreamingConfigFits(&config, held + serving, 0, resident));
     try std.testing.expect(!expertStreamingConfigFits(&config, held + serving - 1, 0, resident));
@@ -4705,7 +4730,7 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     const c = config.dsv41.?;
     const seq: u64 = 524_288;
     const state = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + dsv41CheckpointReserve(&config, seq, 2048)) * 5 / 4;
-    const work = c.transientBytes(2048, seq) * 5 / 4;
+    const work = c.transientBytes(2048, seq) * 5 / 4 + config.prefillPoolBytes();
     const decode = c.decodeTransientBytes(dsv41_borrow.verify_rows, seq) * 5 / 4;
     // No pool to lend: the whole working set is billed, as before.
     try t.expectEqual(state + work, prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
@@ -7149,7 +7174,7 @@ pub fn prefillNeededAtChunk(
     if (config.dsv41) |c| {
         const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
         // The prefill's working set comes out of the decoder pools it may release (`dsv41_borrow`); a decode forward's never does.
-        const work = @max(c.decodeTransientBytes(dsv41_borrow.verify_rows, seq) *| 5 / 4, c.transientBytes(chunk, seq) *| 5 / 4 -| dsv41BorrowableBytes(config));
+        const work = @max(c.decodeTransientBytes(dsv41_borrow.verify_rows, seq) *| 5 / 4, (c.transientBytes(chunk, seq) *| 5 / 4 +| config.prefillPoolBytes()) -| dsv41BorrowableBytes(config));
         return (held +| dsv41CheckpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
     }
     if (config.isGlm5()) {
@@ -21825,6 +21850,16 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     // expose reported — so the bug was invisible from every surface.
     try testing.expect(std.mem.indexOf(u8, body, "\"cache_bytes\":4321") != null); // Swift fetchProps
     try testing.expect(std.mem.indexOf(u8, body, "\"kv_cache_bytes\":8888") != null); // llmtop
+}
+
+test "expertPoolBytes: only DeepSeek-V4.1 takes a ledger pool, within the RAM-wide cap" {
+    const ds = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    try testing.expect(ds.expertPoolBytes() > 0);
+    try testing.expect(ds.expertPoolBytes() <= mlxCacheLimitBytes(128 << 30));
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
+        const c = model_mod.ModelConfig{ .model_type = arch };
+        try testing.expectEqual(@as(u64, 0), c.expertPoolBytes());
+    }
 }
 
 test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {

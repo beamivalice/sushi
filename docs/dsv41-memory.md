@@ -4,7 +4,7 @@ How `deepseek_v41` spends memory under CED prefill: the ledger, the per-layer ca
 prefill that borrows decoder pools and the fully resident load. Index: [CLAUDE.md](../CLAUDE.md#docs-index); related:
 [dsv41-arch](dsv41-arch.md), [engine-expert-streaming](engine-expert-streaming.md).
 
-## The ledger (an STQ pack, `--ssd-budget-gb 96` = 103.08 GB)
+## The ledger (an STQ pack, `--ssd-budget-gb 96` = 103.08 GB, no vision tower)
 
 | term | GB |
 |---|---|
@@ -12,7 +12,8 @@ prefill that borrows decoder pools and the fully resident load. Index: [CLAUDE.m
 | DSpark stages (resident) | 3.92 |
 | union workspace (one layer's 384 experts at the widest layer) | 3.70 |
 | bounce + selected | 0.60 |
-| expert cache | 90.09 |
+| MLX buffer pool, decode cap (`dsv41_pool_bytes`, 1 GiB) | 1.07 |
+| expert cache | 89.0 |
 
 Routed experts by layer, rate-sized (shard headers): the encoder (layers 0-19) holds 57.13 GB (6.8-9.6 MB an
 expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The cache holds 75% of it.
@@ -25,6 +26,42 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
   steadiest (16, 25) about 215. On a 4k and a 16k prompt with a 1024-token decode at budget 96 the decode speed matched
   the uniform split (68.9 and 63.8 tok/s against 68.1 and 65.0), hits being ~99% in both; the profile matters for long
   decodes over changing documents, and the larger the cache the more of the remaining misses it removes.
+- **The MLX buffer pool is a ledger term, in two phases.** `server.applyMlxCacheLimit` caps freed buffers at RAM/16
+  (8 GiB here), and that pool sat outside the plan: a bench went 118 to 126 GB against a 125 GB wired limit. Measured
+  (`--ssd-budget-gb 96`, 4k to 128k code and prose, 150 ms samples of `/props`): every 8k prefill window and the cold
+  4k prefill fill the pool to 7.2-8.0 GB at every depth, so the peak is the cap, not a demand below it; decode and a
+  DSpark round keep it under 1.1 GB, and 0.3 MB between turns. Active bytes run 94.0 GB at rest, 97.3-98.0 GB in a
+  prefill window. So the cap follows the forward's rows (`dsv41_borrow.enterForward`, on the inference thread, from
+  `beforeForward`; `poolCap` is the pure rule):
+  - **Decode** (a forward of up to 17 rows, DSpark's widest verify is 16): `dsv41_pool_bytes`, 1 GiB, billed in the
+    ledger as the `mlx pool` term (`capMlxPool` at load, `[mem] MLX buffer-pool cap ... from the ssd-budget ledger`), so
+    the cache gives up ~3 slots a layer instead of ~24.
+  - **Prefill** (a wider forward): `dsv41_prefill_pool_bytes`, 8 GiB at a default 2048-row chunk and `rows / 2048` of it
+    below, never under the decode cap and never above the RAM-wide cap (31 rows 1 GiB, 512 rows 2 GiB, 1024 rows 4 GiB).
+    The cap set is the bill: `prefillNeed` carries the same number, and a lower cap clears the pool, so what is parked
+    never exceeds what was billed. 4 MiB a row is the measured pool spread over the chunk (~7.7 GB parked at 2048 rows,
+    3.8 MB a row) and twice the forward's own row term (`dim x 400` = 2.05 MB a row; active grew 3.3-4 GB above rest).
+    The pool is not in the ledger: the decoder pools a prefill releases pay for it (`expert_borrow_bytes`), not the
+    decode cache. A pack with no pools to lend (non-STQ) bills it to the request; admission bills the full cap.
+  - A request that ends, by finish, cancel or error, drops the cap to the decode cap (`endRequest`, in the scheduler's
+    slot cleanup), so a prefill with no decode forward after it does not leave the raised pool parked.
+  - Why scale: at `--ssd-budget-gb 115` (280 slots a layer, 8.95 GB headroom) a 31-row restore tail billed the full pool,
+    a 12.17 GB need, and released two decoder pools (5.40 GB, ~1.2 s with the read back). Its need is 3.58 GB of working
+    set plus the pool; with the pool at the decode cap it is 4.65 GB and nothing is released. The working set prices a
+    forward under 512 rows as a 511-row one (`transientBytes` floors at the tail merge): 2.86 GB at 31 rows against ~0.5 GB
+    by the same formula at 31 rows. That floor is conservative, not measured at short forwards, and unchanged.
+  - Measured (STQ-1.75bpw, M5 Max, one cold 14,766-token prefill, three live-state repeats with a 31-row tail, one turn
+    adding 1,000 rows; DSpark default, fans max, die < 50 °C):
+
+    | build, `--ssd-budget-gb` | slots/layer | expert hits | 31-row repeat | 1,000-row turn | peak wired | decode wired |
+    |---|---|---|---|---|---|---|
+    | before, 108 | 263 | 98.62% | 141 tok/s | — | 126.3 GB | 118.5 GB |
+    | this, 108 | 260 | 98.50% | 138 tok/s | — | 124.8 GB | 117.0 GB |
+    | this, 114 | 277 | 99.24% | 146-152 tok/s, no release | 541 tok/s, no release | 127.7 GB | 123.6 GB |
+
+    At 114 a cold prefill releases layers 37..39 (8.15 GB) once and reads them back before decode (~1.4 s a request).
+    The 1,000-row turn parks ~4 GB of pool on top of decode, which is the peak. A 2 GiB prefill pool cost 12% of cold
+    prefill (666 against 760-781 tok/s), so the full chunk keeps 8 GiB.
 - The per-request state (890 B a token, 0.93 GB at 1M) and the prefill transient are not in the SSD budget. They come
   from the serving budget (the GPU ceiling less everything resident), billed per request.
 
@@ -59,7 +96,8 @@ only where the decoder pools a prefill may still release (`ModelConfig.expert_bo
 engine) do not cover it. At 1M: 3.69 GB in all.
 
 **The borrow** (`src/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
-- Before every forward wider than 17 rows, its need, `(transientBytes(rows - 511, seq) + rows x 890) x 5/4`, is checked
+- Before every forward wider than 17 rows, its need, `(transientBytes(rows - 511, seq) + rows x 890) x 5/4` plus the
+  forward's pool cap, 8 GiB at a 2048-row chunk ([above](#the-ledger-an-stq-pack---ssd-budget-gb-96--10308-gb-no-vision-tower)), is checked
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the
   pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released, and the live headroom is re-read after each

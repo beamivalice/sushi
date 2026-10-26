@@ -195,6 +195,7 @@ pub const BudgetLedger = struct {
     workspace_bytes: u64,
     selected_bytes: u64,
     bounce_bytes: u64,
+    pool_bytes: u64 = 0,
     cache_bytes: u64,
     slots_per_layer: u16,
     resident: bool = false,
@@ -218,7 +219,7 @@ pub fn budgetLedger(
     shape: quant.StoreShape,
 ) !BudgetLedger {
     if (layers == 0 or experts == 0 or top_k == 0 or expert_bytes == 0) return error.InvalidExpertGeometry;
-    const beside = trunk_bytes +| mtp_bytes +| vision_bytes;
+    const beside = trunk_bytes +| mtp_bytes +| vision_bytes +| shape.pool_bytes;
     if (shape.all_bytes > 0 and budget_bytes -| beside >= shape.all_bytes) return .{
         .budget_bytes = budget_bytes,
         .trunk_bytes = trunk_bytes,
@@ -227,13 +228,14 @@ pub fn budgetLedger(
         .workspace_bytes = 0,
         .selected_bytes = 0,
         .bounce_bytes = 0,
+        .pool_bytes = shape.pool_bytes,
         .cache_bytes = shape.all_bytes,
         .slots_per_layer = experts,
         .resident = true,
     };
     const workspace_bytes = workspaceBytes(experts, expert_bytes, shape) catch return error.InvalidExpertGeometry;
     const selected_bytes = @as(u64, @min(top_k, experts)) *| expert_bytes;
-    const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes;
+    const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes +| shape.pool_bytes;
     if (fixed >= budget_bytes) return error.SsdBudgetBelowResident;
     const per_slot = @as(u64, layers) *| expert_bytes;
     const slots_u64 = @min((budget_bytes - fixed) / per_slot, experts);
@@ -248,6 +250,7 @@ pub fn budgetLedger(
         .workspace_bytes = workspace_bytes,
         .selected_bytes = selected_bytes,
         .bounce_bytes = bounce_bytes,
+        .pool_bytes = shape.pool_bytes,
         .cache_bytes = @as(u64, slots) *| per_slot,
         .slots_per_layer = slots,
     };
@@ -3607,6 +3610,36 @@ test "expert stream ssd budget ledger refuses a grouped store below one expert o
     // A uniform store has no floor beyond its two slots.
     const uniform = try budgetLedger(fixed + 13 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce, .{});
     try t.expectEqual(@as(u16, 13), uniform.slots_per_layer);
+}
+
+test "expert stream ssd budget ledger bills the MLX pool beside the fixed terms and the cache gives it up" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const expert_bytes: u64 = 9_830_400;
+    const trunk: u64 = 9_900_000_000;
+    const none = try budgetLedger(100 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, BOUNCE_BYTES, .{});
+    const pooled = try budgetLedger(100 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, BOUNCE_BYTES, .{ .pool_bytes = 6 * GiB });
+    try t.expectEqual(@as(u64, 0), none.pool_bytes);
+    try t.expectEqual(6 * GiB, pooled.pool_bytes);
+    try t.expect(pooled.slots_per_layer < none.slots_per_layer);
+    // The planned total never passes the budget, and one more slot would.
+    const fixed = trunk + pooled.workspace_bytes + pooled.selected_bytes + BOUNCE_BYTES + pooled.pool_bytes;
+    try t.expect(fixed + pooled.cache_bytes <= 100 * GiB);
+    try t.expect(fixed + pooled.cache_bytes + 48 * expert_bytes > 100 * GiB);
+    // A budget the pool alone tips under two slots a layer is refused.
+    const floor = fixed + 2 * 48 * expert_bytes;
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(floor - 1, trunk, 0, 0, 48, 512, 10, expert_bytes, BOUNCE_BYTES, .{ .pool_bytes = 6 * GiB }));
+}
+
+test "expert stream: a resident store still bills the pool, and a budget short by it streams" {
+    const t = std.testing;
+    const trunk: u64 = 5_000_000_000;
+    const shape: quant.StoreShape = .{ .all_bytes = 100_000_000_000, .pool_bytes = 2_000_000_000 };
+    const exact = try budgetLedger(trunk + shape.all_bytes + shape.pool_bytes, trunk, 0, 0, 40, 384, 6, 9_000_000, BOUNCE_BYTES, shape);
+    try t.expect(exact.resident);
+    try t.expectEqual(shape.pool_bytes, exact.pool_bytes);
+    const short = try budgetLedger(trunk + shape.all_bytes + shape.pool_bytes - 1, trunk, 0, 0, 40, 384, 6, 9_000_000, BOUNCE_BYTES, shape);
+    try t.expect(!short.resident);
 }
 
 test "expert stream ssd budget ledger bills each union workspace set" {

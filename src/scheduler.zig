@@ -3032,6 +3032,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
     };
     const per_expert = bill.expert_bytes;
     streamed.expert_shape = bill.shape;
+    streamed.expert_shape.pool_bytes = config.expertPoolBytes();
     const picked = resolveStreamedVision(budget_bytes, &streamed, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or pass --no-vision\n", .{
             budget_bytes >> 30,
@@ -3104,7 +3105,7 @@ pub fn billedFillPeakBytes(config: *const ModelConfig, prefill_peak_bytes: u64) 
 /// What a streamed load holds beside its cache and bounce buffers while it fills. A request bill never carries the
 /// workspace: it is allocated at boot and already counted in the active memory a request reads.
 pub fn loadStagingBytes(config: *const ModelConfig, billed_fill_peak_bytes: u64, workspace_bytes: u64) u64 {
-    return billed_fill_peak_bytes +| (if (config.isDsv41()) workspace_bytes else 0);
+    return billed_fill_peak_bytes +| (if (config.isDsv41()) workspace_bytes else 0) +| config.expertPoolBytes();
 }
 
 /// Marks the config streamed: the fields every streamed forward and bill reads.
@@ -3671,6 +3672,20 @@ test "the expert cache resolves from --ssd-budget-gb" {
     try t.expect(no_budget.ledger == null);
 
     try t.expectError(error.SsdBudgetBelowResident, resolveExpertCache(14 * GiB, &cfg, split, false, fused));
+}
+
+test "a DeepSeek ledger carries the MLX pool and gives that many bytes up from the expert cache" {
+    const GiB: u64 = 1 << 30;
+    var cfg = model_mod.ModelConfig{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .num_experts = 384, .num_experts_per_tok = 6 };
+    const split = model_mod.ResidentSplit{ .trunk = 5_350_000_000, .mtp = 3_920_000_000 };
+    const before = try resolveExpertCache(108 * GiB, &cfg, split, true, 8_100_000);
+    cfg.expert_shape.pool_bytes = cfg.expertPoolBytes();
+    const after = try resolveExpertCache(108 * GiB, &cfg, split, true, 8_100_000);
+    try testing.expectEqual(cfg.expertPoolBytes(), after.ledger.?.pool_bytes);
+    try testing.expectEqual(@as(u64, 0), before.ledger.?.pool_bytes);
+    try testing.expect(after.cache_bytes < before.cache_bytes);
+    const l = after.ledger.?;
+    try testing.expect(l.trunk_bytes + l.mtp_bytes + l.workspace_bytes + l.selected_bytes + l.bounce_bytes + l.pool_bytes + l.cache_bytes <= 108 * GiB);
 }
 
 test "streamed vision: the tower comes out of the ssd budget only when asked, refused by name when it does not fit" {
@@ -4265,14 +4280,15 @@ test "a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep th
     try testing.expectEqual(fill, billedFillPeakBytes(&glm, fill));
 }
 
-test "a streamed DeepSeek load bills its union workspace and no fill peak" {
+test "a streamed DeepSeek load bills its union workspace and MLX pool and no fill peak" {
     const fill: u64 = 9_911 << 20;
     const workspace: u64 = 3_525 << 20;
     const ds = ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };
     const qwen = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
     const mimo = ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
     try testing.expectEqual(@as(u64, 0), billedFillPeakBytes(&ds, fill));
-    try testing.expectEqual(workspace, loadStagingBytes(&ds, billedFillPeakBytes(&ds, fill), workspace));
+    try testing.expect(ds.expertPoolBytes() > 0);
+    try testing.expectEqual(workspace + ds.expertPoolBytes(), loadStagingBytes(&ds, billedFillPeakBytes(&ds, fill), workspace));
     try testing.expectEqual(@as(u64, 0), loadStagingBytes(&qwen, billedFillPeakBytes(&qwen, fill), workspace));
     try testing.expectEqual(fill, loadStagingBytes(&mimo, billedFillPeakBytes(&mimo, fill), workspace));
 }
@@ -4381,7 +4397,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const plan = try planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision, assistant_bytes);
         vision_cost = plan.vision;
         load_vision = plan.vision.on;
-        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer{s}\n", .{
+        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB, mlx pool {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer{s}\n", .{
             led.budget_bytes >> 30,
             @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.mtp_bytes)) / 1e9,
@@ -4389,11 +4405,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             @as(f64, @floatFromInt(led.workspace_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.selected_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.bounce_bytes)) / 1e9,
+            @as(f64, @floatFromInt(led.pool_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.cache_bytes)) / 1e9,
             plan.cache.slots_per_layer,
             if (led.resident) ", every routed expert resident" else "",
         });
         applyStreamingPlan(params.config, plan, budget.bytes);
+        if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) @import("server.zig").capMlxPool(led.pool_bytes);
         if (params.config.expert_source_dir == null) {
             params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
             expert_source_assigned = true;
@@ -5668,6 +5686,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+            if (s.model.config) |c| @import("dsv41_borrow.zig").endRequestMlx(c);
         }
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
         destroyAbandoned(abandoned);

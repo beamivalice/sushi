@@ -91,7 +91,8 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 - `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident
   target of N GiB = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
-  bounce; the remainder is a uniform per-layer LRU. The ledger refuses a budget under two slots per layer, and under
+  bounce + the MLX buffer pool a model caps for itself (`StoreShape.pool_bytes`, DeepSeek only; others keep the
+  RAM/16 cap outside the ledger); the remainder is a uniform per-layer LRU. The ledger refuses a budget under two slots per layer, and under
   one expert of every rate group of a grouped layer (`SsdBudgetBelowResident`, `StoreShape.layer_floor_bytes`).
 - **Resident**: a budget that holds every routed expert (`StoreShape.all_bytes`, set when every routed layer is
   rate-grouped) beside the trunk, MTP and tower bills no union workspace, selected slab or bounce. The engine sizes
