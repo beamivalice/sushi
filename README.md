@@ -8,6 +8,7 @@ A local AI server for low-bit, very high quality Sushi quants, using custom EXL3
 
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
+* DeepSeek 4.1 Flash 1017 STQ 1.75bpw - COMING SOON!
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming-on-a-32-gb-mac))
 * [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (requires 64 GB+ and sushi 1.3.0 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
