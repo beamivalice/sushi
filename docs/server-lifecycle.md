@@ -237,9 +237,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **The tower runs after the prefix restore, on the inference thread** (`encodeMediaAfterRestore`, `DeferredMedia`):
   a leading block whose every placeholder row sits inside the restored prefix is not encoded (its KV is restored),
   the encode and its bill (`visionEncodeBill`) cover the blocks after it, and a block the restore cuts through is
-  encoded whole. The slot's splice offset is the placeholder rows in the prefix less the rows skipped. Decode stays
-  before the restore (the media key hashes the pixels), run by up to 8 threads over the body's base64 payloads
-  (`PredecodedImages`; the wire walk takes each by payload hash, so order and bytes are the serial decode's); the `Multimodal: encoded N of M` line gives decode and
+  encoded whole. The slot's splice offset is the placeholder rows in the prefix less the rows skipped.
+- **A patch-grid image is held as its file, never as f32 patches**: the connection thread base64-decodes the payload,
+  reads the size from the JPEG/PNG/WebP header and plans the grid with the processor's resize rule (`planImage`), so
+  the prompt places its rows and the request keeps the compressed bytes (`ImageData.undecoded`); a 1080p screenshot is
+  19.8 MB of patches on DeepSeek-V4.1. The media key is unchanged, a hash of the decoded pixels: `keyMedia` decodes
+  `decode_workers` (8) images at a time on that many threads (`ImageDecodeWindow`), feeds each to the chain and frees
+  it, so keying holds at most 8 decoded images, and a file that will not decode is a 400 naming its place there.
+  `encodeMediaAfterRestore` decodes again, only the images it encodes, through the same window, freeing each after
+  its tower call; an image its restored prefix holds is decoded once, for its key. Qwen, MiMo and GLM take the same
+  path; Gemma's fixed square and `x-mlx-pixels` decode on the connection thread. The `Multimodal: encoded N of M` line gives decode and
   encode ms, and the encode counts in the request's prefill time.
 - **Media refusals are named**: an undecodable image is a 400 naming `messages[i]`/`input[i]` and the reason
   (`imageRejectReason`), an `input_audio` part a 400 unless the model encodes audio (`RequestMedia.accepts_audio`),

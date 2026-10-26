@@ -361,6 +361,12 @@ pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 =
 /// The `VisionEncodeRequest.error_name` of an encode whose bill no longer fits when its turn comes.
 pub const vision_headroom_error = "VisionHeadroomExceeded";
 
+/// The `VisionEncodeRequest.error_name` of an image whose file would not decode.
+pub const image_undecodable_error = "ImageUndecodable";
+
+/// `server.decodeEncodedImage`: an `undecoded` image's file to the pixels its tower reads. Null cannot decode.
+pub var vision_image_decode: ?*const fn (std.mem.Allocator, []const u8, *const model_mod.ModelConfig) ?chat_mod.ImageData = null;
+
 /// `server.visionEncodeBill`: the GPU bytes an encode of these blocks peaks at.
 pub var vision_encode_bill: ?*const fn (*const model_mod.ModelConfig, []const chat_mod.ImageData, []const chat_mod.VideoData, usize) u64 = null;
 
@@ -371,14 +377,15 @@ pub var vision_fit_fault: ?*const fn ([]u8, *const model_mod.ModelConfig, []cons
 pub const MediaBlock = struct { kind: chat_mod.MediaPart.Kind, rows: usize };
 
 /// A request's media, encoded on the inference thread once the prefix restore has fixed how much of it
-/// the restored KV already holds. `images`/`videos` borrow pixel buffers the handler keeps alive until
-/// `Scheduler.complete`; `deinit` frees only the lists.
+/// the restored KV already holds. `images`/`videos` borrow buffers the handler keeps alive until
+/// `Scheduler.complete` (an `undecoded` image's is its file, decoded only if the encode reaches it);
+/// `deinit` frees only the lists.
 pub const DeferredMedia = struct {
     allocator: std.mem.Allocator,
     images: []const chat_mod.ImageData,
     videos: []const chat_mod.VideoData,
     blocks: []const MediaBlock,
-    /// Connection-thread time spent decoding this request's images, for the `Multimodal:` line.
+    /// Connection-thread time spent reading this request's images, for the `Multimodal:` line.
     decode_ns: u64 = 0,
 
     pub fn deinit(self: *DeferredMedia) void {
@@ -439,11 +446,12 @@ fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const Defer
     var rows: usize = 0;
     for (blocks) |b| rows += b.rows;
     const sw = io_util.Stopwatch.init(sch.io);
+    var decode_ns = d.decode_ns;
     defer log.info("  Multimodal: encoded {d} of {d} image(s) and {d} of {d} video(s), {d} of {d} soft tokens (the restored prefix holds {d}): decode {d} ms, encode {d} ms\n", .{
         images.len, d.images.len,
         videos.len, d.videos.len,
         rows,       rows + skip.rows,
-        skip.rows,  d.decode_ns / std.time.ns_per_ms,
+        skip.rows,  decode_ns / std.time.ns_per_ms,
         sw.read() / std.time.ns_per_ms,
     });
     if (blocks.len == 0) return .{ .embeddings = null, .skipped_rows = skip.rows };
@@ -451,7 +459,7 @@ fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const Defer
     const allocator = sch.allocator;
     const pix = try allocator.alloc(VisionImagePixels, images.len);
     defer allocator.free(pix);
-    for (images, pix) |img, *p| p.* = .{ .pixels = img.pixels, .width = @intCast(img.width), .height = @intCast(img.height), .grid_h = img.grid_h, .grid_w = img.grid_w };
+    for (images, pix) |img, *p| p.* = .{ .pixels = img.pixels, .width = @intCast(img.width), .height = @intCast(img.height), .grid_h = img.grid_h, .grid_w = img.grid_w, .undecoded = img.undecoded };
     const vids = try allocator.alloc(VisionVideoPixels, videos.len);
     defer allocator.free(vids);
     for (videos, vids) |vid, *v| v.* = .{ .pixels = vid.pixels, .grid_t = vid.grid_t, .grid_h = vid.grid_h, .grid_w = vid.grid_w };
@@ -469,8 +477,13 @@ fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const Defer
         .allocator = allocator,
     };
     runVisionEncode(sch, &req);
+    decode_ns += req.decode_ns;
     if (req.error_name) |name| {
         defer allocator.free(name);
+        if (std.mem.eql(u8, name, image_undecodable_error)) {
+            refusal.* = MediaRefusal.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG or WebP image", .{skip.images + req.failed_image + 1});
+            return error.MediaRefused;
+        }
         var text: [320]u8 = undefined;
         const fit = if (std.mem.eql(u8, name, vision_headroom_error)) (if (vision_fit_fault) |f| f(&text, cfg, images, videos, rows, req.available_bytes) else null) else null;
         refusal.* = if (fit) |msg| MediaRefusal.init(false, "{s}", .{msg}) else MediaRefusal.init(true, "vision encoding failed: {s}", .{name});
@@ -1158,6 +1171,8 @@ pub const VisionImagePixels = struct {
     /// Qwen3-VL only: full patch grid (0 ⇒ Gemma CHW). Selects QwenVision.
     grid_h: u32 = 0,
     grid_w: u32 = 0,
+    /// `pixels` is still the encoded file; the encode decodes it (`ImageDecodeWindow`).
+    undecoded: bool = false,
 };
 
 /// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
@@ -1210,6 +1225,10 @@ pub const VisionEncodeRequest = struct {
     available_bytes: u64 = 0,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
+    /// Output: which image (an index into `images`) `image_undecodable_error` names.
+    failed_image: usize = 0,
+    /// Output: time spent decoding `undecoded` images.
+    decode_ns: u64 = 0,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
     /// this flips true.
     done: bool = false,
@@ -6043,6 +6062,96 @@ fn flushImatrixCaptures(sch: *Scheduler) void {
     }
 }
 
+/// Most image decodes that run at once, and so most decoded images the host holds for one request.
+pub const decode_workers = 8;
+
+/// An `undecoded` image's file to its pixels; null cannot decode.
+pub const ImageDecodeFn = *const fn (std.mem.Allocator, []const u8, *const model_mod.ModelConfig) ?chat_mod.ImageData;
+
+/// Decodes the `undecoded` images of a request `decode_workers` at a time, one thread each, and frees
+/// each decoded image once its reader (the media key, the tower call) is done with it: a request of
+/// many screenshots never holds more than a window of decoded patches.
+pub const ImageDecodeWindow = struct {
+    allocator: std.mem.Allocator,
+    config: ?*const model_mod.ModelConfig,
+    decode: ?ImageDecodeFn,
+    images: []const VisionImagePixels,
+    first: usize = 0,
+    len: usize = 0,
+    slots: [decode_workers]?chat_mod.ImageData = @splat(null),
+    decode_ns: u64 = 0,
+    /// The index of the image `view` last failed to decode.
+    failed: usize = 0,
+
+    fn nowNs() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+
+    const Pool = struct {
+        window: *ImageDecodeWindow,
+        next: std.atomic.Value(usize) = .init(0),
+
+        fn work(self: *Pool) void {
+            const w = self.window;
+            const decode = w.decode orelse return;
+            const config = w.config orelse return;
+            while (true) {
+                const i = self.next.fetchAdd(1, .monotonic);
+                if (i >= w.len) return;
+                const src = w.images[w.first + i];
+                if (src.undecoded) w.slots[i] = decode(w.allocator, src.pixels, config);
+            }
+        }
+    };
+
+    fn refill(self: *ImageDecodeWindow, from: usize) void {
+        const started = nowNs();
+        self.deinit();
+        self.first = from;
+        self.len = @min(decode_workers, self.images.len - from);
+        var pool = Pool{ .window = self };
+        var threads: [decode_workers - 1]std.Thread = undefined;
+        var n_threads: usize = 0;
+        for (0..self.len - 1) |_| {
+            threads[n_threads] = std.Thread.spawn(.{}, Pool.work, .{&pool}) catch break;
+            n_threads += 1;
+        }
+        pool.work();
+        for (threads[0..n_threads]) |t| t.join();
+        self.decode_ns += nowNs() - started;
+    }
+
+    /// The pixels of `images[index]`, decoding its window when it is not in the current one. Null when
+    /// the file does not decode.
+    pub fn view(self: *ImageDecodeWindow, index: usize) ?VisionImagePixels {
+        const src = self.images[index];
+        if (!src.undecoded) return src;
+        if (index < self.first or index >= self.first + self.len) self.refill(index);
+        const img = self.slots[index - self.first] orelse {
+            self.failed = index;
+            return null;
+        };
+        return .{ .pixels = img.pixels, .width = img.width, .height = img.height, .grid_h = img.grid_h, .grid_w = img.grid_w };
+    }
+
+    pub fn release(self: *ImageDecodeWindow, index: usize) void {
+        if (index < self.first or index >= self.first + self.len) return;
+        const slot = &self.slots[index - self.first];
+        if (slot.*) |img| self.allocator.free(img.pixels);
+        slot.* = null;
+    }
+
+    pub fn deinit(self: *ImageDecodeWindow) void {
+        for (&self.slots) |*slot| {
+            if (slot.*) |img| self.allocator.free(img.pixels);
+            slot.* = null;
+        }
+        self.len = 0;
+    }
+};
+
 /// One image through the tower: a patch-grid ViT takes pixel_values [N, feat]
 /// and yields [1, N/merge², hidden].
 fn encodeImageBlock(vision_enc: *VisionEncoder, img: VisionImagePixels) !mlx.mlx_array {
@@ -6114,13 +6223,24 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     var n_video: usize = 0;
     var next_image: usize = 0;
     var next_video: usize = 0;
+    var window = ImageDecodeWindow{ .allocator = req.allocator, .config = req.model.config, .decode = vision_image_decode, .images = req.images };
+    defer window.deinit();
     for (0..req.images.len + req.videos.len) |block| {
         const is_image = if (req.order.len > 0) req.order[block] == .image else block < req.images.len;
         if ((is_image and next_image == req.images.len) or (!is_image and next_video == req.videos.len)) {
             failParts(sch, req, emb_parts.items, "MediaOrderMismatch");
             return;
         }
-        const emb = (if (is_image) encodeImageBlock(vision_enc, req.images[next_image]) else encodeVideoBlock(vision_enc, req.videos[next_video])) catch |err| {
+        const emb = (if (is_image) blk: {
+            defer req.decode_ns = window.decode_ns;
+            const px = window.view(next_image) orelse {
+                req.failed_image = next_image;
+                failParts(sch, req, emb_parts.items, image_undecodable_error);
+                return;
+            };
+            defer window.release(next_image);
+            break :blk encodeImageBlock(vision_enc, px);
+        } else encodeVideoBlock(vision_enc, req.videos[next_video])) catch |err| {
             failParts(sch, req, emb_parts.items, @errorName(err));
             return;
         };
@@ -13242,6 +13362,107 @@ test "a restored prefix lets the encode skip its images, and the rest match a fu
     try testing.expect(covered.embeddings == null);
     try testing.expectEqual(@as(usize, 9), covered.skipped_rows);
     try testing.expectEqual(@as(usize, 0), Probe.tower_runs);
+}
+
+test "undecoded images are decoded a window at a time, freed after their tower call, and a restored prefix never decodes its own" {
+    const Probe = struct {
+        var live = std.atomic.Value(isize).init(0);
+        var peak = std.atomic.Value(isize).init(0);
+        var decodes = std.atomic.Value(usize).init(0);
+        var fail_id: u8 = 0;
+        fn decode(allocator: std.mem.Allocator, file: []const u8, _: *const ModelConfig) ?chat_mod.ImageData {
+            _ = decodes.fetchAdd(1, .monotonic);
+            if (file[0] == fail_id) return null;
+            const pixels = allocator.alloc(u8, 1) catch return null;
+            pixels[0] = file[0];
+            const now = live.fetchAdd(1, .monotonic) + 1;
+            _ = peak.fetchMax(now, .monotonic);
+            return .{ .pixels = pixels, .width = file[1], .height = 1 };
+        }
+        fn tower(img: VisionImagePixels) anyerror!mlx.mlx_array {
+            if (img.undecoded) return error.TowerGotAFile;
+            var data: [64]f32 = undefined;
+            const rows: usize = img.width;
+            for (0..rows) |r| {
+                data[r * 4 + 0] = @floatFromInt(img.pixels[0]);
+                data[r * 4 + 1] = @floatFromInt(r);
+                data[r * 4 + 2] = 0;
+                data[r * 4 + 3] = 0;
+            }
+            _ = live.fetchSub(1, .monotonic);
+            return mlx.mlx_array_new_data(&data, &[_]c_int{ 1, @intCast(rows), 4 }, 3, .float32);
+        }
+        fn available(_: *const ModelConfig) u64 {
+            return std.math.maxInt(u64);
+        }
+        fn rowsOf(arr: mlx.mlx_array) []const f32 {
+            _ = mlx.mlx_array_eval(arr);
+            const shape = mlx.getShape(arr);
+            return mlx.mlx_array_data_float32(arr).?[0 .. @as(usize, @intCast(shape[1])) * 4];
+        }
+    };
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    var encoder: VisionEncoder = .{ .allocator = testing.allocator, .s = mlx.mlx_default_cpu_stream_new() };
+    model.vision_encoder = &encoder;
+    vision_block_test_hook = Probe.tower;
+    vision_encode_available = Probe.available;
+    vision_image_decode = Probe.decode;
+    defer {
+        vision_block_test_hook = null;
+        vision_encode_available = null;
+        vision_image_decode = null;
+    }
+
+    const n = 20;
+    var eager: [n]chat_mod.ImageData = undefined;
+    var files: [n]chat_mod.ImageData = undefined;
+    var file_bytes: [n][2]u8 = undefined;
+    var blocks: [n]MediaBlock = undefined;
+    var rows_total: usize = 0;
+    for (0..n) |i| {
+        const id: u8 = @intCast(i + 1);
+        const width: u8 = @intCast(1 + i % 3);
+        file_bytes[i] = .{ id, width };
+        eager[i] = .{ .pixels = file_bytes[i][0..1], .width = width, .height = 1 };
+        files[i] = .{ .pixels = &file_bytes[i], .width = width, .height = 1, .undecoded = true };
+        blocks[i] = .{ .kind = .image, .rows = width };
+        rows_total += width;
+    }
+    var refusal: ?MediaRefusal = null;
+
+    const whole = DeferredMedia{ .allocator = testing.allocator, .images = &eager, .videos = &.{}, .blocks = &blocks };
+    const want = try encodeMediaAfterRestore(&sch, &model, &whole, 0, &refusal);
+    defer _ = mlx.mlx_array_free(want.embeddings.?);
+    try testing.expectEqual(@as(usize, 0), Probe.decodes.load(.monotonic));
+
+    Probe.live.store(0, .monotonic);
+    const lazy = DeferredMedia{ .allocator = testing.allocator, .images = &files, .videos = &.{}, .blocks = &blocks };
+    const got = try encodeMediaAfterRestore(&sch, &model, &lazy, 0, &refusal);
+    defer _ = mlx.mlx_array_free(got.embeddings.?);
+    try testing.expectEqualSlices(f32, Probe.rowsOf(want.embeddings.?), Probe.rowsOf(got.embeddings.?));
+    try testing.expectEqual(@as(usize, n), Probe.decodes.load(.monotonic));
+    try testing.expectEqual(@as(isize, decode_workers), Probe.peak.load(.monotonic));
+    try testing.expectEqual(@as(isize, 0), Probe.live.load(.monotonic));
+
+    // The first four images sit inside the restored prefix: their files are never opened.
+    var prefix_rows: usize = 0;
+    for (blocks[0..4]) |b| prefix_rows += b.rows;
+    Probe.decodes.store(0, .monotonic);
+    const tail = try encodeMediaAfterRestore(&sch, &model, &lazy, prefix_rows, &refusal);
+    defer _ = mlx.mlx_array_free(tail.embeddings.?);
+    try testing.expectEqual(@as(usize, n - 4), Probe.decodes.load(.monotonic));
+    try testing.expectEqualSlices(f32, Probe.rowsOf(want.embeddings.?)[prefix_rows * 4 ..], Probe.rowsOf(tail.embeddings.?));
+
+    // A file that will not decode refuses the request by its place in it.
+    Probe.fail_id = 7;
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &lazy, 0, &refusal));
+    try testing.expect(std.mem.startsWith(u8, refusal.?.text(), "image 7 could not be decoded"));
+    try testing.expect(!refusal.?.server_error);
 }
 
 test "an encode refused for headroom after the restore names the bill of what it encodes" {

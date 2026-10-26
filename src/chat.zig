@@ -30,6 +30,9 @@ pub const ImageData = struct {
     tile_rows: u16 = 0,
     tile_cols: u16 = 0,
     tile_index: u16 = 0,
+    /// `pixels` is still the encoded file (JPEG/PNG/WebP) and `width`/`height`/`grid_*` are the plan the
+    /// processor will reach; the tower's turn decodes it, so a request holds the compressed bytes only.
+    undecoded: bool = false,
 };
 
 /// Per-request image preprocessing selector, derived from the loaded model's

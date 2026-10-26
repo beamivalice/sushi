@@ -643,7 +643,9 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   (14 px patches, 3x3 aligner cells, at most `max_image_tokens` 1024 span tokens, scaled up to `min_pixels`), `letterbox`
   is Pillow's `ImageOps.pad` (bicubic `contain`, gray 127, half-to-even margin; `vision_common.resizeRgbU8` is
   Pillow's two-pass uint8 resize), pixels are `(x/255 - 0.5)/0.5` in f32 in `(c, py, px)` order. Equal to the
-  reference to the bit after the bf16 round, and `plan.json` pins the geometry of twelve sizes.
+  reference to the bit after the bf16 round, and `plan.json` pins the geometry of twelve sizes. The prompt needs only
+  the grid, so a request holds each image as its file and `planGrid` runs on the size read from the header; the
+  patches are built for the media key and again when the tower reaches the image, a window at a time ([server-lifecycle](server-lifecycle.md#request-ownership-and-media)).
 - **Tower** (`Dsv41Vision`, `vision.py`): 32 blocks of pre-norm attention (16 heads, 2-D rope: row angles in the first
   half of each rotate-half pair, column angles in the second, f32) and a SwiGLU MLP, bf16 as stored, then `Aligner`
   (zero-pad to multiples of 3, unfold channel-major, `w2(gelu(w1(x)))`). It returns the whole span including the three
