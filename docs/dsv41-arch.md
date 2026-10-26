@@ -12,7 +12,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 - It serves `deepseek_v41` from the ORIGINAL checkpoint (`config.json`, `model-*.safetensors`, the index). Text in,
   text out, one request at a time (the model holds the request's state: `ownsModuleDecodeState`).
 - Off, by name: `--kv-quant` (the state is the activation dtype;
-  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16` or `--mtp-head-kv-quant` refuses the load, a settings `kv_quant` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
+  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
 - Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
   model-settings) is required, as on every streamed load; without one the load fails with `ExpertStreamingRequired`.
@@ -614,7 +614,13 @@ another job:
 | code | 69% | 3.44 | 5.8-6.2 | 4.2 | differ from char 449 (a near-tie) |
 | copy | 100% | 4.93 | 12.2-13.0 | 5.5 | identical |
 
-The stream and the non-stream answers of a DSpark request are the same bytes for all three. A round (draft 12-17 ms, verify 450-750 ms) costs about 2.6 serial
+Greedy DSpark text is not the same from one run to the next, even on the same hardware: the policy picks plain or drafted
+rounds from measured timings (`dspark_rows.Policy`), and the 1-row and multi-row kernels round differently, so a near-tie
+token can flip with the round mix. Only a run that forces one width (`SUSHI_DSV41_DSPARK_ROWS`) repeats, and a forced 1-row
+run equals `--no-mtp`. What holds for a given generation is that its stream and non-stream responses carry the same bytes.
+`--max-mtp-ctx` ends drafting for the rest of a request once prompt + generated passes it (plain 1-row rounds), as it does
+for MTP. A drafted image id ends the verify chunk before it: only a prompt carries one, and the model refuses it without rows.
+A round (draft 12-17 ms, verify 450-750 ms) costs about 2.6 serial
 decode steps, since five rows route to more streamed experts than one, so only acceptance above that pays.
 
 **Batch invariance.** The GPU forward is not row-count invariant: a 5-row verify and the serial rows differ in the last bits,

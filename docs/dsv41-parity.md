@@ -12,7 +12,7 @@ item).
 
 | Feature (Qwen) | DeepSeek | Evidence |
 |---|---|---|
-| Native speculative decode, greedy | works | `[spec-stats] mode=dspark` in the server log; `dsv41 generator: DSpark rounds` |
+| Native speculative decode, greedy | works; text may differ run to run | `[spec-stats] mode=dspark` in the server log; `dsv41 generator: DSpark rounds`. Adaptive DSpark picks plain or drafted rounds from measured timings and the 1-row and multi-row kernels round differently, so greedy text can differ between runs on the same hardware; a given generation's stream and non-stream bytes are the same ([dsv41-arch](dsv41-arch.md#dspark)) |
 | Spec decode for sampled requests | works | point-mass draft, exact accept rule (`Generator.dsparkSampledVerdict`); sampled determinism test |
 | Spec decode under repeat / presence / think penalty | works | verify rows shifted by `penaltyShiftRows`, `thinkShiftRows`; distinct-id test |
 | Spec decode under a thinking bound (Anthropic `budget_tokens`, `reasoning_budget_tokens`) | works | bound checked between rounds, then serial; `a thinking bound fires between DSpark rounds` |

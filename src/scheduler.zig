@@ -4360,6 +4360,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         .drop_expert = params.config.drop_expert != 0,
+        .mtp_typical = generate_mod.mtp_acceptance_explicit and generate_mod.mtp_acceptance_default == .typical,
+        .mtp_tokenv3 = generate_mod.mtp_acceptance_explicit and generate_mod.mtp_acceptance_default == .tokenv3,
+        .mtp_greedy_tail = generate_mod.mtp_greedy_tail_explicit,
     })) |why| {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;

@@ -4395,7 +4395,13 @@ pub const Generator = struct {
         var timer = io_util.Stopwatch.init(self.timer.io);
 
         const policy = &self.dspark_policy;
-        const forced: ?usize = switch (diag) {
+        // `--max-mtp-ctx` against prompt + generated, as `mtpRoundBegin` checks it; context only grows, so it is sticky.
+        if (!self.spec_disabled_runtime and !mtp_mod.mtpCtxWithinLimit(max_mtp_ctx, self.mtpKvLen())) {
+            log.info("  dspark=off (ctx {d} > --max-mtp-ctx {d})\n", .{ self.mtpKvLen(), max_mtp_ctx });
+            self.spec_disabled_runtime = true;
+            self.spec_disable_reason = .max_ctx;
+        }
+        const forced: ?usize = if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) 1 else switch (diag) {
             .off, .log => if (policy.next() == .plain) 1 else null,
             .rows => |n| n,
             .sweep => dspark_sweep_rows[self.dspark_stats.rounds % dspark_sweep_rows.len],
@@ -4418,7 +4424,12 @@ pub const Generator = struct {
         };
         // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
         const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
-        const rows: usize = rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at);
+        var rows: usize = rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at);
+        // The draft heads score the whole vocabulary, but only a prompt may carry the image id (the model refuses it
+        // without rows), and the trunk never picks it: a draft that holds it ends the chunk before it.
+        if (xfm.dsv41) |m| if (m.cfg.image_token_id != 0) {
+            if (std.mem.indexOfScalar(u32, ids_buf[1..rows], m.cfg.image_token_id)) |at| rows = 1 + at;
+        };
         const ctx_before = self.ctx.cache.step;
         var logits = try xfm.dsv41Verify(&self.ctx, ids_buf[0..rows]);
         defer _ = mlx.mlx_array_free(logits);
@@ -21005,4 +21016,102 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     const st = try hc.commitWithRing(&slot_cache, total.items, false, 0, 0, null, if (cps.len > 0) cps else null, null, null, 30, .{});
     try testing.expect(st == .disk_only);
     try testing.expect(hc.pending_disk != null);
+}
+
+const TinyDsparkNet = struct {
+    fx: model_mod.Weights,
+    ids: []u32,
+    config: model_mod.ModelConfig,
+    weights: model_mod.Weights,
+
+    fn init(a: std.mem.Allocator, io: std.Io) !TinyDsparkNet {
+        const dsv41_model = @import("dsv41_model.zig");
+        const dir = try dsv41_model.fixtureDir();
+        var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+        errdefer fx.deinit();
+        var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+        defer sc.deinit();
+        const ids = try dsv41_model.tokens(&sc, &fx);
+        errdefer a.free(ids);
+        var config = try model_mod.parseConfig(io, a, dir);
+        config.expert_streaming = true;
+        config.stream_mtp_head = true;
+        config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+        config.expert_source_dir = try a.dupe(u8, dir);
+        const weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+        return .{ .fx = fx, .ids = ids, .config = config, .weights = weights };
+    }
+
+    fn deinit(self: *TinyDsparkNet, a: std.mem.Allocator) void {
+        self.weights.deinit();
+        self.config.deinit(a);
+        a.free(self.ids);
+        self.fx.deinit();
+    }
+};
+
+test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var st = try TinyDsparkNet.init(a, io);
+    defer st.deinit(a);
+    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const prompt = st.ids[0..30];
+    const saved = max_mtp_ctx;
+    defer max_mtp_ctx = saved;
+    // The prompt is admitted (30 <= 34); the ceiling is crossed a few tokens into the reply.
+    max_mtp_ctx = 34;
+    var g = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 30, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    defer g.deinit(a);
+    g.dspark_diag = .{ .rows = 3 };
+    var drafted_past: u64 = 0;
+    while (true) {
+        const ctx_before = prompt.len + g.generated_ids.items.len;
+        const drafted_before = g.dspark_stats.drafted;
+        const r = (try g.nextDspark(a)) orelse break;
+        a.free(r.tokens);
+        if (ctx_before > max_mtp_ctx) drafted_past += g.dspark_stats.drafted - drafted_before;
+    }
+    if (drafted_past > 0) {
+        std.debug.print("DSpark drafted {d} rows past --max-mtp-ctx {d}\n", .{ drafted_past, max_mtp_ctx });
+        return error.DsparkIgnoresMaxMtpCtx;
+    }
+    try testing.expectEqual(SpecDisableReason.max_ctx, g.spec_disable_reason);
+}
+
+test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since only a prompt may carry one (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var st = try TinyDsparkNet.init(a, io);
+    defer st.deinit(a);
+    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    defer g.deinit(a);
+    g.dspark_diag = .{ .rows = 4 };
+
+    // The draft heads score the whole vocabulary, so the image id is one of their possible picks; this pack's
+    // image id is made an id the draft already holds past row 1.
+    const dsv = xfm.dsv41.?;
+    var d = try xfm.dsv41Draft(g.next_token_id);
+    defer d.deinit();
+    const k = for (2..d.ids.len) |i| {
+        if (d.ids[i] != d.ids[0] and d.ids[i] != d.ids[1]) break i;
+    } else return error.NoDistinctDraft;
+    dsv.cfg.image_token_id = d.ids[k];
+    const round = g.nextDspark(a) catch |err| {
+        std.debug.print("the verify chunk carrying the drafted image id failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const r = round orelse return error.NoRound;
+    defer a.free(r.tokens);
+    try testing.expect(std.mem.indexOfScalar(u32, r.tokens, d.ids[k]) == null);
+    try testing.expect(g.dspark_stats.drafted < k);
 }
