@@ -279,6 +279,7 @@ const exl3_test_weights = [_]struct { []const u8, u16 }{
     .{ "SPEC1 below K1.5 and above K4: every reader decodes", 36 },
     .{ "serves spec1 and std1 on the prefill grid", 36 },
     .{ "one-bank and grouped trellis linears", 35 },
+    .{ "SIMD multi-row: the split row loops", 15 },
     .{ "every slot writes the served kernels' bytes", 35 },
     .{ "512-row E=512 topk=10 layer within 2x affine", 32 },
     .{ "spec1's 2^12 folded into the stores", 28 },

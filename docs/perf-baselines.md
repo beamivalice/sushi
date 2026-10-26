@@ -310,6 +310,55 @@ so the experts are cold), us per call over the picked experts' bytes:
   not the row count: wider spans cost the same per layer until 32 rows per expert, and a streamed layer also reads 2.6 GB
   from SSD per call.
 
+<a id="simd-rows"></a>
+## SIMD multi-row trunk linears (machines without NAX)
+
+The multi-row kernel's SIMD arm is what an M1 to M4 runs for every verify width, and what `gemmNaxOn() == false` runs on
+any machine. Measured on the M5 Max with the SIMD arm forced (`SUSHI_FORCE_GPU_FAMILY_FALLBACK=1
+SUSHI_EXL3_ROWS_SIMD_UBENCH=1`, exl3 test binary, `-Dtest-filter="exl3 SIMD multi-row timing"`), main d810c50c plus the
+split row loops and `tgrp 2`, GPU lock, QUIET, `taskpolicy -a`. Each call is fed by the previous call's output, before and after
+are interleaved in one process, best of 7 chains of up to 48 cold banks; SPEC1 n64 (head and Qwen head n96), f16 rows.
+Cells are us per projection, fans on auto; no M1 to M4 timing exists yet. Output bytes are identical before and after.
+
+| linear | | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|---|
+| `wq_a`+`wkv` | before | 20 | 21 | 26 | 29 | 34 | 37 | 40 | 85 |
+| | after | 20 | 20 | 22 | 23 | 24 | 26 | 29 | 30 |
+| | after GB/s | 227 | 223 | 213 | 198 | 188 | 175 | 160 | 151 |
+| `wq_b` | before | 47 | 50 | 79 | 93 | 115 | 131 | 145 | 243 |
+| | after | 47 | 51 | 56 | 64 | 73 | 83 | 93 | 104 |
+| | after GB/s | 446 | 413 | 377 | 329 | 286 | 252 | 225 | 203 |
+| `wo_a` | before | 40 | 43 | 63 | 74 | 90 | 101 | 113 | 209 |
+| | after | 40 | 42 | 45 | 50 | 57 | 64 | 70 | 77 |
+| | after GB/s | 418 | 398 | 369 | 333 | 296 | 263 | 240 | 218 |
+| `wo_b` | before | 49 | 51 | 75 | 88 | 109 | 122 | 136 | 251 |
+| | after | 49 | 51 | 54 | 60 | 67 | 74 | 84 | 92 |
+| | after GB/s | 429 | 412 | 388 | 349 | 314 | 283 | 250 | 227 |
+| shared `w1`+`w3` | before | 32 | 34 | 48 | 55 | 67 | 75 | 82 | 157 |
+| | after | 32 | 33 | 36 | 39 | 43 | 48 | 53 | 58 |
+| | after GB/s | 371 | 353 | 329 | 304 | 272 | 243 | 222 | 205 |
+| shared `w2` | before | 20 | 22 | 30 | 34 | 40 | 44 | 48 | 92 |
+| | after | 20 | 21 | 23 | 24 | 26 | 29 | 32 | 35 |
+| | after GB/s | 294 | 286 | 259 | 241 | 223 | 203 | 185 | 170 |
+| `head` | before | 894 | 922 | 1077 | 1284 | 1630 | 1841 | 2050 | 3490 |
+| | after | 903 | 930 | 955 | 976 | 1029 | 1132 | 1247 | 1380 |
+| | after GB/s | 550 | 534 | 520 | 509 | 482 | 438 | 398 | 360 |
+| Qwen head | before | 880 | 867 | 912 | 1035 | 1330 | 1483 | 1686 | 3075 |
+| | after | 872 | 872 | 873 | 876 | 891 | 915 | 999 | 1091 |
+| | after GB/s | 547 | 547 | 546 | 544 | 535 | 521 | 477 | 437 |
+
+- Weights are read once for all rows, so the ideal is the one-row time at every width. One and two rows sit there
+  (memory bound, 410-450 GB/s on `wq_b`, 550 on the head). From three rows the kernel is ALU bound: the weight decode costs
+  about 23 us on `wq_b` (two to three rows' worth of FMAs) and each row adds about 10 us, an FMA stream at roughly half the
+  M5 Max's peak.
+- Before, a row loop of five or more rows compiled 2-3x slower (the eight-row cell: 243 us on `wq_b`, +100 over seven).
+  After, a k-tile decodes into registers once and the rows run in loops of at most four (`ROWS_LOOP_MAX`).
+- Ablations at 8 rows (`wq_b`, 103 us): skipping the activation prep saves 14 us, so a separate prep dispatch cannot pay;
+  keeping the prepared rows as f32 in threadgroup memory (no half-to-float converts) is 3-16% slower; threadgroups of 4
+  tile pairs match 2 (the policy stays at 256 threads for M1/M2's register-bound thread cap); 1 pair is 10-12% slower.
+- Every row of a SIMD multi-row launch equals the one-row launch bit for bit (k split and sum order do not depend on
+  the row count): a verify row on a machine without NAX equals its serial step.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

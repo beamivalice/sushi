@@ -295,6 +295,10 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
   on the GEMM arm only (prefill), the inner products before the output H128 + svh (shared with the expert prefill
   kernels; real trunk svh is 0.1 to 5, so an output saturates there only past about 6500 to 3e5). The multi-row
   kernel sums in f32 to the end. No real-magnitude capture of the trunk activations exists yet.
+- The SIMD arm (no NAX) decodes each k-tile into registers once and loops the rows over it in groups of at most four
+  (a longer row loop compiles 2-3x slower); from two rows a threadgroup spans two output tile pairs. Its bytes are the
+  pre-split kernel's at every width, and a row equals the one-row launch bit for bit; the tests keep the old loop as
+  their oracle. Timings: [perf-baselines](perf-baselines.md#simd-rows).
 - DeepSeek shapes at 2 to 8 rows (`SUSHI_EXL3_ROWS_SWEEP=dsv41`, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
   two-row cells, by less than the noise. The policy stands.
 

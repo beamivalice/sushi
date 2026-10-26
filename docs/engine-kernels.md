@@ -169,6 +169,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   the stores ([engine-exl3-experts](engine-exl3-experts.md#kernels), 2.6x on the non-NAX GEMM).
 - Cooperative-only matmul2d takes M, N, K in {16, 32}, with at least one of them 32. Larger tiles are the 16x16
   fragments concatenated. A K=32 op runs no faster than two K=16 ops.
+- **A per-row FMA loop over more than four rows compiles 2 to 3x slower** (the accumulators leave registers; M5, the
+  SIMD multi-row projection): split the rows into loops of at most four over the same decoded weights.
 - **Metal caps each compiled kernel's threads per threadgroup by its register use**; MLX throws at a dispatch above it.
   M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
   A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
