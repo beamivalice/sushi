@@ -28,8 +28,8 @@ pub const USAGE =
     \\Drives a running server through the release bench, once on a code corpus and once on prose: a cold 4k
     \\request, 16 windows of 8192 tokens each restoring the previous prompt end, and 3 decode samples at
     \\4k, 8k, 16k, 32k, 64k and 128k. It reads the GPU clock and thermal pressure through `sudo -n powermetrics`
-    \\beside every request and stops with an error when the clock is throttled (at most 1100 MHz, or pressure
-    \\Heavy or worse); without a passwordless sudo rule it says so and runs unmonitored.
+    \\beside every request and stops with an error when the busy clock is throttled (at most 1100 MHz); the
+    \\pressure level is recorded only. Without a passwordless sudo rule it says so and runs unmonitored.
     \\Boot the server and take the box rules with tests/bench.sh.
     \\
     \\Options:
@@ -1084,6 +1084,8 @@ test "bench report: GPU clock columns beside the tok/s, the header line, and an 
     };
     try testing.expectEqual(Problem.gpu_throttled, check(samples[3]).?);
     try testing.expect(check(samples[0]) == null);
+    // Heavy pressure with the clock held is a measurement, not a throttled request.
+    try testing.expect(check(mk(.prose, 4096, .repeat, 4096, 512, 4065, 10_000, 1539, .heavy)) == null);
     const msg = try throttleMessage(a, samples[3]);
     defer a.free(msg);
     try testing.expectEqualStrings("the GPU was throttled during the code 8192-token ladder request: median 1050 MHz (abort at 1100 MHz or under), thermal pressure Heavy", msg);

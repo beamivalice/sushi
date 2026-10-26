@@ -123,12 +123,12 @@ pub fn summarize(a: std.mem.Allocator, readings: []const Reading, from_ms: i64, 
     return out;
 }
 
-pub const Verdict = enum { ok, pressure, clock };
+pub const Verdict = enum { ok, clock };
 
-/// The abort rule: pressure Heavy or worse (an unnamed level sorts last, so it fails too), or a busy clock at or under
-/// `throttle_mhz`. Moderate is only recorded.
+/// The abort rule is the busy clock at or under `throttle_mhz`. The pressure level is only recorded: a long run on a
+/// fan-cooled box reports `Heavy` while the GPU still holds 1500+ MHz, and the clock is what the tok/s follows.
 pub fn verdict(mhz: f64, pressure: ?Pressure) Verdict {
-    if (pressure) |p| if (@intFromEnum(p) >= @intFromEnum(Pressure.heavy)) return .pressure;
+    _ = pressure;
     return if (mhz > 0 and mhz <= throttle_mhz) .clock else .ok;
 }
 
@@ -374,18 +374,15 @@ test "gpu_clock: the abort rule" {
     try testing.expectEqual(Verdict.ok, verdict(1101, .nominal));
     try testing.expectEqual(Verdict.clock, verdict(1100, .nominal));
     try testing.expectEqual(Verdict.clock, verdict(1050, .nominal));
-    // Moderate is recorded but does not abort; Heavy and worse, and a level we cannot name, do.
+    // The pressure level never aborts on its own: a Heavy box holding 1539 MHz is a measurement, a 1040 MHz one is not.
     try testing.expectEqual(Verdict.ok, verdict(1600, .moderate));
+    try testing.expectEqual(Verdict.ok, verdict(1539, .heavy));
+    try testing.expectEqual(Verdict.ok, verdict(1600, .other));
     try testing.expectEqual(Verdict.clock, verdict(1100, .moderate));
-    try testing.expectEqual(Verdict.pressure, verdict(1600, .heavy));
-    try testing.expectEqual(Verdict.pressure, verdict(1040, .heavy));
-    try testing.expectEqual(Verdict.pressure, verdict(1600, .trapping));
-    try testing.expectEqual(Verdict.pressure, verdict(1600, .sleeping));
-    try testing.expectEqual(Verdict.pressure, verdict(1600, .other));
-    // No busy sample: only the pressure can condemn the request; no sample at all: nothing to judge.
-    try testing.expectEqual(Verdict.ok, verdict(0, .nominal));
+    try testing.expectEqual(Verdict.clock, verdict(1040, .heavy));
+    // No busy sample: nothing to judge.
+    try testing.expectEqual(Verdict.ok, verdict(0, .other));
     try testing.expectEqual(Verdict.ok, verdict(0, null));
-    try testing.expectEqual(Verdict.pressure, verdict(0, .other));
 }
 
 test "gpu_clock: the report header names the clock and the pressure levels seen, or says it was not monitored" {
