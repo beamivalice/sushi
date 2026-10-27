@@ -4,6 +4,8 @@
 
 ## Install
 
+Apple Silicon M1+ and macOS 26.2 or later are required.
+
 ```bash
 brew install beamivalice/tap/sushi
 ```
@@ -101,8 +103,8 @@ keep the f32 default.
 when `--drafter <dir>` names it; a copy beside the pack is ignored. Download it with
 `hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-DFlash2`. Its rounds verify
 between `--drafter-min-depth` (default 2) and `--drafter-max-depth` (default 8) rows, as many as the drafter's confidence
-pays for; greedy output equals the MTP and serial output byte for byte. It is faster than MTP on Sushi-2.6bpw and level
-on Sushi-4bpw ([qwen4-perf](qwen4-perf.md#dflash2)); `--no-drafter` or `enable_drafter:false` keeps MTP.
+pays for; greedy output equals the MTP and serial output byte for byte. Its speed against MTP per pack and context is in
+[qwen4-perf](qwen4-perf.md#dflash2); `--no-drafter` or `enable_drafter:false` keeps MTP.
 
 **64 GB Mac, Sushi-STQ-2.75bpw**
 
@@ -237,9 +239,7 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
   one request, code and prose corpora, 256 and 128 decoded tokens a sample); the 108 row is the
   [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md). Hits count the decode forwards' expert
   picks found in the cache.
-- **The cost of 114.** The cache is bigger, so a long prompt has less memory beside it: a prefill of 2048 or more new
-  tokens lends the last decoder layers (37 to 39, 8.15 GB) and reads them back before decode, about 1.4 s a request.
-  A short agent turn (measured up to 1,000 new tokens) lends nothing and pays nothing. A lower budget leaves more
+- **Long prompts.** A long prefill may lend decoder layers and read them back before decode; a lower budget leaves more
   headroom, so it borrows later ([dsv41-memory](dsv41-memory.md#borrow)).
 - **Other Macs.** Only the 128 GB Mac has been run; the 80 row above is the 96 GB Mac's budget measured there. Below it the ledger admits a budget as low as 17 GiB (16 with
   `--no-vision`; a lower one is refused, `ssd_budget_below_resident` or `ssd_budget_below_vision`), and the slots a budget
@@ -267,8 +267,8 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
   a budget of 116. It is lossy: score it with `sushi kld compare` first ([dsv41-arch](dsv41-arch.md#drop-expert)).
 - **Refused flags.** The model has no KV cache, GatedDeltaNet layers or MTP head to configure, so `--kv-quant`,
   `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` and `--mtp-greedy-tail` stop the load with a
-  message naming the flag. A `model-settings.json` `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored, with one
-  log line.
+  message naming the flag ([dsv41-parity](dsv41-parity.md)). A `model-settings.json` `kv_quant`, `mtp_acceptance` or
+  `mtp_greedy_tail` is ignored, with one log line.
 
 ## Coding agents
 

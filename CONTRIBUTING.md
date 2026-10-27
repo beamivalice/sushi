@@ -12,7 +12,7 @@ Search first, then write. Check the open AND closed issues, the open PRs, and `g
 
 Open an issue with:
 - What you expected vs what happened
-- Model pack (e.g. `Qwen3.8-Flash-Next-Sushi-3bpw`) and the launch flags
+- Model pack (e.g. `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw`) and the launch flags
 - macOS version and chip (e.g. macOS 26.6, M4 Max)
 - Server log output (`--log-level debug`, `~/.sushi/logs/sushi-<port>.log`)
 

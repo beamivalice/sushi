@@ -663,7 +663,7 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
 <a id="verify-rows8"></a>
 ## Flash-Next: verify at 2 to 8 rows costs the same per row (4d7f575c to 8044906b)
 
-Decode meter (`SUSHI_DECODE_FWD_UBENCH`, `_S=1..8`, `_KV`), Sushi-TrellisQ-2.75 (STQ SPEC1 w15 experts, affine-8 trunk), kv8, M5 Max on AC,
+Decode meter (`SUSHI_DECODE_FWD_UBENCH`, `_S=1..8`, `_KV`), Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (STQ SPEC1 w15 experts, affine-8 trunk), kv8, M5 Max on AC,
 `taskpolicy -a`, fans max, GPU lock, 180 s idle before each boot, one boot per cell, 16 forwards, lm_head included. A cell is
 good to about +-1.5 ms from 5 rows up (boot to boot), so read the trend. The 4d7f575c row is the inherited baseline, not rerun.
 Ms per forward at 8K context:

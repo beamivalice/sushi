@@ -2,8 +2,8 @@
 
 The ledger of reviews of upstream mlx-serve (`ddalcu/mlx-serve`, the engine this repo forked) against Sushi. Each pass
 reads the upstream commits since the cursor, decides per commit whether it speeds up or fixes a served architecture
-(`qwen4_exp`, `mimo_v2`, `glm5_next`), and records the verdict here. The other direction, mlx-serve consuming Sushi, is
-[mlx-serve-integration](mlx-serve-integration.md).
+(`qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`), and records the verdict here. The other direction, mlx-serve
+consuming Sushi, is [mlx-serve-integration](mlx-serve-integration.md).
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index).
 
