@@ -38,10 +38,10 @@ installed RAM in whole GB (a 64 GB Mac reports 68.7e9 bytes and counts as 64):
 | GLM-5.3-Flash-Sushi-2bpw | 96 GB | 96 GB |
 | GLM-5.3-Flash-Sushi-2.4bpw | 128 GB | 128 GB |
 | MiMo-V2.6-Flash-Sushi-2.3bpw | 128 GB | 128 GB |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 128 GB (experts streamed) | 128 GB |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 96 GB (experts streamed) | 96 GB |
 
 Each family recommends its largest pack the Mac reaches in the last column. `fits` means the Mac meets the pack's tier
-(DeepSeek's routed experts stream on every Mac: its tier is the Mac that admits the `--ssd-budget-gb 96` to `114` launch
+(DeepSeek's routed experts stream on every Mac: its tier is the Mac that admits the `--ssd-budget-gb 80` launch
 [below](#deepseek-launch)).
 Below it the pack is labelled `may stream (--ssd-budget-gb)`: it may still run with `--ssd-budget-gb`
 ([README, Streaming on a 32 GB Mac](../README.md#streaming-on-a-32-gb-mac)), and nothing promises it does.
@@ -202,16 +202,17 @@ hf download beamster/GLM-5.3-Flash-Sushi-2.4bpw --local-dir ~/.sushi/models/GLM-
 - Up to four requests decode together.
 
 <a id="deepseek-launch"></a>
-**128 GB Mac, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw**
+**96 GB and 128 GB Macs, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw**
 
 ```bash
-sudo sysctl iogpu.wired_limit_mb=120000
+sudo sysctl iogpu.wired_limit_mb=125000   # 96 GB Mac: 93000
 hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.sushi/models/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw
 # or: sushi pull deepseek-v4.1-flash   (lands in ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw)
 
 # images, DSpark, thinking at high, the full 1M context; the routed experts stream from the SSD
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
   --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000
+# 128 GB Mac: --ssd-budget-gb 108, or 96 to leave more memory to other apps; 96 GB Mac: --ssd-budget-gb 80
 ```
 
 - **Disk.** The pack is 332.1 GB: 120 GiB of weights and 189 GiB of Engram tables, which are read from the SSD a row at
@@ -222,8 +223,9 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
   cache, which is what is left. A higher budget gives more expert slots a layer and fewer misses; a miss is an SSD
   read. The budget and the request's own state (0.93 GB at 1M tokens, 3.7 GB billed to a 1M request) plus the largest
   image's encode (1.6 GB) must sit under the GPU limit, so the budget tops out about 5 GiB under it at 1M context.
-- **On a 128 GB Mac, 108 is the recommended budget.** 80 and 96 also serve, with fewer slots; 114 needs
-  `sudo sysctl iogpu.wired_limit_mb=124000`.
+- **Recommended budgets, with `--ctx-size 1000000 --max-tokens 128000`:** on a 128 GB Mac 108, or 96 to leave more
+  memory to other apps, at `sudo sysctl iogpu.wired_limit_mb=125000`; on a 96 GB Mac 80, at
+  `sudo sysctl iogpu.wired_limit_mb=93000`.
 
   | `--ssd-budget-gb` | expert slots a layer (of 384) | expert hits code / prose | decode 4k code / prose | decode 128k code / prose | prefill 8k window code / prose |
   |---|---:|---:|---:|---:|---:|
@@ -239,7 +241,7 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
   tokens lends the last decoder layers (37 to 39, 8.15 GB) and reads them back before decode, about 1.4 s a request.
   A short agent turn (measured up to 1,000 new tokens) lends nothing and pays nothing. A lower budget leaves more
   headroom, so it borrows later ([dsv41-memory](dsv41-memory.md#borrow)).
-- **Other Macs.** Only the 128 GB Mac has been run. Below it the ledger admits a budget as low as 17 GiB (16 with
+- **Other Macs.** Only the 128 GB Mac has been run; the 80 row above is the 96 GB Mac's budget measured there. Below it the ledger admits a budget as low as 17 GiB (16 with
   `--no-vision`; a lower one is refused, `ssd_budget_below_resident` or `ssd_budget_below_vision`), and the slots a budget
   buys are fixed by the pack, so these are plan numbers and no speed is promised:
 
@@ -247,7 +249,7 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
   |---|---:|---|---|
   | 32 | 48 | 48 GB | `iogpu.wired_limit_mb=43000` |
   | 48 | 93 | 64 GB | `iogpu.wired_limit_mb=59000` |
-  | 76 | 171 | 96 GB | `iogpu.wired_limit_mb=90000` |
+  | 80 | 182 | 96 GB | `iogpu.wired_limit_mb=93000` |
 
   A shorter `--ctx-size` shrinks the request bill and lowers the Mac that admits a budget; at 17 to 20 GiB the cache
   holds 6 to 14 slots of 384 and nearly every expert is an SSD read.
