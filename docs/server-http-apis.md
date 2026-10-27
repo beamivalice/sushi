@@ -101,6 +101,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
   byte-silence. SSE comments keep the transport alive but do not count as model progress for every client.
+  While a stream waits in the queue behind another request, the comment reads `: queued behind N
+  request(s); running G of M tokens (~S s at R tok/s)` (G/M: the running request's generated tokens and max); an
+  Anthropic stream gets it before each `ping`.
   `sushi launch omp` sets the Sushi provider's `compat.streamIdleTimeoutMs: 0` so buffered calls can finish;
   explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
   omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's

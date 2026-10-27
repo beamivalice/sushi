@@ -629,6 +629,8 @@ pub const Slot = struct {
     logprobs_n: u32,
     serial_reason_logged: bool = false,
     memory_hold_logged: bool = false,
+    /// The `[queue]` line was logged for this pending slot (inference thread, `queue_mu`).
+    queue_logged: bool = false,
     /// Bytes of cache growth admission priced for this request that it had not allocated yet;
     /// `slotOutstandingGrowth` is the part still unallocated.
     growth_commit: u64 = 0,
@@ -2608,6 +2610,79 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
         n += 1;
     }
     return n;
+}
+
+/// What a pending request waits behind. `running_*` describe the oldest live request; its
+/// `running_max` less `running_generated` is an upper bound on the wait.
+pub const QueueWait = struct {
+    ahead: u32,
+    running_prompt: u32 = 0,
+    running_generated: u32 = 0,
+    running_max: u32 = 0,
+    /// Tokens per second the running request decoded so far; 0 when unmeasured.
+    tps: f64 = 0,
+};
+
+/// Caller holds `queue_mu`. Null unless `slot` is still pending.
+fn queueWaitLocked(sch: *Scheduler, slot: *const Slot) ?QueueWait {
+    const pos = for (sch.pending.items, 0..) |p, i| {
+        if (p == slot) break i;
+    } else return null;
+    var w = QueueWait{ .ahead = @intCast(pos) };
+    var running: ?*const Slot = null;
+    for ([_][]const *Slot{ sch.decoding.items, sch.prefilling.items }) |list| for (list) |s| {
+        if (!slotHoldsAdmission(s) or s.cancelled.load(.acquire)) continue;
+        w.ahead += 1;
+        if (running == null) running = s;
+    };
+    if (running) |s| {
+        const generated = @atomicLoad(u32, &s.completion_tokens, .monotonic);
+        const decode_ns = @atomicLoad(u64, &s.decode_ns, .monotonic);
+        w.running_prompt = @intCast(s.full_prompt.len);
+        w.running_generated = generated;
+        w.running_max = s.max_tokens;
+        if (generated > 0 and decode_ns > 0) w.tps = @as(f64, @floatFromInt(generated)) * std.time.ns_per_s / @as(f64, @floatFromInt(decode_ns));
+    }
+    return w;
+}
+
+/// Connection thread: what `slot` waits behind, or null once it is admitted.
+pub fn queueWait(sch: *Scheduler, slot: *const Slot) ?QueueWait {
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    return queueWaitLocked(sch, slot);
+}
+
+/// The `[queue]` log line (`log_line`) or the SSE comment line a streamed client gets, without
+/// its line ending.
+pub fn queueWaitText(buf: []u8, w: QueueWait, comptime log_line: bool) []const u8 {
+    var out = std.Io.Writer.fixed(buf);
+    out.print(if (log_line) "[queue] waiting behind {d} request(s)" else ": queued behind {d} request(s)", .{w.ahead}) catch return out.buffered();
+    if (w.running_max == 0) return out.buffered();
+    (if (log_line)
+        out.print("; running: {d}+{d} of max {d} tokens", .{ w.running_prompt, w.running_generated, w.running_max })
+    else
+        out.print("; running {d} of {d} tokens", .{ w.running_generated, w.running_max })) catch return out.buffered();
+    if (w.tps > 0) {
+        const left: f64 = @floatFromInt(w.running_max -| w.running_generated);
+        out.print(" (~{d} s at {d:.1} tok/s)", .{ @as(u64, @intFromFloat(@round(left / w.tps))), w.tps }) catch {};
+    }
+    return out.buffered();
+}
+
+/// Inference thread, `queue_mu` held: the one `[queue]` line a pending slot gets; null after it.
+fn queueLogLine(sch: *Scheduler, buf: []u8, slot: *Slot) ?[]const u8 {
+    if (slot.queue_logged) return null;
+    const w = queueWaitLocked(sch, slot) orelse return null;
+    slot.queue_logged = true;
+    return queueWaitText(buf, w, true);
+}
+
+/// The line for a slot that was logged as waiting and now starts; null when it never waited.
+fn queueStartLine(buf: []u8, slot: *const Slot, waited_ns: u64) ?[]const u8 {
+    if (!slot.queue_logged) return null;
+    const secs = @as(f64, @floatFromInt(waited_ns)) / std.time.ns_per_s;
+    return std.fmt.bufPrint(buf, "[queue] started after {d:.1} s", .{secs}) catch null;
 }
 
 /// `commit` is the part of `needed` the request allocates after admission (cache growth the bill
@@ -5670,6 +5745,10 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 r -= 1;
                 _ = sch.pending.orderedRemove(admit_idx[r]);
             }
+            var queue_line: [192]u8 = undefined;
+            for (sch.pending.items) |held| {
+                if (queueLogLine(sch, &queue_line, held)) |line| log.info("{s}\n", .{line});
+            }
         }
 
         if (sch.budget_revise_sw) |sw| {
@@ -7283,6 +7362,9 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
 /// from `pending`).
 fn admitForPrefillLocked(sch: *Scheduler, idx: usize) *Slot {
     const slot = sch.pending.items[idx];
+    var start_line: [64]u8 = undefined;
+    const waited_ns: u64 = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+    if (queueStartLine(&start_line, slot, waited_ns)) |line| log.info("{s}\n", .{line});
     _ = slot.in_pass.fetchAdd(1, .acq_rel);
     // `submit` reserved room for every in-flight slot.
     sch.prefilling.appendAssumeCapacity(slot);
@@ -13622,4 +13704,86 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     try testing.expect(rows_and_windows > 0);
     try testing.expect(hc.live_dsv41.bytes() > 0);
     try testing.expectEqual(rows_and_windows + hc.live_dsv41.bytes(), slotStateBytes(&slot));
+}
+
+var queue_test_prompt: [4096]u32 = undefined;
+
+/// A slot reduced to the fields the queue report reads; no mlx state.
+fn queueTestSlot(prompt_len: usize, generated: u32, max: u32, decode_s: u64) Slot {
+    var s: Slot = undefined;
+    s.full_prompt = queue_test_prompt[0..prompt_len];
+    s.completion_tokens = generated;
+    s.max_tokens = max;
+    s.decode_ns = decode_s * std.time.ns_per_s;
+    s.finished = false;
+    s.error_code = null;
+    s.cancelled = .init(false);
+    s.queue_logged = false;
+    return s;
+}
+
+test "a request held behind a running one logs what it waits behind, once" {
+    const a = testing.allocator;
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.prefilling.deinit(a);
+    var running = queueTestSlot(3000, 8000, 32768, 200);
+    var first = queueTestSlot(10, 0, 100, 0);
+    var second = queueTestSlot(10, 0, 100, 0);
+    try sch.decoding.append(a, &running);
+    try sch.pending.append(a, &first);
+    try sch.pending.append(a, &second);
+
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "[queue] waiting behind 1 request(s); running: 3000+8000 of max 32768 tokens (~619 s at 40.0 tok/s)",
+        queueLogLine(&sch, &buf, &first).?,
+    );
+    try testing.expect(queueLogLine(&sch, &buf, &first) == null);
+    try testing.expectEqualStrings(
+        "[queue] waiting behind 2 request(s); running: 3000+8000 of max 32768 tokens (~619 s at 40.0 tok/s)",
+        queueLogLine(&sch, &buf, &second).?,
+    );
+}
+
+test "the queue report leaves out a decode rate nobody has measured, and a slot that is not queued has none" {
+    const a = testing.allocator;
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.prefilling.deinit(a);
+    var running = queueTestSlot(3000, 0, 32768, 0);
+    var waiting = queueTestSlot(10, 0, 100, 0);
+    var other = queueTestSlot(10, 0, 100, 0);
+    try sch.prefilling.append(a, &running);
+    try sch.pending.append(a, &waiting);
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "[queue] waiting behind 1 request(s); running: 3000+0 of max 32768 tokens",
+        queueLogLine(&sch, &buf, &waiting).?,
+    );
+    try testing.expect(queueWaitLocked(&sch, &other) == null);
+    running.finished = true;
+    const w = queueWaitLocked(&sch, &waiting).?;
+    try testing.expectEqual(@as(u32, 0), w.ahead);
+    try testing.expectEqualStrings("[queue] waiting behind 0 request(s)", queueWaitText(&buf, w, true));
+}
+
+test "a request that waited reports how long once it starts, and one that did not stays silent" {
+    var buf: [64]u8 = undefined;
+    var waited = queueTestSlot(10, 0, 100, 0);
+    waited.queue_logged = true;
+    try testing.expectEqualStrings("[queue] started after 12.3 s", queueStartLine(&buf, &waited, 12_340_000_000).?);
+    var direct = queueTestSlot(10, 0, 100, 0);
+    try testing.expect(queueStartLine(&buf, &direct, 12_340_000_000) == null);
+}
+
+test "the streamed queue notice is one SSE comment line with the same numbers" {
+    var buf: [256]u8 = undefined;
+    const w = QueueWait{ .ahead = 2, .running_prompt = 3000, .running_generated = 8000, .running_max = 32768, .tps = 40 };
+    try testing.expectEqualStrings(
+        ": queued behind 2 request(s); running 8000 of 32768 tokens (~619 s at 40.0 tok/s)",
+        queueWaitText(&buf, w, false),
+    );
 }

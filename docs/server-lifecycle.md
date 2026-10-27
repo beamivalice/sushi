@@ -215,6 +215,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.
+- **A request the admission tick holds (single-flight arch, memory) logs `[queue] waiting behind N request(s); running: P+G of
+  max M tokens (~S s at R tok/s)` once, and `[queue] started after X s` when it starts**; the ETA is the running request's
+  remaining max, an upper bound. Visibility only: no priority, preemption or queue limit.
 - **A slot whose prefill runs is in `Scheduler.prefilling`**, neither `pending` nor `decoding`, so a SIGTERM's
   `cancelAllInFlight` stops it at the next chunk; it ran a MiMo 512k prefill on past 120 s until SIGKILL.
 - **A shutdown drain is an ERROR, never a finish reason**: `cancelAllInFlight` marks `Slot.shutdown_cancelled`, so the

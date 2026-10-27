@@ -10784,7 +10784,7 @@ fn handleStreamingCompletion(
                     client_gone = true;
                     break;
                 }
-                sendStreamKeepalive(stream) catch {
+                sendStreamIdle(stream, scheduler_mod.queueWait(global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
@@ -12098,7 +12098,7 @@ fn handleStreamingGeneration(
                     client_gone = true;
                     break;
                 }
-                sendStreamKeepalive(stream) catch {
+                sendStreamIdle(stream, scheduler_mod.queueWait(global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
@@ -16615,6 +16615,24 @@ fn sendStreamKeepalive(stream: *Conn) !void {
     try stream.writeAll(": keepalive\n\n");
 }
 
+/// The keepalive of a stream still waiting for its first token: while the request is queued
+/// behind another, the comment says so. It is a comment, so no client reads it as content.
+fn sendStreamIdle(stream: *Conn, queued: ?scheduler_mod.QueueWait) !void {
+    const w = queued orelse return sendStreamKeepalive(stream);
+    if (stream.ws_mode != null) return;
+    var buf: [196]u8 = undefined;
+    const line = scheduler_mod.queueWaitText(buf[0..192], w, false);
+    buf[line.len] = '\n';
+    buf[line.len + 1] = '\n';
+    try stream.writeAll(buf[0 .. line.len + 2]);
+}
+
+/// The Anthropic surface's idle event: its ping, preceded by the queue comment while the request waits.
+fn sendAnthropicIdle(stream: *Conn, queued: ?scheduler_mod.QueueWait) !void {
+    if (queued) |w| try sendStreamIdle(stream, w);
+    try sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}");
+}
+
 /// Which no-op event a surface uses to prove liveness.
 const KeepaliveStyle = enum { sse_comment, anthropic_ping };
 
@@ -17634,7 +17652,7 @@ fn handleAnthropicStreaming(
                     client_gone = true;
                     break;
                 }
-                sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}") catch {
+                sendAnthropicIdle(stream, scheduler_mod.queueWait(global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
@@ -19066,7 +19084,7 @@ fn handleResponsesInner(
                         client_gone = true;
                         break;
                     }
-                    sendStreamKeepalive(stream) catch {
+                    sendStreamIdle(stream, scheduler_mod.queueWait(global_scheduler.?, slot_handle.?)) catch {
                         log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                         slot_handle.?.cancel();
                         client_gone = true;
@@ -28312,4 +28330,79 @@ test "completionTimingsField: a non-streaming completion reports cached and pref
     const none = try completionTimingsField(a, 1, 0, 1, 0, 0);
     defer a.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+fn readAllFromPair(fd: std.posix.fd_t, buf: []u8) []u8 {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.recv(fd, buf[got..].ptr, buf.len - got, 0);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    return buf[0..got];
+}
+
+/// What an SSE parser keeps: the events, with every comment block dropped.
+fn sseEventsOnly(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var blocks = std.mem.splitSequence(u8, raw, "\n\n");
+    while (blocks.next()) |block| {
+        if (block.len == 0 or block[0] == ':') continue;
+        try out.appendSlice(allocator, block);
+        try out.appendSlice(allocator, "\n\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "an Anthropic stream waiting in the queue gets the queue comment before each ping, and a plain ping otherwise" {
+    const t = std.testing;
+    const wait = scheduler_mod.QueueWait{ .ahead = 1, .running_prompt = 3000, .running_generated = 8000, .running_max = 32768, .tps = 0 };
+    var sv: [2]std.posix.fd_t = undefined;
+    try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    try sendAnthropicIdle(&conn, wait);
+    try sendAnthropicIdle(&conn, null);
+    _ = std.c.close(sv[0]);
+    var buf: [4096]u8 = undefined;
+    const raw = readAllFromPair(sv[1], &buf);
+    const ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+    try t.expectEqualStrings(": queued behind 1 request(s); running 8000 of 32768 tokens\n\n" ++ ping ++ ping, raw);
+}
+
+test "a queued stream gets SSE comments while it waits and its events are the same bytes as when not queued" {
+    const t = std.testing;
+    const events = [_][]const u8{
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    };
+    const wait = scheduler_mod.QueueWait{ .ahead = 2, .running_prompt = 3000, .running_generated = 8012, .running_max = 32768, .tps = 0 };
+    var outs: [2][]u8 = undefined;
+    var raws: [2][]u8 = undefined;
+    for ([_]bool{ true, false }, 0..) |queued, i| {
+        var sv: [2]std.posix.fd_t = undefined;
+        try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+        defer _ = std.c.close(sv[1]);
+        var conn: Conn = undefined;
+        Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+        for (events) |ev| {
+            if (queued) try sendStreamIdle(&conn, wait);
+            try conn.writeAll(ev);
+        }
+        try sendStreamIdle(&conn, null);
+        _ = std.c.close(sv[0]);
+        var buf: [4096]u8 = undefined;
+        raws[i] = try t.allocator.dupe(u8, readAllFromPair(sv[1], &buf));
+        outs[i] = try sseEventsOnly(t.allocator, raws[i]);
+    }
+    defer for (outs) |o| t.allocator.free(o);
+    defer for (raws) |r| t.allocator.free(r);
+    const note = ": queued behind 2 request(s); running 8012 of 32768 tokens\n\n";
+    try t.expect(std.mem.startsWith(u8, raws[0], note));
+    try t.expectEqual(@as(usize, 3), std.mem.count(u8, raws[0], note));
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, raws[1], "queued"));
+    try t.expect(std.mem.endsWith(u8, raws[1], ": keepalive\n\n"));
+    try t.expectEqualStrings(outs[1], outs[0]);
 }
