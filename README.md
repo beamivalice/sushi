@@ -18,6 +18,8 @@ Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
 ## Quality
 
+<p align="center"><img src="docs/assets/dsv41-1.75bpw-kld.png" alt="DeepSeek-V4.1-Flash KLD by category" width="100%"></p>
+
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
 * MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%)
