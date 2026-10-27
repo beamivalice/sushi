@@ -42,26 +42,31 @@ Update with `brew upgrade sushi`.
 
 GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on with `--mtp-head-kv-quant`; GLM
 with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
-The Qwen columns are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 0.2 GiB off each Qwen cell.
+The Qwen rows are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 0.2 GiB off each Qwen cell.
 
-| context | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | DeepSeek-STQ-1.75bpw ‡ | GLM-2bpw | GLM-2.4bpw |
-|---|---:|---:|---:|---:|---:|---:|
-| weights only | 35.2 | 46.4 | 63.9 | 108.0 | 78.3 | 89.8 |
-| 128k | 40.3 | 51.4 | 69.0 | 110.0 | 82.6 | 94.1 |
-| 256k | 43.2 | 54.3 | 71.9 | 110.3 | 83.8 | 95.2 |
-| 512k | 48.2 | 59.4 | 76.9 | 111.0 | 86.0 | 97.5 |
-| 1M | 58.4 | 69.5 | 87.1 | 112.5 | 90.5 | 102.0 |
+| pack | weights only | 128k | 256k | 512k | 1M |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next-Sushi-2bpw | 35.2 | 40.3 | 43.2 | 48.2 | 58.4 |
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | 46.4 | 51.4 | 54.3 | 59.4 | 69.5 |
+| Qwen3.8-Flash-Next-Sushi-4bpw | 63.9 | 69.0 | 71.9 | 76.9 | 87.1 |
+| GLM-5.3-Flash-Sushi-2bpw | 78.3 | 82.6 | 83.8 | 86.0 | 90.5 |
+| GLM-5.3-Flash-Sushi-2.4bpw | 89.8 | 94.1 | 95.2 | 97.5 | 102.0 |
+| MiMo-V2.6-Flash-Sushi-2.3bpw | 89.7 | 93.7 | 95.8 | 99.9 | 108.2 |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ‡ | 108.0 | 110.0 | 110.3 | 111.0 | 112.5 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
 the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no
 4-bit KV):
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | DeepSeek-STQ-1.75bpw ‡ | GLM-2bpw | GLM-2.4bpw |
-|---|---|---|---|---|---|---|---|
-| 48 GB † | 43,000 MB (42.0 GiB) | 200k / 304k | — | — | — | — | — |
-| 64 GB † | 59,000 MB (57.6 GiB) | 976k / 1M | 416k / 664k | — | — | — | — |
-| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 696k / — | — |
-| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — | 1M / — |
+| pack | 48 GB † (43,000 MB) | 64 GB † (59,000 MB) | 96 GB (90,000 MB) | 128 GB (120,000 MB) |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-2bpw | 200k / 304k | 976k / 1M | 1M / 1M | 1M / 1M |
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | — | 416k / 664k | 1M / 1M | 1M / 1M |
+| Qwen3.8-Flash-Next-Sushi-4bpw | — | — | 1M / 1M | 1M / 1M |
+| GLM-5.3-Flash-Sushi-2bpw | — | — | 696k / — | 1M / — |
+| GLM-5.3-Flash-Sushi-2.4bpw | — | — | — | 1M / — |
+| MiMo-V2.6-Flash-Sushi-2.3bpw | — | — | — | 1M / 1M |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ‡ | — | — | 1M / — | 1M / — |
 
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
 less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-STQ-2.75bpw) at 64 GB.
