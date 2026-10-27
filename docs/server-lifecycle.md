@@ -11,6 +11,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## Entry points
 
 - `src/main.zig`: entry, CLI flags + subcommands (`run/pull/list/serve/launch/kld/update`).
+- `--model <path>` and `sushi run <path>` accept a relative path: `cli.resolveRelativeDir` makes an existing directory absolute (cwd at launch) before anything reads it, because the layout, discovery and cache helpers take absolute paths only.
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - `pull` takes top-level files, `mtp/` and GLM's `GLM-5.3-Flash-DFlash2/` assistant (the loader auto-detects that folder; a
   pull that skips it serves GLM with DFlash2 off, logged as `[glm-dflash] off: no assistant found`).

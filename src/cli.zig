@@ -713,12 +713,24 @@ fn stderrReport(impl: *anyopaque, line: []const u8) void {
 var stderr_reporter_dummy: u8 = 0;
 const stderr_reporter = Reporter{ .impl = &stderr_reporter_dummy, .reportFn = &stderrReport };
 
+/// The absolute real path of `path` when it is a relative path naming an existing directory (resolved against the
+/// cwd), else null. Everything downstream of launch takes absolute model paths only.
+pub fn resolveRelativeDir(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return null;
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return null;
+    defer dir.close(io);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = dir.realPath(io, &buf) catch return null;
+    return allocator.dupe(u8, buf[0..n]) catch null;
+}
+
 /// Resolve + download-if-missing; returns the local model dir (owned).
 /// Exits the process with a friendly message on unknown names, and on a repo of another org that is not
 /// already on disk (downloads come from the `beamster` org only).
 pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
     // A path that exists locally is used as-is.
     if (std.fs.path.isAbsolute(name)) return allocator.dupe(u8, name);
+    if (resolveRelativeDir(allocator, io, name)) |abs| return abs;
     const resolved = resolveShortName(name) orelse {
         log.err("unknown model '{s}'\n", .{name});
         printKnownAliases(io);
@@ -3212,4 +3224,38 @@ test "hf auth: a token becomes a private header file for curl, never an argument
     defer none.deinit(a);
     try anon.appendArgs(&none, a);
     try testing.expectEqual(@as(usize, 0), none.items.len);
+}
+
+test "resolveRelativeDir: a relative directory becomes its absolute real path, anything else is left alone" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "pack", .default_dir);
+    var pack = try tmp.dir.openDir(io, "pack", .{});
+    defer pack.close(io);
+    try @import("glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(io, &tmp_buf);
+    const rel = try std.fs.path.relative(a, cwd_buf[0..cwd_len], null, cwd_buf[0..cwd_len], tmp_buf[0..tmp_len]);
+    defer a.free(rel);
+    const rel_pack = try std.fs.path.join(a, &.{ rel, "pack" });
+    defer a.free(rel_pack);
+    try std.testing.expect(!std.fs.path.isAbsolute(rel_pack));
+
+    const abs = resolveRelativeDir(a, io, rel_pack) orelse return error.TestUnexpectedResult;
+    defer a.free(abs);
+    const want = try std.fs.path.join(a, &.{ tmp_buf[0..tmp_len], "pack" });
+    defer a.free(want);
+    try std.testing.expectEqualStrings(want, abs);
+    const expert_quant = @import("expert_quant.zig");
+    try std.testing.expect(expert_quant.layoutOfDirWithFirstMoe(a, io, "glm5_next", rel_pack, 4, 3) == null);
+    try std.testing.expectEqual(expert_quant.Layout.fp8_individual, expert_quant.layoutOfDirWithFirstMoe(a, io, "glm5_next", abs, 4, 3).?);
+
+    try std.testing.expect(resolveRelativeDir(a, io, want) == null);
+    try std.testing.expect(resolveRelativeDir(a, io, "qwen3.8-flash-next") == null);
+    try std.testing.expect(resolveRelativeDir(a, io, "") == null);
 }

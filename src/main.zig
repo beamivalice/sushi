@@ -596,7 +596,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
             i += 1;
-            model_dir = args[i];
+            model_dir = cli_mod.resolveRelativeDir(allocator, io, args[i]) orelse args[i];
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1;
             port_flag = flagInt(u16, "--port", args[i], 0);
