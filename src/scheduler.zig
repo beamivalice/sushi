@@ -3331,95 +3331,6 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
-/// Bytes of the MTP head sidecar `mtp.loadMtp` reads beside the trunk shards: 0 when MTP is off, the
-/// head rides the checkpoint (its shards are billed already), none ships, or the arch loads its head
-/// elsewhere (MiMo and GLM never call `loadMtp`).
-fn mtpSidecarBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, mtp_on: bool) u64 {
-    if (!mtp_on or config.isMimo() or config.isGlm5() or config.isDsv41()) return 0;
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return 0;
-    defer dir.close(io);
-    const rel = switch (mtp_mod.resolveMtpSource(io, allocator, dir) orelse return 0) {
-        .sidecar_file => |r| r,
-        .in_checkpoint => return 0,
-    };
-    const st = dir.statFile(io, rel, .{}) catch return 0;
-    return @intCast(st.size);
-}
-
-/// The resident weight bill of a load no component-exact bill covers: the shards the index names plus the sidecar head.
-fn plainWeightBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, mtp_on: bool) u64 {
-    return modelDiskBytes(io, model_dir) +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
-}
-
-/// A one-tensor safetensors file: 8-byte LE header length, JSON header, `payload` zero bytes.
-fn writeTestSafetensors(io: std.Io, dir: std.Io.Dir, rel: []const u8, key: []const u8, payload: usize) !u64 {
-    var header_buf: [256]u8 = undefined;
-    const header = try std.fmt.bufPrint(&header_buf, "{{\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[{d}],\"data_offsets\":[0,{d}]}}}}", .{ key, payload / 2, payload });
-    var file: [512]u8 = undefined;
-    std.mem.writeInt(u64, file[0..8], header.len, .little);
-    @memcpy(file[8 .. 8 + header.len], header);
-    const total = 8 + header.len + payload;
-    @memset(file[8 + header.len .. total], 0);
-    if (std.fs.path.dirname(rel)) |d| try dir.createDirPath(io, d);
-    try dir.writeFile(io, .{ .sub_path = rel, .data = file[0..total] });
-    return total;
-}
-
-fn testTmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
-    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
-    return std.fmt.bufPrint(buf, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
-}
-
-test "the preflight bills a separately loaded MTP sidecar once, never an in-checkpoint head twice" {
-    const io = std.testing.io;
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try testTmpDirPath(&tmp, &path_buf);
-
-    const shard = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "model.embed_tokens.weight", 8);
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.embed_tokens.weight\":\"model.safetensors\"}}" });
-    const plain = ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expectEqual(shard, plainWeightBytes(io, a, &plain, dir, true));
-
-    const sidecar = try writeTestSafetensors(io, tmp.dir, "mtp/weights.safetensors", "mtp.fc.weight", 16);
-    try testing.expectEqual(shard + sidecar, plainWeightBytes(io, a, &plain, dir, true));
-    // The head is billed only when it will load, and only where `loadMtp` loads it.
-    try testing.expectEqual(shard, plainWeightBytes(io, a, &plain, dir, false));
-    const mimo = ModelConfig{ .model_type = "mimo_v2" };
-    const glm = ModelConfig{ .model_type = "glm5_next" };
-    try testing.expectEqual(@as(u64, 0), mtpSidecarBytes(io, a, &mimo, dir, true));
-    try testing.expectEqual(@as(u64, 0), mtpSidecarBytes(io, a, &glm, dir, true));
-
-    // A head inside the shards is already in the shard sum.
-    try tmp.dir.deleteFile(io, "mtp/weights.safetensors");
-    const with_head = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "mtp.fc.weight", 8);
-    try testing.expectEqual(with_head, plainWeightBytes(io, a, &plain, dir, true));
-}
-
-test "the Sushi resident bill carries a separately loaded MTP sidecar and its coarse rerank copy" {
-    const io = std.testing.io;
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try testTmpDirPath(&tmp, &path_buf);
-
-    _ = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "model.embed_tokens.weight", 8);
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.embed_tokens.weight\":\"model.safetensors\"}}" });
-    var config = ModelConfig{ .model_type = "qwen4_exp" };
-    config.vocab_size = 128;
-    config.hidden_size = 64;
-    const without = try sushiResidentLoadBytes(io, a, dir, &config, false, true);
-    const sidecar = try writeTestSafetensors(io, tmp.dir, "mtp/weights.safetensors", "mtp.fc.weight", 16);
-    const with = try sushiResidentLoadBytes(io, a, dir, &config, false, true);
-    try testing.expect(with >= without + sidecar);
-    try testing.expectEqual(without, try sushiResidentLoadBytes(io, a, dir, &config, false, false));
-}
-
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -3493,7 +3404,7 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
     if (config.isMimo()) return mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
-    const head_bytes = split.mtp +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
+    const head_bytes = split.mtp;
     const coarse_bits = mtp_mod.rerankCoarseBits();
     const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0)
         mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits)
@@ -4487,7 +4398,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!skip_mem_preflight) {
-        const weights_bytes = streaming_resident_bytes orelse plainWeightBytes(sch.io, sch.allocator, params.config, params.model_dir, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
+        const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const gpu_limit = mlx.maxRecommendedWorkingSet();
         const Reader = struct {
             io: std.Io,
@@ -5048,12 +4959,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(d);
     };
 
-    // Qwen native MTP head (optional). Auto-loaded when the model dir ships
-    // one — an `mtp/weights.safetensors`-class sidecar file OR in-checkpoint
-    // `[language_model.]mtp.*` tensors in the trunk shards; a failed load or
-    // bind only disables the head — the model still serves.
-    var mtp_ptr: ?*mtp_mod.MtpModel = null;
-    var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
+    const mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
     // MiMo's trained heads, resident beside a resident trunk (streaming refuses MTP above).
     var mimo_head: ?*mimo_mtp.Head = null;
     if (mtp_enabled and params.config.isMimo() and !params.config.expert_streaming) {
@@ -5070,60 +4976,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Same predicate as the resident bill that prices this copy.
     if (mimoCoarseHeadBytes(params.config) > 0 and xfm_ptr.lm_head_coarse == null)
         xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
-    if (mtp_enabled and !params.config.isMimo() and !params.config.isGlm5() and !params.config.isDsv41() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
-        if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
-            if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
-                h.* = loaded;
-                if (h.bind(xfm_ptr)) {
-                    mtp_ptr = h;
-                    mtp_cost_profile = h.m5NaxCostProfile(xfm_ptr);
-                    // Price the DRAFT side. The verify ladder above measures
-                    // the trunk forward and nothing else, but an m-deep round
-                    // is that forward PLUS m sequential head steps — which on
-                    // a 27B dominate the per-position marginal. Fitting the
-                    // EV surface without this under-prices depth ~9x (live
-                    // 2026-08-21: forward marginal 0.8 ms/position against a
-                    // hand-measured composite of 7.6). A cached curve already
-                    // carries it, so this is paid once per (chip, model,
-                    // quant, OS build) like the ladder itself.
-                    log.info("MTP head ready (depth={d}, profile={s}).\n", .{
-                        generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
-                        @tagName(mtp_cost_profile),
-                    });
-                } else |bind_err| {
-                    log.warn("MTP sidecar incompatible with target ({s}) — disabled.\n", .{@errorName(bind_err)});
-                    h.deinit();
-                    sch.allocator.destroy(h);
-                }
-            } else |load_err| {
-                log.warn("Failed to load MTP sidecar: {s} — disabled.\n", .{@errorName(load_err)});
-                sch.allocator.destroy(h);
-            }
-        } else |_| {}
-    } else if (mtp_enabled) {
-        // A quiet fallback to mode=pld cost a tester a day: nothing logged
-        // when the probe finds no head. Debug-level — most checkpoints have
-        // no MTP head and an info line per load would be noise.
-        log.debug(
-            "[mtp] no head found: no mtp/ sidecar and no [language_model.]mtp.* " ++
-                "keys resolvable from the index at {s} — MTP off\n",
-            .{params.model_dir},
-        );
-    }
-    errdefer if (mtp_ptr) |h| {
-        h.deinit();
-        sch.allocator.destroy(h);
-    };
-
-    // The qwen4_exp in-checkpoint head's twin of the sidecar's own coarse
-    // rerank build (inside `bind`, above): a `requantizeRows` of the whole
+    // The qwen4_exp in-checkpoint head's coarse rerank build: a
+    // `requantizeRows` of the whole
     // trunk lm_head plus a synchronous eval of ~240 MB. Lazily it ran inside
     // the FIRST request's draft chain — on this thread, mid-round, with the
     // stream drained — i.e. first-token latency for whoever loaded the model.
     // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
-    if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
+    if (mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
 
     if (xfm_ptr.expert_stream) |engine| warm: {
         if (engine.plan.resident) break :warm;
@@ -5176,9 +5037,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.vision_encoder = vision_ptr;
     entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = if (mtp_ptr) |h|
-        generate_mod.MtpHeadRef{ .qwen = h }
-    else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
+    entry.mtp = if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
     else if (xfm_ptr.dsv41 != null and xfm_ptr.dsv41.?.dspark != null)
         generate_mod.MtpHeadRef{ .dsv41 = xfm_ptr }
@@ -5369,7 +5228,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.expert_bounce_bytes,
         )
     else
-        residentWeightBytes(streaming_resident_bytes, entry.bytes_on_disk, plainWeightBytes(sch.io, sch.allocator, params.config, params.model_dir, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on), params.config.num_hidden_layers, params.config.hidden_size);
+        residentWeightBytes(streaming_resident_bytes, entry.bytes_on_disk, modelDiskBytes(sch.io, params.model_dir), params.config.num_hidden_layers, params.config.hidden_size);
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);
@@ -10596,14 +10455,6 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
     // A new arch on the shared moe forward must default to SERIAL, not ride
     // a kernel that never modelled its state.
     {
-        var moe = std.mem.zeroes(model_mod.ModelConfig);
-        moe.model_type = "hy_v3";
-        moe.full_attention_interval = 4;
-        moe.num_experts = 128;
-        moe.num_experts_per_tok = 8;
-        try testing.expect(!moe.supportsBatchedGdnDecode());
-    }
-    {
         var lfm2 = std.mem.zeroes(model_mod.ModelConfig);
         lfm2.model_type = "lfm2";
         lfm2.has_hybrid_layers = true;
@@ -10615,12 +10466,6 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         kda.full_attention_interval = 4;
         kda.kda_vector_gate = true;
         try testing.expect(!kda.supportsBatchedGdnDecode());
-    }
-    {
-        var ink = std.mem.zeroes(model_mod.ModelConfig);
-        ink.model_type = "inkling_mm_model";
-        ink.full_attention_interval = 4;
-        try testing.expect(!ink.supportsBatchedGdnDecode());
     }
     {
         // Pure attention: not a GDN trunk at all, rides the standard kernel.
@@ -10706,7 +10551,7 @@ test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
     const L: usize = 0x10;
     var out: [16]usize = undefined;
 
-    // Non-exclusive candidates (laguna/hy3: per-slot state) admit freely
+    // Non-exclusive candidates (per-slot state) admit freely
     // even beside live slots — their serial-tick interleave is safe.
     {
         const cands = [_]AdmitCand{
@@ -11561,7 +11406,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.loop_guard_start = 0;
     gen.think_closed_by_loop = false;
     gen.mtp = .{ .qwen4 = &xfm };
-    gen.mtp_cache = .{ .qwen = undefined };
+    gen.mtp_cache = .{ .mimo = undefined };
     gen.has_last_hidden = true;
     gen.dflash = null;
     gen.done = false;

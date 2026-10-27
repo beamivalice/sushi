@@ -110,9 +110,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **The kernel unwires a freed Metal buffer asynchronously** (~0.5 s for 50 GB): an unload and an eviction-before-load
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
-- **A separately loaded MTP sidecar is billed beside the shards** (`mtpSidecarBytes`, at its file size, only when MTP is on and
-  `loadMtp` will read it): in the plain bill and in the Sushi bill, where its coarse rerank copy follows. A head in the checkpoint
-  is already in the shard bill and adds nothing; MiMo and GLM never call `loadMtp`.
+- **An MTP head rides the checkpoint's shards**: the bill adds nothing for it beyond the coarse rerank copy.
 - A ready entry's `bytes_resident` (the registry's resident-memory gate, `/v1/models`) is the weights the preflight
   billed (`residentWeightBytes`): a boot `--model` entry has no discovery `bytes_on_disk`, so it measures the shards.
 - **A resident Sushi Qwen or MiMo cold load reserves its load preflight's own requirement** (`residentColdLoadBillBytes`:

@@ -250,14 +250,13 @@ pub const ModelConfig = struct {
     num_experts_per_tok: u32 = 0,
     moe_intermediate_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
-    // DeepSeek-V3-style sigmoid routing (hy_v3): scores = sigmoid(logits) in
+    // DeepSeek-V3-style sigmoid routing: scores = sigmoid(logits) in
     // f32; top-k SELECTED on scores + expert_bias but WEIGHTED by the unbiased
     // scores; optional renorm (/(sum+1e-20)) then × router_scaling_factor.
     moe_sigmoid_router: bool = false,
     moe_route_norm: bool = true,
     router_scaling_factor: f32 = 1.0,
-    // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE
-    // (hy_v3: layer 0 dense at intermediate_size, the rest MoE).
+    // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE.
     first_k_dense_replace: u32 = 0,
 
     // Grouped ("noaux_tc") expert routing: split the biased scores into
@@ -347,15 +346,12 @@ pub const ModelConfig = struct {
     /// config does.
     ngram_table_path: ?[]const u8 = null,
 
-    // Laguna: per-layer Q-head count (full-attention layers 48, sliding 72;
-    // KV heads uniform at num_key_value_heads). 0 = uniform num_attention_heads.
+    // Per-layer Q-head count (MiMo: sliding layers differ from global ones).
+    // 0 = uniform num_attention_heads.
     num_attention_heads_per_layer: [128]u32 = @splat(0),
     has_per_layer_heads: bool = false,
 
-
-    // Laguna YaRN RoPE (full-attention layers only; sliding layers use default
-    // RoPE at rope_local_base_freq). rope_yarn gates the freqs + mscale
-    // precompute at model load; the sliding/full split is by isGlobalLayer.
+    // YaRN RoPE: rope_yarn gates the freqs + mscale precompute at model load.
     rope_yarn: bool = false,
     yarn_factor: f32 = 1.0,
     yarn_orig_max_pos: u32 = 0,
@@ -556,9 +552,9 @@ pub const ModelConfig = struct {
             (if (self.isGlobalLayer(layer_idx)) self.attn_sinks_global else self.attn_sinks_sliding);
     }
 
-    /// Per-layer Q-head count (Laguna: 48 on full-attention layers, 72 on
-    /// sliding). Every other arch has uniform heads, so this falls back to
-    /// num_attention_heads. KV heads stay uniform (layerKVHeads).
+    /// Per-layer Q-head count (MiMo: sliding layers differ from global ones).
+    /// Every other arch has uniform heads, so this falls back to
+    /// num_attention_heads. KV heads follow layerKVHeads.
     pub fn layerNumHeads(self: ModelConfig, layer_idx: u32) u32 {
         if (self.has_per_layer_heads and layer_idx < 128 and self.num_attention_heads_per_layer[layer_idx] > 0) {
             return self.num_attention_heads_per_layer[layer_idx];
@@ -1038,8 +1034,7 @@ pub const ModelConfig = struct {
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
-    /// recurrence (LFM2/Nemotron/GDN) or Inkling's four per-layer short
-    /// convolutions. Shared by Transformer.init and the scheduler's per-slot
+    /// recurrence (LFM2/Nemotron/GDN). Shared by Transformer.init and the scheduler's per-slot
     /// allocation — the two predicates MUST agree or slots crash on a null
     /// `ctx.ssm_entries` (the Qwen3.5-MoE class).
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
@@ -1685,7 +1680,7 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
 /// `yarnMscale(factor)`. Neither is present in a vendor config, and per HF's
 /// default the mscale is then COMPUTED as 0.1·ln(factor)+1 — the value the
 /// scaling was calibrated with. Nested per-layer-type `rope_parameters`
-/// (laguna/gemma4) never reach here: they have no top-level `rope_type`.
+/// never reach here: they have no top-level `rope_type`.
 fn parseYarnRopeParameters(config: *ModelConfig, cfg_obj: std.json.ObjectMap) !void {
     const rp_val = cfg_obj.get("rope_parameters") orelse return;
     if (rp_val != .object) return;
@@ -3101,12 +3096,12 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 ///
 ///   - Quant SIDE tensors (scales/biases), which can be 2-D so they are keyed
 ///     on the suffix. f16 side tensors force gather_qmm/qmatmul onto a ~4x
-///     slower mixed-dtype path (hy_v3 2-bit live, 2026-07-14: 0.70 vs 0.18 ms
-///     per 8-expert gather — 1.2 tok/s on the 295B instead of ~15+).
+///     slower mixed-dtype path (2-bit MoE live, 2026-07-14: 0.70 vs 0.18 ms
+///     per 8-expert gather).
 ///   - ANY 1-D f16 tensor: a per-channel table (norm weight, bias, A_log,
 ///     dt_bias) that is multiplied or added straight into the residual. Leave
 ///     one f16 and the residual turns f32 at the first layer and STAYS f32,
-///     so every later weight read is upcast — the Laguna YaRN-mscale class,
+///     so every later weight read is upcast — the YaRN-mscale class,
 ///     one level up. Measured on prism-ml/Ternary-Bonsai-27B-mlx-2bit (the
 ///     only f16 checkpoint on hand, qwen3_5 GDN hybrid): 27.99 -> 23.88
 ///     ms/forward, 14.7%, three paired boots with cooldown.
@@ -3518,10 +3513,10 @@ test "ModelConfig defaults" {
 }
 
 test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-path class)" {
-    // hy_v3 2-bit (ox-ox) ships F16 scales/biases beside bf16 activations —
+    // A 2-bit pack can ship F16 scales/biases beside bf16 activations —
     // MLX's gather_qmm/qmatmul take a ~4x slower mixed-dtype path (measured
-    // 2026-07-14: 0.70 vs 0.18 ms per 8-expert gather; 1.2 tok/s on the 295B
-    // instead of ~15+). The loader must cast quant SIDE tensors to bf16 once;
+    // 2026-07-14: 0.70 vs 0.18 ms per 8-expert gather).
+    // The loader must cast quant SIDE tensors to bf16 once;
     // weights and non-quant tensors keep their dtype. Dequant delta from the
     // 3 dropped mantissa bits: cos 0.99999994 — under the 2-bit noise floor.
     const allocator = testing.allocator;
@@ -4113,8 +4108,7 @@ test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048
     // default applies): 0.1·ln 4 + 1 — the value the extension is calibrated to.
     try testing.expectApproxEqAbs(@as(f32, 1.138629436111989), c.yarn_attention_factor, 1e-6);
     // qwen4_exp has ONE rope for the trunk, so the YaRN table spans exactly the
-    // 64 dims attention rotates: `partial_rotary_factor`, NOT laguna's
-    // dims and rotate the pass-through slice).
+    // 64 dims attention rotates: `partial_rotary_factor`, not the full head dim.
     try testing.expectApproxEqAbs(@as(f32, 0.25), c.yarnPartial(), 1e-9);
     try testing.expectEqual(@as(u32, 64), c.yarnRotaryDim());
     try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), c.rope_theta, 1.0);
@@ -5133,7 +5127,6 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
         "mistral",
         "gemma3",
         "gemma4",
-        "deepseek_v4",
         "muse_glimmer",
     }) |mt| {
         var cfg = ModelConfig{ .model_type = mt };
@@ -5280,7 +5273,7 @@ test "isExpertStreamingArch admits only implemented streaming families" {
     const t = std.testing;
     try t.expect(isExpertStreamingArch("qwen4_exp"));
     try t.expect(isExpertStreamingArch("mimo_v2"));
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "hy_v3", "laguna", "llama", "deepseek_v4", "gguf", "" }) |mt| {
+    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "gguf", "" }) |mt| {
         try t.expect(!isExpertStreamingArch(mt));
         var c = ModelConfig{
             .model_type = mt,

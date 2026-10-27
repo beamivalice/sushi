@@ -235,7 +235,7 @@ pub const Qwen4Mtp = struct {
     /// after a reset).
     pos_base: c_int = 0,
     /// Cross-request EV controller seed — the in-checkpoint head's twin of
-    /// `mtp.MtpModel.ev_seed_*`: the last HEALTHY request's per-index
+    /// MiMo's `Head.ev_seed_*`: the last HEALTHY request's per-index
     /// acceptance EMAs and base depth, written by `Generator.deinit` and read
     /// by the first `nextMtp` round of the next request. Without it every
     /// request re-warms the controller (MTP_EV_WARMUP_ROUNDS legacy rounds
@@ -2251,7 +2251,7 @@ pub fn gatedFullAttnProjected(
     defer _ = mlx.mlx_array_free(v_t);
     try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
 
-    // Fused decode QK-norm+RoPE (the laguna kernel, hd-128 partial-rotary):
+    // Fused decode QK-norm+RoPE (hd-128 partial-rotary):
     // one dispatch replaces per-head RMSNorm → transpose → partial RoPE for
     // q AND k. Bit-identical to the composed chain below (parity-pinned
     // incl. the rd=32 qwen geometry). With `attn_output_gate` the q input
@@ -2266,7 +2266,7 @@ pub fn gatedFullAttnProjected(
     // for the composed arms, folded into the probe's cos|sin rows for the
     // fused ones (scaling both halves of a rotary pair is the same
     // multiply). `family` 1 keeps the angle cache from serving an unscaled
-    // row to a scaled layer, exactly as laguna's yarn split does.
+    // row to a scaled layer.
     const use_yarn = self.yarnActive();
     const rope_family: usize = if (use_yarn) 1 else 0;
     const rope_base = mlx.mlx_optional_float{

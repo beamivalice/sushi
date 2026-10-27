@@ -1481,25 +1481,6 @@ pub fn main(init: std.process.Init) !void {
         }
         log.info("Model ready.\n", .{});
 
-        // Qwen native MTP head — auto-load when the model ships one (sidecar
-        // file or in-checkpoint tensors in the trunk shards).
-        var mtp_head: ?mtp_mod.MtpModel = null;
-        defer if (mtp_head) |*h| h.deinit();
-        if (mtp_choice.on and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
-            // A failed load (e.g. a sidecar layout we can't bind yet) only
-            // disables the head — mirrors the serve path's graceful degrade.
-            if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
-                mtp_head = loaded;
-                mtp_head.?.bind(&xfm) catch |err| {
-                    log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});
-                    mtp_head.?.deinit();
-                    mtp_head = null;
-                };
-            } else |err| {
-                log.warn("[mtp] failed to load sidecar ({any}) — disabled\n", .{err});
-            }
-        }
-
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
             .{ .role = "user", .content = user_prompt },
@@ -1555,10 +1536,7 @@ pub fn main(init: std.process.Init) !void {
             try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
         } else {
             // Non-streaming: generate all tokens then print
-            const result = if (mtp_head) |*h|
-                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, depth_bounds.active.max, null)
-            else
-                try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
             defer allocator.free(result.token_ids);
 

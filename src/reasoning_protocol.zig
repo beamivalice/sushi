@@ -68,16 +68,11 @@ fn isJsonWhitespaceRun(bytes: []const u8) bool {
 }
 
 pub const Kind = enum {
-    /// The delimited reasoning block Qwen/DeepSeek/LFM/Laguna share: an
+    /// The delimited reasoning block Qwen/GLM/DeepSeek/MiMo share: an
     /// opening tag and a closing tag spelling the same base (see
     /// `chat.BARE_THINK_OPENER` / `BARE_THINK_CLOSER`).
     bare_think,
-    /// `<think:S>...</think:S>` — the Hy3 suffixed family. The suffix is fixed
-    /// by whichever opener resolved (prompt-injected) and the close must
-    /// carry the SAME suffix; think tags with other suffixes are body text.
-    suffixed_think,
     gemma,
-    inkling,
     harmony,
     muse,
 };
@@ -191,20 +186,13 @@ pub const Protocol = struct {
 
     pub fn configureChannels(self: *Protocol) void {
         switch (self.kind) {
-            .bare_think, .suffixed_think => return,
+            .bare_think => return,
             .gemma => {
                 _ = self.setCloser("<channel|>");
                 self.direct_json = true;
                 self.addHeader("<|channel>thought\n", .reasoning);
                 self.addHeader("<|channel>thought", .reasoning);
                 self.addHeader("<|channel>\n", .json_body);
-            },
-            .inkling => {
-                _ = self.setCloser("<|end_message|>");
-                self.addHeader("<|message_model|><|content_thinking|>", .reasoning);
-                self.addHeader("<|message_model|><|content_text|>", .json_body);
-                self.addHeader("<|content_thinking|>", .reasoning);
-                self.addHeader("<|content_text|>", .json_body);
             },
             .harmony => {
                 _ = self.setCloser("<|end|>");
@@ -1573,7 +1561,6 @@ test "constrained split clips a stop before payload and preserves unrelated tags
 test "channel formats require their final header before JSON" {
     const cases = .{
         .{ Kind.gemma, "<|turn>model\n<|channel>thought\n", "work<channel|><|channel>\n{}" },
-        .{ Kind.inkling, "<|message_model|><|content_thinking|>", "work<|end_message|><|message_model|><|content_text|>{}" },
         .{ Kind.harmony, "<|start|>assistant<|channel|>analysis<|message|>", "work<|end|><|start|>assistant<|channel|>final<|message|>{}" },
         .{ Kind.muse, "<|start|>assistant to=self<|message|>", "work<|eom|><|start|>assistant to=user<|message|>{}" },
     };
@@ -1689,14 +1676,12 @@ fn expectRoutedAtEverySplit(kind: Kind, prompt: []const u8, text: []const u8, ex
 test "channel routing and masks agree at every token split, including repeated reasoning" {
     const json = "{\"note\":\"<think> and <|channel|> are data\"}";
     try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "<|channel>thought\nfirst<channel|><|channel>thought\nsecond<channel|><|channel>\n" ++ json, "first\nsecond", json);
-    try expectRoutedAtEverySplit(.inkling, "<|message_model|>", "<|content_thinking|>first<|end_message|><|message_model|><|content_thinking|>second<|end_message|><|message_model|><|content_text|>" ++ json, "firstsecond", json);
     try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>analysis<|message|>first<|end|><|start|>assistant<|channel|>analysis<|message|>second<|end|><|start|>assistant<|channel|>final<|message|>" ++ json, "firstsecond", json);
     try expectRoutedAtEverySplit(.muse, "<|start|>assistant", " to=self<|message|>first<|eom|><|start|>assistant to=self<|message|>second<|eom|><|start|>assistant to=user<|message|>" ++ json, "firstsecond", json);
 }
 
 test "channel formats allow direct answers through their content headers" {
     try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "<|channel>\n{}", "", "{}");
-    try expectRoutedAtEverySplit(.inkling, "<|message_model|>", "<|content_text|>{}", "", "{}");
     try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>final<|message|>{}", "", "{}");
     try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>commentary<|message|>{}", "", "{}");
     try expectRoutedAtEverySplit(.muse, "<|start|>assistant", " to=user<|message|>{}", "", "{}");
@@ -1717,7 +1702,7 @@ test "every channel header prefix recovers to JSON without duplicating partial h
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for ([_]Kind{ .gemma, .inkling, .harmony, .muse }) |kind| {
+    for ([_]Kind{ .gemma, .harmony, .muse }) |kind| {
         var p = Protocol{ .kind = kind };
         p.configureChannels();
         const close = try asciiRecovery(a, p.closerText());
@@ -1759,7 +1744,7 @@ test "every channel header prefix recovers to JSON without duplicating partial h
 }
 
 test "thinking off constrains final headers even after a prompt committed analysis" {
-    for ([_]Kind{ .gemma, .inkling, .harmony, .muse }) |kind| {
+    for ([_]Kind{ .gemma, .harmony, .muse }) |kind| {
         var p = Protocol{ .kind = kind };
         p.configureChannels();
         const reasoning_header = p.headers[0].text;
@@ -1819,7 +1804,7 @@ test "special-token channel headers preserve identity and never become JSON inpu
 }
 
 test "channel masks reject malformed transitions and invalid crossing payloads" {
-    inline for (.{ Kind.gemma, Kind.inkling, Kind.harmony, Kind.muse }) |kind| {
+    inline for (.{ Kind.gemma, Kind.harmony, Kind.muse }) |kind| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();

@@ -552,7 +552,7 @@ pub fn resetDtypeTraceForTest() void {
 ///
 /// A residual wider than the weights promotes EVERY projection's weight on
 /// read, so the cost lands as a UNIFORM multiple across attention, MLP and
-/// lm_head — which reads like a platform problem, not a bug. The Laguna YaRN
+/// lm_head — which reads like a platform problem, not a bug. A YaRN
 /// mscale table (f32 constant multiplied into bf16 q/k) cost 3x and was
 /// invisible to op count, kernel choice, KV ablation and the CPU/GPU split.
 /// Endpoints alone say THAT it widened; per-layer lines on every layer are

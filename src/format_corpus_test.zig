@@ -305,7 +305,7 @@ const Expect = struct {
     /// "successfully").
     tool_arg_absent: ?[]const u8 = null,
     /// Expected name of the LAST parsed tool call (pins per-call name repair
-    /// in multi-call outputs — e.g. the Inkling marker-echoed payload name).
+    /// in multi-call outputs).
     last_tool_name: ?[]const u8 = null,
 };
 
@@ -325,8 +325,8 @@ const pi_edit_tool_schema =
     \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]},"description":"One or more targeted replacements."}},"required":["path","edits"]}}}]
 ;
 
-/// Weather tool with a boolean arg — used by the LIVE Hy3 capture to pin the
-/// tag-format string→bool schema coercion.
+/// Weather tool with a boolean arg — pins the tag-format string→bool schema
+/// coercion.
 const weather_tool_schema =
     \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"celsius":{"type":"boolean"}},"required":["city"]}}}]
 ;
@@ -337,8 +337,7 @@ const write_read_tools_schema =
     \\[{"type":"function","function":{"name":"write","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
 ;
 
-/// pi's bash tool (one required string arg) — used by the LIVE Inkling agent
-/// captures below (pi v0.83.0 session, 2026-07-30).
+/// pi's bash tool (one required string arg).
 const bash_tool_schema =
     \\[{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
 ;
@@ -1230,93 +1229,9 @@ const corpus = [_]Expect{
         .tool_arg_key = "path",
         .tool_arg_value = "a.txt",
     },
-    // ── Hy3 / Hunyuan 3 (hy_v3): suffixed think tags + arg_key/arg_value tool
-    // format. Entries are template-spec-shaped (chat_template.jinja, HYTK
-    // ":opensource"); replace/extend with harvested live bytes once the 295B
-    // runs locally (SUSHI_RAW_DUMP_FILE workflow above). Thinking is
-    // template-opened by default (generation prompt ends with the opener when
-    // reasoning_effort is high/low). ─────────────────────────────────────────
-    .{
-        .family = "hy3",
-        .name = "full think round, template-opened, suffixed close tag",
-        .raw = "The user wants 17*24. 17*24 = 408.</think:opensource>17 × 24 = **408**.",
-        .thinking = true,
-        .opened_by_template = true,
-        .content_contains = "408",
-        .reasoning_contains = "17*24 = 408",
-    },
-    .{
-        .family = "hy3",
-        .name = "template-opened truncated thinking stays out of content (suffixed family)",
-        .raw = "Let me work through the request step by step: first",
-        .thinking = true,
-        .opened_by_template = true,
-        .content_exact = "",
-        .reasoning_contains = "step by step",
-    },
-    .{
-        .family = "hy3",
-        .name = "arg_key/arg_value tool call after thinking, string→bool schema coercion",
-        .raw = "I should edit the file.</think:opensource><tool_calls:opensource>\n" ++
-            "<tool_call:opensource>Edit<tool_sep:opensource>\n" ++
-            "<arg_key:opensource>file_path</arg_key:opensource>\n" ++
-            "<arg_value:opensource>src/main.py</arg_value:opensource>\n" ++
-            "<arg_key:opensource>old_string</arg_key:opensource>\n" ++
-            "<arg_value:opensource>x = 1</arg_value:opensource>\n" ++
-            "<arg_key:opensource>new_string</arg_key:opensource>\n" ++
-            "<arg_value:opensource>x = 2</arg_value:opensource>\n" ++
-            "<arg_key:opensource>replace_all</arg_key:opensource>\n" ++
-            "<arg_value:opensource>false</arg_value:opensource>\n" ++
-            "</tool_call:opensource>\n</tool_calls:opensource>",
-        .thinking = true,
-        .opened_by_template = true,
-        .tools_json = edit_tool_schema,
-        .tool_name = "Edit",
-        .tool_arg_key = "file_path",
-        .tool_arg_value = "src/main.py",
-        .tool_bool_key = "replace_all",
-        .tool_bool_value = false,
-    },
-    .{
-        .family = "hy3",
-        .name = "parallel calls in one wrapper keep their own args",
-        .raw = "<tool_calls:opensource>\n" ++
-            "<tool_call:opensource>read<tool_sep:opensource>\n" ++
-            "<arg_key:opensource>path</arg_key:opensource>\n" ++
-            "<arg_value:opensource>a.txt</arg_value:opensource>\n" ++
-            "</tool_call:opensource>\n" ++
-            "<tool_call:opensource>read<tool_sep:opensource>\n" ++
-            "<arg_key:opensource>path</arg_key:opensource>\n" ++
-            "<arg_value:opensource>b.txt</arg_value:opensource>\n" ++
-            "</tool_call:opensource>\n</tool_calls:opensource>",
-        .tools_json = write_read_tools_schema,
-        .tool_count = 2,
-        .tool_name = "read",
-        .tool_arg_key = "path",
-        .tool_arg_value = "a.txt",
-        .last_tool_arg_value = "b.txt",
-    },
-    .{
-        // Big-file-write truncation class, hy3 shape: max_tokens landed inside
-        // the `content` value. Recover the call with the CLOSED pair only —
-        // the fragment must never ship as a real argument.
-        .family = "hy3",
-        .name = "truncated mid-arg_value recovers name + closed args, drops the fragment",
-        .raw = "<tool_calls:opensource>\n" ++
-            "<tool_call:opensource>write<tool_sep:opensource>\n" ++
-            "<arg_key:opensource>path</arg_key:opensource>\n" ++
-            "<arg_value:opensource>novel.txt</arg_value:opensource>\n" ++
-            "<arg_key:opensource>content</arg_key:opensource>\n" ++
-            "<arg_value:opensource>Chapter 1. It was a dark and stormy night and the",
-        .tools_json = write_read_tools_schema,
-        .tool_name = "write",
-        .tool_arg_key = "path",
-        .tool_arg_value = "novel.txt",
-        .tool_arg_absent = "content",
-    },
     // ── Bare-opener GLM tag family (`<tool_call>NAME<arg_key>…` pairs) ──────
     // Its template renders the BARE-opener arg_key/arg_value shape (the same
-    // sub-format Laguna's GLM parser arm reads), with a newline after the NAME
+    // sub-format the GLM parser arm reads), with a newline after the NAME
     // and after each `</arg_key>` — no plural wrapper, no `<tool_sep>`, no
     // suffixes. Thinking is `<think>…</think>` and, unlike Qwen, the MODEL
     // emits the opener (`<role>ASSISTANT</role>\n` ends the prompt), so
@@ -1473,73 +1388,11 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.<|role_end|>",
         .content_contains = "408",
     },
+    // ── GLM bare-opener tags with no separators between the pairs: a BARE
+    // <tool_call> opener, the NAME, then arg_key/arg_value pairs, no plural
+    // wrapper, no newlines. Entries are template-spec shaped. ─────────────
     .{
-        // Prose mentioning the format's pieces (without an actual opener tag —
-        // the control tags are special tokens a real generation can't casually
-        // reproduce mid-prose) must not parse as a call.
-        .family = "hy3",
-        .name = "prose about arg_key/arg_value is not a tool call",
-        .raw = "Hy3 encodes each argument as an arg_key/arg_value pair inside the call block.",
-        .tools_json = write_read_tools_schema,
-        .no_tool_calls = true,
-        .content_contains = "arg_key/arg_value pair",
-    },
-    .{
-        // LIVE capture 2026-07-14 — first Hy3 (295B, 2-bit) run on this
-        // engine; raw bytes verbatim from the debug log ("Weather in Tokyo in
-        // celsius please", temp 0). Confirms the shipped model emits the
-        // template-spec format exactly; the "true" arg is a STRING in the tag
-        // format and the schema coercion must type it.
-        .family = "hy3",
-        .name = "LIVE: get_weather call, wrapper + sep + arg tags, string→bool coercion",
-        .raw = "<tool_calls:opensource>\n" ++
-            "<tool_call:opensource>get_weather<tool_sep:opensource>\n" ++
-            "<arg_key:opensource>city</arg_key:opensource>\n" ++
-            "<arg_value:opensource>Tokyo</arg_value:opensource>\n" ++
-            "<arg_key:opensource>celsius</arg_key:opensource>\n" ++
-            "<arg_value:opensource>true</arg_value:opensource>\n" ++
-            "</tool_call:opensource>\n</tool_calls:opensource>",
-        .tools_json = weather_tool_schema,
-        .tool_name = "get_weather",
-        .tool_arg_key = "city",
-        .tool_arg_value = "Tokyo",
-        .tool_bool_key = "celsius",
-        .tool_bool_value = true,
-    },
-    .{
-        // LIVE capture 2026-07-16 (pipenetwork/Hy3-REAP62 via SUSHI_RAW_DUMP_FILE,
-        // the soak): the pruned model emitted the PLURAL wrapper
-        // <tool_calls:opensource> and jumped STRAIGHT to the NAME, dropping the
-        // singular per-call <tool_call:opensource> opener the parser keys on — so
-        // the whole (well-formed, complete) call LEAKED as content. Same
-        // weak-model delimiter-drop class as the dropped-<tool_sep> entry, one
-        // delimiter over. Recover the full call incl. the quote-bearing content
-        // (the universal no-tag-leak + valid-JSON-args invariants cover it).
-        .family = "hy3",
-        .name = "LIVE: dropped singular <tool_call> opener (plural wrapper only) still recovers",
-        .raw = "<tool_calls:opensource>\n" ++
-            "write_file</arg_value:opensource>\n" ++
-            "<arg_key:opensource>path</arg_value:opensource>\n" ++
-            "<arg_value:opensource>page.html</arg_value:opensource>\n" ++
-            "<arg_key:opensource>content</arg_value:opensource>\n" ++
-            "<arg_value:opensource><meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div></arg_value:opensource>\n" ++
-            "</tool_call:opensource>\n</tool_calls:opensource>",
-        .tool_name = "write_file",
-        .tool_arg_key = "path",
-        .tool_arg_value = "page.html",
-    },
-
-    // ── Laguna (poolside Laguna S 2.1, model_type "laguna"): BARE <tool_call>
-    // GLM-style tags (tokenizer tool_parser_type "glm47") + <think>/</think>.
-    // The chat template PRE-OPENS <think> at the generation prompt, so output
-    // starts inside reasoning (opened_by_template). Distinct from hy3's
-    // SUFFIXED <tool_call:sfx> + plural <tool_calls:sfx> wrapper — Laguna emits
-    // a BARE <tool_call> opener, the NAME, then arg_key/arg_value pairs, no
-    // plural wrapper. Entries are template-spec shaped (chat_template.jinja);
-    // replace with harvested live bytes once the 117.6B runs on GPU
-    // (SUSHI_RAW_DUMP_FILE workflow above). ────────────────────────────
-    .{
-        .family = "laguna",
+        .family = "glm-bare",
         .name = "full think round, template-opened, plain close tag",
         .raw = "The user wants 17*23. 17*20=340, 17*3=51, total 391.</think>17 × 23 = **391**.",
         .thinking = true,
@@ -1548,8 +1401,8 @@ const corpus = [_]Expect{
         .reasoning_contains = "total 391",
     },
     .{
-        .family = "laguna",
-        .name = "template-opened truncated thinking stays out of content",
+        .family = "glm-bare",
+        .name = "template-opened truncated thinking stays out of content (no tool markup)",
         .raw = "Let me compute step by step: 17*20 = 340, then",
         .thinking = true,
         .opened_by_template = true,
@@ -1557,12 +1410,12 @@ const corpus = [_]Expect{
         .reasoning_contains = "step by step",
     },
     .{
-        // The load-bearing new-code case: a BARE <tool_call> opener (no :sfx)
-        // followed by the NAME then arg_key/arg_value pairs. parseHy3ToolCalls
-        // used to fall bare <tool_call> through to the Hermes JSON scan, which
-        // can't read the GLM body — the whole call leaked. String values stay
-        // strings; schema coercion types the boolean.
-        .family = "laguna",
+        // The load-bearing case: a BARE <tool_call> opener followed by the NAME
+        // then arg_key/arg_value pairs. A parser that fell bare <tool_call>
+        // through to the Hermes JSON scan can't read the GLM body — the whole
+        // call leaked. String values stay strings; schema coercion types the
+        // boolean.
+        .family = "glm-bare",
         .name = "bare <tool_call> GLM call after thinking, string→bool coercion",
         .raw = "I should edit the file.</think><tool_call>Edit" ++
             "<arg_key>file_path</arg_key><arg_value>src/main.py</arg_value>" ++
@@ -1580,7 +1433,7 @@ const corpus = [_]Expect{
         .tool_bool_value = false,
     },
     .{
-        .family = "laguna",
+        .family = "glm-bare",
         .name = "consecutive bare <tool_call> calls each keep their own args",
         .raw = "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>" ++
             "<tool_call>read<arg_key>path</arg_key><arg_value>b.txt</arg_value></tool_call>",
@@ -1595,8 +1448,8 @@ const corpus = [_]Expect{
         // Truncation: max_tokens landed inside the content arg_value (no closing
         // </arg_value>, no </tool_call>). Recover the name + the one CLOSED pair;
         // the fragment must never ship as a real argument.
-        .family = "laguna",
-        .name = "truncated mid-arg_value recovers name + closed args, drops fragment",
+        .family = "glm-bare",
+        .name = "truncated mid-arg_value recovers name + closed args, drops fragment (no separators)",
         .raw = "<tool_call>write" ++
             "<arg_key>path</arg_key><arg_value>novel.txt</arg_value>" ++
             "<arg_key>content</arg_key><arg_value>Chapter 1. It was a dark and stormy night and the",
@@ -1610,143 +1463,13 @@ const corpus = [_]Expect{
         // Prose that merely NAMES the format pieces (no literal <tool_call> tag —
         // the tags are special tokens a real generation won't casually emit
         // mid-prose) must not parse as a call and must pass through as content.
-        .family = "laguna",
+        .family = "glm-bare",
         .name = "prose mentioning tool_call/arg_key is not a call",
-        .raw = "Laguna encodes each argument as an arg_key/arg_value pair inside the tool_call block.",
+        .raw = "The model encodes each argument as an arg_key/arg_value pair inside the tool_call block.",
         .tools_json = write_read_tools_schema,
         .no_tool_calls = true,
         .content_contains = "arg_key/arg_value pair",
     },
-    // ── Inkling (inkling_mm_model, Thinking Machines Inkling Small) ────────
-    // The model emits role-less MESSAGES, each `<|channel marker|>…<|end_message|>`;
-    // thinking, text and tool-invoke are separate messages. Captured live from
-    // pipenetwork/Inkling-Small-MLX-REAP25-4bit, 2026-07-30.
-    .{
-        // Live capture: thinking-off chat ("What is 2+2?").
-        .family = "inkling",
-        .name = "plain text message strips channel markers",
-        .raw = "<|content_text|>4<|end_message|>",
-        .thinking = false,
-        .content_exact = "4",
-    },
-    .{
-        // Live-shaped: thinking message then a fresh model text message.
-        .family = "inkling",
-        .name = "thinking + text messages split cleanly",
-        .raw = "<|content_thinking|>The user asks 5+5; answer 10 only.<|end_message|><|message_model|><|content_text|>10<|end_message|>",
-        .thinking = true,
-        .content_exact = "10",
-        .reasoning_contains = "answer 10 only",
-    },
-    .{
-        // Length-truncated mid-thought (live fibonacci raw run shape):
-        // reasoning, never content.
-        .family = "inkling",
-        .name = "truncated thinking stays out of content",
-        .raw = "<|content_thinking|>The user is asking for a Python function definition for",
-        .thinking = true,
-        .content_exact = "",
-        .reasoning_contains = "Python function definition",
-    },
-    .{
-        // Live capture shape: tool call after thinking (get_time round).
-        .family = "inkling",
-        .name = "invoke_tool_json call after thinking",
-        .raw = "<|content_thinking|>Need the current Tokyo time; call get_time.<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"args\":{\"timezone\":\"Asia/Tokyo\"},\"name\":\"get_time\"}<|end_message|>",
-        .thinking = true,
-        .tool_name = "get_time",
-        .tool_arg_key = "timezone",
-        .tool_arg_value = "Asia/Tokyo",
-        .reasoning_contains = "Tokyo time",
-    },
-    .{
-        // Parallel calls: consecutive invoke messages, each keeps its args.
-        .family = "inkling",
-        .name = "parallel invoke messages keep per-call args",
-        .raw = "<|message_model|>get_time<|content_invoke_tool_json|>{\"args\":{\"timezone\":\"Asia/Tokyo\"},\"name\":\"get_time\"}<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"args\":{\"timezone\":\"Europe/Paris\"},\"name\":\"get_time\"}<|end_message|>",
-        .tool_count = 2,
-        .tool_name = "get_time",
-        .tool_arg_key = "timezone",
-        .tool_arg_value = "Asia/Tokyo",
-        .last_tool_arg_value = "Europe/Paris",
-    },
-    .{
-        // Truncation salvage: the cut landed inside an argument VALUE — the
-        // call keeps its NAME and ships `{}`, never a fragment.
-        .family = "inkling",
-        .name = "truncated invoke payload salvages name + empty args",
-        .raw = "<|message_model|>write<|content_invoke_tool_json|>{\"args\":{\"path\":\"novel.txt\",\"content\":\"Chapter 1. It was a dark and",
-        .tools_json = write_read_tools_schema,
-        .tool_name = "write",
-        .tool_arg_absent = "content",
-    },
-    // The four entries below are VERBATIM captures from the first real pi
-    // agent session on Inkling (pi v0.83.0 → app server :11234, REAP25,
-    // 2026-07-30; log lines 61961/62828/63285/63543). One compounding loop:
-    // streamed tool text leaked as content, the salvage name swallowed the
-    // <|content_text|> marker, pi replied "Tool <|content_text|>… not found",
-    // and the model started echoing that garbage name into its own payloads.
-    .{
-        // Duplicate identical calls, each its own well-formed message (the
-        // first message glues <|content_text|> ahead of the NAME, the second
-        // omits it). Both parse cleanly; no dedup — pi owns that decision.
-        .family = "inkling",
-        .name = "duplicate bash calls with separators both parse clean",
-        .raw = "<|message_model|><|content_text|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls -la src/*.js\"}}<|end_message|><|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls -la src/*.js\"}}<|end_message|>",
-        .tools_json = bash_tool_schema,
-        .tool_count = 2,
-        .tool_name = "bash",
-        .last_tool_name = "bash",
-        .tool_arg_key = "command",
-        .tool_arg_value = "ls -la src/*.js",
-        .last_tool_arg_value = "ls -la src/*.js",
-    },
-    .{
-        // Back-to-back calls with the <|end_message|> DROPPED between them:
-        // `{…}}write<|content_invoke_tool_json|>{…}`. Body extraction must
-        // stop at the balanced object or call 1 swallows call 2 whole.
-        .family = "inkling",
-        .name = "back-to-back invokes without end_message keep both calls' args",
-        .raw =
-        \\<|message_model|><|content_text|>write<|content_invoke_tool_json|>{"name":"write","args":{"content":"import * as T from 'three';\nconst s=new T.Scene(),c=new T.PerspectiveCamera(75,innerWidth/innerHeight,.1,1e3);\nc.position.set(0,1.6,4);s.background=new T.Color(0x111111);\nconst r=new T.WebGLRenderer({canvas:document.getElementById('c'),antialias:true});\nr.setSize(innerWidth,innerHeight);\nexport{T,s,c,r};\n","path":"/Users/user/.sushi/workspace/ink-quake/src/init.js"}}write<|content_invoke_tool_json|>{"name":"write","args":{"content":"import * as T from 'three';\nconst s=new T.Scene(),c=new T.PerspectiveCamera(75,innerWidth/innerHeight,.1,1e3);\nc.position.set(0,1.6,4);s.background=new T.Color(0x111111);\nconst r=new T.WebGLRenderer({canvas:document.getElementById('c'),antialias:true});\nr.setSize(innerWidth,innerHeight);\nexport{T,s,c,r};\n","path":"/Users/user/.sushi/workspace/ink-quake/src/init.js"}}<|end_message|>
-        ,
-        .tools_json = write_read_tools_schema,
-        .tool_count = 2,
-        .tool_name = "write",
-        .last_tool_name = "write",
-        .tool_arg_key = "path",
-        .tool_arg_value = "/Users/user/.sushi/workspace/ink-quake/src/init.js",
-        .last_tool_arg_value = "/Users/user/.sushi/workspace/ink-quake/src/init.js",
-    },
-    .{
-        // The marker-echo stage of the loop: the model copied pi's garbage
-        // "Tool <|content_text|>bash not found" name INTO its second payload.
-        // The parsed name must resolve to `bash` — a NAME carrying `<|` is
-        // what STARTED the loop (also pinned by the universal invariant).
-        .family = "inkling",
-        .name = "marker-echoed payload name resolves to bare identifier",
-        .raw =
-        \\<|message_model|><|content_text|>bash<|content_invoke_tool_json|>{"name":"bash","args":{"command":"cat > src/init.js << 'EOF'\nimport * as T from 'three';\nconst s=new T.Scene(),c=new T.PerspectiveCamera(75,innerWidth/innerHeight,.1,1e3);\nc.position.set(0,1.6,4);s.background=new T.Color(0x111111);\nconst r=new T.WebGLRenderer({canvas:document.getElementById('c'),antialias:true});\nr.setSize(innerWidth,innerHeight);\nexport{T,s,c,r};\nEOF"}}<|end_message|><|message_model|><|content_text|>bash<|content_invoke_tool_json|>{"name":"<|content_text|>bash","args":{}}<|end_message|>
-        ,
-        .tools_json = bash_tool_schema,
-        .tool_count = 2,
-        .tool_name = "bash",
-        .last_tool_name = "bash",
-    },
-    .{
-        // <|content_text|>-prefixed single call (the head shape every tool
-        // turn in the session opened with): NAME parses clean, args intact.
-        .family = "inkling",
-        .name = "content_text-prefixed single call parses clean",
-        .raw =
-        \\<|message_model|><|content_text|>bash<|content_invoke_tool_json|>{"name":"bash","args":{"command":"echo \"=== files ===\"; ls -la src/*.js index.html plan.md; echo \"=== init head ===\"; head -n2 src/init.js; echo \"=== loop imports ===\"; grep import src/loop.js"}}<|end_message|>
-        ,
-        .tools_json = bash_tool_schema,
-        .tool_count = 1,
-        .tool_name = "bash",
-        .tool_arg_key = "command",
-    },
-
     // ── lfm2 (LFM2.5) — pythonic call expressions ──────────────────────
     // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
     // against its own rendered template (2026-08-04). Values are PYTHON
@@ -2099,9 +1822,6 @@ const corpus = [_]Expect{
 const leak_tags = [_][]const u8{
     "<think>",              "</think>",        "<|channel>",        "<channel|>",
     "<|tool_call",          "<tool_call",      "<|\"|>",
-    // Inkling message-channel markers (each a single special token).
-               "<|content_text|>",
-    "<|content_thinking|>", "<|end_message|>", "<|message_model|>", "<|content_invoke_tool_json|>",
     // MiniCPM5 V3 attribute XML. Deliberately the ATTRIBUTE-BEARING spellings,
     // never a bare `<function`: the corpus carries `<functional>` prose that
     // must keep flowing, and a guard that fails on ordinary words is a guard
@@ -2121,8 +1841,6 @@ const reasoning_leak_tags = [_][]const u8{
     "<｜DSML｜",
     "<|tool_call",
     "<tool_call",
-    "<tool_calls:",
-    "<|content_invoke_tool_json|>",
     "<atem:",
 };
 
@@ -2353,20 +2071,13 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         if (!entry.thinking) continue;
 
         // Earliest end position of a think close tag, any family (the chat
-        // helper covers both `</think>` and the Hy3-suffixed variant; an
-        // Inkling thinking MESSAGE closes at its `<|end_message|>`).
+        // helper covers `</think>`).
         const close_end: ?usize = blk: {
             var best: ?usize = null;
             if (chat.indexOfThinkCloseTag(entry.raw, 0)) |c| best = c.pos + c.len;
             if (std.mem.indexOf(u8, entry.raw, "<channel|>")) |p| {
                 const e = p + "<channel|>".len;
                 if (best == null or e < best.?) best = e;
-            }
-            if (std.mem.startsWith(u8, entry.raw, "<|content_thinking|>")) {
-                if (std.mem.indexOf(u8, entry.raw, "<|end_message|>")) |p| {
-                    const e = p + "<|end_message|>".len;
-                    if (best == null or e < best.?) best = e;
-                }
             }
             // Muse: a to=self segment closes at <|eom|>; a resolved non-self
             // header IS the close (immediate split, empty reasoning).
@@ -2418,66 +2129,6 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
 }
 
-test "format corpus: streaming tool buffer never flushes Inkling call text" {
-    // Replay every Inkling tool-call entry through the server's has_tools
-    // streaming order (chat.streamShouldBufferForTools FIRST, then the think
-    // gate; a .flush_text emits everything buffered so far, .split_think
-    // clears the buffer). Channel markers are SINGLE special tokens, so they
-    // arrive whole — the replay feeds them atomically and everything else
-    // byte-by-byte. Invariant: no flush may cover any byte at or past the
-    // start of the first call's NAME — that is exactly the live 2026-07-30
-    // leak (NAME + full JSON streamed as visible content deltas, landing in
-    // pi's transcript and contaminating every later turn's history).
-    const inkling_markers = [_][]const u8{
-        "<|message_model|>",            "<|end_message|>",
-        "<|content_text|>",             "<|content_thinking|>",
-        "<|content_invoke_tool_json|>",
-    };
-    for (corpus) |entry| {
-        if (!std.mem.eql(u8, entry.family, "inkling")) continue;
-        if (entry.tool_name == null) continue;
-        const raw = entry.raw;
-        const inv = std.mem.indexOf(u8, raw, "<|content_invoke_tool_json|>") orelse continue;
-        // NAME start = beginning of the trailing identifier run before the
-        // first invoke marker (how the template glues NAME to the marker).
-        var name_start = inv;
-        while (name_start > 0) {
-            const c = raw[name_start - 1];
-            const is_name_char = std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
-            if (!is_name_char) break;
-            name_start -= 1;
-        }
-
-        var start: usize = 0; // buffer origin — cleared on split_think, like text_buf
-        var think_closed = false;
-        var i: usize = 0;
-        while (i < raw.len) {
-            // Atomic-marker tokenization: a marker starting here arrives whole.
-            var step: usize = 1;
-            for (inkling_markers) |m| {
-                if (std.mem.startsWith(u8, raw[i..], m)) {
-                    step = m.len;
-                    break;
-                }
-            }
-            i += step;
-            const buf = raw[start..i];
-            if (chat.streamShouldBufferForTools(buf)) continue;
-            switch (chat.streamThinkGate(buf, entry.thinking, think_closed)) {
-                .hold_thinking => {},
-                .split_think => {
-                    think_closed = true;
-                    start = i;
-                    if (i > name_start) try fail(entry, "think split flushed tool-call text", buf);
-                },
-                .flush_text => {
-                    if (i > name_start) try fail(entry, "tool-call text flushed as content", buf);
-                },
-            }
-        }
-    }
-}
-
 test "format corpus: no flush boundary lands inside a tool-call opener, any family" {
     // UNIVERSAL class guard. streamShouldBufferForTools is the only thing
     // standing between a mid-marker token boundary and the wire, and the part
@@ -2510,11 +2161,10 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //
     // Scope is deliberate on both sides:
     //   * Only markers the ladder EXISTS to cover — i.e. ones a tokenizer can
-    //     split. Inkling's `<|content_*|>` and Muse's `<|start|>` are single
-    //     special tokens that arrive whole, so no interior offset is reachable
-    //     and upstream gives them no rungs by design; including them here would
-    //     assert something stricter than the tokenizer can produce. They are
-    //     covered by the atomic-marker Inkling replay above instead.
+    //     split. Muse's `<|start|>` is a single special token that arrives
+    //     whole, so no interior offset is reachable and upstream gives it no
+    //     rungs by design; including it here would assert something stricter
+    //     than the tokenizer can produce.
     //   * Only entries that produce a call. `<function` also occurs inside the
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
@@ -2867,8 +2517,8 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
         try testing.expectEqualStrings(d.name, rt_name);
 
         // `arguments` rides as a JSON STRING on the OpenAI shape, and stays an
-        // OBJECT for the families whose template demands it (Inkling
-        // raise_exception's on a string). Either is legal; both must still
+        // OBJECT for the families whose template demands it (Qwen's
+        // `arguments|items` fails on a string). Either is legal; both must still
         // carry the argument back intact.
         const rt_args = fn_obj.get("arguments").?;
         var reparsed: ?std.json.Parsed(std.json.Value) = null;

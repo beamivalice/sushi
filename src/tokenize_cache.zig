@@ -198,7 +198,7 @@ test "TokenizeCache key stability" {
 
 test "TokenizeCache key distinguishes assistant reasoning_content" {
     // reasoning_content changes the rendered prompt for templates that
-    // persist reasoning across turns (laguna) — two histories differing
+    // persist reasoning across turns — two histories differing
     // only in reasoning must not collide on one cached tokenization.
     const m1 = [_]chat_mod.Message{
         .{ .role = "assistant", .content = "4" },

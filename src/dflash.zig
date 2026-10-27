@@ -173,8 +173,7 @@ fn readConfigFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 }
 
 /// Conventional in-checkpoint home for a DFlash assistant: a subdirectory of
-/// the model's own directory declaring the config contract. Mirrors
-/// `mtp.resolveMtpSource`'s sidecar-or-in-checkpoint shape, and it is what
+/// the model's own directory declaring the config contract. It is what
 /// turns the drafter from a LAUNCH-flag dependency into a LOAD-time one — a
 /// hot model switch brings its own drafter, no pairing table decides which
 /// sidecar goes with which checkpoint, and a mismatched pair is unbuildable.

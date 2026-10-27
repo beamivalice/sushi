@@ -1145,7 +1145,7 @@ pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) 
 
 /// Assistant-history reasoning field on an incoming chat message:
 /// `reasoning_content` (our own SSE/vLLM field, what pi rounds-trips) with
-/// `reasoning` (the vLLM request spelling laguna's template reads first) as
+/// `reasoning` (the vLLM request spelling some templates read first) as
 /// the fallback. Non-empty strings only — an empty string would render an
 /// empty <think></think> block, which is exactly the nothink signature this
 /// field exists to avoid.
@@ -1442,9 +1442,7 @@ fn resolveReasoningProtocol(
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
 
     const template = chat_config.chat_template;
-    const kind: rp_mod.Kind = if (std.mem.indexOf(u8, template, "<|content_thinking|>") != null)
-        .inkling
-    else if (std.mem.indexOf(u8, template, "<|channel|>") != null)
+    const kind: rp_mod.Kind = if (std.mem.indexOf(u8, template, "<|channel|>") != null)
         .harmony
     else if (std.mem.indexOf(u8, template, "<|eom|>") != null)
         .muse
@@ -1471,15 +1469,8 @@ fn resolveReasoningProtocol(
                     if (!proto.setCloser(text)) return false;
                 }
             },
-            .suffixed => |suffix| {
-                proto.kind = .suffixed_think;
-                var closer_buf: [32]u8 = undefined;
-                const closer = std.fmt.bufPrint(&closer_buf, "</think:{s}>", .{suffix}) catch return false;
-                if (!proto.setCloser(closer)) return false;
-            },
             .none => {
                 const opener = templateThinkOpener(template) orelse return false;
-                proto.kind = if (std.mem.eql(u8, opener, rp_mod.BARE_THINK_OPENER)) .bare_think else .suffixed_think;
                 var closer_buf: [rp_mod.MAX_MARKER_BYTES]u8 = undefined;
                 const close = std.fmt.bufPrint(&closer_buf, "</{s}", .{opener[1..]}) catch return false;
                 if (!proto.setOpener(opener) or !proto.setCloser(close)) return false;
@@ -1521,9 +1512,7 @@ fn resolveReasoningProtocol(
         proto.special_len += 1;
     }
     for ([_][]const u8{
-        "<|start|>",         "<|channel|>",          "<|message|>",      "<|channel>",      "<channel|>",
-        "<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|end_message|>", "<|end|>",
-        "<|eom|>",
+        "<|start|>", "<|channel|>", "<|message|>", "<|channel>", "<channel|>", "<|end|>", "<|eom|>",
     }) |text| {
         if (tok.specialTokenId(text)) |id| {
             proto.specials[proto.special_len] = .{ .id = id, .text = text };
@@ -5073,7 +5062,7 @@ test "a quantized pack is streaming capable and only the dense one is streaming 
 test "the streaming markers read the ONE arch gate: no other arch carries them" {
     const t = std.testing;
     var buf: [96]u8 = undefined;
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "hy_v3", "llama", "gguf", "bert", "" }) |arch| {
+    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "gguf", "bert", "" }) |arch| {
         try t.expect(!streamingStubMarker(arch, true, true));
         try t.expect(!streamingRequiredMarker(arch, 0, false, true, true));
         try t.expectEqualStrings("", streamingRowPart(&buf, streamingStubMarker(arch, true, true), false, 60));
@@ -6712,7 +6701,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
     // scales with min(chunk, seq) — billing the raw chunk cap rejected a
-    // 31-token prompt for "needing" 6.2 GB on a memory-squeezed hy_v3 host
+    // 31-token prompt for "needing" 6.2 GB on a memory-squeezed host
     // (live 2026-07-14). No-op for prompts >= one chunk.
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
@@ -9475,8 +9464,8 @@ fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) EscapedText
 
 /// `effort` is the client's raw string, borrowed from the parsed request JSON
 /// (which outlives the handler), or on a served arch the selected arm's static
-/// word — dsv4-family templates map it into the
-/// render via `chat.dsv4EffortFor`; every other consumer only reads
+/// word — DeepSeek templates map it into the
+/// render via `chat.dsv41EffortFor`; every other consumer only reads
 /// enable/budget.
 const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null, rerouted_from: ?[]const u8 = null };
 
@@ -12285,22 +12274,9 @@ fn handleStreamingGeneration(
             // INSIDE the thinking block — no opener appears in the streamed text.
             if (!skipped_think_open and (think_buf.items.len >= 7 or !chat_mod.thinkOpenerPossible(think_buf.items))) {
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
-                    // Remove the opener (<think> or the Hy3-suffixed form) and
-                    // any leading newline.
+                    // Remove the opener and any leading newline.
                     saw_think_open = true;
                     var skip: usize = olen;
-                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
-                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
-                    think_buf.clearAndFree(allocator);
-                    try think_buf.appendSlice(allocator, remaining);
-                    allocator.free(remaining);
-                    skipped_think_open = true;
-                } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
-                    // Inkling thinking message (opener is ONE special token) —
-                    // the message closes with <|end_message|>.
-                    saw_think_open = true;
-                    think_close_tag = "<|end_message|>";
-                    var skip: usize = "<|content_thinking|>".len;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                     think_buf.clearAndFree(allocator);
@@ -12365,7 +12341,7 @@ fn handleStreamingGeneration(
                     // Buffer is still a partial prefix of `<|channel>thought` —
                     // wait for more tokens before deciding.
                 } else if (think_buf.items.len < 32 and chat_mod.endsWithPartialThinkOpen(think_buf.items)) {
-                    // Still a growing suffixed opener (`<think:opensou`) —
+                    // Still a growing opener (`…<thi`) —
                     // wait before deciding, or the raw tag leaks as reasoning.
                 } else {
                     // Not a known opener — template already injected one.
@@ -12382,24 +12358,11 @@ fn handleStreamingGeneration(
 
             // Check for the close tag — accept whichever appears first.
             // Models with templates that pre-inject the opener (Qwen 3.5/3.6,
-            // some Gemma 4 variants, Hy3's suffixed form) don't reveal which
+            // some Gemma 4 variants) don't reveal which
             // format they use until the close tag arrives, so look for both
-            // families (indexOfThinkCloseTag covers bare AND suffixed </think…>).
+            // families.
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-            // Inkling: an Inkling thinking message closes at <|end_message|>
-            // (gated on the opener having switched think_close_tag so prose
-            // that MENTIONS the literal in another family never matches), and
-            // a leading <|content_text|> means the model answered DIRECTLY —
-            // close immediately with empty reasoning.
-            const inkling_pos: ?usize = blk_i: {
-                if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk_i 0;
-                if (std.mem.eql(u8, think_close_tag, "<|end_message|>")) {
-                    if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk_i p;
-                }
-                break :blk_i null;
-            };
-            const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
             // Muse: a resolved non-self header is a DIRECT answer — close at 0
             // with empty reasoning (the header bytes are the "tag"); a
             // reasoning segment closes at its <|eom|> (gated on the muse
@@ -12430,7 +12393,6 @@ fn handleStreamingGeneration(
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
                 if (harmony_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
-                if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -12453,16 +12415,11 @@ fn handleStreamingGeneration(
                 } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                     content_after = content_after[10..];
                 }
-                // Strip Inkling content-message markers after the close; the
-                // content message ends at its own <|end_message|>.
-                if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
-                if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
                 // Harmony: the answer arrives as a whole new segment —
                 // `<|start|>assistant<|channel|>final<|message|>` — and every
                 // byte of that header is ordinary text that would otherwise
                 // ride out as content.
                 content_after = chat_mod.stripHarmonySegmentHeader(content_after);
-                if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 // Strip a muse next-segment header (<|start|>assistant
                 // to=user<|message|>). A header still ARRIVING (start marker,
                 // no message marker yet) arms the plain-arm skip instead —
@@ -14886,7 +14843,7 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
             null;
 
         // Reasoning the client round-trips on assistant history. Dropping it
-        // starves templates that persist reasoning across turns (laguna): every
+        // starves templates that persist reasoning across turns: every
         // prior turn renders the empty <think></think> nothink signature and
         // the model stops thinking from turn 2 of a session.
         const msg_reasoning: ?[]const u8 = if (std.mem.eql(u8, role_val.string, "assistant"))
@@ -15022,7 +14979,7 @@ fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value, vp:
                             // History reasoning → Message.reasoning_content, same
                             // round-trip as chat completions' reasoning_content:
                             // templates that persist reasoning across turns
-                            // (laguna) starve into nothink without it.
+                            // starve into nothink without it.
                             // "redacted_thinking" stays skipped (opaque payload).
                             const t = if (block.object.get("thinking")) |v| (if (v == .string) v.string else "") else "";
                             if (t.len > 0) {
@@ -17715,9 +17672,7 @@ fn handleAnthropicStreaming(
             // Buffer for tool detection. Detection rules live in
             // `chat.streamShouldBufferForTools` — the SAME predicate as the
             // chat-completions stream (this path once carried its own inline
-            // subset, which missed the Inkling invoke marker: the 2026-07-30
-            // NAME+JSON content leak, and before that the drift class the
-            // think gate was unified for).
+            // subset, which drifted: the class the think gate was unified for).
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
             const undelivered = buf[text_delivered..];
@@ -17821,16 +17776,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
-                    // Inkling thinking message — closes at <|end_message|>.
-                    think_close_tag = "<|end_message|>";
-                    var skip: usize = "<|content_thinking|>".len;
-                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
-                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
-                    think_buf.clearAndFree(allocator);
-                    try think_buf.appendSlice(allocator, remaining);
-                    allocator.free(remaining);
-                    skipped_think_open = true;
                 } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                     think_close_tag = "<channel|>";
                     var skip: usize = 17;
@@ -17881,7 +17826,7 @@ fn handleAnthropicStreaming(
                 } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
                     // Partial prefix of `<|channel>thought` — wait for more tokens.
                 } else if (think_buf.items.len < 32 and chat_mod.endsWithPartialThinkOpen(think_buf.items)) {
-                    // Still a growing suffixed opener (`<think:opensou`) — wait.
+                    // Still a growing opener (`…<thi`) — wait.
                 } else {
                     // No opener in the model's output — template injected one.
                     // Stay in the think block; close tag is detected dynamically.
@@ -17898,21 +17843,9 @@ fn handleAnthropicStreaming(
                 block_index += 1;
             }
 
-            // Check for the close tag — accept whichever appears first
-            // (indexOfThinkCloseTag covers bare AND Hy3-suffixed </think…>).
+            // Check for the close tag — accept whichever appears first.
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-            // Inkling: <|end_message|> closes the thinking message (gated on
-            // the opener having switched think_close_tag); a leading
-            // <|content_text|> is a DIRECT answer — empty reasoning.
-            const inkling_pos: ?usize = blk_i: {
-                if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk_i 0;
-                if (std.mem.eql(u8, think_close_tag, "<|end_message|>")) {
-                    if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk_i p;
-                }
-                break :blk_i null;
-            };
-            const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
             // Muse: a resolved non-self header is a DIRECT answer — close at 0
             // with empty reasoning; a reasoning segment closes at its <|eom|>
             // (gated on the muse opener having latched think_close_tag).
@@ -17942,7 +17875,6 @@ fn handleAnthropicStreaming(
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
                 if (harmony_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
-                if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -19103,8 +19035,6 @@ fn handleResponsesInner(
         defer think_buf.deinit(allocator);
         var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
         var skipped_think_open = false;
-        // Inkling thinking message seen — its close is <|end_message|>.
-        var inkling_think = false;
         var live_output_index: u32 = 0;
 
         while (true) {
@@ -19193,16 +19123,6 @@ fn handleResponsesInner(
                         try think_buf.appendSlice(allocator, remaining);
                         allocator.free(remaining);
                         skipped_think_open = true;
-                    } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
-                        // Inkling thinking message — closes at <|end_message|>.
-                        var skip: usize = "<|content_thinking|>".len;
-                        while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
-                        const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
-                        think_buf.clearAndFree(allocator);
-                        try think_buf.appendSlice(allocator, remaining);
-                        allocator.free(remaining);
-                        skipped_think_open = true;
-                        inkling_think = true;
                     } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                         var skip: usize = 17;
                         while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -19218,16 +19138,10 @@ fn handleResponsesInner(
                     }
                 }
 
-                // Detect close tag (</think>, <channel|>, or Inkling's
-                // <|end_message|>; a leading <|content_text|> is a DIRECT
-                // Inkling answer — close immediately with empty reasoning).
+                // Detect close tag (</think> or <channel|>).
                 const tp = std.mem.indexOf(u8, think_buf.items, "</think>");
                 const cp = std.mem.indexOf(u8, think_buf.items, "<channel|>");
                 const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
-                    if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk .{ .pos = 0, .tag = "<|content_text|>" };
-                    if (inkling_think) {
-                        if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk .{ .pos = p, .tag = "<|end_message|>" };
-                    }
                     if (tp == null and cp == null) break :blk null;
                     if (tp == null) break :blk .{ .pos = cp.?, .tag = "<channel|>" };
                     if (cp == null) break :blk .{ .pos = tp.?, .tag = "</think>" };
@@ -19256,9 +19170,6 @@ fn handleResponsesInner(
                     } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                         content_after = content_after[10..];
                     }
-                    if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
-                    if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
-                    if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                     content_after = std.mem.trimStart(u8, content_after, "\n ");
                     if (content_after.len > 0) {
                         if (!streamed_message_started) {
@@ -21153,7 +21064,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     var cfg = qwen4ExpLive364kConfig();
     try t.expect(wiredCeilingFloorForRam(&cfg, total_ram) > 0);
     try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(null, total_ram));
-    for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "deepseek_v4", "bailing_hybrid" }) |mt| {
+    for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "bailing_hybrid" }) |mt| {
         var other = cfg;
         other.model_type = mt;
         try t.expect(!other.longCtxGated());
@@ -22644,13 +22555,13 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
     // `default_budget` here, which carries `--reasoning-budget`.
     const allocator = std.testing.allocator;
     const cases = [_]struct { body: []const u8, consumes: bool, default_budget: i32, want: i32 }{
-        // Consuming template (qwen3.8 / dsv4 / inkling): no effort-derived cap.
+        // Consuming template (qwen3.8 / deepseek / glm): no effort-derived cap.
         .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = -1, .want = -1 },
         .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = true, .default_budget = -1, .want = -1 },
         .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = true, .default_budget = -1, .want = -1 },
         // ...but `--reasoning-budget` still binds there.
         .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = 4096, .want = 4096 },
-        // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse, laguna,
+        // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse,
         // Ling): the effort word reaches no template, so the budget is the ONLY
         // thing it does and every mapping stays exactly as it shipped.
         .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 1024 },
@@ -22968,10 +22879,10 @@ test "schema thinking policy defers only a resolved reasoning protocol" {
     try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, true, true));
     try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, false));
 
-    // A suffixed think tail classifies as resolvable (the resolver owns the
+    // A think tail classifies as resolvable (the resolver owns the
     // capability checks); channel-family and plain ChatML tails do not, and
     // keep the fallback — capability is never the tail's alone to decide.
-    try std.testing.expect(chat_mod.promptThinkTailClass("<|im_start|>assistant\n<think:opensource>") == .suffixed);
+    try std.testing.expect(chat_mod.promptThinkTailClass("<|im_start|>assistant\n<think>") == .bare);
     const unsupported_tails = [_][]const u8{
         "<|channel|>analysis<|message|>",
         "<|im_start|>assistant\n",
@@ -23159,7 +23070,7 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
 }
 
 test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {
-    // hy_v3 live 2026-07-14: with 111 GB of weights resident (~4 GB headroom),
+    // Live 2026-07-14: with 111 GB of weights resident (~4 GB headroom),
     // a 31-TOKEN prompt was rejected "needs ~6246MB" — the MLP envelope was
     // billed at the hd-128 8192 chunk cap while the actual prefill runs ONE
     // 31-token forward (~25 MB). A forward is never wider than the prompt:
@@ -23615,8 +23526,7 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     // DeepSeek-V4-Flash shape (live 2026-07-31): 64 heads, ONE latent kv head,
     // 43 layers, head_dim 512 — outside every fused kernel, so the score term
     // fires. But DSV4 attends to sliding_window(128) + index_topk(512) + sink
-    // keys per query, NEVER the whole prompt (deepseek_v4.zig: `tk = wk +
-    // n_sel`). Billing a dense 5806-wide key axis put a 5806-token prompt at
+    // keys per query, NEVER the whole prompt (`tk = wk + n_sel`). Billing a dense 5806-wide key axis put a 5806-token prompt at
     // ~10.3 GB and 400-rejected it on a 1M-context model with 8.6 GB free.
     // The live request verbatim: 5806 tokens at kv-quant 8, chunk 5632, with
     // 8629 MB free. Pre-fix it billed 10277 MB — a dense 5806-wide key axis
@@ -24260,7 +24170,7 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
     const t = std.testing;
     const allocator = t.allocator;
     const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
-        // pi/vLLM SSE spelling — the live laguna case (2026-07-29).
+        // pi/vLLM SSE spelling (live 2026-07-29).
         .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"two plus two\"}", .want = "two plus two" },
         // vLLM request spelling.
         .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning\":\"twice two\"}", .want = "twice two" },
@@ -24286,7 +24196,7 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
 }
 
 test "modelEngineName: GGUF stubs report gguf, everything else mlx" {
-    try testing.expectEqualStrings("mlx", modelEngineName("/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName("/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v41"));
     try testing.expectEqualStrings("gguf", modelEngineName("/m/x.gguf", ""));
     try testing.expectEqualStrings("gguf", modelEngineName("/m/dir", "gguf"));
     try testing.expectEqualStrings("mlx", modelEngineName("/m/qwen4", "qwen4_exp"));
@@ -26476,7 +26386,7 @@ test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the 
 
 test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expectEqualStrings("<think>", templateThinkOpener("{{ '<think>' }} <think>").?);
-    try std.testing.expectEqualStrings("<think:opensource>", templateThinkOpener("{{ '<think:opensource>' }}").?);
+    try std.testing.expect(templateThinkOpener("{{ '<think:opensource>' }}") == null);
     try std.testing.expect(templateThinkOpener("<think> <think:opensource>") == null);
     try std.testing.expect(templateThinkOpener("<think:{{ suffix }}>") == null);
     try std.testing.expect(templateThinkOpener("assistant") == null);

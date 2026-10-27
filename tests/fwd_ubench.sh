@@ -32,7 +32,7 @@ for _ in $(seq 1 600); do
 done
 sleep 2
 
-grep -E "\[fwd-ubench\]|\[ProjRung|\[moe\]|\[dtype\]|\[laguna|engaged|declined" "$LOG"
+grep -E "\[fwd-ubench\]|\[moe\]|\[dtype\]|engaged|declined" "$LOG"
 
 kill "$SRV" 2>/dev/null
 wait "$SRV" 2>/dev/null

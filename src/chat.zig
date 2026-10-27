@@ -142,7 +142,7 @@ pub const Message = struct {
     /// Reasoning the client round-trips on assistant HISTORY messages
     /// (`reasoning_content`/`reasoning` on chat completions, `thinking`
     /// blocks on /v1/messages). Templates that persist reasoning across
-    /// turns (laguna) read it; templates that strip history reasoning
+    /// turns read it; templates that strip history reasoning
     /// (Qwen, Gemma) never reference the field and render unchanged.
     reasoning_content: ?[]const u8 = null,
 };
@@ -189,7 +189,7 @@ fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// Is this `chat_template` entry just an `{% include %}` POINTER at the
 /// sidecar file? transformers >= 5 saves the real template to
 /// `chat_template.jinja` and writes that one-liner into tokenizer_config.json
-/// (mlx-community's Laguna-S-2.1-oQ4e-fast / -oQ5e, issue #169). jinja.cpp has
+/// (mlx-community oQ4e / oQ5e builds, issue #169). jinja.cpp has
 /// no `include` statement, so rendering the pointer fails and drops SILENTLY to
 /// the generic format — the model then answers in another family's markers.
 /// The file it names is always the sidecar the caller already falls back to.
@@ -276,7 +276,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
 
     {   // transformers >= 5 saves the template to chat_template.jinja and leaves
         // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
-        // Laguna-S-2.1-oQ4e-fast, issue #169). jinja.cpp has no `include`, so
+        // oQ4e builds, issue #169). jinja.cpp has no `include`, so
         // taking the pointer literally fails the render and SILENTLY drops to
         // the generic fallback — wrong-family markers the model then echoes.
         // Read it as "no inline template" so the sidecar file is used.
@@ -336,17 +336,6 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             var jinja_reader = f.reader(io, &jinja_buf);
             break :blk try jinja_reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
         } else |_| {
-            // Family fallback: a deepseek_v4 checkpoint that ships NO
-            // template at all (pipenetwork REAP builds — their python
-            // package does its own encoding) gets OUR byte-pinned DSV4
-            // transcription. The generic fallback renders wrong-family
-            // markers the model then echoes into degeneration (the
-            // silent-fallback class, live 2026-08-01), and DSML tool
-            // calling depends on the real template.
-            if (dirModelTypeIs(io, allocator, model_dir, "deepseek_v4")) {
-                log.info("chat: deepseek_v4 checkpoint ships no chat_template — using the embedded DSV4 transcription\n", .{});
-                break :blk try allocator.dupe(u8, @embedFile("fixtures/dsv4_chat_template.jinja"));
-            }
             break :blk try allocator.dupe(u8, "");
         }
     };
@@ -528,8 +517,8 @@ pub fn renderChatTemplate(
     // template renders it as a to=self segment — so one bad chain (a loop-cut
     // tail) would replay in the prompt on every later turn. Drop it on
     // assistant messages before the last user message; tool rounds after it
-    // keep theirs. Families whose templates NEED history reasoning (laguna,
-    // inkling) are untouched — same sniff `noThinkTailSuffix` uses.
+    // keep theirs. Families whose templates NEED history reasoning are
+    // untouched — same sniff `noThinkTailSuffix` uses.
     if (std.mem.indexOf(u8, tpl, "reasoning_strength") != null) {
         if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
         if (try dropPriorTurnReasoning(fallback_arena.?.allocator(), effective_messages)) |stripped| {
@@ -1173,11 +1162,9 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
                 if (ti > 0) try buf.append(allocator, ',');
                 try buf.appendSlice(allocator, "{\"type\":\"function\",");
                 if (tc.id.len > 0) {
-                    // Inkling's template names a tool RESULT by matching
+                    // A template that names a tool RESULT by matching
                     // `message.tool_call_id` against the history call's `id`
-                    // (`tc.id is defined and tc.id == message.tool_call_id`) —
-                    // without the id the result renders nameless. Inert for
-                    // templates that never read it.
+                    // needs the id; inert for templates that never read it.
                     try buf.appendSlice(allocator, "\"id\":");
                     try appendJsonString(allocator, &buf, tc.id);
                     try buf.append(allocator, ',');
@@ -1272,8 +1259,8 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 }
 
 /// Whether the template READS `reasoning_effort` — i.e. the word is a
-/// BEHAVIORAL lever on this checkpoint (dsv4's preamble, Qwen3.8's and
-/// Inkling's effort arms) rather than a string we hand over and it ignores.
+/// BEHAVIORAL lever on this checkpoint (DeepSeek's preamble, Qwen3.8's and
+/// GLM's effort arms) rather than a string we hand over and it ignores.
 /// Where it is, the server must NOT also derive a token budget from the same
 /// word: the budget only truncates what the client is shown, so the two
 /// levers fight — pi asking for `medium` on Qwen3.8 got the model's default
@@ -1286,18 +1273,6 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// muse's `reasoning_strength` is a near-miss the corpus pins.
 pub fn templateConsumesEffort(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
-}
-
-/// OpenAI's effort vocabulary → DeepSeek's low|high|max. `medium` maps to
-/// low deliberately: DeepSeek's `high` text is "Absolute maximum with no
-/// shortcuts permitted" and its own default is low, so nothing verbose is
-/// injected unless the client explicitly asked for it. Unknown strings also
-/// fall back to low for the same reason.
-pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
-    const e = effort orelse return "low";
-    if (std.mem.eql(u8, e, "high")) return "high";
-    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "max";
-    return "low";
 }
 
 /// OpenAI's effort vocabulary -> DeepSeek-V4.1's low|high|max (the encoder's default is high).
@@ -1385,28 +1360,12 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else {
         try buf.appendSlice(allocator, "\"enable_thinking\":false");
     }
-    // Hy3 templates control thinking via `reasoning_effort` (high/low/
-    // no_think), not enable_thinking — and default HIGH when the var is
-    // absent. Always supply the mapped value so thinking-off requests
-    // actually close the think block; templates that don't read it ignore it.
-    //
-    // Inkling's template ALSO reads `reasoning_effort` but with a different
-    // vocabulary (none/minimal/low/medium/high/max) and raise_exception's on
-    // anything else — hy3's "no_think" would fail the render and silently
-    // swap in fallbackFormatChat (wrong-family tags). Its thinking-off word
-    // is "none"; sniffed by the effort header string unique to that family.
-    // Qwen3.8 reads it too, with a THIRD vocabulary (xhigh|medium|low,
-    // default xhigh) and its own raise_exception — hy3's "high"/"no_think"
-    // fail the render on every request, thinking on or off.
-    // DeepSeek-V4-0731's encoder made `reasoning_effort` a THREE-level
-    // vocabulary (low|high|max) whose high/max levels PREPEND a verbose
-    // "Reasoning Effort: …" preamble to the whole conversation, with low (=
-    // nothing) as the reference default. hy3's blanket "high" would inject
-    // that preamble into every thinking request on this family, so dsv4 maps
-    // the CLIENT's effort string through `dsv4EffortFor` — high/max opt in,
-    // everything else (incl. absent) stays the reference default.
-    const dsv4_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
-    const inkling_style = std.mem.indexOf(u8, chat_config.chat_template, "Thinking effort level") != null;
+    // Templates that ignore `reasoning_effort` get high/no_think. The families
+    // that read it each have their own vocabulary (GLM's free word, Qwen3.8's
+    // xhigh|medium|low, DeepSeek's low|high|max) and raise on any other string:
+    // a raise swaps in fallbackFormatChat (wrong-family tags), so every one is
+    // mapped below instead of sent the default.
+    const dsv41_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
     const glm5_style = std.mem.indexOf(u8, chat_config.chat_template, "effective_reasoning_effort") != null and
         std.mem.indexOf(u8, chat_config.chat_template, "[gMASK]<sop>") != null;
     if (templateRequiresReasoningField(chat_config.chat_template)) {
@@ -1418,11 +1377,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, effort orelse "high");
         try buf.append(allocator, '"');
-    } else if (dsv4_style) {
+    } else if (dsv41_style) {
         // V4.1 renders a numeric budget for every thinking turn, on its own ladder.
-        const v41 = std.mem.indexOf(u8, chat_config.chat_template, "(range 1-100") != null;
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
-        try buf.appendSlice(allocator, if (v41) dsv41EffortFor(effort) else dsv4EffortFor(effort));
+        try buf.appendSlice(allocator, dsv41EffortFor(effort));
         try buf.append(allocator, '"');
     } else if (qwen38_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
@@ -1430,12 +1388,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
-    else if (inkling_style)
-        ",\"reasoning_effort\":\"none\""
     else
         ",\"reasoning_effort\":\"no_think\"");
 
-    // DeepSeek-V4's template switches on `thinking_mode` ("chat"|"thinking",
+    // DeepSeek-V4.1's template switches on `thinking_mode` ("chat"|"thinking",
     // the reference encoder's own vocabulary). Only emitted when the template
     // reads it — other families never see the key.
     if (std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null) {
@@ -1703,58 +1659,28 @@ fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
     return null;
 }
 
-// ── Suffixed think/tool tag matching (Hy3 / Hunyuan 3) ──
-//
-// Hy3 templates suffix every control tag with a release marker:
-// `<think:opensource>`, `</think:opensource>`, `<tool_call:opensource>`, …
-// (HYTK in chat_template.jinja; future releases may carry a different
-// suffix). The helpers below match `BASE>` or `BASE:[A-Za-z0-9_-]+>` so the
-// shared think machinery handles both the canonical and suffixed families
-// without hardcoding any specific suffix.
+// ── Think tag matching ──
 
 pub const TagAt = struct { pos: usize, len: usize };
 
-fn tagSuffixChar(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-        (c >= '0' and c <= '9') or c == '_' or c == '-';
+/// Length of the complete tag `base>` at the START of `text` (base "<think" matches "<think>").
+fn tagLenAt(text: []const u8, comptime base: []const u8) ?usize {
+    if (text.len <= base.len or !std.mem.startsWith(u8, text, base) or text[base.len] != '>') return null;
+    return base.len + 1;
 }
 
-/// Length of a complete tag at the START of `text` whose base is `base`
-/// (e.g. base "<think" matches "<think>" and "<think:opensource>").
-fn suffixedTagLenAt(text: []const u8, comptime base: []const u8) ?usize {
-    if (!std.mem.startsWith(u8, text, base)) return null;
-    var i: usize = base.len;
-    if (i < text.len and text[i] == '>') return i + 1;
-    if (i >= text.len or text[i] != ':') return null;
-    i += 1;
-    const suffix_start = i;
-    while (i < text.len) : (i += 1) {
-        const c = text[i];
-        if (c == '>') return if (i > suffix_start) i + 1 else null;
-        if (!tagSuffixChar(c)) return null;
-    }
-    return null;
-}
-
-/// True when `text` could still GROW into a `base`-tag with more streamed
-/// bytes (strict prefix: "<th", "<think", "<think:", "<think:opensou").
-fn isPartialSuffixedTag(text: []const u8, comptime base: []const u8) bool {
-    if (text.len == 0) return false;
-    if (text.len <= base.len) return std.mem.startsWith(u8, base, text);
-    if (!std.mem.startsWith(u8, text, base)) return false;
-    if (text[base.len] != ':') return false;
-    for (text[base.len + 1 ..]) |c| {
-        if (!tagSuffixChar(c)) return false;
-    }
-    return true;
+/// True when `text` could still GROW into `full` with more streamed bytes
+/// (strict prefix: "<th", "<think").
+fn isPartialTag(text: []const u8, comptime full: []const u8) bool {
+    return text.len > 0 and text.len < full.len and std.mem.startsWith(u8, full, text);
 }
 
 pub fn thinkOpenTagLenAt(text: []const u8) ?usize {
-    return suffixedTagLenAt(text, "<think");
+    return tagLenAt(text, "<think");
 }
 
 pub fn thinkCloseTagLenAt(text: []const u8) ?usize {
-    return suffixedTagLenAt(text, "</think");
+    return tagLenAt(text, "</think");
 }
 
 fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
@@ -1864,8 +1790,8 @@ fn valueStillOpen(text: []const u8, from: usize, at: usize, open_tag: []const u8
 }
 
 /// Length of the trailing bytes of `buf` that could still GROW into a think
-/// close tag with more streamed bytes — either family: `</think>`, the
-/// Hy3-suffixed `</think:opensource>`, or Gemma's `<channel|>`. Streaming
+/// close tag with more streamed bytes — either family: `</think>` or
+/// Gemma's `<channel|>`. Streaming
 /// reasoning flushes must hold this suffix back: flushing half a close tag
 /// splits it across the flush boundary, so the retained remainder never
 /// matches and the stream stays "inside thinking" forever (tag bytes leak
@@ -1878,7 +1804,7 @@ pub fn partialThinkCloseSuffixLen(buf: []const u8) usize {
         i -= 1;
         if (buf[i] != '<') continue;
         const tail = buf[i..];
-        if (isPartialSuffixedTag(tail, "</think")) return tail.len;
+        if (isPartialTag(tail, "</think>")) return tail.len;
         if (tail.len < "<channel|>".len and std.mem.startsWith(u8, "<channel|>", tail)) return tail.len;
     }
     return 0;
@@ -1904,10 +1830,9 @@ test "thinkOpenerPossible: a thought no opener can start is delivered without wa
 test "partialThinkCloseSuffixLen holds back growing close tags, ignores prose" {
     try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("plain reasoning text"));
     try testing.expectEqual(@as(usize, 7), partialThinkCloseSuffixLen("thinking…</think"));
-    try testing.expectEqual(@as(usize, 15), partialThinkCloseSuffixLen("thinking…</think:opensou"));
     try testing.expectEqual(@as(usize, 5), partialThinkCloseSuffixLen("thinking…<chan"));
     // A COMPLETE tag is not a partial — the scan-side indexOf owns it.
-    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("done</think:opensource>"));
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("done</think>"));
     // A '<' too far back is prose, not a growing tag.
     try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("a < b and then lots of ordinary words follow here"));
 }
@@ -1939,10 +1864,8 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
 const tool_markup_openers = [_][]const u8{
     "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
     "<|tool_call", // Gemma 4
-    "<tool_call", // Hermes XML + the plural/suffixed variants
-    "<tool_calls:", // Hy3 suffixed wrapper
+    "<tool_call", // Hermes XML + the plural variants
     "<atem:", // Muse-Glimmer ATEM (covers function_calls/invoke/parameter)
-    INKLING_INVOKE_TAG,
 };
 
 /// Earliest index of Claude-style `<function_calls>` / `<invoke …>` markup, or null. Like MiniCPM5's,
@@ -2015,37 +1938,21 @@ fn miniCpm5MarkupCut(text: []const u8) ?usize {
 /// slice (no alloc); text with no marker is returned untouched.
 pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     var cut: usize = text.len;
-    var is_inkling = false;
     for (tool_markup_openers) |m| {
         if (std.mem.indexOf(u8, text, m)) |p| {
-            if (p < cut) {
-                cut = p;
-                is_inkling = std.mem.eql(u8, m, INKLING_INVOKE_TAG);
-            }
+            if (p < cut) cut = p;
         }
     }
     // MiniCPM5 attribute form. Same reasoning, different discriminator: the
     // dialect is `<function` + whitespace + a `name=` attribute, so prose words
     // beginning `<function…` are left alone.
     if (miniCpm5MarkupCut(text)) |p| {
-        if (p < cut) {
-            cut = p;
-            is_inkling = false;
-        }
+        if (p < cut) cut = p;
     }
     if (bareInvokeMarkupCut(text)) |p| {
-        if (p < cut) {
-            cut = p;
-            is_inkling = false;
-        }
+        if (p < cut) cut = p;
     }
     if (cut == text.len) return text;
-    // Inkling puts the tool NAME immediately BEFORE its invoke marker, so the
-    // cut takes the trailing identifier run with it — otherwise the bare name
-    // is what the client renders as the answer.
-    if (is_inkling) {
-        while (cut > 0 and inklingIsNameChar(text[cut - 1])) cut -= 1;
-    }
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
 }
 
@@ -2096,12 +2003,6 @@ pub const ThinkSplit = struct {
 };
 
 /// True when a rendered generation prompt ends inside a think block the
-const INKLING_THINKING_TAG = "<|content_thinking|>";
-const INKLING_TEXT_TAG = "<|content_text|>";
-const INKLING_END_TAG = "<|end_message|>";
-const INKLING_MODEL_TAG = "<|message_model|>";
-const INKLING_INVOKE_TAG = "<|content_invoke_tool_json|>";
-
 /// A think block the MODEL opens when the template did not: a bare `<think>` token, or
 /// Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible deltas) then the
 /// word `thought`. `channel_armed` = the previous delta was that marker and nothing visible
@@ -2119,53 +2020,8 @@ pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8
 pub fn isChannelMarkerToken(tt: []const u8) bool {
     return std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
         std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>") or
-        std.mem.eql(u8, tt, INKLING_TEXT_TAG) or std.mem.eql(u8, tt, INKLING_END_TAG) or
-        std.mem.eql(u8, tt, INKLING_MODEL_TAG) or std.mem.eql(u8, tt, INKLING_THINKING_TAG) or
         std.mem.eql(u8, tt, MUSE_START_TAG) or std.mem.eql(u8, tt, MUSE_MSG_TAG) or
         std.mem.eql(u8, tt, MUSE_EOM_TAG) or std.mem.eql(u8, tt, MUSE_EOT_TAG);
-}
-
-/// Strip a leading `<|message_model|>` (and, on raw completions, a leading
-/// `<|end_message|>` closing the prompt's implicit message) so the channel
-/// marker is at position 0.
-fn inklingStripMessageHead(text: []const u8) []const u8 {
-    var t = std.mem.trimStart(u8, text, "\n ");
-    if (std.mem.startsWith(u8, t, INKLING_END_TAG)) t = t[INKLING_END_TAG.len..];
-    if (std.mem.startsWith(u8, t, INKLING_MODEL_TAG)) t = t[INKLING_MODEL_TAG.len..];
-    return t;
-}
-
-/// Content runs to its `<|end_message|>` (anything after is a re-opened
-/// message the stop token cut, or trailing markers — dropped).
-fn inklingTrimContentTail(content_in: []const u8) []const u8 {
-    var content = content_in;
-    if (std.mem.indexOf(u8, content, INKLING_END_TAG)) |em| content = content[0..em];
-    return std.mem.trim(u8, content, "\n ");
-}
-
-/// The Inkling arm of splitThinkBlock: null when the text carries no Inkling
-/// channel markers (every other family falls through).
-fn splitInklingChannels(text: []const u8) ?ThinkSplit {
-    const t = inklingStripMessageHead(text);
-    if (std.mem.startsWith(u8, t, INKLING_THINKING_TAG)) {
-        const body = t[INKLING_THINKING_TAG.len..];
-        if (std.mem.indexOf(u8, body, INKLING_END_TAG)) |em| {
-            const reasoning = std.mem.trim(u8, body[0..em], "\n ");
-            var content = inklingStripMessageHead(body[em + INKLING_END_TAG.len ..]);
-            if (std.mem.startsWith(u8, content, INKLING_TEXT_TAG)) content = content[INKLING_TEXT_TAG.len..];
-            return .{
-                .reasoning_content = if (reasoning.len > 0) reasoning else null,
-                .content = inklingTrimContentTail(content),
-            };
-        }
-        // Length-truncated mid-thought: reasoning, never content.
-        const reasoning = std.mem.trim(u8, body, "\n ");
-        return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
-    }
-    if (std.mem.startsWith(u8, t, INKLING_TEXT_TAG)) {
-        return .{ .reasoning_content = null, .content = inklingTrimContentTail(t[INKLING_TEXT_TAG.len..]) };
-    }
-    return null;
 }
 
 // ── Muse-Glimmer (muse_glimmer) channel format ──────────────────────────
@@ -2674,34 +2530,21 @@ fn k2ThinkOpenerAt(trimmed_tail: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Narrow form used by generation-side phase switches. A suffixed reasoning
-/// family (for example Hy3's `<think:opensource>`) has a different close token
-/// and must not be armed against Qwen's bare `</think>` boundary.
+/// Narrow form used by generation-side phase switches: armed against the bare
+/// `</think>` boundary only.
 pub fn promptTailOpensBareThink(tail: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
     return std.mem.endsWith(u8, trimmed, "<think>");
 }
 
 /// Which reasoning opener a rendered generation prompt ENDS with (trailing
-/// whitespace ignored): a bare `<think>`, a complete suffixed `<think:S>`, or
-/// nothing. Generation-side protocol resolution consumes this — the suffix is
-/// carried into the close delimiter (`</think:S>`) so a close with a different
-/// suffix is never treated as the boundary. The returned suffix borrows the
-/// caller's buffer.
-pub const ThinkTailClass = union(enum) {
-    bare,
-    suffixed: []const u8,
-    none,
-};
+/// whitespace ignored): a bare `<think>`, or nothing. Generation-side protocol
+/// resolution consumes this.
+pub const ThinkTailClass = enum { bare, none };
 
 pub fn promptThinkTailClass(tail: []const u8) ThinkTailClass {
     const trimmed_tail = std.mem.trimEnd(u8, tail, "\n\r\t ");
-    if (endsWithThinkOpenTag(trimmed_tail)) |l| {
-        const tag = trimmed_tail[trimmed_tail.len - l ..];
-        if (std.mem.eql(u8, tag, BARE_THINK_OPENER)) return .bare;
-        return .{ .suffixed = tag["<think:".len .. tag.len - 1] };
-    }
-    return .none;
+    return if (std.mem.endsWith(u8, trimmed_tail, BARE_THINK_OPENER)) .bare else .none;
 }
 
 /// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
@@ -2810,12 +2653,6 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
     // the `<|message|>` marker, minus harmony's `<|channel|>`; runs regardless
     // of the `thinking` flag because the headers need stripping either way.
     if (splitMuseChannels(text)) |split| return split;
-    // Inkling (inkling_mm_model) message channels: the model emits role-less
-    // MESSAGES — `<|content_thinking|>R<|end_message|>` then
-    // `<|message_model|><|content_text|>C<|end_message|>` — not a tag pair.
-    // Keyed on channel openers no other family emits; runs regardless of the
-    // `thinking` flag because the content marker needs stripping either way.
-    if (splitInklingChannels(text)) |split| return split;
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         const think_tag = "<|channel>thought\n";
@@ -2837,7 +2674,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
             .content = trimTrailingThinkClosers(stripTrailingThinkOpen(content)),
         };
     }
-    // Standard style: <think>...</think> (or the Hy3-suffixed variant)
+    // Standard style: <think>...</think>
     if (indexOfThinkCloseTag(text, 0)) |close| {
         const reasoning_start: usize = thinkOpenTagLenAt(text) orelse 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..close.pos], "\n ");
@@ -2895,8 +2732,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
 
 const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
 
-/// Earliest think/thought opener at or after `from` (either tag family;
-/// the think style covers both `<think>` and the Hy3-suffixed form).
+/// Earliest think/thought opener at or after `from` (either tag family).
 fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
     const chan = std.mem.indexOfPos(u8, text, from, "<|channel>thought");
     const think = indexOfThinkOpenTag(text, from);
@@ -3058,12 +2894,6 @@ pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
             if (std.mem.endsWith(u8, buf, tag[0..l])) return true;
         }
     }
-    // Hy3-suffixed opener mid-stream (`…<think:opensou`): everything from the
-    // last `<` must be a valid growing prefix of `<think:suffix>`.
-    if (std.mem.lastIndexOfScalar(u8, buf, '<')) |lt| {
-        const tail = buf[lt..];
-        if (tail.len > "<think".len and isPartialSuffixedTag(tail, "<think")) return true;
-    }
     return false;
 }
 
@@ -3101,13 +2931,6 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // Gemma 4 fully-formed canonical open.
     if (std.mem.indexOf(u8, buf, "<|tool_call") != null) return true;
 
-    // Inkling: the invoke marker is a SINGLE special token (arrives whole) —
-    // once present, everything from here on is call payload. Without this the
-    // NAME + full JSON streamed as visible content deltas (live 2026-07-30,
-    // first real pi session; the leak landed in pi's transcript and
-    // contaminated every later turn's history).
-    if (std.mem.indexOf(u8, buf, INKLING_INVOKE_TAG) != null) return true;
-
     // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
     if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
 
@@ -3118,14 +2941,6 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     if (museHeaderHoldsForTools(buf)) return true;
     // gpt_oss/harmony segment-header hold: same shape, `<|channel|>`-keyed.
     if (harmonyHeaderHoldsForTools(buf)) return true;
-
-    // Inkling NAME hold: with a message-boundary marker present (a family
-    // signal no other template emits), a segment that is still a bare
-    // identifier run may be the NAME directly before an invoke marker. Prose
-    // disambiguates within a token or two (space/punctuation); a call
-    // disambiguates at the invoke marker. An EMPTY segment never holds, so
-    // thinking splits stay prompt and marker-only flushes keep flowing.
-    if (inklingSegmentCouldBeToolName(buf)) return true;
 
     // `<tool…` family: walk every `<tool` occurrence, accept the first one
     // whose terminator is valid (mirrors parseToolCalls' acceptance rule).
@@ -3167,30 +2982,6 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         if (std.mem.endsWith(u8, buf, p)) return true;
     }
     return false;
-}
-
-/// Inkling streaming NAME hold: true when the text after the last message
-/// boundary (<|end_message|> / <|message_model|> / <|content_text|>) is a
-/// NON-EMPTY bare identifier run — the shape of a tool NAME right before its
-/// invoke marker. A thinking message never matches (no boundary marker →
-/// whole buffer, which carries `<|`); other families never emit these
-/// markers at all.
-fn inklingSegmentCouldBeToolName(buf: []const u8) bool {
-    var seg_start: usize = 0;
-    var saw_marker = false;
-    inline for (.{ INKLING_END_TAG, INKLING_MODEL_TAG, INKLING_TEXT_TAG }) |tag| {
-        if (std.mem.lastIndexOf(u8, buf, tag)) |p| {
-            saw_marker = true;
-            seg_start = @max(seg_start, p + tag.len);
-        }
-    }
-    if (!saw_marker) return false;
-    const seg = buf[seg_start..];
-    if (seg.len == 0 or seg.len > 64) return false;
-    for (seg) |c| {
-        if (!inklingIsNameChar(c)) return false;
-    }
-    return true;
 }
 
 /// Streaming-only: does a `<function …` opener anywhere in `buf` still hold?
@@ -3282,9 +3073,8 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
 /// front (the close scan stops early). ~0.3% of a 15 ms/token model, ~1% at
 /// 5 ms/token, and it GROWS with the thought.
 ///
-/// Exactness rests on one property of the marker grammar: `tagSuffixChar`
-/// excludes `<`, so every recognized marker contains exactly ONE `<`, at its
-/// start. A marker straddling the scanned/unscanned boundary must therefore
+/// Exactness rests on one property of the marker grammar: every recognized
+/// marker contains exactly ONE `<`, at its start. A marker straddling the scanned/unscanned boundary must therefore
 /// begin at the LAST `<` in the buffer — and if that `<` cannot still grow into
 /// a marker, nothing straddles the boundary at all. So the resume point is
 /// exact and bounded, with no overlap constant to get wrong.
@@ -3331,8 +3121,8 @@ pub const ThinkScan = struct {
         const lt = self.last_lt orelse return substr_from;
         if (lt >= upto) return substr_from;
         const tail = buf[lt..upto];
-        const growing = isPartialSuffixedTag(tail, "<think") or
-            isPartialSuffixedTag(tail, "</think") or
+        const growing = isPartialTag(tail, "<think>") or
+            isPartialTag(tail, "</think>") or
             (tail.len < "<|channel>thought".len and std.mem.startsWith(u8, "<|channel>thought", tail)) or
             (tail.len < "<channel|>".len and std.mem.startsWith(u8, "<channel|>", tail));
         return if (growing) @min(lt, substr_from) else substr_from;
@@ -3388,13 +3178,6 @@ pub fn streamThinkGateScan(
     // the <|channel|> marker tells them apart.
     if (harmonyStreamVerdict(buf)) |v| return v;
     if (museStreamVerdict(buf)) |v| return v;
-    {
-        const ihead = inklingStripMessageHead(buf);
-        if (std.mem.startsWith(u8, ihead, INKLING_TEXT_TAG)) return .flush_text;
-        if (std.mem.startsWith(u8, ihead, INKLING_THINKING_TAG)) {
-            return if (std.mem.indexOf(u8, ihead, INKLING_END_TAG) != null) .split_think else .hold_thinking;
-        }
-    }
     scan.advance(buf);
     const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
         scan.saw_channel_thought or
@@ -3413,17 +3196,6 @@ pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bo
     // Muse channels decide early — the recipient header is ordinary text and
     // must never flush unresolved.
     if (museStreamVerdict(buf)) |v| return v;
-    // Inkling channels decide early: every marker is a SINGLE special token,
-    // so a leading <|content_text|> is a whole marker (the flush path's
-    // marker-token skip keeps it out of visible deltas), and a thinking
-    // message holds until its <|end_message|> arrives.
-    {
-        const ihead = inklingStripMessageHead(buf);
-        if (std.mem.startsWith(u8, ihead, INKLING_TEXT_TAG)) return .flush_text;
-        if (std.mem.startsWith(u8, ihead, INKLING_THINKING_TAG)) {
-            return if (std.mem.indexOf(u8, ihead, INKLING_END_TAG) != null) .split_think else .hold_thinking;
-        }
-    }
     const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
         std.mem.indexOf(u8, buf, "<|channel>thought") != null or
         indexOfThinkOpenTag(buf, 0) != null or
@@ -3586,11 +3358,6 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // inner `<tool…>` blocks get a chance — this is what makes the outer
     // `<tool_calls>` wrapper case work.
     //
-    // Inkling (inkling_mm_model) is tried FIRST: its calls are MESSAGES —
-    // `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>` —
-    // whose distinctive marker no other family emits; the generic `<tool`
-    // scans never see the shape and other families never carry the marker.
-    try parseInklingToolCalls(allocator, text, &calls);
     // Muse-Glimmer ATEM (`<atem:invoke name="X">`): distinctive namespace
     // prefix no other family emits; the generic `<tool` scan never sees it
     // (the bytes after `<` are `atem`, not `tool`). Runs on the FULL text —
@@ -3610,12 +3377,11 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // distinctive marker no other family emits, and the generic `<tool` scan
     // never sees it (the opener is `<|tool_call_start|>`, not `<|tool_call>`).
     try parsePythonicToolCalls(allocator, effective_text, &calls);
-    // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST among the tag
-    // families: its wrapper (`<tool_calls:opensource>`) would also trip the
-    // generic `<tool` scan below, which would misread the non-JSON
+    // GLM's bare `<tool_call>NAME<arg_key>…` format is tried FIRST among the
+    // tag families: the generic `<tool` scan below would misread its non-JSON
     // arg_key/arg_value body. When it matched, the generic scans are skipped
     // but the shared safety net at the bottom still runs.
-    try parseHy3ToolCalls(allocator, effective_text, &calls);
+    try parseArgKeyToolCalls(allocator, effective_text, &calls);
     if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
@@ -3993,12 +3759,8 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
     }
 
-    // If no <tool_call> tags, try to find raw JSON tool call(s). Never on
-    // text carrying the Inkling invoke marker: that format OWNED the parse,
-    // and a call it deliberately skipped (no recoverable name) must not be
-    // resurrected from its payload bytes by the bare-JSON heuristic — the
-    // comment below says "no tag syntax anywhere", and there IS tag syntax.
-    if (calls.items.len == 0 and std.mem.indexOf(u8, text, INKLING_INVOKE_TAG) == null) {
+    // If no <tool_call> tags, try to find raw JSON tool call(s).
+    if (calls.items.len == 0) {
         var trimmed = std.mem.trim(u8, effective_text, " \t\n\r");
         if (std.mem.startsWith(u8, trimmed, "</tool_call>")) {
             trimmed = std.mem.trim(u8, trimmed["</tool_call>".len..], " \t\n\r");
@@ -5158,23 +4920,6 @@ fn parseXmlElementArgsJson(allocator: std.mem.Allocator, body: []const u8) ?[]u8
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{}) catch null;
 }
 
-/// Hy3 (Hunyuan 3) tag-format tool calls (chat_template.jinja spec):
-///   <tool_calls:SFX>
-///   <tool_call:SFX>NAME<tool_sep:SFX>
-///   <arg_key:SFX>KEY</arg_key:SFX>
-///   <arg_value:SFX>VALUE</arg_value:SFX> …
-///   </tool_call:SFX> …
-///   </tool_calls:SFX>
-/// Only the SUFFIXED form (`<tool_call:` …) is handled here — bare
-/// `<tool_call>` is Hermes JSON and stays with the generic scan. Values are
-/// kept as RAW STRINGS: the template `tojson`s non-string values on the way
-/// in, and the schema-driven coercion at the server chokepoint types them on
-/// the way back (types come from the SCHEMA, never the value's spelling).
-/// Args build through ObjectMap + Stringify — keys escaped, duplicates
-/// first-wins — per the tag-format-converter class rule. Truncation
-/// (max_tokens mid-call, the big-file-write class): a call whose name is
-/// delimited by `<tool_sep` recovers with its CLOSED key/value pairs only;
-/// partial values are never salvaged.
 /// Earliest position at/after `from` where any of `needles` occurs, or null.
 fn isBareToolName(body: []const u8) bool {
     const name = std.mem.trim(u8, body, " \t\n\r");
@@ -5196,29 +4941,20 @@ fn earliestIndexOfAny(text: []const u8, from: usize, needles: []const []const u8
 }
 
 /// A tool-name character per the identifier alphabet every template family's
-/// names draw from. The Inkling NAME is glued directly to the invoke marker,
-/// so anything outside this set (a channel marker's `>`, a payload's `}`,
-/// prose punctuation) terminates the name run.
-fn inklingIsNameChar(c: u8) bool {
+/// names draw from. Anything outside this set (a channel marker's `>`, a
+/// payload's `}`, prose punctuation) terminates a name run.
+fn toolNameChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
 }
 
-/// The trailing identifier run ending at `end` (exclusive). Live 2026-07-30:
-/// the boundary-based prefix scan swallowed the `<|content_text|>` marker
-/// (name `<|content_text|>bash`), and a dropped `<|end_message|>` between
-/// calls produced `}}write` — both resolve to the bare NAME here.
-fn inklingTrailingNameRun(text: []const u8, end: usize) []const u8 {
+/// The trailing identifier run ending at `end` (exclusive): a name that
+/// echoed a channel marker (`<|content_text|>bash`) resolves to the bare NAME.
+fn trailingNameRun(text: []const u8, end: usize) []const u8 {
     var start = end;
-    while (start > 0 and inklingIsNameChar(text[start - 1])) start -= 1;
+    while (start > 0 and toolNameChar(text[start - 1])) start -= 1;
     return text[start..end];
 }
 
-/// Inkling tool calls: `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>`
-/// per call (one message each; parallel calls are consecutive messages). The
-/// payload's "name" is authoritative (the prefix NAME is the same string in
-/// well-formed output, and is the fallback when the payload is truncated).
-/// Truncation salvage per the hard rule: recover NAME + `{}` — never partial
-/// argument values.
 // DeepSeek-V4 native DSML markers. `｜` is the FULLWIDTH vertical bar
 // (U+FF5C, 3 bytes) — the dsml_token "｜DSML｜" appears in no other family.
 // V4.1 puts a space before every tag name (`<｜DSML｜ invoke`); both spellings parse.
@@ -5382,81 +5118,6 @@ fn dsmlValueIsJson(allocator: std.mem.Allocator, value: []const u8) bool {
     return true;
 }
 
-fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, INKLING_INVOKE_TAG)) |inv| {
-        const prefix_name = inklingTrailingNameRun(text, inv);
-
-        // Body = the balanced JSON object right after the marker (string-aware
-        // brace scan). The next <|end_message|> is NOT a reliable terminator:
-        // the model drops it between back-to-back calls (live 2026-07-30,
-        // `{…}}write<|content_invoke_tool_json|>{…}`), and an end-tag-bounded
-        // body then swallows the following call whole. No balance by end of
-        // text = truncation → the NAME + `{}` salvage below.
-        const body_start = inv + INKLING_INVOKE_TAG.len;
-        var body: []const u8 = "";
-        const after = std.mem.trimStart(u8, text[body_start..], "\n ");
-        if (std.mem.startsWith(u8, after, "{")) {
-            if (balancedJsonObject(after)) |obj| {
-                body = obj;
-                pos = (body_start + (text.len - body_start - after.len)) + obj.len;
-            } else {
-                pos = text.len; // truncated object — nothing further to scan
-            }
-        } else {
-            // No object after the marker at all: keep the old end-tag-bounded
-            // read so a non-JSON payload still gets a parse attempt.
-            const body_end = std.mem.indexOfPos(u8, text, body_start, INKLING_END_TAG) orelse text.len;
-            body = std.mem.trim(u8, text[body_start..body_end], "\n ");
-            pos = body_end;
-        }
-
-        var name: []const u8 = prefix_name;
-        var args_json: ?[]const u8 = null; // allocated when set
-        if (std.json.parseFromSlice(std.json.Value, allocator, body, .{})) |parsed| {
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                if (parsed.value.object.get("name")) |nv| {
-                    if (nv == .string and nv.string.len > 0) {
-                        name = nv.string;
-                        // Marker-echo repair: pi's "Tool <|content_text|>bash
-                        // not found" reply taught the model to copy the garbage
-                        // name INTO its payloads (live 2026-07-30). No real
-                        // tool name contains `<|` — keep the trailing
-                        // identifier run; empty → fall back to the prefix name.
-                        if (std.mem.indexOf(u8, name, "<|") != null) {
-                            name = inklingTrailingNameRun(name, name.len);
-                            if (name.len == 0) name = prefix_name;
-                        }
-                    }
-                }
-                if (parsed.value.object.get("args")) |av| {
-                    if (av == .object) {
-                        // Re-serialize through Stringify: escaping + key dedup
-                        // by construction (the tag-converter invariant).
-                        args_json = std.json.Stringify.valueAlloc(allocator, av, .{}) catch null;
-                    }
-                }
-                // `name` borrows from `parsed` — dupe before deinit.
-                name = try allocator.dupe(u8, name);
-            } else {
-                name = try allocator.dupe(u8, name);
-            }
-        } else |_| {
-            // Truncated / mangled payload: NAME + {} (never ship fragments).
-            name = try allocator.dupe(u8, name);
-        }
-        errdefer allocator.free(name);
-        if (name.len == 0) {
-            allocator.free(name);
-            if (args_json) |a| allocator.free(a);
-            continue;
-        }
-        const arguments = args_json orelse try allocator.dupe(u8, "{}");
-        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
-    }
-}
-
 // ── ATEM tool calls (Muse-Glimmer / `muse_glimmer`) ────────────────────
 //
 //   <atem:function_calls>
@@ -5563,10 +5224,10 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
             continue;
         };
         // No real tool name carries a channel marker (corpus invariant —
-        // the inkling marker-echo class).
+        // the marker-echo class).
         var name_slice = raw_name;
         if (std.mem.indexOf(u8, name_slice, "<|") != null) {
-            name_slice = inklingTrailingNameRun(name_slice, name_slice.len);
+            name_slice = trailingNameRun(name_slice, name_slice.len);
         }
         if (name_slice.len == 0) {
             pos = after_tag;
@@ -5852,72 +5513,48 @@ fn parsePythonicToolCalls(allocator: std.mem.Allocator, text: []const u8, calls:
     }
 }
 
-fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+/// GLM's tag-format tool calls: a BARE `<tool_call>` opener, the NAME, then
+/// `<arg_key>K</arg_key><arg_value>V</arg_value>` pairs:
+///   <tool_call>NAME
+///   <arg_key>KEY</arg_key>
+///   <arg_value>VALUE</arg_value> …
+///   </tool_call> …
+/// Values are kept as RAW STRINGS: the template `tojson`s non-string values on
+/// the way in, and the schema-driven coercion at the server chokepoint types
+/// them on the way back (types come from the SCHEMA, never the value's
+/// spelling). Args build through ObjectMap + Stringify — keys escaped,
+/// duplicates first-wins — per the tag-format-converter class rule. Truncation
+/// (max_tokens mid-call, the big-file-write class) recovers with the CLOSED
+/// key/value pairs only; partial values are never salvaged.
+fn parseArgKeyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, "<tool_call")) |p| {
+    while (std.mem.indexOfPos(u8, text, pos, "<tool_call>")) |p| {
         const after_base = p + "<tool_call".len;
-        var name_start: usize = undefined;
-        if (after_base < text.len and text[after_base] == ':') {
-            // Canonical singular per-call opener `<tool_call:sfx>`.
-            const open_len = suffixedTagLenAt(text[p..], "<tool_call") orelse {
-                pos = after_base;
-                continue;
-            };
-            name_start = p + open_len;
-        } else if (std.mem.startsWith(u8, text[p..], "<tool_calls:")) {
-            // Suffixed plural WRAPPER `<tool_calls:sfx>` (hy3 only — the BARE
-            // DSV4/generic `<tool_calls>` wrapper is a different format and must
-            // fall through to its own parser). Normally an inner singular
-            // `<tool_call:sfx>` opener follows — defer to it (the next loop
-            // iteration parses that). A weak model (Hy3-REAP62, live 2026-07-16
-            // raw capture) DROPS the singular opener and jumps straight to the
-            // NAME, leaking the whole (otherwise well-formed) call; recover by
-            // treating the wrapper's end as the opener. Same weak-model
-            // delimiter-drop class as the <tool_sep> drop below, one delimiter over.
-            const wrap_len = suffixedTagLenAt(text[p..], "<tool_calls") orelse {
-                pos = after_base;
-                continue;
-            };
-            var probe = p + wrap_len;
-            while (probe < text.len and std.ascii.isWhitespace(text[probe])) probe += 1;
-            const inner_singular = std.mem.startsWith(u8, text[probe..], "<tool_call") and
-                probe + "<tool_call".len < text.len and text[probe + "<tool_call".len] == ':';
-            if (inner_singular) {
-                pos = p + wrap_len;
-                continue;
-            }
-            name_start = p + wrap_len;
-        } else if (after_base < text.len and text[after_base] == '>' and blk: {
-            // Bare `<tool_call>` has two sub-formats sharing this opener:
-            //   • Hermes JSON `<tool_call>{…}` / function-tag `<tool_call><function=…>`
-            //     → the generic scan reads those; fall through.
-            //   • GLM (Laguna, tokenizer tool_parser_type "glm47"):
-            //     `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`
-            //     — bare opener, NAME, then arg_key/arg_value pairs, NO plural
-            //     wrapper. Route HERE only when an `<arg_key` precedes this
-            //     call's close (the unambiguous GLM signal a JSON/function body
-            //     never has), so the Hermes path is untouched.
-            const body = after_base + 1;
-            const this_close = std.mem.indexOfPos(u8, text, body, "</tool_call") orelse text.len;
-            const ak_at = std.mem.indexOfPos(u8, text, body, "<arg_key") orelse text.len;
-            // A parameterless GLM call has no <arg_key>: its whole body is
-            // the bare NAME, a shape neither the JSON nor `<function=` arms read.
-            break :blk ak_at < this_close or isBareToolName(text[body..this_close]);
-        }) {
-            name_start = after_base + 1;
-        } else {
-            // Bare `<tool_call>` Hermes JSON / function-tag — not this format.
+        // Bare `<tool_call>` has two sub-formats sharing this opener:
+        //   • Hermes JSON `<tool_call>{…}` / function-tag `<tool_call><function=…>`
+        //     → the generic scan reads those; fall through.
+        //   • GLM: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`
+        //     — bare opener, NAME, then arg_key/arg_value pairs. Route HERE only
+        //     when an `<arg_key` precedes this call's close (the unambiguous GLM
+        //     signal a JSON/function body never has), so the Hermes path is
+        //     untouched.
+        const body = after_base + 1;
+        const this_close = std.mem.indexOfPos(u8, text, body, "</tool_call") orelse text.len;
+        const ak_probe = std.mem.indexOfPos(u8, text, body, "<arg_key") orelse text.len;
+        // A parameterless GLM call has no <arg_key>: its whole body is
+        // the bare NAME, a shape neither the JSON nor `<function=` arms read.
+        if (!(ak_probe < this_close or isBareToolName(text[body..this_close]))) {
             pos = after_base;
             continue;
         }
+        const name_start = body;
 
-        // NAME runs to the first structural marker after the opener. Canonically
-        // that's <tool_sep:sfx>; a mangled call (weak model dropped <tool_sep> —
-        // live 2026-07-16, Hy3-REAP62 via pi) instead closes the name with
-        // </arg_value>/<arg_key>/</tool_call>, so accept any of them. No marker
-        // at all → the cut happened inside the name; nothing to recover.
+        // NAME runs to the first structural marker after the opener. A mangled
+        // call (weak model) closes the name with </arg_value> instead of
+        // newline/<arg_key>, so accept any of them. No marker at all → the cut
+        // happened inside the name; nothing to recover.
         const name_end = earliestIndexOfAny(text, name_start, &.{
-            "<tool_sep", "<arg_key", "<arg_value", "</tool_call", "</arg_key", "</arg_value",
+            "<arg_key", "<arg_value", "</tool_call", "</arg_key", "</arg_value",
         }) orelse {
             pos = name_start;
             continue;
@@ -5931,40 +5568,32 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
         var args_map: std.json.ObjectMap = .empty;
         defer args_map.deinit(allocator);
 
-        // Consume a valid <tool_sep:sfx> if present; a mangled call that dropped
-        // it (weak model — live REAP capture) starts the arg scan right at the
-        // name's (wrong) close tag instead.
-        var i: usize = name_end;
-        if (suffixedTagLenAt(text[name_end..], "<tool_sep")) |sep_len| {
-            i = name_end + sep_len;
-        }
         // Parse <arg_key>/<arg_value> pairs, bounded by this call's </tool_call>.
         // SCAN to the next <arg_key> (rather than requiring it right here) so a
         // stray name-close tag between the name and the first key is skipped, and
-        // match the KEY block's close TOLERANTLY (</arg_key> OR </arg_value>) —
-        // REAP closes it with </arg_value> (live 2026-07-16 raw capture: bash /
-        // command / "ls -la"). The well-formed path is unchanged: its <tool_sep>
-        // is consumed above, <arg_key> is found immediately, and </arg_key> is the
-        // earliest close.
+        // match the KEY block's close TOLERANTLY (</arg_key> OR </arg_value>), as
+        // a weak model closes it with </arg_value>. The well-formed path is
+        // unchanged: </arg_key> is the earliest close.
+        var i: usize = name_end;
         const call_end = std.mem.indexOfPos(u8, text, i, "</tool_call") orelse text.len;
         while (true) {
             const ak_at = std.mem.indexOfPos(u8, text, i, "<arg_key") orelse break;
             if (ak_at >= call_end) break;
-            const ak_len = suffixedTagLenAt(text[ak_at..], "<arg_key") orelse {
+            const ak_len = tagLenAt(text[ak_at..], "<arg_key") orelse {
                 i = ak_at + "<arg_key".len;
                 continue;
             };
             const key_start = ak_at + ak_len;
             const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
-            const ak_close_len = suffixedTagLenAt(text[ak_close..], "</arg_key") orelse
-                suffixedTagLenAt(text[ak_close..], "</arg_value") orelse break;
+            const ak_close_len = tagLenAt(text[ak_close..], "</arg_key") orelse
+                tagLenAt(text[ak_close..], "</arg_value") orelse break;
             const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
             i = ak_close + ak_close_len;
             while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
-            const av_len = suffixedTagLenAt(text[i..], "<arg_value") orelse break;
+            const av_len = tagLenAt(text[i..], "<arg_value") orelse break;
             const val_start = i + av_len;
             const av_close = std.mem.indexOfPos(u8, text, val_start, "</arg_value") orelse break;
-            const av_close_len = suffixedTagLenAt(text[av_close..], "</arg_value") orelse break;
+            const av_close_len = tagLenAt(text[av_close..], "</arg_value") orelse break;
             const value = text[val_start..av_close];
             i = av_close + av_close_len;
             if (key.len > 0 and args_map.getEntry(key) == null) {
@@ -5979,7 +5608,7 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
         try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
 
         if (std.mem.indexOfPos(u8, text, i, "</tool_call")) |cl| {
-            const cl_len = suffixedTagLenAt(text[cl..], "</tool_call") orelse 0;
+            const cl_len = tagLenAt(text[cl..], "</tool_call") orelse 0;
             pos = if (cl_len > 0) cl + cl_len else cl + "</tool_call".len;
         } else {
             pos = i;
@@ -7189,7 +6818,7 @@ fn stripHermesValueFraming(raw: []const u8) []const u8 {
 /// which the equals-sign form never produces (its char right after
 /// `<function` is always `=`), so the two can never false-fire on each
 /// other. Duplicate `<param name="K">` — first occurrence wins, mirroring
-/// `parseHermesToolCall`'s `<parameter=>` dedup and `parseHy3ToolCalls`'s
+/// `parseHermesToolCall`'s `<parameter=>` dedup and `parseArgKeyToolCalls`'s
 /// `<arg_key>` dedup (both exist because std.json rejects duplicate object
 /// keys). An unrecognized function name or an undeclared parameter is never
 /// rejected here — schema validation is centralized downstream
@@ -7198,7 +6827,7 @@ fn stripHermesValueFraming(raw: []const u8) []const u8 {
 /// dialect. Truncation (EOS or max_tokens mid-call): when no `</function>`
 /// close is found, the param scan is bounded by end-of-text instead — any
 /// COMPLETE `<param>…</param>` pairs before the cut still recover (mirrors
-/// `parseHy3ToolCalls`'s `call_end` fallback); a partial trailing value is
+/// `parseArgKeyToolCalls`'s `call_end` fallback); a partial trailing value is
 /// never salvaged.
 fn parseMiniCpm5ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     var pos: usize = 0;
@@ -7915,193 +7544,13 @@ test "promptTailOpensThink detects template-injected opener" {
     try testing.expect(!promptTailOpensThink(""));
 }
 
-test "promptThinkTailClass resolves bare, suffixed, and plain tails" {
+test "promptThinkTailClass resolves bare and plain tails" {
     try testing.expectEqual(ThinkTailClass.bare, promptThinkTailClass("<|im_start|>assistant\n<think>\n"));
-    const s = promptThinkTailClass("<think:opensource>");
-    try testing.expectEqualStrings("opensource", s.suffixed);
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<think:opensource>"));
     try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|im_start|>assistant\n"));
     try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|start|>assistant"));
     try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass(""));
-    // A PARTIAL opener is not an opener.
-    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<think:open"));
-}
-
-test "splitThinkBlock: Inkling message channels (thinking + text + truncation)" {
-    // Real REAP25 captures (2026-07-30): the model emits role-less MESSAGES —
-    // a thinking message, then a fresh <|message_model|> text message — not a
-    // tag pair. Channel markers must never leak into content or reasoning.
-    {
-        const out = "<|content_thinking|>Shorter wavelengths scatter more.<|end_message|><|message_model|><|content_text|>Rayleigh scattering.<|end_message|>";
-        const split = splitThinkBlock(out, true, false);
-        try testing.expectEqualStrings("Shorter wavelengths scatter more.", split.reasoning_content.?);
-        try testing.expectEqualStrings("Rayleigh scattering.", split.content);
-    }
-    // Thinking-off shape (live capture: chat 2+2)
-    {
-        const out = "<|content_text|>4<|end_message|>";
-        const split = splitThinkBlock(out, false, false);
-        try testing.expect(split.reasoning_content == null);
-        try testing.expectEqualStrings("4", split.content);
-    }
-    // Length-truncated mid-thought: reasoning, never content
-    {
-        const out = "<|content_thinking|>The user is asking for";
-        const split = splitThinkBlock(out, true, false);
-        try testing.expectEqualStrings("The user is asking for", split.reasoning_content.?);
-        try testing.expectEqualStrings("", split.content);
-    }
-    // Raw-completion shape: leading <|end_message|><|message_model|> before
-    // the first channel marker (no template context).
-    {
-        const out = "<|end_message|><|message_model|><|content_thinking|>Standard implementation.<|end_message|><|message_model|><|content_text|>def fib(n): ...<|end_message|>";
-        const split = splitThinkBlock(out, true, false);
-        try testing.expectEqualStrings("Standard implementation.", split.reasoning_content.?);
-        try testing.expectEqualStrings("def fib(n): ...", split.content);
-    }
-}
-
-test "parseToolCalls: Inkling invoke_tool_json family" {
-    const allocator = testing.allocator;
-    // Canonical shape from the chat template: NAME<|content_invoke_tool_json|>
-    // {"name":...,"args":{...}}<|end_message|>, optionally after a thinking message.
-    {
-        const text = "<|content_thinking|>Need the time.<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{\"timezone\":\"UTC\"}}<|end_message|>";
-        const calls = (try parseToolCalls(allocator, text)).?;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        try testing.expectEqual(@as(usize, 1), calls.len);
-        try testing.expectEqualStrings("get_time", calls[0].name);
-        try testing.expect(!calls[0].inferred);
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-        defer parsed.deinit();
-        try testing.expectEqualStrings("UTC", parsed.value.object.get("timezone").?.string);
-    }
-    // Two calls in one turn (parallel) — each its own message.
-    {
-        const text = "<|message_model|>alpha<|content_invoke_tool_json|>{\"name\":\"alpha\",\"args\":{\"a\":1}}<|end_message|><|message_model|>beta<|content_invoke_tool_json|>{\"name\":\"beta\",\"args\":{}}<|end_message|>";
-        const calls = (try parseToolCalls(allocator, text)).?;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        try testing.expectEqual(@as(usize, 2), calls.len);
-        try testing.expectEqualStrings("alpha", calls[0].name);
-        try testing.expectEqualStrings("beta", calls[1].name);
-    }
-    // Truncated mid-args: salvage NAME + {} — never partial values.
-    {
-        const text = "<|message_model|>write_file<|content_invoke_tool_json|>{\"name\":\"write_file\",\"args\":{\"path\":\"/tmp/x\",\"content\":\"half-writ";
-        const calls = (try parseToolCalls(allocator, text)).?;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        try testing.expectEqual(@as(usize, 1), calls.len);
-        try testing.expectEqualStrings("write_file", calls[0].name);
-        try testing.expectEqualStrings("{}", calls[0].arguments);
-    }
-}
-
-test "parseToolCalls: Inkling name is the trailing identifier run" {
-    const allocator = testing.allocator;
-    // Live 2026-07-30 pi session: the tool message opens with the
-    // <|content_text|> marker glued to the NAME. When the payload is
-    // truncated, the salvage name must be the bare identifier — never
-    // `<|content_text|>bash` (pi's "Tool <|content_text|>bash not found"
-    // reply taught the model to echo that garbage name back).
-    {
-        const text = "<|message_model|><|content_text|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls";
-        const calls = (try parseToolCalls(allocator, text)).?;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        try testing.expectEqual(@as(usize, 1), calls.len);
-        try testing.expectEqualStrings("bash", calls[0].name);
-        try testing.expectEqualStrings("{}", calls[0].arguments);
-    }
-    // Marker echoed INTO the payload's "name" (the self-reinforcing loop's
-    // second stage): sanitize to the trailing identifier run.
-    {
-        const text = "<|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"<|content_text|>bash\",\"args\":{}}<|end_message|>";
-        const calls = (try parseToolCalls(allocator, text)).?;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        try testing.expectEqual(@as(usize, 1), calls.len);
-        try testing.expectEqualStrings("bash", calls[0].name);
-    }
-    // Payload name that is ONLY a marker, no prefix name either → the call
-    // has no recoverable name and is skipped.
-    {
-        const text = "<|message_model|><|content_invoke_tool_json|>{\"name\":\"<|content_text|>\",\"args\":{}}<|end_message|>";
-        const calls = try parseToolCalls(allocator, text);
-        try testing.expect(calls == null);
-    }
-}
-
-test "parseToolCalls: Inkling back-to-back invokes without <|end_message|>" {
-    const allocator = testing.allocator;
-    // Live 2026-07-30: the model drops the <|end_message|> between two calls
-    // (`{…}}write<|content_invoke_tool_json|>{…}`). Body extraction must stop
-    // at the balanced object — an end-tag-bounded body swallows call 2 whole.
-    const text = "<|message_model|><|content_text|>write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"a.js\",\"content\":\"x\"}}write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"b.js\",\"content\":\"y\"}}<|end_message|>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 2), calls.len);
-    try testing.expectEqualStrings("write", calls[0].name);
-    try testing.expectEqualStrings("write", calls[1].name);
-    const p0 = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer p0.deinit();
-    try testing.expectEqualStrings("a.js", p0.value.object.get("path").?.string);
-    const p1 = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
-    defer p1.deinit();
-    try testing.expectEqualStrings("b.js", p1.value.object.get("path").?.string);
-}
-
-test "streamShouldBufferForTools: Inkling invoke marker and NAME hold" {
-    // The invoke marker is a single special token — once present, everything
-    // from here is call payload and must never flush as content.
-    try testing.expect(streamShouldBufferForTools("<|message_model|>bash<|content_invoke_tool_json|>"));
-    try testing.expect(streamShouldBufferForTools("<|content_invoke_tool_json|>{\"name\":\"bash\""));
-    // NAME hold: an Inkling boundary marker plus a bare identifier segment
-    // could be the NAME right before the invoke marker — hold until
-    // disambiguated (prose adds a space/punct within a token or two).
-    try testing.expect(streamShouldBufferForTools("<|message_model|><|content_text|>bash"));
-    try testing.expect(streamShouldBufferForTools("<|message_model|>get_time"));
-    // Prose disambiguates → flows.
-    try testing.expect(!streamShouldBufferForTools("<|content_text|>The answer"));
-    // Completed message (empty segment after the end marker) → flows.
-    try testing.expect(!streamShouldBufferForTools("<|content_text|>4<|end_message|>"));
-    // A thinking message never trips the NAME hold (the think gate owns it).
-    try testing.expect(!streamShouldBufferForTools("<|content_thinking|>Need the time"));
-    // No Inkling markers → other families completely unaffected.
-    try testing.expect(!streamShouldBufferForTools("bash"));
-    try testing.expect(!streamShouldBufferForTools("plain prose mentioning get_time here"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<think"));
 }
 
 test "parseToolCalls JSON format" {
@@ -9545,9 +8994,7 @@ test "trimLeakedToolMarkup cuts at the first unparsed tool-call opener" {
     try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"x\">"));
     try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<|tool_call>{}"));
     try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<tool_call>{}"));
-    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<tool_calls:opensource>"));
-    // Inkling's NAME sits before the marker, so it goes with the cut.
-    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done. shell<|content_invoke_tool_json|>{}"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<tool_calls>"));
 
     // A marker with nothing before it leaves nothing behind — a bare marker
     // is not an answer (live: DSV4 answered a question and then emitted a
@@ -10252,140 +9699,19 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
     try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
 }
 
-test "renderChatTemplate: Hy3 constructs — str.format tokens, arguments.items(), tojson(ensure_ascii=False)" {
-    // Hy3's chat_template.jinja builds EVERY special token via
-    // `'<think{}>'.format(HYTK)` on line 1 — an engine without str.format
-    // throws there, and renderChatTemplate silently downgrades to
-    // fallbackFormatChat (the wrong-family prompt-format class). This pins the
-    // three constructs the template leans on: positional {} format, dict
-    // .items() iteration over tool-call arguments (requires args serialized as
-    // an OBJECT), and `| tojson(ensure_ascii=False)` on non-string values.
-    const allocator = testing.allocator;
-    const tpl =
-        \\{%- set HYTK = ':opensource' %}
-        \\{%- set eos_token = '<eos{}>'.format(HYTK) %}
-        \\{%- set user_token = '<user{}>'.format(HYTK) %}
-        \\{%- for message in messages -%}
-        \\{%- if message['role'] == 'user' -%}{{ user_token }}{{ message['content'] }}
-        \\{%- elif message['role'] == 'assistant' -%}<asst>{{ message['content'] }}
-        \\{%- if message['tool_calls'] %}{% for tool in message['tool_calls'] %}{%- set arguments = tool['function']['arguments'] %}<call>{{ tool['function']['name'] }}{% for key, value in arguments.items() %}<k>{{ key }}</k>{% if value is not string %}{%- set value = value | tojson(ensure_ascii=False) %}{% endif %}<v>{{ value }}</v>{% endfor %}</call>{% endfor %}{{ eos_token }}{% endif %}
-        \\{%- endif -%}
-        \\{%- endfor -%}
-        \\{# {{ tools }} #}
-    ;
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "write_file", .arguments = "{\"path\": \"a.txt\", \"count\": 2}" }};
-    const messages = [_]Message{
-        .{ .role = "user", .content = "write it" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc },
-    };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
-    defer allocator.free(rendered);
-
-    try testing.expect(std.mem.indexOf(u8, rendered, "<user:opensource>write it") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "<eos:opensource>") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "<call>write_file") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "<k>path</k><v>a.txt</v>") != null);
-    // Non-string value rendered through tojson.
-    try testing.expect(std.mem.indexOf(u8, rendered, "<k>count</k><v>2</v>") != null);
-}
-
-test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallback (hermetic)" {
-    // src/fixtures/inkling_chat_template.jinja is the verbatim template from
-    // pipenetwork/Inkling-Small-MLX-* (Thinking Machines Inkling Small). It
-    // exercises jinja features no other family does — namespace(), dict/tuple
-    // literals, tojson(sort_keys=true, separators=(",", ":")), `is mapping` —
-    // and it RAISES on any reasoning_effort string it doesn't know (including
-    // hy3's "no_think") and on tool-call arguments passed as a JSON STRING. A
-    // raise = silent fallbackFormatChat = wrong-family tags, so the render is
-    // pinned hermetically for both thinking arms.
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/inkling_chat_template.jinja");
-
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    const tools_json =
-        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
-    ;
-    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
-    const messages = [_]Message{
-        .{ .role = "system", .content = "You are helpful." },
-        .{ .role = "user", .content = "What time is it?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc },
-        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
-    };
-
-    // Thinking ON: effort header 0.9 (our "high"), tool declare, tool call as
-    // {"name":...,"args":{...}} with args as an OBJECT (sorted, compact), tool
-    // result named via tool_call_id lookup, generation prompt at the tail.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|>tool_declare<|content_xml|>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "\"name\":\"get_time\"") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_user|><|content_text|>What time is it?<|end_message|>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{\"timezone\":\"UTC\"}}<|end_message|>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|content_model_end_sampling|>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_tool|>get_time<|content_text|>12:34 UTC<|end_message|>") != null);
-        try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
-        // No fallback-format markers (a raise inside the template silently falls back).
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
-    }
-    // Thinking OFF: the effort header must be the template's "0" form — hy3's
-    // "no_think" is UNKNOWN to this template and raises.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "Thinking effort level: 0<|end_message|>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
-    }
-    // History reasoning round-trip (laguna class): this template PERSISTS
-    // assistant reasoning as its own <|content_thinking|> message. If the
-    // field ever stops reaching the render, prior turns silently lose their
-    // thinking blocks while turn 1 still works.
-    {
-        const hist = [_]Message{
-            .{ .role = "user", .content = "Why is the sky blue?" },
-            .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
-            .{ .role = "user", .content = "And sunsets?" },
-        };
-        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_text|>Rayleigh scattering.<|end_message|>") != null);
-        try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
-    }
-}
-
 test "templateConsumesEffort: the real templates that READ the effort word" {
-    // The three families whose templates act on `reasoning_effort`. For these
+    // The families whose templates act on `reasoning_effort`. For these
     // the word is the lever and an effort-derived TOKEN budget on top is pure
     // truncation (see the fn doc).
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_chat_template.jinja")));
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_27b_chat_template.jinja")));
-    try testing.expect(templateConsumesEffort(@embedFile("fixtures/dsv4_chat_template.jinja")));
-    try testing.expect(templateConsumesEffort(@embedFile("fixtures/inkling_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/dsv41_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/glm53_chat_template.jinja")));
 
     // Muse reads `reasoning_strength` — the near-miss. Matching it would strip
     // the budget from a family the word never reaches, silently uncapping it.
     try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
-    // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
+    // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, Ling,
     // Nemotron, llama, mistral) reads neither: thinking is a bool there.
     try testing.expect(!templateConsumesEffort(
         "{%- if enable_thinking %}<think>\n{%- endif %}"));
@@ -10952,32 +10278,11 @@ test "serializeExtraContext with thinking disabled" {
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
 }
 
-test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {
-    // medium deliberately maps LOW: DeepSeek's "high" text is a verbose
-    // "absolute maximum, no shortcuts" preamble and the reference default is
-    // low — nothing verbose is injected unless the client explicitly asked.
-    try testing.expectEqualStrings("low", dsv4EffortFor(null));
-    try testing.expectEqualStrings("low", dsv4EffortFor("none"));
-    try testing.expectEqualStrings("low", dsv4EffortFor("minimal"));
-    try testing.expectEqualStrings("low", dsv4EffortFor("low"));
-    try testing.expectEqualStrings("low", dsv4EffortFor("medium"));
-    try testing.expectEqualStrings("low", dsv4EffortFor("banana")); // unknown → default
-    try testing.expectEqualStrings("high", dsv4EffortFor("high"));
-    try testing.expectEqualStrings("max", dsv4EffortFor("xhigh"));
-    try testing.expectEqualStrings("max", dsv4EffortFor("max"));
-    // `ultra` is an EXPLICIT ask for the top tier — the unknown-string fallback would invert it into low.
-    try testing.expectEqualStrings("max", dsv4EffortFor("ultra"));
-}
-
-test "serializeExtraContext: dsv4 gets the reference's default reasoning effort" {
-    // DeepSeek-V4-0731 turned `reasoning_effort` into low|high|max where
-    // high/max PREPEND a verbose preamble to the conversation and low adds
-    // nothing (the reference default). The hy3 convention of sending "high"
-    // for every thinking-enabled request would silently attach that preamble
-    // to every dsv4 thinking turn; the family is sniffed by `thinking_mode`,
-    // which only this template reads.
+test "serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto low|high|max" {
+    // The family is sniffed by `thinking_mode`, which only this template
+    // reads; `thinking_mode` still carries the on/off switch.
     const allocator = testing.allocator;
-    var dsv4 = ChatConfig{
+    var dsv41 = ChatConfig{
         .chat_template = "{%- set mode = thinking_mode|default('chat') -%}",
         .bos_token = null,
         .eos_token = null,
@@ -10985,31 +10290,27 @@ test "serializeExtraContext: dsv4 gets the reference's default reasoning effort"
         .allocator = allocator,
     };
     for ([_]bool{ true, false }) |thinking| {
-        const r = try serializeExtraContext(allocator, &dsv4, thinking, null);
+        const r = try serializeExtraContext(allocator, &dsv41, thinking, null);
         defer allocator.free(r);
-        try testing.expect(std.mem.indexOf(u8, r, "\"reasoning_effort\":\"low\"") != null);
-        // thinking_mode still carries the on/off switch for this family.
+        try testing.expect(std.mem.indexOf(u8, r, "\"reasoning_effort\":\"high\"") != null);
         try testing.expect(std.mem.indexOf(u8, r, if (thinking)
             "\"thinking_mode\":\"thinking\""
         else
             "\"thinking_mode\":\"chat\"") != null);
     }
-    // A client-supplied effort string reaches the template MAPPED through
-    // `dsv4EffortFor` — high/max opt into the verbose preamble, medium stays
-    // at the reference default (never silently verbose).
     const mapped_cases = [_]struct { in: ?[]const u8, out: []const u8 }{
         .{ .in = "high", .out = "\"reasoning_effort\":\"high\"" },
         .{ .in = "max", .out = "\"reasoning_effort\":\"max\"" },
         .{ .in = "xhigh", .out = "\"reasoning_effort\":\"max\"" },
-        .{ .in = "medium", .out = "\"reasoning_effort\":\"low\"" },
+        .{ .in = "low", .out = "\"reasoning_effort\":\"low\"" },
     };
     for (mapped_cases) |case| {
-        const r = try serializeExtraContext(allocator, &dsv4, true, case.in);
+        const r = try serializeExtraContext(allocator, &dsv41, true, case.in);
         defer allocator.free(r);
         try testing.expect(std.mem.indexOf(u8, r, case.out) != null);
     }
 
-    // Other families are untouched: hy3-style keeps high/no_think.
+    // Other families are untouched: high/no_think.
     var other = ChatConfig{
         .chat_template = "{{ reasoning_effort }}",
         .bos_token = null,
@@ -11076,14 +10377,14 @@ test "serializeMessagesJson carries assistant reasoning_content" {
     try testing.expect(parsed.value.array.items[0].object.get("reasoning_content") == null);
 }
 
-test "assistant history reasoning_content reaches a template that reads it (laguna round-trip)" {
-    // laguna's chat_template.jinja persists reasoning across turns: history
+test "assistant history reasoning_content reaches a template that reads it (round-trip)" {
+    // A template that persists reasoning across turns reads history
     // assistant messages render <think>{message.reasoning|reasoning_content}</think>.
     // When the parse layer drops the field, every history turn renders the
     // empty <think></think> nothink signature and the model stops thinking
-    // from turn 2 of a session (live 2026-07-29, pi agent on Laguna XS: one
+    // from turn 2 of a session (live 2026-07-29, pi agent: one
     // reasoning delta on the 2-msg turn, zero across the next 13k chunks).
-    // Template fragment mirrors laguna's assistant-history branch.
+    // Template fragment mirrors an assistant-history branch that reads it.
     const allocator = testing.allocator;
     var config = ChatConfig{
         .chat_template = "{%- for message in messages -%}" ++
@@ -11883,7 +11184,7 @@ test "streamTailIsReasoning: an unopened block was content all along" {
     // thought must not leak into content (Qwen/LFM2.5 pre-inject the opener).
     try testing.expect(streamTailIsReasoning(true, true, false));
     // A model-emitted opener is the same evidence (Gemma's `<|channel>thought`,
-    // Inkling's `<|content_thinking|>`), even with no prompt opener.
+    // a `<think>` the model writes itself), even with no prompt opener.
     try testing.expect(streamTailIsReasoning(true, false, true));
     // Already closed and split ⇒ the tail is the visible answer.
     try testing.expect(!streamTailIsReasoning(false, true, true));
@@ -11915,9 +11216,8 @@ test "promptTailOpensThink does not match Gemma's channel opener" {
     // Gemma turn would be held forever waiting for a tag that never arrives.
     try testing.expect(!promptTailOpensThink("<|turn>model\n<|channel>thought\n"));
     try testing.expect(!promptTailOpensThink("<|turn>model\n"));
-    // The `<think>` family it DOES match — bare and suffixed (hy3).
+    // The `<think>` family it DOES match.
     try testing.expect(promptTailOpensThink("<|im_start|>assistant\n<think>"));
-    try testing.expect(promptTailOpensThink("<|im_start|>assistant\n<think:opensource>"));
 }
 
 test "streamThinkGate: the 3-arg form is the 4-arg form with no prompt opener" {
@@ -13194,61 +12494,26 @@ test "splitThinkBlock content never keeps trailing channel close spam" {
     try testing.expect(std.mem.indexOf(u8, split.content, "The answer.") != null);
 }
 
-// ── Hy3 (hy_v3 / Hunyuan 3) suffixed think tags + tag-format tool calls ──
+// ── GLM arg_key/arg_value tag-format tool calls ──
 
-test "hy3 think: splitThinkBlock splits on </think:opensource>" {
-    const out = "I reason here.</think:opensource>The answer is 4.";
-    const split = splitThinkBlock(out, true, true);
-    try testing.expectEqualStrings("I reason here.", split.reasoning_content.?);
-    try testing.expectEqualStrings("The answer is 4.", split.content);
-}
-
-test "hy3 think: literal suffixed opener + close" {
-    const out = "<think:opensource>hmm</think:opensource>Answer.";
-    const split = splitThinkBlock(out, true, false);
-    try testing.expectEqualStrings("hmm", split.reasoning_content.?);
-    try testing.expectEqualStrings("Answer.", split.content);
-}
-
-test "hy3 think: trailing suffixed close spam trimmed from content" {
-    const out = "r</think:opensource>Answer.</think:opensource></think:opensource>";
-    const split = splitThinkBlock(out, true, true);
-    try testing.expectEqualStrings("Answer.", split.content);
-}
-
-test "hy3 think: dangling re-opened suffixed opener never leaks" {
-    const out = "r</think:opensource>Answer.\n<think:opensource>\nnew thought";
-    const split = splitThinkBlock(out, true, true);
-    try testing.expectEqualStrings("Answer.", split.content);
-    try testing.expect(std.mem.indexOf(u8, split.content, "<think") == null);
-}
-
-test "hy3 think: promptTailOpensThink recognizes the suffixed opener, not a closed no_think tail" {
-    try testing.expect(promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>"));
-    try testing.expect(!promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource></think:opensource>"));
-    try testing.expect(!promptTailOpensBareThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>"));
-    try testing.expect(promptTailOpensBareThink("assistant\n<think>\n"));
-}
-
-test "hy3 think: streamThinkGate splits on suffixed close and holds on a partial suffixed re-open" {
+test "streamThinkGate holds a partial re-opened <think at the tail" {
     // Template-opened thinking: reasoning streams in with no literal opener.
     try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("partial reasoning", true, false));
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("reasoning</think:opensource>ans", true, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("reasoning</think>ans", true, false));
     // Mid-text re-open arriving token by token: the partial tail must hold the
-    // flush (leaking "<think:opensou" into visible text is the tag-leak class).
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("visible<think:opensou", false, true));
+    // flush (leaking "<thin" into visible text is the tag-leak class).
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("visible<thin", false, true));
     // Prose that merely mentions "<think about it" is NOT a partial opener.
     try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("let's <think about it", false, true));
 }
 
-test "parseToolCalls hy3 arg_key/arg_value format (single call, hostile value bytes)" {
-    const raw = "<tool_calls:opensource>\n" ++
-        "<tool_call:opensource>write_file<tool_sep:opensource>\n" ++
-        "<arg_key:opensource>path</arg_key:opensource>\n" ++
-        "<arg_value:opensource>jfk.txt</arg_value:opensource>\n" ++
-        "<arg_key:opensource>content</arg_key:opensource>\n" ++
-        "<arg_value:opensource>Hello \"world\"\nline2\ttabbed</arg_value:opensource>\n" ++
-        "</tool_call:opensource>\n</tool_calls:opensource>";
+test "parseToolCalls arg_key/arg_value format (single call, hostile value bytes)" {
+    const raw = "<tool_call>write_file\n" ++
+        "<arg_key>path</arg_key>\n" ++
+        "<arg_value>jfk.txt</arg_value>\n" ++
+        "<arg_key>content</arg_key>\n" ++
+        "<arg_value>Hello \"world\"\nline2\ttabbed</arg_value>\n" ++
+        "</tool_call>";
     const calls = (try parseToolCalls(testing.allocator, raw)).?;
     defer {
         for (calls) |tc| {
@@ -13267,32 +12532,11 @@ test "parseToolCalls hy3 arg_key/arg_value format (single call, hostile value by
     try testing.expectEqualStrings("Hello \"world\"\nline2\ttabbed", parsed.value.object.get("content").?.string);
 }
 
-test "parseToolCalls hy3: two calls in one wrapper" {
-    const raw = "<tool_calls:opensource>\n" ++
-        "<tool_call:opensource>alpha<tool_sep:opensource>\n" ++
-        "<arg_key:opensource>a</arg_key:opensource>\n<arg_value:opensource>1</arg_value:opensource>\n" ++
-        "</tool_call:opensource>\n" ++
-        "<tool_call:opensource>beta<tool_sep:opensource>\n" ++
-        "<arg_key:opensource>b</arg_key:opensource>\n<arg_value:opensource>two</arg_value:opensource>\n" ++
-        "</tool_call:opensource>\n</tool_calls:opensource>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 2), calls.len);
-    try testing.expectEqualStrings("alpha", calls[0].name);
-    try testing.expectEqualStrings("beta", calls[1].name);
-}
-
-test "parseToolCalls hy3: duplicate arg key — first wins, args stay valid JSON" {
-    const raw = "<tool_call:opensource>edit<tool_sep:opensource>\n" ++
-        "<arg_key:opensource>path</arg_key:opensource>\n<arg_value:opensource>a.txt</arg_value:opensource>\n" ++
-        "<arg_key:opensource>path</arg_key:opensource>\n<arg_value:opensource>b.txt</arg_value:opensource>\n" ++
-        "</tool_call:opensource>";
+test "parseToolCalls arg_key: duplicate arg key — first wins, args stay valid JSON" {
+    const raw = "<tool_call>edit\n" ++
+        "<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n" ++
+        "<arg_key>path</arg_key>\n<arg_value>b.txt</arg_value>\n" ++
+        "</tool_call>";
     const calls = (try parseToolCalls(testing.allocator, raw)).?;
     defer {
         for (calls) |tc| {
@@ -13307,14 +12551,13 @@ test "parseToolCalls hy3: duplicate arg key — first wins, args stay valid JSON
     try testing.expectEqualStrings("a.txt", parsed.value.object.get("path").?.string);
 }
 
-test "parseToolCalls hy3: truncated mid-value recovers name + closed args only" {
+test "parseToolCalls arg_key: truncated mid-value recovers name + closed args only" {
     // max_tokens cut the generation inside the second value — recover the call
     // with the CLOSED pair only; never salvage the partial content (the
     // truncated-opener class: a half-written file is worse than a retry).
-    const raw = "<tool_calls:opensource>\n" ++
-        "<tool_call:opensource>write_file<tool_sep:opensource>\n" ++
-        "<arg_key:opensource>path</arg_key:opensource>\n<arg_value:opensource>x.txt</arg_value:opensource>\n" ++
-        "<arg_key:opensource>content</arg_key:opensource>\n<arg_value:opensource>a very long novel that never clos";
+    const raw = "<tool_call>write_file\n" ++
+        "<arg_key>path</arg_key>\n<arg_value>x.txt</arg_value>\n" ++
+        "<arg_key>content</arg_key>\n<arg_value>a very long novel that never clos";
     const calls = (try parseToolCalls(testing.allocator, raw)).?;
     defer {
         for (calls) |tc| {
@@ -13331,20 +12574,16 @@ test "parseToolCalls hy3: truncated mid-value recovers name + closed args only" 
     try testing.expect(parsed.value.object.get("content") == null);
 }
 
-test "parseToolCalls hy3: dropped <tool_sep> + mangled key-close still recovers name AND args" {
-    // Live 2026-07-16 RAW capture (pipenetwork/Hy3-REAP62 via the running server,
-    // SUSHI_RAW_DUMP_FILE): the pruned model drops <tool_sep> (closes the NAME
-    // with </arg_value:opensource>) and closes the arg KEY block with
-    // </arg_value:opensource> instead of </arg_key:opensource> — the VALUE block is
-    // well-formed. Before the fix the strict parser bailed at the missing
-    // <tool_sep> and the whole call LEAKED as content (finish_reason stop), so pi
-    // saw bash({}) → "command required" and looped. The corruption is small and
-    // regular, so recover the FULL call: name=bash, {"command":"ls -la"}.
-    const raw = "<tool_calls:opensource>\n" ++
-        "<tool_call:opensource>bash</arg_value:opensource>\n" ++
-        "<arg_key:opensource>command</arg_value:opensource>\n" ++
-        "<arg_value:opensource>ls -la</arg_value:opensource>\n" ++
-        "</tool_call:opensource>\n</tool_calls:opensource>";
+test "parseToolCalls arg_key: mangled name-close + key-close still recovers name AND args" {
+    // A weak model closes the NAME with </arg_value> and closes the arg KEY
+    // block with </arg_value> instead of </arg_key> — the VALUE block is
+    // well-formed. A strict parser bails and the whole call LEAKS as content
+    // (finish_reason stop), so the client sees bash({}) and loops. The
+    // corruption is small and regular, so recover the FULL call.
+    const raw = "<tool_call>bash</arg_value>\n" ++
+        "<arg_key>command</arg_value>\n" ++
+        "<arg_value>ls -la</arg_value>\n" ++
+        "</tool_call>";
     const calls = (try parseToolCalls(testing.allocator, raw)).?;
     defer {
         for (calls) |tc| {
@@ -13358,58 +12597,6 @@ test "parseToolCalls hy3: dropped <tool_sep> + mangled key-close still recovers 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
-}
-
-test "parseToolCalls hy3: dropped singular <tool_call> opener (plural wrapper only) still recovers" {
-    // Live 2026-07-16 RAW capture (pipenetwork/Hy3-REAP62 via the running server,
-    // SUSHI_RAW_DUMP_FILE): the pruned model emitted the PLURAL wrapper
-    // <tool_calls:opensource> and jumped STRAIGHT to the NAME, dropping the
-    // singular per-call <tool_call:opensource> opener the parser keys on — so the
-    // whole (well-structured, complete) call LEAKED as content (finish_reason
-    // stop). Same weak-model delimiter-drop class as the <tool_sep> drop above,
-    // one delimiter over. The call is otherwise regular (name/key closed with
-    // </arg_value>), so recover the FULL call incl. the quote-bearing content.
-    const raw = "<tool_calls:opensource>\n" ++
-        "write_file</arg_value:opensource>\n" ++
-        "<arg_key:opensource>path</arg_value:opensource>\n" ++
-        "<arg_value:opensource>page.html</arg_value:opensource>\n" ++
-        "<arg_key:opensource>content</arg_value:opensource>\n" ++
-        "<arg_value:opensource><meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div></arg_value:opensource>\n" ++
-        "</tool_call:opensource>\n</tool_calls:opensource>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("write_file", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("page.html", parsed.value.object.get("path").?.string);
-    try testing.expectEqualStrings(
-        "<meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div>",
-        parsed.value.object.get("content").?.string,
-    );
-}
-
-test "parseToolCalls hy3: suffixed think close before the wrapper still parses" {
-    const raw = "planning the call</think:opensource>\n<tool_calls:opensource>\n" ++
-        "<tool_call:opensource>list_files<tool_sep:opensource>\n" ++
-        "<arg_key:opensource>dir</arg_key:opensource>\n<arg_value:opensource>.</arg_value:opensource>\n" ++
-        "</tool_call:opensource>\n</tool_calls:opensource>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("list_files", calls[0].name);
 }
 
 // ── DeepSeek-V4 native DSML tool calls ─────────────────────────────────
@@ -13443,7 +12630,7 @@ test "parseToolCalls dsml: canonical two-call block, string and JSON params" {
 }
 
 test "parseToolCalls dsml: dropped invoke close before the next call still parses both" {
-    // Delimiter-drop tolerance (hy3 class): the model omits </｜DSML｜invoke>
+    // Delimiter-drop tolerance: the model omits </｜DSML｜invoke>
     // between back-to-back calls.
     const raw = "<｜DSML｜tool_calls>\n" ++
         "<｜DSML｜invoke name=\"first\">\n" ++
@@ -13522,34 +12709,6 @@ test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hol
     try testing.expect(streamShouldBufferForTools("answer text <｜"));
     // plain prose with a fullwidth bar elsewhere must NOT hold
     try testing.expect(!streamShouldBufferForTools("the ｜ character is fun"));
-}
-
-test "loadChatConfig: template-less deepseek_v4 checkpoint gets the embedded DSV4 template" {
-    // pipenetwork REAP builds ship NO chat_template (their python package
-    // does its own encoding) — the generic fallback renders wrong-family
-    // markers and the model degenerates into echoing them (live 2026-08-01:
-    // pi against REAP37 looped `<start_of_turn>model`). A deepseek_v4
-    // checkpoint with no template must get OUR byte-pinned transcription.
-    const allocator = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\": \"e\"}" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"deepseek_v4\"}" });
-    var pbuf: [512]u8 = undefined;
-    const plen = try tmp.dir.realPath(io, &pbuf);
-    const dir_path = pbuf[0..plen];
-
-    var cc = try loadChatConfig(io, allocator, dir_path);
-    defer cc.deinit();
-    try testing.expect(std.mem.indexOf(u8, cc.chat_template, "thinking_mode") != null);
-    try testing.expect(std.mem.indexOf(u8, cc.chat_template, "DSML") != null);
-
-    // Any other arch keeps the empty fallback (fallbackFormatChat territory).
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"llama\"}" });
-    var cc2 = try loadChatConfig(io, allocator, dir_path);
-    defer cc2.deinit();
-    try testing.expectEqual(@as(usize, 0), cc2.chat_template.len);
 }
 
 test "renderChatTemplate: muse_glimmer shipped template renders byte-identical to python jinja2 (hermetic)" {
@@ -13853,7 +13012,7 @@ test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current too
     defer allocator.free(r2);
     try testing.expect(std.mem.indexOf(u8, r2, "<|start|>assistant to=self<|message|>Need the weather tool.<|eom|>") != null);
 
-    // A non-muse template that persists history reasoning (laguna class) is
+    // A non-muse template that persists history reasoning is
     // untouched — the round-trip rule stays per-family.
     const generic_tpl = "{%- for m in messages -%}{%- if m.get('reasoning_content') -%}<think>{{ m['reasoning_content'] }}</think>{%- endif -%}{{ m['role'] }}: {{ m['content'] }}\n{%- endfor -%}";
     var generic = ChatConfig{
@@ -14351,120 +13510,6 @@ test "serializeExtraContext: muse maps effort onto reasoning_strength" {
     try testing.expect(std.mem.indexOf(u8, r, "reasoning_strength") == null);
 }
 
-test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_result (hermetic)" {
-    // src/fixtures/dsv4_chat_template.jinja is OUR faithful transcription of
-    // DeepSeek-V4's encoding_dsv4.py (the checkpoint ships none): TOOLS block
-    // into the system position, assistant history tool calls as DSML
-    // invoke/parameter markup (string params raw, JSON params via tojson —
-    // whose default ", "/": " separators match python json.dumps), tool role
-    // as <tool_result> user turns (consecutive results merge), thinking_mode
-    // chat|thinking with the reference's drop-thinking rule (reasoning kept
-    // only for assistant turns AFTER the last user/tool message).
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/dsv4_chat_template.jinja");
-
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    const tools_json =
-        \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]}}}]
-    ;
-    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_weather", .arguments = "{\"city\": \"Paris\", \"days\": 3}" }};
-    const messages = [_]Message{
-        .{ .role = "system", .content = "You are helpful." },
-        .{ .role = "user", .content = "Weather in Paris?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc },
-        .{ .role = "tool", .content = "Sunny, 22C", .tool_call_id = "tc_0" },
-    };
-
-    // Thinking OFF (chat mode): assistant turns open with the bare </think>.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "You are helpful.\n\n## Tools") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "\"<｜DSML｜tool_calls>\" block") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"get_weather\"") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<｜User｜>Weather in Paris?") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "</｜DSML｜tool_calls><｜end▁of▁sentence｜>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<｜User｜><tool_result>Sunny, 22C</tool_result>") != null);
-        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜></think>"));
-        // No fallback-format markers (a raise inside the template silently falls back).
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
-    }
-    // Thinking ON with TOOLS: the reference DISABLES drop_thinking whenever
-    // tools are declared (agent sessions keep reasoning on every assistant
-    // turn — the laguna round-trip class), so the tool-calling assistant
-    // renders <think>…</think> even though a tool result follows it.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜><think>"));
-        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜><think></think>\n\n<｜DSML｜tool_calls>") != null);
-        // 0731's reasoning-effort preamble must NOT appear at the serializer's
-        // dsv4 default (the reference default is "low" = nothing). hy3's
-        // blanket "high" would have prepended it to every thinking request.
-        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning Effort:") == null);
-    }
-    // Client-supplied effort reaches the render MAPPED (dsv4EffortFor): the
-    // raw CLIENT vocabulary goes in ("xhigh"), the template sees "max" and
-    // prepends the max preamble. This is the end-to-end pin the unit tests
-    // can't give — the string must survive renderChatTemplate →
-    // serializeExtraContext → Jinja.
-    {
-        const user_only = [_]Message{.{ .role = "user", .content = "prove it" }};
-        const r_max = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "xhigh", false);
-        defer allocator.free(r_max);
-        try testing.expect(std.mem.indexOf(u8, r_max, "Reasoning Effort: Beyond maximum") != null);
-        const r_high = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "high", false);
-        defer allocator.free(r_high);
-        try testing.expect(std.mem.indexOf(u8, r_high, "Reasoning Effort: Absolute maximum") != null);
-        // Outside thinking mode the preamble never applies, whatever the effort.
-        const r_chat = try renderChatTemplate(allocator, &user_only, &config, null, null, false, "high", false);
-        defer allocator.free(r_chat);
-        try testing.expect(std.mem.indexOf(u8, r_chat, "Reasoning Effort:") == null);
-    }
-    // Old-turn reasoning DROPS (the reference's drop_thinking): an assistant
-    // turn with a LATER user message renders without its reasoning.
-    {
-        const hist = [_]Message{
-            .{ .role = "user", .content = "Why is the sky blue?" },
-            .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
-            .{ .role = "user", .content = "And sunsets?" },
-        };
-        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜></think>Rayleigh scattering.") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "Shorter wavelengths") == null);
-        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜><think>"));
-    }
-    // No system message + tools: the reference delivers tools through a
-    // system/developer turn and renders `system_content + "\n\n" + tools`, so
-    // an EMPTY system turn still emits the two newlines (measured against
-    // 0731's encoder — it silently DROPS tools attached to a user message, so
-    // an empty system turn is its only way to say "tools, no system prompt").
-    // Clients routinely send user+tools with no system message, and dropping
-    // that separator shifts every token after the bos away from what the
-    // model was trained on. Pinned byte-exact by tests/dsv4_template_ab.py.
-    {
-        const no_sys = [_]Message{
-            .{ .role = "user", .content = "hi" },
-        };
-        const rendered = try renderChatTemplate(allocator, &no_sys, &config, tools_json, null, false, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.startsWith(u8, rendered, "<｜begin▁of▁sentence｜>\n\n## Tools"));
-        try testing.expect(std.mem.indexOf(u8, rendered, "tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi") != null);
-    }
-}
-
 test "ThinkScan: incremental gate matches the fresh gate at every prefix length" {
     // The gate is O(buffer) per token today (measured 47.99 us/token at 113 KB
     // with no close in the buffer), i.e. O(n^2) over a reasoning block. A
@@ -14474,18 +13519,12 @@ test "ThinkScan: incremental gate matches the fresh gate at every prefix length"
     const corpus = [_][]const u8{
         "plain visible prose with no markup at all",
         "<think>reasoning here</think>the answer",
-        "<think:opensource>hy3 reasoning</think:opensource>answer",
         // A </think> inside a tool ARGUMENT is payload, not a block close.
         "<think>plan<tool_call>f<arg_key>k</arg_key><arg_value>closes with </think> inside</arg_value></tool_call>done</think>visible",
         "<|channel>thought hidden<channel|>visible",
         "prose where a < b and nothing else happens",
         "trailing partial opener at the end <thi",
         "trailing partial close </thin",
-        // A suffix longer than the 32-byte tail window the partial-scan uses:
-        // the fresh scan still recognizes it, so the cursor must too.
-        "<think>x</think:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>tail",
-        "<|message_thinking|>inkling thought<|end_message|>after",
-        "<|message_text|>inkling visible",
     };
     const flags = [_][2]bool{ .{ true, false }, .{ false, false }, .{ false, true } };
     for (corpus) |full| {

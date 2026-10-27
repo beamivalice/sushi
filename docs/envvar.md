@@ -4,9 +4,9 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 184 vars. By kind: tradeoff levers 14, diagnostics 47, microbenches 72, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
+**Summary.** 183 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 72, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
-## Tradeoff levers (15)
+## Tradeoff levers (14)
 
 Two arms that trade speed, memory or exactness, or a policy a user may want to move.
 
@@ -21,8 +21,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_LMHEAD_FULL` | `transformer.zig:24018` | `1` reads the full lm_head instead of the greedy top-32 shortlist (MiMo; the shortlist is not certified exact) | once | yes: engine-mtp |
 | `SUSHI_LOOP_TRIM` | `scheduler.zig:6233` | default on: trims displayed loop-stop replies; `0` keeps the whole degenerate tail for strict bytes (`tests/test_loop_stop_signal.sh` boots both) | once | yes: server-http-apis, tests/CLAUDE |
 | `SUSHI_MTP_ADAPTIVE_SERIAL` | `generate.zig:9517` | default on; `0` disables the adaptive speculate-vs-serial vote at long KV (`tests/test_mtp_adaptive.sh` boots both) | once | yes: mimo2-perf, tests/CLAUDE |
-| `SUSHI_MTP_DRAFT_HEAD_BITS` | `mtp.zig:822, mimo_mtp.zig:33` | draft-only lm_head requant width (default 3, MiMo coarse readout 2; `0\|off` disables); verification is untouched | load | yes: mimo2-mtp |
-| `SUSHI_MTP_HEAD_QUANT_BITS` | `mtp.zig:1780` | requant width of dense MTP head trunks at load (default 4, g64; `0` off) | load | yes: engine-mtp |
+| `SUSHI_MTP_DRAFT_HEAD_BITS` | `mtp.zig:427, mimo_mtp.zig:33` | coarse rerank readout width (default 3, MiMo 2; `0\|off` disables); verification is untouched | load | yes: mimo2-mtp |
 | `SUSHI_NGRAM_WARM` | `qwen4_exp.zig:146` | default on: pread the Flash-Next n-gram table at load; `0` skips it | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_QSA_SCORE_SHEET_MB` | `transformer.zig:5868` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
@@ -170,6 +169,10 @@ Cut from the code with the arm only they reached; the defaults are unchanged.
 - *Kill switches of adopted arms*: `SUSHI_FUSED_256` (the hd-256 `sushi_attn_p256` kernel; the composed path still serves declined shapes and is the tests' parity oracle) and `SUSHI_SSD_WRITE_THROUGH` (the prefill write-through to the SSD tier, always on once its gates pass).
 - *Measured, then adopted or dropped*: `SUSHI_GDN_PIPELINED` (the software-pipelined GDN prefill kernel is the NAX Qwen route, +3.8% prefill at 32K) and `SUSHI_QSA_ATTN_BALANCED` (the balanced split-K arm: no gain, not bit-identical; [qwen4-perf](qwen4-perf.md#gdn-pipelined)).
 - *Dead or leftover*: `CODEX_SANDBOX`, `HY3_MODEL_DIR`, `MINICPM5_MODEL_DIR`, `PERF_REPORT`, `REAL_BLOB`, `SUSHI_DSV4_DSPARK`, and the `--dspark` flag that only set it.
+
+## Removed 2026-10-26
+
+- *The Qwen3.5/3.6 MTP sidecar loader*: `SUSHI_MTP_HEAD_QUANT_BITS` (requant of a dense sidecar head's trunk) went with `MtpModel`, which no served architecture reaches.
 
 ## Removed 2026-10-13
 

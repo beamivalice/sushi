@@ -85,7 +85,7 @@ CONTENT=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d[
 RC=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d["choices"][0]["message"];rc=m.get("reasoning_content","");print(rc[:100] if rc else "NONE")' 2>/dev/null)
 FR2=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["choices"][0].get("finish_reason","?"))' 2>/dev/null)
 # A verbose reasoner can still be INSIDE its thought when max_tokens lands
-# (Laguna-XS spends >500 on 15x17). Empty content there is the truncated-thought
+# (a verbose reasoner spends >500 on 15x17). Empty content there is the truncated-thought
 # rule working, not a bug — so demand content only when the block actually closed.
 if [ "$FR2" = "length" ] && [ -z "$CONTENT" ]; then
   run_test "cut mid-thought: reasoning kept, nothing leaked to content" "$([ "$RC" != "NONE" ] && echo PASS || echo FAIL)" "finish=length"
@@ -119,8 +119,8 @@ TC_NAME=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);tcs=
 RC=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d["choices"][0]["message"];rc=m.get("reasoning_content","");print(rc[:100] if rc else "NONE")' 2>/dev/null)
 CONTENT=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d["choices"][0]["message"];print(m.get("content") or "")' 2>/dev/null)
 run_test "Tool call present" "$([ "$TC_NAME" = "shell" ] && echo PASS || echo FAIL)" "got '$TC_NAME'"
-# Thinking BEFORE a tool call is the model's choice: Laguna-XS closes its
-# pre-opened block immediately and calls the tool in ~35 tokens. The server
+# Thinking BEFORE a tool call is the model's choice: a model may close its
+# pre-opened block immediately and call the tool in ~35 tokens. The server
 # guarantee is SEPARATION, not that a thought exists.
 if [ "$RC" != "NONE" ]; then
   run_test "Has reasoning_content" "PASS" "reasoning='${RC:0:80}'"
@@ -210,7 +210,7 @@ NO_TAGS_RC=$(echo "$STREAM" | grep '"reasoning_content"' | grep -cE '<think>|<\|
 if [ "$HAS_RC" -gt 0 ]; then
   run_test "Has reasoning_content deltas" "PASS" "$HAS_RC deltas"
 else
-  # Straight to the call (same model choice as Test 4) — Laguna-XS closes its
+  # Straight to the call (same model choice as Test 4) — the model closes its
   # pre-opened block empty and writes its working as VISIBLE prose, which is a
   # legitimate turn: content alongside a tool call is normal. What must hold is
   # that the call survived; the two tag checks below cover the leak side.

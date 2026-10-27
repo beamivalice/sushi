@@ -43,7 +43,6 @@ const VisionEncoder = vision_mod.VisionEncoder;
 const dflash_mod = @import("dflash.zig");
 const DflashModel = dflash_mod.DflashModel;
 const mtp_mod = @import("mtp.zig");
-const MtpModel = mtp_mod.MtpModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
 const TokenizeCache = tokenize_cache_mod.TokenizeCache;
 
@@ -337,14 +336,10 @@ pub const LoadedModel = struct {
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
         if (self.mtp) |h| {
-            // Only the Qwen sidecar is a separately allocated object; an
+            // Only MiMo's heads are a separately allocated object; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
-                .qwen => |q| {
-                    q.deinit();
-                    self.allocator.destroy(q);
-                },
                 .mimo => |m| {
                     m.deinit();
                     self.allocator.destroy(m);
@@ -470,14 +465,10 @@ pub const LoadedModel = struct {
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
         if (self.mtp) |h| {
-            // Only the Qwen sidecar is a separately allocated object; an
+            // Only MiMo's heads are a separately allocated object; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
-                .qwen => |q| {
-                    q.deinit();
-                    self.allocator.destroy(q);
-                },
                 .mimo => |m| {
                     m.deinit();
                     self.allocator.destroy(m);

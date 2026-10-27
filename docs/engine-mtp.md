@@ -13,7 +13,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 
 | File | Role |
 |---|---|
-| `src/mtp.zig` | MTP head (in-checkpoint `mtp.*` or sidecar via `resolveMtpSource`) |
+| `src/mtp.zig` | shared MTP machinery: depth bounds, cost profiles, draft rerank (the heads live in `qwen4_forward.zig`, `mimo_mtp.zig`) |
 | `src/mtp_acceptance.zig` | acceptance modes `exact|typical|tokenv3` |
 | `src/mtp_group_planner.zig` / `src/mtp_group_cost.zig` | grouped verify planner |
 | `src/mtp_qmv.zig` | M=1-exact qmv rows |
@@ -238,10 +238,7 @@ chain/group paths still capture per row. `dflash_policy.ladder()` is that table 
   tok/s vs typical 84.0 / 89.0 and exact 74.3 / 74.6 (2.7-2.9 vs 2.5 vs 2.1 tokens per round). Its emitted-text NLL
   fell below exact (0.603 vs 0.680 nats, paired interval [-0.23, +0.01]; non-argmax tokens 19.2% vs 21.6%): less
   diverse text, not a likelihood loss. Exact + tail stayed inside the NLL noise but decoded 72.8 / 72.2 tok/s.
-- **Norms**: delta-encoded head norms AUTO-FOLD at load (raw-HF heads get the `+1` repair, `mtpNormNeedsRepair` reads
-  the norm's OWN negative fraction, whole-head 5% bar); publish packs FOLDED (the converter folds them).
-  Quant re-solved PER WEIGHT; a sidecar's mode is solved from GEOMETRY (`quantParamsFromGeometry`); dense bf16 head
-  trunks requantize at load (`SUSHI_MTP_HEAD_QUANT_BITS` 4/g64).
+- **Norms**: publish packs carry FOLDED head norms (the converter folds them).
 
 <a id="ple-defer"></a>
 ## The deferred PLE leaf

@@ -332,7 +332,6 @@ fn freeArray(a: mlx.mlx_array) void {
 /// in tokens and probabilities — so the split is exactly these five operations
 /// and nothing else.
 pub const MtpHeadRef = union(enum) {
-    qwen: *mtp_mod.MtpModel,
     /// qwen4_exp: the head and its history live on the Transformer
     /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
@@ -347,7 +346,6 @@ pub const MtpHeadRef = union(enum) {
     /// than per-request? Both the scheduler and the sticky-serial arm ask this.
     pub fn moduleOwned(self: MtpHeadRef) bool {
         return switch (self) {
-            .qwen => false,
             // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
             .qwen4, .mimo => false,
             // The model's own request state; its slot is exclusive through `ownsModuleDecodeState`.
@@ -357,7 +355,6 @@ pub const MtpHeadRef = union(enum) {
 
     pub fn makeCache(self: MtpHeadRef, allocator: std.mem.Allocator) !MtpCacheRef {
         return switch (self) {
-            .qwen => |h| .{ .qwen = try h.makeCache(allocator) },
             .qwen4 => |t| blk: {
                 const st = try allocator.create(transformer_mod.Transformer.Qwen4MtpState);
                 errdefer allocator.destroy(st);
@@ -388,9 +385,8 @@ pub const MtpHeadRef = union(enum) {
         return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
     }
 
-    /// One head forward over L positions. `.logits` returns the LAST row only,
-    /// on both arms. `.mixed` asks for the lm_head's INPUT vector instead: on
-    /// the sidecar that is `hidden_next` and nothing extra is produced, on
+    /// One head forward over L positions. `.logits` returns the LAST row only.
+    /// `.mixed` asks for the lm_head's INPUT vector instead: on
     /// qwen4_exp it is the mixer output, returned in `rerank_x`. `host_ids` are
     /// `id_arr`'s values when the caller holds them (a round's committed rows);
     /// the MiMo arm records them.
@@ -407,7 +403,6 @@ pub const MtpHeadRef = union(enum) {
     ) !mtp_mod.StepOut {
         return switch (self) {
             .mimo => |h| mimoStep(h, target, &cache.mimo, id_arr, hidden, @intCast(rope_offset), want, host_ids),
-            .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
             .qwen4 => |t| blk: {
                 cache.activate();
                 break :blk qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx);
@@ -458,7 +453,6 @@ pub const MtpHeadRef = union(enum) {
         allocator: std.mem.Allocator,
     ) !void {
         switch (self) {
-            .qwen => |h| try mtp_mod.appendHistoryWithMrope(h, target, &cache.qwen, token_ids, hidden, rope_offset, mrope_ctx),
             .mimo => |h| try h.appendHistory(target, cache.mimo.st, token_ids, hidden, @intCast(rope_offset)),
             .qwen4 => |t| {
                 const ids_i32 = try allocator.alloc(i32, token_ids.len);
@@ -480,7 +474,6 @@ pub const MtpHeadRef = union(enum) {
     /// draft-head projection + argmax.
     pub fn canRerankDrafts(self: MtpHeadRef) bool {
         return switch (self) {
-            .qwen => |h| h.canRerankDrafts(),
             // Built lazily on the first ask: `loadQwen4Mtp` runs while the
             // Transformer is still under construction and its lm_head — the
             // very weight the coarse head is a copy of — is not assigned yet.
@@ -490,9 +483,9 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
-    /// `x` is whatever the TARGET's lm_head consumes for this arm — the
-    /// sidecar's post-norm hidden, or qwen4_exp's MIXER output. Never
-    /// `hidden_next` on qwen4_exp: that is the pre-mixer `[B,S,hc*H]` stream.
+    /// `x` is whatever the TARGET's lm_head consumes for this arm — qwen4_exp's
+    /// MIXER output. Never `hidden_next` on qwen4_exp: that is the pre-mixer
+    /// `[B,S,hc*H]` stream.
     pub fn draftSelect(
         self: MtpHeadRef,
         target: *Transformer,
@@ -500,7 +493,6 @@ pub const MtpHeadRef = union(enum) {
         suppress_mask: ?mlx.mlx_array,
     ) !mlx.mlx_array {
         return switch (self) {
-            .qwen => |h| h.draftSelect(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
             .mimo => |h| h.draftSelect(target, x, suppress_mask),
             .dsv41 => error.Dsv41DsparkHasNoHeadStep,
@@ -517,7 +509,6 @@ pub const MtpHeadRef = union(enum) {
         suppress_mask: ?mlx.mlx_array,
     ) !?mtp_mod.Shortlist {
         return switch (self) {
-            .qwen => |h| h.draftShortlist(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftShortlist(x, suppress_mask),
             .mimo => |h| h.draftShortlist(target, x, suppress_mask),
             .dsv41 => null,
@@ -525,13 +516,11 @@ pub const MtpHeadRef = union(enum) {
     }
 
     /// Every G17/NAX cost surface is calibrated against one exact runtime
-    /// geometry — the dense Qwen3.6/3.8-27B sidecars on the `.qwen` arm, the
-    /// qwen4_exp in-checkpoint head on its own arm — so every other head
-    /// plans under `generic`: an off-profile head served by a calibrated
-    /// surface would plan depths the measurement never covered.
+    /// geometry — the qwen4_exp in-checkpoint head on its own arm — so every
+    /// other head plans under `generic`: an off-profile head served by a
+    /// calibrated surface would plan depths the measurement never covered.
     pub fn costProfile(self: MtpHeadRef, target: *const Transformer, kv: transformer_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
         return switch (self) {
-            .qwen => |h| h.m5NaxCostProfile(target),
             .qwen4 => |t| mtp_mod.qwen4G17CostProfileForKv(t, kv),
             .mimo => if (target.config.expert_layout == .exl3_k4) .mimo_exl3 else .generic,
             .dsv41 => .generic,
@@ -539,12 +528,11 @@ pub const MtpHeadRef = union(enum) {
     }
 
     /// The head's last healthy acceptance surface, or null when it has never
-    /// published one. BOTH arms store it on the head object itself — the
-    /// sidecar `MtpModel` and the in-checkpoint `Qwen4Mtp` — so a seed dies
+    /// published one. Every arm stores it on the head object itself — the
+    /// in-checkpoint `Qwen4Mtp` and MiMo's `Head` — so a seed dies
     /// with the head and can never cross models.
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
-            .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
             .mimo => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
             .qwen4 => |t| blk: {
                 if (t.qwen4_mtp) |*m| {
@@ -558,10 +546,6 @@ pub const MtpHeadRef = union(enum) {
 
     pub fn setEvSeed(self: MtpHeadRef, accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32) void {
         switch (self) {
-            .qwen => |h| {
-                h.ev_seed_accept = accept;
-                h.ev_seed_m_lo = m_lo;
-            },
             .mimo => |h| {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
@@ -598,7 +582,6 @@ pub fn mtpHeadPersistEnabled() bool {
 
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
-    qwen: KVCache,
     qwen4: Qwen4Ref,
     mimo: MimoRef,
 
@@ -608,10 +591,10 @@ pub const MtpCacheRef = union(enum) {
     /// The in-checkpoint head plus this request's own half of it.
     pub const Qwen4Ref = struct { t: *Transformer, st: *transformer_mod.Transformer.Qwen4MtpState, allocator: std.mem.Allocator };
 
-    /// Install this request's state on the qwen4 head; no-op on the sidecar arm.
+    /// Install this request's state on the qwen4 head; no-op on the other arms.
     pub fn activate(self: *const MtpCacheRef) void {
         switch (self.*) {
-            .qwen, .mimo => {},
+            .mimo => {},
             .qwen4 => |r| r.t.qwen4MtpActivate(r.st),
         }
     }
@@ -624,7 +607,6 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
-            .qwen => |*c| c.step,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk r.t.qwen4_mtp.?.seq_offset;
@@ -638,7 +620,6 @@ pub const MtpCacheRef = union(enum) {
     /// pointer must also carry `head()`. Null when head persistence is off.
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
-            .qwen => |*c| c,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk if (mtpHeadPersistEnabled()) &r.t.qwen4_mtp.?.cache else null;
@@ -648,10 +629,10 @@ pub const MtpCacheRef = union(enum) {
         };
     }
 
-    /// The Transformer owning the in-checkpoint head; null on the sidecar arm and whenever `kv()` is null.
+    /// The Transformer owning the in-checkpoint head; null on the other arms and whenever `kv()` is null.
     pub fn head(self: *MtpCacheRef) ?*Transformer {
         return switch (self.*) {
-            .qwen, .mimo => null,
+            .mimo => null,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk if (mtpHeadPersistEnabled()) r.t else null;
@@ -661,7 +642,6 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
-            .qwen => |*c| try c.truncate(len, s),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);
                 try r.t.qwen4MtpTruncate(len);
@@ -675,7 +655,6 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
-            .qwen => |*c| c.deinit(),
             .qwen4 => |r| {
                 r.t.qwen4MtpRelease(r.st);
                 r.st.deinit();
@@ -694,7 +673,6 @@ pub const MtpCacheRef = union(enum) {
     /// across the whole prompt.
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
-            .qwen => |*c| c.appendEvalArrays(vec),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);
                 r.t.qwen4_mtp.?.cache.appendEvalArrays(vec);
@@ -1462,7 +1440,7 @@ pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: us
 /// full prompt — "[hot-cache] hybrid miss (no checkpoint ≤ 870 of 897)" was
 /// llmprobe's prompt-cache-prefix cell failing (the 2026-06-10 class; fine
 /// strides used to mask it by laying boundaries underneath). 30 covers every
-/// template suffix in the fleet with margin (ChatML+think ≈ 7 tokens, laguna
+/// template suffix in the fleet with margin (ChatML+think ≈ 7 tokens, a
 /// pre-opened think ≈ 10) while keeping the tail forward UNDER the
 /// prefill-eval-cadence threshold (seq >= 32): a 65-token tail was treated as
 /// a prefill and paid ~450ms of mid-loop eval bubbles on the 27B, where the
@@ -5252,8 +5230,7 @@ pub const Generator = struct {
     /// planner-owned round, which builds every chain as a group.
     pub fn mtpLookupAllowed(self: *const Generator) bool {
         if (mtp_lookup_disabled) return false;
-        const head = self.mtp orelse return false;
-        if (head == .qwen or self.mtp_batch_head) return false;
+        if (self.mtp == null or self.mtp_batch_head) return false;
         return !(group_planner.enabled() and self.mtp_planner_owned);
     }
 
@@ -5729,7 +5706,7 @@ pub const Generator = struct {
             if (g.mtpMropeContext() != null) any_mrope = true;
             switch (g.mtp.?) {
                 .qwen4 => {},
-                .qwen, .mimo, .dsv41 => all_qwen4 = false,
+                .mimo, .dsv41 => all_qwen4 = false,
             }
         }
         if (!all_qwen4 or any_mrope or gens.len == 1) {
@@ -9305,7 +9282,7 @@ pub const Generator = struct {
         if (self.mtp_cache == null) return null;
         const mc = &self.mtp_cache.?;
         return switch (mc.*) {
-            .qwen, .mimo => 0,
+            .mimo => 0,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 const m = &(r.t.qwen4_mtp orelse break :blk 0);
@@ -9357,8 +9334,8 @@ pub const Generator = struct {
         );
     }
 
-    /// The heads the adaptive serial switch was calibrated for: qwen4_exp's and MiMo's; a
-    /// sidecar pack has a different verify surface. Not `moduleOwned()`: different question.
+    /// The heads the adaptive serial switch was calibrated for: qwen4_exp's and MiMo's; DeepSeek's
+    /// DSpark has a different verify surface. Not `moduleOwned()`: different question.
     pub fn mtpAdaptiveHeadEligible(tag: std.meta.Tag(MtpHeadRef)) bool {
         return tag == .qwen4 or tag == .mimo;
     }
@@ -11371,112 +11348,6 @@ pub fn generate(
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
         .logprobs = if (logprobs_n > 0) try logprob_results.toOwnedSlice(allocator) else null,
-    };
-}
-
-/// MTP-enabled non-streaming variant of `generate`. Drives `nextMtp` (the model's own multi-token-prediction head).
-/// `head` must already be `bind()`-ed to `xfm`.
-pub fn generateMtp(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    xfm: *Transformer,
-    head: *mtp_mod.MtpModel,
-    tok: *const Tokenizer,
-    prompt_ids: []const u32,
-    max_tokens: u32,
-    sampling: SamplingParams,
-    eos_token_ids: []const u32,
-    timeout_ns: u64,
-    depth: u32,
-    lookup_prompt: ?[]const u32,
-) !GenerationResult {
-    var timer = io_util.Stopwatch.init(io);
-    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
-        .mtp_enabled = true,
-        .mtp_acceptance = mtp_acceptance_default,
-        .mtp = MtpHeadRef{ .qwen = head },
-        .mtp_depth = depth,
-        .lookup_prompt = lookup_prompt,
-    });
-    gen.timeout_ns = timeout_ns;
-    defer gen.deinit(allocator);
-
-    const prefill_ns = timer.read();
-    const prefill_tps: f64 = if (prefill_ns > 0)
-        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
-    else
-        0.0;
-    log.debug("Prefill (mtp): {d}ms ({d} tokens, {d:.3} tok/s)\n", .{
-        prefill_ns / std.time.ns_per_ms,
-        prompt_ids.len,
-        prefill_tps,
-    });
-
-    var output_ids = std.ArrayList(u32).empty;
-    defer output_ids.deinit(allocator);
-
-    timer.reset();
-
-    decode: while (!gen.done and gen.completion_tokens < max_tokens) {
-        const result = (try gen.nextMtp(allocator)) orelse break;
-        defer allocator.free(result.tokens);
-        for (result.tokens) |tok_id| {
-            if (isEosId(tok_id, eos_token_ids)) {
-                gen.done = true;
-                gen.finish_reason = "stop";
-                break :decode;
-            }
-            try output_ids.append(allocator, tok_id);
-            if (output_ids.items.len >= max_tokens) {
-                gen.done = true;
-                gen.finish_reason = "length";
-                break :decode;
-            }
-        }
-        if (timeout_ns > 0 and timer.read() >= timeout_ns) {
-            gen.done = true;
-            gen.finish_reason = "length";
-            break;
-        }
-    }
-
-    const decode_ns = timer.read();
-    const num_decoded = output_ids.items.len;
-    const decode_tps: f64 = if (decode_ns > 0)
-        @as(f64, @floatFromInt(num_decoded)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
-    else
-        0.0;
-    if (gen.mtp_attempted > 0) {
-        const avg_acc: f64 = @as(f64, @floatFromInt(gen.mtp_accepted_tokens)) / @as(f64, @floatFromInt(gen.mtp_attempted));
-        log.info("Decode (mtp): {d}ms ({d} tokens, {d:.3} tok/s; mtp accept={d}/{d} attempts, avg {d:.2} tokens/attempt)\n", .{
-            decode_ns / std.time.ns_per_ms,
-            num_decoded,
-            decode_tps,
-            gen.mtp_accepted_tokens,
-            gen.mtp_attempted,
-            avg_acc,
-        });
-    } else {
-        log.debug("Decode (mtp): {d}ms ({d} tokens, {d:.3} tok/s; no draft attempts)\n", .{
-            decode_ns / std.time.ns_per_ms,
-            num_decoded,
-            decode_tps,
-        });
-    }
-    gen.logSpecStats();
-    gen.logQsaArms();
-    const strip_leading = tok.tok_type == .sentencepiece_bpe;
-    const text = try tok.decode(allocator, output_ids.items, strip_leading);
-    const token_ids = try output_ids.toOwnedSlice(allocator);
-    return .{
-        .text = text,
-        .token_ids = token_ids,
-        .prompt_tokens = gen.prompt_tokens,
-        .completion_tokens = gen.completion_tokens,
-        .finish_reason = gen.finish_reason,
-        .prefill_tps = prefill_tps,
-        .decode_tps = decode_tps,
-        .logprobs = null,
     };
 }
 
@@ -14956,8 +14827,8 @@ test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
 }
 
 test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads null" {
-    // The in-checkpoint head stores the seed on `Qwen4Mtp` — per loaded model,
-    // exactly like the sidecar's `MtpModel.ev_seed_*`. Before this it was a
+    // The in-checkpoint head stores the seed on `Qwen4Mtp` — per loaded model.
+    // Before this it was a
     // null/no-op stub, so every qwen4 request re-warmed the controller from
     // scratch. Only the two seed fields are touched here; the rest of the head
     // (and of the Transformer) is never read on this path.
@@ -15145,9 +15016,8 @@ test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
 }
 
 test "the qwen4 rerank draft feeds the MIXER output, never the pre-mixer stream" {
-    // The one way this change can be wrong without failing to compile. On the
-    // sidecar arm `hidden_next` IS the lm_head's input, so the obvious wiring
-    // (`draftSelect(xfm, step_out.hidden_next, ...)`) is correct there and
+    // The one way this change can be wrong without failing to compile. The
+    // obvious wiring (`draftSelect(xfm, step_out.hidden_next, ...)`) is
     // silently wrong on qwen4_exp, whose `hidden_next` is the pre-mixer
     // `[B,S,hc*H]` stream — 4x the width the head consumes. The chain must
     // therefore prefer `rerank_x` when a step publishes one.
@@ -16636,7 +16506,6 @@ test "the allocator pool is returned at the prefill/decode handover, on archs th
         "bailing_hybrid",
         "llama",
         "gemma4",
-        "deepseek_v4",
         "muse_glimmer",
     }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt };
@@ -17212,35 +17081,6 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
 }
 
-test "every request-finalize seam that logs [spec-stats] also logs [qsa-arms]" {
-    // Class guard for a wiring bug this test was written after: `logQsaArms`
-    // was added beside the three `gen.logSpecStats()` calls in THIS file, which
-    // are the legacy/CLI path only. The SERVER finalizes requests in
-    // `scheduler.finishSlot` ("scheduler-driven slots finalize here instead"),
-    // so `[qsa-arms]` was dead on every served request while looking wired.
-    // A per-request meter is worth nothing if it misses the path that actually
-    // serves requests, so the SEAM — not the symbol — is what gets pinned:
-    // every call site of the request summary must carry both. Needles are
-    // assembled at comptime so this test's own source cannot satisfy the scan.
-    const spec_call = "logSpec" ++ "Stats();";
-    const qsa_call = "logQsa" ++ "Arms();";
-    inline for (.{ @embedFile("generate.zig"), @embedFile("scheduler.zig") }) |src| {
-        var i: usize = 0;
-        var seams: usize = 0;
-        while (std.mem.indexOfPos(u8, src, i, spec_call)) |at| {
-            seams += 1;
-            // The paired call must sit in the same short block, not merely
-            // somewhere else in the file.
-            const win_end = @min(src.len, at + 400);
-            if (std.mem.indexOfPos(u8, src, at, qsa_call)) |q| {
-                if (q >= win_end) return error.SpecStatsSeamMissesQsaArms;
-            } else return error.SpecStatsSeamMissesQsaArms;
-            i = at + spec_call.len;
-        }
-        try std.testing.expect(seams > 0);
-    }
-}
-
 test "mtpAdaptiveVoteFor: a switch needs BOTH measured prices past the margin" {
     const G = Generator;
     const margin = G.MTP_ADAPTIVE_MARGIN;
@@ -17595,9 +17435,9 @@ test "S21: a to_serial on a per-request head is not sticky; the release stays a 
     try testing.expect(!G.stickyReleaseNow(false, true));
 }
 
-test "S21: a KV-only sidecar head keeps its re-arm, and nothing about it changes" {
+test "S21: a head that is not module-owned keeps its re-arm, and nothing about it changes" {
     const G = Generator;
-    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen = undefined }));
+    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
     try testing.expect(!G.stickyOnSerialSwitch(null));
 
     var b = G.MtpAdaptive{};
@@ -17751,11 +17591,11 @@ test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its perio
     try testing.expectEqual(@as(?u32, 20), run(true)); // shipped: every layout
 }
 
-test "mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, a sidecar head does not" {
+test "mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, DSpark does not" {
     const G = Generator;
     try testing.expect(G.mtpAdaptiveHeadEligible(.qwen4));
     try testing.expect(G.mtpAdaptiveHeadEligible(.mimo));
-    try testing.expect(!G.mtpAdaptiveHeadEligible(.qwen));
+    try testing.expect(!G.mtpAdaptiveHeadEligible(.dsv41));
 }
 
 test "mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k" {
@@ -18606,9 +18446,10 @@ test "MTP detaching a pre-draft preserves the committed head boundary" {
             var gen: Generator = undefined;
             gen.xfm = &xfm;
             gen.mtp_planner_owned = owned;
-            gen.mtp_cache = .{ .qwen = try KVCache.init(allocator, 0) };
+            const head_state = try allocator.create(mimo_mtp.State);
+            head_state.* = .{ .allocator = allocator, .hid_base = 9 };
+            gen.mtp_cache = .{ .mimo = .{ .st = head_state } };
             defer gen.mtp_cache.?.deinit();
-            gen.mtp_cache.?.qwen.step = 9;
             gen.mtp_hist_stash = null;
             const arrays = try allocator.alloc(mlx.mlx_array, 3);
             for (arrays) |*array| array.* = mlx.mlx_array_new();
@@ -19429,8 +19270,6 @@ test "mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never 
 
     g.mtp = .{ .mimo = undefined };
     try testing.expect(g.mtpLookupAllowed());
-    g.mtp = .{ .qwen = undefined };
-    try testing.expect(!g.mtpLookupAllowed());
     g.mtp = null;
     try testing.expect(!g.mtpLookupAllowed());
     g.mtp = .{ .qwen4 = undefined };

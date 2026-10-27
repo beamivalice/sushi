@@ -12,7 +12,7 @@ Two things shape the layout, both learned the hard way:
    opening.
 
 2. Decode and prefill are different wins on different rows. A sliding trim on a
-   SERIAL arch (laguna, inkling) pays in prefill chunks and leaves decode flat;
+   SERIAL arch pays in prefill chunks and leaves decode flat;
    on a speculative arch (muse, gemma) it pays in the verify block and leaves
    prefill flat. Charting only one of them silently zeroes half the matrix.
 
@@ -37,8 +37,6 @@ ORDER = [
     ("muse-30b-4bit",        "Muse-Glimmer 30B",   "4-bit · sw 2048 · DFlash", False),
     ("gemma4-26b-a4b-4bit",  "Gemma 4 26B-A4B",    "4-bit · sw 1024 · PLD",    False),
     ("gemma4-e4b-4bit",      "Gemma 4 E4B",        "4-bit · sw 512 · drafter", False),
-    ("laguna-xs-nvfp4",      "Laguna XS 2.1",      "NVFP4 · sw 512 · serial",  False),
-    ("inkling-small-2bit",   "Inkling Small",      "2-bit · sw 512 · serial",  False),
     ("qwen36-27b-4bit",      "Qwen 3.6 27B",       "4-bit · no sliding · MTP", True),
     ("qwen36-35b-a3b-oq4",   "Qwen 3.6 35B-A3B",   "oQ4 · no sliding · MTP",   True),
     ("lfm2-2.6b-nvfp4",      "LFM2.5 2.6B",        "NVFP4 · no sliding",       True),

@@ -1119,19 +1119,6 @@ pub fn mimoBatchRowsAttn(
     return out;
 }
 
-// ── Inkling attention (no RoPE: rel-logits bias + k/v short conv) ──
-// Reference: inkling_mlx/attention.py. Per-head q/k RMSNorm with scale
-// 1/head_dim; hybrid sliding(512)/global; the additive mask carries BOTH
-// the hidden-state-conditioned relative-position bias and the
-// causal/sliding constraint; log-scaling on global layers past n_floor
-// (exact no-op below — skipped entirely). k/v projections pass through
-// depthwise causal short-convolutions whose kernel-1 f32 tails ride the
-// per-slot ssm entry (slots 0 and 1 of the layer's concatenated
-// conv_state; the layer tail owns slots 2/3 and the state reassembly).
-
-// ── Gemma 4 Full Attention for MoE layers ──
-// Handles dual head dims, v_norm, sliding window, per-layer RoPE.
-
 pub fn mimoRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     // MiMo routing is defined over f32 activations and f32 router weights,
     // independently of the residual/expert storage dtype.

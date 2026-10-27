@@ -27,7 +27,7 @@ fi
 # Find the first two model dirs with a supported model_type — see
 # tests/_lib_supported_models.sh and src/model_discovery.zig. Picking by
 # config.json existence alone is not enough: a partial download of an
-# unsupported arch (e.g. deepseek_v4) would crash sushi on load.
+# unsupported arch would crash sushi on load.
 source "$(dirname "$0")/_lib_supported_models.sh"
 MODELS=()
 while IFS= read -r m; do MODELS+=("$m"); done < <(list_supported_models "$ROOT" 2)

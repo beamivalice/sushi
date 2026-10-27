@@ -636,11 +636,6 @@ No code from the following was copied into sushi. They were read as
 specifications while writing our own implementations of the same architectures,
 and they are listed because they made that work possible.
 
-  * poolside `modeling_laguna.py` (Apache-2.0), the reference for the `laguna`
-    architecture.
-  * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
-    checkpoints (Apache-2.0), the reference and parity oracle for
-    `inkling_mm_model`.
   * turboderp/exllamav3 (MIT), the EXL3 format. `src/exl3/` re-implements the
     16x16 trellis packing, the MCG and MUL1 decodes, the tensor-core permutation
     and the suh/svh Hadamard from that reference. `src/encoder/` re-implements

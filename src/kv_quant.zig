@@ -1040,7 +1040,7 @@ test "quantAttention GQA 4:1 decode (T_q=1) matches dense SDPA, 4/8-bit" {
     try gqaParityCase(8, 2, 1, 16, 8, "", none);
 }
 
-test "quantAttention GQA 6:1 decode (T_q=1) matches dense SDPA (laguna ratio)" {
+test "quantAttention GQA 6:1 decode (T_q=1) matches dense SDPA (6:1 ratio)" {
     const none = mlx.mlx_array{ .ctx = null };
     try gqaParityCase(48, 8, 1, 24, 8, "", none);
 }

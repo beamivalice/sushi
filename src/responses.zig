@@ -108,8 +108,8 @@ pub const ReasoningConfig = struct {
     enable: bool,
     budget: i32,
     /// The client's raw `reasoning.effort` string, borrowed from the parsed
-    /// request JSON — dsv4-family templates map it into the render
-    /// (`chat.dsv4EffortFor`); null when the request didn't send one.
+    /// request JSON — DeepSeek templates map it into the render
+    /// (`chat.dsv41EffortFor`); null when the request didn't send one.
     effort: ?[]const u8 = null,
 };
 
