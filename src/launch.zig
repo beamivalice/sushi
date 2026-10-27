@@ -319,13 +319,26 @@ fn writeOpencodeReasoning(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
 
 /// OpenCode 2 needs --standalone to receive this process's inline config.
 /// OpenCode 1 has no such flag. Probe CLI support instead of assuming a version.
+/// Several installs can share PATH (npm, ~/.opencode, Homebrew): the newest wins, not the first.
 fn appendOpencodeInvocation(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: []const []const u8) !void {
     try out.appendSlice(allocator,
+        \\autoload -Uz is-at-least
+        \\typeset -A sushi_seen
+        \\sushi_opencode_bin= sushi_opencode_ver=
+        \\for b in $(whence -ap opencode); do
+        \\  (( ${+sushi_seen[${b:A}]} )) && continue
+        \\  sushi_seen[${b:A}]=1
+        \\  [[ $("$b" --version 2>&1) =~ '[0-9]+\.[0-9]+\.[0-9]+' ]] && v=$MATCH || v=0
+        \\  if [[ -z $sushi_opencode_bin ]] || ! is-at-least $v $sushi_opencode_ver; then
+        \\    sushi_opencode_bin=$b sushi_opencode_ver=$v
+        \\  fi
+        \\done
+        \\if [[ -z $sushi_opencode_bin ]]; then echo "opencode is not installed" >&2; exit 127; fi
         \\sushi_opencode_flags=()
-        \\if opencode --help 2>&1 | grep -q -- '--standalone'; then
+        \\if "$sushi_opencode_bin" --help 2>&1 | grep -q -- '--standalone'; then
         \\  sushi_opencode_flags=(--standalone)
         \\fi
-        \\opencode
+        \\"$sushi_opencode_bin"
     );
     if (extras.len > 0 and extras[0].len > 0 and extras[0][0] != '-') {
         try out.append(allocator, ' ');
@@ -1446,14 +1459,70 @@ test "opencode script: optional --standalone follows the subcommand, the model r
     const b = budgetForContext(1048576);
     const tui = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{});
     defer t.allocator.free(tui);
-    try t.expect(std.mem.indexOf(u8, tui, "\nopencode \"${sushi_opencode_flags[@]}\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, tui, "\n\"$sushi_opencode_bin\" \"${sushi_opencode_flags[@]}\"\n") != null);
     try t.expect(std.mem.indexOf(u8, tui, "--model") == null);
     const run = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{ "run", "read it's" });
     defer t.allocator.free(run);
-    try t.expect(std.mem.indexOf(u8, run, "\nopencode 'run' \"${sushi_opencode_flags[@]}\" 'read it'\\''s'\n") != null);
+    try t.expect(std.mem.indexOf(u8, run, "\n\"$sushi_opencode_bin\" 'run' \"${sushi_opencode_flags[@]}\" 'read it'\\''s'\n") != null);
     const flag = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{"--continue"});
     defer t.allocator.free(flag);
-    try t.expect(std.mem.indexOf(u8, flag, "\nopencode \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
+    try t.expect(std.mem.indexOf(u8, flag, "\n\"$sushi_opencode_bin\" \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
+}
+
+/// Runs the opencode launch script under `zsh -f` with fake `opencode`s, each spec `dir|--version output|--help
+/// output`, on PATH in the order given. Returns what the chosen fake logged.
+fn runOpencodeFakes(extras: []const []const u8, specs: []const []const u8, exit_code: u8) ![]u8 {
+    const script = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", FALLBACK_BUDGET, "{}", extras);
+    defer t.allocator.free(script);
+    const setup =
+        \\d=$(mktemp -d); trap 'rm -rf $d' EXIT
+        \\pdirs=()
+        \\for spec in "$@"; do
+        \\  f=("${(@s:|:)spec}")
+        \\  mkdir $d/$f[1]; pdirs+=($d/$f[1])
+        \\  print -r -- "#!/bin/sh
+        \\case \$1 in --version) echo '$f[2]';; --help) echo '$f[3]';; *) echo \"picked $f[1] \$*\" >> $d/log;; esac" > $d/$f[1]/opencode
+        \\  chmod +x $d/$f[1]/opencode
+        \\done
+        \\PATH="${(j.:.)pdirs}:/usr/bin:/bin"
+        \\
+    ;
+    const full = try std.mem.concat(t.allocator, u8, &.{ setup, script, "\ncat $d/log\n" });
+    defer t.allocator.free(full);
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(t.allocator);
+    try argv.appendSlice(t.allocator, &.{ "/bin/zsh", "-f", "-c", full, "sushi-test" });
+    try argv.appendSlice(t.allocator, specs);
+    const r = try std.process.run(t.allocator, t.io, .{ .argv = argv.items });
+    defer t.allocator.free(r.stderr);
+    errdefer t.allocator.free(r.stdout);
+    try t.expectEqual(exit_code, r.term.exited);
+    return r.stdout;
+}
+
+test "opencode script: the newest opencode on PATH launches, whichever comes first" {
+    const old = "old|1.4.2|usage: opencode [options]";
+    const new = "new|opencode v2.0.18|usage: opencode --standalone";
+    for ([_][2][]const u8{ .{ old, new }, .{ new, old } }) |order| {
+        const out = try runOpencodeFakes(&.{ "run", "hi" }, &order, 0);
+        defer t.allocator.free(out);
+        try t.expectEqualStrings("picked new run --standalone hi\n", out);
+    }
+    // Versions compare by number, not by text: 10.0.0 outranks 9.9.9.
+    const out = try runOpencodeFakes(&.{}, &.{ "nine|9.9.9|", "ten|10.0.0|" }, 0);
+    defer t.allocator.free(out);
+    try t.expectEqualStrings("picked ten \n", out);
+}
+
+test "opencode script: an unreadable version still launches when it is the only opencode, and none exits 127" {
+    const only = try runOpencodeFakes(&.{}, &.{"odd|not a version|"}, 0);
+    defer t.allocator.free(only);
+    try t.expectEqualStrings("picked odd \n", only);
+    const ranked = try runOpencodeFakes(&.{}, &.{ "odd|not a version|", "old|1.4.2|" }, 0);
+    defer t.allocator.free(ranked);
+    try t.expectEqualStrings("picked old \n", ranked);
+    const none = try runOpencodeFakes(&.{}, &.{}, 127);
+    defer t.allocator.free(none);
 }
 
 test "grok names" {

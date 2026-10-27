@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`sushi launch opencode` runs the newest opencode**: with an older opencode ahead of a newer one on PATH, the launcher started the older; it now picks the highest version installed.
 - **`--model` and `sushi run` accept a relative path**: `sushi serve --model ./pack` used to fail with `ExpertLayoutUnsupported` (or lose expert streaming detection) unless the path was absolute; it is now resolved against the current directory at launch.
 
 ## v1.4.0 — DeepSeek-V4.1-Flash, Qwen STQ 2.75bpw, sushi bench
