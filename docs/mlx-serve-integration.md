@@ -84,7 +84,7 @@ same commits: MLX 64ea011 (v0.32.3) and mlx-c 56b2d39. Move both pins together.
 
 ## Recommended pin
 
-sushi v1.3.0 (8e4c0af1), proposed in ddalcu/mlx-serve#933; mlx-serve main pins v1.2.4 (0bc61aa6) until it merges.
+sushi v1.4.0 (90bee8d9), proposed in ddalcu/mlx-serve#933; mlx-serve main pins v1.2.4 (0bc61aa6) until it merges.
 mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#768. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
@@ -96,6 +96,8 @@ mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#76
   row, and a decode lane that reads its third word through two 32-bit funnels; both bit-identical and additive.
 - v1.3.0 adds `moeRagged` over a `Ragged` bank, the STQ format's experts split into rate groups with their own
   bit rates, and `shardStampAgrees` for the named codebook table; additive, mlx-serve calls none of them yet.
+- v1.4.0 adds `linear` (trellis-coded dense linears, the STQ trunk) and `parseQuantBlock` for any `expert_quant`-shaped
+  block; additive, mlx-serve calls neither yet.
 
 ## Handing a new engine to mlx-serve
 
