@@ -44,27 +44,32 @@ GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MT
 with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
 The Qwen columns are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 0.2 GiB off each Qwen cell.
 
-| context | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+| context | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | DeepSeek-STQ-1.75bpw ‡ | GLM-2bpw | GLM-2.4bpw |
 |---|---:|---:|---:|---:|---:|---:|
-| weights only | 35.2 | 46.4 | 63.9 | 89.7 | 78.3 | 89.8 |
-| 128k | 40.3 | 51.4 | 69.0 | 93.7 | 82.6 | 94.1 |
-| 256k | 43.2 | 54.3 | 71.9 | 95.8 | 83.8 | 95.2 |
-| 512k | 48.2 | 59.4 | 76.9 | 99.9 | 86.0 | 97.5 |
-| 1M | 58.4 | 69.5 | 87.1 | 108.2 | 90.5 | 102.0 |
+| weights only | 35.2 | 46.4 | 63.9 | 108.0 | 78.3 | 89.8 |
+| 128k | 40.3 | 51.4 | 69.0 | 110.0 | 82.6 | 94.1 |
+| 256k | 43.2 | 54.3 | 71.9 | 110.3 | 83.8 | 95.2 |
+| 512k | 48.2 | 59.4 | 76.9 | 111.0 | 86.0 | 97.5 |
+| 1M | 58.4 | 69.5 | 87.1 | 112.5 | 90.5 | 102.0 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
 the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no
 4-bit KV):
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+| Mac | GPU limit | Sushi-2bpw | Sushi-STQ-2.75bpw | Sushi-4bpw | DeepSeek-STQ-1.75bpw ‡ | GLM-2bpw | GLM-2.4bpw |
 |---|---|---|---|---|---|---|---|
 | 48 GB † | 43,000 MB (42.0 GiB) | 200k / 304k | — | — | — | — | — |
 | 64 GB † | 59,000 MB (57.6 GiB) | 976k / 1M | 416k / 664k | — | — | — | — |
-| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | — | 696k / — | — |
-| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — |
+| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 696k / — | — |
+| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — | 1M / — |
 
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
 less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-STQ-2.75bpw) at 64 GB.
+
+‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every Mac, so its memory is the `--ssd-budget-gb` you
+set plus the request's own bill: the first table is at `--ssd-budget-gb 108`, the bill measured from 4k to 128k (1.6 GiB
+plus 2.8 KB a token) and extended to 1M. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac and at `80` on a 96 GB Mac
+with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)).
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
