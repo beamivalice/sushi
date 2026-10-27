@@ -98,7 +98,7 @@ The protocol, fixed for every model and release:
   arm is Pride and Prejudice (`src/fixtures/prose_pride_and_prejudice.txt`, Project Gutenberg #1342, public domain, header
   and footer removed): speculative decoding accepts fewer tokens on prose than on code (1.95 against 2.9 a round on a 209k
   DSpark trace), so code decode alone flatters it. Each is tokenized through the server's `/tokenize`, sent as token ids
-  on `/v1/completions`: greedy, `ignore_eos`, 512 decoded tokens, the server's default speculative mode (the
+  on `/v1/completions`: greedy, `ignore_eos`, 256 decoded tokens on the code arm and 128 on the prose arm, the server's default speculative mode (the
   `[spec-stats] mode=` lines of each request name it in the report). One `sushi bench` run does the code arm, then the
   prose arm, each with the whole schedule below, on one server and one private prefix-cache directory: the two prompts
   share no prefix, so the prose arm's 4k request is cold. It is not expert-cache cold: the code arm has run before it.

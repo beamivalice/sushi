@@ -40,7 +40,7 @@ pub const USAGE =
     \\  --report <path>        Write the docs/bench/v<ver>/<model>.md report here
     \\  --version <ver>        Release version for the report title
     \\  --stamp <text>         Header lines for the report (commit, binary, hardware); \n separates lines
-    \\  --decode-tokens <n>    Tokens decoded per sample (default 512)
+    \\  --decode-tokens <n>    Tokens decoded per code-arm sample (default 256; the prose arm decodes at most 128)
     \\  --help                 Show this help
     \\
 ;
@@ -54,7 +54,7 @@ pub const Options = struct {
     report: []const u8 = "",
     version: []const u8 = "",
     stamp: []const u8 = "",
-    decode_tokens: u32 = 512,
+    decode_tokens: u32 = 256,
 };
 
 pub const ParseError = error{ UnknownArgument, MissingValue, BadValue, MissingRequired };
@@ -225,6 +225,13 @@ fn isRung(len: usize) bool {
 
 /// The 4k cold request, then every 8192-token window; a rung is followed by its two repeats at once so
 /// a checkpoint cap cannot thin the point a repeat restores.
+/// The prose arm decodes half the code arm's tokens a sample: its rounds are the slowest of the run.
+pub const prose_decode_tokens: u32 = 128;
+
+pub fn armDecodeTokens(arm: Arm, decode_tokens: u32) u32 {
+    return if (arm == .prose) @min(decode_tokens, prose_decode_tokens) else decode_tokens;
+}
+
 pub fn plan(allocator: std.mem.Allocator, decode_tokens: u32) ![]Request {
     var list: std.ArrayList(Request) = .empty;
     errdefer list.deinit(allocator);
@@ -633,11 +640,11 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
     if (rep.aborted.len > 0) try w.print("**Aborted, not a measurement:** {s}\n\n", .{rep.aborted});
     try gpu_clock.writeRunHeader(w, rep.clock);
     try w.print(
-        "Protocol: token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample. The code arm is one fixed seeded TypeScript corpus; " ++
+        "Protocol: token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample ({d} on prose). The code arm is one fixed seeded TypeScript corpus; " ++
             "the prose arm is Pride and Prejudice (public domain), where speculative acceptance is lower. " ++
             "Each arm runs in turn on the same server: the 4k request is cold; each later request restores the previous prompt-end point. A decode rung's samples 2 and 3 run right after its ladder request, and the first request counts. " ++
             "The server's own prefill time, the restore time (logged apart) taken out; TTFT is the request wall time minus its decode time. The server's default speculative mode stays on.",
-        .{rep.decode_tokens},
+        .{ rep.decode_tokens, armDecodeTokens(.prose, rep.decode_tokens) },
     );
     if (rep.cooldown) |c| {
         try w.print(" The server idled {d} s between the arms (", .{c.waited_s});
@@ -872,7 +879,6 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         model = parsed.value.data[0].id;
     }
 
-    const reqs = try plan(a, opts.decode_tokens);
     var samples: std.ArrayList(Sample) = .empty;
     const url = try std.fmt.allocPrint(a, "{s}/v1/completions", .{base});
     var log_len: usize = (try readLog(a, io, opts.log_path)).len;
@@ -900,6 +906,7 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
             },
         }
         log.info("[bench] {s} corpus: {d} tokens, model {s}\n", .{ @tagName(arm), ids.items.len, model });
+        const reqs = try plan(a, armDecodeTokens(arm, opts.decode_tokens));
         for (reqs) |req| {
             const s = try runRequest(a, io, &client, url, model, opts.log_path, ids.items, req, arm, &log_len, sampler);
             try samples.append(a, s);
@@ -944,7 +951,7 @@ test "bench args: defaults, every flag, and a refusal for the rest" {
     const o = try parseArgs(&.{ "--out", "/tmp/o", "--log", "/tmp/l", "--decode-tokens", "256", "--url", "127.0.0.1:9", "--version", "1.4.0" });
     try testing.expectEqual(@as(u32, 256), o.decode_tokens);
     try testing.expectEqualStrings("127.0.0.1:9", o.url);
-    try testing.expectEqual(@as(u32, 512), (try parseArgs(&.{ "--out", "o", "--log", "l" })).decode_tokens);
+    try testing.expectEqual(@as(u32, 256), (try parseArgs(&.{ "--out", "o", "--log", "l" })).decode_tokens);
     try testing.expectError(error.UnknownArgument, parseArgs(&.{ "--out", "o", "--log", "l", "--fast" }));
     try testing.expectError(error.MissingValue, parseArgs(&.{ "--out", "o", "--log" }));
     try testing.expectError(error.BadValue, parseArgs(&.{ "--out", "o", "--log", "l", "--decode-tokens", "0" }));
@@ -1065,6 +1072,12 @@ test "bench wire: a completion's timings, and a reply without them is refused" {
     try testing.expectApproxEqAbs(@as(f64, 4000.5), c.prompt_ms, 0.001);
     try testing.expectError(error.NoTimings, parseCompletion(a, "{\"usage\":{}}"));
     try testing.expect(!c.loop_stop);
+}
+
+test "bench plan: the prose arm decodes at most 128 tokens a sample, the code arm what was asked" {
+    try testing.expectEqual(@as(u32, 256), armDecodeTokens(.code, 256));
+    try testing.expectEqual(@as(u32, 128), armDecodeTokens(.prose, 256));
+    try testing.expectEqual(@as(u32, 64), armDecodeTokens(.prose, 64));
 }
 
 test "bench wire: a loop stop is read from the choice's finish_details" {

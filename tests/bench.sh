@@ -25,7 +25,7 @@ LOCK="$ROOT/scripts/gpu-lock.sh"
 TAG="$(date +%Y%m%d-%H%M%S)"
 VERSION=""
 PORT=11250
-DECODE_TOKENS=512
+DECODE_TOKENS=256
 PACK=""
 SERVER_FLAGS=()
 
