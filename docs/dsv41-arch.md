@@ -193,6 +193,9 @@ Other pieces:
   dequantized at their layer, bit-identical to rows read there.
 - The next chunk's Engram rows are read during this one, once this chunk's own are in RAM, so layer 1 of the next chunk
   finds its rows already read; a repeated row id in a batch is read once. Both are bit-identical to reading at the layer.
+  Measured at bf21aa5e against 646ec552 (sushi bench, STQ 1.75bpw, `--ssd-budget-gb 108`, debug log, one A then one B): the prose
+  arm's Engram wait per 2048-row chunk fell from 225 ms to 1.2 ms (median), its 0-128k cold prefill from 770 to 815 tok/s
+  (8k windows +5-10%); code, whose n-grams hit the row cache, waited 1 ms before and is unchanged (911 vs 909 tok/s).
 - Attention runs each span and each attention or FFN block in its own scope, so MLX frees the f32 gathers and logits
   copies between spans.
 
