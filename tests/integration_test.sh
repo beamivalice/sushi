@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-MODEL_DIR="${1:-${SUSHI_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}}"
+MODEL_DIR="${1:-${SUSHI_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}}"
 PORT="${2:-8095}"
 BASE="http://localhost:$PORT"
 BINARY="./zig-out/bin/sushi"

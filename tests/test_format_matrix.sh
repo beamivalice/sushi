@@ -47,9 +47,9 @@ NC='\033[0m'
 
 # logical|display|path|has_thinking|extra server flags
 MODELS=(
-    "qwen4_exp|Qwen3.8 Flash-Next (think tags + XML tools)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|yes|"
+    "qwen4_exp|Qwen3.8 Flash-Next (think tags + XML tools)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}|yes|"
     "mimo_v2|MiMo-V2.6-Flash (EXL3 experts)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}|yes|--no-vision"
-    "deepseek_v41|DeepSeek-V4.1-Flash (DSML tools, streamed experts)|${DSV41_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/deepseek-ai/DeepSeek-V4.1-Flash-1017}|yes|--ssd-budget-gb ${DSV41_SSD_BUDGET_GB:-88}"
+    "deepseek_v41|DeepSeek-V4.1-Flash (DSML tools, streamed experts)|${DSV41_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw}|yes|--ssd-budget-gb ${DSV41_SSD_BUDGET_GB:-96}"
 )
 
 # FORMAT_MODELS=csv filter of logical names. Unknown names simply match

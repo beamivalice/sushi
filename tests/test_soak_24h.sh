@@ -27,7 +27,7 @@ set -e
 
 SOAK_DURATION_HOURS="${SOAK_DURATION_HOURS:-24}"
 PORT="${PORT:-8095}"
-MODEL="${SOAK_MODEL:-${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}}"
+MODEL="${SOAK_MODEL:-${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}}"
 BASE="http://127.0.0.1:$PORT"
 LOG_DIR="${SOAK_LOG_DIR:-./tests}"
 SAMPLE_LOG="$LOG_DIR/soak_log.csv"

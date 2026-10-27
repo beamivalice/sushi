@@ -21,7 +21,7 @@
 # Any chat model works; defaults to the Flash-Next EXL3 pack. SKIPs without one.
 set -uo pipefail
 
-MODEL="${LOGPROBS_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${LOGPROBS_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11293}"
 BIN="${BINARY:-./zig-out/bin/sushi}"
 BASE="http://127.0.0.1:$PORT"

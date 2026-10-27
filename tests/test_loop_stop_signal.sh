@@ -23,14 +23,14 @@
 # Needs any chat model — the prompt loops on all of them. Point LOOP_TEST_MODEL
 # at a small one to keep this cheap.
 #
-# Usage: LOOP_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw \
+# Usage: LOOP_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw \
 #          ./tests/test_loop_stop_signal.sh [port]
 
 set -u
 
 PORT="${1:-11266}"
 BINARY="${BINARY:-./zig-out/bin/sushi}"
-MODEL="${LOOP_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${LOOP_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PASS=0
 FAIL=0
 

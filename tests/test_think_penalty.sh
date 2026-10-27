@@ -10,9 +10,9 @@
 #   3. STREAM == NON-STREAM on every request.
 #
 # Usage: THINK_TEST_MODEL=<qwen4_exp pack> ./tests/test_think_penalty.sh [port]
-# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw.
+# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw.
 set -u
-MODEL="${THINK_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${THINK_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11317}"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
 LAMBDA="${THINK_TEST_LAMBDA:-2}"

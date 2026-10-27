@@ -9,7 +9,7 @@
 #   SMOKE_ARCHES=qwen4_exp ./tests/test_smoke_matrix.sh
 #   SMOKE_CONFIGS=default,kv4 ./tests/test_smoke_matrix.sh
 #   SMOKE_MAX_GB=80 ./tests/test_smoke_matrix.sh  # skip bigger packs (default: no cap)
-#   QWEN4_EXP_MODEL=<pack> MIMO_STREAM_MODEL=<pack> MIMO_SSD_BUDGET_GB=60 DSV41_MODEL=<pack> DSV41_SSD_BUDGET_GB=88
+#   QWEN4_EXP_MODEL=<pack> MIMO_STREAM_MODEL=<pack> MIMO_SSD_BUDGET_GB=60 DSV41_MODEL=<pack> DSV41_SSD_BUDGET_GB=96
 #
 # Configs: default (kv8) | off (--kv-quant off) | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
 # where the pack ships a head and does not stream) | nospec (--no-mtp
@@ -33,9 +33,9 @@ mkdir -p "$OUT/home"
 
 # arch|thinking(yes/no)|candidate paths (first that exists wins)
 ARCHES=(
-    "qwen4_exp|yes|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+    "qwen4_exp|yes|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
     "mimo_v2|yes|${MIMO_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
-    "deepseek_v41|yes|${DSV41_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/deepseek-ai/DeepSeek-V4.1-Flash-1017}"
+    "deepseek_v41|yes|${DSV41_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw}"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,off,kv4,mtp,nospec}"
 
@@ -183,7 +183,12 @@ for l in sys.stdin:
     for ch in json.loads(l[6:]).get("choices",[]):
         t+=ch.get("text") or ""
 print(repr(t))' 2>/dev/null)
-    check "ignore_eos: completion stream == non-stream bytes" "$([[ -n "$c" && "$c" == "$rc" ]] && echo 0 || echo 1)" "ns=${c:0:120} st=${rc:0:120}"
+    if [[ "$arch" == deepseek_v41 && "$cfg" == default ]]; then
+        # Two greedy DSpark runs may differ (docs/dsv41-arch.md#dspark); the nospec cell checks the bytes.
+        skip "ignore_eos: completion stream == non-stream bytes" "adaptive DSpark text differs run to run"
+    else
+        check "ignore_eos: completion stream == non-stream bytes" "$([[ -n "$c" && "$c" == "$rc" ]] && echo 0 || echo 1)" "ns=${c:0:120} st=${rc:0:120}"
+    fi
     r=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
         -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"ignore_eos\":true}")
     check "ignore_eos: chat refuses it with a 400" "$([[ "$r" == 400 ]] && echo 0 || echo 1)" "status=$r"
@@ -265,7 +270,7 @@ for entry in "${ARCHES[@]}"; do
     arch_flags=()
     [[ "$arch" == mimo_v2 ]] && arch_flags=(${MIMO_SSD_BUDGET_GB:+--ssd-budget-gb "$MIMO_SSD_BUDGET_GB"})
     # Its routed experts always stream, so the budget is required; its KV is not a KV cache, so only default and nospec differ.
-    [[ "$arch" == deepseek_v41 ]] && arch_flags=(--ssd-budget-gb "${DSV41_SSD_BUDGET_GB:-88}")
+    [[ "$arch" == deepseek_v41 ]] && arch_flags=(--ssd-budget-gb "${DSV41_SSD_BUDGET_GB:-96}")
 
     for cfg in "${WANT_CFG[@]}"; do
         CELL="$arch.$cfg"

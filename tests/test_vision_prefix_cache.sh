@@ -12,7 +12,7 @@
 # text-only turn re-places the earlier image and restores its rows from the
 # cache rather than dropping it.
 set -u
-MODEL="${VISION_CACHE_MODEL:-${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}}"
+MODEL="${VISION_CACHE_MODEL:-${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}}"
 PORT="${2:-11419}"
 BIN="${SUSHI_BIN:-./zig-out/bin/sushi}"
 LOG="$HOME/.sushi/runs/vision-cache/server-$PORT.log"

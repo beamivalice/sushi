@@ -9,7 +9,7 @@
 # Usage: ./tests/test_tool_parsing.sh [model_dir] [port]
 # Starts its own server, runs tests, kills it.
 
-MODEL_DIR=${1:-${SUSHI_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}}
+MODEL_DIR=${1:-${SUSHI_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}}
 PORT=${2:-8097}
 BASE="http://127.0.0.1:$PORT"
 BINARY="./zig-out/bin/sushi"

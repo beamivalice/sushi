@@ -16,7 +16,7 @@ import sys
 import time
 import urllib.request
 
-MODEL_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("SUSHI_MODELS_DIR", os.path.expanduser("~/.sushi/models")), "Qwen3.8-Flash-Next-Sushi-3bpw")
+MODEL_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("SUSHI_MODELS_DIR", os.path.expanduser("~/.sushi/models")), "Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw")
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8095
 STREAM = bool(int(sys.argv[3])) if len(sys.argv) > 3 else False
 BASE = f"http://127.0.0.1:{PORT}"

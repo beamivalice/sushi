@@ -32,7 +32,7 @@ MODELS_DIR="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
 if [ $# -gt 0 ]; then
     PACKS=("$@")
 else
-    PACKS=("${QWEN_MODEL:-$MODELS_DIR/Qwen3.8-Flash-Next-Sushi-3bpw}" "${MIMO_MODEL:-$MODELS_DIR/MiMo-V2.6-Flash-Sushi-2.3bpw}")
+    PACKS=("${QWEN_MODEL:-$MODELS_DIR/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}" "${MIMO_MODEL:-$MODELS_DIR/MiMo-V2.6-Flash-Sushi-2.3bpw}")
 fi
 PORT="${PORT:-19141}"
 BIN="${BINARY:-./zig-out/bin/sushi}"

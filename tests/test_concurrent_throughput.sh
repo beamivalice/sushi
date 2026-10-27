@@ -18,7 +18,7 @@
 # Requires:
 #   - A built sushi binary
 #   - Either CONCURRENT_TEST_MODEL set or default at
-#     ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw
+#     ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw
 #
 # Usage:
 #   CONCURRENT_TEST_MODEL=/path/to/model ./tests/test_concurrent_throughput.sh [port]
@@ -32,7 +32,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${CONCURRENT_TEST_MODEL:-${PLD_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}}"
+MODEL="${CONCURRENT_TEST_MODEL:-${PLD_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}}"
 MAX_TOKENS=${MAX_TOKENS:-200}
 SPEEDUP_THRESHOLD=${SPEEDUP_THRESHOLD:-1.6}
 N_PARALLEL=${N_PARALLEL:-4}
@@ -40,7 +40,7 @@ N_PARALLEL=${N_PARALLEL:-4}
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_concurrent_throughput: model directory not found."
     echo "  Set CONCURRENT_TEST_MODEL or place an MLX checkpoint at"
-    echo "  ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw"
+    echo "  ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
     exit 0
 fi
 

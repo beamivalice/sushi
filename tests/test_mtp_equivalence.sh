@@ -28,7 +28,7 @@
 #      and matches too; a seeded sampled copy is the same bytes streamed.
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
-# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw. A standalone
+# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw. A standalone
 # sidecar (every mtp.sidecar_rel_paths location) or a sharded/monolithic
 # checkpoint carrying one of mtp_marker_keys works.
 # Calibrated auto-depth surfaces can additionally pin their live dispatch arm:
@@ -46,7 +46,7 @@
 # must be byte-identical to --no-mtp. Its copy task runs prompt-lookup rounds as Qwen's does.
 
 set -u
-MODEL="${MTP_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${MTP_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11313}"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
 EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"

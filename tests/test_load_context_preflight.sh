@@ -4,7 +4,7 @@
 # Owns one GPU-lock run; checks warmup memory, not timing. Silent on success.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 exec python3 - "$ROOT" "$MODEL" "${2:-12484}" "${3:-startup}" "${4:---mtp}" <<'PY'
 import json
 import os

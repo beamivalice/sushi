@@ -26,7 +26,7 @@ set -u
 
 PORT="${1:-11487}"
 BINARY="${BINARY:-./zig-out/bin/sushi}"
-MODEL="${INTERLEAVE_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${INTERLEAVE_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 WORK="${INTERLEAVE_TEST_OUTPUT_DIR:-$(mktemp -d)}"
 mkdir -p "$WORK"
 SHARE_ONLY="${INTERLEAVE_SHARE_ONLY:-0}"

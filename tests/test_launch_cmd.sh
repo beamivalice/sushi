@@ -22,7 +22,7 @@
 
 set -u
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}
+MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
 PORT=${2:-8097}
 BASE="http://127.0.0.1:$PORT"
 BIN=./zig-out/bin/sushi

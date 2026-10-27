@@ -42,7 +42,7 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 # logical|display|path|pi_case|probe_timeout_s|extra server flags
 # pi_case must exist in pi_integration_run.sh's html matrix; empty = no pi layer.
 MODELS=(
-    "qwen4_exp|Qwen3.8 Flash-Next (qwen4_exp)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|html-qwen4|240|"
+    "qwen4_exp|Qwen3.8 Flash-Next (qwen4_exp)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}|html-qwen4|240|"
     "mimo_v2|MiMo-V2.6-Flash EXL3 (mimo_v2)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}|html-mimo|240|--no-vision"
 )
 

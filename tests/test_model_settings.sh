@@ -19,7 +19,7 @@ BIN="$ROOT/zig-out/bin/sushi"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
 MODELS_ROOT="${MODELS_ROOT:-$HOME/.sushi/models}"
-MODEL_A="${MODEL_A:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL_A="${MODEL_A:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 MODEL_B="${MODEL_B:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-4bpw}"
 STREAM_MODEL="${STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen/Qwen3.8-Flash-Next}"
 if [ ! -f "$MODEL_A/config.json" ] || [ ! -f "$MODEL_B/config.json" ]; then

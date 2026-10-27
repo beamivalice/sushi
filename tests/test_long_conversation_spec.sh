@@ -22,7 +22,7 @@
 # the next request — the conversation gets monotonically longer as we go.
 #
 # Defaults:
-#   model = ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw
+#   model = ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw
 #   N = 12 turns of ~50-token unique content (more than enough to cross 512)
 #
 # Usage:
@@ -38,7 +38,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${LONG_CONV_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${LONG_CONV_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 DRAFTER="${LONG_CONV_TEST_DRAFTER:-}"
 
 if [ ! -d "$MODEL" ]; then

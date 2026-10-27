@@ -31,7 +31,7 @@
 #
 # Requires:
 #   - A built sushi binary (zig build -Doptimize=ReleaseFast)
-#   - KEEPALIVE_TEST_MODEL or ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw
+#   - KEEPALIVE_TEST_MODEL or ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw
 #
 # Usage: ./tests/test_stream_keepalive.sh [port]
 
@@ -43,7 +43,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${KEEPALIVE_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${KEEPALIVE_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_stream_keepalive: model directory not found ($MODEL)."
     exit 0

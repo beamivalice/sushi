@@ -14,7 +14,7 @@
 
 set -u
 
-MODEL_A=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}
+MODEL_A=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
 MODEL_B=${2:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}
 PORT=${3:-8121}
 BASE="http://127.0.0.1:$PORT"

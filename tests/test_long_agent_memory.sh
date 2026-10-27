@@ -45,7 +45,7 @@ set -u
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"
-MODEL="${LONG_AGENT_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${LONG_AGENT_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 DRAFTER="${LONG_AGENT_TEST_DRAFTER:-}"
 
 RED='\033[0;31m'

@@ -14,7 +14,7 @@ intermediate → our impl" pattern used for the Gemma 4 vision and MTP parity te
 
 Usage:
   python3 tests/build_qwen_vision_fixture.py \
-      --model ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw \
+      --model ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw \
       --image tests/fixtures/house.jpeg \
       --out   /tmp/qwen_vision_fixture
 """

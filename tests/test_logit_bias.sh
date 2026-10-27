@@ -1,7 +1,7 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
 set -euo pipefail
-MODEL="${LOGIT_BIAS_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${LOGIT_BIAS_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11318}"
 MODE="${2:-both}"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"

@@ -14,7 +14,7 @@
 set -u
 PORT="${1:-11441}"
 BASE="http://127.0.0.1:$PORT"
-MODEL_A="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw"
+MODEL_A="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
 MODEL_B="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-2bpw"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'

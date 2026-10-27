@@ -12,7 +12,7 @@
 #
 # Usage: MODEL=<dir> ./tests/test_shutdown_midstream.sh [port] [iterations]
 set -u
-MODEL="${MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11455}"
 ITERS="${2:-8}"
 BIN="./zig-out/bin/sushi"

@@ -13,10 +13,10 @@
 #   4. A penalised request beside a concurrent unpenalised neighbour: both keep their solo bytes.
 #
 # Usage: PENALTY_TEST_MODEL=<pack> ./tests/test_penalty_paths.sh [port]
-# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw. SUSHI_TEST_EXTRA_ARGS adds server flags
+# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw. SUSHI_TEST_EXTRA_ARGS adds server flags
 # (a streamed pack: `--ssd-budget-gb 18`).
 set -u
-MODEL="${PENALTY_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MODEL="${PENALTY_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11319}"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
 EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"
