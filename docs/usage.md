@@ -47,7 +47,7 @@ Below it the pack is labelled `may stream (--ssd-budget-gb)`: it may still run w
 ([README, Streaming](../README.md#streaming)), and nothing promises it does.
 `sushi pull` prints that warning before it downloads a pack below its tier, then pulls anyway. A pack whose repo
 Hugging Face does not return yet is listed as `(not yet published)` and `sushi pull` of it says so. That includes a
-private repo (DeepSeek's today) for anyone without access; a user granted access sees its size and pulls it after
+private repo for anyone without access; a user granted access sees its size and pulls it after
 `hf auth login` or with `HF_TOKEN`: both commands send `HF_TOKEN`, else the token file `hf auth login` saved
 (`HF_TOKEN_PATH`, else `$HF_HOME/token`, else `~/.cache/huggingface/token`).
 
