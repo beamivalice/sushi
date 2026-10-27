@@ -14,6 +14,11 @@ name: CI
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      test_filter:
+        description: "Only the tests whose name contains one of these ';'-separated substrings (empty: the whole suite)"
+        required: false
+        default: ""
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -94,4 +99,10 @@ jobs:
         run: bash tests/test_mlx_staged_nax.sh
 
       - name: Run Zig tests
-        run: zig build test -Doptimize=ReleaseFast --summary all
+        env:
+          TEST_FILTER: ${{ inputs.test_filter }}
+        run: |
+          args=()
+          IFS=';' read -ra parts <<< "${TEST_FILTER:-}"
+          for p in ${parts[@]+"${parts[@]}"}; do [ -n "$p" ] && args+=("-Dtest-filter=$p"); done
+          zig build test -Doptimize=ReleaseFast --summary all ${args[@]+"${args[@]}"}

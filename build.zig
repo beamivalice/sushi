@@ -158,7 +158,7 @@ pub fn build(b: *std.Build) void {
     test_mod.linkFramework("Metal", .{});
     test_mod.linkFramework("IOSurface", .{});
 
-    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    const test_filter = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat for several)");
     const qwen_preprocess_fixture = b.option(
         []const u8,
         "qwen-preprocess-fixture",
@@ -168,7 +168,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     // A filtered run stays one binary: bucket filters OR with the user's, they cannot narrow it.
     const unit_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
-        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .root_module = test_mod, .filters = &.{f} })}) catch @panic("OOM")
+        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .root_module = test_mod, .filters = f })}) catch @panic("OOM")
     else
         addTestBuckets(b, test_mod);
     for (unit_tests) |unit_test| {
@@ -185,7 +185,7 @@ pub fn build(b: *std.Build) void {
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
     const exl3_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
-        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .name = "exl3-test", .root_module = exl3_test_mod, .filters = &.{f} })}) catch @panic("OOM")
+        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .name = "exl3-test", .root_module = exl3_test_mod, .filters = f })}) catch @panic("OOM")
     else
         addExl3TestBins(b, exl3_test_mod);
     for (exl3_tests) |exl3_test| {
@@ -197,7 +197,7 @@ pub fn build(b: *std.Build) void {
     const encoder_tests = b.addTest(.{
         .name = "encoder-test",
         .root_module = encoder_mod,
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filter orelse &.{},
     });
     test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
     test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
