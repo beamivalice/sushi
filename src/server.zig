@@ -617,6 +617,11 @@ fn mtpCapable(lm: *LoadedModel) bool {
     return lm.mtp != null;
 }
 
+/// DSpark verifies each row under that row's grammar mask, so a constrained request may speculate with it.
+fn rowMaskedDrafter(lm: *LoadedModel) bool {
+    return if (lm.mtp) |head| head == .dsv41 else false;
+}
+
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
 /// per surface after tokenization; a machine limit, so it outranks an explicit `enable_mtp:true`.
 fn admitMtpForCtx(enable_mtp: bool, prompt_tokens: usize) bool {
@@ -10334,6 +10339,7 @@ fn handleChatCompletions(
                     sc.deferWithProtocol(&schema_proto);
                     deferred = schema_proto.startState().phase != .json_body;
                 }
+                sc.constraint.row_masks = rowMaskedDrafter(lm);
                 sampling.constraint = &sc.constraint;
                 if (deferred) {
                     log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
@@ -17162,6 +17168,7 @@ fn handleAnthropicMessages(
                     sc.deferWithProtocol(&schema_proto);
                     deferred = schema_proto.startState().phase != .json_body;
                 }
+                sc.constraint.row_masks = rowMaskedDrafter(lm);
                 sampling.constraint = &sc.constraint;
                 if (deferred) {
                     log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
@@ -18865,6 +18872,7 @@ fn handleResponsesInner(
                     sc.deferWithProtocol(&schema_proto);
                     deferred = schema_proto.startState().phase != .json_body;
                 }
+                sc.constraint.row_masks = rowMaskedDrafter(lm);
                 sampling.constraint = &sc.constraint;
                 if (deferred) {
                     log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });

@@ -41,6 +41,7 @@ const dsv41_prefix = @import("dsv41_prefix.zig");
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
 const dspark_rows = @import("dspark_rows.zig");
+const row_grammar = @import("row_grammar.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
 pub const ThinkPenalty = think_penalty.ThinkPenalty;
@@ -701,6 +702,15 @@ pub const Constraint = struct {
     /// authoritative reasoning→answer boundary the response emitters route
     /// on. Set exactly once, at the transition; `null` until then.
     pending_span: ?rp_mod.ConstraintSpan = null,
+    /// The loaded model's drafter verifies rows under per-row masks (`row_grammar`), so this request may speculate.
+    row_masks: bool = false,
+
+    /// Whether DSpark rounds can serve this constraint: the protocol never reaches a channel header or an opener choice.
+    pub fn rowsDraftable(self: *const Constraint) bool {
+        if (!self.row_masks) return false;
+        const proto = self.proto orelse return true;
+        return proto.header_len == 0 and (self.pstate.phase == .reasoning or self.pstate.phase == .json_body);
+    }
 };
 
 /// A forced recovery must leave room for the whole remaining transition AND
@@ -1165,7 +1175,7 @@ pub fn mtpUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
 /// Why a request runs without MTP, for the log; null when MTP may run.
 pub fn mtpRefusal(sampling: SamplingParams, logprobs_n: u32) ?[]const u8 {
     if (logprobs_n != 0) return "logprobs requested";
-    if (sampling.constraint != null) return "grammar-constrained output";
+    if (sampling.constraint) |c| if (!c.rowsDraftable()) return "grammar-constrained output";
     if (sampling.call_force != null) return "forced tool call";
     return null;
 }
@@ -1839,7 +1849,13 @@ pub const Generator = struct {
     /// A DSpark round commits through the first draft with this id and no further, so the request's state
     /// stands right behind it for the scheduler to checkpoint. The scheduler clears it once taken.
     dspark_round_ends_at: ?u32 = null,
-    dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dsv41_max_drafts + 2]u32 = @splat(0) } = .{},
+    /// A constrained DSpark request: `next_token_id` is sampled under the grammar but not yet emitted or in the cache,
+    /// and `has_pending_logits` is false. Serial decode (`next`) emits it first.
+    dspark_pending: bool = false,
+    /// One verify mask per row (`row_grammar.plan`), reused across rounds.
+    dspark_masks: std.ArrayList(bool) = .empty,
+    dspark_serial_logged: bool = false,
+    dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dsv41_max_drafts + 2]u32 = @splat(0), mask_ns: u64 = 0, serial: u64 = 0 } = .{},
     /// Per-phase wall-time trace (SUSHI_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
@@ -2185,6 +2201,7 @@ pub const Generator = struct {
                     rows_w.buffered(),
                 },
             );
+            if (self.sampling.constraint != null) log.info("  [spec-stats] mode=dspark grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
             return;
         }
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
@@ -3341,6 +3358,10 @@ pub const Generator = struct {
                 .has_last_hidden = has_captured_hidden,
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
+                .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
+                .dspark = options.dspark_enabled and dsparkEligible(sampling, options.logprobs_n),
+                .dspark_diag = dsparkDiag(),
+                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, if (xfm.dsv41) |m| m.cfg.dspark.block else 5),
             };
             gen.pending_logits = logits;
             gen.has_pending_logits = true;
@@ -3664,6 +3685,7 @@ pub const Generator = struct {
                 return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint) };
             },
             .reasoning, .header => {
+                self.dspark_pending = false;
                 if (self.has_pending_logits) {
                     _ = mlx.mlx_array_free(self.pending_logits);
                     self.has_pending_logits = false;
@@ -3745,6 +3767,7 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(self.pending_token);
             self.has_pending_token = false;
         }
+        self.dspark_masks.deinit(allocator);
         if (self.has_last_hidden) {
             _ = mlx.mlx_array_free(self.last_hidden);
             self.has_last_hidden = false;
@@ -4374,7 +4397,14 @@ pub const Generator = struct {
             self.finish_reason = "length";
             return null;
         }
-        if (try self.checkStop()) return null;
+        const constraint = self.sampling.constraint;
+        if (constraint) |c| {
+            switch (try self.dsparkConstrainedEntry(allocator, c)) {
+                .proceed => {},
+                .stop => return null,
+                .served => |r| return r,
+            }
+        } else if (try self.checkStop()) return null;
         const xfm = self.xfm;
         const s = xfm.s;
         const t1 = self.next_token_id;
@@ -4417,6 +4447,16 @@ pub const Generator = struct {
         if (xfm.dsv41) |m| if (m.cfg.image_token_id != 0) {
             if (std.mem.indexOfScalar(u32, ids_buf[1..rows], m.cfg.image_token_id)) |at| rows = 1 + at;
         };
+        const vocab: usize = if (xfm.dsv41) |m| m.cfg.vocab else 0;
+        var rows_masked = false;
+        if (constraint) |c| {
+            var mask_timer = io_util.Stopwatch.init(self.timer.io);
+            try self.dspark_masks.resize(allocator, rows * vocab);
+            const planned = try row_grammar.plan(self.rowView(c), t1, ids_buf[1..rows], self.dspark_masks.items, vocab);
+            rows = planned.rows;
+            rows_masked = planned.masked;
+            self.dspark_stats.mask_ns += mask_timer.read();
+        }
         const ctx_before = self.ctx.cache.step;
         var logits = try xfm.dsv41Verify(&self.ctx, ids_buf[0..rows]);
         defer _ = mlx.mlx_array_free(logits);
@@ -4429,17 +4469,21 @@ pub const Generator = struct {
             _ = try self.thinkShiftRows(&logits, row_ids_arr);
             _ = try self.penaltyShiftRows(&logits, row_ids_arr);
         }
+        var masked_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked_logits);
+        if (rows_masked) try applyRowMasks(&masked_logits, logits, self.dspark_masks.items[0 .. rows * vocab], rows, vocab, s);
+        const verdict_logits = if (rows_masked) masked_logits else logits;
         var accepted: u32 = 0;
         var pending: u32 = 0;
         if (isGreedyTemperature(self.sampling.temperature)) {
-            var verified = try verifyArgmax(logits, self.sampling.suppress_mask, s);
+            var verified = try verifyArgmax(verdict_logits, self.sampling.suppress_mask, s);
             defer verified.deinit();
             try mlx.check(mlx.mlx_array_eval(verified.lazy()));
             const best = try verified.ids(rows);
             while (accepted + 1 < rows and @as(u32, @intCast(best[accepted])) == ids_buf[1 + accepted]) accepted += 1;
             pending = @intCast(best[accepted]);
         } else {
-            const verdict = try self.dsparkSampledVerdict(logits, ids_buf[1..rows]);
+            const verdict = try self.dsparkSampledVerdict(verdict_logits, ids_buf[1..rows]);
             accepted = verdict.accepted;
             pending = verdict.pending;
         }
@@ -4449,9 +4493,11 @@ pub const Generator = struct {
         const n_commit: usize = 1 + accepted;
         const tokens = try allocator.dupe(u32, ids_buf[0..n_commit]);
         errdefer allocator.free(tokens);
+        if (constraint) |c| for (tokens, self.generated_ids.items.len..) |t, index| try self.dsparkObserve(c, index, t);
         try self.generated_ids.appendSlice(allocator, tokens);
         self.advanceStep(@intCast(n_commit));
         self.next_token_id = pending;
+        self.dspark_pending = constraint != null;
         const st = &self.dspark_stats;
         st.rounds += 1;
         st.plain += @intFromBool(rows == 1);
@@ -4482,6 +4528,139 @@ pub const Generator = struct {
             self.finish_reason = "length";
         }
         return .{ .tokens = tokens, .accepted_tokens = accepted };
+    }
+
+    const ConstrainedEntry = union(enum) { proceed, stop, served: DrafterStepResult };
+    const Pending = union(enum) { commit, stop, forced: u32 };
+
+    fn rowView(self: *const Generator, c: *Constraint) row_grammar.View {
+        return .{ .grammar = c.grammar, .token_bytes = c.token_bytes, .proto = c.proto, .pstate = &c.pstate, .eos_ids = self.eos_token_ids };
+    }
+
+    fn dsparkNoteSerial(self: *Generator, why: []const u8) void {
+        if (self.dspark_serial_logged) return;
+        self.dspark_serial_logged = true;
+        log.info("  [spec] dspark: this request decodes serially while {s}\n", .{why});
+    }
+
+    /// The start of a constrained round: serial ticks where the constraint cannot be verified in rows, else the
+    /// pending token (sampled here from the serial state's logits on the first round) judged as serial decode would.
+    fn dsparkConstrainedEntry(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !ConstrainedEntry {
+        if (self.checkBudgetStop()) return .stop;
+        const phase = c.pstate.phase;
+        const vocab: usize = if (self.xfm.dsv41) |m| m.cfg.vocab else 0;
+        const why: ?[]const u8 = if (c.pstate.recovering)
+            "a forced boundary drains"
+        else if (phase != .reasoning and phase != .json_body)
+            "the reasoning protocol is at a channel header"
+        else if (c.token_bytes.bytes.len > vocab)
+            "the token table is wider than the vocabulary"
+        else
+            null;
+        if (why) |w| {
+            self.dsparkNoteSerial(w);
+            self.dspark_stats.serial += 1;
+            const token = (try self.next(allocator)) orelse return .stop;
+            return .{ .served = .{ .tokens = try allocator.dupe(u32, &.{token}), .accepted_tokens = 0 } };
+        }
+        if (self.has_pending_logits) try self.dsparkSamplePending(allocator, c);
+        return switch (try self.dsparkJudgePending(allocator, c)) {
+            .commit => .proceed,
+            .stop => .stop,
+            .forced => |t| .{ .served = .{ .tokens = try allocator.dupe(u32, &.{t}), .accepted_tokens = 0 } },
+        };
+    }
+
+    /// The serial state's pending logits become a pending token, sampled under the mask of the committed state.
+    fn dsparkSamplePending(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !void {
+        const logits = self.pending_logits;
+        self.has_pending_logits = false;
+        defer _ = mlx.mlx_array_free(logits);
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        const kind = try row_grammar.maskFor(self.rowView(c), c.mask_buf);
+        if (kind == .masked) try applyGrammarMask(allocator, &masked, logits, c.mask_buf, self.xfm.s);
+        const lazy = try self.sampleLazy(if (kind == .masked) masked else logits, .committed);
+        defer _ = mlx.mlx_array_free(lazy);
+        try mlx.check(mlx.mlx_array_eval(lazy));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+        self.next_token_id = @intCast(val);
+        self.dspark_pending = true;
+    }
+
+    /// What serial decode does with the token it just sampled before committing it: an EOS stops (inside the
+    /// reasoning it forces the boundary instead), and so do three pad tokens in a row.
+    fn dsparkJudgePending(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !Pending {
+        const t = self.next_token_id;
+        const eos = isEosId(t, self.eos_token_ids);
+        const pad_run = t == 0 and self.consecutive_pad + 1 >= 3;
+        if (c.pstate.phase == .reasoning) {
+            const proto = c.proto.?;
+            const closes = eos and proto.closer_atomic != null and t == proto.closer_atomic.?;
+            if ((eos and !closes) or pad_run) {
+                self.dspark_pending = false;
+                switch (try self.forceConstraintTransition(allocator)) {
+                    .committed => |forced| {
+                        log.info("[grammar] reasoning boundary forced after {s}\n", .{if (eos) "premature EOS" else "terminal padding"});
+                        return .{ .forced = forced };
+                    },
+                    .activated => unreachable,
+                    .refused => {
+                        self.done = true;
+                        self.finish_reason = "stop";
+                        return .stop;
+                    },
+                }
+            }
+        } else if (eos or pad_run) {
+            self.dspark_pending = false;
+            self.done = true;
+            self.finish_reason = "stop";
+            return .stop;
+        }
+        self.consecutive_pad = if (t == 0) self.consecutive_pad + 1 else 0;
+        return .commit;
+    }
+
+    /// Commits `token`, the generated token at `index`, to the constraint as serial decode does after sampling it.
+    fn dsparkObserve(self: *Generator, c: *Constraint, index: usize, token: u32) !void {
+        const adv = try row_grammar.advance(self.rowView(c), token);
+        if (!adv.crossed) return;
+        const bytes = if (token < c.token_bytes.bytes.len) c.token_bytes.bytes[token] else null;
+        c.pending_span = if (bytes == null)
+            .{ .token_index = @intCast(index + 1), .byte_offset = 0 }
+        else
+            .{ .token_index = @intCast(index), .byte_offset = rp_mod.payloadByteOffset(bytes, adv.suffix) };
+        self.loop_guard_start = index;
+        log.info("[grammar] reasoning boundary reached; enforcing final-answer schema\n", .{});
+    }
+
+    /// Serial decode taking over from a DSpark round: emit the pending token, then forward it for the next sample.
+    fn dsparkEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        const c = self.sampling.constraint.?;
+        if (self.checkBudgetStop()) return null;
+        switch (try self.dsparkJudgePending(allocator, c)) {
+            .stop => return null,
+            .forced => |t| return t,
+            .commit => {},
+        }
+        self.dspark_pending = false;
+        const token = self.next_token_id;
+        try self.dsparkObserve(c, self.generated_ids.items.len, token);
+        self.advanceStep(1);
+        try self.generated_ids.append(allocator, token);
+        if (self.step >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+            return token;
+        }
+        const tok_i32: i32 = @intCast(token);
+        const tok_input = mlx.mlx_array_new_data(&tok_i32, &[_]c_int{ 1, 1 }, 2, .int32);
+        defer _ = mlx.mlx_array_free(tok_input);
+        self.pending_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+        self.has_pending_logits = true;
+        return token;
     }
 
     /// The longest accepted prefix of point-mass `drafts` against the verify rows' filtered densities (keep a
@@ -9730,7 +9909,7 @@ pub const Generator = struct {
         var tick_prof = TickProf.begin();
         defer tick_prof.finish();
         if (self.done) return null;
-        if (self.sampling.constraint != null) return self.nextConstrained(allocator);
+        if (self.sampling.constraint != null) return if (self.dspark_pending) self.dsparkEmitPending(allocator) else self.nextConstrained(allocator);
 
         // Transition shim: speculative-decode paths may exit with
         // `next_token_id` set but `pending_logits` unset (drafter's exit
@@ -10326,8 +10505,8 @@ pub const Generator = struct {
         return token;
     }
 
-    /// Check all stop conditions. Returns true if generation should stop.
-    pub fn checkStop(self: *Generator) !bool {
+    /// The length and stall stops, which no token decides.
+    fn checkBudgetStop(self: *Generator) bool {
         if (self.step >= self.max_tokens) {
             self.done = true;
             self.finish_reason = "length";
@@ -10338,6 +10517,12 @@ pub const Generator = struct {
             self.finish_reason = "length";
             return true;
         }
+        return false;
+    }
+
+    /// Check all stop conditions. Returns true if generation should stop.
+    pub fn checkStop(self: *Generator) !bool {
+        if (self.checkBudgetStop()) return true;
         if (tokenStops(self.next_token_id, self.eos_token_ids, &self.consecutive_pad)) {
             self.done = true;
             self.finish_reason = "stop";
@@ -12256,6 +12441,16 @@ fn applyGrammarMask(allocator: std.mem.Allocator, res: *mlx.mlx_array, logits: m
     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
 
+    try mlx.check(mlx.mlx_where(res, mask_arr, logits, neg_inf, s));
+}
+
+/// `logits` `[1, rows, vocab]` with each row's forbidden tokens at -inf; `masks` is `rows * vocab` bools.
+fn applyRowMasks(res: *mlx.mlx_array, logits: mlx.mlx_array, masks: []const bool, rows: usize, vocab: usize, s: mlx.mlx_stream) !void {
+    const shape = [_]c_int{ 1, @intCast(rows), @intCast(vocab) };
+    const mask_arr = mlx.mlx_array_new_data(@ptrCast(masks.ptr), &shape, 3, .bool_);
+    defer _ = mlx.mlx_array_free(mask_arr);
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask_arr, logits, neg_inf, s));
 }
 
@@ -21075,4 +21270,246 @@ test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since
     defer a.free(r.tokens);
     try testing.expect(std.mem.indexOfScalar(u32, r.tokens, d.ids[k]) == null);
     try testing.expect(g.dspark_stats.drafted < k);
+}
+
+test "mtpRefusal: a constraint speculates only where the drafter verifies rows under masks, and never through a channel header" {
+    var c = Constraint{ .grammar = undefined, .token_bytes = undefined, .mask_buf = &.{} };
+    try testing.expectEqualStrings("grammar-constrained output", mtpRefusal(.{ .constraint = &c }, 0).?);
+    c.row_masks = true;
+    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) == null);
+    try testing.expect(dsparkEligible(.{ .constraint = &c }, 0));
+    try testing.expectEqualStrings("logprobs requested", mtpRefusal(.{ .constraint = &c }, 2).?);
+    var proto = rp_mod.Protocol{ .kind = .bare_think };
+    c.proto = &proto;
+    c.pstate = .{ .phase = .reasoning };
+    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) == null);
+    c.pstate = .{ .phase = .choice };
+    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) != null);
+    c.pstate = .{ .phase = .reasoning };
+    proto.header_len = 1;
+    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) != null);
+}
+
+const grammar_test_schema =
+    \\{"type":"object","properties":{"a":{"type":"boolean"},"b":{"type":"integer"}},"required":["a","b"],"additionalProperties":false}
+;
+
+/// JSON bytes cycled over the tiny vocabulary (id 0 pad), `closer` spelling the reasoning close.
+fn grammarTestBytes(a: std.mem.Allocator, vocab: usize, closer: u32, eos: u32) !token_mask.TokenBytes {
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const bytes = try arena.allocator().alloc(?[]const u8, vocab);
+    const chars = "{}\":,abtruefals0123456789 -";
+    for (bytes, 0..) |*b, i| b.* = if (i < 2) null else chars[(i - 2) % chars.len ..][0..1];
+    bytes[closer] = rp_mod.BARE_THINK_CLOSER;
+    bytes[eos] = null;
+    return token_mask.TokenBytes.init(arena, bytes, eos);
+}
+
+const GrammarMode = union(enum) { serial, spark: ?DsparkDiag };
+
+const GrammarOutcome = struct {
+    tokens: std.ArrayList(u32) = .empty,
+    /// Where the answer starts in the token stream, null when the reasoning never closed.
+    payload_from: ?usize = null,
+    finish: []const u8 = "",
+    rounds: u64 = 0,
+    drafted: u64 = 0,
+    serial: u64 = 0,
+    /// The answer's bytes, owned.
+    payload: []u8 = &.{},
+
+    fn deinit(self: *GrammarOutcome, a: std.mem.Allocator) void {
+        self.tokens.deinit(a);
+        a.free(self.payload);
+    }
+};
+
+fn grammarRun(
+    a: std.mem.Allocator,
+    io: std.Io,
+    xfm: *Transformer,
+    tok: *Tokenizer,
+    prompt: []const u32,
+    want: u32,
+    tb: *const token_mask.TokenBytes,
+    closer: ?u32,
+    eos: u32,
+    params: SamplingParams,
+    mode: GrammarMode,
+) !GrammarOutcome {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, grammar_test_schema, .{});
+    defer parsed.deinit();
+    var sc: SchemaConstraint = undefined;
+    try sc.initFromValue(a, parsed.value, tb);
+    defer sc.deinit();
+    var proto = rp_mod.Protocol{ .kind = .bare_think };
+    var candidates = [_]u32{closer orelse 0};
+    if (closer != null) {
+        try testing.expect(proto.setCloser(rp_mod.BARE_THINK_CLOSER));
+        proto.closer_span_candidates = &candidates;
+        try testing.expect(proto.setForced(&.{closer.?}));
+        sc.deferWithProtocol(&proto);
+    }
+    sc.constraint.row_masks = true;
+    var sampling = params;
+    sampling.constraint = &sc.constraint;
+    try xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, want, sampling, &.{eos}, switch (mode) {
+        .serial => .{ .skip_lazy_preforward = true },
+        .spark => .{ .dspark_enabled = true },
+    });
+    defer gen.deinit(a);
+    var out = GrammarOutcome{};
+    errdefer out.deinit(a);
+    switch (mode) {
+        .serial => while (try gen.next(a)) |t| try out.tokens.append(a, t),
+        .spark => |diag| {
+            try testing.expect(gen.dspark);
+            if (diag) |d| gen.dspark_diag = d;
+            blocks: while (try gen.nextDspark(a)) |r| {
+                defer a.free(r.tokens);
+                for (r.tokens) |t| {
+                    if (t == eos) break :blocks;
+                    try out.tokens.append(a, t);
+                }
+            }
+        },
+    }
+    out.finish = gen.finish_reason;
+    out.rounds = gen.dspark_stats.rounds;
+    out.drafted = gen.dspark_stats.drafted;
+    out.serial = gen.dspark_stats.serial;
+    var payload: std.ArrayList(u8) = .empty;
+    errdefer payload.deinit(a);
+    var lead: usize = 0;
+    if (closer == null) {
+        out.payload_from = 0;
+    } else if (sc.constraint.pending_span) |span| {
+        out.payload_from = span.token_index;
+        lead = span.byte_offset;
+    }
+    if (out.payload_from) |from| for (out.tokens.items[@min(from, out.tokens.items.len)..]) |t| try payload.appendSlice(a, tb.bytes[t] orelse "");
+    out.payload = try a.dupe(u8, payload.items[@min(lead, payload.items.len)..]);
+    payload.deinit(a);
+    return out;
+}
+
+/// A finished answer is JSON the schema accepts: both fields, nothing else.
+fn expectAnswer(a: std.mem.Allocator, out: GrammarOutcome) !void {
+    if (!std.mem.eql(u8, out.finish, "stop") or out.payload_from == null) return;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out.payload, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expect(obj.get("a").? == .bool and obj.get("b").? == .integer and obj.count() == 2);
+}
+
+test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens, behind a reasoning boundary and from the first token (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.dsv41.?.dspark != null);
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const prompt = ids[0..30];
+    const want: u32 = 48;
+    const vocab = xfm.dsv41.?.cfg.vocab;
+
+    // The reasoning ends on a token the model picks a few steps in, so the boundary lands inside the request.
+    var free: std.ArrayList(u32) = .empty;
+    defer free.deinit(a);
+    {
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 12, greedy, &.{}, .{ .skip_lazy_preforward = true });
+        defer gen.deinit(a);
+        while (try gen.next(a)) |t| try free.append(a, t);
+    }
+    const closer: u32 = for (free.items[6..]) |t| {
+        if (t >= 2) break t;
+    } else 2;
+    var tb = try grammarTestBytes(a, vocab, closer, 1);
+    defer tb.deinit();
+
+    // A one-row round is the serial step when the rows do not sum by width, so every token must match.
+    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+    for ([_]?u32{ closer, null }) |c| {
+        var serial = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, greedy, .serial);
+        defer serial.deinit(a);
+        var plain = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, greedy, .{ .spark = .{ .rows = 1 } });
+        defer plain.deinit(a);
+        try testing.expect(serial.tokens.items.len > 8);
+        try testing.expectEqualSlices(u32, serial.tokens.items, plain.tokens.items);
+        try testing.expectEqualStrings(serial.finish, plain.finish);
+        try testing.expect(plain.rounds > 0);
+        try testing.expectEqual(serial.payload_from, plain.payload_from);
+        try testing.expectEqualStrings(serial.payload, plain.payload);
+        try expectAnswer(a, plain);
+    }
+
+    // Exact rounds give a row the same bytes at every width: any mix equals the one-row stream.
+    dsv41_model.setDsparkExact(xfm.dsv41.?, true);
+    const modes = [_]?DsparkDiag{ .{ .rows = 3 }, .{ .rows = 6 }, .sweep, null };
+    for ([_]?u32{ closer, null }) |c| {
+        var base = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, greedy, .{ .spark = .{ .rows = 1 } });
+        defer base.deinit(a);
+        for (modes) |mode| {
+            var got = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, greedy, .{ .spark = mode });
+            defer got.deinit(a);
+            try testing.expectEqualSlices(u32, base.tokens.items, got.tokens.items);
+            try testing.expectEqualStrings(base.payload, got.payload);
+            try testing.expect(got.drafted > 0);
+            try expectAnswer(a, got);
+        }
+    }
+
+    // An EOS inside the reasoning forces the boundary instead of stopping, whichever round samples it.
+    const eos_in_reasoning = free.items[3];
+    try testing.expect(eos_in_reasoning >= 2 and eos_in_reasoning != closer);
+    var forced_tb = try grammarTestBytes(a, vocab, closer, eos_in_reasoning);
+    defer forced_tb.deinit();
+    var base = try grammarRun(a, io, &xfm, &tok, prompt, want, &forced_tb, closer, eos_in_reasoning, greedy, .{ .spark = .{ .rows = 1 } });
+    defer base.deinit(a);
+    try testing.expect(base.payload_from != null);
+    for (modes) |mode| {
+        var got = try grammarRun(a, io, &xfm, &tok, prompt, want, &forced_tb, closer, eos_in_reasoning, greedy, .{ .spark = mode });
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u32, base.tokens.items, got.tokens.items);
+        try expectAnswer(a, got);
+    }
+    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+    var serial = try grammarRun(a, io, &xfm, &tok, prompt, want, &forced_tb, closer, eos_in_reasoning, greedy, .serial);
+    defer serial.deinit(a);
+    var plain = try grammarRun(a, io, &xfm, &tok, prompt, want, &forced_tb, closer, eos_in_reasoning, greedy, .{ .spark = .{ .rows = 1 } });
+    defer plain.deinit(a);
+    try testing.expectEqualSlices(u32, serial.tokens.items, plain.tokens.items);
+    dsv41_model.setDsparkExact(xfm.dsv41.?, true);
+
+    // A sampled request keeps to the grammar and repeats at a forced width.
+    const sampled = SamplingParams{ .temperature = 0.8, .seed = 7 };
+    for ([_]?u32{ closer, null }) |c| {
+        var first = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, sampled, .{ .spark = .{ .rows = 3 } });
+        defer first.deinit(a);
+        var again = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, sampled, .{ .spark = .{ .rows = 3 } });
+        defer again.deinit(a);
+        try testing.expectEqualSlices(u32, first.tokens.items, again.tokens.items);
+        try expectAnswer(a, first);
+    }
 }

@@ -305,8 +305,9 @@ expert, so only the logits' direction is held (`dsv41 fused`).
 ## DSpark
 
 The release's drafter: three sliding-window stages (`mtp.0..2`, window 128, rope theta 10000 and no YaRN, 128 routed
-experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries logprobs, a grammar or a forced call
-(`generate.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A repeat or
+experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries logprobs or a forced call
+(`generate.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A grammar or JSON schema drafts too
+([below](#dspark-grammar)). A repeat or
 presence penalty and the think penalty shift the verify rows by the ids before them (`penaltyShiftRows`, `thinkShiftRows`). A thinking bound
 (Anthropic `budget_tokens`, `reasoning_budget_tokens`) is checked between rounds, so a round may pass the budget by up to the
 block; when it fires the closer is committed and the rest decodes serially.
@@ -340,6 +341,16 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   is on and `--no-mtp` / `mtp: false` drop it. `--mtp-min-depth` / `--mtp-max-depth` bound the verify width (below); the block is fixed at 5 drafts.
   The boot line reads `[spec] DeepSeek-V4.1-Flash decodes with DSpark (...)` or `... plain ticks (...)`, and a request that
   drafted logs `[spec-stats] mode=dspark` with acceptance, draft and verify ms.
+
+- <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `Generator.dsparkConstrainedEntry`). Each verify row takes the mask serial decode builds
+  after the drafts before it (`row_grammar.plan` walks a scratch copy of the JSON grammar and reasoning state over the drafts), so the
+  masked argmax of a row is the serial token and a greedy request emits serial's tokens; a sampled one draws from the masked, filtered
+  row. A draft its row's mask forbids ends the chunk there, and so does one serial decode answers by forcing the boundary (EOS or pad
+  inside the reasoning). While a schema waits behind the reasoning close the rows carry only the reasoning mask (it excludes the
+  tokens that would close with a payload the schema rejects); past the close, the JSON mask. The pending token is judged at the next
+  round's start as serial decode judges a sampled one (`dsparkJudgePending`), and a serial tick (`next`, the loop guard's forced
+  boundary) first emits it (`dsparkEmitPending`). `[spec-stats]` adds the host `mask_ms` per round and the serial ticks. A channel-header
+  protocol or an opener choice keeps the request serial (`Constraint.rowsDraftable`).
 
 - **Verify width** (`dspark_rows.zig`, `Generator.nextDspark`). A round verifies the first R rows of its 6-row block (t1 and R-1
   drafts; the draft is greedy, so a shorter verify keeps exactly the tokens a longer one would have kept up to R) and R=1 is a plain

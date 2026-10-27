@@ -60,7 +60,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - Qwen3.8-Flash-Next's DFlash2 drafter verifies through the same forward, per-position capture and `ssmRollbackFromCapture`
   (GDN, PLE and QSA state), so the invariant above holds for it unchanged; a drafter named with `--drafter` outranks the head (MTP is the default)
   ([qwen4-arch](qwen4-arch.md#dflash2)).
-- logprobs>0, grammar and a forced call disable spec; DFlash and the drafter also refuse a penalty. A request that
+- logprobs>0, grammar and a forced call disable spec (DeepSeek's DSpark drafts under a grammar, [dsv41-arch](dsv41-arch.md#dspark-grammar)); DFlash and the drafter also refuse a penalty. A request that
   asked for MTP and runs without it logs `mtp=disabled (<reason>)`.
 
 ## Cost and acceptance

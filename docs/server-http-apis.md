@@ -215,6 +215,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   no whitespace OUTSIDE the root value, the model's OWN layout inside (`MAX_FREE_WS` 16).
 - A root number ends only at EOS, so it is complete once terminable; the empty-mask disable in `nextConstrainedToken`
   is the logged last resort (a new dead end gets a schema in the `no reachable grammar state is a dead end` test).
+- DeepSeek's DSpark verifies each row under that row's mask (`row_grammar.zig`), before and after the reasoning close; logprobs and forced calls still disable spec.
 - Every schema-mask surface uses ONE thinking policy (`schemaMasksThinking`); tools present = no mask. Per-model
   grammar table lives on `LoadedModel`.
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →

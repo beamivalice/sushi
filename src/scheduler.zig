@@ -8242,6 +8242,8 @@ fn plannerOutputClock(slot: *Slot, gen: *Generator) void {
 }
 
 fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
+    // Ahead of the block: a reader handed any of its tokens already sees where the payload starts.
+    if (gen.takeConstraintSpan()) |span| slot.publishConstraintSpan(span.token_index, span.byte_offset);
     if (gen.mtp != null and tokens.len > 0) {
         plannerOutputClock(slot, gen);
     }
