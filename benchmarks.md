@@ -23,4 +23,4 @@
 | Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (MTP) | 168.6 / 62.8 mtp |
 | Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp |
 | GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 114`) | 83.3 / 48.3 dspark |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark |

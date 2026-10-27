@@ -395,7 +395,7 @@ before each server. One binary built from `bb9adb6a`.
 power, `iogpu.wired_limit_mb=125000`, `taskpolicy -a`, per-model GPU lock, fans max and idle under 50 °C before each server.
 Not comparable with the llmprobe ladders below.
 - Qwen STQ 2.75bpw and 4bpw: binary SHA `fcb8ee2f` (source of `846863bd`). GLM: `d361c70b` (SHA `4d25c2d7`); its 128K code
-  samples are loop-stopped at 390 tokens. DeepSeek: `a2337236` (SHA `f3fc6fbb`), `--ssd-budget-gb 114`; 96 and 108 in usage.md.
+  samples are loop-stopped at 390 tokens. DeepSeek: `bf21aa5e` (SHA `5027a704`), `--ssd-budget-gb 108`; 80 and 96 in usage.md.
 
 ## v1.3.0 release context ladder
 

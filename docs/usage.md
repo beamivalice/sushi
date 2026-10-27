@@ -222,19 +222,19 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
   cache, which is what is left. A higher budget gives more expert slots a layer and fewer misses; a miss is an SSD
   read. The budget and the request's own state (0.93 GB at 1M tokens, 3.7 GB billed to a 1M request) plus the largest
   image's encode (1.6 GB) must sit under the GPU limit, so the budget tops out about 5 GiB under it at 1M context.
-- **On a 128 GB Mac, 108 is the recommended budget.** 96 also serves, with fewer slots; 114, the largest run, needs
+- **On a 128 GB Mac, 108 is the recommended budget.** 80 and 96 also serve, with fewer slots; 114 needs
   `sudo sysctl iogpu.wired_limit_mb=124000`.
 
-  | `--ssd-budget-gb` | expert slots a layer (of 384) | expert hits | decode 4k code / prose | decode 128k code / prose | prefill 8k window code / prose |
+  | `--ssd-budget-gb` | expert slots a layer (of 384) | expert hits code / prose | decode 4k code / prose | decode 128k code / prose | prefill 8k window code / prose |
   |---|---:|---:|---:|---:|---:|
-  | 96 | 227 | 98.96% | 74.1 / 47.2 | 60.1 / 44.0 | 938 / 690 |
-  | 108 | 260 | 99.49% | 80.7 / 47.0 | 69.9 / 50.9 | 977 / 773 |
-  | 114 | 277 | 99.16% | 83.3 / 48.3 | 72.7 / 46.0 | 681 / 544 |
+  | 80 | 182 | 96.5% / 99.2% | 44.7 / 44.5 | 36.6 / 39.4 | 760 / 547 |
+  | 96 | 227 | 98.7% / 99.6% | 65.8 / 48.2 | 51.8 / 45.4 | 963 / 700 |
+  | 108 | 260 | 99.6% / 99.9% | 76.6 / 49.3 | 63.7 / 43.5 | 1,024 / 821 |
 
-  Slots are the plan from the pack's headers. Every row is one `sushi bench` run on the same binary (tok/s, DSpark on,
-  one request, code and prose corpora); the 114 row is the [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md).
-  At 114 each 8k prefill window pays the layer lending below, which is why its prefill reads lower and its hits, read
-  back after every prefill, sit under 108's.
+  Slots are the plan from the pack's headers. Every row is one `sushi bench` run of the same engine (tok/s, DSpark on,
+  one request, code and prose corpora, 256 and 128 decoded tokens a sample); the 108 row is the
+  [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md). Hits count the decode forwards' expert
+  picks found in the cache.
 - **The cost of 114.** The cache is bigger, so a long prompt has less memory beside it: a prefill of 2048 or more new
   tokens lends the last decoder layers (37 to 39, 8.15 GB) and reads them back before decode, about 1.4 s a request.
   A short agent turn (measured up to 1,000 new tokens) lends nothing and pays nothing. A lower budget leaves more
