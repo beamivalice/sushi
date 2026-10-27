@@ -9,7 +9,7 @@ A local AI server for low-bit, very high quality Sushi quants, using custom EXL3
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
 * DeepSeek 4.1 Flash 1017 STQ 1.75bpw - COMING SOON!
-* [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming-on-a-32-gb-mac))
+* [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
 * [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (requires 64 GB+ and sushi 1.3.0 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
@@ -76,28 +76,33 @@ set plus the request's own bill: the first table is at `--ssd-budget-gb 108`, th
 plus 2.8 KB a token) and extended to 1M. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac and at `80` on a 96 GB Mac
 with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)).
 
-A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
-the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
-serves text unless `--vision` loads the vision tower, whose weights then come out of the N GiB (DeepSeek-V4.1-Flash loads it by default; `--no-vision` skips it).
+## Streaming
 
-## Streaming on a 32 GB Mac
+Any Sushi pack runs on a Mac with less memory than its weights. `--ssd-budget-gb N` keeps N GiB resident (the trunk,
+the speculative head and a cache of routed experts) and reads the other experts from the SSD, with the same replies as
+a resident load; a larger N caches more experts and reads the SSD less. The context's KV or state is billed on top, so
+N plus the context must fit under the GPU limit. DeepSeek-V4.1-Flash always streams.
 
-Sushi-2bpw streams on a 32 GB Mac with MTP on, at about 20 tok/s decode:
+| Mac | pack | `--ssd-budget-gb` | GPU limit (MB) | context | decode at 4k |
+|---|---|---:|---:|---|---|
+| 32 GB | Qwen3.8-Flash-Next-Sushi-2bpw | 18 | 27,000 | 66k | ~20 tok/s |
+| 96 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 80 | 93,000 | 1M | 45 code / 45 prose |
+| 128 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose |
 
 ```bash
-sudo sysctl iogpu.wired_limit_mb=27000
+sudo sysctl iogpu.wired_limit_mb=27000   # resets at reboot
 sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-gb 18 --ctx-size 66000 \
   --qwen-gdn 16 --expert-pick-tolerance 0.3
 ```
 
-`--qwen-gdn 16` stores Qwen's recurrent state in bf16 instead of the f32 default, which halves the state in every cache
-checkpoint (about 54 MB each) and is what the 32, 48 and 64 GB recipes run.
-
-`--ssd-budget-gb 18` keeps 18 GiB resident (the trunk, the MTP head and an expert cache) and reads the remaining experts
-from the SSD; the KV cache is billed on top of it. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert
-whose router probability is at least 0.7 of the missed one's, which saves an SSD read; leave it out for replies
-identical to a resident load. The plan may come within 1 GiB of the GPU limit
-(`--wired-margin-gib N`, 1 to 32). The GPU limit resets at reboot.
+- `--qwen-gdn 16` stores Qwen's recurrent state in bf16 instead of the f32 default, halving it in every cache
+  checkpoint (about 54 MB each); the 32, 48 and 64 GB recipes run it.
+- `--expert-pick-tolerance 0.3` is lossy: on a cache miss it takes the best cached expert whose router probability is at
+  least 0.7 of the missed one's and skips the SSD read. Leave it out for replies identical to a resident load.
+- A streamed load serves text unless `--vision` loads the vision tower out of the N GiB; DeepSeek-V4.1-Flash loads it by
+  default (`--no-vision` skips it).
+- The plan may come within 1 GiB of the GPU limit (`--wired-margin-gib N`, 1 to 32). DeepSeek launches:
+  [usage](docs/usage.md#deepseek-launch).
 
 ## Benchmarks
 

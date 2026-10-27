@@ -44,7 +44,7 @@ Each family recommends its largest pack the Mac reaches in the last column. `fit
 (DeepSeek's routed experts stream on every Mac: its tier is the Mac that admits the `--ssd-budget-gb 80` launch
 [below](#deepseek-launch)).
 Below it the pack is labelled `may stream (--ssd-budget-gb)`: it may still run with `--ssd-budget-gb`
-([README, Streaming on a 32 GB Mac](../README.md#streaming-on-a-32-gb-mac)), and nothing promises it does.
+([README, Streaming](../README.md#streaming)), and nothing promises it does.
 `sushi pull` prints that warning before it downloads a pack below its tier, then pulls anyway. A pack whose repo
 Hugging Face does not return yet is listed as `(not yet published)` and `sushi pull` of it says so. That includes a
 private repo (DeepSeek's today) for anyone without access; a user granted access sees its size and pulls it after
@@ -92,7 +92,7 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-2bpw --local-dir ~/.sushi/models/Q
 ```
 
 Every 32 GB, 48 GB and 64 GB Qwen recipe passes `--qwen-gdn 16` (the 32 GB one is in the
-[README](../README.md#streaming-on-a-32-gb-mac)): the recurrent state is f32 by default, and bf16 halves it in every
+[README](../README.md#streaming)): the recurrent state is f32 by default, and bf16 halves it in every
 cache checkpoint (about 54 MB each on Flash-Next), the memory these recipes are sized to. The 96 GB and larger recipes
 keep the f32 default.
 
