@@ -7,6 +7,7 @@
 //! complete first (a stream cannot know a longer stop is coming).
 
 const std = @import("std");
+const log = @import("log.zig");
 
 pub const Hit = struct { index: usize, stop: []const u8 };
 
@@ -99,6 +100,10 @@ pub const Gate = struct {
         // A completed stop waits for a held prefix that starts EARLIER: it could still complete as the earlier match.
         if (earliest(buf, self.stops)) |hit| if (hit.index <= wait_from) {
             n = hit.index;
+            if (self.matched == null) {
+                var line: [160]u8 = undefined;
+                log.info("{s}\n", .{matchLine(&line, hit.stop)});
+            }
             self.matched = hit.stop;
         };
         const out = try allocator.dupe(u8, buf[0..n]);
@@ -111,6 +116,13 @@ pub const Gate = struct {
         return out;
     }
 };
+
+/// The one `[stop]` line a request's own stop sequence leaves, so a turn it cut is told from an EOS.
+fn matchLine(out: []u8, stop: []const u8) []const u8 {
+    const head = "[stop] reason=stop-seq match=";
+    @memcpy(out[0..head.len], head);
+    return out[0..log.appendQuoted(out, head.len, stop, 100)];
+}
 
 /// Test driver: what a streaming surface delivers for `fragments` (the decoded token texts, in
 /// order), and which stop fired. Returns the concatenated delivered bytes (caller frees).
@@ -166,6 +178,11 @@ fn expectParityAtEverySplit(text: []const u8, stops: []const []const u8) !void {
         var j: usize = i;
         while (j <= text.len) : (j += 1) try expectParity(&.{ text[0..i], text[i..j], text[j..] }, stops);
     }
+}
+
+test "[stop] names the stop sequence that cut the turn" {
+    var line: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("[stop] reason=stop-seq match=\"\\n\\nUser:\"", matchLine(&line, "\n\nUser:"));
 }
 
 test "a stop prefix is held until the stop completes, never delivered" {

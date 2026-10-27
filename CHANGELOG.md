@@ -7,6 +7,7 @@ earlier history is mlx-serve's, in that project's changelog.
 ## Unreleased
 
 - **`sushi launch opencode` runs the newest opencode**: with an older opencode ahead of a newer one on PATH, the launcher started the older; it now picks the highest version installed.
+- **The server log names the token that ended each turn**: a reply that finishes `stop` logs `[stop]` with the EOS token id and text, the token before it, the completion count and the decode path, so a turn that ends mid-sentence can be traced to its token.
 - **`--model` and `sushi run` accept a relative path**: `sushi serve --model ./pack` used to fail with `ExpertLayoutUnsupported` (or lose expert streaming detection) unless the path was absolute; it is now resolved against the current directory at launch.
 - **Claude Code can count tokens**: `POST /v1/messages/count_tokens` answers `{"input_tokens": N}`, the prompt a
   `/v1/messages` request with the same body would prefill, images included, without generating anything. Thanks to

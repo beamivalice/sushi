@@ -671,6 +671,10 @@ pub const Slot = struct {
     /// t1 streamed at the MTP prefill handover; the first block still commits it, and its
     /// echo is not published twice (`takeHandoverEcho`).
     handover_token: ?u32 = null,
+    /// The EOS (or pad) that ended the turn, never pushed or counted; names the `[stop]` line.
+    stop_token: ?u32 = null,
+    /// `"spec"` or `"batch"` where the finishing tick knew; empty = derive from the slot's mode.
+    stop_path: []const u8 = "",
     cancelled: std.atomic.Value(bool),
     /// The server, not the client, ended this slot (shutdown drain): readers see an error, never a finish reason.
     shutdown_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -6799,26 +6803,75 @@ fn formatShortGen(
         const sep: []const u8 = if (i == 0) "" else ",";
         n += (std.fmt.bufPrint(out[n..], "{s}{d}", .{ sep, id }) catch break).len;
     }
-    n += (std.fmt.bufPrint(out[n..], "] bytes=\"", .{}) catch return out[0..n]).len;
-    var cap = @min(text.len, SHORT_GEN_TEXT_CAP);
-    // A token is a BPE fragment: never cut inside a multi-byte sequence.
-    while (cap > 0 and cap < text.len and (text[cap] & 0xC0) == 0x80) cap -= 1;
-    for (text[0..cap]) |c| {
-        var one = [_]u8{if (c < 0x20) ' ' else c};
-        const esc: []const u8 = switch (c) {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            else => one[0..1],
-        };
-        if (n + esc.len > out.len) break;
-        @memcpy(out[n..][0..esc.len], esc);
-        n += esc.len;
-    }
-    n += (std.fmt.bufPrint(out[n..], "\" path={s}", .{path}) catch return out[0..n]).len;
+    n += (std.fmt.bufPrint(out[n..], "] bytes=", .{}) catch return out[0..n]).len;
+    n = log.appendQuoted(out, n, text, SHORT_GEN_TEXT_CAP);
+    n += (std.fmt.bufPrint(out[n..], " path={s}", .{path}) catch return out[0..n]).len;
     return out[0..n];
+}
+
+/// Decoded bytes of a token that ride the `[stop]` line.
+const STOP_TEXT_CAP = 48;
+
+const StopLine = struct {
+    kind: []const u8,
+    token: u32,
+    token_text: []const u8,
+    after: ?u32,
+    after_text: []const u8,
+    completion: u32,
+    path: []const u8,
+};
+
+/// Which token ended a turn that finished "stop": the logs otherwise cannot tell an EOS from a pad run or a stop sequence.
+fn formatStop(out: []u8, line: StopLine) []const u8 {
+    var n: usize = 0;
+    n += (std.fmt.bufPrint(out[n..], "[stop] reason={s} token={d} ", .{ line.kind, line.token }) catch return out[0..n]).len;
+    n = log.appendQuoted(out, n, line.token_text, STOP_TEXT_CAP);
+    if (line.after) |id| {
+        n += (std.fmt.bufPrint(out[n..], " after={d} ", .{id}) catch return out[0..n]).len;
+    } else {
+        n += (std.fmt.bufPrint(out[n..], " after=none ", .{}) catch return out[0..n]).len;
+    }
+    n = log.appendQuoted(out, n, line.after_text, STOP_TEXT_CAP);
+    n += (std.fmt.bufPrint(out[n..], " completion={d} path={s}", .{ line.completion, line.path }) catch return out[0..n]).len;
+    return out[0..n];
+}
+
+/// An EOS ends the turn by itself; token 0 ends it only as the third pad in a row.
+fn stopKind(token: u32, eos: []const u32) []const u8 {
+    return if (generate_mod.isEosId(token, eos)) "eos" else "pad-run";
+}
+
+/// Names the token that ended a turn finishing "stop" on an EOS or a pad run. Decodes into stack
+/// scratch: a log line never allocates and never fails the request.
+fn logStop(slot: *Slot, reason: []const u8) void {
+    if (!std.mem.eql(u8, reason, "stop")) return;
+    const gen: ?*Generator = if (slot.legacy_gen) |*g| g else null;
+    const token = slot.stop_token orelse (if (gen) |g| g.stop_token else null) orelse return;
+    const after: ?u32 = blk: {
+        slot.out_mu.lockUncancelable(slot.io);
+        defer slot.out_mu.unlock(slot.io);
+        break :blk slot.out_buf.getLastOrNull();
+    };
+    var scratch: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const tok = slot.model.tokenizer;
+    const token_text: []const u8 = if (tok) |t| (t.decode(fba.allocator(), &.{token}, false) catch "") else "";
+    const after_text: []const u8 = if (tok != null and after != null) (tok.?.decode(fba.allocator(), &.{after.?}, false) catch "") else "";
+    var path = slot.stop_path;
+    if (path.len == 0) {
+        path = if (gen) |g| (if (specTickMode(slot.enable_mtp, g.mtp != null or g.dspark, slot.enable_drafter, g.dflash != null) == .regular) "serial" else "spec") else "serial";
+    }
+    var buf: [384]u8 = undefined;
+    log.info("{s}\n", .{formatStop(&buf, .{
+        .kind = stopKind(token, slot.eos_token_ids),
+        .token = token,
+        .token_text = token_text,
+        .after = after,
+        .after_text = after_text,
+        .completion = slot.completion_tokens,
+        .path = path,
+    })});
 }
 
 /// A one-word answer and a block-path handling bug look identical until the ids are named.
@@ -6910,6 +6963,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
     if (slot.completion_tokens <= 2) logShortGen(slot, reason);
+    if (latched == null) logStop(slot, reason);
     commitSlotIfApplicable(sch, slot);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
@@ -8242,6 +8296,11 @@ fn plannerOutputClock(slot: *Slot, gen: *Generator) void {
 }
 
 fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
+    if (publishBlockTokens(slot, gen, tokens)) |reason| finishSlot(sch, slot, reason);
+}
+
+/// Publishes `tokens` one by one; the result is the reason the block ended the slot, null when it did not.
+fn publishBlockTokens(slot: *Slot, gen: *Generator, tokens: []const u32) ?[]const u8 {
     // Ahead of the block: a reader handed any of its tokens already sees where the payload starts.
     if (gen.takeConstraintSpan()) |span| slot.publishConstraintSpan(span.token_index, span.byte_offset);
     if (gen.mtp != null and tokens.len > 0) {
@@ -8254,21 +8313,20 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
     for (tokens, 0..) |t, i| {
         if (slot.cancelled.load(.acquire)) {
             if (gen.mtp != null) log.debug("[mtp-publish] cancelled after round: discarded={d}\n", .{tokens.len - i});
-            return;
+            return null;
         }
         if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-            finishSlot(sch, slot, "stop");
-            return;
+            slot.stop_token = t;
+            slot.stop_path = "spec";
+            return "stop";
         }
         slot.pushToken(t);
         slot.completion_tokens += 1;
         if (t != 0) slot.was_pad_only = false;
-        if (slot.completion_tokens >= slot.max_tokens) {
-            finishSlot(sch, slot, "length");
-            return;
-        }
+        if (slot.completion_tokens >= slot.max_tokens) return "length";
     }
     std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+    return null;
 }
 
 /// Every single-slot decode tick funnels through here, so a decode-time MLX failure is
@@ -9191,6 +9249,7 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
         if (try gen.checkStop()) {
+            slot.stop_path = "batch";
             finishSlot(sch, slot, gen.finish_reason);
             continue;
         }
@@ -9783,6 +9842,8 @@ fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
                 if (tok != 0) slot.was_pad_only = false;
                 slot.completion_tokens = gen.completion_tokens;
                 if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
+                    slot.stop_token = gen.next_token_id;
+                    slot.stop_path = "batch";
                     finishSlot(sch, slot, "stop");
                     continue;
                 }
@@ -9794,11 +9855,13 @@ fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
                 // checkStop fired on the pipelined lookahead (EOS / pad-run
                 // / max_tokens / timeout); nothing to emit.
                 slot.completion_tokens = gen.completion_tokens;
+                slot.stop_path = "batch";
                 finishSlot(sch, slot, gen.finish_reason);
                 continue;
             }
         } else if (try batchEntryStops(gen)) {
             slot.completion_tokens = gen.completion_tokens;
+            slot.stop_path = "batch";
             finishSlot(sch, slot, gen.finish_reason);
             continue;
         }
@@ -10122,12 +10185,16 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         }
 
         if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
+            slot.stop_token = gen.next_token_id;
+            slot.stop_path = "batch";
             finishSlot(sch, slot, "stop");
             continue;
         }
         if (gen.next_token_id == 0) {
             gen.consecutive_pad += 1;
             if (gen.consecutive_pad >= 3) {
+                slot.stop_token = 0;
+                slot.stop_path = "batch";
                 finishSlot(sch, slot, "stop");
                 continue;
             }
@@ -11371,6 +11438,61 @@ test "[short-gen] carries both token counts, the ids and what they decode to" {
     @memset(&long, 'x');
     const capped = formatShortGen(&buf, "stop", 1, &.{}, &long, "pld");
     try testing.expectEqual(@as(usize, SHORT_GEN_TEXT_CAP), std.mem.count(u8, capped, "x"));
+}
+
+test "[stop] names the token that ended the turn" {
+    // Bar: the line names the token and the one before it, escapes both, and has an honest "none".
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "[stop] reason=eos token=248046 \"<|im_end|>\" after=1510 \"Ġ`\" completion=2784 path=serial",
+        formatStop(&buf, .{ .kind = "eos", .token = 248046, .token_text = "<|im_end|>", .after = 1510, .after_text = "Ġ`", .completion = 2784, .path = "serial" }),
+    );
+    try testing.expectEqualStrings(
+        "[stop] reason=pad-run token=0 \"\" after=none \"\" completion=0 path=batch",
+        formatStop(&buf, .{ .kind = "pad-run", .token = 0, .token_text = "", .after = null, .after_text = "", .completion = 0, .path = "batch" }),
+    );
+    const esc = formatStop(&buf, .{ .kind = "eos", .token = 2, .token_text = "a\"\nb", .after = 7, .after_text = "x", .completion = 1, .path = "spec" });
+    try testing.expectEqualStrings("[stop] reason=eos token=2 \"a\\\"\\nb\" after=7 \"x\" completion=1 path=spec", esc);
+    try testing.expectEqualStrings("eos", stopKind(248046, &.{ 248046, 248044 }));
+    try testing.expectEqualStrings("pad-run", stopKind(0, &.{248046}));
+}
+
+test "a speculative block ending on EOS records the stop token and leaves it out of the count" {
+    var gen: Generator = undefined;
+    gen.mtp = null;
+    gen.sampling = .{};
+    gen.completion_tokens = 0;
+    var slot: Slot = undefined;
+    slot.io = testing.io;
+    slot.allocator = testing.allocator;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.out_buf = .empty;
+    defer slot.out_buf.deinit(testing.allocator);
+    slot.handover_token = null;
+    slot.cancelled = .init(false);
+    var eos = [_]u32{ 248046, 248044 };
+    slot.eos_token_ids = &eos;
+    slot.completion_tokens = 0;
+    slot.max_tokens = 100;
+    slot.was_pad_only = true;
+    slot.stop_token = null;
+    slot.stop_path = "";
+
+    const reason = publishBlockTokens(&slot, &gen, &.{ 1510, 248046 }) orelse return error.TestExpectedFinish;
+    try testing.expectEqualStrings("stop", reason);
+    try testing.expectEqual(@as(?u32, 248046), slot.stop_token);
+    try testing.expectEqualStrings("spec", slot.stop_path);
+    try testing.expectEqual(@as(u32, 1), slot.completion_tokens);
+    try testing.expectEqualSlices(u32, &.{1510}, slot.out_buf.items);
+
+    // A block that runs out of tokens without an EOS or the cap names no stop token.
+    slot.stop_token = null;
+    slot.completion_tokens = 1;
+    gen.completion_tokens = 3;
+    try testing.expect(publishBlockTokens(&slot, &gen, &.{ 5, 6 }) == null);
+    try testing.expectEqual(@as(?u32, null), slot.stop_token);
 }
 
 test "complete waits out an inference pass that still holds the slot" {

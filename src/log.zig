@@ -287,6 +287,33 @@ pub fn atLevel(level: Level, comptime fmt: []const u8, args: anytype) void {
     if (enabled(level)) emit(fmt, args);
 }
 
+/// Appends `text` to `out[n..]` as one double-quoted, escaped literal of at most `cap` source bytes,
+/// never cut inside a multi-byte sequence. Returns the new length; `n` when the literal does not fit.
+pub fn appendQuoted(out: []u8, n: usize, text: []const u8, cap: usize) usize {
+    var end = @min(text.len, cap);
+    while (end > 0 and end < text.len and (text[end] & 0xC0) == 0x80) end -= 1;
+    var w = n;
+    if (w + 2 > out.len) return n;
+    out[w] = '"';
+    w += 1;
+    for (text[0..end]) |c| {
+        var one = [_]u8{if (c < 0x20) ' ' else c};
+        const esc: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => one[0..1],
+        };
+        if (w + esc.len + 1 > out.len) break;
+        @memcpy(out[w..][0..esc.len], esc);
+        w += esc.len;
+    }
+    out[w] = '"';
+    return w + 1;
+}
+
 // ── Tests ──
 
 const testing = std.testing;

@@ -1748,6 +1748,8 @@ pub const Generator = struct {
     completion_tokens: u32,
     finish_reason: []const u8,
     done: bool,
+    /// The EOS (or pad) that ended generation, when one did; never part of `generated_ids`' accounting.
+    stop_token: ?u32 = null,
     eos_token_ids: []const u32,
     generated_ids: std.ArrayList(u32),
     /// Degenerate-tail detection must not reconsider a reasoning loop after
@@ -4355,6 +4357,7 @@ pub const Generator = struct {
                 if (!isEosId(token, self.eos_token_ids)) emitted = i;
                 self.done = true;
                 self.finish_reason = "stop";
+                self.stop_token = token;
                 break;
             }
         }
@@ -4609,6 +4612,7 @@ pub const Generator = struct {
                     .refused => {
                         self.done = true;
                         self.finish_reason = "stop";
+                        self.stop_token = t;
                         return .stop;
                     },
                 }
@@ -4617,6 +4621,7 @@ pub const Generator = struct {
             self.dspark_pending = false;
             self.done = true;
             self.finish_reason = "stop";
+            self.stop_token = t;
             return .stop;
         }
         self.consecutive_pad = if (t == 0) self.consecutive_pad + 1 else 0;
@@ -10159,6 +10164,7 @@ pub const Generator = struct {
                     .refused => {
                         self.done = true;
                         self.finish_reason = "stop";
+                        self.stop_token = token;
                         return null;
                     },
                 }
@@ -10178,6 +10184,7 @@ pub const Generator = struct {
                     .refused => {
                         self.done = true;
                         self.finish_reason = "stop";
+                        self.stop_token = token;
                         return null;
                     },
                 }
@@ -10276,6 +10283,7 @@ pub const Generator = struct {
             if (token == eos_id and constraint.pstate.phase != .header) {
                 self.done = true;
                 self.finish_reason = "stop";
+                self.stop_token = token;
                 return null;
             }
         }
@@ -10284,6 +10292,7 @@ pub const Generator = struct {
             if (self.consecutive_pad >= 3) {
                 self.done = true;
                 self.finish_reason = "stop";
+                self.stop_token = token;
                 return null;
             }
         } else {
@@ -10447,6 +10456,7 @@ pub const Generator = struct {
                 if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
                 self.done = true;
                 self.finish_reason = "stop";
+                self.stop_token = token;
                 return null;
             }
         }
@@ -10456,6 +10466,7 @@ pub const Generator = struct {
                 if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
                 self.done = true;
                 self.finish_reason = "stop";
+                self.stop_token = token;
                 return null;
             }
         } else {
@@ -10526,6 +10537,7 @@ pub const Generator = struct {
         if (tokenStops(self.next_token_id, self.eos_token_ids, &self.consecutive_pad)) {
             self.done = true;
             self.finish_reason = "stop";
+            self.stop_token = self.next_token_id;
             return true;
         }
         return false;
