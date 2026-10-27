@@ -71,17 +71,14 @@ the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
 less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-STQ-2.75bpw) at 64 GB.
 
-‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every Mac, so its memory is the `--ssd-budget-gb` you
-set plus the request's own bill: the first table is at `--ssd-budget-gb 108`, the bill measured from 4k to 128k (1.6 GiB
-plus 2.8 KB a token) and extended to 1M. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac and at `80` on a 96 GB Mac
-with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)).
+‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every under 128GB Mac. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `iogpu.wired_limit_mb=125000` and at `80` on a 96 GB Mac with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)).
 
 ## Streaming
 
 Any Sushi pack runs on a Mac with less memory than its weights. `--ssd-budget-gb N` keeps N GiB resident (the trunk,
 the speculative head and a cache of routed experts) and reads the other experts from the SSD, with the same replies as
-a resident load; a larger N caches more experts and reads the SSD less. The context's KV or state is billed on top, so
-N plus the context must fit under the GPU limit. DeepSeek-V4.1-Flash always streams.
+a resident load. A larger N caches more experts and reads the SSD less. The context's KV or state is billed on top, so
+N plus the context must fit under the GPU limit.
 
 | Mac | pack | `--ssd-budget-gb` | GPU limit (MB) | context | decode at 4k |
 |---|---|---:|---:|---|---|
@@ -89,22 +86,9 @@ N plus the context must fit under the GPU limit. DeepSeek-V4.1-Flash always stre
 | 96 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 80 | 93,000 | 1M | 45 code / 45 prose |
 | 128 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose |
 
-```bash
-sudo sysctl iogpu.wired_limit_mb=27000   # resets at reboot
-sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-gb 18 --ctx-size 66000 \
-  --qwen-gdn 16 --expert-pick-tolerance 0.3
-```
-
-- `--qwen-gdn 16` stores Qwen's recurrent state in bf16 instead of the f32 default, halving it in every cache
-  checkpoint (about 54 MB each); the 32, 48 and 64 GB recipes run it.
-- `--expert-pick-tolerance 0.3` is lossy: on a cache miss it takes the best cached expert whose router probability is at
-  least 0.7 of the missed one's and skips the SSD read. Leave it out for replies identical to a resident load.
-- A streamed load serves text unless `--vision` loads the vision tower out of the N GiB; DeepSeek-V4.1-Flash loads it by
-  default (`--no-vision` skips it).
-- The plan may come within 1 GiB of the GPU limit (`--wired-margin-gib N`, 1 to 32). DeepSeek launches:
-  [usage](docs/usage.md#deepseek-launch).
-
 ## Benchmarks
+
+### Sushi bench (Speed)
 
 | Sushi 🍣 1.4.0 | M5 Max 128 GB | 4k | 8k | 16k | 32k | 64k | 128k |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -117,22 +101,16 @@ sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-g
 | **DeepSeek 4.1 Flash-STQ-1.75bpw** (`--ssd-budget-gb 108`) | Prefill | 707 | 1,024 | 998 | 993 | 950 | 829 |
 | | Decode | 76.6 | 84.2 | 76.2 | 85.3 | 78.1 | 63.7 |
 
-`sushi bench` code arm (tok/s, shipping defaults with the default speculative mode, prefill is the 8k window ending at
-the rung). The prose arm and each model's report are in [docs/bench/v1.4.0](docs/bench/v1.4.0/summary.md).
+### Tool-eval-bench 3.0 (Agentic)
 
-Community reports, using llmprobe `--bench-only`:
-
-| Class | Typical RAM | Pack | Prefill tok/s | Gen tok/s |
-|---|---|---|---:|---:|
-| M1 Max | 64 GB | 3bpw | ~350 | ~32 |
-| M2 Max | 64 GB | 3bpw | ~400 | ~38-40 |
-| M3 Ultra 60c | 256 GB | 4bpw | ~420 | ~60 |
-| M4 Max | 64 GB | 3bpw | ~690 | ~60-65 |
-| M5 Pro | 64 GB | 2.6bpw | ~900 | ~50-55 |
-| M5 Max | 128 GB | 3bpw | ~1,900 | ~95 |
-| M5 Max | 128 GB | 4bpw | ~1,750 | ~90 |
-| M5 Max | 128 GB | MiMo 2.3bpw | ~1,130 | ~70 |
-| M5 Max | 128 GB | GLM 2.4bpw | ~860 | ~55 |
+| Pack                 | Thinking | Score  | Points  | Rating | Max weights in RAM |
+| -------------------- | -------- | ------ | ------- | ------ | ------------------ |
+| DeepSeek STQ 1.75bpw | high     | **92** | 178/194 | 5★     | 129 GB (108 stream)|
+| Qwen STQ 2.75bpw     | medium   | **91** | 176/194 | 5★     | 50 GB              |
+| Qwen 4bpw            | medium   | **90** | 174/194 | 5★     | 68 GB              |
+| GLM 2.4bpw           | high     | **90** | 175/194 | 5★     | 98 GB              |
+| MiMo 2.3bpw          | on       | **89** | 172/194 | 4★     | 103 GB             |
+| Qwen 2bpw            | medium   | **88** | 170/194 | 3★     | 38 GB              |
 
 ## License
 
