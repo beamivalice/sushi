@@ -3270,7 +3270,7 @@ pub const TensorArray = struct {
 
 /// From this size a tensor is read into its own mapping that MLX imports without a copy;
 /// below it, the scratch copy into a fresh MLX buffer costs less than a page per tensor.
-const import_min_bytes: usize = 1 << 20;
+pub var import_min_bytes: usize = 1 << 20;
 
 /// `len` bytes at `offset` as a `shape`/`dtype` array, read around the file cache with the read
 /// and copy of its chunks spread over several threads (`expert_io.ParallelReader`). A large tensor
@@ -3287,7 +3287,61 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
         try mlx.check(mlx.mlx_array_eval(array));
         return .{ .array = array, .bytes = if (len == 0) &.{} else mlx.mlx_array_data_uint8(array).?[0..len] };
     }
-    const size: usize = @intCast(expert_io.pageRoundUp(len));
+    const region = try ownedRegion(len);
+    reader.fill(fd, region.ptr[0..len], offset) catch |err| {
+        destroyRegion(region);
+        return err;
+    };
+    const ptr = region.ptr;
+    const wrapped = try wrapRegion(region, shape, dtype);
+    return .{ .array = wrapped.array, .bytes = mlx.mlx_array_data_uint8(wrapped.array).?[0..len], .mapped = if (wrapped.aliased) ptr else null };
+}
+
+pub const MappedRegion = struct { ptr: [*]align(std.heap.page_size_min) u8, len: usize };
+
+/// Bytes of the live regions MLX holds as array buffers (`wrapOwned`), the weights sushi owns.
+pub var owned_bytes: std.atomic.Value(u64) = .init(0);
+/// No-copy wraps MLX refused (it copied the region instead).
+pub var refused_imports: std.atomic.Value(u64) = .init(0);
+
+const Span = struct { ptr: usize, len: usize };
+var span_lock: std.atomic.Value(bool) = .init(false);
+var spans: std.ArrayList(Span) = .empty;
+
+fn lockSpans() void {
+    while (span_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+}
+
+fn trackRegion(region: *const MappedRegion) void {
+    _ = owned_bytes.fetchAdd(region.len, .monotonic);
+    lockSpans();
+    defer span_lock.store(false, .release);
+    spans.append(std.heap.c_allocator, .{ .ptr = @intFromPtr(region.ptr), .len = region.len }) catch {};
+}
+
+/// Does `ptr` lie inside a live owned region? A test helper and the load log's audit.
+/// Every byte sushi maps and MLX sees without a copy: weight regions plus the expert slab pools.
+pub fn ownedBytesTotal() u64 {
+    return owned_bytes.load(.monotonic) + expert_io.slab_bytes.load(.monotonic);
+}
+
+pub fn ownsPointer(ptr: ?*const anyopaque) bool {
+    const at = @intFromPtr(ptr orelse return false);
+    lockSpans();
+    defer span_lock.store(false, .release);
+    for (spans.items) |sp| if (at >= sp.ptr and at < sp.ptr + sp.len) return true;
+    return false;
+}
+
+pub fn ownedRegionCount() usize {
+    lockSpans();
+    defer span_lock.store(false, .release);
+    return spans.items.len;
+}
+
+/// A zeroed, page-rounded anonymous mapping of at least `len` bytes (a mapping cannot be empty).
+pub fn ownedRegion(len: usize) !*MappedRegion {
+    const size: usize = @intCast(expert_io.pageRoundUp(@max(len, 1)));
     const mapped = std.c.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     if (mapped == std.c.MAP_FAILED) return error.OutOfMemory;
     const region = std.heap.c_allocator.create(MappedRegion) catch {
@@ -3295,13 +3349,20 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
         return error.OutOfMemory;
     };
     region.* = .{ .ptr = @ptrCast(@alignCast(mapped)), .len = size };
-    reader.fill(fd, region.ptr[0..len], offset) catch |err| {
-        unmapRegion(region);
-        return err;
-    };
-    // When Metal refuses the mapping MLX copies it and runs `unmapRegion` before returning:
-    // `region` is not touched after this call.
+    return region;
+}
+
+/// Releases a region that was never wrapped.
+pub fn destroyRegion(region: *MappedRegion) void {
+    _ = std.c.munmap(region.ptr, region.len);
+    std.heap.c_allocator.destroy(region);
+}
+
+/// `region` as an evaluated array; `aliased` is false when MLX copied the mapping instead of importing it, which
+/// releases the region.
+fn wrapRegion(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !struct { array: mlx.mlx_array, aliased: bool } {
     const ptr = region.ptr;
+    trackRegion(region);
     const array = mlx.mlx_array_new_data_managed_payload(ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
     if (array.ctx == null) {
         // MLX throws from this constructor only before adopting the mapping (its copy
@@ -3311,20 +3372,40 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
     }
     errdefer _ = mlx.mlx_array_free(array);
     try mlx.check(mlx.mlx_array_eval(array));
-    const data = mlx.mlx_array_data_uint8(array).?;
-    return .{ .array = array, .bytes = data[0..len], .mapped = if (data == ptr) ptr else null };
+    return .{ .array = array, .aliased = mlx.mlx_array_data_uint8(array) == ptr };
 }
 
-const MappedRegion = struct { ptr: [*]align(std.heap.page_size_min) u8, len: usize };
+/// `region` as an evaluated `shape`/`dtype` array whose buffer is the region itself; the region goes with the array.
+/// A mapping Metal refuses is copied by MLX into its own allocator, which is `error.OwnedImportCopied`.
+pub fn wrapOwned(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const wrapped = try wrapRegion(region, shape, dtype);
+    if (wrapped.aliased) return wrapped.array;
+    _ = refused_imports.fetchAdd(1, .monotonic);
+    _ = mlx.mlx_array_free(wrapped.array);
+    return error.OwnedImportCopied;
+}
 
-fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
+pub fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
     const region: *MappedRegion = @ptrCast(@alignCast(payload.?));
-    _ = std.c.munmap(region.ptr, region.len);
-    std.heap.c_allocator.destroy(region);
+    _ = owned_bytes.fetchSub(region.len, .monotonic);
+    {
+        lockSpans();
+        defer span_lock.store(false, .release);
+        for (spans.items, 0..) |sp, i| if (sp.ptr == @intFromPtr(region.ptr)) {
+            _ = spans.swapRemove(i);
+            break;
+        };
+    }
+    destroyRegion(region);
 }
 
 /// One header entry's payload as an MLX array. Caller frees.
 pub fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
+    return (try readSafetensorArray(reader, fd, header, meta)).array;
+}
+
+/// `readSafetensor` with the import's outcome: `mapped` is null for a tensor MLX copied.
+pub fn readSafetensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !TensorArray {
     if (meta != .object) return error.InvalidSafetensorsTensor;
     const dtype_value = meta.object.get("dtype") orelse return error.InvalidSafetensorsTensor;
     const dims = meta.object.get("shape") orelse return error.InvalidSafetensorsTensor;
@@ -3341,7 +3422,7 @@ pub fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header:
     const lo = offsets.array.items[0];
     const hi = offsets.array.items[1];
     if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != bytes) return error.InvalidSafetensorsTensor;
-    return (try readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype)).array;
+    return readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype);
 }
 
 /// The resident key a shard tensor loads under, or null when it is skipped.
@@ -6505,4 +6586,26 @@ test "a shard loads only when one of its tensors survives the filter" {
         }
         try testing.expectEqual(c.loads, any);
     }
+}
+
+test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned bytes return" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const start = owned_bytes.load(.monotonic);
+    const refused = refused_imports.load(.monotonic);
+    const spans_start = ownedRegionCount();
+
+    // The control: a page-aligned region is imported as it is.
+    const good = try ownedRegion(100);
+    const kept = try wrapOwned(good, &.{100}, .uint8);
+    try testing.expect(ownsPointer(mlx.mlx_array_data_uint8(kept)));
+    try testing.expectEqual(start + expert_io.pageRoundUp(100), owned_bytes.load(.monotonic));
+    _ = mlx.mlx_array_free(kept);
+    try testing.expectEqual(start, owned_bytes.load(.monotonic));
+    try testing.expectEqual(spans_start, ownedRegionCount());
+
+    // Empty.
+    const empty = try ownedRegion(1);
+    try testing.expectError(error.OwnedImportCopied, wrapOwned(empty, &.{0}, .uint8));
+    try testing.expectEqual(start, owned_bytes.load(.monotonic));
+    try testing.expectEqual(refused + 1, refused_imports.load(.monotonic));
 }

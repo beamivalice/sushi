@@ -83,6 +83,7 @@ test {
     _ = @import("dsv41_qat.zig");
     _ = @import("dsv41_engram.zig");
     _ = @import("dsv41_source.zig");
+    _ = @import("dsv41_owned.zig");
     _ = @import("dsv41_model.zig");
     _ = @import("dsv41_stream.zig");
     _ = @import("dsv41_borrow.zig");

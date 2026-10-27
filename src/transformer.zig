@@ -27681,6 +27681,7 @@ fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const 
     // The load drops each tensor from the map once its arrays are bound.
     const mdl = try dsv41_model.init(allocator, config.dsv41.?, @constCast(weights), config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
     errdefer mdl.deinit();
+    dsv41_model.logMemory(mdl);
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
     dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);

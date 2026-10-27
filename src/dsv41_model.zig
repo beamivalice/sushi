@@ -14,6 +14,7 @@ const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const engram = @import("dsv41_engram.zig");
 const source = @import("dsv41_source.zig");
+const owned_mod = @import("dsv41_owned.zig");
 const model_mod = @import("model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
@@ -611,6 +612,9 @@ pub const Model = struct {
     drop: ?*const expert_usage.Drop = null,
     /// Arrays made at load (casts, views, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
+    /// Bytes this load built in owned regions rather than read from the shards: widened f32 tensors, shared stacks,
+    /// the DSpark ragged storage.
+    built: struct { widened: u64 = 0, stacks: u64 = 0, ragged: u64 = 0 } = .{},
     dec_state: ?State = null,
     /// Counts the states dropped: a record of the live state (`dsv41_prefix.Live`) holds only while it is unchanged.
     state_epoch: u64 = 0,
@@ -692,8 +696,12 @@ pub const Model = struct {
         return x;
     }
 
-    /// `x` cast to `dt` and evaluated, owned by the model.
+    /// `x` cast to `dt` and evaluated, owned by the model. A bf16 tensor widened to f32 is built in an owned region.
     fn ownCast(self: *Model, x: A, dt: mlx.mlx_dtype) !A {
+        if (dt == .float32) if (try owned_mod.widenF32(x)) |wide| {
+            self.built.widened += mlx.mlx_array_size(wide) * 4;
+            return self.own(wide);
+        };
         var o = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&o, x, dt, self.s));
         _ = try self.own(o);
@@ -1051,6 +1059,11 @@ fn fuseShared(m: *Model, lins: []const *Lin) !?exl3.linear.Shared {
     }
     var cat: [3]A = undefined;
     for (0..3) |k| {
+        if (try owned_mod.stack(parts[k][0..lins.len], @enumFromInt(k))) |stacked| {
+            m.built.stacks += mlx.mlx_array_size(stacked) * mlx.mlx_array_itemsize(stacked);
+            cat[k] = try m.own(stacked);
+            continue;
+        }
         const v = mlx.mlx_vector_array_new_data(&parts[k], lins.len);
         defer _ = mlx.mlx_vector_array_free(v);
         var o = mlx.mlx_array_new();
@@ -1130,6 +1143,28 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (mlx.streamIsGpu(s)) try kernels.probeHc(gpa, s, c.hc_mult, c.dim, c.hc_iters);
     m.ced_split = c.cedSplit();
     return m;
+}
+
+/// Where the load's weight arrays live: sushi's owned regions or MLX's allocator. Evaluates them.
+pub fn memoryAudit(m: *const Model) !owned_mod.Audit {
+    var arrays: std.ArrayList(A) = .empty;
+    defer arrays.deinit(m.gpa);
+    try arrays.appendSlice(m.gpa, m.owned.items);
+    if (m.dspark) |ds| for (ds.stq) |rb| try arrays.appendSlice(m.gpa, rb.storage()[0..9]);
+    return owned_mod.audit(m.gpa, arrays.items);
+}
+
+pub fn logMemory(m: *const Model) void {
+    const gb = struct {
+        fn of(b: u64) f64 {
+            return @as(f64, @floatFromInt(b)) / 1e9;
+        }
+    }.of;
+    const a = memoryAudit(m) catch |e| return log.warn("[dsv41-mem] audit failed: {s}\n", .{@errorName(e)});
+    log.info("[dsv41-mem] owned {d:.2} GB in {d} regions (built here: DSpark storage {d:.2}, f32 widenings {d:.2}, shared stacks {d:.2}), MLX-owned weights {d:.2} GB in {d} arrays ({d} of 1 MiB or more), refused {d}\n", .{
+        gb(model_mod.owned_bytes.load(.monotonic)), model_mod.ownedRegionCount(), gb(m.built.ragged), gb(m.built.widened), gb(m.built.stacks),
+        gb(a.mlx_bytes),                            a.mlx_arrays,                 a.mlx_large,         model_mod.refused_imports.load(.monotonic),
+    });
 }
 
 fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
@@ -3349,14 +3384,23 @@ fn loadStqExperts(m: *Model, w: *model_mod.Weights, si: usize) !exl3.Ragged {
             @field(banks[count], pn) = .{ .trellis = parts[0], .suh = parts[1], .svh = parts[2] };
         }
     }
-    var rb = try exl3.Ragged.init(m.s, banks[0..count]);
+    // A group's source is dropped once copied, so a stage's load peak is its storage plus one group.
+    const drop_group = struct {
+        const Ctx = struct { w: *model_mod.Weights, names: []const NameBuf, lens: []const usize };
+        fn run(raw: ?*anyopaque, g: usize) void {
+            const ctx: *const Ctx = @ptrCast(@alignCast(raw.?));
+            for (ctx.names[g * 9 ..][0..9], ctx.lens[g * 9 ..][0..9]) |*b, n| source.drop(ctx.w, b[0..n]);
+        }
+    };
+    var drop_ctx: drop_group.Ctx = .{ .w = w, .names = names[0 .. count * 9], .lens = lens[0 .. count * 9] };
+    var rb = try owned_mod.raggedOwned(m.s, banks[0..count], .{ .ctx = &drop_ctx, .run = drop_group.run });
     errdefer rb.deinit();
     if (rb.experts != c.dspark.experts or rb.hidden != c.dim or rb.inter != c.moe_inter) {
         log.err("deepseek_v41: DSpark stage {d}'s trellis experts are {d} of {d}x{d}, config says {d} of {d}x{d}\n", .{ si, rb.experts, rb.hidden, rb.inter, c.dspark.experts, c.dim, c.moe_inter });
         return error.Dsv41WeightLayout;
     }
-    // The ragged storage is a copy: evaluated, it outlives the weight map's arrays.
     try evalAll(&rb.storage());
+    for (rb.storage()[0..9]) |a| m.built.ragged += mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
     return rb;
 }
 
@@ -5433,4 +5477,37 @@ test "dsv41 vision: the CED replay keeps the image mask of the rows it replays (
     const got = try sc_mod.hostI32(try sc.astype(pass.img, .int32));
     for (got, ids[ids.len - w ..]) |g, id| try testing.expectEqual(@as(i32, @intFromBool(id == t.image_id)), g);
     try testing.expect(std.mem.indexOfScalar(i32, got, 1) != null and std.mem.indexOfScalar(i32, got, 0) != null);
+}
+
+fn stqFixtureDir() ![]const u8 {
+    return std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+}
+
+test "dsv41 owned: every weight array of an STQ load with DSpark lies in a sushi-owned region (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try stqFixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const min = model_mod.import_min_bytes;
+    model_mod.import_min_bytes = 1;
+    defer model_mod.import_min_bytes = min;
+    const m = try tinyModel(dir, .{ .act = .bfloat16, .experts = false, .dspark = true }, cpu);
+    defer m.deinit();
+    // The rope tables and Engram's q.k product are built by MLX ops from a few KiB.
+    var mlx_made: std.ArrayList(?*anyopaque) = .empty;
+    defer mlx_made.deinit(testing.allocator);
+    try mlx_made.appendSlice(testing.allocator, &.{ m.rope_plain.freqs.ctx, m.rope_yarn.freqs.ctx });
+    for (m.engrams) |e| try mlx_made.append(testing.allocator, e.qk.ctx);
+    var outside: usize = 0;
+    for (m.owned.items) |a| {
+        try mlx.check(mlx.mlx_array_eval(a));
+        if (model_mod.ownsPointer(mlx.mlx_array_data_uint8(a))) continue;
+        outside += 1;
+        try testing.expect(std.mem.indexOfScalar(?*anyopaque, mlx_made.items, a.ctx) != null);
+    }
+    try testing.expectEqual(mlx_made.items.len, outside);
+    for (m.dspark.?.stq) |rb| for (rb.storage()[0..9]) |a| try testing.expect(model_mod.ownsPointer(mlx.mlx_array_data_uint8(a)));
+    try testing.expect(m.built.ragged > 0 and m.built.widened > 0 and m.built.stacks > 0);
+    const audit = try memoryAudit(m);
+    try testing.expectEqual(outside, audit.mlx_arrays);
 }

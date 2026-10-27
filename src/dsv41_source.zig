@@ -100,11 +100,17 @@ fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, ctx
         while (tensors.next()) |entry| {
             const key = entry.key_ptr.*;
             if (std.mem.eql(u8, key, "__metadata__") or !keep(key, ctx)) continue;
-            const value = try model.readSafetensor(&reader, fd, &header, entry.value_ptr.*);
+            const read = try model.readSafetensorArray(&reader, fd, &header, entry.value_ptr.*);
+            const value = read.array;
             var value_owned = true;
             defer if (value_owned) {
                 _ = mlx.mlx_array_free(value);
             };
+            // A copied import would put the weight back in MLX's allocator, outside the ledger.
+            if (read.bytes.len >= model.import_min_bytes and read.mapped == null) {
+                log.err("[dsv41-mem] {s}: MLX refused the no-copy import of its {d} bytes\n", .{ key, read.bytes.len });
+                return error.OwnedImportCopied;
+            }
             const owned = try allocator.dupe(u8, key);
             var key_owned = true;
             defer if (key_owned) allocator.free(owned);
@@ -151,6 +157,7 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
     var shards = try shardNames(io, allocator, dir_path);
     defer freeShardNames(allocator, &shards);
     var total: u64 = 0;
+    var ragged: [ragged_slots]u64 = @splat(0);
     for (shards.items) |name| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
         defer allocator.free(path);
@@ -167,10 +174,42 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
             const offs = (entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader).array.items;
             if (offs.len != 2 or offs[0] != .integer or offs[1] != .integer) return error.InvalidSafetensorsHeader;
             const bytes: u64 = @intCast(offs[1].integer - offs[0].integer);
-            total +|= bytes *| widening(key);
+            if (raggedSlot(key)) |slot| {
+                ragged[slot] +|= bytes;
+                continue;
+            }
+            total +|= builtBytes(key, bytes);
         }
     }
+    for (ragged) |b| total +|= if (b > 0) expert_io.pageRoundUp(b) else 0;
     return total;
+}
+
+/// Bytes a stored tensor holds once built. From `import_min_bytes` it lives in its own page-rounded mapping, built
+/// there or read into it; a block scale and a stacked expert are rebuilt in MLX's allocator.
+fn builtBytes(key: []const u8, stored: u64) u64 {
+    const w = widening(key);
+    const built = stored *| w;
+    if (w == 32 or std.mem.indexOf(u8, key, ".ffn.experts.") != null or built < model.import_min_bytes) return built;
+    return expert_io.pageRoundUp(built);
+}
+
+const ragged_slots = 16 * 9;
+
+/// A DSpark stage's trellis expert tensor `mtp.<s>.mlp.switch_mlp.<proj>_proj[.gN].<part>` as the one owned region
+/// its (stage, projection, part) is built into (`dsv41_owned.raggedOwned`), or null for any other key.
+fn raggedSlot(key: []const u8) ?usize {
+    const head = "mtp.";
+    if (!std.mem.startsWith(u8, key, head)) return null;
+    const dot = std.mem.indexOfScalarPos(u8, key, head.len, '.') orelse return null;
+    const stage = std.fmt.parseInt(usize, key[head.len..dot], 10) catch return null;
+    const rest = key[dot..];
+    const mid = ".mlp.switch_mlp.";
+    if (stage >= 16 or !std.mem.startsWith(u8, rest, mid)) return null;
+    const tail = rest[mid.len..];
+    const proj: usize = if (std.mem.startsWith(u8, tail, "gate_proj")) 0 else if (std.mem.startsWith(u8, tail, "up_proj")) 1 else if (std.mem.startsWith(u8, tail, "down_proj")) 2 else return null;
+    const part: usize = if (std.mem.endsWith(u8, tail, ".trellis")) 0 else if (std.mem.endsWith(u8, tail, ".suh")) 1 else if (std.mem.endsWith(u8, tail, ".svh")) 2 else return null;
+    return stage * 9 + part * 3 + proj;
 }
 
 /// How many times the built tensor is as large as the stored one: an fp8 weight's block scale is repeated down its
@@ -292,4 +331,27 @@ test "dsv41 source: the tower's bytes are the vision section, the trunk's exclud
     var text = try loadResident(testing.io, testing.allocator, root, .{});
     defer text.deinit();
     try testing.expect(text.get("vision.blocks.0.attn.wo.weight") == null and text.get("layers.3.ffn.gate.bias") != null);
+}
+
+test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's trellis tensors as one region each" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const mib: usize = 1 << 20;
+    try writeShard(tmp.dir, "model-a.safetensors", &.{
+        .{ "embed.weight", mib + 100 },
+        .{ "norm.weight", 4000 },
+        .{ "layers.3.ffn.gate.weight", 600_000 },
+        .{ "layers.3.attn.wq_a.scale", 2 * mib + 1 },
+        .{ "mtp.0.mlp.switch_mlp.gate_proj.g0.trellis", 3 * mib },
+        .{ "mtp.0.mlp.switch_mlp.gate_proj.g1.trellis", 100 },
+        .{ "mtp.0.mlp.switch_mlp.gate_proj.g0.suh", 50 },
+        .{ "mtp.0.mlp.switch_mlp.gate_proj.g1.suh", 50 },
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    // The f32 gate widens to 1.2 MB; the scale grid is rebuilt by MLX at 32x, unrounded.
+    const trunk = expert_io.pageRoundUp(mib + 100) + 4000 + expert_io.pageRoundUp(1_200_000) + (2 * mib + 1) * 32;
+    try testing.expectEqual(trunk, try residentBytes(testing.io, testing.allocator, root));
+    // The two groups' trellis bytes are one region, their scales another.
+    try testing.expectEqual(expert_io.pageRoundUp(3 * mib + 100) + expert_io.pageRoundUp(100), try dsparkBytes(testing.io, testing.allocator, root));
 }

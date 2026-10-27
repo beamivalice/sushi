@@ -75,6 +75,23 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
   `memory.kv_cache_bytes` and a live `/metrics` row's `state_bytes` count it (`dsv41_model.stateBytes` plus the live
   points) while the request runs.
 
+<a id="owned-weights"></a>
+## Weight memory sushi owns
+
+The weight load builds every long-lived weight of 1 MiB or more in a mapping of its own that MLX imports without a copy
+(`model.ownedRegion` and `wrapOwned`); `/props` `memory.owned_bytes` and the `[dsv41-mem]` load line report it.
+- A shard tensor is read into its mapping (`readTensorArray`); the weight load refuses one MLX copied instead
+  (`OwnedImportCopied`), since a copy would sit outside the ledger.
+- The DSpark stage's trellis experts are nine regions (trellis, `suh`, `svh` per projection), the groups' bytes back to
+  back, copied on the host; each group's source is dropped after its copy, so a stage's load peak is its storage plus
+  one group (`dsv41_owned.raggedOwned`, into `Ragged.initPools`).
+- f32 widenings (bf16 to f32 is the bits shifted up, as MLX's cast) and the fused-stack bank of `fuseShared` are built
+  in regions; the slices into the stack stay views.
+- Left in MLX: tensors under 1 MiB, the meta tables, the rope tables and Engram's q.k product.
+- The bill (`dsv41_source.sumBytes`) rounds each tensor from 1 MiB, and each DSpark (stage, projection, part) as one
+  region, up to the page. MLX refuses no page-aligned mapping; it also accepts a start inside a page, so the
+  `OwnedImportCopied` check is the data-pointer test, not an alignment rule.
+
 ## Plans that lost
 
 Replayed on recorded routes, two plans were dropped. Pinning the encoder's experts resident (layers 0-19) saves prefill

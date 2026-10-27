@@ -715,6 +715,9 @@ pub const Lease = struct {
     id: u64,
 };
 
+/// Bytes mapped by live PageSlabs: sushi-owned memory MLX sees through no-copy imports (`/props` owned_bytes).
+pub var slab_bytes: std.atomic.Value(u64) = .init(0);
+
 pub const PageSlab = struct {
     allocator: std.mem.Allocator,
     bytes: []align(align_bytes) u8,
@@ -738,12 +741,14 @@ pub const PageSlab = struct {
             0,
         );
         slab.* = .{ .allocator = allocator, .bytes = @alignCast(mapped) };
+        _ = slab_bytes.fetchAdd(slab.bytes.len, .monotonic);
         return slab;
     }
 
     pub fn destroy(self: *PageSlab) void {
         const allocator = self.allocator;
         self.live.deinit(allocator);
+        _ = slab_bytes.fetchSub(self.bytes.len, .monotonic);
         std.posix.munmap(self.bytes);
         allocator.destroy(self);
     }
@@ -2068,4 +2073,12 @@ test "parallel reader fills any range, across many chunks and workers and up to 
         defer t.allocator.free(past);
         try t.expectError(error.FillShortRead, reader.fill(fd, past, size - page));
     }
+}
+
+test "a PageSlab counts its mapped bytes while it lives" {
+    const before = slab_bytes.load(.monotonic);
+    const slab = try PageSlab.create(std.testing.allocator, 5000);
+    try std.testing.expectEqual(before + pageRoundUp(5000), slab_bytes.load(.monotonic));
+    slab.destroy();
+    try std.testing.expectEqual(before, slab_bytes.load(.monotonic));
 }
