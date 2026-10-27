@@ -228,6 +228,8 @@ pub const Table = struct {
     sdim: u32,
     /// Hot rows held in RAM; null reads every row from the shard.
     cache: ?*RowCache = null,
+    /// Rows `pread` from the shard so far.
+    rows_read: std.atomic.Value(u64) = .init(0),
 
     pub fn close(self: *Table) void {
         _ = std.c.close(self.fd);
@@ -308,27 +310,63 @@ pub const Table = struct {
         }
     };
 
+    /// Each distinct id is read once, from the cache or the shard, and copied to every position that holds it.
     pub fn read(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
         const n = ids.len;
         const w = try gpa.alignedAlloc(u8, .@"4", n * self.head_dim);
         errdefer gpa.free(w);
         const sc = try gpa.alignedAlloc(u8, .@"4", n * self.sdim);
         errdefer gpa.free(sc);
+        const first = try gpa.alloc(u32, n);
+        defer gpa.free(first);
+        // Out of memory for the map reads every position, as a batch without repeats does.
+        const repeats = firstOccurrences(gpa, ids, first) catch 0;
         const cache = self.cache orelse {
-            try self.readInto(ids, null, w, sc);
+            if (repeats == 0) {
+                try self.readInto(ids, null, w, sc);
+                return .{ .w = w, .s = sc };
+            }
+            const only = try gpa.alloc(u32, n - repeats);
+            defer gpa.free(only);
+            var k: usize = 0;
+            for (first, 0..) |f, i| if (f == i) {
+                only[k] = @intCast(i);
+                k += 1;
+            };
+            try self.readInto(ids, only, w, sc);
+            self.copyRepeats(first, w, sc);
             return .{ .w = w, .s = sc };
         };
         const missed = try gpa.alloc(u32, n);
         defer gpa.free(missed);
-        const k = cache.lookup(ids, w, sc, missed);
+        var k = cache.lookup(ids, w, sc, missed);
+        if (repeats > 0) {
+            var kept: usize = 0;
+            for (missed[0..k]) |i| if (first[i] == i) {
+                missed[kept] = i;
+                kept += 1;
+            };
+            k = kept;
+        }
         try self.readInto(ids, missed[0..k], w, sc);
         cache.insert(ids, missed[0..k], w, sc);
+        if (repeats > 0) self.copyRepeats(first, w, sc);
         return .{ .w = w, .s = sc };
+    }
+
+    fn copyRepeats(self: *const Table, first: []const u32, w: []u8, sc: []u8) void {
+        const wl = self.head_dim;
+        const sl = self.sdim;
+        for (first, 0..) |f, i| if (f != i) {
+            @memcpy(w[i * wl ..][0..wl], w[f * wl ..][0..wl]);
+            @memcpy(sc[i * sl ..][0..sl], sc[f * sl ..][0..sl]);
+        };
     }
 
     /// Reads `ids[i]` into row i of `w` and `sc` for every i of `only` (all of them when null).
     fn readInto(self: *const Table, ids: []const u32, only: ?[]const u32, w: []u8, sc: []u8) !void {
         const n = if (only) |o| o.len else ids.len;
+        _ = @constCast(&self.rows_read).fetchAdd(n, .monotonic);
         const job: Job = .{ .t = self, .ids = ids, .only = only, .w = w, .s = sc };
         // One thread per 16 rows (a verify's rows wait at the first Engram layer), this one included.
         const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
@@ -414,6 +452,20 @@ pub const Table = struct {
         }
     };
 };
+
+/// Sets `first[i]` to the earliest position holding `ids[i]` and returns how many positions repeat an earlier one.
+fn firstOccurrences(gpa: std.mem.Allocator, ids: []const u32, first: []u32) !usize {
+    var seen: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer seen.deinit(gpa);
+    try seen.ensureTotalCapacity(gpa, @intCast(ids.len));
+    var repeats: usize = 0;
+    for (ids, first, 0..) |id, *f, i| {
+        const slot = seen.getOrPutAssumeCapacity(id);
+        if (slot.found_existing) repeats += 1 else slot.value_ptr.* = @intCast(i);
+        f.* = slot.value_ptr.*;
+    }
+    return repeats;
+}
 
 /// Rows each table's cache holds. On 1M tokens of documents in turn the hit rate is 31% at
 /// 64k rows, 42% at 1M and 47% at 4M: past 1M a row buys little.
@@ -557,6 +609,8 @@ pub const Prefetch = struct {
     span: usize,
     nc: usize,
     stop: std.atomic.Value(bool) = .init(false),
+    /// Set once the thread has read every grid (or was stopped).
+    ended: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
@@ -608,6 +662,7 @@ pub const Prefetch = struct {
     }
 
     fn run(self: *Prefetch) void {
+        defer self.ended.store(true, .release);
         for (self.grids) |*g| {
             const n_spans = g.items.len / self.tables.len;
             for (self.tables, 0..) |table, layer| for (0..n_spans) |k| {
@@ -632,6 +687,18 @@ pub const Prefetch = struct {
     pub fn covers(self: *const Prefetch, at: usize, len: usize) bool {
         for (self.grids) |g| if (g.at == at and g.len >= len) return true;
         return false;
+    }
+
+    /// Does a grid start at `at` with `ids` (row ids, `Spec.ids`' layout) as its first tokens' rows? Row ids decide what
+    /// the reads hold, so a grid that matches serves exactly the rows a fresh read of `ids` would.
+    pub fn matches(self: *const Prefetch, at: usize, ids: []const u32) bool {
+        for (self.grids) |g| if (g.at == at and g.ids.len >= ids.len and std.mem.eql(u32, g.ids[0..ids.len], ids)) return true;
+        return false;
+    }
+
+    /// Has the thread read everything it was given?
+    pub fn finished(self: *const Prefetch) bool {
+        return self.ended.load(.acquire);
     }
 
     /// The rows of `layer`'s span `k` of the grid at `at`, once read (the caller frees them).
@@ -893,6 +960,85 @@ test "dsv41 engram: a prefetch hands each span's rows as a gather of the same id
     };
 }
 
+test "dsv41 engram: an id repeated within a batch is read from the shard once and fills every place it sits" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFp8Fixture(io, td.dir, true);
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var t = try Table.open(testing.allocator, dir, 1, 4, 64);
+    defer t.close();
+    var wide: [144]u32 = undefined;
+    for (&wide, 0..) |*id, i| id.* = @intCast((i * 7 + i / 5) % 4);
+    for ([_][]const u32{ &.{ 3, 1, 3, 3, 0, 1, 2, 3 }, &.{ 2, 2 }, &.{1}, &wide }) |ids| {
+        const before = t.rows_read.load(.monotonic);
+        const got = try t.read(testing.allocator, ids);
+        defer got.deinit(testing.allocator);
+        var distinct: u64 = 0;
+        for (0..4) |r| distinct += @intFromBool(std.mem.indexOfScalar(u32, ids, @intCast(r)) != null);
+        try testing.expectEqual(distinct, t.rows_read.load(.monotonic) - before);
+        for (ids, 0..) |id, i| {
+            try testing.expectEqual(@as(u8, @intCast(127 + id)), got.s[2 * i]);
+            try testing.expectEqual(@as(u8, 126), got.s[2 * i + 1]);
+            try testing.expect(std.mem.allEqual(u8, got.w[64 * i ..][0..64], 0x38));
+        }
+    }
+    try testing.expectError(error.EngramRead, t.read(testing.allocator, &.{ 7, 7 }));
+}
+
+test "dsv41 engram: with a row cache a repeated missed id is read once, and a cached one not at all" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFp8Fixture(io, td.dir, true);
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var t = try Table.open(testing.allocator, dir, 1, 4, 64);
+    defer t.close();
+    var cache = try RowCache.init(testing.allocator, 4 * RowCache.WAYS, 64, 2);
+    defer cache.deinit();
+    t.cache = &cache;
+    for ([_]struct { ids: []const u32, reads: u64 }{
+        .{ .ids = &.{ 2, 1, 2, 2, 1 }, .reads = 2 },
+        .{ .ids = &.{ 1, 2, 3, 3 }, .reads = 1 },
+        .{ .ids = &.{ 3, 2, 1, 2 }, .reads = 0 },
+    }) |c| {
+        const before = t.rows_read.load(.monotonic);
+        const got = try t.read(testing.allocator, c.ids);
+        defer got.deinit(testing.allocator);
+        try testing.expectEqual(c.reads, t.rows_read.load(.monotonic) - before);
+        for (c.ids, 0..) |id, i| try testing.expectEqual(@as(u8, @intCast(127 + id)), got.s[2 * i]);
+    }
+}
+
+test "dsv41 engram: a prefetch is the next chunk's only when its grid starts there and holds the same row ids" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFp8Fixture(io, td.dir, true);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 1, 4, 64);
+    defer t.close();
+    // 5 tokens, 2 tables, 2 columns.
+    var ids: [5 * 2 * 2]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i * 3 + 1) % 4);
+    const tables = [_]*const Table{ &t, &t };
+    var pf = try Prefetch.start(testing.allocator, &tables, &.{.{ .at = 7, .len = 5, .ids = &ids }}, 2, 5);
+    defer pf.finish();
+    try testing.expect(pf.matches(7, &ids) and pf.matches(7, ids[0..8]) and pf.matches(7, &.{}));
+    try testing.expect(!pf.matches(6, &ids) and !pf.matches(8, ids[0..8]));
+    var longer: [5 * 2 * 2 + 4]u32 = undefined;
+    @memcpy(longer[0..ids.len], &ids);
+    @memset(longer[ids.len..], 0);
+    try testing.expect(!pf.matches(7, &longer));
+    var other = ids;
+    other[9] ^= 1;
+    try testing.expect(!pf.matches(7, &other) and pf.matches(7, other[0..8]));
+    for (0..2) |layer| (try pf.take(7, layer, 0)).deinit(testing.allocator);
+    while (!pf.finished()) std.Thread.yield() catch {};
+}
+
 test "dsv41 engram: the embedded V4.1 token map collapses case variants and ends where the config says" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = testing.tmpDir(.{});
@@ -947,10 +1093,28 @@ test "dsv41 engram: row reuse by cache capacity over a token file (SUSHI_DSV41_E
     const comp = try a.alloc(u32, doc);
     const rows = try a.alloc(u32, doc * h.n_layers * nc);
     var missed: [MAX_COLS]u32 = undefined;
+    // A document as one batch a table, as a prefill chunk reads it: rows missed by the whole batch against the cache
+    // before it, and the distinct ones among them (what `Table.read` preads).
+    var batch: [2]RowCache = .{ try RowCache.init(a, cache_rows, 0, 0), try RowCache.init(a, cache_rows, 0, 0) };
+    const gathered = try a.alloc(u32, doc * nc);
+    const batch_missed = try a.alloc(u32, doc * nc);
+    const miss_ids = try a.alloc(u32, doc * nc);
+    var batch_reads: [2][2]u64 = @splat(@splat(0));
     var d: usize = 0;
     while ((d + 1) * doc <= toks.len) : (d += 1) {
         for (comp, toks[d * doc ..][0..doc]) |*o, t| o.* = if (t < map.len) map[t] else map[e.pad_id];
         h.rows(&.{}, comp, rows);
+        for (0..h.n_layers) |l| {
+            for (0..doc) |t| @memcpy(gathered[t * nc ..][0..nc], rows[(t * h.n_layers + l) * nc ..][0..nc]);
+            const k = batch[l].lookup(gathered, &.{}, &.{}, batch_missed);
+            for (batch_missed[0..k], miss_ids[0..k]) |i, *o| o.* = gathered[i];
+            std.mem.sort(u32, miss_ids[0..k], {}, std.sort.asc(u32));
+            var distinct: u64 = 0;
+            for (miss_ids[0..k], 0..) |id, i| distinct += @intFromBool(i == 0 or miss_ids[i - 1] != id);
+            batch_reads[l][0] += k;
+            batch_reads[l][1] += distinct;
+            batch[l].insert(gathered, batch_missed[0..k], &.{}, &.{});
+        }
         for (0..doc) |t| for (0..h.n_layers) |l| {
             const ids = rows[(t * h.n_layers + l) * nc ..][0..nc];
             for (&caches) |*pair| {
@@ -959,6 +1123,7 @@ test "dsv41 engram: row reuse by cache capacity over a token file (SUSHI_DSV41_E
             }
         };
     }
+    for (batch_reads, 0..) |r, l| std.debug.print("[engram-reuse] layer {d}, {d} rows a batch, 1M-row cache: {d} rows missed, {d} distinct ({d:.1}% fewer preads)\n", .{ if (l == 0) @as(u32, 1) else 14, doc * nc, r[0], r[1], 100 * (1 - @as(f64, @floatFromInt(r[1])) / @as(f64, @floatFromInt(@max(r[0], 1)))) });
     for (caches, caps) |pair, cap| {
         const rate = [2]f64{ @as(f64, @floatFromInt(pair[0].hits)) / @as(f64, @floatFromInt(pair[0].hits + pair[0].misses)), @as(f64, @floatFromInt(pair[1].hits)) / @as(f64, @floatFromInt(pair[1].hits + pair[1].misses)) };
         std.debug.print("[engram-reuse] {d} docs, {d} rows a table ({d:.0} MB a table at 272 B a row): hit layer 1 {d:.3}, layer 14 {d:.3}\n", .{ d, cap, @as(f64, @floatFromInt(RowCache.bytesFor(cap, 256, 8))) / 1e6, rate[0], rate[1] });

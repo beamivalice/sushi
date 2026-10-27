@@ -12919,6 +12919,9 @@ pub const ForwardCtx = struct {
     /// without this every chunk would restart at vision row 0. Set per chunk
     /// by the generate.zig prefill loop; 0 for unchunked/decode forwards.
     vision_splice_offset: usize = 0,
+    /// DeepSeek-V4.1 chunked prefill: the prompt tokens after this chunk, whose Engram rows the model reads while the
+    /// chunk runs. Empty for the last chunk and for decode.
+    ahead_ids: []const i32 = &.{},
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens
@@ -27742,7 +27745,10 @@ fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, m:
     }
     // The model splices the image rows itself: the span's embedding never leaves it.
     const vision: ?dsv41_model.VisionRows = if (ctx.vision_embeddings) |ve| .{ .rows = ve, .offset = ctx.vision_splice_offset } else null;
-    const last = try dsv41_model.extendVision(m, host[0..n], .last, dsv41_model.SPAN, vision);
+    const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
+    defer m.gpa.free(ahead);
+    for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
+    const last = try dsv41_model.extendAhead(m, host[0..n], .last, dsv41_model.SPAN, vision, ahead);
     defer _ = mlx.mlx_array_free(last);
     if (self.expert_stream) |engine| engine.finishForward(n);
     ctx.cache.step = st.n;

@@ -2879,6 +2879,15 @@ pub const Generator = struct {
                 else
                     nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
+                // The model reads the next forward's Engram rows while this chunk runs: the next chunk, or the final span.
+                if (xfm.dsv41 != null) {
+                    const ahead_end = if (end < loop_end)
+                        nextChunkEnd(end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                    else
+                        prompt_ids.len;
+                    ctx.ahead_ids = ids_i32[end..ahead_end];
+                }
+                defer ctx.ahead_ids = &.{};
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -20854,6 +20863,55 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     try got.append(a, gen.next_token_id);
     while (try gen.next(a)) |t| try got.append(a, t);
     try testing.expectEqualSlices(u32, want.items, got.items);
+}
+
+test "dsv41 generator: a chunked prefill tells the model the tokens after each chunk, and the next pass takes their Engram rows (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    var prompt: [1400]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
+    const saved_chunk = prefill_chunk_override;
+    defer prefill_chunk_override = saved_chunk;
+    prefill_chunk_override = 256;
+
+    // The hook runs once a chunk and once more at the prompt end, before the final span.
+    const Count = struct {
+        n: usize = 0,
+        fn call(ctx: *anyopaque, _: usize, _: []SSMCheckpoint) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n += 1;
+        }
+    };
+    var count = Count{};
+    const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 256, .adaptive_chunk_width = false, .ssm_checkpoint_stride = 256, .ssm_checkpoint_max = 4, .write_through_hook = .{ .ctx = &count, .call = Count.call } };
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 6, greedy, &.{}, opts);
+    defer gen.deinit(a);
+    try testing.expect(count.n > 4);
+    // Every forward but the first, the final span included, started with the rows read during the one before it.
+    try testing.expectEqual(@as(u64, count.n - 1), xfm.dsv41.?.engram_ahead_used);
+    try testing.expect(xfm.dsv41.?.engram_ahead == null);
 }
 
 test "dsv41 generator: after a DSpark request the slot cache marks its rows and snapshots like the scheduler's commit (DSV41_TINY)" {

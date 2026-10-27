@@ -627,6 +627,9 @@ pub const Model = struct {
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
     /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
     dspark_exact: bool = true,
+    /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
+    engram_ahead: ?*engram.Prefetch = null,
+    engram_ahead_used: u64 = 0,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
     engram_wait_ns: u64 = 0,
     engram_forwards: u64 = 0,
@@ -657,6 +660,7 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
+        self.dropAhead();
         for (self.engrams) |*e| closeEngram(e);
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -673,6 +677,11 @@ pub const Model = struct {
         self.owned.deinit(self.gpa);
         self.gpa.free(self.layers);
         self.gpa.destroy(self);
+    }
+
+    fn dropAhead(self: *Model) void {
+        if (self.engram_ahead) |pf| pf.finish();
+        self.engram_ahead = null;
     }
 
     fn own(self: *Model, x: A) !A {
@@ -2218,6 +2227,7 @@ pub fn ensureState(m: *Model) !*State {
 }
 
 pub fn resetState(m: *Model) void {
+    m.dropAhead();
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
     m.state_epoch +%= 1;
@@ -2493,6 +2503,9 @@ pub const Pass = struct {
     tail: ?usize = null,
     /// The chunk's Engram rows read on a thread while the layers before each Engram layer run.
     engram_pf: ?*engram.Prefetch = null,
+    /// The prompt tokens after this chunk, whose Engram rows are read while the chunk runs (`aheadEngram`).
+    ahead: []const u32 = &.{},
+    ahead_started: bool = false,
     /// `[L]` bool, the rows inside an image span (none for text): they route by the image bias and take no Engram write.
     img: A = none,
     /// The last layer built, when its routed chain was queued from the cache map and the host has not checked it yet.
@@ -2888,6 +2901,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
         p.x = nx;
         if (prof(m, L)) |pf| try pf.mark(.engram, &.{nx});
     }
+    if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
     const c = &m.cfg;
     // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
     const wait = m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX;
@@ -2986,9 +3000,17 @@ pub fn extendSpan(m: *Model, ids: []const u32, want: Want, span: usize) !A {
 
 /// `extendSpan` over a chunk that may hold image spans, whose rows `vision` carries.
 pub fn extendVision(m: *Model, ids: []const u32, want: Want, span: usize, vision: ?VisionRows) !A {
+    return extendAhead(m, ids, want, span, vision, &.{});
+}
+
+/// `extendVision` of a prefill chunk whose request goes on with the tokens `ahead`: their Engram rows are read while
+/// this chunk runs, and the next pass starts with them when it is that chunk. Any other pass reads its own.
+pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision: ?VisionRows, ahead: []const u32) !A {
+    errdefer m.dropAhead();
     const st = try ensureState(m);
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
+    pass.ahead = ahead;
     planCed(m, &pass, want);
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
@@ -3012,11 +3034,45 @@ fn reportEngramWait(m: *Model, L: usize) void {
 /// A chunk's Engram rows start reading now, one grid of one span per table, so each table's reads hide behind the
 /// layers before it (a decode token's: layer 0 for layer 1, layers 0-13 for layer 14).
 fn prefetchEngram(m: *Model, p: *Pass) !void {
+    const carried = m.engram_ahead;
+    m.engram_ahead = null;
+    var adopted = false;
+    defer if (carried) |pf| if (!adopted) pf.finish();
     const hs = &(m.hash orelse return);
     if (m.engrams.len == 0 or (!m.decode_engram_ahead and p.ids.len <= NARROW_ROWS)) return;
+    if (carried) |pf| if (pf.matches(p.p0, p.rows)) {
+        adopted = true;
+        p.engram_pf = pf;
+        m.engram_ahead_used += 1;
+        log.debug("[dsv41] engram rows of the chunk at {d} were read ahead ({d} rows)\n", .{ p.p0, p.ids.len });
+    };
+    if (p.engram_pf == null) {
+        var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
+        for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
+        p.engram_pf = try engram.Prefetch.start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
+    }
+    if (p.engram_pf.?.finished()) aheadEngram(m, p) catch {};
+}
+
+/// Starts reading the rows of `p.ahead` (a chunk of the request after this one) once this pass's own are in RAM, so they
+/// arrive while its layers run and the SSD is not shared. Host memory: one chunk's rows, 264 B for each of the
+/// 24 row ids of 2 tables a token. A failure leaves the next pass to read its own.
+fn aheadEngram(m: *Model, p: *Pass) !void {
+    if (p.ahead_started or p.ahead.len == 0) return;
+    p.ahead_started = true;
+    const hs = &(m.hash orelse return);
+    if (m.engrams.len == 0) return;
+    const gpa = m.gpa;
+    const comp = try gpa.alloc(u32, p.ahead.len);
+    defer gpa.free(comp);
+    for (p.ahead, comp) |t, *o| o.* = m.compressedId(t);
+    const rows = try gpa.alloc(u32, comp.len * hs.n_layers * hs.cols());
+    defer gpa.free(rows);
+    hs.rows(p.st.hist.items, comp, rows);
     var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
     for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
-    p.engram_pf = try engram.Prefetch.start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
+    m.dropAhead();
+    m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
 }
 
 /// Whether the pass's chunk runs the CED decoder over its last rows only: it does when it is wider than the window and
@@ -4452,6 +4508,153 @@ test "dsv41 Engram: a chunk's rows read ahead on a thread give the bytes of the 
     }
     defer for (rows) |pair| for (pair) |r| testing.allocator.free(r);
     for (rows[0], rows[1]) |a, b| try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(b), std.mem.sliceAsBytes(a));
+}
+
+const Told = enum { off, next, long, short, wrong };
+
+/// A prefill of `ids[from..]` cut as `chunks`; each chunk is told the tokens that follow it as `told` says (the next
+/// chunk's, five more than it, half of it, or others). Every chunk's last-row logits and the state it ends in.
+fn aheadArm(m: *Model, sc: *Scope, ids: []const u32, from: usize, chunks: []const usize, told: Told, rows: ?A) !Run {
+    var run: Run = .{};
+    errdefer run.deinit();
+    var other: [64]u32 = undefined;
+    var at = from;
+    var consumed: usize = 0;
+    for (chunks, 0..) |n, c| {
+        var ahead: []const u32 = &.{};
+        if (told != .off and c + 1 < chunks.len) {
+            const next = chunks[c + 1];
+            ahead = ids[at + n ..][0..switch (told) {
+                .long => @min(next + 5, ids.len - at - n),
+                .short => next / 2,
+                else => next,
+            }];
+            if (told == .wrong) {
+                for (other[0..ahead.len], ahead) |*o, t| o.* = (t + 1) % m.cfg.vocab;
+                ahead = other[0..ahead.len];
+            }
+        }
+        const vision: ?VisionRows = if (rows) |r| .{ .rows = r, .offset = consumed } else null;
+        try run.take(sc, try extendAhead(m, ids[at..][0..n], .last, 5, vision, ahead));
+        consumed += imageRows(m, ids[at..][0..n]);
+        at += n;
+    }
+    run.slots = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(run.slots, nil_slot);
+    try captureState(m, run.slots);
+    return run;
+}
+
+fn beginAheadArm(m: *Model, restore: ?[]const Slot, ids: []const u32, from: usize) !void {
+    if (restore) |slots| try restoreState(m, slots, from, ids) else resetState(m);
+}
+
+fn expectAheadArms(m: *Model, sc: *Scope, ids: []const u32, from: usize, chunks: []const usize, rows: ?A, restore: ?[]const Slot) !void {
+    try beginAheadArm(m, restore, ids, from);
+    const used0 = m.engram_ahead_used;
+    var plain = try aheadArm(m, sc, ids, from, chunks, .off, rows);
+    defer plain.deinit();
+    try testing.expectEqual(used0, m.engram_ahead_used);
+    const hist = try testing.allocator.dupe(u32, (try ensureState(m)).hist.items);
+    defer testing.allocator.free(hist);
+    for ([_]Told{ .next, .long, .short, .wrong }) |told| {
+        try beginAheadArm(m, restore, ids, from);
+        const used = m.engram_ahead_used;
+        var run = try aheadArm(m, sc, ids, from, chunks, told, rows);
+        defer run.deinit();
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(plain.rows.items), std.mem.sliceAsBytes(run.rows.items));
+        try expectSlotsBits(sc, plain.slots, run.slots);
+        try testing.expectEqualSlices(u32, hist, (try ensureState(m)).hist.items);
+        // The rows told are taken when they are the next chunk's ids, or more: the cut falls inside n-grams, after a
+        // restored prefix and inside an image span.
+        const taken: u64 = switch (told) {
+            .next, .long => chunks.len - 1,
+            else => 0,
+        };
+        try testing.expectEqual(taken, m.engram_ahead_used - used);
+    }
+}
+
+test "dsv41 Engram: a prefill that reads each chunk's successor ahead gives the logits and state of one that does not (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = true }, s);
+    defer m.deinit();
+    try testing.expect(m.engrams.len > 0 and ids.len >= TINY_S);
+    try expectAheadArms(m, &sc, ids[0..TINY_S], 0, &.{ 13, 9, 10, 8 }, null, null);
+
+    // From a restored prefix, whose history the first look-ahead continues.
+    resetState(m);
+    _ = mlx.mlx_array_free(try extend(m, ids[0..9], .last));
+    const cp = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(cp, nil_slot);
+    defer {
+        for (cp) |*sl| freeSlot(sl);
+        testing.allocator.free(cp);
+    }
+    try captureState(m, cp);
+    try expectAheadArms(m, &sc, ids[0..TINY_S], 9, &.{ 12, 11, 8 }, null, cp);
+}
+
+test "dsv41 Engram: the look-ahead holds across an image span cut by a chunk (DSV41_TINY)" {
+    const dir = try fixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, cpu);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const t = try visionTinyModel(dir, cpu);
+    defer t.m.deinit();
+    const ids = try testing.allocator.dupe(u32, base[0..TINY_S]);
+    defer testing.allocator.free(ids);
+    for (ids[5..15]) |*id| id.* = t.image_id;
+    const rows = try routerRows(&sc, t.m.cfg.dim, 10, 0x1a6e);
+    try expectAheadArms(t.m, &sc, ids, 0, &.{ 8, 8, 12, 12 }, rows, null);
+    try testing.expectEqual(@as(usize, 10), std.mem.count(u32, (try ensureState(t.m)).hist.items, &.{engram.Hash.DEAD}));
+}
+
+test "dsv41 Engram: the carried look-ahead is freed by a reset, by a failed pass and by the model's unload (DSV41_TINY)" {
+    const dir = try fixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, cpu);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const t = try visionTinyModel(dir, cpu);
+    defer t.m.deinit();
+    const m = t.m;
+    const ids = try testing.allocator.dupe(u32, base[0..TINY_S]);
+    defer testing.allocator.free(ids);
+    try testing.expectEqual(@as(usize, 0), imageRows(m, ids));
+    _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
+    try testing.expect(m.engram_ahead != null);
+    resetState(m);
+    try testing.expect(m.engram_ahead == null);
+
+    // The next chunk holds an image span no rows were given for: the pass fails, and the rows read for it go.
+    for (ids[22..26]) |*id| id.* = t.image_id;
+    _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
+    try testing.expect(m.engram_ahead != null);
+    try testing.expectError(error.Dsv41VisionRowsMissing, extendAhead(m, ids[20..], .last, 5, null, &.{}));
+    try testing.expect(m.engram_ahead == null);
+
+    // A request that ends here leaves its look-ahead to the unload.
+    resetState(m);
+    _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
+    try testing.expect(m.engram_ahead != null);
 }
 
 const AttnCase = struct { L: usize, wp: usize, K: usize, nc: usize, holes: bool = true, H: usize = 64, hd: usize = 512, window: usize = 128 };

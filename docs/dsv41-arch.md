@@ -53,7 +53,10 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   as `mxfp8`. A row cache per table (`RowCache`, 8-way set-associative, least recent out) keeps 1M rows; on 1M
   tokens of documents in turn it serves 31% of reads at 64k rows, 42% at 1M and 47% at 4M
   (`SUSHI_DSV41_ENGRAM_REUSE=<tokens>` replays a u32 token file). Every pass, decode included, reads its rows on a thread from
-  `beginPass` (`prefetchEngram`): a decode token's layer-1 rows hide behind layer 0, its layer-14 rows behind layers 0-13. The n-gram hash and the compressed-vocabulary map
+  `beginPass` (`prefetchEngram`): a decode token's layer-1 rows hide behind layer 0, its layer-14 rows behind layers 0-13. A batch reads each
+  distinct row id once and copies it to every place it sits (`Table.read`). A prefill chunk's pass is told the prompt tokens after it
+  (`ForwardCtx.ahead_ids`) and reads the next chunk's rows while it runs (`aheadEngram`, one chunk of host rows, ~13 KB a token, unbilled);
+  the next pass takes them when its row ids are the same, else reads its own. The n-gram hash and the compressed-vocabulary map
   are the reference's (`engram.py`); the map ships embedded (`src/fixtures/dsv41_engram_token_map.bin`) and a pack's own
   `engram_token_map.json` outranks it. `tests/dump_dsv41_token_map.py --check` re-derives it from `tokenizer.json`.
 - **Forward** (`src/dsv41_model.zig`): bf16 activations, f32 where the reference is f32 (head, compressor, hyper-connection
@@ -188,6 +191,8 @@ Prefill width:
 Other pieces:
 - A wide chunk's Engram rows are read ahead on a host thread over the whole chunk (`prefetchEngram`). They are
   dequantized at their layer, bit-identical to rows read there.
+- The next chunk's Engram rows are read during this one, once this chunk's own are in RAM, so layer 1 of the next chunk
+  finds its rows already read; a repeated row id in a batch is read once. Both are bit-identical to reading at the layer.
 - Attention runs each span and each attention or FFN block in its own scope, so MLX frees the f32 gathers and logits
   copies between spans.
 
