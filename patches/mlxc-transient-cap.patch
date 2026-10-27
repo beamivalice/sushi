@@ -1,0 +1,59 @@
+diff --git a/mlx/c/memory.cpp b/mlx/c/memory.cpp
+index fb38921..9e7fa84 100644
+--- a/mlx/c/memory.cpp
++++ b/mlx/c/memory.cpp
+@@ -89,3 +89,39 @@ extern "C" int mlx_set_wired_limit(size_t* res, size_t limit) {
+   }
+   return 0;
+ }
++extern "C" int mlx_set_transient_limit(size_t* res, size_t limit) {
++  try {
++    *res = mlx::core::set_transient_limit(limit);
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++extern "C" int mlx_get_external_memory(size_t* res) {
++  try {
++    *res = mlx::core::get_external_memory();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++extern "C" int mlx_get_transient_peak(size_t* res) {
++  try {
++    *res = mlx::core::get_transient_peak();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++extern "C" int mlx_reset_transient_peak(void) {
++  try {
++    mlx::core::reset_transient_peak();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
+diff --git a/mlx/c/memory.h b/mlx/c/memory.h
+index bae9e08..19eaf7c 100644
+--- a/mlx/c/memory.h
++++ b/mlx/c/memory.h
+@@ -37,6 +37,10 @@ int mlx_reset_peak_memory(void);
+ int mlx_set_cache_limit(size_t* res, size_t limit);
+ int mlx_set_memory_limit(size_t* res, size_t limit);
+ int mlx_set_wired_limit(size_t* res, size_t limit);
++int mlx_set_transient_limit(size_t* res, size_t limit);
++int mlx_get_external_memory(size_t* res);
++int mlx_get_transient_peak(size_t* res);
++int mlx_reset_transient_peak(void);
+ 
+ /**@}*/
+ 

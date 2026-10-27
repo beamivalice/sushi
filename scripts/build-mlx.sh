@@ -49,8 +49,9 @@ done
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
-PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
+MLX_PATCH="$REPO_ROOT/patches/mlx-transient-cap.patch"
+MLXC_PATCHES=("$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch" "$REPO_ROOT/patches/mlxc-transient-cap.patch")
+PATCH_SHA="$(cat "$MLX_PATCH" "${MLXC_PATCHES[@]}" | shasum | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
@@ -78,7 +79,15 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 
 NCPU="$(sysctl -n hw.ncpu)"
 
+# Reset the files a patch touches, then apply it: a rebuild never stacks a patch on its own edit.
+apply_patch() {
+  git -C "$1" checkout -- $(git -C "$1" apply --numstat -p1 "$2" | cut -f3)
+  git -C "$1" apply -p1 "$2"
+}
+
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
+# The transient-cap patch adds the allocator's external-bytes accounting and cap.
+apply_patch "$MLX_SRC" "$MLX_PATCH"
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
@@ -89,9 +98,9 @@ cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
 cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
-# The pinned C wrapper needs the optional global-scale slot added by MLX 0.32.3.
-git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3)
-git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
+# The pinned C wrapper needs the optional global-scale slot added by MLX 0.32.3, and the
+# allocator-cap calls the mlx patch added.
+for patch in "${MLXC_PATCHES[@]}"; do apply_patch "$MLXC_SRC" "$patch"; done
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \

@@ -12,13 +12,33 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 Sushi follows mlx-serve's MLX0.32.3 pin `64ea011c` and mlx-c `56b2d39`.
 The C wrapper patch supplies the new optional global-scale argument in its
 C++ `gather_qmm` call; the C ABI stays unchanged. The build stamp includes
-both source revisions and the patch hash. `tests/test_mlx_staged_nax.sh`
+both source revisions and the hash of every patch. `tests/test_mlx_staged_nax.sh`
 checks those fields against the source, along with NAX symbols and min-OS.
 An older staged library can load successfully while retaining a sorted-row
 overflow bug above32K; library presence alone does not qualify the runtime.
 Sorted `gather_qmm` requires ascending expert IDs in that bank's own ID space.
 After slab remapping, sort each reference arm separately and invert its output
 permutation before comparing bytes; grouping by the other arm's IDs is invalid.
+
+<a id="transient-cap"></a>
+## The transient cap patch
+
+`patches/mlx-transient-cap.patch` (mlx) and `patches/mlxc-transient-cap.patch` (mlx-c C ABI) are applied by
+`build-mlx.sh`; the stamp's `patch=` hashes all three patches. Stock `MetalAllocator` counts an imported (no-copy)
+buffer in `active_memory_`, `malloc` never refuses and `set_memory_limit` only throttles eval, so nothing could bound
+what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed-buffer pool).
+- `external_memory_` is the imported bytes (`make_buffer` adds, `release` subtracts); transient = active - external.
+- `mlx_set_transient_limit` (0 = off, the default): a new buffer (not a pool hit) whose transient + pool + size passes
+  it first trims the pool by the excess, then throws `std::runtime_error` starting `[mlx-transient-cap]`.
+- `mlx_get_transient_peak` / `mlx_reset_transient_peak`: high-water of transient; a reset restarts it at the current level.
+- The throw is an ordinary MLX exception: mlx-c turns it into the latch, `mlx.checkError` raises
+  `error.TransientCapExceeded` (a 503 naming the cap, not the memory 503) and `settledErrorName` consumes it. After a
+  refusal drain the stream (`mlx_synchronize`) and clear the latch before the next op; the failed array stays valid and
+  evaluates once there is room.
+- A primitive allocates its outputs in `eval_gpu`/`eval_cpu` on the evaluating thread inside `eval_impl`, whose catch
+  flushes the open streams before it rethrows, so the throw unwinds.
+- `SUSHI_DSV41_TRANSIENT_PEAK=1` logs `[transient-peak]` per DeepSeek phase (decode, DSpark draft/verify, prefill chunk,
+  vision encode). Guards: the `transient cap` tests in `mlx.zig`.
 
 ## The one MLX thread
 

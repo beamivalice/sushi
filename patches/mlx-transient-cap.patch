@@ -1,0 +1,186 @@
+Hard cap on the bytes MLX allocates itself. Imported (no-copy) buffers count in
+MLX's active memory but belong to the caller, so the allocator tracks them apart
+(external) and a transient limit (0 = off) bounds active - external + cache:
+a new buffer past it trims the cache, then throws a runtime_error tagged
+[mlx-transient-cap]. get/reset expose the transient high-water.
+
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+index 903cce218..cc596f46d 100644
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -93,6 +93,12 @@ size_t MetalAllocator::set_memory_limit(size_t limit) {
+   return limit;
+ };
+ 
++size_t MetalAllocator::set_transient_limit(size_t limit) {
++  std::unique_lock lk(mutex_);
++  std::swap(limit, transient_limit_);
++  return limit;
++};
++
+ size_t MetalAllocator::get_memory_limit() {
+   return block_limit_;
+ }
+@@ -137,6 +143,22 @@ Buffer MetalAllocator::malloc(size_t size) {
+           buffer_cache_.release_cached_buffers(mem_required - gc_limit_);
+     }
+ 
++    if (transient_limit_ > 0) {
++      size_t held = transient_memory() + get_cache_memory() + size;
++      if (held > transient_limit_) {
++        num_resources_ -=
++            buffer_cache_.release_cached_buffers(held - transient_limit_);
++        held = transient_memory() + get_cache_memory() + size;
++      }
++      if (held > transient_limit_) {
++        std::ostringstream msg;
++        msg << "[mlx-transient-cap] Allocating " << size << " bytes needs "
++            << held << " bytes of transient memory; the limit is "
++            << transient_limit_ << ".";
++        throw std::runtime_error(msg.str());
++      }
++    }
++
+     // Allocate new buffer if needed
+     if (num_resources_ >= resource_limit_) {
+       std::ostringstream msg;
+@@ -165,6 +187,7 @@ Buffer MetalAllocator::malloc(size_t size) {
+ 
+   active_memory_ += buf->length();
+   peak_memory_ = std::max(peak_memory_, active_memory_);
++  transient_peak_ = std::max(transient_peak_, transient_memory());
+ 
+   // Maintain the cache below the requested limit
+   if (get_cache_memory() > max_pool_size_) {
+@@ -212,6 +235,7 @@ Buffer MetalAllocator::make_buffer(void* ptr, size_t size) {
+   std::unique_lock lk(mutex_);
+   residency_sets_.insert(buf);
+   active_memory_ += buf->length();
++  external_memory_ += buf->length();
+   peak_memory_ = std::max(peak_memory_, active_memory_);
+   num_resources_++;
+   return Buffer{static_cast<void*>(buf)};
+@@ -224,6 +248,7 @@ void MetalAllocator::release(Buffer buffer) {
+   }
+   std::unique_lock lk(mutex_);
+   active_memory_ -= buf->length();
++  external_memory_ -= buf->length();
+   num_resources_--;
+   residency_sets_.erase(buf);
+   lk.unlock();
+@@ -260,6 +285,18 @@ size_t set_wired_limit(size_t limit) {
+   }
+   return metal::allocator().set_wired_limit(limit);
+ }
++size_t set_transient_limit(size_t limit) {
++  return metal::allocator().set_transient_limit(limit);
++}
++size_t get_external_memory() {
++  return metal::allocator().get_external_memory();
++}
++size_t get_transient_peak() {
++  return metal::allocator().get_transient_peak();
++}
++void reset_transient_peak() {
++  metal::allocator().reset_transient_peak();
++}
+ size_t get_active_memory() {
+   return metal::allocator().get_active_memory();
+ }
+diff --git a/mlx/backend/metal/allocator.h b/mlx/backend/metal/allocator.h
+index 885951364..3565f3b4c 100644
+--- a/mlx/backend/metal/allocator.h
++++ b/mlx/backend/metal/allocator.h
+@@ -36,6 +36,17 @@ class MetalAllocator : public allocator::Allocator {
+   size_t get_cache_memory() {
+     return buffer_cache_.cache_size();
+   };
++  size_t get_external_memory() {
++    return external_memory_;
++  };
++  size_t get_transient_peak() {
++    return transient_peak_;
++  };
++  void reset_transient_peak() {
++    std::unique_lock lk(mutex_);
++    transient_peak_ = transient_memory();
++  };
++  size_t set_transient_limit(size_t limit);
+   size_t set_cache_limit(size_t limit);
+   size_t set_memory_limit(size_t limit);
+   size_t get_memory_limit();
+@@ -51,6 +62,13 @@ class MetalAllocator : public allocator::Allocator {
+   static constexpr int small_size_ = 256;
+   static constexpr int heap_size_ = 1 << 20;
+ 
++  // Active bytes MLX itself allocated: imported (no-copy) buffers are the
++  // caller's and stay out.
++  size_t transient_memory() const {
++    return active_memory_ > external_memory_ ? active_memory_ - external_memory_
++                                             : 0;
++  }
++
+   MetalAllocator(Device& d);
+   ~MetalAllocator();
+ 
+@@ -67,6 +85,11 @@ class MetalAllocator : public allocator::Allocator {
+   size_t gc_limit_;
+   size_t active_memory_{0};
+   size_t peak_memory_{0};
++  size_t external_memory_{0};
++  size_t transient_peak_{0};
++  // 0 = off. Otherwise a new buffer that would push transient + cached bytes
++  // past it throws once the cache has been trimmed.
++  size_t transient_limit_{0};
+   size_t max_pool_size_;
+   size_t wired_limit_{0};
+   size_t num_resources_{0};
+diff --git a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+index a800e381a..2cdaf9571 100644
+--- a/mlx/backend/no_gpu/allocator.cpp
++++ b/mlx/backend/no_gpu/allocator.cpp
+@@ -206,6 +206,16 @@ size_t get_cache_memory() {
+ size_t set_cache_limit(size_t limit) {
+   return allocator::common_allocator().set_cache_limit(limit);
+ }
++size_t set_transient_limit(size_t) {
++  return 0;
++}
++size_t get_external_memory() {
++  return 0;
++}
++size_t get_transient_peak() {
++  return 0;
++}
++void reset_transient_peak() {}
+ size_t set_wired_limit(size_t) {
+   return 0;
+ }
+diff --git a/mlx/memory.h b/mlx/memory.h
+index 14c099f1b..7269e70d5 100644
+--- a/mlx/memory.h
++++ b/mlx/memory.h
+@@ -76,6 +76,23 @@ MLX_API size_t set_cache_limit(size_t limit);
+ /* Clear the memory cache. */
+ MLX_API void clear_cache();
+ 
++/* Cap the bytes MLX itself holds (live buffers it allocated plus its cache),
++ * leaving imported (no-copy) buffers out. A new allocation past the cap first
++ * trims the cache, then throws a runtime_error tagged "[mlx-transient-cap]".
++ * 0 turns the cap off. Metal only; elsewhere a no-op. Returns the previous cap.
++ * */
++MLX_API size_t set_transient_limit(size_t limit);
++
++/* Bytes of the active memory that are imported (no-copy) buffers. */
++MLX_API size_t get_external_memory();
++
++/* High-water of active memory minus external memory since the last
++ * reset_transient_peak. */
++MLX_API size_t get_transient_peak();
++
++/* Restart the transient high-water from the current transient level. */
++MLX_API void reset_transient_peak();
++
+ /* Set the wired size limit.
+  *
+  * Note, this function is only useful when using the Metal backend with

@@ -18,6 +18,7 @@ const owned_mod = @import("dsv41_owned.zig");
 const model_mod = @import("model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
+const transient_peak = @import("transient_peak.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -3043,13 +3044,16 @@ pub fn extendVision(m: *Model, ids: []const u32, want: Want, span: usize, vision
 pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision: ?VisionRows, ahead: []const u32) !A {
     errdefer m.dropAhead();
     const st = try ensureState(m);
+    transient_peak.begin();
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
     planCed(m, &pass, want);
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
-    return finishPass(m, &pass, want);
+    const logits = try finishPass(m, &pass, want);
+    transient_peak.end(if (st.verify != null) .dspark_verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len);
+    return logits;
 }
 
 /// At debug level: the Engram wait of each wide chunk, and the mean of every 64 decode forwards.
@@ -3233,6 +3237,13 @@ pub fn draft(m: *Model, t1: u32, with_heads: bool) !Draft {
 /// the windows of committed main rows, the trunk head over the last stage's norm, then the Markov bigram bias chained
 /// token to token.
 pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
+    transient_peak.begin();
+    const out = try draftPass(m, t1, heads_wanted);
+    transient_peak.end(.dspark_draft, m.cfg.dspark.block);
+    return out;
+}
+
+fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const gpa = m.gpa;
     const saved_profile = m.profile;
     m.profile = null;

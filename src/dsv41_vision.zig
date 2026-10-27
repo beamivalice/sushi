@@ -19,6 +19,7 @@ const common = @import("vision_common.zig");
 const cfg_mod = @import("dsv41_config.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const log = @import("log.zig");
+const transient_peak = @import("transient_peak.zig");
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -285,6 +286,7 @@ pub const Dsv41Vision = struct {
     /// Encode one image: `patches` is `[grid_h * grid_w, 3 * p * p]`. Returns the trunk's whole span,
     /// `[1, spanRows, out_dim]`, evaluated.
     pub fn forward(self: *Dsv41Vision, patches: A, grid_h: u32, grid_w: u32) !A {
+        transient_peak.begin();
         const hidden = try self.towerHidden(patches, grid_h, grid_w);
         defer _ = mlx.mlx_array_free(hidden);
         var sc = Scope.init(self.allocator, self.s);
@@ -293,6 +295,7 @@ pub const Dsv41Vision = struct {
         const out = sc.out(try self.span(&sc, feats, grid_h, grid_w));
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
+        transient_peak.end(.vision_encode, grid_h * grid_w);
         return out;
     }
 

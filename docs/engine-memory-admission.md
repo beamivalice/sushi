@@ -479,6 +479,13 @@ exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from
 missing files. A 300-shard regression runs with a 128-descriptor soft limit.
 
+## Transient cap (mechanism, not billed yet)
+
+MLX can be capped on the bytes it allocates itself, imported weights left out
+([engine-mlx-gotchas](engine-mlx-gotchas.md#transient-cap)): no flag, default off, no bill follows it yet. A refused
+allocation fails the request as `TransientCapExceeded`. `SUSHI_DSV41_TRANSIENT_PEAK=1` logs the peak per phase to
+size the caps and the bill from.
+
 ## Observing memory
 
 `/props` reports `active_bytes`, `memory.cache_bytes`, `batching`; RSS is blind to Metal.

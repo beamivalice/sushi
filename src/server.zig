@@ -7142,12 +7142,16 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     if (slot.errorNameIs("MediaRefused")) return error.MediaRefused;
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
     if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
+    if (slot.errorNameIs("TransientCapExceeded")) return error.TransientCapExceeded;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     return error.GenerationFailed;
 }
 
 /// The message `error.GenerationOutOfMemory` sends on every surface and both paths.
 const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
+
+/// The message `error.TransientCapExceeded` sends: MLX refused an allocation past the transient memory cap.
+const TRANSIENT_CAP_MSG = "The request needed more transient GPU memory than the engine's cap allows and was abandoned. The server is still running. Reduce the prompt length or the image size.";
 
 /// The body of the pre-flight memory 400. Two arms: with the credits present the message
 /// quotes them; with them structurally zero (every arch outside `admissionEvictsHotCache`)
@@ -7214,6 +7218,13 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "server_error",
             .anthropic_type = "api_error",
             .message = GEN_OOM_MSG,
+        },
+        error.TransientCapExceeded => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = TRANSIENT_CAP_MSG,
         },
         // Refused before the first forward: the request is too large, a named 400.
         error.PrefillDoesNotFit => .{
@@ -24190,6 +24201,27 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     try testing.expectEqualStrings(not_enough_memory_message, loadRefusalFor(error.NotEnoughMemory).?.message);
     try testing.expectEqualStrings("out_of_memory", loadRefusalFor(error.InsufficientMemory).?.type);
     try testing.expectEqualStrings(insufficient_free_memory_message, loadRefusalFor(error.InsufficientMemory).?.message);
+}
+
+test "a slot the transient cap failed answers a named 503, not the memory 503" {
+    const t = std.testing;
+    var slot: scheduler_mod.Slot = undefined;
+    slot.io = t.io;
+    slot.out_mu = .init;
+    slot.memory_context_refusal = null;
+    slot.media_refusal = null;
+    slot.shutdown_cancelled = .init(false);
+    slot.error_code = "TransientCapExceeded";
+
+    try t.expect(slotFailure(&slot) == error.TransientCapExceeded);
+    var buf: [192]u8 = undefined;
+    const w = mapGenerationError(error.TransientCapExceeded, &buf);
+    try t.expectEqual(@as(u32, 503), w.code);
+    try t.expectEqualStrings(TRANSIENT_CAP_MSG, w.message);
+    try t.expect(!std.mem.eql(u8, w.message, GEN_OOM_MSG));
+
+    slot.error_code = "OutOfMemory";
+    try t.expect(slotFailure(&slot) == error.GenerationOutOfMemory);
 }
 
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
