@@ -125,6 +125,8 @@ The protocol, fixed for every model and release:
   reached `Heavy` 25 minutes in with the GPU still at 1539 MHz. The partial report is `bench-aborted.md` in the run
   directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Without a passwordless `sudo -n powermetrics` both say the clock is not monitored and
   go on; a decode number from a run that was not monitored needs a `powermetrics` look beside it before it is recorded.
+- **The prose arm starts cool.** Between the arms `sushi bench` sets the fans to max and idles until the hottest
+  `fanctl status` die is under 50 C, at most 180 s (a fixed 180 s without `fanctl`); the wait is logged and named in the report's protocol line.
 - **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
   short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement. A decode the
   server's loop stop ended (`finish_details.type` = `repetition_loop`) is valid: it counts and is listed under Notes.

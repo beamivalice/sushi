@@ -416,7 +416,73 @@ pub const Report = struct {
     clock: gpu_clock.RunSummary = .{},
     /// Why the run stopped early; empty for a complete run.
     aborted: []const u8 = "",
+    cooldown: ?Cooldown = null,
 };
+
+/// The target and the cap of the idle between the arms; the same rule `tests/bench.sh` applies before a boot.
+pub const cooldown_target_c: f64 = 50;
+pub const cooldown_cap_s: u32 = 180;
+const cooldown_poll_s: u32 = 10;
+
+pub const Cooldown = struct {
+    waited_s: u32,
+    start_c: ?f64 = null,
+    end_c: ?f64 = null,
+};
+
+/// No reading means the fixed wait: only the cap ends it.
+pub fn cooldownDone(die_c: ?f64, waited_s: u32) bool {
+    if (waited_s >= cooldown_cap_s) return true;
+    return if (die_c) |t| t < cooldown_target_c else false;
+}
+
+/// The hottest `topTemps` sensor of a `fanctl status` document; null when it holds none or is not that document.
+pub fn hottestDie(allocator: std.mem.Allocator, status: []const u8) ?f64 {
+    const parsed = std.json.parseFromSlice(struct { topTemps: []const struct { celsius: f64 } }, allocator, status, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    var hottest: ?f64 = null;
+    for (parsed.value.topTemps) |t| hottest = if (hottest) |h| @max(h, t.celsius) else t.celsius;
+    return hottest;
+}
+
+fn fanctlRun(a: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]u8 {
+    const r = std.process.run(a, io, .{ .argv = argv, .stdout_limit = .limited(1 << 20) }) catch return null;
+    a.free(r.stderr);
+    const ok = switch (r.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (ok) return r.stdout;
+    a.free(r.stdout);
+    return null;
+}
+
+fn readDie(a: std.mem.Allocator, io: std.Io) ?f64 {
+    const out = fanctlRun(a, io, &.{ "fanctl", "status" }) orelse return null;
+    defer a.free(out);
+    return hottestDie(a, out);
+}
+
+/// Fans to max, then idles until the hottest die is under the target or the cap passes; the server stays up.
+fn cooldownBetweenArms(a: std.mem.Allocator, io: std.Io) Cooldown {
+    if (fanctlRun(a, io, &.{ "fanctl", "max", "--ttl", "900" })) |out| a.free(out);
+    var clock = io_util.Stopwatch.init(io);
+    const start_c = readDie(a, io);
+    var die = start_c;
+    while (true) {
+        const waited: u32 = @intCast(clock.read() / std.time.ns_per_s);
+        if (cooldownDone(die, waited)) break;
+        std.Io.sleep(io, .fromSeconds(cooldown_poll_s), .real) catch {};
+        die = readDie(a, io);
+    }
+    const waited: u32 = @intCast(clock.read() / std.time.ns_per_s);
+    if (start_c) |s| {
+        log.info("[bench] arms cooldown: {d:.0} C -> {d:.0} C in {d} s\n", .{ s, die orelse s, waited });
+    } else {
+        log.info("[bench] arms cooldown: {d} s (no fanctl)\n", .{waited});
+    }
+    return .{ .waited_s = waited, .start_c = start_c, .end_c = die };
+}
 
 fn writeThousands(w: *std.Io.Writer, v: f64) !void {
     const n: u64 = @intFromFloat(@round(@max(v, 0)));
@@ -570,9 +636,15 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
         "Protocol: token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample. The code arm is one fixed seeded TypeScript corpus; " ++
             "the prose arm is Pride and Prejudice (public domain), where speculative acceptance is lower. " ++
             "Each arm runs in turn on the same server: the 4k request is cold; each later request restores the previous prompt-end point. A decode rung's samples 2 and 3 run right after its ladder request, and the first request counts. " ++
-            "The server's own prefill time, the restore time (logged apart) taken out; TTFT is the request wall time minus its decode time. The server's default speculative mode stays on.\n\n",
+            "The server's own prefill time, the restore time (logged apart) taken out; TTFT is the request wall time minus its decode time. The server's default speculative mode stays on.",
         .{rep.decode_tokens},
     );
+    if (rep.cooldown) |c| {
+        try w.print(" The server idled {d} s between the arms (", .{c.waited_s});
+        if (c.start_c) |s| try w.print("die {d:.0} C to {d:.0} C", .{ s, c.end_c orelse s }) else try w.writeAll("die not read");
+        try w.writeAll(").");
+    }
+    try w.writeAll("\n\n");
 
     const code_gpu = armHasGpu(rep.samples, .code);
     const prose_gpu = armHasGpu(rep.samples, .prose);
@@ -807,7 +879,9 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     const sampler = startSampler(gpa, io);
     defer if (sampler) |s| s.stop();
     var aborted: []const u8 = "";
+    var cooldown: ?Cooldown = null;
     arms: for ([_]Arm{ .code, .prose }) |arm| {
+        if (arm == .prose) cooldown = cooldownBetweenArms(a, io);
         var ids: std.ArrayList(u32) = .empty;
         switch (arm) {
             .code => {
@@ -848,6 +922,7 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         .samples = samples.items,
         .clock = if (sampler) |s| try s.summarizeAll(a) else .{},
         .aborted = aborted,
+        .cooldown = cooldown,
     };
     const raw = try std.json.Stringify.valueAlloc(a, .{ .model = model, .url = opts.url, .decode_tokens = opts.decode_tokens, .corpus_seed = corpus_seed, .stamp = opts.stamp, .aborted = aborted, .samples = samples.items }, .{ .whitespace = .indent_2 });
     try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench.json" }), raw);
@@ -1158,4 +1233,45 @@ test "bench report: GPU clock columns beside the tok/s, the header line, and an 
     try testing.expect(std.mem.indexOf(u8, md2, "Code MHz") == null);
     try testing.expect(std.mem.indexOf(u8, md2, "GPU MHz") == null);
     try testing.expect(std.mem.indexOf(u8, md2, "## Warnings") == null);
+}
+
+test "bench cooldown: stops under 50 C, is capped at 180 s, and waits the full cap without a reading" {
+    try testing.expect(cooldownDone(49.9, 0));
+    try testing.expect(!cooldownDone(50.0, 0));
+    try testing.expect(!cooldownDone(87, 170));
+    try testing.expect(cooldownDone(87, 180));
+    try testing.expect(!cooldownDone(null, 0));
+    try testing.expect(!cooldownDone(null, 170));
+    try testing.expect(cooldownDone(null, 180));
+}
+
+test "bench cooldown: the hottest die in a fanctl status document, and nothing from a bad one" {
+    const status =
+        \\{
+        \\  "fans" : [ { "actualRPM" : 5356, "index" : 0, "mode" : 0 } ],
+        \\  "state" : "max",
+        \\  "topTemps" : [
+        \\    { "celsius" : 55.165626525878906, "key" : "TCMb" },
+        \\    { "celsius" : 87, "key" : "TCHP" },
+        \\    { "celsius" : 47.078125, "key" : "TCDX" }
+        \\  ]
+        \\}
+    ;
+    try testing.expectEqual(@as(f64, 87), hottestDie(testing.allocator, status).?);
+    try testing.expectEqual(@as(?f64, null), hottestDie(testing.allocator, "{\"topTemps\":[]}"));
+    try testing.expectEqual(@as(?f64, null), hottestDie(testing.allocator, "not json"));
+    try testing.expectEqual(@as(?f64, null), hottestDie(testing.allocator, "{\"state\":\"max\"}"));
+}
+
+test "bench report: the protocol line names the cooldown between the arms" {
+    const a = testing.allocator;
+    const md = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &.{}, .cooldown = .{ .waited_s = 140, .start_c = 87, .end_c = 49 } });
+    defer a.free(md);
+    try testing.expect(std.mem.indexOf(u8, md, "The server idled 140 s between the arms (die 87 C to 49 C).") != null);
+    const blind = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &.{}, .cooldown = .{ .waited_s = 180 } });
+    defer a.free(blind);
+    try testing.expect(std.mem.indexOf(u8, blind, "The server idled 180 s between the arms (die not read).") != null);
+    const none = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &.{} });
+    defer a.free(none);
+    try testing.expect(std.mem.indexOf(u8, none, "between the arms") == null);
 }
