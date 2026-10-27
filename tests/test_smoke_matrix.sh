@@ -183,12 +183,7 @@ for l in sys.stdin:
     for ch in json.loads(l[6:]).get("choices",[]):
         t+=ch.get("text") or ""
 print(repr(t))' 2>/dev/null)
-    if [[ "$arch" == deepseek_v41 && "$cfg" == default ]]; then
-        # Two greedy DSpark runs may differ (docs/dsv41-arch.md#dspark); the nospec cell checks the bytes.
-        skip "ignore_eos: completion stream == non-stream bytes" "adaptive DSpark text differs run to run"
-    else
-        check "ignore_eos: completion stream == non-stream bytes" "$([[ -n "$c" && "$c" == "$rc" ]] && echo 0 || echo 1)" "ns=${c:0:120} st=${rc:0:120}"
-    fi
+    check "ignore_eos: completion stream == non-stream bytes" "$([[ -n "$c" && "$c" == "$rc" ]] && echo 0 || echo 1)" "ns=${c:0:120} st=${rc:0:120}"
     r=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
         -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"ignore_eos\":true}")
     check "ignore_eos: chat refuses it with a 400" "$([[ "$r" == 400 ]] && echo 0 || echo 1)" "status=$r"
