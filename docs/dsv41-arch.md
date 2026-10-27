@@ -245,7 +245,7 @@ tests at the output; `zig build test` caches a passing env-gated run, so re-run 
 | slab experts vs resident experts | identical logits |
 | DSpark draft: ids, Markov-biased logits, confidence, main rows | QAT off 1e-4 / 2e-3 of the peak; QAT on cosine > 0.99 from the reference's rows |
 | DSpark verify rollback at every accepted count, a second round, the next draft | serial logits 2e-3, serial draft |
-| `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie either way, as a span of rows and a one-row decode round differently (the exact-stream rows above pin the identity) |
+| `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against serial decode (DSpark rows are the same at every width, and the serial step sums as the SIMD one-row arm) (the exact-stream rows above pin the identity) |
 | DSpark bills | resident bytes equal the held arrays; window and slack bytes equal the bill |
 | `Transformer.forward` through the shell | identical to the model's own, across prefill and decode chunks |
 | chat template | 14 cases byte for byte with `encode_messages` |
@@ -349,7 +349,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   cleared by a round that pays. One dismissed block does not back off: blocks are bimodal (on the sweep prompt 26% accept
   nothing and 24% all five), the next block pays whatever happened between, and the earlier per-block rule (R=1 owes the next
   `period` plain steps) turned 25% dismissals into 55% one-row rounds once the verify got cheap (replay of the sweep's 68 blocks
-  through the policy: 44.8 tok/s with it, 50.4 without; the gate ended 12-18 ticks of 3000 either way). Live (the shipped STQ pack, budget 110, `--ctx-size 65536`, one A then one B, die under 50 °C, commit c42b60a5): the 5.4k harbour prompt 45.1 -> 47.9 tok/s, a novel story 44.0 -> 47.6 (the old rule made 590 of 595 rounds plain there, the new one drafts a third). Greedy text depends on which rounds were plain: verify rows agree bit for bit at every width from 2 up, and a 1-row round is the serial step bit for bit, but the 1-row kernels (the trunk's SIMD rows arm, the one-row expert arms) sum in another order than the multi-row NAX arms. The stop switch is GLM's
+  through the policy: 44.8 tok/s with it, 50.4 without; the gate ended 12-18 ticks of 3000 either way). Live (the shipped STQ pack, budget 110, `--ctx-size 65536`, one A then one B, die under 50 °C, commit c42b60a5): the 5.4k harbour prompt 45.1 -> 47.9 tok/s, a novel story 44.0 -> 47.6 (the old rule made 590 of 595 rounds plain there, the new one drafts a third). Greedy text is the same at every round-width mix (exact greedy, below): a row has the same bytes at every verify width. The stop switch is GLM's
   (`spec_cost_gate.zig`: 8-round windows against a probed plain step, 5% margin); the plain step is the 1-row round, so the state
   is the engine's and no other drafter runs. Sampled requests use the same choice and the acceptance rule above (a 1-row round draws
   its token from the filtered row). `--mtp-max-depth n` caps R at n+1 and `--mtp-min-depth n` floors it at n+1 with no plain step or back-off below it (equal values pin R; a depth past the 5-draft block clamps to it, logged once at load; `--mtp-min-depth 1` is the default). `model-settings.json` has no depth keys. `SUSHI_DSV41_DSPARK_ROWS` forces or sweeps R. The adaptive R follows measured ms, so a seeded sampled
@@ -368,10 +368,33 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   for about 1.3 accepted tokens; the adaptive round matches serial there (the drafts of a novel text are worth about what their rows
   cost) and takes 70-90% of the rounds as 1-row steps. A one-row step through the verify path decodes at 32 tok/s warm at 1k, 4k and
   16k, above the 27.5 of `--no-mtp` (different boots: unconfirmed).
+- **Exact greedy costs nothing measurable** (base `1aececf3` + the exact route, the knob on against off in one binary; the shipped
+  STQ 1.75bpw, `--ssd-budget-gb 108 --ctx-size 65536`, `taskpolicy -a`, GPU lock, QUIET, fans max, die under 50 C at each boot, one
+  boot per arm and kind, A then B; a ~4.9k-token code prompt (a Zig source review) and a ~4.0k-token prose prompt, 600 greedy
+  tokens, second pass of each; forced `SUSHI_DSV41_DSPARK_ROWS=sweep`, verify ms trimmed means of `[dspark-round]`, ~30-40 rounds a
+  width). A = arms that sum by width (`SUSHI_DSV41_DSPARK_EXACT=0`), B = exact (the default):
+
+| R | code A | code B | delta | prose A | prose B | delta |
+|---|---|---|---|---|---|---|
+| 1 (plain step) | 22.4 | 22.7 | +0.3 | 22.1 | 22.2 | +0.2 |
+| 2 | 32.0 | 31.6 | -0.4 | 31.3 | 31.3 | 0.0 |
+| 3 | 38.0 | 38.2 | +0.2 | 36.6 | 36.4 | -0.2 |
+| 4 | 46.3 | 45.7 | -0.5 | 43.5 | 42.9 | -0.6 |
+| 5 | 53.1 | 53.4 | +0.2 | 49.3 | 49.2 | -0.2 |
+| 6 | 60.9 | 59.8 | -1.1 | 56.1 | 56.0 | -0.2 |
+| 8 | 77.6 | 74.3 | -3.3 | 68.6 | 68.6 | 0.0 |
+
+  The plain step costs +0.3 ms (1.3%) with NAX at one row; the wider rows are unchanged to within noise (the head's SIMD arm
+  gains a little at 2 to 5 rows). Adaptive decode, warm second pass: code 60.7 / 64.5 tok/s (A / B), prose 46.9 / 46.5; the texts
+  differ, so each arm's acceptance differs (code 84% / 88% of drafts), and the numbers are within what the text moves. Text: B is
+  byte-identical over three repeats of a request and equal between the forced-width sweep boot and the adaptive boot; A differs
+  between its own repeats and between its sweep and adaptive boots. `--no-mtp` serial: 49.4 tok/s code, 48.7 prose (20.2 and
+  20.5 ms a token), text identical over repeats and not equal to DSpark's. The plain DSpark step is 22.4 ms, 2 ms above serial.
 - **A one-row round is the serial step.** It opens no verify (nothing to give back), and the stage windows' commit
   (`commitMain`, per row, never batched across rows: the 1-row and multi-row `main_proj` arms may differ in bits) is left
   lazy and submitted when the next pass begins, instead of a second host wait after the verdict. Greedy text of a forced
-  one-row run is byte-identical to `--no-mtp` over 600 tokens. Measured on `353f8f79` (shipped STQ 1.75bpw, `--ssd-budget-gb 108
+  one-row run is byte-identical to `--no-mtp` over 600 tokens with `SUSHI_DSV41_DSPARK_EXACT=0`; by default its trunk takes the NAX arm
+  (exact greedy, below) and can part from `--no-mtp` at a near-tie. Measured on `353f8f79` (shipped STQ 1.75bpw, `--ssd-budget-gb 108
   --ctx-size 1000000`, 4754-token prompt, 600 greedy tokens, first request of a cold boot, lock, QUIET, fans max, die 49.5 C,
   `taskpolicy -a`): forced one-row 21.8 -> 21.2 ms a token (verify median 21.4 -> 21.0) against 20.9 serial (`d57f8ea8`, other
   boots, so unpaired); adaptive 62.5 -> 63.8 tok/s. What is left (~0.3 ms) is the commit's own GPU time plus the 7.9 GB
@@ -614,10 +637,19 @@ another job:
 | code | 69% | 3.44 | 5.8-6.2 | 4.2 | differ from char 449 (a near-tie) |
 | copy | 100% | 4.93 | 12.2-13.0 | 5.5 | identical |
 
-Greedy DSpark text is not the same from one run to the next, even on the same hardware: the policy picks plain or drafted
-rounds from measured timings (`dspark_rows.Policy`), and the 1-row and multi-row kernels round differently, so a near-tie
-token can flip with the round mix. Only a run that forces one width (`SUSHI_DSV41_DSPARK_ROWS`) repeats, and a forced 1-row
-run equals `--no-mtp`. What holds for a given generation is that its stream and non-stream responses carry the same bytes.
+Greedy DSpark text is the same at every round-width mix on the same hardware (exact greedy): the same request gives the same
+bytes whatever plain and drafted rounds the policy (`dspark_rows.Policy`) picks from measured timings, and at any forced width
+(`SUSHI_DSV41_DSPARK_ROWS`). A row's bytes depend on the arm of each linear it passes through, so each linear has one arm at
+every width. The trunk linears (`projectRows`) were the only arms that changed with the width: the one-row step took the SIMD
+rows arm and 2 or more rows the NAX arm, whose k sums differ. A DSpark round now runs the NAX arm at one row too
+(`kernels.rows_exact`, set around `verify`), except the lm_head, whose SIMD rows arm equals its one-row launch bit for bit and
+is the faster one up to 5 rows, so it takes the SIMD arm at every width. The rest is already width-invariant, by test: the shared
+expert's one-row coop chain against the lane chain (`STQ shared expert at DeepSeek's shape`), the expert-grouped routed chain
+(`verify rows that decode each distinct expert once`), the per-row commit and attention, router and indexer rows (the indexer's
+top-k split changes no pick). Where there is no NAX the arms are the same and nothing changes. `--no-mtp` serial keeps its SIMD
+one-row arm, so its text can part from DSpark's at a near-tie (it is itself the same at every repeat). `SUSHI_DSV41_DSPARK_EXACT=0`
+restores the arms that sum by width (SIMD one-row step, NAX head at 2..8 rows); text then depends on the round mix. What holds
+either way is that a generation's stream and non-stream responses carry the same bytes.
 `--max-mtp-ctx` ends drafting for the rest of a request once prompt + generated passes it (plain 1-row rounds), as it does
 for MTP. A drafted image id ends the verify chunk before it: only a prompt carries one, and the model refuses it without rows.
 A round (draft 12-17 ms, verify 450-750 ms) costs about 2.6 serial

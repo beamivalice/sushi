@@ -2212,3 +2212,49 @@ test "dsv41 kernels: the load's warm leaves no state, and the served logits are 
     defer for (rows) |r| testing.allocator.free(r);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rows[0]), std.mem.sliceAsBytes(rows[1]));
 }
+
+test "dsv41 DSpark exact: a one-row round gives the bytes of row 0 of a wider verify at every position, and leaves the state the wider round leaves (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    // The tiny width is not the prepared chain's geometry, which the served verify rows take.
+    exl3.rate_groups.prepared_force = true;
+    defer exl3.rate_groups.prepared_force = null;
+    const P = 24;
+    var one: StqServed = undefined;
+    try one.init(dir, .bfloat16, true, true, 8, s);
+    defer one.deinit();
+    var wide: StqServed = undefined;
+    try wide.init(dir, .bfloat16, true, true, 8, s);
+    defer wide.deinit();
+    const V = one.m.cfg.vocab;
+    var t: u32 = undefined;
+    for ([_]*StqServed{ &one, &wide }) |m| {
+        const lg = try model.extend(m.m, ids[0..P], .last);
+        defer _ = mlx.mlx_array_free(lg);
+        t = @intCast(argmax(try sc_mod.hostF32(lg)));
+    }
+    var at: usize = P;
+    for ([_]usize{ 3, 2, 6, 4, 5, 3, 6, 2 }) |width| {
+        const a = try model.verify(one.m, &.{t});
+        defer _ = mlx.mlx_array_free(a);
+        var round: [6]u32 = undefined;
+        round[0] = t;
+        @memcpy(round[1..width], ids[at + 1 ..][0 .. width - 1]);
+        const b = try model.verify(wide.m, round[0..width]);
+        defer _ = mlx.mlx_array_free(b);
+        const ra = try sc_mod.hostF32(a);
+        const rb = try sc_mod.hostF32(b);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ra[0..V]), std.mem.sliceAsBytes(rb[0..V]));
+        try model.finishVerify(one.m, 0);
+        try model.finishVerify(wide.m, 0);
+        t = @intCast(argmax(ra[0..V]));
+        at += 1;
+    }
+}

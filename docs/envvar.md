@@ -4,9 +4,9 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 183 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 72, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
+**Summary.** 184 vars. By kind: tradeoff levers 14, diagnostics 47, microbenches 72, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
-## Tradeoff levers (14)
+## Tradeoff levers (15)
 
 Two arms that trade speed, memory or exactness, or a policy a user may want to move.
 
@@ -17,6 +17,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `QWEN4_PLE_PREFETCH_PREFILL` | `qwen4_exp.zig:949` | wide n-gram gather arm: unset = kv gate (pool from 256k keys, serial walk below), `0` serial, `1` pool; both arms measured, the best flips with table residency | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_DECODE_ASYNC_LADDER` | `transformer.zig:15036` | unset: batched Qwen4 decode ladders every 4th layer, other paths serial; `0\|off` off, `auto` every 8th, `<n>` every n-th | boot | yes: engine-kernels, qwen4-perf |
 | `SUSHI_DFLASH_QUANT_BITS` | `dflash.zig:445` | affine width of the DFlash sidecar requant (default 8; `0\|off` or an unsupported width keeps dense bf16) | load | no |
+| `SUSHI_DSV41_DSPARK_EXACT` | `transformer.zig` (`initDsv41`) | default on: a DSpark round's trunk linears give a row the same bytes at every verify width (the NAX arm at one row too, the lm_head on the SIMD rows arm), so greedy text is the same at every round-width mix; `0` takes the faster arms (SIMD one-row step, NAX head), whose text may differ with the mix | load | yes: dsv41-arch |
 | `SUSHI_LMHEAD_FULL` | `transformer.zig:24018` | `1` reads the full lm_head instead of the greedy top-32 shortlist (MiMo; the shortlist is not certified exact) | once | yes: engine-mtp |
 | `SUSHI_LOOP_TRIM` | `scheduler.zig:6233` | default on: trims displayed loop-stop replies; `0` keeps the whole degenerate tail for strict bytes (`tests/test_loop_stop_signal.sh` boots both) | once | yes: server-http-apis, tests/CLAUDE |
 | `SUSHI_MTP_ADAPTIVE_SERIAL` | `generate.zig:9517` | default on; `0` disables the adaptive speculate-vs-serial vote at long KV (`tests/test_mtp_adaptive.sh` boots both) | once | yes: mimo2-perf, tests/CLAUDE |

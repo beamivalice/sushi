@@ -2841,7 +2841,16 @@ fn rowsChunk(in_dim: c_int, rows: c_int, nsplit: c_int) c_int {
 /// latency-bound in a forward, so k splits into ranges of at most 512 over at least 320 threadgroups; only an
 /// lm_head-wide output fills the GPU with whole 128-wide blocks and folds the finish.
 fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int) RowsGeom {
-    return rowsGeometryFor(in_dim, out_dim, rows, groups, rows >= 2 and gemmNaxOn());
+    const nax = if (rows_exact) !isLmHead(in_dim, out_dim, groups) else rows >= 2;
+    return rowsGeometryFor(in_dim, out_dim, rows, groups, nax and gemmNaxOn());
+}
+
+/// A row has the same bytes at every width: the NAX arm at one row too, and for the lm_head, where the SIMD rows arm is
+/// the faster one up to 5 rows and equals its one-row launch bit for bit, the SIMD arm at every width.
+pub var rows_exact: bool = false;
+
+fn isLmHead(in_dim: c_int, out_dim: c_int, groups: c_int) bool {
+    return groups == 1 and in_dim == 5120 and out_dim == 129280;
 }
 
 /// DeepSeek's trunk linears on the NAX arm: `kph` simdgroups split a threadgroup's k range and sum in threadgroup
@@ -13797,6 +13806,50 @@ fn oneRowChain(s: mlx.mlx_stream, f: *const MimoMoeFixture, x: mlx.mlx_array, li
 
 fn f32Bytes(a: mlx.mlx_array) ![]const u8 {
     return std.mem.sliceAsBytes((mlx.mlx_array_data_float32(a) orelse return error.F32Unreadable)[0..mlx.mlx_array_size(a)]);
+}
+
+test "exl3 STQ shared expert at DeepSeek's shape: a one-row chain gives row 0 of a wider chain the same bytes" {
+    const s = mlx.gpuStream();
+    defer setDecodeParams(.mul1);
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    setDecodeParams(dec);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = 5120, .inter = 2304, .e = 1, .rows = 6, .topk = 1, .rate = .{ .n = 64 }, .dec = dec, .seed = 5120, .banks = .{ 0.01, 1, 0.01, 1 }, .x_scale = 4 });
+    defer f.deinit();
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, f.arrays[8], .bfloat16, s));
+    const a = f.arrays;
+    var one: ?mlx.mlx_array = null;
+    defer if (one) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    for ([_]c_int{ 1, 2, 3, 6 }) |rows| {
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ rows, 5120 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var slots = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(slots);
+        try mlx.check(mlx.mlx_slice(&slots, a[7], &[_]c_int{0}, 1, &[_]c_int{rows}, 1, &[_]c_int{1}, 1, s));
+        var scores = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scores);
+        try mlx.check(mlx.mlx_slice(&scores, a[9], &[_]c_int{0}, 1, &[_]c_int{rows}, 1, &[_]c_int{1}, 1, s));
+        const before = one_row_coop_dispatches;
+        const y = try moeSwigluClamped(s, part, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], slots, scores, 1, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(y);
+        var y32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y32);
+        try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(y32));
+        try std.testing.expectEqual(before + @as(usize, if (rows == 1) 2 else 0), one_row_coop_dispatches);
+        if (rows == 1) {
+            one = y32;
+            y32 = mlx.mlx_array_new();
+            continue;
+        }
+        try std.testing.expectEqualSlices(u8, (try f32Bytes(one.?))[0 .. 5120 * 4], (try f32Bytes(y32))[0 .. 5120 * 4]);
+    }
 }
 
 test "exl3 GLM one-row decode chain equals the lane chain to the byte and engages on one row only" {

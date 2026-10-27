@@ -624,6 +624,9 @@ pub const Model = struct {
     attn_f16: bool = false,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
+    /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
+    /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
+    dspark_exact: bool = true,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
     engram_wait_ns: u64 = 0,
     engram_forwards: u64 = 0,
@@ -2468,6 +2471,11 @@ pub fn setFused(m: *Model, composed: bool) void {
     log.info("[dsv41] fused kernels {s}{s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "" });
 }
 
+pub fn setDsparkExact(m: *Model, on: bool) void {
+    m.dspark_exact = on;
+    if (m.dspark != null and !on) log.info("[dsv41] DSpark rounds sum by width (SUSHI_DSV41_DSPARK_EXACT=0): greedy text may differ with the round mix\n", .{});
+}
+
 /// One chunk of a request in flight: the residual streams between layers, the Engram rows and what layers hand
 /// down, over the state `st` the chunk extends. `extendSpan` runs every layer in turn.
 pub const Pass = struct {
@@ -3198,6 +3206,8 @@ pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
 pub fn verify(m: *Model, ids: []const u32) !A {
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
+    exl3.kernels.rows_exact = m.dspark_exact;
+    defer exl3.kernels.rows_exact = false;
     if (ids.len == 1) return extend(m, ids, .all);
     const nl = m.cfg.layers;
     var v: Verify = .{

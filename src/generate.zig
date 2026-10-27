@@ -20423,6 +20423,70 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     try testing.expect(std.mem.count(u32, single[0].items, &.{single[0].items[1]}) < want - 1);
 }
 
+test "dsv41 generator: with exact DSpark rounds greedy text is the same at every round-width mix (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.dsv41.?.dspark != null);
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const prompt = ids[0..30];
+    const want: u32 = 60;
+
+    var first: std.ArrayList(u32) = .empty;
+    defer first.deinit(a);
+
+    // One width, a cycle through every width (`dspark_sweep_rows`), and the adaptive policy.
+    const modes = [_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .{ .rows = 6 }, .sweep, null };
+    for (modes, 0..) |mode, i| {
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        try testing.expect(gen.dspark);
+        if (mode) |d| gen.dspark_diag = d;
+        var got: std.ArrayList(u32) = .empty;
+        defer got.deinit(a);
+        while (try gen.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try got.appendSlice(a, r.tokens);
+        }
+        try testing.expectEqual(@as(usize, want), got.items.len);
+        if (i == 0) try first.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, first.items, got.items);
+    }
+
+    // `SUSHI_DSV41_DSPARK_EXACT=0` still decodes a whole request; its text may differ with the round mix.
+    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+    try xfm.resetCache();
+    var fast = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+    defer fast.deinit(a);
+    var n: usize = 0;
+    while (try fast.nextDspark(a)) |r| {
+        defer a.free(r.tokens);
+        for (r.tokens) |t| try testing.expect(t < xfm.dsv41.?.cfg.vocab);
+        n += r.tokens.len;
+    }
+    try testing.expectEqual(@as(usize, want), n);
+}
+
 test "dsv41 generator: a DSpark round ends right behind the id it is told to, at any verify width, with the state standing there (DSV41_TINY)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const dsv41_model = @import("dsv41_model.zig");

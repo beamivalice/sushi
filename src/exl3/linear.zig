@@ -489,6 +489,62 @@ test "exl3 linear: the multi-row kernel gives a row the same bytes at widths 2 t
     }
 }
 
+test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at DeepSeek's trunk shapes, and the lm_head keeps its serial launch's" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer kernels.setDecodeParams(.mul1);
+    kernels.rows_exact = true;
+    defer kernels.rows_exact = false;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x0ea5);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    const shapes = [_]struct { in: usize, out: usize, n: u32, groups: usize }{
+        .{ .in = 5120, .out = 1792, .n = 64, .groups = 1 },
+        .{ .in = 1280, .out = 32768, .n = 64, .groups = 1 },
+        .{ .in = 4096, .out = 1024, .n = 64, .groups = 8 },
+        .{ .in = 8192, .out = 5120, .n = 64, .groups = 1 },
+        .{ .in = 5120, .out = 129280, .n = 96, .groups = 1 },
+    };
+    for (shapes) |sh| {
+        var h = try Host.init(alloc, rnd, sh.groups, sh.in, sh.out, sh.n);
+        defer h.deinit();
+        const xb = try alloc.alloc(u16, sh.groups * 6 * sh.in);
+        for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
+        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(sh.groups), 6, @intCast(sh.in) }, 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(x);
+        var one_row: []const f32 = &.{};
+        for ([_]c_int{ 1, 2, 3, 6 }) |width| {
+            var part = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(part);
+            try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ @intCast(sh.groups), width, @intCast(sh.in) }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            const y = try linearGrouped(s, part, h.p, dec);
+            defer _ = mlx.mlx_array_free(y);
+            var cy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cy);
+            const got = try hostF32(s, y, &cy);
+            if (width == 1) {
+                one_row = try alloc.dupe(f32, got);
+                if (sh.out == 129280) {
+                    kernels.rows_exact = false;
+                    defer kernels.rows_exact = true;
+                    const serial = try linearGrouped(s, part, h.p, dec);
+                    defer _ = mlx.mlx_array_free(serial);
+                    var cs = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(cs);
+                    try t.expectEqualSlices(u8, std.mem.sliceAsBytes(one_row), std.mem.sliceAsBytes(try hostF32(s, serial, &cs)));
+                }
+                continue;
+            }
+            const w: usize = @intCast(width);
+            for (0..sh.groups) |g| try t.expectEqualSlices(u8, std.mem.sliceAsBytes(one_row[g * sh.out ..][0..sh.out]), std.mem.sliceAsBytes(got[g * w * sh.out ..][0..sh.out]));
+        }
+    }
+}
+
 const bench = @import("bench_util.zig");
 
 /// DeepSeek-V4.1-Flash's trunk linears as the STQ pack stores them (`trunk_quant` n64, the head n96).

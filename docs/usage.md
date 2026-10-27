@@ -252,7 +252,7 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw --local-dir ~/.s
   a token and the prefix cache keeps seen prompts on the SSD by default, so a repeated prompt skips its prefill. One
   request decodes at a time.
 - **DSpark**, the checkpoint's own drafter, is on by default; `--no-mtp` turns it off. It accepts drafts by the exact rule
-  only. Greedy output can differ from `--no-mtp` at a near-tie, never between a stream and a non-stream reply.
+  only. Greedy output is the same at every round-width mix, can differ from `--no-mtp` at a near-tie, and never differs between a stream and a non-stream reply.
 - **Thinking** is `high` by default. A request names `reasoning_effort` `low`, `high` or `max` (`medium` is served as
   `high`); `enable_thinking: false` or effort `off` answers without thinking.
 - **Images** are served by default. `--no-vision` leaves the tower out, saves its 0.97 GB for the expert cache and turns
