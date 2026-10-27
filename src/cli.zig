@@ -400,16 +400,85 @@ pub const Reporter = struct {
     }
 };
 
-/// Appends the shared curl argv prefix; returns the owned Authorization
-/// header string when HF_TOKEN is set (caller frees).
-fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !?[]u8 {
-    try list.appendSlice(allocator, &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2" });
-    if (std.c.getenv("HF_TOKEN")) |tok| {
-        const header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{std.mem.span(tok)});
-        try list.appendSlice(allocator, &.{ "-H", header });
-        return header;
+/// The process environment a Hugging Face token is resolved from; a test passes its own.
+const HfEnv = struct {
+    token: ?[]const u8 = null,
+    token_path: ?[]const u8 = null,
+    hf_home: ?[]const u8 = null,
+    home: []const u8,
+
+    fn fromProcess() HfEnv {
+        const get = struct {
+            fn f(name: [:0]const u8) ?[]const u8 {
+                return if (std.c.getenv(name.ptr)) |v| std.mem.span(v) else null;
+            }
+        }.f;
+        return .{ .token = get("HF_TOKEN"), .token_path = get("HF_TOKEN_PATH"), .hf_home = get("HF_HOME"), .home = homeDir() };
     }
-    return null;
+};
+
+/// The token `sushi pull` and `sushi list` send: `HF_TOKEN`, else the file `hf auth login` wrote (`HF_TOKEN_PATH`,
+/// else `$HF_HOME/token`, else `~/.cache/huggingface/token`; the first one set is the only one read). Blank is none.
+fn resolveHfToken(allocator: std.mem.Allocator, io: std.Io, env: HfEnv) !?[]u8 {
+    if (env.token) |t| {
+        const v = std.mem.trim(u8, t, " \t\r\n");
+        if (v.len > 0) return try allocator.dupe(u8, v);
+    }
+    const path = try hfTokenPath(allocator, env);
+    defer allocator.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096)) catch return null;
+    defer allocator.free(raw);
+    const v = std.mem.trim(u8, raw, " \t\r\n");
+    return if (v.len == 0) null else try allocator.dupe(u8, v);
+}
+
+fn hfTokenPath(allocator: std.mem.Allocator, env: HfEnv) ![]u8 {
+    if (env.token_path) |p| if (p.len > 0) return allocator.dupe(u8, p);
+    if (env.hf_home) |h| if (h.len > 0) return std.fmt.allocPrint(allocator, "{s}/token", .{h});
+    return std.fmt.allocPrint(allocator, "{s}/.cache/huggingface/token", .{env.home});
+}
+
+var hf_header_seq = std.atomic.Value(u32).init(0);
+
+/// The Authorization header for one curl call, kept in a 0600 file passed as `-H @file`: a token in argv shows in `ps`.
+const HfAuth = struct {
+    arg: ?[]u8 = null,
+
+    fn initProcess(allocator: std.mem.Allocator, io: std.Io) !HfAuth {
+        const tmp_dir = if (std.c.getenv("TMPDIR")) |t| std.mem.trimEnd(u8, std.mem.span(t), "/") else "/tmp";
+        return init(allocator, io, HfEnv.fromProcess(), tmp_dir);
+    }
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, env: HfEnv, tmp_dir: []const u8) !HfAuth {
+        const token = try resolveHfToken(allocator, io, env) orelse return .{};
+        defer allocator.free(token);
+        const line = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\n", .{token});
+        defer allocator.free(line);
+        const arg = try std.fmt.allocPrint(allocator, "@{s}/sushi-hf-{d}-{d}.hdr", .{ tmp_dir, std.c.getpid(), hf_header_seq.fetchAdd(1, .monotonic) });
+        errdefer allocator.free(arg);
+        const file = try std.Io.Dir.cwd().createFile(io, arg[1..], .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        errdefer std.Io.Dir.cwd().deleteFile(io, arg[1..]) catch {};
+        try file.writeStreamingAll(io, line);
+        return .{ .arg = arg };
+    }
+
+    fn deinit(self: *HfAuth, allocator: std.mem.Allocator, io: std.Io) void {
+        const arg = self.arg orelse return;
+        std.Io.Dir.cwd().deleteFile(io, arg[1..]) catch {};
+        allocator.free(arg);
+        self.arg = null;
+    }
+
+    fn appendArgs(self: HfAuth, list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+        if (self.arg) |arg| try list.appendSlice(allocator, &.{ "-H", arg });
+    }
+};
+
+/// Appends the shared curl argv prefix and the Hugging Face credentials.
+fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator, auth: HfAuth) !void {
+    try list.appendSlice(allocator, &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2" });
+    try auth.appendArgs(list, allocator);
 }
 
 /// How an HTTP status reads for a Hugging Face lookup: a document, "no such repo" (HF answers 401 for a repo
@@ -432,12 +501,9 @@ fn curlGet(allocator: std.mem.Allocator, io: std.Io, url: []const u8, quick: boo
         &.{ "--connect-timeout", "3", "--max-time", "6" }
     else
         &.{ "--retry", "3", "--retry-delay", "2" });
-    var header: ?[]u8 = null;
-    defer if (header) |h| allocator.free(h);
-    if (std.c.getenv("HF_TOKEN")) |tok| {
-        header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{std.mem.span(tok)});
-        try argv.appendSlice(allocator, &.{ "-H", header.? });
-    }
+    var auth = HfAuth.initProcess(allocator, io) catch return error.FetchFailed;
+    defer auth.deinit(allocator, io);
+    try auth.appendArgs(&argv, allocator);
     try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
     const result = std.process.run(allocator, io, .{
         .argv = argv.items,
@@ -475,8 +541,9 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
 
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
-    const header_storage = try curlBaseArgs(&argv, allocator);
-    defer if (header_storage) |h| allocator.free(h);
+    var auth = HfAuth.initProcess(allocator, io) catch return error.DownloadFailed;
+    defer auth.deinit(allocator, io);
+    try curlBaseArgs(&argv, allocator, auth);
     try argv.appendSlice(allocator, &.{ "--create-dirs", "-C", "-", "-o", partial });
     if (show_progress) {
         try argv.append(allocator, "--progress-bar");
@@ -573,9 +640,9 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch |err| {
         if (err == error.NotFound) {
-            reporter.say("error: {s} was not found on Hugging Face: it may not be published yet (or it is gated: set HF_TOKEN)", .{resolved.repo});
+            reporter.say("error: {s} was not found on Hugging Face: it may not be published yet (or it is private or gated: set HF_TOKEN or run `hf auth login`)", .{resolved.repo});
         } else {
-            reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
+            reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN / `hf auth login` for gated repos)", .{resolved.repo});
         }
         return error.PullFailed;
     };
@@ -3054,4 +3121,95 @@ test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM o
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &.{ .off, .low, .medium, .xhigh }));
     try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
     try testing.expectEqual(@as(?model.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
+}
+
+test "hf token: env var, then HF_TOKEN_PATH, then HF_HOME/token, then the default file, then none" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.createDirPath(io, "home/.cache/huggingface");
+    try tmp.dir.createDirPath(io, "hfhome");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.cache/huggingface/token", .data = "default-tok\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "hfhome/token", .data = "  home-tok \r\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "explicit", .data = "path-tok" });
+    const home = try std.fmt.allocPrint(a, "{s}/home", .{root});
+    defer a.free(home);
+    const hf_home = try std.fmt.allocPrint(a, "{s}/hfhome", .{root});
+    defer a.free(hf_home);
+    const explicit = try std.fmt.allocPrint(a, "{s}/explicit", .{root});
+    defer a.free(explicit);
+
+    const Case = struct { env: HfEnv, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .env = .{ .token = " env-tok\n", .token_path = explicit, .hf_home = hf_home, .home = home }, .want = "env-tok" },
+        .{ .env = .{ .token = "", .token_path = explicit, .hf_home = hf_home, .home = home }, .want = "path-tok" },
+        .{ .env = .{ .token_path = explicit, .hf_home = hf_home, .home = home }, .want = "path-tok" },
+        .{ .env = .{ .hf_home = hf_home, .home = home }, .want = "home-tok" },
+        .{ .env = .{ .home = home }, .want = "default-tok" },
+    };
+    for (cases) |c| {
+        const got = try resolveHfToken(a, io, c.env);
+        defer if (got) |g| a.free(g);
+        try testing.expectEqualStrings(c.want.?, got.?);
+    }
+    // The first path set is the only one read: a missing file there is no token, not a fall-through.
+    const missing = try std.fmt.allocPrint(a, "{s}/nope", .{root});
+    defer a.free(missing);
+    try testing.expect(try resolveHfToken(a, io, .{ .token_path = missing, .hf_home = hf_home, .home = home }) == null);
+    try testing.expect(try resolveHfToken(a, io, .{ .home = root }) == null);
+}
+
+test "hf token: an empty or blank token file is no token" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blank", .data = " \n\t\n" });
+    for ([_][]const u8{ "empty", "blank" }) |name| {
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, name });
+        defer a.free(path);
+        try testing.expect(try resolveHfToken(a, io, .{ .token_path = path, .home = root }) == null);
+    }
+}
+
+test "hf auth: a token becomes a private header file for curl, never an argument, and goes away with it" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "secret-tok\n" });
+    const token_path = try std.fmt.allocPrint(a, "{s}/token", .{root});
+    defer a.free(token_path);
+
+    var auth = try HfAuth.init(a, io, .{ .token_path = token_path, .home = root }, root);
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(a);
+    try auth.appendArgs(&argv, a);
+    try testing.expectEqual(@as(usize, 2), argv.items.len);
+    try testing.expectEqualStrings("-H", argv.items[0]);
+    try testing.expect(argv.items[1][0] == '@');
+    try testing.expect(std.mem.indexOf(u8, argv.items[1], "secret-tok") == null);
+    const header_path = argv.items[1][1..];
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, header_path, a, .limited(4096));
+    defer a.free(body);
+    try testing.expectEqualStrings("Authorization: Bearer secret-tok\n", body);
+    const st = try std.Io.Dir.cwd().statFile(io, header_path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    auth.deinit(a, io);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, header_path, .{}));
+
+    var anon = try HfAuth.init(a, io, .{ .home = root }, root);
+    defer anon.deinit(a, io);
+    var none = std.ArrayList([]const u8).empty;
+    defer none.deinit(a);
+    try anon.appendArgs(&none, a);
+    try testing.expectEqual(@as(usize, 0), none.items.len);
 }

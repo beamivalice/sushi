@@ -135,7 +135,7 @@ A path, a credential or an output location.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `HF_TOKEN` | `cli.zig:295` | Bearer token added to `sushi pull` downloads (the standard Hugging Face name) | boot | yes: --help |
+| `HF_TOKEN`, `HF_TOKEN_PATH`, `HF_HOME` | `cli.zig` `HfEnv` | Bearer token for `sushi pull` and `sushi list`: `HF_TOKEN`, else the file `HF_TOKEN_PATH`, else `$HF_HOME/token`, else `~/.cache/huggingface/token` (the standard Hugging Face names); curl reads it from a 0600 temp header file, never argv | per call | yes: usage |
 | `SUSHI_HIDDEN_OUT`, `SUSHI_HIDDEN_SPOOL_BYTES`, `SUSHI_HIDDEN_SPOOL_FIRST` | `hidden_capture.zig` | `<abs dir>` enables hidden-state block-boundary capture; spool budget and first window index of its spool mode | boot | yes: engine-expert-streaming, glm5-arch, quality-kld |
 | `SUSHI_IMATRIX_OUT` | `imatrix.zig:34` | `<abs>.safetensors` enables expert-imatrix capture | boot | yes: engine-expert-streaming, quality-kld |
 | `SUSHI_NGRAM_BF16_DIR` | `model.zig:1174` | serves a Flash-Next pack with the original bf16 n-gram table (KLD isolation) | load | yes: engine-expert-streaming, quality-kld, qwen4-arch |
