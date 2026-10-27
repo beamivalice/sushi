@@ -191,6 +191,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - GPU parity = no-worse-than fp32 ground truth, never kernel-vs-kernel; a parity loop asserts FINITENESS before it
   diffs; every shape an eligibility predicate adopts gets its own A/B.
+- A "no further from truth than the composed chain" bar needs an f32 floor: without NAX the composed GEMMs are true f32
+  and the kernel's own accumulation noise exceeds them (CI's GPU and an M1; an M5's TF32 core hides it). A kernel test
+  whose launch geometry a load probes (`probeHc`) runs that probe too.
 - Drive a parity case at the model's REAL activation magnitudes, not synthetic unit-scale inputs, and score it
   against a TRUE f32 oracle (an oracle that mirrors the kernel's own f16 stores cannot see a saturation).
 - A `metal_kernel` config is cached by FULL SHAPE (`ShapeKey`); a per-token-varying TEMPLATE value is a fresh JIT

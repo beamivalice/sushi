@@ -924,11 +924,13 @@ test "a threadgroup-size refusal names the pipeline limit and only it is consume
     try t.expectEqual(@as(?u32, null), threadgroupLimit("[slice_update] Invalid slice sizes."));
     try t.expectEqual(@as(?u32, null), threadgroupLimit("maximum allowed threads per threadgroup (x)"));
 
+    // A refusal an earlier test left latched is that test's failure, not this one's.
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
     try t.expectEqual(@as(?u32, null), takeThreadgroupLimit());
     latchErrorForTest("[matmul] Last dimension of first input must match.");
     try t.expectEqual(@as(?u32, null), takeThreadgroupLimit());
     try t.expect(errorPending());
-    var buf: [512]u8 = undefined;
     _ = takeError(&buf);
     latchErrorForTest(refusal);
     try t.expectEqual(@as(?u32, 832), takeThreadgroupLimit());

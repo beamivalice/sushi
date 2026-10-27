@@ -12865,6 +12865,7 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/glm-cull";
     model.prefix_cache = null;
+    model.transformer = null;
     var slots: [3]Slot = undefined;
     for (&slots, 0..) |*slot, i| {
         slot.model = &model;
@@ -12921,6 +12922,7 @@ test "a GLM cancel landing between the cull passes is committed once before its 
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/glm-cull-race";
     model.prefix_cache = null;
+    model.transformer = null;
     var slots: [2]Slot = undefined;
     for (&slots, 0..) |*slot, i| {
         slot.model = &model;

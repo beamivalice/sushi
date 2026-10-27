@@ -385,13 +385,16 @@ fn decodeBatchParity(bits: u8, rows: usize, prefix_rows: usize, chain: bool, spr
     const want = (try run(&ops, query.*, bf16, prefix_rows, tape, branches[0..rows], selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
     try @import("glm5_attention.zig").expectSameBits(want, got);
     for (0..rows) |row| {
+        // A fresh arena per row: without NAX the batch runs as per-row composites and one arena would overflow at 8 rows.
+        var row_ops = Ops{ .s = s };
+        defer row_ops.deinit();
         const at: c_int = @intCast(row);
-        const one = try ops.slice(query.*, 0, at, at + 1);
-        const one_ids = try ops.slice(selected, 0, at, at + 1);
-        const got1 = (try run(&ops, one, kv8, prefix_rows, tape, branches[row .. row + 1], one_ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
-        const want1 = (try run(&ops, one, bf16, prefix_rows, tape, branches[row .. row + 1], one_ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+        const one = try row_ops.slice(query.*, 0, at, at + 1);
+        const one_ids = try row_ops.slice(selected, 0, at, at + 1);
+        const got1 = (try run(&row_ops, one, kv8, prefix_rows, tape, branches[row .. row + 1], one_ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+        const want1 = (try run(&row_ops, one, bf16, prefix_rows, tape, branches[row .. row + 1], one_ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
         try @import("glm5_attention.zig").expectSameBits(want1, got1);
-        try @import("glm5_attention.zig").expectSameBits(got1, try ops.slice(got, 0, at, at + 1));
+        try @import("glm5_attention.zig").expectSameBits(got1, try row_ops.slice(got, 0, at, at + 1));
     }
     try std.testing.expectEqual(@as(usize, if (rows == 3) 2 else 0), b3Calls());
     try std.testing.expectEqual(rows * 2, b1Calls());
