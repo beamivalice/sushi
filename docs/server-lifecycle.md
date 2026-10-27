@@ -217,6 +217,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   Guard: `tests/test_cancel_mid_tick.sh`.
 - **A slot whose prefill runs is in `Scheduler.prefilling`**, neither `pending` nor `decoding`, so a SIGTERM's
   `cancelAllInFlight` stops it at the next chunk; it ran a MiMo 512k prefill on past 120 s until SIGKILL.
+- **A shutdown drain is an ERROR, never a finish reason**: `cancelAllInFlight` marks `Slot.shutdown_cancelled`, so the
+  reader gets `.err` (`error.ServerShutdown`, 503 "Server is shutting down") instead of `.done`, whose default
+  `finish_reason` is `length` (a queued request logged `0+0 tokens [length]`).
 
 ## Request ownership and media
 

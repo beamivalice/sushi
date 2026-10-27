@@ -670,6 +670,8 @@ pub const Slot = struct {
     /// echo is not published twice (`takeHandoverEcho`).
     handover_token: ?u32 = null,
     cancelled: std.atomic.Value(bool),
+    /// The server, not the client, ended this slot (shutdown drain): readers see an error, never a finish reason.
+    shutdown_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Inference thread only: `cullDecodingWith` committed this cancelled slot, so its cleanup drain must not.
     committed_at_cull: bool = false,
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
@@ -849,6 +851,7 @@ pub const Slot = struct {
             .finish_details = null,
             .loop_trim_start = null,
             .cancelled = std.atomic.Value(bool).init(false),
+            .shutdown_cancelled = std.atomic.Value(bool).init(false),
             .constraint_payload_at = std.atomic.Value(u32).init(std.math.maxInt(u32)),
             .constraint_payload_offset = std.atomic.Value(u32).init(0),
             .prompt_tokens = 0,
@@ -1089,7 +1092,7 @@ pub const Slot = struct {
             // the slot, so shutdown could never drain in-flight requests and
             // raced `Scheduler.deinit` into a use-after-free (SIGSEGV in
             // `complete`). Buffered tokens above still drain first.
-            if (self.cancelled.load(.acquire)) return .{ .done = {} };
+            if (self.cancelled.load(.acquire)) return self.cancelledResult();
             self.out_cond.waitUncancelable(self.io, &self.out_mu);
         }
     }
@@ -1126,7 +1129,7 @@ pub const Slot = struct {
             // teardown.
             if (self.cancelled.load(.acquire)) {
                 self.out_mu.unlock(self.io);
-                return .{ .done = {} };
+                return self.cancelledResult();
             }
             // Arm the event under the lock: producers mutate under this lock
             // and set() before releasing it, so a set racing our reset leaves
@@ -1141,11 +1144,20 @@ pub const Slot = struct {
         }
     }
 
+    fn cancelledResult(self: *Slot) NextResult {
+        return if (self.shutdown_cancelled.load(.acquire)) .{ .err = {} } else .{ .done = {} };
+    }
+
     /// Connection thread: signal cancellation. The inference thread will
     /// drop this slot at the next tick boundary.
     /// Connection thread: the request's own stop sequence completed; end generation as a normal stop.
     pub fn cancelOnStop(self: *Slot) void {
         self.stop_hit.store(true, .release);
+        self.cancel();
+    }
+
+    pub fn cancelForShutdown(self: *Slot) void {
+        self.shutdown_cancelled.store(true, .release);
         self.cancel();
     }
 
@@ -1929,9 +1941,9 @@ pub const Scheduler = struct {
     pub fn cancelAllInFlight(self: *Scheduler) void {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
-        for (self.pending.items) |slot| slot.cancel();
-        for (self.prefilling.items) |slot| slot.cancel();
-        for (self.decoding.items) |slot| slot.cancel();
+        for (self.pending.items) |slot| slot.cancelForShutdown();
+        for (self.prefilling.items) |slot| slot.cancelForShutdown();
+        for (self.decoding.items) |slot| slot.cancelForShutdown();
     }
 
     /// Plan 05 Phase D: resolve `id_or_empty` ("" / "sushi" → default)
@@ -12390,6 +12402,33 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     sch.complete(slot);
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
     try testing.expect(cancelled);
+}
+
+test "a shutdown drain ends a queued request with an error, a client disconnect still ends it as done" {
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    model.prefix_cache = null;
+    var sch = submitTestScheduler(testing.allocator, 2);
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+    defer sch.prefilling.deinit(testing.allocator);
+    const params: SubmitParams = .{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 };
+    const gone = try sch.submit(params);
+    gone.cancel();
+    try testing.expect(gone.waitNext() == .done);
+    const drained = try sch.submit(params);
+    sch.cancelAllInFlight();
+    // A drained slot never ran: `done` would surface as the default finish reason, `length`.
+    try testing.expect(drained.waitNextTimeout(0).? == .err);
+    try testing.expect(drained.waitNext() == .err);
+    sch.complete(drained);
+    sch.complete(gone);
+    var batch: [16]*Slot = undefined;
+    const take = takeTeardownLocked(&sch, &batch);
+    for (batch[0..take.cleanup_n]) |s| s.deinit();
+    destroyAbandoned(take.abandoned);
 }
 
 test "admission combines Qwen and MiMo reservations in either order" {

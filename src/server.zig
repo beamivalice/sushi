@@ -7123,6 +7123,7 @@ threadlocal var slot_media_refusal: ?scheduler_mod.MediaRefusal = null;
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     slot_memory_context_refusal = slot.memory_context_refusal;
     slot_media_refusal = slot.media_refusal;
+    if (slot.shutdown_cancelled.load(.acquire)) return error.ServerShutdown;
     if (slot.errorNameIs("MediaRefused")) return error.MediaRefused;
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
     if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
@@ -7214,6 +7215,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
             .message = EMPTY_PROMPT_MSG,
+        },
+        // The shutdown drain ended a request that was queued or running.
+        error.ServerShutdown => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = "Server is shutting down",
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -24058,6 +24067,12 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expectEqualStrings(PREFILL_NOFIT_MSG, w.message);
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
         try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    }
+    {
+        const w = mapGenerationError(error.ServerShutdown, &buf);
+        try t.expectEqual(@as(u32, 503), w.code);
+        try t.expectEqualStrings("server_error", w.openai_type);
+        try t.expectEqualStrings("Server is shutting down", w.message);
     }
     {
         const w = mapGenerationError(error.GenerationFailed, &buf);
