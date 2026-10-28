@@ -119,13 +119,13 @@ pub fn getAppMemFootprintMb() u32 {
 }
 
 /// Bytes the OS will grant a new wiring: free (less speculative, which `external` carries
-/// back) plus file-backed pages, capped by the RAM outside wired + compressor. Mach's page
-/// classes overlap: a resident model's GPU-wired pages sit in `wired` AND in the anonymous
+/// back), file-backed and purgeable pages (volatile anonymous memory the OS drops on demand), capped
+/// by the RAM outside wired + compressor. Mach's page classes overlap: a resident model's GPU-wired pages sit in `wired` AND in the anonymous
 /// set, so subtracting `wired + compressor + internal` charges them twice. Anonymous pressure
 /// still shows, as it consumes free pages and raises wired. 0 on a failed query.
-fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
+fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, wire_pages: u64, compressor_pages: u64, purgeable_pages: u64, page: u64) u64 {
     if (total_mem == 0) return 0;
-    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages;
+    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages +| purgeable_pages;
     const outside: u64 = total_mem -| (wire_pages +| compressor_pages) *| page;
     return @min(reclaimable *| page, outside);
 }
@@ -171,7 +171,7 @@ pub fn getAvailableMemBytes() u64 {
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
-    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.wire_count, vm.compressor_page_count, page);
+    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.wire_count, vm.compressor_page_count, vm.purgeable_count, page);
 }
 
 test "computeAvailableBytes sums the reclaimable classes, capped by wired headroom" {
@@ -180,19 +180,27 @@ test "computeAvailableBytes sums the reclaimable classes, capped by wired headro
     const ppg: u64 = GB / page; // pages per GB
 
     // free_count already contains the speculative pages, which are file-backed inside external.
-    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 83 * ppg, ppg, page));
+    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 83 * ppg, ppg, 0, page));
 
     // The cap: wired + compressor bound the figure.
-    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 9 * ppg, ppg, page));
+    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 9 * ppg, ppg, 0, page));
 
     // A 7 GB model resident in the anonymous set consumed the free and file pages of a 16 GB
     // box (9 GB anonymous, 3 wired, 1 compressed), so a second 7 GB load is still refused.
-    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 3 * ppg, 1 * ppg, page));
+    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 3 * ppg, 1 * ppg, 0, page));
 
     // Disagreeing counters never underflow; a failed query or a box with no headroom reports 0.
-    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 1, 1, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 16 * ppg, 0, page));
+    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, 0, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 1, 1, 0, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 16 * ppg, 0, 0, page));
+}
+
+test "computeAvailableBytes counts purgeable pages as reclaimable, still capped by wired headroom" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const ppg: u64 = GB / page;
+    try std.testing.expectEqual(@as(u64, 5 * GB), computeAvailableBytes(64 * GB, 2 * ppg, 0, 1 * ppg, 8 * ppg, ppg, 2 * ppg, page));
+    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 12 * ppg, 0, 3 * ppg, page));
 }
 
 test "computeAvailableBytes: a resident model's wired pages are not charged a second time" {
@@ -206,7 +214,7 @@ test "computeAvailableBytes: a resident model's wired pages are not charged a se
     const compressor: u64 = 32_238;
     // What the OS grants a new wiring: the free and file-backed pages, 19.25 GiB. Charging the
     // anonymous pages (1,823,546) on top of `wired` left 4.54 GiB.
-    try std.testing.expectEqual((free_count - speculative + external) * page, computeAvailableBytes(8_388_608 * page, free_count, speculative, external, wired, compressor, page));
+    try std.testing.expectEqual((free_count - speculative + external) * page, computeAvailableBytes(8_388_608 * page, free_count, speculative, external, wired, compressor, 0, page));
 }
 
 pub fn getSysMemPct() u32 {
