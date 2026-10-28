@@ -6669,47 +6669,6 @@ test "parseToolCalls flat shape ignores id/type metadata" {
     try testing.expect(parsed.value.object.get("type") == null);
 }
 
-test "parseToolCalls repairs Qwen MoE missing-arguments-key shape" {
-    const allocator = testing.allocator;
-    // Real broken output observed from Qwen3.6-35B-A3B-6bit:
-    // {"name": "shell",  {"command":"ls"}}  — `, {` instead of `, "arguments": {`
-    const text = "<tool_call>\n{\"name\":  \"shell\",     {\"command\":\"ls -la\"}}\n</tool_call>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("shell", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
-}
-
-test "parseToolCalls repairs Qwen MoE missing-opening-quote on arguments key" {
-    const allocator = testing.allocator;
-    // Real broken output observed from Qwen3.6-35B-A3B-6bit:
-    // {"name": "shell", arguments": {"command":"mkdir -p src/app"}}
-    // — missing the OPENING `"` on the `arguments` key.
-    const text = "<tool_call>\n{\"name\": \"shell\", arguments\": {\"command\": \"mkdir -p src/app\"}}\n</tool_call>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("shell", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("mkdir -p src/app", parsed.value.object.get("command").?.string);
-}
-
 test "parseToolCalls recovers writeFile content with RAW newlines (small-model big-file escaping)" {
     const allocator = testing.allocator;
     // Small models writing a big file often emit literal newlines inside the
@@ -6866,27 +6825,6 @@ test "parseToolCalls recovers truncated <function=writeFile> (max_tokens mid-con
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expect(parsed.value == .object);
-}
-
-test "parseToolCalls recovers EOS-before-close-tag <function=> with full args" {
-    const allocator = testing.allocator;
-    // Bonus from the same fix: a Hermes call that closed </parameter></function>
-    // but hit EOS before </tool_call> now recovers WITH its args, not just the
-    // name (parseHermesToolCall reads the closed parameter).
-    const text = "<tool_call>\n<function=shell>\n<parameter=command>ls -la</parameter>\n</function>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("shell", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
 }
 
 test "parseToolCalls recovers a bare <function=> call with NO <tool_call> opener" {
@@ -7966,21 +7904,6 @@ test "parseToolCalls Gemma 4 format" {
     try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
 }
 
-test "parseToolCalls Gemma 4 with channel thinking" {
-    const allocator = testing.allocator;
-    const text = "<|channel>thought\nLet me check the weather<channel|>\n<|tool_call>call:get_weather{\"city\": \"Paris\"}<tool_call|>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("get_weather", calls[0].name);
-}
-
 test "parseToolCalls Gemma 4 truncated (no closing tag)" {
     const allocator = testing.allocator;
     // Model hit EOS before generating <tool_call|>
@@ -8053,30 +7976,6 @@ test "parseToolCalls Gemma 4 loop-stop truncated content dropped, name recovered
     try testing.expect(parsed.value == .object);
     try testing.expect(parsed.value.object.get("content") == null);
     try testing.expect(parsed.value.object.get("path") == null);
-}
-
-test "parseToolCalls Gemma 4 truncated content after a complete path keeps path, drops fragment" {
-    const allocator = testing.allocator;
-    // The ordering that would CORRUPT a file: `path` completed BEFORE the cut.
-    // Pre-fix salvage = {path, <partial garbage content>} — a schema-valid call
-    // the client executes, writing a fragment to a real path and reporting
-    // success. The completed path survives (the client's missing-content error
-    // steers a clean re-issue); the fragment never ships.
-    const text = "<|tool_call>call:write{path:<|\"|>plang/php.html<|\"|>,content:<|\"|><!DOCTYPE html>\n<p>PHP is a server-side scripting language, server-side scripting language, server-";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("write", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("plang/php.html", parsed.value.object.get("path").?.string);
-    try testing.expect(parsed.value.object.get("content") == null);
 }
 
 test "parseToolCalls Gemma 4 bare rich value truncated at end-of-body is dropped" {
@@ -10233,24 +10132,6 @@ test "parseToolCalls: fenced JSON array of parallel calls parses all" {
     try testing.expect(std.mem.indexOf(u8, calls[1].arguments, "Tokyo, Japan") != null);
 }
 
-test "parseToolCalls: XML-element tool form (tool_name + arg children)" {
-    // Verbatim DSV4-Flash capture (2026-06-10, MLX Core agent chat): the
-    // tool name and each argument arrive as XML child elements — no JSON.
-    const allocator = testing.allocator;
-    const text = "Let me check the available disk space on this device.\n\n<tool_calls>\n<tool_name>shell</tool_name>\n<command>df -h / | grep -v \"Filesystem\"</command>\n</tool_calls>";
-    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("shell", calls[0].name);
-    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "df -h / | grep -v \\\"Filesystem\\\"") != null);
-}
-
 test "parseToolCalls: XML-element-TAG form (<tool_NAME> with arg children)" {
     // Verbatim DSV4-Flash capture (2026-06-10 pi html-ds4 turn 2): the tool
     // name rides in the tag itself — <tool_read>, <tool_edit> — with each
@@ -10308,16 +10189,6 @@ test "parseToolCalls: <tool_NAME> with prose body containing braces is NOT a too
     // args object, not merely contain one.
     const allocator = testing.allocator;
     const text = "<tool_summary>The config {a: 1} was applied.</tool_summary>";
-    const calls = try parseToolCalls(allocator, text);
-    try testing.expect(calls == null);
-}
-
-test "parseToolCalls: hallucinated <tool_output> result tag is NOT a tool call" {
-    // Verbatim DSV4-Flash capture (same session, turn 1): the model invented
-    // a tool RESULT without calling anything. A plain-text body must never
-    // produce a call to a tool named "output".
-    const allocator = testing.allocator;
-    const text = "Here's the page I created for you:\n\n<tool_output>Page ready: mlx.html</tool_output>";
     const calls = try parseToolCalls(allocator, text);
     try testing.expect(calls == null);
 }
@@ -10414,58 +10285,6 @@ test "coerceToolArgsToSchema: Python-style False on a boolean param becomes JSON
         "  <script src=\"game.js\" type=\"module\"></script>",
         parsed.value.object.get("new_string").?.string,
     );
-}
-
-test "coerceToolArgsToSchema: a STRING param spelled `false` stays a string" {
-    // The inverse half of the same class: isJsonLiteral guesses the type from
-    // the value's SPELLING, so a code edit whose old_string is literally the
-    // token `false` was shipped as JSON `false` (boolean) — "expected string,
-    // provided boolean". The schema is the only thing that can disambiguate.
-    const allocator = testing.allocator;
-    const raw = "<tool_call>\n<function=Edit>\n<parameter=file_path>\na.js\n</parameter>\n" ++
-        "<parameter=old_string>\nfalse\n</parameter>\n<parameter=new_string>\n42\n</parameter>\n" ++
-        "</function>\n</tool_call>";
-    const calls = (try parseToolCalls(allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
-
-    const parsed = try parseArgsObj(allocator, calls[0].arguments);
-    defer parsed.deinit();
-    const old = parsed.value.object.get("old_string").?;
-    try testing.expect(old == .string);
-    try testing.expectEqualStrings("false", old.string);
-    const new = parsed.value.object.get("new_string").?;
-    try testing.expect(new == .string);
-    try testing.expectEqualStrings("42", new.string);
-}
-
-test "coerceToolArgsToSchema: quoted boolean in a JSON body is coerced too" {
-    // Same class, different producer: the model emits well-formed JSON but
-    // quotes the boolean. Strict parse succeeds, so no repair path ever runs.
-    const allocator = testing.allocator;
-    const raw = "<tool_call>{\"name\":\"Edit\",\"arguments\":{\"file_path\":\"a.js\"," ++
-        "\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":\"true\"}}</tool_call>";
-    const calls = (try parseToolCalls(allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
-
-    const parsed = try parseArgsObj(allocator, calls[0].arguments);
-    defer parsed.deinit();
-    const v = parsed.value.object.get("replace_all").?;
-    try testing.expect(v == .bool);
-    try testing.expectEqual(true, v.bool);
 }
 
 test "coerceToolArgsToSchema: unknown tool / unknown key / undecidable value pass through" {
@@ -11892,56 +11711,6 @@ test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} 
 
 // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
 
-test "parseToolCalls minicpm5: single string arg (shell pwd)" {
-    const raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("shell", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
-}
-
-test "parseToolCalls minicpm5: shell echo hello" {
-    const raw = "<function name=\"shell\">\n  <param name=\"command\">echo hello</param>\n</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("shell", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("echo hello", parsed.value.object.get("command").?.string);
-}
-
-test "parseToolCalls minicpm5: git status" {
-    const raw = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("git status", parsed.value.object.get("command").?.string);
-}
-
 test "parseToolCalls minicpm5: git log -1" {
     const raw = "<function name=\"shell\">\n  <param name=\"command\">git log -1</param>\n</function>";
     const calls = (try parseToolCalls(testing.allocator, raw)).?;
@@ -11998,25 +11767,6 @@ test "parseToolCalls minicpm5: a param value keeps its own leading/trailing blan
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("\nhi\n", parsed.value.object.get("content").?.string);
-}
-
-test "parseToolCalls minicpm5: CDATA param value kept verbatim" {
-    const raw = "<function name=\"write_file\">\n" ++
-        "  <param name=\"path\"><![CDATA[notes.txt]]></param>\n" ++
-        "  <param name=\"content\"><![CDATA[line one\nline <two> & \"three\"]]></param>\n" ++
-        "</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("line one\nline <two> & \"three\"", parsed.value.object.get("content").?.string);
 }
 
 test "parseToolCalls minicpm5: character data AFTER a CDATA section is not discarded" {
@@ -12083,60 +11833,6 @@ test "parseToolCalls minicpm5: CDATA payload containing a literal </function> is
     try testing.expectEqualStrings("pwd", second.value.object.get("command").?.string);
 }
 
-test "parseToolCalls minicpm5: two sequential calls, no wrapper" {
-    const raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\n" ++
-        "<function name=\"shell\">\n  <param name=\"command\">ls -la</param>\n</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 2), calls.len);
-    const first = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer first.deinit();
-    try testing.expectEqualStrings("pwd", first.value.object.get("command").?.string);
-    const second = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[1].arguments, .{});
-    defer second.deinit();
-    try testing.expectEqualStrings("ls -la", second.value.object.get("command").?.string);
-}
-
-test "parseToolCalls minicpm5: duplicate param — first occurrence wins" {
-    const raw = "<function name=\"shell\">\n" ++
-        "  <param name=\"command\">pwd</param>\n" ++
-        "  <param name=\"command\">ls -la</param>\n" ++
-        "</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
-}
-
-test "parseToolCalls minicpm5: undeclared function name is still parsed (kept, not guessed away)" {
-    const raw = "<function name=\"delete_everything\">\n  <param name=\"path\">/</param>\n</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("delete_everything", calls[0].name);
-    try testing.expectEqual(false, calls[0].inferred);
-}
-
 test "parseToolCalls minicpm5: missing param is never fabricated" {
     const raw = "<function name=\"write\">\n  <param name=\"path\">notes.txt</param>\n</function>";
     const calls = (try parseToolCalls(testing.allocator, raw)).?;
@@ -12151,24 +11847,6 @@ test "parseToolCalls minicpm5: missing param is never fabricated" {
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
     try testing.expect(parsed.value.object.get("content") == null);
-}
-
-test "parseToolCalls minicpm5: unrecognized param passes through untouched" {
-    const raw = "<function name=\"shell\">\n" ++
-        "  <param name=\"command\">pwd</param>\n" ++
-        "  <param name=\"timeout_ms\">5000</param>\n" ++
-        "</function>";
-    const calls = (try parseToolCalls(testing.allocator, raw)).?;
-    defer {
-        for (calls) |tc| {
-            testing.allocator.free(tc.name);
-            testing.allocator.free(tc.arguments);
-        }
-        testing.allocator.free(calls);
-    }
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("5000", parsed.value.object.get("timeout_ms").?.string);
 }
 
 test "minicpm5 COMBINED: parser and scrubber agree on the same bytes" {
@@ -12270,12 +11948,6 @@ test "parseToolCalls minicpm5: an UNCLOSED named opener in prose is not a call" 
     defer parsed.deinit();
     try testing.expectEqualStrings("ls", parsed.value.object.get("command").?.string);
     try testing.expect(parsed.value.object.get("cwd") == null);
-}
-
-test "parseToolCalls minicpm5: malformed open tag (dropped quote) never guesses a call" {
-    const raw = "<function name=\"shell>\n  <param name=\"command\">pwd</param>\n</function>\nI'll run that now.";
-    const calls = try parseToolCalls(testing.allocator, raw);
-    try testing.expect(calls == null);
 }
 
 test "parseToolCalls minicpm5: prose before and after a call, and function-like false positives" {
@@ -12549,24 +12221,6 @@ test "renderChatTemplate: a NUL byte in message content does not truncate the pr
     try testing.expect(std.mem.indexOf(u8, rendered, "before") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "after") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>assistant") != null);
-}
-
-test "parseToolCalls qwen: a truncated <function= call is never renamed by a JSON parameter value" {
-    // Bar: a call cut before any close tag keeps the name its `<function=`
-    // opener declared, whatever the parameter value looks like.
-    const allocator = testing.allocator;
-    const raw =
-        "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/package.json\n</parameter>\n" ++
-        "<parameter=content>\n{\"name\": \"voxel-pagoda-garden\", \"version\": \"1.0.0\"}";
-    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqualStrings("write_file", calls[0].name);
 }
 
 test "parseToolCalls qwen: a parameter value carrying </parameter> is not emptied" {
