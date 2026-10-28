@@ -1117,18 +1117,9 @@ pub fn main(init: std.process.Init) !void {
         if (t) |thread| thread.detach();
     }
 
-    // Observability: allocate the metrics core once (when --metrics is on) and
-    // publish it via the server-global `g_metrics`. Declared here — above every
-    // serve-dispatch path (headless and the primary MLX
-    // path) — so `server_mod.serve()` spawns the gauge sampler + routes /metrics
-    // regardless of engine, and each LoadParams builder reads it back into the
-    // scheduler's per-request sink via `.metrics = server_mod.g_metrics`. The
-    // instance lives on this stack frame for the whole process lifetime; the
-    // defer clears the global so an early serve() failure can't leave it
-    // dangling. Off (the default) → null: a single per-request branch, no cost.
-    var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
-    if (metrics_instance) |*m| server_mod.g_metrics = m;
-    defer server_mod.g_metrics = null;
+    // Observability: `--metrics` turns the process-wide core on before serving; without it the core stays off
+    // until POST /metrics/enable. Every LoadParams builder reads it back as the scheduler's initial sink.
+    if (metrics_enabled) _ = metrics_mod.process.enable();
 
     // An unsupported file format is refused by name before any config.json read.
     if (isGgufPath(io, model_dir)) {
@@ -1431,7 +1422,7 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-            .metrics = server_mod.g_metrics,
+            .metrics = metrics_mod.current(),
         };
         var serve_cfg = launch_serve.serverConfig();
         serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
@@ -1714,7 +1705,7 @@ fn runHeadlessServe(
         .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .metrics = server_mod.g_metrics,
+        .metrics = metrics_mod.current(),
     };
 
     var serve_cfg = launch_serve.serverConfig();

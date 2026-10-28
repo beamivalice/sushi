@@ -20,7 +20,7 @@ const ORIGIN = 'http://sushi.test';
 // Runs in the page before its own scripts: every endpoint the page calls is answered here, and the chat
 // stream pauses after its first words until the test opens the gate.
 function installStubs(config) {
-  const stub = window.__stub = { calls: [], aborted: 0, streams: 0, metricsStatus: config.metricsStatus, openGate: null, ...config };
+  const stub = window.__stub = { calls: [], aborted: 0, streams: 0, metricsStatus: config.metricsStatus, enableStatus: 200, openGate: null, ...config };
   const gate = new Promise((resolve) => { stub.openGate = resolve; });
   window.__clears = 0;
   const realClear = CanvasRenderingContext2D.prototype.clearRect;
@@ -38,6 +38,10 @@ function installStubs(config) {
       case '/v1/models': return json({ data: [{ id: 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
       case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
       case '/v1/tools': return json({ edit_default: false });
+      case '/metrics/enable':
+        if (stub.enableStatus !== 200) return json({ error: { message: 'refused' } }, stub.enableStatus);
+        stub.metricsStatus = 200;
+        return json({ metrics: true, already_enabled: false });
       case '/metrics.json':
         if (stub.metricsStatus !== 200) return json({ error: { message: 'metrics off' } }, stub.metricsStatus);
         return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [] });
@@ -235,6 +239,57 @@ async function main() {
       const { page, context } = await openPage(browser, '/dashboard', { metricsStatus: 503 });
       await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
       await page.waitForFunction(() => document.getElementById('dashModels').textContent.includes('test-model'));
+      await context.close();
+    }
+
+    {
+      const { page, errors, context } = await openPage(browser, '/dashboard', { metricsStatus: 503, key: 'k-12345' });
+      await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
+      assert.equal(await page.isVisible('#dashEnableMetrics'), true, 'the button shows while metrics are off');
+      const enables = () => page.evaluate(() => window.__stub.calls.filter((call) => call.path === '/metrics/enable'));
+      assert.equal((await enables()).length, 0, 'nothing is enabled by itself');
+      await page.click('#dashEnableMetrics');
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      const sent = await enables();
+      assert.equal(sent.length, 1, 'one enable request');
+      assert.equal(sent[0].method, 'POST');
+      assert.equal(sent[0].auth, 'Bearer k-12345', 'it carries the chat key');
+      assert.equal(await page.isVisible('#dashEnableMetrics'), false, 'the button is gone once metrics are on');
+      await page.waitForFunction(() => document.getElementById('dashTGpu').textContent.includes('55'));
+      assert.equal(await page.evaluate(() => performance.getEntriesByType('navigation').length), 1, 'no page reload');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      const { page, context } = await openPage(browser, '/dashboard', { metricsStatus: 503, enableStatus: 500 });
+      await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
+      await page.click('#dashEnableMetrics');
+      await page.waitForFunction(() => /Could not enable metrics/.test(document.getElementById('dashStatus').textContent));
+      assert.equal(await page.isVisible('#dashEnableMetrics'), true, 'a refused enable leaves the button for another try');
+      assert.equal(await page.isEnabled('#dashEnableMetrics'), true);
+      await context.close();
+    }
+
+    for (const metricsStatus of [200, 401]) {
+      const { page, context } = await openPage(browser, '/dashboard', { metricsStatus });
+      await page.waitForFunction(() => window.__stub.calls.some((call) => call.path === '/metrics.json'));
+      await page.waitForTimeout(300);
+      assert.equal(await page.isVisible('#dashEnableMetrics'), false, `no button when the feed answers ${metricsStatus}`);
+      await context.close();
+    }
+
+    {
+      const { page, context } = await openPage(browser, '/chat', { metricsStatus: 503 });
+      await page.waitForSelector('#modelSelect option', { state: 'attached' });
+      await page.fill('#promptInput', 'keep me');
+      await page.click('#navDashboard');
+      await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
+      await page.click('#dashEnableMetrics');
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      await page.click('#navChat');
+      assert.equal(await page.inputValue('#promptInput'), 'keep me', 'enabling from the dashboard leaves the chat composer alone');
+      assert.equal(await page.evaluate(() => document.getElementById('chatPanel').inert), false);
       await context.close();
     }
 

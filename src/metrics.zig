@@ -289,6 +289,44 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeHistogram(w, "vllm:request_generation_tokens", "Per-request output token count distribution", &m.output_tokens_hist, 1.0);
 }
 
+/// The process's metrics core, off until `enable`. `get` is one acquire load, null while off, so a reader that
+/// sees off keeps the no-op path and one that sees on sees an initialised core. Nothing here calls MLX.
+pub const Switch = struct {
+    const off = 0;
+    const building = 1;
+    const on = 2;
+
+    state: std.atomic.Value(u8) = .init(off),
+    core: Metrics = undefined,
+
+    pub fn get(self: *Switch) ?*Metrics {
+        return if (self.state.load(.acquire) == on) &self.core else null;
+    }
+
+    /// Turns metrics on once, whichever thread calls first; true only for the call that did it. A losing
+    /// caller returns after the core is ready, so `get` is never null once `enable` has returned.
+    pub fn enable(self: *Switch) bool {
+        if (self.state.cmpxchgStrong(off, building, .acquire, .monotonic) == null) {
+            self.core = Metrics.init();
+            self.state.store(on, .release);
+            return true;
+        }
+        while (self.state.load(.acquire) != on) std.atomic.spinLoopHint();
+        return false;
+    }
+};
+
+pub var process: Switch = .{};
+
+pub fn current() ?*Metrics {
+    return process.get();
+}
+
+/// The inference thread's view of the sink: a sink it already holds stays, otherwise it adopts the published one.
+pub fn adoptPublished(held: ?*Metrics, published: ?*Metrics) ?*Metrics {
+    return held orelse published;
+}
+
 // ---------------------------------------------------------------------------
 // renderJson — open JSON feed (drives the index-page live metrics panel)
 // ---------------------------------------------------------------------------
@@ -1076,4 +1114,61 @@ test "failed and rejected counters render under their Prometheus and JSON names"
     const counters = parsed.value.object.get("counters").?.object;
     try testing.expectEqual(@as(i64, 1), counters.get("requests_failed_total").?.integer);
     try testing.expectEqual(@as(i64, 2), counters.get("requests_rejected_total").?.integer);
+}
+
+test "a Switch is off until enabled, then publishes one initialised core" {
+    const testing = std.testing;
+    var sw: Switch = .{};
+    try testing.expect(sw.get() == null);
+    try testing.expect(sw.enable());
+    const core = sw.get().?;
+    try testing.expectEqual(@as(u64, 0), core.requests_rejected_total.load());
+    core.recordRejected();
+    try testing.expect(!sw.enable());
+    try testing.expect(sw.get().? == core);
+    try testing.expectEqual(@as(u64, 1), sw.get().?.requests_rejected_total.load());
+}
+
+test "racing enables initialise the core once and every reader sees it ready" {
+    const testing = std.testing;
+    const N = 8;
+    var sw: Switch = .{};
+    var go = std.atomic.Value(bool).init(false);
+    var changed = std.atomic.Value(u32).init(0);
+    var bad = std.atomic.Value(u32).init(0);
+    const Ctx = struct {
+        sw: *Switch,
+        go: *std.atomic.Value(bool),
+        changed: *std.atomic.Value(u32),
+        bad: *std.atomic.Value(u32),
+        fn run(c: *@This()) void {
+            while (!c.go.load(.acquire)) {}
+            if (c.sw.enable()) _ = c.changed.fetchAdd(1, .monotonic);
+            const m = c.sw.get() orelse {
+                _ = c.bad.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (m.requests_rejected_total.load() != 0) _ = c.bad.fetchAdd(1, .monotonic);
+        }
+    };
+    var ctxs: [N]Ctx = undefined;
+    var threads: [N]std.Thread = undefined;
+    for (&ctxs, &threads) |*c, *t| {
+        c.* = .{ .sw = &sw, .go = &go, .changed = &changed, .bad = &bad };
+        t.* = try std.Thread.spawn(.{}, Ctx.run, .{c});
+    }
+    go.store(true, .release);
+    for (&threads) |*t| t.join();
+    try testing.expectEqual(@as(u32, 1), changed.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
+}
+
+test "the inference thread adopts a published sink once and never drops the one it holds" {
+    const testing = std.testing;
+    var a = Metrics.init();
+    var b = Metrics.init();
+    try testing.expect(adoptPublished(null, null) == null);
+    try testing.expect(adoptPublished(null, &a) == &a);
+    try testing.expect(adoptPublished(&a, &b) == &a);
+    try testing.expect(adoptPublished(&a, null) == &a);
 }

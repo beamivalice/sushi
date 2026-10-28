@@ -246,6 +246,20 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - A request reader waits at most `REQUEST_READ_LIMIT_MS` (30 s) between bytes and for its whole head, then drops the connection without a reply, so a silent or dripping client never holds its thread; a `Content-Length` sums into the size check with saturating arithmetic, so a wrapping value is a 413 instead of a small allocation.
 - A schema `pattern` repeat count is at most 1000 and its NFA at most 32768 states (`regex.zig`); past either, `compile` fails with `InvalidPattern`.
 - `--metrics`: zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`.
+- **Metrics at runtime**: `POST /metrics/enable` turns the same core on in a server booted without `--metrics` (200
+  `{"metrics":true,"already_enabled":false}`, and `true` on every later call: idempotent; any other method is a 405). There is
+  no off switch. It sits behind the `--api-key` gate like the other mutating routes and refuses a foreign `Origin` (403, same
+  rule as `/v1/load-model`); `curl -X POST http://127.0.0.1:12345/metrics/enable` needs no Origin. The state is readable from
+  the feeds themselves: `GET /metrics` and `/metrics.json` answer 503 exactly while metrics are off, and the 503 body names
+  this endpoint (no `/props` field). Counters, histograms and the session rows count from the moment of the enable; a
+  request already in flight is counted when it ends.
+- Thread safety of the runtime enable: `metrics.process` (a `Switch`) holds the core in static storage behind one atomic
+  state (off, building, on). The first `enable` builds the core and publishes `on` with release; a racing caller waits for
+  `on`; `get()` is one acquire load that returns null while off, so every reader keeps the no-op path until then. Connection
+  threads read it through `metrics.current()`. The inference thread owns `Scheduler.metrics` and adopts the published core
+  right after it wakes for work (`adoptPublished`), never mid-tick. The gauge sampler thread starts once, from `--metrics` at
+  boot or from the first enable (`startGaugeSampler`, a state machine joined by `stopGaugeSampler` before the scheduler is
+  torn down). The core calls no MLX; the sampler's `mlx_get_*_memory` reads are the existing `--metrics` behaviour.
 - **A request outcome is counted exactly once** (`Slot.metrics_recorded`, inference thread): `finishSlot` or the cleanup drain,
   whichever sees the slot first (`recordSlotEnd`/`recordSlotCleanup`). The outcome comes from the slot's finish state, never
   from `Slot.cancelled` (`complete` sets it on every completion): success feeds the histograms; `sushi:request_cancelled_total`
@@ -283,7 +297,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
 - The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
   `/v1/models` and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
-  charts need `--metrics` (without it the page says so; the Models table still works). While hidden it polls only
+  charts need metrics: without them the page says so, shows an **Enable metrics** button (only while `/metrics.json` answers
+  503; it `POST`s `/metrics/enable` with the chat's key, then polls at once, so the charts start without a reload and the
+  button goes away; a refusal leaves the button and says why), and the Models table still works. While hidden it polls only
   `/metrics.json`, and only when no chat request is in flight and the browser tab is visible. Switches and tab
   returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
   401 stops the hidden poll until the dashboard is shown again. It follows the chat's

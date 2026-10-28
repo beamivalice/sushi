@@ -700,6 +700,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 #dashPanel .d-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--d-muted); }
 #dashPanel .d-dot.ok { background: var(--d-ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--d-ok) 25%, transparent); }
 #dashPanel .d-dot.bad { background: var(--d-bad); }
+#dashPanel .d-statusrow { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding-right: 20px; }
+#dashPanel .d-statusrow button { margin-top: 8px; }
+#dashPanel .d-statusrow button[hidden] { display: none; }
 #dashStatus { font-size: 13px; color: var(--d-muted); padding: 8px 20px 0; min-height: 22px; }
 #dashStatus.err { color: var(--d-bad); }
 #dashPanel .d-main { padding: 12px 20px 28px; display: grid; gap: 14px; max-width: 1400px; margin: 0 auto; }
@@ -985,7 +988,10 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
       <button id="dashPause" type="button">Pause</button>
     </div>
   </div>
-  <div id="dashStatus">Connecting...</div>
+  <div class="d-statusrow">
+    <div id="dashStatus">Connecting...</div>
+    <button id="dashEnableMetrics" type="button" hidden>Enable metrics</button>
+  </div>
   <div class="d-main">
   <section class="tiles">
     <div class="tile"><div class="k">Generation</div><div class="v" id="dashTGen">-</div><div class="s">tok/s</div></div>
@@ -2747,7 +2753,7 @@ init();
 
   let paused = false, timer = null, prev = null, inflight = false;
   let dashActive = false, lastData = null, bgStopped = false, lastPollAt = 0, lastServerAt = 0, failures = 0;
-  let lastCounters = null, restartNote = '';
+  let lastCounters = null, restartNote = '', metricsOff = false;
   const restarts = []; // times the server was seen restarting, drawn on the charts
   const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [] };
   const lastGen = new Map(); // request_id -> {gen, t}
@@ -2767,6 +2773,22 @@ init();
   const mean = h => h && h.count ? h.sum / h.count : NaN;
 
   function setStatus(msg, err) { if (paused) return; $('dot').title = err ? 'Not connected' : 'Live'; $('status').textContent = msg; $('status').className = err ? 'err' : ''; $('dot').className = 'd-dot ' + (err ? 'bad' : 'ok'); }
+
+  // The server answers 503 on /metrics.json exactly while metrics are off; POST /metrics/enable turns them on.
+  function syncEnableButton() { $('enable-metrics').hidden = !metricsOff; }
+  $('enable-metrics').onclick = async () => {
+    const button = $('enable-metrics');
+    button.disabled = true;
+    try {
+      const r = await api('/metrics/enable', { method: 'POST' });
+      if (!r.ok) throw new Error(r.status === 401 ? 'the server wants an API key' : 'HTTP ' + r.status);
+      metricsOff = false; bgStopped = false; failures = 0;
+      syncEnableButton();
+      restart();
+    } catch (e) {
+      setStatus('Could not enable metrics: ' + (e instanceof TypeError ? 'cannot reach the server' : e.message) + '.', true);
+    } finally { button.disabled = false; }
+  };
 
   function restart() { clearTimeout(timer); prev = null; propsAt = 0; if (!paused) tick(); }
 
@@ -2791,7 +2813,9 @@ init();
         let r;
         try { r = await api('/metrics.json', { signal: ctl.signal }); } finally { clearTimeout(to); }
         permanent = r.status === 503 || r.status === 401;
-        if (r.status === 503) throw new Error('Live charts need metrics: restart sushi with --metrics. The Models table works without it.');
+        metricsOff = r.status === 503;
+        syncEnableButton();
+        if (r.status === 503) throw new Error('Live charts need metrics: press Enable metrics, or start sushi with --metrics. The Models table works without it.');
         if (r.status === 401) throw new Error('Server wants an API key (started with --api-key).');
         if (!r.ok) throw new Error('HTTP ' + r.status);
         update(await r.json());

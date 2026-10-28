@@ -1543,8 +1543,8 @@ pub const Scheduler = struct {
     /// Slots out of `pending` whose prefill pass is running: neither pending nor decoding, so
     /// a shutdown reaches them only here (queue_mu).
     prefilling: std.ArrayList(*Slot),
-    /// Metrics sink. Null when --metrics is off. Populated from LoadParams.
-    /// Read once per REQUEST in `finishSlot` — never on the per-token path.
+    /// Metrics sink. Null while metrics are off. Populated from LoadParams, and adopted by the inference thread
+    /// (its only writer) once `POST /metrics/enable` publishes one. Read once per REQUEST in `finishSlot`.
     metrics: ?*metrics_mod.Metrics,
     /// In-flight generated-token aggregate: the sum of `completion_tokens`
     /// over the slots still decoding, republished by the inference thread once
@@ -5736,6 +5736,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
             }
             if (sch.shutdown.load(.acquire)) break;
+            // POST /metrics/enable publishes the sink from another thread; only this thread ever stores `sch.metrics`.
+            sch.metrics = metrics_mod.adoptPublished(sch.metrics, metrics_mod.current());
             // Hold until the loop parks again.
             sleep_inhibit.setActive(true);
 

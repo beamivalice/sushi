@@ -56,10 +56,6 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 /// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
 var active_conn_threads = std.atomic.Value(u32).init(0);
 var completion_id_counter = std.atomic.Value(i64).init(0);
-/// Set from main.zig before serve() is called when --metrics is on; null
-/// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
-/// routes. When null, `/metrics*` return 503.
-pub var g_metrics: ?*instr.Metrics = null;
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
 /// CORS preflight requires the key — the OpenAI/Anthropic APIs AND the
@@ -818,6 +814,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/health",
     "/metrics",
     "/metrics.json",
+    "/metrics/enable",
     "/props",
     "/tokenize",
     "/v1/chat/completions",
@@ -845,7 +842,7 @@ fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const u8,
         std.mem.eql(u8, method, "GET") and ws_mod.isUpgrade(headers)
     else
         std.mem.eql(u8, path, "/v1/load-model") or std.mem.eql(u8, path, "/v1/unload-model") or
-            std.mem.eql(u8, path, "/v1/models/rescan");
+            std.mem.eql(u8, path, "/v1/models/rescan") or std.mem.eql(u8, path, "/metrics/enable");
     if (!guarded) return false;
     const origin = findHeaderValueCI(headers, "origin") orelse return false;
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
@@ -1893,29 +1890,12 @@ pub fn serve(
     scheduler_mod.vision_fit_fault = &towerFitFaultText;
     defer scheduler_mod.vision_encode_available = null;
 
-    // Gauge sampler: samples instantaneous system + queue state every 2 s and
-    // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
-    // (a few non-blocking syscalls + one brief queue_mu lock per 2 s); never on
-    // the per-token decode path.
-    // LIFO defer ordering: `stop` is registered AFTER `join` so it runs FIRST
-    // (setting the flag), letting the thread exit before join() blocks. Do NOT
-    // gate on scheduler.shutdown here — deinit() (which sets that flag) is the
-    // earliest defer and runs LAST, after the join, so the loop would never see
-    // it; the dedicated `sampler_stop` flag avoids that LIFO deadlock.
-    var sampler_thread: ?std.Thread = null;
-    var sampler_stop = std.atomic.Value(bool).init(false);
-    if (g_metrics) |m| {
-        const ctx = GaugeSamplerCtx{
-            .metrics = m,
-            .scheduler = scheduler,
-            .stop = &sampler_stop,
-        };
-        sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{ctx});
+    if (instr.current() != null) {
+        startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
         log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics and /metrics.json\n", .{ host, port });
     }
-    // LIFO: join deferred first → runs second. stop deferred second → runs first.
-    defer if (sampler_thread) |t| t.join();
-    defer sampler_stop.store(true, .monotonic);
+    // Registered after the scheduler's deinit defer, so it runs first and the sampler never reads a freed scheduler.
+    defer stopGaugeSampler();
 
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
     // and never in `Scheduler.deinit` — see `IdleEvictCtx.stop`.
@@ -2363,21 +2343,21 @@ fn handleConnection(
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
     // API-key gate above when --api-key is set (auth already enforced here).
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
-        if (g_metrics) |m| {
+        if (instr.current()) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             try instr.renderPrometheus(m, &out.writer);
             // Quiet: don't dump the ~3 KB scrape body every 2 s at debug level.
             try sendResponseQuiet(stream, "200 OK", "text/plain; version=0.0.4; charset=utf-8", out.written());
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics)");
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics, or POST /metrics/enable)");
         }
         return;
     }
     // JSON feed of the same counters. Behind the global API-key gate above
     // when --api-key is set.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics.json")) {
-        if (g_metrics) |m| {
+        if (instr.current()) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
@@ -2385,7 +2365,7 @@ fn handleConnection(
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics\"}");
+            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics, or POST /metrics/enable\"}");
         }
         return;
     }
@@ -2397,6 +2377,14 @@ fn handleConnection(
     if (crossOriginRefused(method, path, request[0..header_end_pos], listen_host, listen_port)) {
         log.debug("{s} {s} -> 403 (foreign Origin)\n", .{ method, path });
         try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "This route accepts browser requests from this server's own page only", 403);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/metrics/enable")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "/metrics/enable answers POST only", 405);
+            return;
+        }
+        try handleMetricsEnable(stream);
         return;
     }
     if (std.mem.eql(u8, path, "/v1/update")) {
@@ -9269,6 +9257,18 @@ fn busyForUpdate(io: std.Io) bool {
 
 /// `POST /v1/update`: `update.guard` decides. On accept the answer is 202 and the server shuts down through its
 /// SIGTERM path; main then replaces the process with the updater (`update.relaunchIfRequested`).
+/// Turns metrics on for the running server; 200 whether this call did it or it was already on. Counters start
+/// from zero at the moment of the first enable.
+fn handleMetricsEnable(stream: *Conn) !void {
+    const changed = instr.process.enable();
+    startGaugeSampler() catch |err| {
+        log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
+        return sendResponse(stream, "500 Internal Server Error", "application/json", "{\"error\":\"metrics enabled but the gauge sampler did not start; retry\"}");
+    };
+    if (changed) log.info("Prometheus metrics: ENABLED at runtime (POST /metrics/enable)\n", .{});
+    try sendResponse(stream, "200 OK", "application/json", if (changed) "{\"metrics\":true,\"already_enabled\":false}" else "{\"metrics\":true,\"already_enabled\":true}");
+}
+
 fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, raw_path: []const u8) !void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     var rbuf: [512]u8 = undefined;
@@ -13473,6 +13473,39 @@ fn idleEvictLoop(ctx: IdleEvictCtx) void {
     }
 }
 
+const sampler_idle = 0;
+const sampler_spawning = 1;
+const sampler_running = 2;
+const sampler_closed = 3;
+var sampler_state = std.atomic.Value(u8).init(sampler_idle);
+var sampler_thread: std.Thread = undefined;
+var sampler_stop = std.atomic.Value(bool).init(false);
+
+/// Starts the gauge sampler once, from `--metrics` at boot or from `POST /metrics/enable`, whichever gets
+/// there first. A no-op while metrics are off, before the scheduler exists, and after shutdown began.
+fn startGaugeSampler() !void {
+    const m = instr.current() orelse return;
+    const sch = global_scheduler orelse return;
+    if (sampler_state.cmpxchgStrong(sampler_idle, sampler_spawning, .acquire, .monotonic) != null) return;
+    errdefer sampler_state.store(sampler_idle, .release);
+    sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{GaugeSamplerCtx{ .metrics = m, .scheduler = sch, .stop = &sampler_stop }});
+    sampler_state.store(sampler_running, .release);
+}
+
+fn stopGaugeSampler() void {
+    sampler_stop.store(true, .monotonic);
+    while (true) switch (sampler_state.load(.acquire)) {
+        sampler_idle => if (sampler_state.cmpxchgStrong(sampler_idle, sampler_closed, .acq_rel, .monotonic) == null) return,
+        sampler_spawning => std.atomic.spinLoopHint(),
+        sampler_running => {
+            sampler_thread.join();
+            sampler_state.store(sampler_closed, .release);
+            return;
+        },
+        else => return,
+    };
+}
+
 fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
     // Wake every 500 ms to check the stop flag; sample system state once per
     // 2-second interval. The 2 s cadence is what makes generation_tokens_live a
@@ -13807,6 +13840,91 @@ test "dashboard page: --api-key leaves the page open and keeps the metrics feed 
         defer t.allocator.free(response);
         try t.expect(std.mem.startsWith(u8, response, c.status));
     }
+}
+
+test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
+    const t = std.testing;
+    instr.process = .{};
+    defer instr.process = .{};
+    for ([_][]const u8{ "/metrics", "/metrics.json" }) |path| {
+        const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\n\r\n", .{path});
+        defer t.allocator.free(request);
+        const off = try serveOneForTest(request);
+        defer t.allocator.free(off);
+        try t.expect(std.mem.startsWith(u8, off, "HTTP/1.1 503 "));
+        try t.expect(std.mem.indexOf(u8, responseBody(off), "POST /metrics/enable") != null);
+    }
+    const first = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(first);
+    try t.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200 OK\r\n"));
+    try t.expectEqualStrings("{\"metrics\":true,\"already_enabled\":false}", responseBody(first));
+    try t.expect(instr.current() != null);
+    for ([_][]const u8{ "/metrics", "/metrics.json" }) |path| {
+        const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\n\r\n", .{path});
+        defer t.allocator.free(request);
+        const on = try serveOneForTest(request);
+        defer t.allocator.free(on);
+        try t.expect(std.mem.startsWith(u8, on, "HTTP/1.1 200 OK\r\n"));
+    }
+    const core = instr.current().?;
+    core.recordRejected();
+    const again = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(again);
+    try t.expect(std.mem.startsWith(u8, again, "HTTP/1.1 200 OK\r\n"));
+    try t.expectEqualStrings("{\"metrics\":true,\"already_enabled\":true}", responseBody(again));
+    try t.expect(instr.current().? == core);
+    try t.expectEqual(@as(u64, 1), core.requests_rejected_total.load());
+}
+
+test "metrics enable: any other method is a 405 and leaves metrics off" {
+    const t = std.testing;
+    instr.process = .{};
+    defer instr.process = .{};
+    for ([_][]const u8{ "GET", "PUT", "DELETE" }) |method| {
+        const request = try std.fmt.allocPrint(t.allocator, "{s} /metrics/enable HTTP/1.1\r\n\r\n", .{method});
+        defer t.allocator.free(request);
+        const response = try serveOneForTest(request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 405 "));
+    }
+    try t.expect(instr.current() == null);
+}
+
+test "metrics enable: --api-key binds the route, and a foreign Origin is refused before it acts" {
+    const t = std.testing;
+    instr.process = .{};
+    defer instr.process = .{};
+    const prev_key = g_api_key;
+    const prev_strict = g_api_key_strict;
+    const old_host = listen_host;
+    const old_port = listen_port;
+    defer {
+        g_api_key = prev_key;
+        g_api_key_strict = prev_strict;
+        listen_host = old_host;
+        listen_port = old_port;
+    }
+    g_api_key = "s3cret";
+    g_api_key_strict = true;
+    listen_host = "127.0.0.1";
+    listen_port = 12345;
+    const keyless = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(keyless);
+    try t.expect(std.mem.startsWith(u8, keyless, "HTTP/1.1 401 "));
+    const wrong = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nAuthorization: Bearer nope\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(wrong);
+    try t.expect(std.mem.startsWith(u8, wrong, "HTTP/1.1 401 "));
+    try t.expect(instr.current() == null);
+
+    const foreign = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nAuthorization: Bearer s3cret\r\nOrigin: http://evil.test\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(foreign);
+    try t.expect(std.mem.startsWith(u8, foreign, "HTTP/1.1 403 "));
+    try t.expect(instr.current() == null);
+
+    const ok = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nAuthorization: Bearer s3cret\r\nOrigin: http://localhost:12345\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(ok);
+    try t.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 OK\r\n"));
+    try t.expect(instr.current() != null);
 }
 
 test "chat page: another method on the page paths is refused before any model resolves" {
@@ -14332,7 +14450,7 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
 
 /// A request refused before it owned a slot. A null sink (metrics off) is one branch.
 fn countRejected() void {
-    if (g_metrics) |m| m.recordRejected();
+    if (instr.current()) |m| m.recordRejected();
 }
 
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
@@ -27633,6 +27751,8 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
         .{ .method = "POST", .path = "/v1/unload-model", .headers = "Origin: null\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "ORIGIN: http://127.0.0.1:12346\r\n", .refused = true },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "Origin: http://127.0.0.1:12345\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://127.0.0.1:12345\r\n", .refused = false },
@@ -28506,14 +28626,12 @@ test "a non-stream generation without a stop in its text runs to the end" {
 }
 
 test "countRejected moves only the rejected counter, and does nothing with metrics off" {
-    const saved = g_metrics;
-    defer g_metrics = saved;
-
-    g_metrics = null;
+    instr.process = .{};
+    defer instr.process = .{};
     countRejected();
 
-    var m = instr.Metrics.init();
-    g_metrics = &m;
+    _ = instr.process.enable();
+    const m = instr.current().?;
     countRejected();
     try std.testing.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
     try std.testing.expectEqual(@as(u64, 0), m.requests_failed_total.load());
