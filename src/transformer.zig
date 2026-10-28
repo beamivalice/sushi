@@ -1462,6 +1462,7 @@ pub fn macosProductVersion(buf: []u8) ?[]const u8 {
 fn gpuArchitecture(buf: []u8) ?[]const u8 {
     var dev = mlx.mlx_device{ .ctx = null };
     if (mlx.mlx_get_default_device(&dev) != 0) return null;
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) != 0) return null;

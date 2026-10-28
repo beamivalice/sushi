@@ -1348,6 +1348,7 @@ pub fn main(init: std.process.Init) !void {
         else blk: {
             var dev = mlx.mlx_device{ .ctx = null };
             _ = mlx.mlx_get_default_device(&dev);
+            defer _ = mlx.mlx_device_free(dev);
             var info = mlx.mlx_device_info_new();
             defer _ = mlx.mlx_device_info_free(info);
             if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
@@ -1567,6 +1568,7 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     if (explicit) return val;
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;

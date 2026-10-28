@@ -693,6 +693,7 @@ pub fn check(ret: c_int) !void {
 pub fn maxRecommendedWorkingSet() usize {
     var dev = mlx_device{ .ctx = null };
     _ = mlx_get_default_device(&dev);
+    defer _ = mlx_device_free(dev);
     var info = mlx_device_info_new();
     defer _ = mlx_device_info_free(info);
     if (mlx_device_info_get(&info, dev) != 0) return 0;

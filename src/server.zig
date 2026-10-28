@@ -2807,6 +2807,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 fn getGpuWorkingSetLimit() u64 {
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) == 0) {
@@ -3003,6 +3004,7 @@ pub fn resolveMlxCadence() void {
     var arch_z: [*:0]const u8 = "";
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) == 0) _ = mlx.mlx_device_info_get_string(&arch_z, info, "architecture");
