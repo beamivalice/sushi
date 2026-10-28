@@ -1,6 +1,6 @@
 # tests/ — test matrix & guard reference (auto-loaded when working here)
 
-Root CLAUDE.md carries the TDD policy and the docs index (engine knowledge lives in `docs/`); this file is the full matrix of integration/guard scripts and what each pins.
+Root CLAUDE.md carries the TDD policy and the docs index (engine knowledge lives in `docs/`); [docs/testsuite.md](../docs/testsuite.md) says what a test may be, its tier and where it lives; this file is the full matrix of integration/guard scripts and what each pins.
 
 ## Testing
 

@@ -62,6 +62,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/bench/v1.4.0/summary.md](docs/bench/v1.4.0/summary.md) | release context ladder and per-model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number, the release bench |
+| [docs/testsuite.md](docs/testsuite.md) | what a test may be, tiers (`test-host`, gpu, pack, bench), placement, how a test is built, what a change runs |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
 
 **Private, local-only** (`docs/private/`, gitignored, main checkout only: a worktree reads them from there). Never
@@ -144,6 +145,7 @@ Feature = unit test that fails without it (+ integration script if HTTP-observab
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
 corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the matching doc.
 
+Tests follow [testsuite](docs/testsuite.md); `zig build test-host` runs the MLX-free tier beside a live server.
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live:
 `tests/test_qwen4_exp.sh`, `tests/test_bf16_streaming.sh`, `tests/test_mtp_equivalence.sh`,
 `tests/test_prefix_cache_*.sh`, `tests/test_smoke_matrix.sh`. Matrix: `tests/CLAUDE.md`.

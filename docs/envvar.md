@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 187 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 76, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
+**Summary.** 188 vars. By kind: tradeoff levers 13, diagnostics 48, microbenches 76, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `transformer.zig:5868` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (46)
+## Diagnostics (47)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -35,6 +35,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `QWEN4_DEBUG_SCORES` | `qwen4_qsa.zig:1324, 1373` | prints QSA pooled shapes and score rows | once | no |
 | `QWEN4_DUMP_QSA_BLOCKS` | `qwen4_qsa.zig:618` | `<path>` dumps the selected QSA block indices | once | no |
 | `QWEN4_FIXTURE_ROWS` | `transformer.zig` | prints per-row cos/margin in the Qwen4 fixture test | test | no |
+| `SUSHI_TEST_NO_GPU` | `mlx.zig` (`testNoGpuEnv`) | a test build sees no Metal backend, so `requireGpu` tests skip | test | yes: testsuite |
 | `QWEN4_GDN_CHECK` | `transformer.zig:18495, 18638` | runs the composed GDN prework beside the fused kernel and compares | once | no |
 | `QWEN4_NO_POOLED` | `qwen4_qsa.zig:1232` | forces `QsaPooledRequired` to exercise the pooled-key fallback | once | no |
 | `QWEN4_OPCOUNT` | `qwen4_forward.zig:2907` | FFI op counts per block of the Qwen4 forward | once | no |
