@@ -431,7 +431,8 @@ var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk
 var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE };
 
 const gate_sgs = 8;
-const topk_tg = 1024;
+/// Threads a top-k threadgroup runs; `probeTopk` halves it where the GPU caps the kernel lower.
+pub var topk_tg: usize = 1024;
 const dense_f32x_rps = 4;
 
 /// `x` `[L, D]` times the router rows `w` `[E, D]` in f32 (`D` a multiple of 8).
@@ -482,7 +483,7 @@ pub fn topkIndices(sc: *Scope, x: A, k: usize) !A {
 pub fn topkIndicesSplit(sc: *Scope, x: A, k: usize, splits: usize) !A {
     const L = dim(x, 0);
     var o: [1]A = undefined;
-    const tmpl: []const Tmpl = &.{.{ .name = "TG", .v = topk_tg }};
+    const tmpl: []const Tmpl = &.{.{ .name = "TG", .v = ci(topk_tg) }};
     const spec: []const OutSpec = &.{.{ .shape = &.{ ci(L), ci(k) }, .dt = .int32 }};
     // k rides in a buffer: as a template arg every index width up to index_topk was its own Metal compile.
     if (splits <= 1) {
@@ -1712,6 +1713,27 @@ pub fn hcNorm(sc: *Scope, z: A, x: A, cpre: A, norm_w: A, iters: usize, eps: A) 
     return .{ .sp = .{ .pre = o[0], .post = o[1], .comb = o[2] }, .h = o[3] };
 }
 
+/// Launches the top-k kernels (one threadgroup a row, and chunked) at `topk_tg` threads, halving it until they run.
+pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    while (true) {
+        probeTopkOnce(gpa, s) catch |e| {
+            if (e != error.MlxError or topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            topk_tg /= 2;
+            continue;
+        };
+        return;
+    }
+}
+
+fn probeTopkOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    var sc = Scope.init(gpa, s);
+    defer sc.deinit();
+    const x = try sc.zeros(&.{ 1, 64 }, .float32);
+    const one = try topkIndicesSplit(&sc, x, 4, 1);
+    const split = try topkIndicesSplit(&sc, x, 4, 2);
+    try sc_mod.evalAll(&.{ one, split });
+}
+
 /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1, M2): launches every hyper-connection
 /// kernel once at `hc_tg` threads and halves it until they run.
 pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !void {
@@ -2148,6 +2170,25 @@ test "dsv41 topk: the picks are the k largest in index order, ties to the lower 
     tie[7] = -std.math.inf(f32);
     const t = try sc_mod.hostI32(try topkIndices(&sc, try sc.floats(&tie, &.{ 1, n }), 10));
     try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 4, 5, n - 4, n - 3, n - 2, n - 1 }, t[0..10]);
+}
+
+test "dsv41 topk: the picks do not depend on the threadgroup width" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    try probeTopk(sc.a, sc.s);
+    const widest = topk_tg;
+    defer topk_tg = widest;
+    const k = 100;
+    const x = try randn(&sc, &.{ 3, 5000 }, .float32, 52, 1.0);
+    const want = try testing.allocator.dupe(i32, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
+    defer testing.allocator.free(want);
+    for ([_]usize{ 256, 512, 1024 }) |w| {
+        if (w > widest) continue;
+        topk_tg = w;
+        try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
+        try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 4)));
+    }
 }
 
 test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long rows, ties and -inf included" {

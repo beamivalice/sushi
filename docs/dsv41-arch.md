@@ -95,6 +95,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   262144 keys, 1 row 0.74 to 0.44 ms, 4 rows 2.35 to 1.27 ms per eval (about 0.2 ms of each is the eval floor); live serial b349f67e 42.8 tok/s at 209k, 47.8 at 4.7k, the same 600
   greedy tokens (one boot, GPU lock, QUIET, fans max, die 49 C, taskpolicy -a). Ruled out
   on the ubench: a 512-thread score threadgroup and a replicated top-k histogram (both unchanged).
+- **Top-k threadgroup width** (`topk_tg`, `probeTopk` at load): 1024 threads, halved where the GPU caps the kernel lower (M1/M2: 832); the picks are width-independent (`dsv41 topk: the picks do not depend` test).
 - **Decode top-k, split** (`topkIndicesSplit`, `topkSplits`): a decode block (up to 16 rows) of at least 131072 scores (262144 past
   one row) with k <= 512 splits each row over 8 chunks; each chunk's threadgroup selects its own top-k and one merge
   threadgroup selects over the chunks' picks, which are ascending in row index, so the indices, their order and the ties
