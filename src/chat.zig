@@ -3320,6 +3320,33 @@ pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
     return reasoning[already..];
 }
 
+/// `<tool_call>` followed by a special token spelled where `<` belongs
+/// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none.
+fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const wrapper = "<tool_call>";
+    var out: ?std.ArrayList(u8) = null;
+    errdefer if (out) |*o| o.deinit(allocator);
+    var copied: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, wrapper)) |at| {
+        var p = at + wrapper.len;
+        from = p;
+        while (p < text.len and std.ascii.isWhitespace(text[p])) p += 1;
+        if (!std.mem.startsWith(u8, text[p..], "<|")) continue;
+        const close = std.mem.indexOfPos(u8, text, p + 2, "|>") orelse continue;
+        if (close - p > 32 or std.mem.indexOfAny(u8, text[p + 2 .. close], "<>\n ") != null) continue;
+        if (!std.mem.startsWith(u8, text[close + 2 ..], "function=")) continue;
+        if (out == null) out = .empty;
+        try out.?.appendSlice(allocator, text[copied..p]);
+        try out.?.append(allocator, '<');
+        copied = close + 2;
+        from = copied;
+    }
+    var o = out orelse return null;
+    try o.appendSlice(allocator, text[copied..]);
+    return try o.toOwnedSlice(allocator);
+}
+
 /// Parse tool calls from model output text.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
@@ -3329,6 +3356,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     } else if (indexOfThinkCloseTag(text, 0)) |close| {
         effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }
+
+    const special_fixed = try hermesSpecialOpenerRepair(allocator, effective_text);
+    defer if (special_fixed) |r| allocator.free(r);
+    if (special_fixed) |r| effective_text = r;
 
     var calls = std.ArrayList(ParsedToolCall).empty;
     errdefer {

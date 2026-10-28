@@ -93,6 +93,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   growing prefix (`invokeOpenerHoldsForTools`); the scrubber cuts it only beside a `<parameter ` or `</invoke>`
   (`bareInvokeMarkupCut`), and the parser reads it only beside one of them too (`parseInvokeToolCalls`), so prose
   naming the tag survives even when the name it shows is a declared tool. Corpus families `qwen4_exp`, `dsv41-dsml`.
+- **Inferred `<invoke>` is the LAST tag family tried**: a native `<tool_call>` can carry invoke-shaped text in a value. An
+  inferred opener with no `<parameter ` or close before the next opener is prose and never borrows the next call's body.
+- **A lone `</｜DSML｜` closer is leaked markup**: the scrubber cuts at it and the stream gate holds `</` and every
+  prefix of `</｜DSML｜`, while a completed `</div>` flushes. Corpus family `dsv4-dsml`.
+- **An argument key never carries markup or a line break** (corpus invariant): a doubled `<arg_key><arg_key>K` keys on
+  the LAST opener; a special token spelled where `<` belongs before `function=` right after `<tool_call>` is read as
+  `<` (`hermesSpecialOpenerRepair`).
 - **A `</think>` inside a tool ARGUMENT is payload** (`thinkCloseIsToolCallPayload`): decline a close whose nearest
   preceding tool opener is still OPEN AND whose block closes afterwards.
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched).
