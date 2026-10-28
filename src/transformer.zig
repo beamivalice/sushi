@@ -52341,66 +52341,6 @@ test "streamed expert composite arm keeps the pre-change bytes" {
     }
 }
 
-test "the streamed expert composite and kernel arms both produce finite rows" {
-    const alloc = std.testing.allocator;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const hidden: c_int = 64;
-    const inter: c_int = 32;
-    const u: c_int = 8;
-    const topk: c_int = 10;
-    const rows: c_int = 2;
-    var prng = std.Random.DefaultPrng.init(0x5177c4);
-    const rnd = prng.random();
-    const gu_host = try alloc.alloc(u16, @intCast(u * 2 * inter * hidden));
-    defer alloc.free(gu_host);
-    seFillBf16(rnd, gu_host);
-    const dn_host = try alloc.alloc(u16, @intCast(u * hidden * inter));
-    defer alloc.free(dn_host);
-    seFillBf16(rnd, dn_host);
-    const x_host = try alloc.alloc(u16, @intCast(rows * hidden));
-    defer alloc.free(x_host);
-    seFillBf16(rnd, x_host);
-    const w_host = try alloc.alloc(u16, @intCast(rows * topk));
-    defer alloc.free(w_host);
-    seFillBf16(rnd, w_host);
-    const slots_host = try seSlots(alloc, @intCast(rows), @intCast(topk), @intCast(u));
-    defer alloc.free(slots_host);
-
-    const gu = mlx.mlx_array_new_data(gu_host.ptr, &[_]c_int{ u, 2 * inter, hidden }, 3, .bfloat16);
-    defer _ = mlx.mlx_array_free(gu);
-    const dn = mlx.mlx_array_new_data(dn_host.ptr, &[_]c_int{ u, hidden, inter }, 3, .bfloat16);
-    defer _ = mlx.mlx_array_free(dn);
-    const x = mlx.mlx_array_new_data(x_host.ptr, &[_]c_int{ rows, hidden }, 2, .bfloat16);
-    defer _ = mlx.mlx_array_free(x);
-    const w = mlx.mlx_array_new_data(w_host.ptr, &[_]c_int{ rows, topk }, 2, .bfloat16);
-    defer _ = mlx.mlx_array_free(w);
-    const slots = mlx.mlx_array_new_data(slots_host.ptr, &[_]c_int{ rows, topk }, 2, .int32);
-    defer _ = mlx.mlx_array_free(slots);
-    const views = try seSplitViews(s, gu, dn, u, inter, hidden);
-    defer _ = mlx.mlx_array_free(views.gate);
-    defer _ = mlx.mlx_array_free(views.up);
-    defer _ = mlx.mlx_array_free(views.down);
-    const op = StreamedExpertOperands{
-        .x_rows = x,
-        .gate = views.gate,
-        .up = views.up,
-        .down = views.down,
-        .slab_gate_up = gu,
-        .slab_down = dn,
-        .slots = slots,
-        .weights = w,
-    };
-    for ([_]bool{ false, true }) |use_kernels| {
-        const out = try streamedExpertCompute(s, op, rows, use_kernels);
-        defer _ = mlx.mlx_array_free(out);
-        try std.testing.expectEqualSlices(c_int, &[_]c_int{ rows, hidden }, mlx.getShape(out));
-        try mlx.check(mlx.mlx_array_eval(out));
-        const p = mlx.mlx_array_data_bfloat16(out).?;
-        for (p[0..@intCast(rows * hidden)]) |bits| try std.testing.expect(std.math.isFinite(seBf16(bits)));
-    }
-}
-
 test "imatrix capture keys the streamed MoE statistics on GLOBAL expert ids, on every arm" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();

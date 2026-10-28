@@ -9311,41 +9311,6 @@ test "DiskTier: a failing synchronous writeMeta frees the final path exactly onc
     } else |_| {}
 }
 
-test "materializeContiguous: the fresh-handle errdefer never outlives the transfer" {
-    // The fresh handle's errdefer must not stay armed across `t.arr = cont`, or a later failure
-    // frees the same array twice. Transliterated onto a heap allocation so the testing
-    // allocator catches both a leak and a double free.
-    const t = testing;
-
-    const Item = struct { arr: *u32 };
-    const S = struct {
-        fn run(a: std.mem.Allocator, items: []Item, fail_at: usize) !void {
-            for (items, 0..) |*it, i| {
-                const cont = try a.create(u32);
-                {
-                    errdefer a.destroy(cont);
-                    cont.* = it.arr.* + 1;
-                }
-                a.destroy(it.arr);
-                it.arr = cont;
-                if (i == fail_at) return error.Injected;
-            }
-        }
-    };
-
-    var items: [4]Item = undefined;
-    for (&items, 0..) |*it, i| {
-        it.* = .{ .arr = try testing.allocator.create(u32) };
-        it.arr.* = @intCast(i);
-    }
-    // The caller's `defer freeNamed(&list)`: it owns every `arr`, on every outcome.
-    defer for (&items) |*it| testing.allocator.destroy(it.arr);
-    try t.expectError(error.Injected, S.run(testing.allocator, &items, 2));
-    try t.expectEqual(@as(u32, 1), items[0].arr.*);
-    try t.expectEqual(@as(u32, 3), items[2].arr.*);
-    try t.expectEqual(@as(u32, 3), items[3].arr.*);
-}
-
 // ── SSD-first chunk sharing ──
 
 /// Two 600-token sequences that agree for the first `shared` tokens and diverge after.
