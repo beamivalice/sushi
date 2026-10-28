@@ -1260,7 +1260,7 @@ test "ResponseStore evicts LRU at cap" {
 fn expectSameQwenPrompt(actual: []const chat_mod.Message, expected: []const chat_mod.Message) !void {
     const a = testing.allocator;
     const config = chat_mod.ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
         .bos_token = null,
         .eos_token = "<|im_end|>",
         .add_bos_token = false,

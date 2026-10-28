@@ -21386,7 +21386,7 @@ test "Responses history omits loop cuts while retaining the response and input" 
 
 fn renderQwenForResponsesTest(a: std.mem.Allocator, messages: []const chat_mod.Message) ![]const u8 {
     const config = chat_mod.ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
         .bos_token = null,
         .eos_token = "<|im_end|>",
         .add_bos_token = false,
@@ -26425,7 +26425,7 @@ fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []const u
 
     const Family = struct { tpl: []const u8, head: []const u8, name_tail: []const u8, sep: []const u8 };
     const families = [_]Family{
-        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .head = "<tool_call>\n<function=", .name_tail = ">\n", .sep = "\n\n" },
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .head = "<tool_call>\n<function=", .name_tail = ">\n", .sep = "\n\n" },
         .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .head = "<tool_call><function=", .name_tail = ">", .sep = "" },
     };
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "What time is it?" }};
@@ -26519,7 +26519,7 @@ test "tool_choice auto and none arm no forced call" {
     defer arena_state.deinit();
     var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
     defer deinitTestTokenizer(&tok);
-    var config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    var config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
     const ids = try tok.encode(a, "<|im_start|>assistant\n<think>\n");
     defer a.free(ids);
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .auto, null) == null);
@@ -26535,7 +26535,7 @@ test "tool_choice none bans each family's one-token call opener, and nothing els
     var split = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
     defer deinitTestTokenizer(&split);
     for ([_][]const u8{
-        @embedFile("fixtures/qwen38_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
         @embedFile("fixtures/mimo_v26_chat_template.jinja"),
         @embedFile("fixtures/glm53_chat_template.jinja"),
     }) |tpl| {
@@ -26591,7 +26591,7 @@ test "a late system turn keeps each turn's prompt a prefix of the next where the
     const Template = struct { tpl: []const u8, places_late_system: bool };
     const templates = [_]Template{
         .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .places_late_system = true },
-        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .places_late_system = true },
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .places_late_system = true },
         .{ .tpl = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .places_late_system = false },
     };
     for (templates) |t| {
@@ -26676,7 +26676,7 @@ test "--preserve-thinking takes on or off" {
 
 test "a request renders with its own preserve_thinking and leaves the model's config alone" {
     const a = std.testing.allocator;
-    var model_config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    var model_config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
     const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"chat_template_kwargs\":{\"preserve_thinking\":false}}", .{});
     defer parsed.deinit();
     const per_request = renderConfigFor(&model_config, parsed.value.object, null, true);
@@ -26708,7 +26708,7 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
     const a = std.testing.allocator;
     const cli = @import("cli.zig");
     const families = .{
-        .{ "qwen4_exp", @embedFile("fixtures/qwen38_chat_template.jinja") },
+        .{ "qwen4_exp", @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ "mimo_v2", @embedFile("fixtures/mimo_v26_chat_template.jinja") },
     };
     inline for (families) |family| {
@@ -28189,7 +28189,7 @@ const CountTokensFixture = struct {
         f.tok = try byteTokenizerForTests(a, f.arena.allocator(), &.{ "<|im_start|>", "<|im_end|>", "<think>", "</think>" });
         // Thinking declared off, so only a test that names a thinking default meets one.
         f.cfg = .{ .num_hidden_layers = 0, .pinned_context = 4096, .model_type = "qwen4_exp", .gen_enable_thinking = false };
-        f.chat_cfg = .{ .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        f.chat_cfg = .{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
         f.lm = undefined;
         f.lm.id = "";
         f.lm.config = &f.cfg;

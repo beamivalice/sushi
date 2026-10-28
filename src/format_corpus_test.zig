@@ -70,8 +70,7 @@ test "format corpus: late system notes never vanish, and a template that places 
     // `in_place` templates render a late note where it was sent (the stock Qwen ones through the
     // adapter); the rest fold it into the leading turn, which rewrites earlier bytes by design.
     const templates = [_]struct { source: []const u8, in_place: bool }{
-        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
-        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/dsv41_chat_template.jinja"), .in_place = true },
         .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
@@ -2489,8 +2488,7 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
     const chatml = "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>' }}{% endfor %}";
     const Case = struct { name: []const u8, tpl: []const u8, system_headers: usize };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .system_headers = 2 },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .system_headers = 2 },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .system_headers = 0 },
         .{ .name = "role loop", .tpl = chatml, .system_headers = 2 },
@@ -2528,8 +2526,7 @@ test "format corpus: a forced tool_choice reaches the prompt once, on every temp
         "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
     const Case = struct { name: []const u8, tpl: []const u8 };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
         .{ .name = "no tools (fallback injection)", .tpl = no_tools_chatml },
@@ -2556,8 +2553,7 @@ test "format corpus: a forced call is the family's own call markup and parses ba
     const allocator = testing.allocator;
     const Case = struct { name: []const u8, tpl: []const u8, end: []const u8 = "<|im_end|>" };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .end = "<｜end▁of▁sentence｜>" },
     };
@@ -2611,8 +2607,7 @@ test "format corpus: a string value parses back byte-exact from each family's ow
     const allocator = testing.allocator;
     const Case = struct { name: []const u8, tpl: []const u8, open: []const u8 = "<tool_call>", close: []const u8 = "</tool_call>" };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .open = "<｜DSML｜ calls>", .close = "</｜DSML｜ calls>" },
     };
@@ -2656,8 +2651,7 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
     const allocator = testing.allocator;
     const Case = struct { name: []const u8, tpl: []const u8 };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
     };
@@ -2928,9 +2922,7 @@ test "format corpus: tool traffic renders through every served template, never t
     const Case = struct { name: []const u8, tpl: []const u8, media: bool = true };
     const cases = [_]Case{
         .{ .name = "glm5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
-        // The 2.4T checkpoint is text-only: its template raises on a media part by design.
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .media = false },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .media = false },
     };
@@ -3016,8 +3008,7 @@ test "format corpus: a history call whose arguments are not an object still rend
     const allocator = testing.allocator;
     const templates = [_]struct { name: []const u8, tpl: []const u8 }{
         .{ .name = "glm5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
     };

@@ -686,32 +686,26 @@ fn hasLateSystem(messages: []const Message) bool {
     return false;
 }
 
-/// The two stock Qwen3.8 revisions (the one the served Flash-Next ships, and the 2.4T one) raise on
-/// a system turn that is not first. Replace only that branch so the turn renders in place; any
-/// other revision keeps its native contract and the fold.
+/// The stock Flash-Next template raises on a system turn that is not first. Replace only that
+/// branch so the turn renders in place; any other revision keeps its native contract and the fold.
 fn qwenLateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
-    const templates = [_]struct { source: []const u8, content: []const u8 }{
-        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .content = "render_content(message.content, false, true)|trim" },
-        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .content = "content" },
-    };
+    const source = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
+    const content = "render_content(message.content, false, true)|trim";
     const branch =
         \\{%- if message.role == "system" %}
         \\        {%- if not loop.first %}
         \\            {{- raise_exception('System message must be at the beginning.') }}
         \\        {%- endif %}
     ;
-    for (templates) |template| {
-        if (!std.mem.eql(u8, tpl, template.source)) continue;
-        if (std.mem.count(u8, tpl, branch) != 1) return null;
-        const replacement = try std.mem.concat(allocator, u8, &.{
-            "{%- if message.role == \"system\" %}{%- if not loop.first %}{{- '<|im_start|>system\\n' + (",
-            template.content,
-            ") + '<|im_end|>\\n' }}{%- endif %}",
-        });
-        defer allocator.free(replacement);
-        return try std.mem.replaceOwned(u8, allocator, tpl, branch, replacement);
-    }
-    return null;
+    if (!std.mem.eql(u8, tpl, source)) return null;
+    if (std.mem.count(u8, tpl, branch) != 1) return null;
+    const replacement = try std.mem.concat(allocator, u8, &.{
+        "{%- if message.role == \"system\" %}{%- if not loop.first %}{{- '<|im_start|>system\\n' + (",
+        content,
+        ") + '<|im_end|>\\n' }}{%- endif %}",
+    });
+    defer allocator.free(replacement);
+    return try std.mem.replaceOwned(u8, allocator, tpl, branch, replacement);
 }
 
 /// False when the template raises on a system turn that is not first, or drops it.
@@ -1201,11 +1195,8 @@ fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
 
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
 /// raise_exception's on any other string and its own default is xhigh, so an
-/// absent or unrecognized effort keeps the checkpoint default. Thinking-off
-/// maps to low for the variants that REFUSE it (2.4T-A95B): the request is
-/// served on the cheapest arm with the think block closed in the prompt by
-/// `noThinkTailSuffix`. On a variant that accepts thinking-off (27B) the
-/// template never reads the key on that arm, so the value is inert.
+/// absent or unrecognized effort keeps the checkpoint default. The template
+/// never reads the key on its thinking-off arm, so the value is inert there.
 fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (!enable_thinking) return "low";
     // An ABSENT effort takes OUR default, not the checkpoint's. The template
@@ -1252,17 +1243,8 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // detection. EVERY 3.8 template raises on OpenAI's "high", so this keys the
     // mapping for the whole family.
     const qwen38_style = std.mem.indexOf(u8, chat_config.chat_template, "'xhigh'") != null;
-    // Whether the template REFUSES thinking-off is a SEPARATE question from the
-    // effort vocabulary, and the two split inside one family: 2.4T-A95B raises
-    // ("Disabling thinking is not supported"), the 27B answers that arm the 3.6
-    // way with a closed `<think>\n\n</think>` and NO reasoning preamble. Keying
-    // the override on the shared 'xhigh' literal forced the 27B's thinking-off
-    // requests onto the thinking-on arm, injecting a system line the checkpoint
-    // never renders there. Only a refusing template gets the flag withheld;
-    // thinking-off is then committed in the prompt by `noThinkTailSuffix`.
-    const refuses_nothink = std.mem.indexOf(u8, chat_config.chat_template, "Disabling thinking is not supported") != null;
     if (need_comma) try buf.append(allocator, ',');
-    if (enable_thinking or refuses_nothink) {
+    if (enable_thinking) {
         try buf.appendSlice(allocator, "\"enable_thinking\":true");
     } else {
         try buf.appendSlice(allocator, "\"enable_thinking\":false");
@@ -8475,8 +8457,7 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
     // The families whose templates act on `reasoning_effort`. For these
     // the word is the lever and an effort-derived TOKEN budget on top is pure
     // truncation (see the fn doc).
-    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_chat_template.jinja")));
-    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_27b_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_flash_next_chat_template.jinja")));
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/dsv41_chat_template.jinja")));
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/glm53_chat_template.jinja")));
 
@@ -8494,7 +8475,7 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     // defaults are filled for ALL templates.
     const allocator = testing.allocator;
     var config = ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
         .bos_token = null,
         .eos_token = "<|im_end|>",
         .add_bos_token = false,
@@ -8542,7 +8523,7 @@ test "renderChatTemplate folds a late system turn only where the template refuse
     // A Qwen3.8 revision the adapter does not pin raises on a system turn past index 0 (the raise was
     // the generic fallback), so the turn is folded into the leading one.
     {
-        const revised = try std.mem.concat(allocator, u8, &.{ @embedFile("fixtures/qwen38_chat_template.jinja"), "{#- revision #}" });
+        const revised = try std.mem.concat(allocator, u8, &.{ @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), "{#- revision #}" });
         defer allocator.free(revised);
         var config = ChatConfig{
             .chat_template = revised,
@@ -8574,8 +8555,7 @@ test "renderChatTemplate folds a late system turn only where the template refuse
 }
 
 const qwen_late_templates = [_][]const u8{
-    @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
-    @embedFile("fixtures/qwen38_chat_template.jinja"),
+    @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
 };
 
 test "stock Qwen late system notes render in place and keep tool rounds a prefix" {
@@ -8854,6 +8834,27 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
         try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
     }
+    // "medium" injects no preamble.
+    {
+        const med = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "medium", false);
+        defer allocator.free(med);
+        try testing.expect(std.mem.indexOf(u8, med, "Reasoning effort is set to") == null);
+        try testing.expect(std.mem.indexOf(u8, med, "You have access to the following functions:") != null);
+    }
+    // A tool round renders through the template's own call and response markup.
+    {
+        const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+        const round = [_]Message{
+            .{ .role = "user", .content = "What time is it?" },
+            .{ .role = "assistant", .content = "", .tool_calls = &tc },
+            .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+        };
+        const rendered = try renderChatTemplate(allocator, &round, &config, tools_json, null, true, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<function=get_time>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<parameter=timezone>\nUTC\n</parameter>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response>\n12:34 UTC\n</tool_response>") != null);
+    }
     // Thinking OFF renders the template's OWN no-think prompt: closed block,
     // no reasoning preamble, and nothing appended after it.
     {
@@ -8873,8 +8874,7 @@ const forced_choice_tools =
 test "renderChatTemplate: a forced tool_choice reaches templates that render tools themselves" {
     const allocator = testing.allocator;
     const templates = [_][]const u8{
-        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
-        @embedFile("fixtures/qwen38_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
         @embedFile("fixtures/mimo_v26_chat_template.jinja"),
     };
     const instr = "\nYou MUST call the function \"get_time\". Do not respond with text.";
@@ -8916,8 +8916,7 @@ test "forcedCallText reads each family's call markup from its own template" {
     const allocator = testing.allocator;
     const Case = struct { tpl: []const u8, sep: []const u8, required: []const u8, named: []const u8, name_tail: []const u8 };
     const cases = [_]Case{
-        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
-        .{ .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
         .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .sep = "", .required = "<tool_call><function=", .named = "<tool_call><function=get_time>", .name_tail = ">" },
     };
     for (cases) |c| {
@@ -8961,8 +8960,7 @@ test "renderChatTemplate: preserve_thinking keeps or drops Qwen3.8's prior-turn 
         .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
     };
     const templates = [_][]const u8{
-        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
-        @embedFile("fixtures/qwen38_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
     };
     for (templates) |tpl| {
         var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
@@ -11361,14 +11359,14 @@ test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hol
 }
 
 test "renderChatTemplate: thinking-off closes a template-opened think block" {
-    // The Qwen3.8 template opens `<think>` unconditionally; thinking-off used to
+    // The GLM template opens `<think>` unconditionally; thinking-off used to
     // mean generating the whole reasoning pass and discarding it. Closing the
     // block in the prompt skips it. Thinking ON keeps the opener untouched.
     const allocator = testing.allocator;
     var config = ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"),
         .bos_token = null,
-        .eos_token = "<|im_end|>",
+        .eos_token = null,
         .add_bos_token = false,
         .allocator = allocator,
     };
@@ -11376,12 +11374,12 @@ test "renderChatTemplate: thinking-off closes a template-opened think block" {
 
     const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
     defer allocator.free(off);
-    try testing.expect(std.mem.endsWith(u8, off, "</think>"));
+    try testing.expect(std.mem.endsWith(u8, off, "<|assistant|><think></think>"));
     try testing.expect(!promptTailOpensThink(off));
 
     const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
     defer allocator.free(on);
-    try testing.expect(std.mem.endsWith(u8, on, "<|im_start|>assistant\n<think>\n"));
+    try testing.expect(std.mem.endsWith(u8, on, "<|assistant|><think>"));
 }
 
 test "renderChatTemplate: continuation appends the partial reply into the OPEN assistant turn" {
