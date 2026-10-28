@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3-Flash decode uses fewer GPU launches per MoE layer**: the shared expert now runs inside the routed experts' pair and down launches, for a serial token (two fewer), for batched requests and for DFlash2 verify rows (four fewer), with byte-identical output.
 - **A load that wires more than macOS allows warns at startup**: past `vm.global_user_wire_limit` (116.82 GB by default on a 128 GB Mac) a prefill runs slower, so the log now names the limit and the `sudo sysctl` that raises it.
 - **DeepSeek-V4.1-Flash decodes with 200 fewer GPU launches per token**: the shared expert now runs inside the routed experts' decode launches on every speculated layer, serial decode and DSpark verify alike, with byte-identical output.
 - **DeepSeek-V4.1-Flash reads its token embedding from SSD**: the 4-bit table's 0.37 GB is no longer resident and goes to the expert cache; output is unchanged.

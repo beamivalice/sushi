@@ -895,7 +895,7 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
     }
 }
 
-fn headerOf(dec: exl3.Decode) ![:0]const u8 {
+pub fn headerOf(dec: exl3.Decode) ![:0]const u8 {
     const prev = kernels.activeDecode();
     kernels.setDecodeParams(dec);
     defer kernels.setDecodeParams(prev);

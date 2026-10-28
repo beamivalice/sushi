@@ -128,7 +128,56 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   (`glm5_shared.zig`, one simdgroup per projection, activation arithmetic of `glm5_activation.zig`); the down stays the stock
   qmv. The BF16 add rides the routed finish reduce (after the routed sum's own rounding), and that reduce lists `shared`
   as its FIRST input: MLX encodes inputs in order, so the shared chain runs before the routed one. Shared last measured
-  +0.55 to +0.7 ms/token slower than the separate add; the dispatch count is the same either way.
+  +0.55 to +0.7 ms/token slower than the separate add; the dispatch count is the same either way. A serial decode row
+  takes the fold below instead.
+
+<a id="shared-fold"></a>
+**The shared expert rides the routed lane chain's launches** (`exl3/glm_fold.zig`, `glm5_shared.folded`, decode
+rows, `[1,rows,4096]` BF16, resident affine5/6/8 g128 shared banks, an EXL3 pack on the GLM lane arms). The serial layer
+launched gate/up, the stock qmv down and the routed five (prepare, pair, middle, down, reduce): seven. The shared gate/up
+kernel now holds extra threadgroups of the routed pair launch and the shared down those of the routed down launch
+(`fuse.zig`: the two kernels' threadgroups laid end to end on one grid, the host kernel's names renamed `s_`, `S_`),
+so a layer launches five; the finish reduce still lists the shared output first. Each part keeps its own statements: the
+routed kernels are untouched, and the shared kernels are the qmv_fast row groups of `glm5_decode.zig` and the activation
+text of `gateUp`, laid out 128 threads wide (gate/up: eight rows a threadgroup, a gate simdgroup and an up simdgroup per
+four rows; down: sixteen rows, a simdgroup per four), so every output element has the bytes of the separate chain.
+- **Reach**: a serial decode row (`glm_fold.moeClampedSharedFolded`) and two to eight rows of the batched decode (two to
+  four requests) and the DFlash2 verify rows (`moeLayoutSharedFolded`, called from `glm5_dflash_ffn.apply` on the lane
+  arms: hidden 4096, top-8, limit 10). Not streaming, the covariance tap, or nine to sixteen rows. The rows chain
+  launched the shared rows kernels (gate, up, activation, down: four) and the `glm_group2` routed five: nine; the fold
+  runs five. The multi-row riders are the same two kernels with one grid row per input row: each row is the one-token
+  qmv_fast order, which is what the rows kernels reproduce per row, so the bytes are the rows chain's. The routed kernels
+  are `glm_group2`'s own (the two- and three-member group sources, grouped serial reduction, two tiles), untouched. Anything
+  the fold cannot reproduce declines to the separate chain before any launch: another row count or dtype, a limit other
+  than 10, a codebook off the lane arms, a gate/up pair stored at two widths or with strided or lazy banks, a dense or FP8
+  shared expert, a down that is not `width -> hidden`, ids that do not match the rows.
+- **Proof** (`GLM shared expert folded into the routed launches is bit exact ...` for one row, `... routed rows launches
+  ...` for two to eight): bytes equal to the separate chain (gate/up plus the stock affine down plus
+  `moeClampedWithShared`; the shared rows chain plus `moeLayoutShared`), at the real 4096/2048 geometry with nine experts at
+  n36, for gate/up and down stored at 6/6/6, 5/5/5, 8/8/8, 5/5/8, 8/8/6 (and 6/6/5 on one row) bits, large and small gains
+  (the clamps both ways), with either part's threadgroups first; five launches a layer (`glm_fold.launchCount`). Two more
+  tests cover the declines.
+- **Chain per layer** (`SUSHI_GLM_FOLD_UBENCH=1` on the main test binary, base `f831f1e5` plus the rows change,
+  ReleaseFast, GPU lock, `taskpolicy -a`, fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over eight
+  distinct banks, shared A6, routed n36 mcg w12, random routes, us):
+
+  | rows | separate | fused (routed first) | fused (shared first) | routed only | fused / separate |
+  |---|---|---|---|---|---|
+  | 1 | 215.5 | 204.8 | 231.3 | 176.8 | 0.950 |
+  | 2 | 353.7 | 295.5 | 352.4 | 281.3 | 0.836 |
+  | 3 | 422.1 | 376.0 | 428.1 | 344.7 | 0.891 |
+  | 4 | 529.0 | 484.9 | 547.1 | 449.3 | 0.917 |
+  | 6 | 716.1 | 685.5 | 742.4 | 616.6 | 0.957 |
+  | 8 | 898.3 | 881.0 | 938.0 | 779.2 | 0.981 |
+
+  One row measured 212.3 / 202.3 / 229.0 / 173.6 (0.953) and 210.8 / 200.4 / 226.9 / 173.1 (0.951) in two earlier runs. The
+  shared expert costs 38 us a layer beside the routed chain at one row, 72 at two, 77 at three and 119 at eight; the fold
+  takes 10, 58, 46, 44, 31 and 17 of them back. The gain shrinks as rows grow.
+  The routed threadgroups must lead: shared first costs up to 8%. A
+  32-thread variant (one simdgroup per four rows riding the prepare and middle launches) was 2% slower than separate.
+- Live (a9853b3e, GLM-5.3-Flash-Sushi-2.4bpw, default DFlash2, AC, fans max, one A then one B): byte-identical on a
+  512-token request and four concurrent 256-token requests; the plain decode step 30.4 -> 28.5 ms. Four concurrent
+  DFlash2 requests verify more than eight rows a round and keep the separate chain.
 - Router: FP32 GEMV with sigmoid and correction, then stable top-8 and unbiased normalization (two dispatches; BF16
   weights widened locally). Dense/shared activation: one dispatch over the exhaustive BF16 sigmoid table (128 KiB).
 - Attention: B1 per decode row and B3/B4 for verification branches, from one gather source (`[B,2051,512]` bank,

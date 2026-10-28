@@ -250,6 +250,7 @@ const Moe = struct {
         const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
         // The shared expert is built first: the finish reduce lists it first, so MLX encodes its chain ahead of the routed one.
         if (self.shared) |shared| if (self.streamed == null and isDecodeRow(x)) {
+            if (try shared.applyFolded(ops, x, self.bank, routing.indices, routing.scores, cfg.expertDecode(), cfg.glm_swiglu_limit)) |y| return ops.own(y);
             const mid = try shared.apply(ops, x, cfg.glm_swiglu_limit);
             if (mlx.mlx_array_dtype(mid) == .bfloat16 and std.mem.eql(c_int, mlx.getShape(mid), mlx.getShape(x))) {
                 const dec = cfg.expertDecode();

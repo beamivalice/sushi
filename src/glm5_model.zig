@@ -319,6 +319,17 @@ pub const DenseMlp = struct {
         };
     }
 
+    /// A decode row's routed output plus this expert, the expert riding the routed launches; null where it runs alone.
+    pub fn applyFolded(self: DenseMlp, ops: *Ops, x: Arr, routed: @import("sushi_exl3").Bank, ids: Arr, scores: Arr, dec: @import("sushi_exl3").format.Decode, limit: f32) !?Arr {
+        if (linear_tap != null) return null;
+        const bank = struct {
+            fn of(l: Linear) @import("glm5_decode.zig").Bank {
+                return .{ .weight = l.w, .scales = l.scales, .biases = l.biases };
+            }
+        }.of;
+        return @import("glm5_shared.zig").folded(ops.s, x, bank(self.gate), bank(self.up), bank(self.down), routed, ids, scores, dec, limit, try @import("hc_prefill.zig").sigmoidTable(ops.s));
+    }
+
     pub fn apply(self: DenseMlp, ops: *Ops, x: Arr, limit: f32) !Arr {
         if (linear_tap == null) if (try @import("glm5_shared.zig").gateUp(ops.s, x, .{ .weight = self.gate.w, .scales = self.gate.scales, .biases = self.gate.biases }, .{ .weight = self.up.w, .scales = self.up.scales, .biases = self.up.biases }, limit, try @import("hc_prefill.zig").sigmoidTable(ops.s))) |middle|
             return self.down.apply(ops, try ops.own(middle));

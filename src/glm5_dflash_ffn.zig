@@ -26,7 +26,7 @@ pub fn batchCount() usize {
     return routed_batches;
 }
 
-fn dense(linear: base.DenseMlp, ops: *Ops, x: Arr, limit: f32) !Arr {
+pub fn dense(linear: base.DenseMlp, ops: *Ops, x: Arr, limit: f32) !Arr {
     const gate = try rows.linearRows(ops, linear.gate, x, .affine_rows);
     const up = try rows.linearRows(ops, linear.up, x, .affine_rows);
     const activated = if (try @import("glm5_activation.zig").apply(ops.s, gate, up, limit)) |value| try ops.own(value) else blk: {
@@ -71,6 +71,12 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             const gs = mlx.getShape(layer.bank.gate.trellis);
             const lane_rows = shape[1] >= 2 and shape[1] <= 8 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook.servesGlmFastPaths() and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]);
             if (lane_rows) if (layer.shared) |shared| {
+                if (try shared.applyFolded(ops, x, layer.bank, routing.indices, routing.scores, dec, target.cfg.glm_swiglu_limit)) |joined| {
+                    group2_batches += 1;
+                    routed_batches += 1;
+                    logGroup2(dec, true);
+                    break :blk try ops.own(joined);
+                }
                 const y = try dense(shared, ops, x, target.cfg.glm_swiglu_limit);
                 if (try api.glm_group2.moeLayoutShared(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane, y)) |joined| {
                     group2_batches += 1;

@@ -154,10 +154,10 @@ fn laneSource(comptime source: []const u8) [:0]const u8 {
     }
     return result ++ "";
 }
-const LANE_TILED_SOURCE = laneSource(TILED_SOURCE);
-const LANE_TILED_PAIR_SOURCE = laneSource(TILED_PAIR_SOURCE);
-const LANE_THREE_SOURCE = laneSource(THREE_SOURCE);
-const LANE_THREE_PAIR_SOURCE = laneSource(
+pub const LANE_TILED_SOURCE = laneSource(TILED_SOURCE);
+pub const LANE_TILED_PAIR_SOURCE = laneSource(TILED_PAIR_SOURCE);
+pub const LANE_THREE_SOURCE = laneSource(THREE_SOURCE);
+pub const LANE_THREE_PAIR_SOURCE = laneSource(
     "const bool upper=threadgroup_position_in_grid.z!=0u;\nconst device half* x=upper?xu:xg;\nconst device ushort* trellis=upper?tu:tg;\ndevice half* y=upper?yu:yg;\n" ++
         replace(THREE_SOURCE, "uint split = uint(threadgroup_position_in_grid.z);", "uint split=0u;"),
 );
