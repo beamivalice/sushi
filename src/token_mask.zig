@@ -121,8 +121,7 @@ pub const BuildError = error{OutOfMemory};
 
 /// Precompute the byte sequence for every token id in `tokenizer`.
 ///
-/// For byte-level BPE, this reverses the GPT-2 byte→unicode mapping. For
-/// SentencePiece, this swaps `▁` (U+2581) for spaces. Special tokens
+/// This reverses the GPT-2 byte→unicode mapping. Special tokens
 /// (BOS/EOS/PAD/chat-template tags) decode to `null`.
 pub fn build(gpa: std.mem.Allocator, tokenizer: *const Tokenizer) BuildError!TokenBytes {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -167,9 +166,8 @@ pub fn build(gpa: std.mem.Allocator, tokenizer: *const Tokenizer) BuildError!Tok
 
 fn decodeSingle(arena: std.mem.Allocator, tokenizer: *const Tokenizer, id: u32) ![]const u8 {
     const ids: [1]u32 = .{id};
-    // The tokenizer's existing decode handles all three tokenizer types,
-    // including byte-level unicode→byte reversal and SentencePiece ▁→space.
-    return try tokenizer.decode(arena, &ids, false);
+    // The tokenizer's existing decode reverses the byte-level unicode→byte mapping.
+    return try tokenizer.decode(arena, &ids);
 }
 
 pub const MaskResult = struct { allowed: u32, probed: u32 };

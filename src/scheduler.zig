@@ -3306,7 +3306,6 @@ fn stubCpuState(allocator: std.mem.Allocator, config_value: ModelConfig) !CpuSta
         .merge_ranks = @TypeOf(tok.merge_ranks).init(allocator),
         .allocator = allocator,
         .special_tokens = std.StringHashMap(u32).init(allocator),
-        .tok_type = .byte_level_bpe,
         .byte_to_unicode = byte_map,
         .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
         .bos_id = null,
@@ -6778,8 +6777,8 @@ fn logStop(slot: *Slot, reason: []const u8) void {
     var scratch: [512]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const tok = slot.model.tokenizer;
-    const token_text: []const u8 = if (tok) |t| (t.decode(fba.allocator(), &.{token}, false) catch "") else "";
-    const after_text: []const u8 = if (tok != null and after != null) (tok.?.decode(fba.allocator(), &.{after.?}, false) catch "") else "";
+    const token_text: []const u8 = if (tok) |t| (t.decode(fba.allocator(), &.{token}) catch "") else "";
+    const after_text: []const u8 = if (tok != null and after != null) (tok.?.decode(fba.allocator(), &.{after.?}) catch "") else "";
     var path = slot.stop_path;
     if (path.len == 0) {
         path = if (gen) |g| (if (specTickMode(slot.enable_mtp, g.mtp != null or g.dspark, slot.enable_drafter, g.dflash != null) == .regular) "serial" else "spec") else "serial";
@@ -6807,7 +6806,7 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
     );
     const ids = gen.generated_ids.items;
     const decoded: ?[]u8 = if (slot.model.tokenizer) |tok|
-        (tok.decode(slot.allocator, ids, false) catch null)
+        (tok.decode(slot.allocator, ids) catch null)
     else
         null;
     defer if (decoded) |d| slot.allocator.free(d);
@@ -8415,9 +8414,9 @@ fn settleThoughtPoint(slot: *Slot, gen: *Generator) void {
     const generated = gen.generated_ids.items;
     const end = std.mem.indexOfScalar(u32, generated, tp.closer) orelse return gen.dropThoughtPoint();
     if (end < 2) return gen.dropThoughtPoint();
-    const first = tok.decode(slot.allocator, generated[0..1], false) catch return gen.dropThoughtPoint();
+    const first = tok.decode(slot.allocator, generated[0..1]) catch return gen.dropThoughtPoint();
     defer slot.allocator.free(first);
-    const tail = tok.decode(slot.allocator, generated[end - 2 .. end], false) catch return gen.dropThoughtPoint();
+    const tail = tok.decode(slot.allocator, generated[end - 2 .. end]) catch return gen.dropThoughtPoint();
     defer slot.allocator.free(tail);
     const style: generate_mod.CloserStyle = if (gen.glm_dflash_native) .bare_closer else .newline_before_closer;
     if (!generate_mod.thoughtEdgesSurvive(style, first, tail)) {
@@ -8443,9 +8442,9 @@ fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) void
         log.debug("[dsv41-prefix] no decode restore point: a {d}-token thought is cheaper to prefill than to keep\n", .{thought});
         return;
     }
-    const first = tok.decode(slot.allocator, generated[0..1], false) catch return;
+    const first = tok.decode(slot.allocator, generated[0..1]) catch return;
     defer slot.allocator.free(first);
-    const last = tok.decode(slot.allocator, generated[thought - 1 .. thought], false) catch return;
+    const last = tok.decode(slot.allocator, generated[thought - 1 .. thought]) catch return;
     defer slot.allocator.free(last);
     if (!dsv41_prefix.thoughtEdgesSurviveTrim(first, last)) {
         log.info("[dsv41-prefix] no decode restore point: the thought starts or ends in whitespace the next prompt trims\n", .{});

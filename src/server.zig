@@ -1121,7 +1121,7 @@ fn promptOpensThink(
 ) bool {
     if (prompt_ids.len == 0) return false;
     const n = @min(prompt_ids.len, 8);
-    const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - n ..], false) catch return false;
+    const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - n ..]) catch return false;
     defer allocator.free(tail);
     return chat_mod.promptTailOpensThink(tail);
 }
@@ -1360,7 +1360,7 @@ fn resolveReasoningProtocol(
 ) bool {
     if (prompt_ids.len == 0 or lm.transformer == null) return false;
     const tail_n = @min(prompt_ids.len, 64);
-    const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - tail_n ..], false) catch return false;
+    const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - tail_n ..]) catch return false;
     defer allocator.free(tail);
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
 
@@ -1564,11 +1564,11 @@ fn completionShowsToken(tok: *const Tokenizer, id: u32, skip_special: bool) bool
 }
 
 fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: []const u32, skip_special: bool) ![]u8 {
-    if (!skip_special) return tok.decode(allocator, ids, false);
+    if (!skip_special) return tok.decode(allocator, ids);
     var shown = std.ArrayList(u32).empty;
     defer shown.deinit(allocator);
     for (ids) |id| if (completionShowsToken(tok, id, true)) try shown.append(allocator, id);
-    return tok.decode(allocator, shown.items, false);
+    return tok.decode(allocator, shown.items);
 }
 
 /// The auto budget's own tightness question: under a quarter of the window left.
@@ -9201,7 +9201,7 @@ fn handleDetokenize(
         if (item == .integer) try ids.append(allocator, @intCast(item.integer));
     }
 
-    const text = try tok.decode(allocator, ids.items, false);
+    const text = try tok.decode(allocator, ids.items);
     defer allocator.free(text);
 
     const result = try detokenizeResponseJson(allocator, text);
@@ -10384,11 +10384,8 @@ fn handleNonStreamingCompletion(
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
-    // Text completion is a raw continuation: keep the first token's leading
-    // space (SentencePiece `▁`) instead of the chat-style strip the scheduler
-    // applies — FIM clients rely on exact indentation, and the streaming
-    // handler never stripped it, so this also restores stream/non-stream
-    // parity (tests/test_completions_spec.sh).
+    // Text completion is a raw continuation: FIM clients rely on exact
+    // indentation (stream/non-stream parity: tests/test_completions_spec.sh).
     const raw_text = try completionText(allocator, tok, result.token_ids, skip_special);
     defer allocator.free(raw_text);
 
@@ -10566,8 +10563,7 @@ fn handleStreamingCompletion(
         const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
             try lps.note(token_id);
             if (!completionShowsToken(tok, token_id, skip_special)) continue;
-            const strip = tok.tok_type == .sentencepiece_bpe;
-            const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+            const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded_c);
             break :blk try stop_gate.push(allocator, raw_decoded_c);
         };
@@ -10669,7 +10665,7 @@ fn reasoningWithinBudget(allocator: std.mem.Allocator, tok: *const Tokenizer, re
     defer allocator.free(ids);
     const n: usize = @intCast(budget);
     if (ids.len <= n) return .{ .text = reasoning, .owned = false };
-    return .{ .text = try tok.decode(allocator, ids[0..n], false), .owned = true };
+    return .{ .text = try tok.decode(allocator, ids[0..n]), .owned = true };
 }
 
 /// Client stop sequences a non-stream surface hands the scheduler wait, so generation ends when one completes.
@@ -10685,7 +10681,6 @@ const EarlyStop = struct {
     tok: *const Tokenizer,
     gate: stop_seq_mod.Gate,
     completion_skip_special: ?bool,
-    strip_leading: bool,
     spent: bool = false,
 
     /// `ids` holds every token so far; the last one is new. True once the generation can end.
@@ -10693,7 +10688,7 @@ const EarlyStop = struct {
         if (self.spent) return false;
         const id = ids[ids.len - 1];
         if (self.completion_skip_special) |skip| if (!completionShowsToken(self.tok, id, skip)) return false;
-        const piece = try self.tok.decode(allocator, &[_]u32{id}, false);
+        const piece = try self.tok.decode(allocator, &[_]u32{id});
         defer allocator.free(piece);
         allocator.free(try self.gate.push(allocator, piece));
         if (self.gate.matched == null) return false;
@@ -10701,7 +10696,7 @@ const EarlyStop = struct {
         const text = if (self.completion_skip_special) |skip|
             try completionText(allocator, self.tok, ids, skip)
         else
-            try self.tok.decode(allocator, ids, self.strip_leading);
+            try self.tok.decode(allocator, ids);
         defer allocator.free(text);
         return stop_seq_mod.earliest(text, self.gate.stops) != null;
     }
@@ -10826,7 +10821,6 @@ fn nonStreamingViaScheduler(
         .tok = tok,
         .gate = .{ .stops = stop.stops },
         .completion_skip_special = stop.completion_skip_special,
-        .strip_leading = tok.tok_type == .sentencepiece_bpe and (sampling.constraint == null or sampling.constraint.?.proto == null),
     } else null;
     defer if (early) |*e| e.gate.deinit(allocator);
     const end = try drainSettled(sch, slot, conn, allocator, &output_ids, if (early) |*e| e else null);
@@ -10839,7 +10833,6 @@ fn nonStreamingViaScheduler(
     const prefill_tps = generate_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, slot.prefill_ns);
     const decode_tps = generate_mod.tokensPerSec(slot.completion_tokens, slot.decode_ns);
 
-    const strip_leading = tok.tok_type == .sentencepiece_bpe and (sampling.constraint == null or sampling.constraint.?.proto == null);
     // A loop cut is a truncation, and the degenerate span is the part the
     // client must not get: an agent re-sends the cut turn as history, the
     // model reads its own loop back and resumes it — five loop-stops in a
@@ -10847,7 +10840,7 @@ fn nonStreamingViaScheduler(
     // Only reachable non-streaming: a delta cannot be retracted, so a
     // streaming client has already received the tail.
     const emit_ids = loopTrimmedIds(output_ids.items, slot.loop_trim_start);
-    const text = try tok.decode(allocator, emit_ids, strip_leading);
+    const text = try tok.decode(allocator, emit_ids);
     const token_ids = try output_ids.toOwnedSlice(allocator);
 
     // Convert the generator's (token index, byte offset) payload boundary
@@ -10858,7 +10851,7 @@ fn nonStreamingViaScheduler(
         var pb: ?usize = ps.byte_offset;
         if (ps.token_index > 0) {
             if (ps.token_index <= emit_ids.len) {
-                const prefix = tok.decode(allocator, emit_ids[0..ps.token_index], strip_leading) catch null;
+                const prefix = tok.decode(allocator, emit_ids[0..ps.token_index]) catch null;
                 if (prefix) |p| {
                     pb = p.len + ps.byte_offset;
                     allocator.free(p);
@@ -11084,7 +11077,7 @@ fn handleNonStreamingGeneration(
                 // Truncate: decode only budget-many tokens
                 const budget_usize: usize = @intCast(reasoning_budget);
                 const truncated_ids = reasoning_ids[0..budget_usize];
-                const truncated_text = try tok.decode(allocator, truncated_ids, false);
+                const truncated_text = try tok.decode(allocator, truncated_ids);
                 budget_truncated_reasoning = truncated_text;
                 budget_reasoning_allocated = true;
                 log.info("  reasoning budget truncated ({d}/{d} tokens)\n", .{ budget_usize, reasoning_ids.len });
@@ -11848,8 +11841,7 @@ fn handleStreamingGeneration(
         // one, or a character the token left unfinished.
         const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
             try lps.note(token_id);
-            const strip = tok.tok_type == .sentencepiece_bpe;
-            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
             if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
@@ -12395,7 +12387,7 @@ const StreamLogprobs = struct {
     fn note(self: *StreamLogprobs, id: u32) !void {
         if (!self.enabled) return;
         try self.ids.append(self.allocator, id);
-        const text = self.tok.decode(self.allocator, &[_]u32{id}, false) catch "";
+        const text = self.tok.decode(self.allocator, &[_]u32{id}) catch "";
         defer if (text.len > 0) self.allocator.free(text);
         try self.lens.append(self.allocator, text.len);
         self.bytes_noted += text.len;
@@ -14138,8 +14130,7 @@ fn formatTokenLogprob(
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
-    const strip = tok.tok_type == .sentencepiece_bpe;
-    const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+    const token_text = try tok.decode(allocator, &[_]u32{token_id});
     defer allocator.free(token_text);
 
     const escaped_token = try jsonEscape(allocator, token_text);
@@ -14164,7 +14155,7 @@ fn formatTokenLogprob(
     for (top_logprobs, 0..) |tlp, i| {
         if (i > 0) try top_buf.appendSlice(allocator, ",");
 
-        const tlp_text = try tok.decode(allocator, &[_]u32{tlp.token_id}, strip and false);
+        const tlp_text = try tok.decode(allocator, &[_]u32{tlp.token_id});
         defer allocator.free(tlp_text);
         const escaped_tlp = try jsonEscape(allocator, tlp_text);
         defer allocator.free(escaped_tlp);
@@ -14233,7 +14224,7 @@ fn formatCompletionsLogprobs(
             try tops.appendSlice(allocator, ",");
             try offs.appendSlice(allocator, ",");
         }
-        const text = try tok.decode(allocator, &[_]u32{token_ids[i]}, false);
+        const text = try tok.decode(allocator, &[_]u32{token_ids[i]});
         defer allocator.free(text);
         const esc = try jsonEscape(allocator, text);
         defer allocator.free(esc);
@@ -14247,7 +14238,7 @@ fn formatCompletionsLogprobs(
         try tops.appendSlice(allocator, "{");
         for (logprobs[i].top_logprobs, 0..) |t, j| {
             if (j > 0) try tops.appendSlice(allocator, ",");
-            const ttext = try tok.decode(allocator, &[_]u32{t.token_id}, false);
+            const ttext = try tok.decode(allocator, &[_]u32{t.token_id});
             defer allocator.free(ttext);
             const tesc = try jsonEscape(allocator, ttext);
             defer allocator.free(tesc);
@@ -14306,7 +14297,7 @@ fn contentTokenRange(
     var off: usize = 0;
     for (token_ids, 0..) |id, i| {
         if (off >= end_off) return .{ .start = start orelse i, .end = i };
-        const text = tok.decode(allocator, &[_]u32{id}, false) catch return all;
+        const text = tok.decode(allocator, &[_]u32{id}) catch return all;
         defer allocator.free(text);
         // A token straddling the boundary belongs to content: it put bytes there.
         if (start == null and off + text.len > start_off) start = i;
@@ -17200,7 +17191,7 @@ fn handleAnthropicNonStreaming(
                 defer allocator.free(r_ids);
                 const budget_usize: usize = @intCast(reasoning_budget);
                 if (r_ids.len > budget_usize) {
-                    truncated_reasoning = try tok.decode(allocator, r_ids[0..budget_usize], false);
+                    truncated_reasoning = try tok.decode(allocator, r_ids[0..budget_usize]);
                     trunc_allocated = true;
                 }
             }
@@ -17538,8 +17529,7 @@ fn handleAnthropicStreaming(
         // The gate remembers WHICH stop matched (reported as stop_reason "stop_sequence" + the
         // echoed `stop_sequence` field in message_delta).
         const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
-            const strip = tok.tok_type == .sentencepiece_bpe;
-            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
             if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
@@ -18875,7 +18865,7 @@ fn handleResponsesInner(
             }
             const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
                 try token_ids_buf.append(allocator, token_id);
-                const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, false);
+                const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
                 defer allocator.free(raw_decoded);
                 if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
                 break :blk try stop_gate.push(allocator, raw_decoded);
@@ -23729,7 +23719,7 @@ test "a tool-call reply delivers the budget-capped thought" {
 
 test "skipToContent keeps the content token when a multi-byte character splits across tokens" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -23741,9 +23731,9 @@ test "skipToContent keeps the content token when a multi-byte character splits a
     try tok.id_to_token.put(2, "C");
     try tok.id_to_token.put(3, "L");
     try tok.id_to_token.put(4, "T");
-    const lead = try tok.decode(a, &.{3}, false);
+    const lead = try tok.decode(a, &.{3});
     defer a.free(lead);
-    const cont = try tok.decode(a, &.{4}, false);
+    const cont = try tok.decode(a, &.{4});
     defer a.free(cont);
     var joined = try a.alloc(u8, lead.len + cont.len);
     defer a.free(joined);
@@ -23770,7 +23760,7 @@ test "a responses disconnect is never stored" {
 
 test "reasoningWithinBudget cuts a thought at the budget and keeps a shorter one whole" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -23942,7 +23932,7 @@ test "an empty prompt refused at submit is a 400 invalid_request_error in both d
 test "POST /v1/completions with a prompt that tokenizes to nothing answers 400 before any generation" {
     const t = std.testing;
     const a = t.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var cfg = model_mod.ModelConfig{ .num_hidden_layers = 0, .pinned_context = 4096 };
     var lm: LoadedModel = undefined;
@@ -24035,7 +24025,7 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     // `top_logprobs` is a map keyed by token TEXT.
     const allocator = std.testing.allocator;
 
-    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(allocator);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -24104,7 +24094,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     // U+FFFD per invalid sequence, which is what OpenAI's own shape does.
     const allocator = std.testing.allocator;
 
-    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(allocator);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -24183,7 +24173,7 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
     // nothing the client could see.
     const allocator = std.testing.allocator;
 
-    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(allocator);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -26472,7 +26462,7 @@ fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []const u
                     try published.appendSlice(a, ids);
                 }
             }
-            const text = try tok.decode(a, published.items, false);
+            const text = try tok.decode(a, published.items);
             defer a.free(text);
             // Qwen's template opens the thought in the prompt; MiMo's leaves the opener to the model.
             const opener: []const u8 = if (thinking and f.sep.len == 0) "<think>" else "";
@@ -26865,7 +26855,7 @@ test "ignore_eos: a completion's text past EOS drops the special turn markers, t
     defer streamed.deinit(a);
     for (ids) |id| {
         if (!completionShowsToken(&tok, id, true)) continue;
-        const piece = try tok.decode(a, &.{id}, false);
+        const piece = try tok.decode(a, &.{id});
         defer a.free(piece);
         try streamed.appendSlice(a, piece);
     }
@@ -27394,7 +27384,7 @@ test "GLM vision serving processor carries image and video token budgets without
     const counts = countMediaPlaceholders(&ids, &cfg);
     try std.testing.expectEqual(@as(usize, 1), counts.images);
     try std.testing.expectEqual(@as(usize, 1), counts.videos);
-    var tok = Tokenizer.initEmptyForTests(std.testing.allocator, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(std.testing.allocator);
     defer tok.deinit();
     try tok.special_tokens.put(try std.testing.allocator.dupe(u8, "0.0 seconds"), 1000);
     try tok.special_tokens.put(try std.testing.allocator.dupe(u8, "1.0 seconds"), 1001);
@@ -27710,7 +27700,7 @@ const TickPlayer = struct {
 fn expectSettledAfterEarlyStop(published: u32) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     try tok.id_to_token.put(1, "S");
     var sch: scheduler_mod.Scheduler = undefined;
@@ -27737,7 +27727,7 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
     var player = TickPlayer{ .slot = &slot, .n = published, .gap_ms = 20 };
     const t = try std.Thread.spawn(.{}, TickPlayer.run, .{&player});
     const stops = [_][]const u8{"S"};
-    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null, .strip_leading = false };
+    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null };
     defer early.gate.deinit(a);
     var out = std.ArrayList(u32).empty;
     defer out.deinit(a);
@@ -27784,7 +27774,7 @@ const FakeSlot = struct {
 
 fn expectNonStreamStopsAt(stop: []const u8, pieces: []const []const u8, stop_token: usize) !void {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var ids: [16]u32 = undefined;
     for (pieces, 0..) |p, i| {
@@ -27793,7 +27783,7 @@ fn expectNonStreamStopsAt(stop: []const u8, pieces: []const []const u8, stop_tok
     }
     var slot = FakeSlot{ .tokens = ids[0..pieces.len] };
     const stops = [_][]const u8{stop};
-    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null, .strip_leading = false };
+    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null };
     defer early.gate.deinit(a);
     var out = std.ArrayList(u32).empty;
     defer out.deinit(a);
@@ -27811,13 +27801,13 @@ test "a non-stream generation ends on the token that completes a stop" {
 
 test "a non-stream generation without a stop in its text runs to the end" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     try tok.id_to_token.put(1, "E");
     try tok.id_to_token.put(2, "N");
     var slot = FakeSlot{ .tokens = &.{ 1, 2, 1 } };
     const stops = [_][]const u8{"END"};
-    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null, .strip_leading = false };
+    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null };
     defer early.gate.deinit(a);
     var out = std.ArrayList(u32).empty;
     defer out.deinit(a);
@@ -27970,7 +27960,7 @@ test "reasoning usage preserves totals and reports zero" {
 
 test "reasoning usage tokenization ignores SSE boundaries" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();

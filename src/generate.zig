@@ -11556,8 +11556,7 @@ pub fn generate(
         decode_tps,
     });
 
-    const strip_leading = tok.tok_type == .sentencepiece_bpe;
-    const text = try tok.decode(allocator, output_ids.items, strip_leading);
+    const text = try tok.decode(allocator, output_ids.items);
     const token_ids = try output_ids.toOwnedSlice(allocator);
 
     return .{
@@ -16351,7 +16350,7 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     defer mtp_weights.deinit();
     var head = (try mimo_mtp.Head.load(a, mlx.gpuStream(), &config, &mtp_weights)) orelse return error.SkipZigTest;
     defer head.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const want: usize = 64;
     const kv = transformer_mod.KVQuantConfig.affine(8);
@@ -16462,7 +16461,7 @@ test "fillSuppressMask: padding rows past the tokenizer's last defined id are su
 
 test "Tokenizer.definedVocabSize: highest defined id + 1, 0 when nothing is defined" {
     const allocator = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(allocator);
     defer tok.deinit();
     try testing.expectEqual(@as(usize, 0), tok.definedVocabSize());
     // Added specials sit ABOVE the base vocab and are not contiguous with it,
@@ -17675,7 +17674,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
@@ -17820,7 +17819,7 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
@@ -17917,7 +17916,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
@@ -18188,7 +18187,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const previous = group_planner.enabled_override;
     group_planner.enabled_override = true;
@@ -18286,7 +18285,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prior = group_planner.enabled_override;
     group_planner.enabled_override = true;
@@ -19259,7 +19258,7 @@ test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {
 test "GLM short prompts and odd chunk widths still checkpoint only on pool boundaries" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -19284,7 +19283,7 @@ test "GLM short prompts and odd chunk widths still checkpoint only on pool bound
 test "an empty prompt is a typed error at the generator, never an index" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -19303,7 +19302,7 @@ fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {
 test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefills its suffix exactly like cold" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var first: [300]u32 = undefined;
     for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
@@ -19391,7 +19390,7 @@ test "a GLM prefill without checkpoints chunks like any other prefill" {
 test "the GLM prefill holds as many checkpoints as its schedule says, and ends on the newest" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -19435,7 +19434,7 @@ const GlmReleasing = struct {
 test "a GLM prefill whose hook releases landed checkpoints holds at most two states and lists every restore point" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -19487,7 +19486,7 @@ const GlmStepDown = struct {
 test "GLM checkpoints stay on the grid when a request steps its chunk down, and a restore there with the same widths matches cold" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -19750,7 +19749,7 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.dsv41.?.dspark != null and xfm.moduleStateSpecRollback());
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -19931,7 +19930,7 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.dsv41.?.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -19994,7 +19993,7 @@ test "dsv41 generator: a seeded sampled request verifies at one width whatever t
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 60;
@@ -20072,7 +20071,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -20142,7 +20141,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const s = xfm.s;
     var prompt: [600]u32 = undefined;
@@ -20301,7 +20300,7 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
 
     var baseline: usize = 0;
@@ -20339,7 +20338,7 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 12;
@@ -20392,7 +20391,7 @@ test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const closer: u32 = 4;
     const forced = [_]u32{ 3, closer, 10 };
@@ -20561,7 +20560,7 @@ fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 30;
@@ -20653,7 +20652,7 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
 
@@ -20716,7 +20715,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
@@ -20790,7 +20789,7 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
@@ -20843,7 +20842,7 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     // The scheduler's slot owns a cache with one entry per layer; the Transformer's own is a shell.
     // `initSlot` hands every slot the engine's default KV scheme, whatever the pack reports.
@@ -20926,7 +20925,7 @@ test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV4
     defer st.deinit(a);
     var xfm = try Transformer.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prompt = st.ids[0..30];
     const saved = max_mtp_ctx;
@@ -20959,7 +20958,7 @@ test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since
     defer st.deinit(a);
     var xfm = try Transformer.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
     defer g.deinit(a);
@@ -21139,7 +21138,7 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.dsv41.?.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -21287,7 +21286,7 @@ fn commitTestRound(gen: *Generator, tokens: []const u32) !void {
 test "GLM thought point: the round that carries the closer is cut to a pool boundary, its state is the newest checkpoint, and a restore from it is the live state" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [300]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 3);
@@ -21367,7 +21366,7 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);

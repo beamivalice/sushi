@@ -1045,7 +1045,7 @@ fn promptIds(allocator: std.mem.Allocator, l: *Loaded, opts: Options, p: Prompt)
 }
 
 fn renderPrompt(allocator: std.mem.Allocator, l: *Loaded, opts: Options, p: Prompt) ![]const u8 {
-    if (p.ids) |ids| return l.tok.decode(allocator, ids, false);
+    if (p.ids) |ids| return l.tok.decode(allocator, ids);
     const text = p.text;
     if (opts.no_template) return allocator.dupe(u8, text);
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = text }};

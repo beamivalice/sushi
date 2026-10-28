@@ -100,7 +100,7 @@ pub const ReasoningMarker = struct {
             const ids = try tok.encode(gpa, marker[k..]);
             defer gpa.free(ids);
             if (ids.len == 0 or ids.len > rp_mod.MAX_FORCED_TOKENS) continue;
-            const decoded = try tok.decode(gpa, ids, false);
+            const decoded = try tok.decode(gpa, ids);
             defer gpa.free(decoded);
             if (!std.mem.eql(u8, decoded, marker[k..])) continue;
             suffixes[k] = .{ .offset = @intCast(tokens.items.len), .len = @intCast(ids.len) };
@@ -1889,7 +1889,7 @@ test "ModelRegistry: peek does not refcount" {
 /// to `lm`, the way the real loader hands ownership to the entry.
 fn attachTestTokenizer(lm: *LoadedModel, tokens: []const struct { u32, []const u8 }) !void {
     const tok = try lm.allocator.create(Tokenizer);
-    tok.* = Tokenizer.initEmptyForTests(lm.allocator, .byte_level_bpe);
+    tok.* = Tokenizer.initEmptyForTests(lm.allocator);
     for (tokens) |t| try tok.id_to_token.put(t[0], t[1]);
     lm.tokenizer = tok;
 }

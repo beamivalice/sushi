@@ -201,7 +201,7 @@ test "format corpus: control-token text in a user, system or tool message stays 
     // The bytes are the template's render: literal text changes the ids, never the prompt.
     const rendered = try chat.renderChatTemplate(a, &messages, &config, null, null, false, null, false);
     defer a.free(rendered);
-    const text = try tok.decode(a, ids, false);
+    const text = try tok.decode(a, ids);
     defer a.free(text);
     try testing.expectEqualStrings(rendered, text);
 }

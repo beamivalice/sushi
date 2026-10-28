@@ -1515,7 +1515,7 @@ pub fn main(init: std.process.Init) !void {
             var completion_tokens: u32 = 0;
             while (try gen.next(allocator)) |token_id| {
                 const ids = [_]u32{token_id};
-                const piece = try tok.decode(allocator, &ids, completion_tokens == 0);
+                const piece = try tok.decode(allocator, &ids);
                 defer allocator.free(piece);
                 if (piece.len > 0) {
                     try stdout_w.writeAll(piece);
