@@ -858,6 +858,16 @@ const corpus = [_]Expect{
         .tool_arg_value = "Paris, France",
         .last_tool_arg_value = "Tokyo, Japan",
     },
+    .{
+        // Raw JSON that spells the argument object `parameters`, not `arguments`.
+        .family = "shared",
+        .name = "bare JSON call with a `parameters` object",
+        .raw = "{\"name\": \"write_file\", \"parameters\": {\"path\": \"a.txt\", \"content\": \"hi\"}}",
+        .tool_name = "write_file",
+        .tool_count = 1,
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+    },
     // ── Small-model big-file escaping recovery (looseRepairToolCallJson) ────
     // Class: a model writing a large file in one shot mangles the JSON `content`
     // string — raw control bytes instead of `\n`/`\t`, and/or unescaped inner
