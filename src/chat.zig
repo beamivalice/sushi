@@ -1863,6 +1863,7 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
 /// parse has no reliable end, and shipping half of it is the same leak.
 const tool_markup_openers = [_][]const u8{
     "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
+    "</｜DSML｜", // lone closers the model emits after prose with no opener
     "<|tool_call", // Gemma 4
     "<tool_call", // Hermes XML + the plural variants
     "<atem:", // Muse-Glimmer ATEM (covers function_calls/invoke/parameter)
@@ -2933,6 +2934,7 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 
     // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
     if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
+    if (std.mem.indexOf(u8, buf, "</｜DSML｜") != null) return true;
 
     // Muse-Glimmer ATEM: everything from the wrapper on is call payload.
     if (std.mem.indexOf(u8, buf, "<atem:") != null) return true;
@@ -2977,6 +2979,8 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         // splits too in case the tokenizer spells the marker in pieces)
         "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
         "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
+        "</", "</\xef", "</\xef\xbd", "</｜", "</｜D", "</｜DS", "</｜DSM",
+        "</｜DSML", "</｜DSML\xef", "</｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -12699,6 +12703,16 @@ test "parseToolCalls dsml: zero-arg call and thinking prefix" {
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("list_files", calls[0].name);
     try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "streamShouldBufferForTools: lone DSML closer holds, ordinary closing tags flush" {
+    try testing.expect(streamShouldBufferForTools("Done.\n\n</｜DSML｜ parameter>"));
+    try testing.expect(streamShouldBufferForTools("Done. </"));
+    try testing.expect(streamShouldBufferForTools("Done. </｜DS"));
+    try testing.expect(streamShouldBufferForTools("Done. </｜DSML\xef\xbd"));
+    try testing.expect(!streamShouldBufferForTools("Use </div> here"));
+    try testing.expect(!streamShouldBufferForTools("a </b> then more"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n\n</｜DSML｜ calls>"));
 }
 
 test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hold" {

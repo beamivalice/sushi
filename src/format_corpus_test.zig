@@ -337,6 +337,10 @@ const write_read_tools_schema =
     \\[{"type":"function","function":{"name":"write","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
 ;
 
+const write_bash_tools_schema =
+    \\[{"type":"function","function":{"name":"write","description":"Write a file","parameters":{"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}}},{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+;
+
 /// pi's bash tool (one required string arg).
 const bash_tool_schema =
     \\[{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
@@ -1814,6 +1818,48 @@ const corpus = [_]Expect{
         .tool_arg_key = "content",
         .tool_arg_value = "first line\nlast line\n",
     },
+    .{
+        .family = "dsv4-dsml",
+        .name = "lone DSML closers after prose are cut, not answered",
+        .raw = "Task 3 tests pass. Running the full check.\n\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+        .content_exact = "Task 3 tests pass. Running the full check.",
+    },
+    .{
+        .family = "hermes",
+        .name = "a bare <invoke> inside a write value does not hijack the <tool_call>",
+        .raw = "<tool_call>\n<function=write>\n<parameter=content>\nrun <invoke name=\"bash\"><parameter name=\"command\">ls</parameter></invoke>\n</parameter>\n</function>\n</tool_call>",
+        .tools_json = write_bash_tools_schema,
+        .tool_name = "write",
+        .tool_count = 1,
+    },
+    .{
+        .family = "claude-invoke",
+        .name = "prose <invoke> opener before a real invoke keeps its own arguments",
+        .raw = "Use <invoke name=\"a\"> like so.\n<invoke name=\"bash\"><parameter name=\"command\">ls</parameter></invoke>",
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_count = 1,
+        .tool_arg_key = "command",
+        .tool_arg_value = "ls",
+    },
+    .{
+        .family = "glm-bare",
+        .name = "doubled <arg_key> opener keeps a clean key",
+        .raw = "<tool_call>write<arg_key><arg_key>file_path</arg_key><arg_value>x</arg_value></tool_call>",
+        .tool_name = "write",
+        .tool_arg_key = "file_path",
+        .tool_arg_value = "x",
+    },
+    .{
+        .family = "hermes",
+        .name = "special token spelled in place of < before function=",
+        .raw = "<tool_call>\n<|im_start|>function=read_file>\n<parameter=path>\nsrc/a.js\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "src/a.js",
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of
@@ -1828,7 +1874,7 @@ const leak_tags = [_][]const u8{
     // nobody can keep green.
     "<function name=",      "<param name=",    "</function>",       "</param>",
     // DeepSeek-V4 DSML marker (covers invoke/parameter/tool_calls forms).
-    "<｜DSML｜",
+    "<｜DSML｜", "</｜DSML｜",
     // Muse-Glimmer channel markers (each a single special token). The
     // `assistant to=` header TEXT between them is covered by the split tests.
     "<|start|>",            "<|message|>",     "<|eom|>",           "<|eot|>",
@@ -1930,6 +1976,13 @@ test "format corpus: recorded model outputs across families" {
                 };
                 defer parsed.deinit();
                 if (parsed.value != .object) try fail(entry, "tool arguments are not a JSON object", tc.arguments);
+                // An argument key never carries markup or a line break.
+                var key_it = parsed.value.object.iterator();
+                while (key_it.next()) |kv| {
+                    if (std.mem.indexOfAny(u8, kv.key_ptr.*, "<\n\r") != null) {
+                        try fail(entry, "argument KEY carries markup or a line break", kv.key_ptr.*);
+                    }
+                }
 
                 // Universal declared-type invariant: every argument whose type
                 // the tool declares must actually carry that JSON type. This is
