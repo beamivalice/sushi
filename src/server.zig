@@ -13139,9 +13139,40 @@ fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []const u
     } else try stream.flush();
 }
 
-fn logHttpRequest(method: []const u8, path: []const u8, body: []const u8) void {
+/// `raw_path` with the value of every `api_key` / `key` query parameter replaced by `***`; a query too long for
+/// `buf` is dropped whole rather than risk logging a key.
+fn redactQueryKeys(buf: []u8, raw_path: []const u8) []const u8 {
+    const qpos = std.mem.indexOfScalar(u8, raw_path, '?') orelse return raw_path;
+    const fail_closed = raw_path[0 .. qpos + 1];
+    if (qpos + 1 > buf.len) return fail_closed[0..@min(fail_closed.len, buf.len)];
+    @memcpy(buf[0 .. qpos + 1], fail_closed);
+    var n = qpos + 1;
+    var it = std.mem.splitScalar(u8, raw_path[qpos + 1 ..], '&');
+    var first = true;
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=');
+        const secret = eq != null and (std.mem.eql(u8, pair[0..eq.?], "api_key") or std.mem.eql(u8, pair[0..eq.?], "key"));
+        const kept = if (secret) pair[0 .. eq.? + 1] else pair;
+        const tail = if (secret) "***" else "";
+        const need = @intFromBool(!first) + kept.len + tail.len;
+        if (n + need > buf.len) return fail_closed;
+        if (!first) {
+            buf[n] = '&';
+            n += 1;
+        }
+        @memcpy(buf[n..][0..kept.len], kept);
+        n += kept.len;
+        @memcpy(buf[n..][0..tail.len], tail);
+        n += tail.len;
+        first = false;
+    }
+    return buf[0..n];
+}
+
+fn logHttpRequest(method: []const u8, raw_path: []const u8, body: []const u8) void {
     if (!log.isDebug()) return;
-    log.debug("[http] -> {s} {s} body={d}b\n", .{ method, path, body.len });
+    var buf: [1024]u8 = undefined;
+    log.debug("[http] -> {s} {s} body={d}b\n", .{ method, redactQueryKeys(&buf, raw_path), body.len });
     logHttpBody("[http] request body", body);
 }
 
@@ -29013,4 +29044,14 @@ test "image input decodes GIF and BMP: red, green over blue, white" {
         try std.testing.expectEqual(@as(u32, 2), size.w);
         try std.testing.expectEqual(@as(u32, 2), size.h);
     }
+}
+
+test "the debug log redacts api_key and key query values and keeps the rest" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/metrics", redactQueryKeys(&buf, "/metrics"));
+    try std.testing.expectEqualStrings("/metrics?api_key=***", redactQueryKeys(&buf, "/metrics?api_key=s3cret"));
+    try std.testing.expectEqualStrings("/m?a=1&key=***&b=2", redactQueryKeys(&buf, "/m?a=1&key=abc&b=2"));
+    try std.testing.expectEqualStrings("/m?api_key=***&key=***", redactQueryKeys(&buf, "/m?api_key=x&key=y"));
+    try std.testing.expectEqualStrings("/m?apikey=1&flag", redactQueryKeys(&buf, "/m?apikey=1&flag"));
+    try std.testing.expectEqualStrings("/m?", redactQueryKeys(&buf, "/m?" ++ "a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&" ++ "key=zzzz"));
 }
