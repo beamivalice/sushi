@@ -1,7 +1,8 @@
 //! DeepSeek-V4.1's prefill takes its working set from the expert cache. A forward that does not fit the free memory
 //! first releases whole decoder-layer pools, latest layer first: under CED those layers run only a chunk's last
 //! `window` rows, and a released layer's picks are read into the union workspace. The first decode forward after the
-//! prefill reads the pools back. Admission bills a request's state and a decode forward, not its prefill working set.
+//! prefill reads the pools back. Every forward runs under a transient cap (`Config.forwardCap`), which is what admission
+//! bills: a request's state, a decode forward's cap and the part of a prefill's the pools cannot cover.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
@@ -15,53 +16,44 @@ const Config = cfg_mod.Config;
 /// nothing is ever released.
 pub var headroom_fn: ?*const fn (*const ModelConfig) u64 = null;
 
-/// The widest verify block, `t1` and 16 drafts: up to it a forward is a decode forward, whose working set admission
-/// reserves.
-pub const verify_rows: u64 = 17;
+/// The widest verify block: up to it a forward is a decode forward, whose cap admission always reserves.
+pub const verify_rows = cfg_mod.verify_rows;
 
-/// The working set of a forward of `rows` that ends at position `seq` (a prefill chunk's, whose last chunk may absorb a
-/// tail, or a decode or verify forward's) and the state its rows add.
-pub fn forwardBytes(c: *const Config, rows: u64, seq: u64) u64 {
-    const work = if (rows > verify_rows) c.transientBytes(rows -| cfg_mod.tail_merge_rows, seq) else c.decodeTransientBytes(rows, seq);
-    return work +| rows *| c.stateBytesPerToken();
+/// What a prefill-width forward must find free before it runs: the most it may allocate (`Config.forwardCap`).
+pub fn prefillNeed(c: *const Config, rows: u64, seq: u64) u64 {
+    return c.forwardCap(rows, seq);
 }
 
-/// What a prefill-width forward must find free before it runs: `forwardBytes` with the request bill's quarter, and the
-/// buffer pool's growth above the decode cap (`poolGrowth`).
-pub fn prefillNeed(c: *const Config, rows: u64, seq: u64, pool_growth: u64) u64 {
-    return forwardBytes(c, rows, seq) *| 5 / 4 +| pool_growth;
-}
-
-/// PURE: the MLX buffer-pool cap of a forward of `rows`, and the pool its need bills: the decode cap up to a verify
-/// block, then growing with the rows to the prefill cap at a default chunk (`prefill_width`), never above the RAM-wide
-/// cap. A 2048-row chunk parks ~3.8 MB a row (twice the forward's own ~2 MB a row), so the cap spreads evenly over it.
-pub fn poolCap(rows: u64, decode_cap: u64, prefill_cap: u64, ram_cap: u64) u64 {
+/// PURE: the MLX buffer-pool cap of a forward of `rows`: the decode cap up to a verify block, the RAM-wide cap above
+/// it. The transient cap bounds the pool with the forward's allocations, so a wide forward needs no cap of its own.
+pub fn poolCap(rows: u64, decode_cap: u64, ram_cap: u64) u64 {
     const decode = @min(ram_cap, decode_cap);
-    if (rows <= verify_rows) return decode;
-    const full = @min(ram_cap, @max(prefill_cap, decode_cap));
-    return @max(decode, @min(full, full *| rows / cfg_mod.prefill_width));
+    return if (rows <= verify_rows) decode else @max(decode, ram_cap);
 }
 
-/// The RAM-wide pool cap, installed by the server. Unset (tests, `sushi kld`), the pool is never moved.
+/// The RAM-wide pool cap, installed by the server. Unset (tests, `sushi kld`), neither cap is ever moved.
 pub var pool_ram_cap: u64 = 0;
 /// The cap in force while it is above the decode cap; null at the decode cap the ledger set at load.
 var pool_now: ?u64 = null;
+/// Whether a transient cap is installed.
+var transient_now: bool = false;
 /// The process-wide cap the load replaced with the decode cap; null while none is lowered.
 var ram_limit: ?u64 = null;
 
 pub const PoolOps = struct {
     set_limit: *const fn (bytes: u64) void,
     clear: *const fn () void,
+    /// Caps what MLX may allocate beyond what it holds now, its freed-buffer pool included; 0 lifts the cap.
+    set_transient: *const fn (bytes: u64) void,
 };
 
 fn rowsCap(rows: u64, config: *const ModelConfig) u64 {
-    return poolCap(rows, config.expertPoolBytes(), config.prefillPoolBytes(), if (pool_ram_cap == 0) std.math.maxInt(u64) else pool_ram_cap);
+    return poolCap(rows, config.expertPoolBytes(), if (pool_ram_cap == 0) std.math.maxInt(u64) else pool_ram_cap);
 }
 
-/// What a forward of `rows` parks above the decode cap. The decode cap is a standing term of the live headroom
-/// (`server.dsv41Headroom`), so a forward that stays at it bills nothing more.
-pub fn poolGrowth(rows: u64, config: *const ModelConfig) u64 {
-    return rowsCap(rows, config) -| config.expertPoolBytes();
+/// What a phase may take: its own bytes and the decode pool the ledger parks beside every phase.
+fn phaseLimit(bytes: u64, config: *const ModelConfig) u64 {
+    return bytes +| config.expertPoolBytes();
 }
 
 fn moveCap(want: u64, config: *const ModelConfig, ops: PoolOps) bool {
@@ -75,16 +67,38 @@ fn moveCap(want: u64, config: *const ModelConfig, ops: PoolOps) bool {
     return true;
 }
 
-/// Moves the pool cap to the one `rows` bills, on the inference thread. True on a change.
-pub fn enterForward(rows: u64, config: *const ModelConfig, ops: PoolOps) bool {
+fn setTransient(bytes: u64, ops: PoolOps) void {
+    transient_now = bytes > 0;
+    ops.set_transient(bytes);
+}
+
+/// Moves the pool cap to the one `rows` takes and caps the forward's allocations at what it bills, on the inference
+/// thread. True when the pool cap moved.
+pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
     if (pool_ram_cap == 0 or !config.isDsv41()) return false;
+    setTransient(phaseLimit(c.forwardCap(rows, seq), config), ops);
     return moveCap(rowsCap(rows, config), config, ops);
 }
 
-/// A request is over: whatever forward ran last, the cap drops back to the decode cap.
+/// An image encode of `bill` bytes (`server.visionEncodeBill`) starts: its allocations are capped at it. No bill, no cap.
+pub fn enterVision(bill: u64, config: *const ModelConfig, ops: PoolOps) void {
+    if (pool_ram_cap == 0 or bill == 0 or !config.isDsv41()) return;
+    setTransient(phaseLimit(bill, config), ops);
+}
+
+/// The encode is over; the next forward installs its own cap.
+pub fn leaveVision(config: *const ModelConfig, ops: PoolOps) void {
+    if (pool_ram_cap == 0 or !config.isDsv41() or !transient_now) return;
+    setTransient(0, ops);
+}
+
+/// A request is over: whatever forward ran last, the transient cap is lifted (a restore allocates the next request's
+/// state before its first forward) and the pool cap drops back to the decode cap.
 pub fn endRequest(config: *const ModelConfig, ops: PoolOps) bool {
     if (pool_ram_cap == 0 or !config.isDsv41()) return false;
-    return moveCap(config.expertPoolBytes(), config, ops);
+    const was_on = transient_now;
+    if (was_on) setTransient(0, ops);
+    return moveCap(config.expertPoolBytes(), config, ops) or was_on;
 }
 
 /// The load lowered the process-wide cap from `prev` to the ledger's decode cap.
@@ -96,6 +110,7 @@ pub fn poolCapped(prev: u64) void {
 pub fn unloadModel(config: *const ModelConfig, ops: PoolOps) bool {
     if (!config.isDsv41()) return false;
     pool_now = null;
+    if (transient_now) setTransient(0, ops);
     const prev = ram_limit orelse return false;
     ram_limit = null;
     ops.set_limit(prev);
@@ -121,7 +136,27 @@ fn mlxClear() void {
     _ = mlx.mlx_clear_cache();
 }
 
-const mlx_ops: PoolOps = .{ .set_limit = &mlxSetLimit, .clear = &mlxClear };
+/// The limit counts MLX's own active bytes and its pool, so it is installed over what is live now.
+fn mlxSetTransient(bytes: u64) void {
+    if (bytes == 0) {
+        _ = mlx.setTransientLimit(0);
+        return;
+    }
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.setTransientLimit(@intCast(@as(u64, active) -| mlx.externalMemory() +| bytes));
+}
+
+const mlx_ops: PoolOps = .{ .set_limit = &mlxSetLimit, .clear = &mlxClear, .set_transient = &mlxSetTransient };
+
+/// The image-encode hooks on the real MLX allocator.
+pub fn enterVisionMlx(bill: u64, config: *const ModelConfig) void {
+    enterVision(bill, config, mlx_ops);
+}
+
+pub fn leaveVisionMlx(config: *const ModelConfig) void {
+    leaveVision(config, mlx_ops);
+}
 
 /// The pools a prefill may release when `cache_bytes` is split evenly over the layers: the load-time estimate the
 /// engine's own count replaces once it is built.
@@ -146,11 +181,11 @@ pub fn releaseCount(pools: []const u64, need: u64, headroom: u64) ?usize {
 /// its need fits the live headroom, and is refused when all of them do not cover it. A decode forward reads released
 /// pools back while each fits beside its own working set.
 pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: u64, seq: u64) !void {
-    _ = enterForward(rows, config, mlx_ops);
+    _ = enterForward(rows, seq, config, c, mlx_ops);
     const headroom = headroom_fn orelse return;
     if (engine.borrow_from >= engine.layers.len) return;
-    if (rows <= verify_rows) return restore(engine, config, headroom, forwardBytes(c, rows, seq));
-    const need = prefillNeed(c, rows, seq, poolGrowth(rows, config));
+    if (rows <= verify_rows) return restore(engine, config, headroom, c.forwardCap(rows, seq));
+    const need = prefillNeed(c, rows, seq);
     if (headroom(config) >= need) return;
     _ = mlx.mlx_clear_cache();
     const before = headroom(config);
@@ -249,14 +284,13 @@ test "dsv41 borrow: a forward releases pools in order until the headroom covers 
     try testing.expectEqual(@as(?usize, null), releaseCount(&pools, 13, 0));
 }
 
-test "dsv41 borrow: a prefill chunk's need is its working set and its rows' state with the quarter, a decode forward's is far smaller" {
+test "dsv41 borrow: a forward's need is its cap, a decode forward's far smaller" {
     const c = try cfg_mod.parseText(cfg_mod.release_config);
     const ctx: u64 = 1 << 20;
-    try testing.expectEqual((c.transientBytes(2048 - cfg_mod.tail_merge_rows, ctx) + 2048 * c.stateBytesPerToken()) * 5 / 4, prefillNeed(&c, 2048, ctx, 0));
+    try testing.expectEqual(c.forwardCap(2048, ctx), prefillNeed(&c, 2048, ctx));
     // A last chunk that absorbed its tail is priced at its own rows.
-    try testing.expect(prefillNeed(&c, 2048 + 511, ctx, 0) > prefillNeed(&c, 2048, ctx, 0));
-    try testing.expectEqual(c.decodeTransientBytes(6, ctx) + 6 * c.stateBytesPerToken(), forwardBytes(&c, 6, ctx));
-    try testing.expect(forwardBytes(&c, verify_rows, ctx) * 3 < prefillNeed(&c, 512, ctx, 0));
+    try testing.expect(prefillNeed(&c, 2048 + 511, ctx) > prefillNeed(&c, 2048, ctx));
+    try testing.expect(c.forwardCap(verify_rows, ctx) * 3 < prefillNeed(&c, 512, ctx) * 2);
 }
 
 test "dsv41 borrow: the load-time estimate is the decoder layers' even share of the cache, STQ packs only" {
@@ -265,63 +299,46 @@ test "dsv41 borrow: the load-time estimate is the decoder layers' even share of 
     try testing.expectEqual(@as(u64, 0), plannedBytes(&c, false, 80_000_000_000));
 }
 
-test "dsv41 borrow: a prefill chunk's need carries the pool it may park, and the decoder pools cover both at 1M" {
-    const c = try cfg_mod.parseText(cfg_mod.release_config);
-    const ctx: u64 = 1 << 20;
-    const pool = @import("model.zig").dsv41_prefill_pool_bytes;
-    try testing.expectEqual(prefillNeed(&c, 2048, ctx, 0) + pool, prefillNeed(&c, 2048, ctx, pool));
-    // A 60 GB cache leaves the decoder layers this many bytes to lend.
-    const lend = plannedBytes(&c, true, 60_000_000_000);
-    try testing.expect(lend >= prefillNeed(&c, 2048 + 511, ctx, pool));
-}
-
-test "dsv41 borrow: the pool cap scales with the forward's rows, from the decode cap up to the prefill cap and never past the RAM-wide cap" {
+test "dsv41 borrow: the pool cap is the decode cap up to a verify block and the RAM-wide cap above it" {
     const decode: u64 = 1 << 30;
-    const prefill: u64 = 8 << 30;
     const ram: u64 = 8 << 30;
-    try testing.expectEqual(decode, poolCap(1, decode, prefill, ram));
-    try testing.expectEqual(decode, poolCap(verify_rows, decode, prefill, ram));
-    // A short tail parks the decode pool and no more; the bill and the MLX cap are the same number.
-    try testing.expectEqual(decode, poolCap(31, decode, prefill, ram));
-    try testing.expectEqual(@as(u64, 2 << 30), poolCap(512, decode, prefill, ram));
-    try testing.expectEqual(@as(u64, 4 << 30), poolCap(1024, decode, prefill, ram));
-    try testing.expectEqual(prefill, poolCap(cfg_mod.prefill_width, decode, prefill, ram));
-    try testing.expectEqual(prefill, poolCap(2048 + 511, decode, prefill, ram));
-    try testing.expectEqual(prefill, poolCap(1 << 20, decode, prefill, ram));
-    var rows: u64 = 1;
-    while (rows < 1 << 21) : (rows += 97) {
-        try testing.expect(poolCap(rows, decode, prefill, ram) <= ram);
-        try testing.expect(poolCap(rows, decode, prefill, 4 << 30) <= 4 << 30);
-        try testing.expect(poolCap(rows, decode, prefill, ram) >= poolCap(rows -| 1, decode, prefill, ram));
-    }
-    try testing.expectEqual(@as(u64, 4 << 30), poolCap(2048, decode, prefill, 4 << 30));
-    try testing.expectEqual(@as(u64, 512 << 20), poolCap(31, decode, prefill, 512 << 20));
-    try testing.expectEqual(decode, poolCap(4096, decode, 1 << 20, ram));
+    try testing.expectEqual(decode, poolCap(1, decode, ram));
+    try testing.expectEqual(decode, poolCap(verify_rows, decode, ram));
+    try testing.expectEqual(ram, poolCap(verify_rows + 1, decode, ram));
+    try testing.expectEqual(ram, poolCap(1 << 20, decode, ram));
+    // Never past the RAM-wide cap, and never under the decode cap it is the floor of.
+    try testing.expectEqual(@as(u64, 4 << 30), poolCap(2048, decode, 4 << 30));
+    try testing.expectEqual(@as(u64, 512 << 20), poolCap(31, decode, 512 << 20));
+    try testing.expectEqual(@as(u64, 1 << 20), poolCap(4096, decode, 1 << 20));
 }
 
-test "dsv41 borrow: at the budget-115 geometry a 31-row tail fits the headroom with no release, a 2048-row chunk releases three pools" {
+test "dsv41 borrow: at the budget-115 geometry no chunk releases a pool, and at 117 a 2048-row chunk releases one" {
     const c = try cfg_mod.parseText(cfg_mod.release_config);
-    const decode = @import("model.zig").dsv41_pool_bytes;
-    const prefill = @import("model.zig").dsv41_prefill_pool_bytes;
-    const ram: u64 = 8 << 30;
     // Live at `--ssd-budget-gb 115` (280 slots a layer): the decoder pools a prefill may release, and the headroom there.
     const pools = [_]u64{ 2_700_000_000, 2_700_000_000, 2_760_000_000 };
     const headroom: u64 = 8_950_000_000;
-    const tail = prefillNeed(&c, 31, 14766, poolCap(31, decode, prefill, ram) - decode);
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, tail, headroom));
-    const chunk = prefillNeed(&c, 2048, 2048, poolCap(2048, decode, prefill, ram) - decode);
-    try testing.expectEqual(@as(?usize, 3), releaseCount(&pools, chunk, headroom));
-    // The same tail with the full pool billed is what forced the borrow.
-    try testing.expectEqual(@as(?usize, 2), releaseCount(&pools, prefillNeed(&c, 31, 14766, prefill), headroom));
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, 31, 14766), headroom));
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, 2048, 2048), headroom));
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, 2048 + 511, 1 << 20), headroom));
+    // At 117 the headroom is ~4.6 GB.
+    try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, 2048, 2048), 4_600_000_000));
 }
 
 const PoolProbe = struct {
     var limits: [8]u64 = undefined;
     var n: usize = 0;
     var cleared: usize = 0;
+    var transient: u64 = 0;
+    var transient_sets: usize = 0;
     fn reset() void {
         n = 0;
         cleared = 0;
+        transient = 0;
+        transient_sets = 0;
+    }
+    fn capTransient(bytes: u64) void {
+        transient = bytes;
+        transient_sets += 1;
     }
     fn set(bytes: u64) void {
         limits[n] = bytes;
@@ -330,100 +347,135 @@ const PoolProbe = struct {
     fn clear() void {
         cleared += 1;
     }
-    const ops: PoolOps = .{ .set_limit = &set, .clear = &clear };
+    const ops: PoolOps = .{ .set_limit = &set, .clear = &clear, .set_transient = &capTransient };
 };
 
 fn withPoolState(ram_cap: u64, body: *const fn () anyerror!void) !void {
-    const saved = .{ pool_ram_cap, pool_now, ram_limit };
+    const saved = .{ pool_ram_cap, pool_now, ram_limit, transient_now };
     defer {
         pool_ram_cap = saved[0];
         pool_now = saved[1];
         ram_limit = saved[2];
+        transient_now = saved[3];
     }
     pool_ram_cap = ram_cap;
     pool_now = null;
     ram_limit = null;
+    transient_now = false;
     PoolProbe.reset();
     try body();
 }
 
+fn dsv41Config() !ModelConfig {
+    var config = ModelConfig{ .model_type = "deepseek_v41" };
+    config.dsv41 = try cfg_mod.parseText(cfg_mod.release_config);
+    return config;
+}
+
 test "dsv41 borrow: a forward moves the pool cap to its rows' cap, and lowering it clears the pool" {
-    const config = ModelConfig{ .model_type = "deepseek_v41" };
     const Body = struct {
         fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
             const decode = config.expertPoolBytes();
             // A decode forward finds the ledger's cap in force: nothing to move.
-            try testing.expect(!enterForward(1, &config, PoolProbe.ops));
-            try testing.expect(!enterForward(31, &config, PoolProbe.ops));
+            try testing.expect(!enterForward(1, 9_000, &config, c, PoolProbe.ops));
+            try testing.expect(!enterForward(17, 9_000, &config, c, PoolProbe.ops));
             try testing.expectEqual(@as(usize, 0), PoolProbe.n);
-            try testing.expect(enterForward(2048, &config, PoolProbe.ops));
-            try testing.expect(!enterForward(2048, &config, PoolProbe.ops));
-            try testing.expectEqual(config.prefillPoolBytes(), PoolProbe.limits[0]);
+            try testing.expect(enterForward(2048, 2048, &config, c, PoolProbe.ops));
+            try testing.expect(!enterForward(2048, 4096, &config, c, PoolProbe.ops));
+            try testing.expectEqual(@as(u64, 8 << 30), PoolProbe.limits[0]);
             try testing.expectEqual(@as(usize, 0), PoolProbe.cleared);
             // A narrower forward after a wide one cannot leave the wide pool parked.
-            try testing.expect(enterForward(1024, &config, PoolProbe.ops));
-            try testing.expectEqual(@as(usize, 1), PoolProbe.cleared);
-            try testing.expect(enterForward(1, &config, PoolProbe.ops));
+            try testing.expect(enterForward(1, 4097, &config, c, PoolProbe.ops));
             try testing.expectEqual(decode, PoolProbe.limits[PoolProbe.n - 1]);
-            try testing.expectEqual(@as(usize, 2), PoolProbe.cleared);
+            try testing.expectEqual(@as(usize, 1), PoolProbe.cleared);
         }
     };
     try withPoolState(8 << 30, &Body.run);
-    // Unset (tests, `sushi kld`), the pool is never moved.
+    // Unset (tests, `sushi kld`), nothing is moved or capped.
+    const config = try dsv41Config();
     PoolProbe.reset();
-    try testing.expect(!enterForward(2048, &config, PoolProbe.ops));
+    try testing.expect(!enterForward(2048, 2048, &config, &config.dsv41.?, PoolProbe.ops));
     try testing.expectEqual(@as(usize, 0), PoolProbe.n);
+    try testing.expectEqual(@as(usize, 0), PoolProbe.transient_sets);
 }
 
-test "dsv41 borrow: a request that ends without a decode forward still lowers the pool cap" {
-    const config = ModelConfig{ .model_type = "deepseek_v41" };
+test "dsv41 borrow: every phase installs the cap it bills and the decode pool beside it" {
     const Body = struct {
         fn run() anyerror!void {
-            try testing.expect(enterForward(2048, &config, PoolProbe.ops));
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            const pool = config.expertPoolBytes();
+            _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(1, 9_000) + pool, PoolProbe.transient);
+            _ = enterForward(17, 225_000, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(17, 225_000) + pool, PoolProbe.transient);
+            _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(2048, 225_000) + pool, PoolProbe.transient);
+            // The same rows further into the context cost more: the cap follows the position.
+            const before = PoolProbe.transient;
+            _ = enterForward(2048, 1 << 20, &config, c, PoolProbe.ops);
+            try testing.expect(PoolProbe.transient > before);
+            // An image encode is capped at its own bill.
+            enterVision(1_100_000_000, &config, PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 1_100_000_000) + pool, PoolProbe.transient);
+            leaveVision(&config, PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 0), PoolProbe.transient);
+            // An encode with no bill is not capped to the pool alone.
+            const none = PoolProbe.transient_sets;
+            enterVision(0, &config, PoolProbe.ops);
+            try testing.expectEqual(none, PoolProbe.transient_sets);
+            // Another architecture is never capped.
+            const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+            const sets = PoolProbe.transient_sets;
+            enterVision(1 << 30, &qwen, PoolProbe.ops);
+            try testing.expectEqual(sets, PoolProbe.transient_sets);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: a request that ends lifts the transient cap and lowers the pool cap, even with no decode forward" {
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            _ = enterForward(2048, 2048, &config, &config.dsv41.?, PoolProbe.ops);
+            try testing.expect(PoolProbe.transient > 0);
             try testing.expect(endRequest(&config, PoolProbe.ops));
+            try testing.expectEqual(@as(u64, 0), PoolProbe.transient);
             try testing.expectEqual(config.expertPoolBytes(), PoolProbe.limits[PoolProbe.n - 1]);
             try testing.expectEqual(@as(usize, 1), PoolProbe.cleared);
-            // Already at the decode cap: nothing to do.
+            // Already at rest: nothing to do.
+            const sets = PoolProbe.transient_sets;
             try testing.expect(!endRequest(&config, PoolProbe.ops));
-            try testing.expectEqual(@as(usize, 2), PoolProbe.n);
-            // Another architecture's request never touches the pool.
-            try testing.expect(enterForward(2048, &config, PoolProbe.ops));
+            try testing.expectEqual(sets, PoolProbe.transient_sets);
+            // A decode request that ends: the cap is lifted though the pool cap never moved.
+            _ = enterForward(1, 9_000, &config, &config.dsv41.?, PoolProbe.ops);
+            try testing.expect(endRequest(&config, PoolProbe.ops));
+            try testing.expectEqual(@as(u64, 0), PoolProbe.transient);
+            // Another architecture's request never touches either cap.
+            _ = enterForward(2048, 2048, &config, &config.dsv41.?, PoolProbe.ops);
             const qwen = ModelConfig{ .model_type = "qwen4_exp" };
             try testing.expect(!endRequest(&qwen, PoolProbe.ops));
-        }
-    };
-    try withPoolState(8 << 30, &Body.run);
-}
-
-test "dsv41 borrow: a forward bills the pool it parks above the decode cap, so a decode-width tail adds nothing" {
-    const config = ModelConfig{ .model_type = "deepseek_v41" };
-    const Body = struct {
-        fn run() anyerror!void {
-            const c = try cfg_mod.parseText(cfg_mod.release_config);
-            const decode = config.expertPoolBytes();
-            try testing.expectEqual(@as(u64, 0), poolGrowth(1, &config));
-            try testing.expectEqual(@as(u64, 0), poolGrowth(31, &config));
-            try testing.expectEqual(decode, poolGrowth(512, &config));
-            try testing.expectEqual(config.prefillPoolBytes() - decode, poolGrowth(2048, &config));
-            // The ledger holds the decode cap: the need of a 31-row tail is its working set and the quarter.
-            try testing.expectEqual(forwardBytes(&c, 31, 14766) * 5 / 4, prefillNeed(&c, 31, 14766, poolGrowth(31, &config)));
-            try testing.expectEqual(forwardBytes(&c, 2048, 2048) * 5 / 4 + config.prefillPoolBytes() - decode, prefillNeed(&c, 2048, 2048, poolGrowth(2048, &config)));
+            try testing.expect(PoolProbe.transient > 0);
         }
     };
     try withPoolState(8 << 30, &Body.run);
 }
 
 test "dsv41 borrow: unloading DeepSeek gives the next model the process-wide pool cap and forgets the raised cap" {
-    const config = ModelConfig{ .model_type = "deepseek_v41" };
     const Body = struct {
         fn run() anyerror!void {
+            const config = try dsv41Config();
             const ram: u64 = 8 << 30;
             poolCapped(ram);
             // A second load keeps the cap the first one replaced.
             poolCapped(config.expertPoolBytes());
-            try testing.expect(enterForward(2048, &config, PoolProbe.ops));
+            try testing.expect(enterForward(2048, 2048, &config, &config.dsv41.?, PoolProbe.ops));
             try testing.expect(pool_now != null);
             try testing.expect(unloadModel(&config, PoolProbe.ops));
+            try testing.expectEqual(@as(u64, 0), PoolProbe.transient);
             try testing.expectEqual(ram, PoolProbe.limits[PoolProbe.n - 1]);
             try testing.expectEqual(@as(?u64, null), pool_now);
             try testing.expectEqual(@as(?u64, null), ram_limit);

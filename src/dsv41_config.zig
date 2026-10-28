@@ -177,7 +177,7 @@ pub const Config = struct {
 
     /// Bytes ONE token adds to a request's state: the compressed KV rows of each KV source (FP4 with an E4M3 scale per
     /// 16) and the index keys of each owner (MXFP4), at their `ratio`-to-1 compression, stored as the round trips
-    /// left them. Growth slack and the copy a growth makes are transient (`transientBytes`).
+    /// left them. Growth slack and the copy a growth makes are transient (`forwardCap`).
     pub fn stateBytesPerToken(self: *const Config) u64 {
         var raw: u64 = 0;
         for (0..self.layers) |l| {
@@ -214,37 +214,22 @@ pub const Config = struct {
         return base + (@as(u64, self.n_mtp) * self.window + @as(u64, self.layers) * ring_slack) * self.head_dim * act_bytes;
     }
 
-    /// The forward's working set for `chunk` rows against `seq` positions: the residual streams and
-    /// MoE activations scale with the rows, the attention spans with the span width, and the head
-    /// scores one row. A prompt's last chunk absorbs a tail of up to `tail_merge_rows`, so the widest forward is
-    /// `chunk + tail_merge_rows` rows.
-    pub fn transientBytes(self: *const Config, chunk: u64, seq: u64) u64 {
-        return self.workingSet(@min(chunk +| tail_merge_rows, @max(seq, 1)), 1, seq);
-    }
-
-    /// `transientBytes` for a decode or verify forward of `rows`: no tail merge, every row's logits. With the prefill's
-    /// working set taken from the expert cache (`dsv41_borrow`), this is what admission still reserves.
-    pub fn decodeTransientBytes(self: *const Config, rows: u64, seq: u64) u64 {
-        return self.workingSet(@max(rows, 1), @max(rows, 1), seq);
-    }
-
-    fn workingSet(self: *const Config, rows: u64, head_rows: u64, seq: u64) u64 {
-        const span = @min(rows, span_rows);
-        const keys: u64 = @as(u64, self.index_topk) + self.window;
-        const attn = span * keys * self.head_dim * 4 * 3 + span * self.heads * self.head_dim * 4 * 4 + span * self.heads * keys * 4 * 3;
-        const index = span * self.index_heads * index_tile * 4 * 2;
-        // Scaled by the context: a wide span's index top-k streams over key tiles, so its scores, their masked copy and
-        // the tile's keys stop growing at one tile, and the candidate masks of the rows that hold them are a byte per
-        // block; a decode-width block scores every key from the packed rows (`narrow_rows` rows, `score_copies` live
-        // copies, the two phases never overlap); and the rows' growth, its slack plus one layer's old rows during the copy.
+    /// The most one forward of `rows` ending at position `seq` may allocate through MLX beyond what is live when it
+    /// starts: its transients and the state rows it appends. The transient cap installs it (`dsv41_borrow`) and
+    /// admission bills it. A prefill-width forward costs `cap_row_bytes_per_dim` a row and a channel; a decode or
+    /// verify block scores every key (`narrow_rows` rows, `score_copies` copies) and its rows fit in the slack. Both
+    /// carry the rows' growth: its slack plus one layer's old rows beside the new buffer during the copy.
+    pub fn forwardCap(self: *const Config, rows: u64, seq: u64) u64 {
         const ctx = @max(seq, 1);
-        const cand_rows = if (self.cedSplit() != null) @min(rows, self.window) else rows;
-        const masks = if (self.cand_source >= 0 and self.cand_block_size > 0) cand_rows * ctx / self.cand_block_size * 2 else 0;
-        const scored = span * @min(ctx, index_stream_tile) * 4 * score_copies + masks;
-        const narrow = narrow_rows * ctx * 4 * score_copies;
-        const by_ctx = @max(scored, narrow) + ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
-        const per_row = @as(u64, self.dim) * row_bytes_per_dim;
-        return attn + index + by_ctx + rows * per_row + head_rows * @as(u64, self.vocab) * 4 * 3 + slack_bytes;
+        const by_rows = if (rows > verify_rows) rows *| self.dim *| cap_row_bytes_per_dim else narrow_rows * ctx * 4 * score_copies;
+        const growth = ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
+        return (by_rows +| growth) *| 5 / 4 +| cap_slack_bytes;
+    }
+
+    /// `forwardCap` of a prefill chunk of `chunk` rows ending at `seq`: the last chunk of a prompt absorbs a tail of
+    /// up to `tail_merge_rows`, so the widest forward is `chunk + tail_merge_rows` rows.
+    pub fn chunkCap(self: *const Config, chunk: u64, seq: u64) u64 {
+        return self.forwardCap(@min(chunk +| tail_merge_rows, @max(seq, 1)), seq);
     }
 };
 
@@ -262,20 +247,20 @@ fn indexRowBytes(width: u64) u64 {
 /// The prefill chunk a load runs at when its bill fits (an explicit `--prefill-chunk` outranks it): with CED the bulk of a
 /// chunk is the encoder's 20 layers, whose experts a wider chunk reads once for more rows.
 pub const prefill_width: u32 = 2048;
-const slack_bytes: u64 = 256 << 20;
+/// Added to every cap: twice the 0.12 GiB of small tensors and tables a decode forward was measured to hold.
+const cap_slack_bytes: u64 = 256 << 20;
 const score_copies: u64 = 3;
 /// `generate.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
 pub const tail_merge_rows: u64 = 511;
-/// Peak bytes a forward row holds per hidden channel, with each span, attention and FFN freed at its scope's end.
-/// Measured on the 5120-wide release as 1.0 to 1.8 MB a row between 512 and 1507 rows.
-const row_bytes_per_dim: u64 = 400;
-/// Rows per attention span and index keys scored per matmul, as `dsv41_model` runs them.
-pub const span_rows: u64 = 256;
-pub const index_tile: u64 = 4096;
+/// Peak bytes a prefill forward row holds per hidden channel: measured on the 5120-wide release as 2.3 MiB a row from
+/// 256 to 2048 rows (2.8 MiB for one 363-row chunk, its state rows included), rounded up.
+const cap_row_bytes_per_dim: u64 = 480;
 /// Keys one pass of a wide span's streamed index top-k scores, as `dsv41_model` runs them.
 pub const index_stream_tile: u64 = 32768;
 /// Rows up to which the indexer scores a block with the scalar kernel, whole rows at a time.
 pub const narrow_rows: u64 = 16;
+/// The widest verify block, `t1` and 16 drafts: up to it a forward is a decode forward.
+pub const verify_rows: u64 = 17;
 /// A row store grows by its length over this: slack is that fraction of the state, and each growth copies the store.
 pub const rows_grow_div: u64 = 16;
 
@@ -527,31 +512,61 @@ pub fn readFile(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8) !Confi
 
 const testing = std.testing;
 
-test "dsv41 bills: a token costs its compressed rows and the transient scales with the chunk" {
+test "dsv41 bills: a token costs its compressed rows" {
     const c = try parseText(release_config);
     // KV sources and index owners 2, 8, 14 compress 2:1 and 20 keeps a row per token: main rows 288 B, index keys
     // 68 B, the release's 890 B per token.
     try testing.expectEqual(@as(u64, 890), c.stateBytesPerToken());
     // 40 bf16 window rings of 128 rows and the open pooling group of the three 2:1 sources.
     try testing.expectEqual(@as(u64, 40 * 128 * 512 * 2 + 3 * 512 * 4 * 2), c.stateFixedBytes(false));
-    // The indexer streams key tiles, so the bill is flat in the context but for the decode block's scores and the rows'
-    // growth: under 1 KB a token past a tile of keys, where whole scores billed 3.9 KB.
-    try testing.expect(c.transientBytes(256, 1 << 20) - c.transientBytes(256, 1 << 18) < (3 << 18) * 1024);
-    try testing.expect(c.transientBytes(2048, 1 << 20) > c.transientBytes(512, 1 << 20));
-    try testing.expect(c.transientBytes(512, 100) < c.transientBytes(512, 1 << 20));
-    try testing.expect(c.transientBytes(1, 1) >= slack_bytes);
 }
 
-test "dsv41 bills: a decode or verify forward bills its own rows, the scores over the context and the rows' growth" {
+const gib: u64 = 1 << 30;
+
+fn gibs(x: f64) u64 {
+    return @intFromFloat(x * @as(f64, @floatFromInt(gib)));
+}
+
+test "dsv41 forward cap: covers a quarter over what every measured peak added to the state it started from" {
     const c = try parseText(release_config);
-    const ctx: u64 = 1 << 20;
-    // A decode block scores every key from the packed rows, and a growth copies one layer's old rows beside its slack.
-    const growth = ctx * (c.stateBytesPerToken() / rows_grow_div + c.worstLayerBytesPerToken());
-    try testing.expect(c.decodeTransientBytes(17, ctx) >= narrow_rows * ctx * 4 * score_copies + growth + slack_bytes);
-    try testing.expect(c.decodeTransientBytes(17, ctx) > c.decodeTransientBytes(1, ctx));
-    try testing.expect(c.decodeTransientBytes(17, ctx) > c.decodeTransientBytes(17, 8192));
-    // A prefill chunk's working set is several times a verify block's.
-    try testing.expect(c.decodeTransientBytes(17, ctx) * 3 < c.transientBytes(512, ctx));
+    // Peaks of MLX's own bytes (imported weights left out, state rows in), STQ pack, budget 108, binary 26a28040. The
+    // cap is over the level a forward starts at, which holds the state of `ctx` tokens at least.
+    const peaks = [_]struct { rows: u64, ctx: u64, peak: f64 }{
+        .{ .rows = 1, .ctx = 9_000, .peak = 0.116 },
+        .{ .rows = 1, .ctx = 225_000, .peak = 0.336 },
+        .{ .rows = verify_rows, .ctx = 225_000, .peak = 0.336 },
+        .{ .rows = 2048, .ctx = 2048, .peak = 4.57 },
+        .{ .rows = 2048, .ctx = 225_000, .peak = 4.772 },
+        .{ .rows = 1183, .ctx = 1183, .peak = 2.479 },
+        .{ .rows = 1000, .ctx = 1000, .peak = 2.253 },
+        .{ .rows = 363, .ctx = 363, .peak = 1.02 },
+        .{ .rows = 256, .ctx = 256, .peak = 0.572 },
+        .{ .rows = 42, .ctx = 42, .peak = 0.121 },
+        .{ .rows = 31, .ctx = 225_000, .peak = 0.336 },
+    };
+    for (peaks) |m| {
+        const added = gibs(m.peak) -| m.ctx * c.stateBytesPerToken();
+        try testing.expect(c.forwardCap(m.rows, m.ctx) >= added * 5 / 4);
+    }
+}
+
+test "dsv41 forward cap: grows with the rows and the context, a chunk's tail merge is priced, and 1M fits" {
+    const c = try parseText(release_config);
+    const m: u64 = 1 << 20;
+    try testing.expect(c.forwardCap(2048, 9_000) > c.forwardCap(1024, 9_000));
+    try testing.expect(c.forwardCap(2048, m) > c.forwardCap(2048, 9_000));
+    try testing.expect(c.forwardCap(verify_rows, m) > c.forwardCap(1, 9_000));
+    try testing.expect(c.forwardCap(verify_rows, m) * 4 < c.forwardCap(2048, m));
+    try testing.expectEqual(c.forwardCap(2048 + tail_merge_rows, m), c.chunkCap(2048, m));
+    // A prompt shorter than the chunk cannot run more rows than it has.
+    try testing.expectEqual(c.forwardCap(100, 100), c.chunkCap(2048, 100));
+    // The measured growth beyond the state rows (1094 B a token less 890) is a fraction of the cap's per-token slope.
+    const measured: u64 = (gibs(0.336) - gibs(0.116)) / (225_000 - 9_000) - c.stateBytesPerToken();
+    const slope = (c.forwardCap(1, m) - c.forwardCap(1, 9_000)) / (m - 9_000);
+    try testing.expect(slope >= measured * 5 / 4);
+    // The extrapolation to 1M context: a decode forward under 1.1 GB, a tail-merged 2048-row chunk under 8.8 GB.
+    try testing.expect(c.forwardCap(verify_rows, m) < 1_100_000_000);
+    try testing.expect(c.chunkCap(2048, m) < 8_800_000_000);
 }
 
 /// The V4.1-Flash release's `config.json`.

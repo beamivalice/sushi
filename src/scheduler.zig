@@ -6158,6 +6158,9 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         }
     };
 
+    if (req.model.config) |cfg| @import("dsv41_borrow.zig").enterVisionMlx(req.bill_bytes, cfg);
+    defer if (req.model.config) |cfg| @import("dsv41_borrow.zig").leaveVisionMlx(cfg);
+
     // Encode all soft tokens into `emb_parts`: images and videos in prompt
     // `order`, then audio, so the single splice channel scatters them in the
     // order of the placeholder rows.

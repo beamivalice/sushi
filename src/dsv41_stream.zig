@@ -1802,7 +1802,7 @@ fn borrowCase(cache_bytes: u64) !void {
 
     // The first chunk finds the need less one and a half of the last two pools: those two go, the rest stay.
     const first = 25;
-    const need = borrow.prefillNeed(&xfm.dsv41.?.cfg, first, first, 0);
+    const need = borrow.prefillNeed(&xfm.dsv41.?.cfg, first, first);
     BorrowProbe.engine = engine;
     try testing.expectEqual(cache_bytes == 64 << 20, engine.plan.resident);
     BorrowProbe.base = need + engine.unionPending() - engine.poolBytes(last) - engine.poolBytes(last - 1) / 2;

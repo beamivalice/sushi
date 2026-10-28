@@ -36,28 +36,17 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
   - **Decode** (a forward of up to 17 rows, DSpark's widest verify is 16): `dsv41_pool_bytes`, 1 GiB, billed in the
     ledger as the `mlx pool` term (`capMlxPool` at load, `[mem] MLX buffer-pool cap ... from the ssd-budget ledger`), so
     the cache gives up ~3 slots a layer instead of ~24.
-  - **Prefill** (a wider forward): `dsv41_prefill_pool_bytes`, 8 GiB at a default 2048-row chunk and `rows / 2048` of it
-    below, never under the decode cap and never above the RAM-wide cap (31 rows 1 GiB, 512 rows 2 GiB, 1024 rows 4 GiB).
-    The cap set is the bill, once: the decode cap is a standing term of the live headroom (`server.dsv41Headroom` takes
-    it off ceiling less active, since the parked pool sits in MLX's cache, not its active bytes), so `prefillNeed`
-    carries only the growth above it (`poolGrowth`); a lower cap clears the pool, so what is parked never exceeds what
-    was billed. 4 MiB a row is the measured pool spread over the chunk (~7.7 GB parked at 2048 rows,
-    3.8 MB a row) and twice the forward's own row term (`dim x 400` = 2.05 MB a row; active grew 3.3-4 GB above rest).
-    The growth is not in the ledger: the decoder pools a prefill releases pay for it (`expert_borrow_bytes`), not the
-    decode cache. A pack with no pools to lend (non-STQ) bills it to the request. Admission (`prefillNeededAtChunk`)
-    bills the decode cap beside every request, plus the growth to the prefill cap; at load `expertStreamingServingBytes`
-    leaves the decode cap out, the ledger's staging term already holds it.
-  - Unloading a DeepSeek model gives the next model the process-wide cap `applyMlxCacheLimit` installed and forgets the
-    raised cap (`dsv41_borrow.unloadModel`, in the scheduler's unload and eviction paths).
-  - A request that ends, by finish, cancel or error, drops the cap to the decode cap (`endRequest`, in the scheduler's
-    slot cleanup), so a prefill with no decode forward after it does not leave the raised pool parked.
-  - Why scale: at `--ssd-budget-gb 115` (280 slots a layer, 8.95 GB headroom) a 31-row restore tail billed the full pool,
-    a 12.17 GB need, and released two decoder pools (5.40 GB, ~1.2 s with the read back). Its need is 3.58 GB of working
-    set plus the growth over the decode cap, which is nothing at 31 rows; billing the whole cap (4.65 GB) counted the
-    decode cap twice, and failed the tiny STQ borrow test. At a 14,766-token position the need is 3.58 / 4.65 / 15.03 GB
-    at 31 / 512 / 2048 rows (1 / 2 / 8 GiB cap). The working set prices a
-    forward under 512 rows as a 511-row one (`transientBytes` floors at the tail merge): 2.86 GB at 31 rows against ~0.5 GB
-    by the same formula at 31 rows. That floor is conservative, not measured at short forwards, and unchanged.
+  - **Prefill** (a wider forward): the RAM-wide cap, with no cap of its own. The transient cap
+    ([below](#transient-caps)) bounds the pool together with the forward's allocations, so MLX trims the pool on demand
+    at it and the parked pool never passes what was billed. The decode cap is a standing term of the live headroom
+    (`server.dsv41Headroom` takes it off ceiling less active, since the parked pool sits in MLX's cache, not its active
+    bytes); a lower cap clears the pool. Admission (`prefillNeededAtChunk`) bills the decode cap beside every request;
+    at load `expertStreamingServingBytes` leaves it out, the ledger's staging term already holds it.
+  - Unloading a DeepSeek model gives the next model the process-wide cap `applyMlxCacheLimit` installed, forgets the
+    raised cap and lifts the transient cap (`dsv41_borrow.unloadModel`, in the scheduler's unload and eviction paths).
+  - A request that ends, by finish, cancel or error, drops the pool cap to the decode cap and lifts the transient cap
+    (`endRequest`, in the scheduler's slot cleanup), so a prefill with no decode forward after it does not leave the
+    raised pool parked, and the next request's restore allocates its state uncapped.
   - Measured (STQ-1.75bpw, M5 Max, one cold 14,766-token prefill, three live-state repeats with a 31-row tail, one turn
     adding 1,000 rows; DSpark default, fans max, die < 50 °C):
 
@@ -69,11 +58,66 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
 
     At 114 a cold prefill releases layers 37..39 (8.15 GB) once and reads them back before decode (~1.4 s a request).
     The 1,000-row turn parks ~4 GB of pool on top of decode, which is the peak. A 2 GiB prefill pool cost 12% of cold
-    prefill (666 against 760-781 tok/s), so the full chunk keeps 8 GiB.
+    prefill (666 against 760-781 tok/s); those rows are from before the transient cap, which replaced the pool's own
+    prefill cap.
 - The per-request state (890 B a token, 0.93 GB at 1M) and the prefill transient are not in the SSD budget. They come
   from the serving budget (the GPU ceiling less everything resident), billed per request. `/props`
   `memory.kv_cache_bytes` and a live `/metrics` row's `state_bytes` count it (`dsv41_model.stateBytes` plus the live
   points) while the request runs.
+
+<a id="transient-caps"></a>
+## Transient caps
+
+MLX allocates through a patched allocator that can refuse a buffer ([engine-mlx-gotchas](engine-mlx-gotchas.md#transient-cap)).
+Every DeepSeek phase runs under a cap on the bytes MLX allocates itself beyond what it holds when the phase starts: the
+cap is `limit = active - imported + (the phase's bytes + the decode pool)`, set on the inference thread by
+`dsv41_borrow.enterForward` before each forward (prefill chunk, decode, DSpark verify; the draft runs under the cap of
+the forward before it) and by `enterVision` around an image encode. The pool counts in it, so the allocator trims the
+pool on demand and the phase's bytes plus the pool never pass the limit. A request that reaches it fails as
+`TransientCapExceeded` (503) and the server keeps serving. A request's end lifts the cap. There is no flag.
+
+The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `server.visionEncodeBill` for an image.
+
+    prefill-width forward (> 17 rows):  (rows x dim x 480 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
+    decode or verify forward (<= 17):   (seq x 16 x 4 x 3 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
+
+The per-row 480 B a channel is the 2.3 MiB a row measured from 256 to 2048 rows, rounded up (one 363-row chunk read 2.8
+MiB with its state rows); the per-context term is a decode block's scores (16 rows, 3 copies, f32) and the row stores'
+growth (a sixteenth of the state, plus one layer's old rows beside the new buffer: 55 + 356 B a token); the 256 MiB is
+twice the 0.12 GiB of small tensors a decode forward holds. A last chunk absorbs a tail, so a chunk bills
+`chunk + 511` rows (`chunkCap`).
+
+Measured peaks of MLX's own bytes, imported weights left out and the state's rows in (`SUSHI_DSV41_TRANSIENT_PEAK=1`,
+binary 26a28040, STQ-1.75bpw, `--ssd-budget-gb 108`, DSpark, one 225k-token cold prefill, raw
+`p2b-1028`), and the cap beside them (the pool allowance, 1 GiB, is added on top):
+
+| phase | rows | context | measured peak, GiB | cap, GB |
+|---|---|---|---|---|
+| decode | 1 | 9k / 225k | 0.116 / 0.336 | 0.28 / 0.44 |
+| DSpark draft, verify | 5, <= 17 | 225k | 0.304, 0.327 | 0.44 |
+| prefill chunk | 2048 | 2k / 225k | 4.57 / 4.77 | 6.6 / 6.7 |
+| prefill chunk | 256 / 1000 / 1183 | short | 0.57 / 2.25 / 2.48 | 1.0 / 3.4 / 3.9 |
+| vision encode | 8463 patches (1031 tokens) | | 1.11 | 1.47 (`visionEncodeBill`) |
+
+A cap is over the level its phase starts from, which holds the state: each cap covers a quarter over the measured peak
+less the state of the context (`dsv41 forward cap` test). Extrapolated to 1M tokens: a decode or verify forward 1.06 GB,
+a 2048-row chunk 7.1 GB and a tail-merged one (2559 rows) 8.7 GB. The decode slope the measurements give beyond the
+state's 890 B a token is 204 B; the cap carries 603 B (x 5/4).
+
+**What the bill is now** (`prefillNeededAtChunk`, the borrow's `prefillNeed`; the old bill was
+`transientBytes x 5/4 + (8 GiB - 1 GiB)` pool growth for a prefill and `decodeTransientBytes(17) x 5/4` for a decode):
+
+| term | context | old, GB | new, GB |
+|---|---|---|---|
+| borrow need, 2048 rows | 14.8k / 225k / 1M | 15.1 / 15.3 / 15.8 | 6.6 / 6.7 / 7.1 |
+| chunk bill, 2048 + 511 rows | 14.8k / 225k / 1M | 16.4 / 16.6 / 17.1 | 8.1 / 8.2 / 8.7 |
+| decode or verify block | 9k / 225k / 1M | 0.55 / 0.71 / 1.33 | 0.28 / 0.44 / 1.06 |
+| image encode | any | unchanged: the bill already covered the measured peak by a quarter | |
+
+The pool growth (7.5 GB) was most of the old bill and the cap replaces it: a 2048-row chunk's need falls 8.3-8.7 GB,
+the rest being the measured per-row rate against the old formula. At wired 124000 with DSpark and the SSD tier on (the
+`with its decoder pools lendable` test), budget 117 and no decoder pool to lend, the advertised context is 390,144
+tokens where it was under 262,144.
 
 <a id="owned-weights"></a>
 ## Weight memory sushi owns
@@ -109,7 +153,7 @@ billed three copies (3.9 KB a context token with the keys unpacked and the growt
 into a running top-k (`indexStream`), so one span's peak is flat in the context (44-81 MB at the release shapes, 948 MB
 whole at 1M). The context-scaled bill is 0.6 KB a token (the decode block's scores 192 B, growth slack 56 B, one
 layer's old rows during a growth 356 B) on top of the state's 0.89 KB. The prefix cache's restore points no longer
-hold RAM ([below](#borrow)), so a 1M request bills 3.69 GB.
+hold RAM ([below](#borrow)), so a 1M request bills 3.4 GB.
 
 <a id="borrow"></a>
 ## Admission bills the state: the prefill borrows the decoder pools, restore points go to SSD
@@ -118,13 +162,12 @@ Rules: a prompt's prefill working set must not limit the admitted context, and t
 
 **What admission bills** (`server.prefillNeededAtChunk`, x 5/4): the request's state (`(seq + max_tokens) x 890 B` and
 the rings), the restore points in flight to SSD (below), and a decode or verify forward's working set
-(`Config.decodeTransientBytes(17, seq)`, the prefill formula at 17 rows; 1.06 GB at 1M). The prefill working set is billed
-only where the decoder pools a prefill may still release (`ModelConfig.expert_borrow_bytes`, published live by the
-engine) do not cover it. At 1M: 3.69 GB in all.
+(`Config.forwardCap(17, seq)`, the transient cap of a verify block; 1.06 GB at 1M). The prefill working set is its cap
+(`Config.chunkCap`, [below](#transient-caps)), billed only where the decoder pools a prefill may still release
+(`ModelConfig.expert_borrow_bytes`, published live by the engine) do not cover it. At 1M: 3.4 GB in all.
 
 **The borrow** (`src/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
-- Before every forward wider than 17 rows, its need, `(transientBytes(rows - 511, seq) + rows x 890) x 5/4` plus the
-  forward's pool growth over the decode cap, 7 GiB at a 2048-row chunk ([above](#the-ledger-an-stq-pack---ssd-budget-gb-96--10308-gb-no-vision-tower)), is checked
+- Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (6.6 GB at 2048 rows),
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the
   pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released, and the live headroom is re-read after each
@@ -187,7 +230,7 @@ every expert read at load, and each layer's picks mapped to slots on the GPU, so
 of the picks. The borrow stays: a prefill past the headroom releases decoder pools, its first release paying for a
 union workspace (3.54 GB, the widest decoder layer) that the last restore drops.
 
-The 1M bill with the prefill borrowed is 3.69 GB (state 0.93, writer in flight 0.93, rings, decode floor 1.09, x5/4).
+The 1M bill with the prefill borrowed is 3.4 GB (state 0.93, writer in flight 0.93, rings, x5/4, and the decode cap 1.06).
 `--drop-expert` ([dsv41-arch](dsv41-arch.md#drop-expert)) frees bytes from the experts to make this fit: on an STQ pack
 whose experts total 119.6 GB, dropping 8 per layer frees 2.1-2.5 GB and dropping 16 frees 4.3-5.0 GB.
 

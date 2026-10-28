@@ -351,7 +351,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
 - **DeepSeek STQ bills a request's state, not its prefill working set**: the working set comes out of decoder-layer
   expert pools each prefill forward releases when its need passes the live headroom, refused before anything is released
-  where the pools cannot cover it; the MLX pool a prefill parks (8 GiB at a 2048-row chunk) rides in that working set; admission bills that term only past the lendable bytes, plus a decode forward's
+  where the pools cannot cover it; its transient cap (`Config.chunkCap`, the pool inside it) is that working set; admission bills that term only past the lendable bytes, plus a decode forward's
   working set and the decode pool parked in MLX's cache (1 GiB, outside the active bytes admission reads; counted once, in the bill, and taken off the live headroom), and SSD-first its restore points' in-flight bytes ([dsv41-memory](dsv41-memory.md#borrow)).
 - DeepSeek's resident bill (`dsv41_source.sumBytes`) is page-rounded per weight mapping: a tensor from 1 MiB, and a DSpark stage's nine ragged
   regions each ([dsv41-memory](dsv41-memory.md#owned-weights)).
@@ -479,12 +479,15 @@ exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from
 missing files. A 300-shard regression runs with a 128-descriptor soft limit.
 
-## Transient cap (mechanism, not billed yet)
+## Transient cap (billed for DeepSeek-V4.1)
 
 MLX can be capped on the bytes it allocates itself, imported weights left out
-([engine-mlx-gotchas](engine-mlx-gotchas.md#transient-cap)): no flag, default off, no bill follows it yet. A refused
-allocation fails the request as `TransientCapExceeded`. `SUSHI_DSV41_TRANSIENT_PEAK=1` logs the peak per phase to
-size the caps and the bill from.
+([engine-mlx-gotchas](engine-mlx-gotchas.md#transient-cap)): no flag, off until a DeepSeek phase installs it. Each
+phase installs `active - imported + (its bill + the decode pool)` and the bill IS that cap: `Config.forwardCap` for a
+prefill chunk or a decode and verify forward, `visionEncodeBill` for an image encode
+([dsv41-memory](dsv41-memory.md#transient-caps)). A refused allocation fails the request as `TransientCapExceeded`,
+a named 503. The pool is inside the cap, so a prefill's pool is no separate bill. A request's end lifts it.
+`SUSHI_DSV41_TRANSIENT_PEAK=1` logs the peak per phase, which the caps were sized from.
 
 ## Observing memory
 
