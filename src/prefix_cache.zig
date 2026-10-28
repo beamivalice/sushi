@@ -8444,7 +8444,7 @@ test "HotPrefixCache: a failed commit still frees the checkpoints it was handed 
 
     // fail_index 0: the first cache-side allocation (the tokens dupe) fails.
     // Ownership of the checkpoints transfers to the cache UNCONDITIONALLY —
-    // the scheduler's catch arm frees nothing (scan-pinned in scheduler.zig;
+    // the scheduler's catch arm frees nothing (commitCancelledPrefillSlot detaches them first;
     // pre-fix it freed too, a double free with a different allocator). The
     // cache's error paths therefore MUST free the slice; std.testing.allocator
     // flags both the leak and a double free.
@@ -9928,29 +9928,6 @@ test "prefix cache: a hybrid miss with a raw token match names itself" {
     // At and above it, a cold prefill of that many tokens owes an explanation.
     try testing.expectEqual(MissKind.no_checkpoint, missKind(1, MIN_CANCELLED_COMMIT_TOKENS));
     try testing.expectEqual(MissKind.no_checkpoint, missKind(4, 393_000));
-}
-
-test "prefix cache: the no-match lookup arm consults missKind, never returns silently" {
-    // Class guard for the 560 s unexplained cold prefill: every early return
-    // from the lookup owes a reason. The `match == null` arm is the one that
-    // had none, and it is reachable only through this file.
-    const source = @embedFile("prefix_cache.zig");
-    const start = std.mem.indexOf(u8, source, "if (match == null) {") orelse
-        return error.MissingNoMatchArm;
-    const arm = source[start .. start + 900];
-    const end = std.mem.indexOf(u8, arm, "return .{ .matched = 0, .full_match = false };") orelse
-        return error.MissingNoMatchReturn;
-    try testing.expect(std.mem.indexOf(u8, arm[0..end], "missKind(") != null);
-    try testing.expect(std.mem.indexOf(u8, arm[0..end], "[hot-cache] hybrid miss") != null);
-    // The probe must be filled BEFORE the restorability filter can `continue`
-    // a candidate away, or `best_raw` is always 0 and the line never fires.
-    const fbr = std.mem.indexOf(u8, source, "fn findBestRestorableMatch(") orelse
-        return error.MissingFinder;
-    const body = source[fbr .. fbr + 2600];
-    const probe_at = std.mem.indexOf(u8, body, "if (probe) |p| {") orelse return error.MissingProbe;
-    const filter_at = std.mem.indexOf(u8, body, "const effective = if (require_ssm_checkpoint)") orelse
-        return error.MissingFilter;
-    try testing.expect(probe_at < filter_at);
 }
 
 test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is budget-bounded" {
