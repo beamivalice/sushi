@@ -24076,11 +24076,11 @@ test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the
     dense.quant_bits = 0;
     try t.expectEqual(@as(u64, 0), prefillDequantWeightBytes(&dense));
 
-    // Non-affine (nvfp4/mxfp8) stays in mlx_quantized_matmul — no dequantized
-    // copy exists to bill (measured: nvfp4 lands with the dq-off arm).
-    var nvfp4 = cfg;
-    nvfp4.quant_mode = .nvfp4;
-    try t.expectEqual(@as(u64, 0), prefillDequantWeightBytes(&nvfp4));
+    // Non-affine (mxfp4/mxfp8) stays in mlx_quantized_matmul — no dequantized
+    // copy exists to bill.
+    var mxfp8 = cfg;
+    mxfp8.quant_mode = .mxfp8;
+    try t.expectEqual(@as(u64, 0), prefillDequantWeightBytes(&mxfp8));
 
     // The estimator must not bill an allocation the kill switch removed.
     transformer_mod.prefill_dq_gemm_override = false;

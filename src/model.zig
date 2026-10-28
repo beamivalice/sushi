@@ -48,7 +48,6 @@ pub const MimoVitAttn = enum { full, row, col };
 
 pub const QuantMode = enum {
     affine,
-    nvfp4,
     mxfp4,
     mxfp8,
 
@@ -60,7 +59,6 @@ pub const QuantMode = enum {
     pub fn cstr(self: QuantMode) [*:0]const u8 {
         return switch (self) {
             .affine => "affine",
-            .nvfp4 => "nvfp4",
             .mxfp4 => "mxfp4",
             .mxfp8 => "mxfp8",
         };
@@ -2121,7 +2119,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (q.get("mode")) |v| {
             if (v == .string) {
                 config.quant_mode = QuantMode.fromString(v.string) orelse {
-                    log.err("unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{v.string});
+                    log.err("unsupported quantization mode '{s}' (supported: affine, mxfp4, mxfp8)\n", .{v.string});
                     return error.UnsupportedQuantMode;
                 };
             }
@@ -4460,25 +4458,6 @@ test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
         \\}
     ;
     try expectError(error.UnsupportedQuantBits, parseConfigFromJson(testing.allocator, json_7bit));
-}
-
-test "parseConfigFromJson nvfp4 quantization mode" {
-    // NVFP4 checkpoints (issue #24): {"group_size": 16, "bits": 4, "mode": "nvfp4"}.
-    // The mode must land on config.quant_mode so the loader skips the .biases
-    // fetches (nvfp4 stores no biases tensors) and the matmul call sites pass
-    // "nvfp4" to mlx instead of "affine".
-    const json =
-        \\{
-        \\  "model_type": "qwen3",
-        \\  "hidden_size": 1024,
-        \\  "quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expectEqual(QuantMode.nvfp4, config.quant_mode);
-    try testing.expectEqual(@as(u32, 4), config.quant_bits);
-    try testing.expectEqual(@as(u32, 16), config.quant_group_size);
-    try testing.expect(!config.quant_mode.hasBiases());
 }
 
 test "parseConfigFromJson explicit affine mode keeps biases" {

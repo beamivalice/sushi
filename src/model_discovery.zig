@@ -69,7 +69,7 @@ fn isSupportedModelType(model_type: []const u8) bool {
 /// Quantization modes the MLX loader supports. Must stay in sync with
 /// `model.zig:QuantMode` (discovery deliberately avoids importing model.zig,
 /// which would drag the mlx FFI into this filesystem-only module).
-const supported_quant_modes = [_][]const u8{ "affine", "nvfp4", "mxfp4", "mxfp8" };
+const supported_quant_modes = [_][]const u8{ "affine", "mxfp4", "mxfp8" };
 
 fn isSupportedQuantMode(mode: []const u8) bool {
     for (supported_quant_modes) |m| {
@@ -95,7 +95,7 @@ const ConfigPeek = union(enum) {
 /// `quantization.mode`. Discovery uses this to filter out:
 ///   - unsupported archs (which crash the tokenizer)
 ///   - unsupported quantization modes (anything outside
-///     `supported_quant_modes` — affine, nvfp4, mxfp4, mxfp8).
+///     `supported_quant_modes` — affine, mxfp4, mxfp8).
 ///
 /// Returned strings are owned by `allocator`; the caller frees them via
 /// the helpers in `freeConfigPeek`.
@@ -767,7 +767,7 @@ fn tryAddModel(
             },
             .unsupported_quant => |mode| {
                 defer allocator.free(mode);
-                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, mxfp4, mxfp8)", .{ name, mode });
                 return true;
             },
             .drafter => {
@@ -1740,14 +1740,11 @@ test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
     try testing.expect(isSupportedModelType("gemma3"));
 }
 
-test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {
-    // Regression for "[discovery] skip ...: unsupported quantization mode
-    // 'nvfp4'": nvfp4 / mxfp4 / mxfp8 checkpoints are loadable and must be
-    // discoverable.
+test "isSupportedQuantMode accepts affine, mxfp4 and mxfp8, rejects nvfp4 and unknown" {
     try testing.expect(isSupportedQuantMode("affine"));
-    try testing.expect(isSupportedQuantMode("nvfp4"));
     try testing.expect(isSupportedQuantMode("mxfp4"));
     try testing.expect(isSupportedQuantMode("mxfp8"));
+    try testing.expect(!isSupportedQuantMode("nvfp4"));
     try testing.expect(!isSupportedQuantMode("fp99"));
 }
 
