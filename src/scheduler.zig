@@ -8546,13 +8546,20 @@ fn thinkBoundForcesPlain(gen: *const Generator) bool {
     return thinkBoundFired(gen) and (gen.mtp == null or gen.spec_disable_reason == .think_bound);
 }
 
-/// An MTP round must not accept past the position serial decode closes the thought at: cap its
-/// drafts to the thought room, or run the last room token serial.
+/// Drafts a thinking bound lets the slot's next MTP round carry, so it accepts no further than serial decode
+/// closes the thought: null = unbounded, 0 = the room's last token runs plain. `observe` first.
+fn thinkBoundDraftLimit(gen: *const Generator) ?u32 {
+    const room = (gen.sampling.think_bound orelse return null).room() orelse return null;
+    return generate_mod.mtpDraftCapForRoom(room) orelse 0;
+}
+
+/// A solo or grouped MTP round keeps the tighter of its own cap and the thought room, or runs the
+/// last room token serial.
 fn capMtpRoundToThinkBound(gen: *Generator) void {
-    const room = (gen.sampling.think_bound orelse return).room() orelse return;
-    if (generate_mod.mtpDraftCapForRoom(room)) |cap| {
-        gen.mtp_group_cap = cap;
-    } else gen.mtp_serial_left = 1;
+    const limit = thinkBoundDraftLimit(gen) orelse return;
+    if (limit == 0) {
+        gen.mtp_serial_left = 1;
+    } else gen.mtp_group_cap = if (gen.mtp_group_cap > 0) @min(gen.mtp_group_cap, limit) else limit;
 }
 
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
@@ -9248,6 +9255,14 @@ fn planProbe(
     return true;
 }
 
+/// Drafts the planner may give an MTP row: the depth range, the tokens `max_tokens` leaves and the
+/// thought room (0 = a plain row). A row with a think bound is `observe`d first.
+fn plannerRowCap(gen: *const Generator) u32 {
+    const depth = if (gen.mtp_depth > 0) gen.mtp_depth else @max(1, gen.mtp_depth_current);
+    const cap = @min(@min(depth, Planner.MAX_DEPTH), gen.max_tokens -| gen.completion_tokens -| 1);
+    return if (thinkBoundDraftLimit(gen)) |limit| @min(cap, limit) else cap;
+}
+
 fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
     const xfm = active[0].model.transformer orelse return false;
@@ -9272,7 +9287,8 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         const mtp_row = why == .spec_active and slotMtpGroupable(slot);
         if (why != .ok and !mtp_row) return false;
         has_mtp = has_mtp or mtp_row;
-        const cap = if (mtp_row) @min(@min(if (gen.mtp_depth > 0) gen.mtp_depth else @max(1, gen.mtp_depth_current), Planner.MAX_DEPTH), gen.max_tokens -| gen.completion_tokens -| 1) else 0;
+        if (gen.sampling.think_bound) |tb| tb.observe(gen.generated_ids.items);
+        const cap = if (mtp_row) plannerRowCap(gen) else 0;
         rows[i] = .{ .history = &gen.mtp_planner_history, .cap = @intCast(cap), .latency_ms = Planner.LATENCY_MS };
         lenses[i] = @intCast(slot.moe_seq_offset);
     }
@@ -9457,6 +9473,8 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
+        gen.mtp_group_cap = 0;
+        capMtpRoundToThinkBound(gen);
         gen.mtp_batch_head = true;
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             gen.mtp_batch_head = false;
@@ -9675,6 +9693,7 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
+        capMtpRoundToThinkBound(gen);
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             slot.markError(@errorName(e));
             continue;
@@ -11780,6 +11799,44 @@ test "the last thought token before the bound runs serial, wider rooms cap the d
     gen.mtp_group_cap = 0;
     capMtpRoundToThinkBound(&gen);
     try testing.expectEqual(@as(u32, 0), gen.mtp_group_cap);
+}
+
+test "a group's row cap and the thought room both bound a round's drafts" {
+    var tb = generate_mod.ThinkBound{ .budget = 12, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 1 };
+    var gen: Generator = undefined;
+    gen.sampling = .{ .think_bound = &tb };
+    // Room 11 leaves the group's row cap of 3 in force.
+    gen.mtp_group_cap = 3;
+    gen.mtp_serial_left = 0;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 3), gen.mtp_group_cap);
+    // Room 4 caps below the row cap of 6.
+    gen.mtp_group_cap = 6;
+    tb.count = 8;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 3), gen.mtp_group_cap);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_serial_left);
+}
+
+test "a planner row never gets more drafts than its thought room" {
+    var tb = generate_mod.ThinkBound{ .budget = 20, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 0 };
+    var gen: Generator = undefined;
+    gen.mtp_depth = 4;
+    gen.mtp_depth_current = 4;
+    gen.max_tokens = 1000;
+    gen.completion_tokens = 10;
+    gen.sampling = .{};
+    try testing.expectEqual(@as(u32, 4), plannerRowCap(&gen));
+    gen.sampling = .{ .think_bound = &tb };
+    try testing.expectEqual(@as(u32, 4), plannerRowCap(&gen));
+    tb.count = 17;
+    try testing.expectEqual(@as(u32, 2), plannerRowCap(&gen));
+    // Room 1: the slot takes a plain row.
+    tb.count = 19;
+    try testing.expectEqual(@as(u32, 0), plannerRowCap(&gen));
+    // A bound that already fired no longer limits the answer.
+    tb.fired = true;
+    try testing.expectEqual(@as(u32, 4), plannerRowCap(&gen));
 }
 
 test "a plain batched tick checks the thinking budget before its rows forward" {

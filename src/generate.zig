@@ -783,6 +783,11 @@ test "decode tick ubench count is off unless a positive integer" {
     try std.testing.expectEqual(@as(u32, 8), tickUbenchN("8"));
 }
 
+test "a planner-owned slot rejoins the planner after a forced commit, any other takes the serial ramp" {
+    try testing.expectEqual(Generator.MtpSerialExit.none, Generator.mtpSerialExitAfterForced(true));
+    try testing.expectEqual(Generator.MtpSerialExit.drain, Generator.mtpSerialExitAfterForced(false));
+}
+
 test "forced recovery leaves room for the whole transition and one answer token" {
     try std.testing.expect(forcedBoundaryCanContinue(0, 2, 1));
     try std.testing.expect(forcedBoundaryCanContinue(8, 10, 1));
@@ -6695,6 +6700,12 @@ pub const Generator = struct {
         if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
     }
 
+    /// Where an MTP slot re-enters after a forced commit: a planner-owned slot rejoins the planner, which drains
+    /// the commit's pending logits and primes a fresh hidden; a serial ramp would keep its whole group plain.
+    fn mtpSerialExitAfterForced(planner_owned: bool) MtpSerialExit {
+        return if (planner_owned) .none else .drain;
+    }
+
     /// A forced commit (`commitForcedTokens`) ran plain through the trunk, so the head's history has a
     /// hole. Re-seed a qwen4 head (its positions refuse a gap) and take the serial exit ramp back to
     /// MTP. False = not an MTP slot that may resume: the caller disables speculation.
@@ -6712,7 +6723,7 @@ pub const Generator = struct {
         }
         self.spec_disabled_runtime = false;
         self.spec_disable_reason = .none;
-        self.mtp_serial_exit = .drain;
+        self.mtp_serial_exit = mtpSerialExitAfterForced(group_planner.enabled() and self.mtp_planner_owned);
         return true;
     }
 
