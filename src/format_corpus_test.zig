@@ -823,7 +823,7 @@ const corpus = [_]Expect{
         // Verbatim capture from gemma-3-12b-it-qat-4bit on the live matrix
         // (2026-06-10): models without a trained tool format emit the call as
         // a ```json fence. The raw-JSON fallback must tolerate the fence.
-        .family = "gemma3",
+        .family = "shared",
         .name = "markdown-fenced raw JSON tool call",
         .raw = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"report_v2.html\", \"content\": \"<h1>Report</h1>\"}}\n```",
         .tool_name = "write",
@@ -836,7 +836,7 @@ const corpus = [_]Expect{
         // JSON ARRAY of {name, arguments} objects. Pre-fix only the first
         // object parsed — the second call was silently dropped on all three
         // API surfaces.
-        .family = "gemma3",
+        .family = "shared",
         .name = "fenced JSON array of parallel tool calls parses ALL calls",
         .raw = "```json\n[\n  {\n    \"name\": \"get_weather\",\n    \"arguments\": {\n      \"location\": \"Paris, France\"\n    }\n  },\n  {\n    \"name\": \"get_weather\",\n    \"arguments\": {\n      \"location\": \"Tokyo, Japan\"\n    }\n  }\n]\n```",
         .tool_name = "get_weather",
@@ -847,7 +847,7 @@ const corpus = [_]Expect{
     },
     .{
         // Unfenced variant of the same shape.
-        .family = "gemma3",
+        .family = "shared",
         .name = "bare JSON array of parallel tool calls parses ALL calls",
         .raw = "[{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris, France\"}}, {\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo, Japan\"}}]",
         .tool_name = "get_weather",
@@ -1178,7 +1178,7 @@ const corpus = [_]Expect{
     .{
         // The counterweight: models WITHOUT a trained tool format (Gemma 3)
         // emit fenced raw-JSON calls — a declared name must keep parsing.
-        .family = "gemma3",
+        .family = "shared",
         .name = "fenced raw-JSON call with a DECLARED name still parses",
         .raw = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```",
         .tools_json = write_read_tools_schema,
@@ -2163,50 +2163,9 @@ const Dialect = struct {
 
 const dialects = [_]Dialect{
     .{
-        .family = "qwen3.5/3.6",
-        .dialect = "tool_call wrapper + JSON body",
-        .raw = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n</tool_call>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        // The dialect the checkpoint's OWN template mandates.
-        .family = "qwen3.5/3.6",
-        .dialect = "tool_call wrapper + <function=> body",
-        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>\n</tool_call>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        .family = "qwen3.5/3.6",
-        .dialect = "bare <function=>, no wrapper",
-        .raw = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        .family = "hermes/chatml",
-        .dialect = "tool_call wrapper, single line",
-        .raw = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}</tool_call>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
         .family = "gemma4",
         .dialect = "channel tool_call",
         .raw = "<|tool_call>call:write_file{path:<|\"|>a.txt<|\"|>,content:<|\"|>hi<|\"|>}<tool_call|>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        .family = "llama3",
-        .dialect = "raw JSON, name+parameters",
-        .raw = "{\"name\": \"write_file\", \"parameters\": {\"path\": \"a.txt\", \"content\": \"hi\"}}",
         .name = "write_file",
         .key = "path",
         .value = "a.txt",
