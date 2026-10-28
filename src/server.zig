@@ -20740,6 +20740,7 @@ fn storeResponse(
         history[i] = .{
             .role = try a.dupe(u8, m.role),
             .content = try a.dupe(u8, m.content),
+            .reasoning_content = if (m.reasoning_content) |rc| try a.dupe(u8, rc) else null,
             .tool_call_id = if (m.tool_call_id) |tid| try a.dupe(u8, tid) else null,
             .tool_calls = if (m.tool_calls) |tcs| blk: {
                 const copied = try a.alloc(chat_mod.ToolCall, tcs.len);
@@ -20755,16 +20756,8 @@ fn storeResponse(
         };
     }
     if (keep_assistant) {
-        // Build the assistant message that produced this response.
-        var assistant_text_parts = std.ArrayList(u8).empty;
-        defer assistant_text_parts.deinit(a);
-        if (reasoning_text) |rt| {
-            try assistant_text_parts.appendSlice(a, "<think>");
-            try assistant_text_parts.appendSlice(a, rt);
-            try assistant_text_parts.appendSlice(a, "</think>");
-        }
-        try assistant_text_parts.appendSlice(a, visible_text);
-        const assistant_content = try a.dupe(u8, assistant_text_parts.items);
+        const assistant_content = try a.dupe(u8, visible_text);
+        const assistant_reasoning: ?[]const u8 = if (reasoning_text) |rt| try a.dupe(u8, rt) else null;
 
         var assistant_tool_calls: ?[]chat_mod.ToolCall = null;
         if (tool_calls) |tcs| if (tcs.len > 0) {
@@ -20782,6 +20775,7 @@ fn storeResponse(
         history[total_msgs - 1] = .{
             .role = try a.dupe(u8, "assistant"),
             .content = assistant_content,
+            .reasoning_content = assistant_reasoning,
             .tool_calls = assistant_tool_calls,
         };
     }
@@ -21843,6 +21837,89 @@ test "Responses history omits loop cuts while retaining the response and input" 
     try testing.expectEqual(@as(usize, 2), next.history.len);
     try testing.expectEqualStrings("hi", next.history[0].content);
     try testing.expectEqualStrings("answer", next.history[1].content);
+}
+
+fn renderQwenForResponsesTest(a: std.mem.Allocator, messages: []const chat_mod.Message) ![]const u8 {
+    const config = chat_mod.ChatConfig{
+        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}]";
+    return chat_mod.renderChatTemplate(a, messages, &config, tools, null, true, null, false);
+}
+
+test "Responses: a stored chain and an input replay render the same Qwen prompt" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const a = testing.allocator;
+    const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
+    const first = [_]chat_mod.Message{.{ .role = "user", .content = "compare" }};
+    try storeResponse(testing.io, a, "r1", "model", "completed", "{}", &first, "", "inspect it", &calls, null);
+    const stored = global_response_store.?.map.get("r1").?;
+
+    const out = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"function_call_output","call_id":"c1","output":"done"}]
+    , .{});
+    defer out.deinit();
+    var chained = try responses_mod.parseInput(a, out.value, null, stored.history, null, .{});
+    defer chained.deinit();
+
+    const replay = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":"compare"},
+        \\ {"type":"reasoning","summary":[{"type":"summary_text","text":"inspect it"}]},
+        \\ {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"id\":1}"},
+        \\ {"type":"function_call_output","call_id":"c1","output":"done"}]
+    , .{});
+    defer replay.deinit();
+    var replayed = try responses_mod.parseInput(a, replay.value, null, null, null, .{});
+    defer replayed.deinit();
+
+    const by_chain = try renderQwenForResponsesTest(a, chained.messages.items);
+    defer a.free(by_chain);
+    const by_replay = try renderQwenForResponsesTest(a, replayed.messages.items);
+    defer a.free(by_replay);
+    try testing.expectEqualStrings(by_replay, by_chain);
+    try testing.expect(std.mem.indexOf(u8, by_chain, "inspect it") != null);
+}
+
+test "Responses: a stored reasoning turn renders as the model's own think block" {
+    const a = testing.allocator;
+    const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
+    // The Qwen3.8 template reads only reasoning_content; an inline <think> in content renders as literal text.
+    const inline_think = [_]chat_mod.Message{
+        .{ .role = "user", .content = "compare" },
+        .{ .role = "assistant", .content = "<think>inspect it</think>", .tool_calls = &calls },
+        .{ .role = "tool", .content = "done", .tool_call_id = "c1" },
+    };
+    const field = [_]chat_mod.Message{
+        inline_think[0],
+        .{ .role = "assistant", .content = "", .reasoning_content = "inspect it", .tool_calls = &calls },
+        inline_think[2],
+    };
+    const r_inline = try renderQwenForResponsesTest(a, &inline_think);
+    defer a.free(r_inline);
+    const r_field = try renderQwenForResponsesTest(a, &field);
+    defer a.free(r_field);
+    try testing.expect(std.mem.indexOf(u8, r_field, "<think>\ninspect it\n</think>\n\n<tool_call>") != null);
+    try testing.expect(std.mem.indexOf(u8, r_inline, "<think>\ninspect it\n</think>") == null);
+}
+
+test "Responses history keeps reasoning as reasoning_content, as an input replay does" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const messages = [_]chat_mod.Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "replayed thought" },
+    };
+    try storeResponse(testing.io, testing.allocator, "r1", "model", "completed", "{}", &messages, "answer", "fresh thought", null, null);
+    const stored = global_response_store.?.map.get("r1").?;
+    try testing.expectEqual(@as(usize, 3), stored.history.len);
+    try testing.expectEqualStrings("replayed thought", stored.history[1].reasoning_content.?);
+    try testing.expectEqualStrings("answer", stored.history[2].content);
+    try testing.expectEqualStrings("fresh thought", stored.history[2].reasoning_content.?);
 }
 
 test "deinitGlobalResponseStore frees stored responses" {

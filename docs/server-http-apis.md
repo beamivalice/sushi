@@ -43,7 +43,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   request on another arch that names NO effort gets no server budget: Qwen3.8's template renders an absent word as
   low (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via
-  `ResponseStore`, WS via Upgrade. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
+  `ResponseStore`, WS via Upgrade. A replayed `reasoning` input item (`content[].reasoning_text`, else
+  `summary[].summary_text`) joins the following message and calls as ONE assistant turn's `reasoning_content`, and the
+  store keeps it in the same field, so an input replay and a `previous_response_id` chain render the same prompt;
+  an encrypted, empty or malformed item is dropped, never a 400. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl.
   `stop_sequence` echo, full SSE block lifecycle (a block opens only once the open one is stopped, so each owns its
