@@ -1133,11 +1133,10 @@ fn atomicTokenId(allocator: std.mem.Allocator, tok: *const Tokenizer, text: []co
     return if (ids.len == 1) ids[0] else null;
 }
 
-/// The in-stream thinking bound needs atomic think markers (bare `<think>`
-/// family, or a pack that aliases its own markers onto it).
+/// The in-stream thinking bound needs atomic think markers.
 fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
     if (lm.transformer == null) return false;
-    return tok.marker_closers != null or atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) != null;
+    return atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) != null;
 }
 
 /// Qwen's own thinking-budget recipe: the model is told time is up, then the
@@ -1160,8 +1159,7 @@ pub fn loopCloseBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 
 fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: u32, announce: bool) ?generate_mod.ThinkBound {
     if (!enable_thinking or lm.transformer == null) return null;
-    const closer = promptOpenerMarkerCloser(allocator, tok, prompt_ids) orelse
-        atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
+    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
         if (announce) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
         return null;
     };
@@ -1200,7 +1198,7 @@ fn thinkPenaltyFor(lambda: f32, enable_thinking: bool, opener: ?u32, closer: ?u3
 fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, lambda: f32) generate_mod.ThinkPenalty {
     if (!enable_thinking or lm.transformer == null) return .{};
     if (!@import("think_penalty.zig").needsSpan(lambda, lm.transformer.?.logit_bias)) return .{};
-    const closer = promptOpenerMarkerCloser(allocator, tok, prompt_ids) orelse atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
+    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
     var tp = thinkPenaltyFor(@max(lambda, 1), enable_thinking, atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER), closer, promptOpensThink(allocator, tok, prompt_ids));
     tp.lambda = if (tp.lambda > 0) lambda else 0;
     if (tp.armed()) log.info("  think penalty {d}: markers lowered inside the reasoning span\n", .{lambda});
@@ -1348,22 +1346,6 @@ fn templateThinkOpener(template: []const u8) ?[]const u8 {
     return found;
 }
 
-/// The aliased atomic closer for the last non-whitespace prompt token, when
-/// that token is a K2 think opener (`Tokenizer.markerCloserFor`).
-fn promptOpenerMarkerCloser(allocator: std.mem.Allocator, tok: *const Tokenizer, prompt_ids: []const u32) ?u32 {
-    if (tok.marker_closers == null) return null;
-    var i = prompt_ids.len;
-    while (i > 0 and prompt_ids.len - i < 8) {
-        i -= 1;
-        const id = prompt_ids[i];
-        if (tok.markerCloserFor(id)) |closer| return closer;
-        const text = tok.decode(allocator, prompt_ids[i..][0..1], false) catch return null;
-        defer allocator.free(text);
-        if (std.mem.trim(u8, text, "\n\r\t ").len != 0) return null;
-    }
-    return null;
-}
-
 /// Resolve a reasoning protocol from the rendered prompt and template. Tokenizer
 /// indexes and exact recovery suffixes are cached on the loaded model.
 fn resolveReasoningProtocol(
@@ -1397,14 +1379,6 @@ fn resolveReasoningProtocol(
             .bare => {
                 proto.kind = .bare_think;
                 if (!proto.setCloser(chat_mod.BARE_THINK_CLOSER)) return false;
-                // K2 decodes its openers as `<think>` (alias); the prompt's
-                // opener token names the pack's own closer, and only that
-                // spelling is the boundary (a literal `</think>` in the
-                // reasoning is text).
-                if (promptOpenerMarkerCloser(allocator, tok, prompt_ids)) |id| {
-                    const text = tok.id_to_token.get(id) orelse return false;
-                    if (!proto.setCloser(text)) return false;
-                }
             },
             .none => {
                 const opener = templateThinkOpener(template) orelse return false;
@@ -8098,7 +8072,6 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
 fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
     return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
         std.mem.indexOf(u8, tmpl, "<think>") != null or
-        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
         std.mem.indexOf(u8, tmpl, "thought") != null or
         std.mem.indexOf(u8, tmpl, "<|channel>") != null;
 }

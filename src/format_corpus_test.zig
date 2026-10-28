@@ -1246,13 +1246,9 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
     },
-    // ── K2-Horizon (IFM) ────────────────────────────────────────────────
-    // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
-    // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
-    // inside a bare plural wrapper. Thinking is template-opened
-    // (`…assistant\n<ifm|think>\n`, decoded `<think>`).
+    // ── GLM arg_key form inside a bare plural `<tool_calls>` wrapper ────────
     .{
-        .family = "k2_horizon",
+        .family = "glm5",
         .name = "plural wrapper around newline-separated arg pairs",
         .raw = "I'll check the weather.\n<tool_calls>\n<tool_call>get_weather\n" ++
             "<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n" ++
@@ -1266,7 +1262,7 @@ const corpus = [_]Expect{
         .tool_bool_value = true,
     },
     .{
-        .family = "k2_horizon",
+        .family = "glm5",
         .name = "template-opened thought, then two calls in one wrapper",
         .raw = "Two reads are needed.</think>\n<tool_calls>\n" ++
             "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n</tool_call>\n" ++
@@ -1637,10 +1633,10 @@ const corpus = [_]Expect{
         .tool_arg_value = "a.txt",
     },
     .{
-        // LIVE capture 2026-09-14 (K2-Horizon 7B, llmprobe agentic): a GLM
+        // LIVE capture 2026-09-14 (llmprobe agentic): a GLM
         // call to a PARAMETERLESS tool has no <arg_key>, the one signal the
         // GLM route keyed on, so it fell to the Hermes path and vanished.
-        .family = "k2",
+        .family = "glm5",
         .name = "GLM call with a bare name and no arguments",
         .raw = "<tool_calls>\n<tool_call>list_files\n</tool_call>\n</tool_calls>",
         .tool_name = "list_files",

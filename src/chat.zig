@@ -998,18 +998,11 @@ pub fn jsonNestingExceeds(body: []const u8, limit: usize) bool {
 }
 
 pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, false, null);
-}
-
-/// K2-Horizon's template raises on an assistant turn with NO thinking field,
-/// so that family gets an empty `reasoning_content` where a client sent none
-/// (renders as the closed `<ifm|think>\n</ifm|think>` signature).
-fn templateRequiresReasoningField(tpl: []const u8) bool {
-    return std.mem.indexOf(u8, tpl, "'ifm|think'") != null;
+    return serializeMessagesJsonImpl(allocator, messages, null);
 }
 
 pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, templateRequiresReasoningField(chat_config.chat_template), chat_config.image_placeholder);
+    return serializeMessagesJsonImpl(allocator, messages, chat_config.image_placeholder);
 }
 
 /// `content` as the typed part list vision templates render, each media part
@@ -1066,7 +1059,7 @@ fn appendJoined(allocator: std.mem.Allocator, text: *std.ArrayList(u8), piece: [
     try text.appendSlice(allocator, piece);
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, reasoning_required: bool, image_atom: ?[]const u8) ![]const u8 {
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, image_atom: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1127,8 +1120,6 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
             // would still pass `is defined`-style checks.
             try buf.appendSlice(allocator, ",\"reasoning_content\":");
             try appendJsonString(allocator, &buf, rc);
-        } else if (reasoning_required and std.mem.eql(u8, msg.role, "assistant")) {
-            try buf.appendSlice(allocator, ",\"reasoning_content\":\"\"");
         }
 
         try buf.append(allocator, '}');
@@ -1235,15 +1226,6 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     return "xhigh";
 }
 
-/// K2-Horizon reads `reasoning_effort` as high|medium|low (default high) and
-/// raises on anything else; each word picks a different think opener.
-fn k2EffortFor(effort: ?[]const u8) []const u8 {
-    const e = effort orelse return "high";
-    if (std.mem.eql(u8, e, "medium")) return "medium";
-    if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
-    return "high";
-}
-
 /// `effort` is the client's raw `reasoning_effort` string (null when the
 /// request didn't send one) — today only the dsv4 family maps it into the
 /// template; other families keep their fixed vocabulary.
@@ -1294,11 +1276,7 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     const dsv41_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
     const glm5_style = std.mem.indexOf(u8, chat_config.chat_template, "effective_reasoning_effort") != null and
         std.mem.indexOf(u8, chat_config.chat_template, "[gMASK]<sop>") != null;
-    if (templateRequiresReasoningField(chat_config.chat_template)) {
-        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
-        try buf.appendSlice(allocator, k2EffortFor(effort));
-        try buf.append(allocator, '"');
-    } else if (glm5_style) {
+    if (glm5_style) {
         // Sushi defaults to high; depth is a prompt instruction, never a token cap.
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, effort orelse "high");
@@ -1934,19 +1912,7 @@ pub const BARE_THINK_CLOSER = "</think>";
 /// render ends with a CLOSED `</think>` block and must not match.
 pub fn promptTailOpensThink(tail: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
-    return endsWithThinkOpenTag(trimmed) != null or k2ThinkOpenerAt(trimmed) != null;
-}
-
-/// K2-Horizon's three RENDERED think openers (one per effort). The tokenizer
-/// decodes them all to `<think>`, so generated text never carries them; only
-/// the rendered prompt bytes do, and the closer must spell the same variant.
-const k2_think_openers = [_][]const u8{ "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>" };
-
-fn k2ThinkOpenerAt(trimmed_tail: []const u8) ?[]const u8 {
-    for (k2_think_openers) |opener| {
-        if (std.mem.endsWith(u8, trimmed_tail, opener)) return opener;
-    }
-    return null;
+    return endsWithThinkOpenTag(trimmed) != null;
 }
 
 /// Narrow form used by generation-side phase switches: armed against the bare
@@ -1988,11 +1954,6 @@ fn noThinkTailSuffix(rendered: []const u8, enable_thinking: bool) ?[]const u8 {
 /// cases would drift apart.
 fn contentChannelTail(rendered: []const u8) []const u8 {
     const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
-    if (k2ThinkOpenerAt(tail)) |opener| {
-        inline for (k2_think_openers) |o| {
-            if (std.mem.eql(u8, opener, o)) return "</" ++ o[1..];
-        }
-    }
     if (promptTailOpensThink(tail)) return "</think>";
     return "";
 }
@@ -12856,16 +12817,6 @@ test "a model-opened think block latches from its own opener token" {
     try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
 }
 
-test "K2-Horizon: the rendered prompt opens one of three think tags; thinking-off closes the SAME one" {
-    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think>\n"));
-    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
-    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_faster>\n"));
-    try testing.expect(!promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|thinker>\n"));
-    try testing.expectEqualStrings("</ifm|think_fast>", contentChannelTail("<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
-    try testing.expectEqualStrings("</ifm|think>", contentChannelTail("x<ifm|think>\n"));
-    try testing.expectEqualStrings("</think>", contentChannelTail("x<think>\n"));
-}
-
 test "serializeMessagesJson: a string-content template gets each image as its atom where it sits, blank-line joined" {
     const a = testing.allocator;
     const parts = [_]MediaPart{ .{ .at = 0, .kind = .image }, .{ .at = 5, .kind = .image }, .{ .at = 5, .kind = .video } };
@@ -12887,35 +12838,6 @@ test "serializeMessagesJson: a string-content template gets each image as its at
     const typed = try serializeMessagesJsonFor(a, msgs[0..1], &cfg);
     defer a.free(typed);
     try testing.expect(std.mem.indexOf(u8, typed, "{\"type\":\"image\"}") != null);
-}
-
-test "K2-Horizon: assistant history always carries a thinking field, and the effort word is high|medium|low" {
-    const k2_tpl = "{%- set think_tag = 'ifm|think' -%}{%- set effort = reasoning_effort | default('high') -%}";
-    const cfg = ChatConfig{ .chat_template = k2_tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
-    const messages = [_]Message{
-        .{ .role = "user", .content = "hi" },
-        .{ .role = "assistant", .content = "hello" },
-        .{ .role = "assistant", .content = "again", .reasoning_content = "why" },
-    };
-    const json = try serializeMessagesJsonFor(testing.allocator, &messages, &cfg);
-    defer testing.allocator.free(json);
-    try testing.expect(std.mem.indexOf(u8, json, "\"content\":\"hello\",\"reasoning_content\":\"\"") != null);
-    try testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"why\"") != null);
-    // Other families keep omitting the key.
-    const plain = ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
-    const json2 = try serializeMessagesJsonFor(testing.allocator, messages[0..2], &plain);
-    defer testing.allocator.free(json2);
-    try testing.expect(std.mem.indexOf(u8, json2, "reasoning_content") == null);
-
-    const cases = [_]struct { in: ?[]const u8, want: []const u8 }{
-        .{ .in = null, .want = "high" },     .{ .in = "high", .want = "high" },     .{ .in = "xhigh", .want = "high" },
-        .{ .in = "max", .want = "high" },    .{ .in = "medium", .want = "medium" }, .{ .in = "low", .want = "low" },
-        .{ .in = "minimal", .want = "low" }, .{ .in = "none", .want = "low" },      .{ .in = "bogus", .want = "high" },
-    };
-    for (cases) |c| try testing.expectEqualStrings(c.want, k2EffortFor(c.in));
-    const extra = try serializeExtraContext(testing.allocator, &cfg, true, "xhigh");
-    defer testing.allocator.free(extra);
-    try testing.expect(std.mem.indexOf(u8, extra, "\"reasoning_effort\":\"high\"") != null);
 }
 
 test "foldSystemMessages: a system turn past index 0 joins the leading system message" {
