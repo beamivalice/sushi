@@ -14,9 +14,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index).
 | fork point | `ef5e667d` | | 2026-09-17 |
 | earlier pass | `25e94c33` | | 2026-10-04 |
 | previous pass | `a21784b0` | `92446711` | 2026-10-09 |
-| **latest pass (reviewed through)** | `7b83ef30` | `eacf1f00` | 2026-10-11 |
+| 2026-10-11 pass | `7b83ef30` | `eacf1f00` | 2026-10-11 |
+| **latest pass (reviewed through)** | `e1d2013c` | `8fe10823` | 2026-10-28 |
 
-Next pass starts at `7b83ef30`.
+Next pass starts at `e1d2013c`. Upstream's plugin-host restructure (P4 to P14, SDK moves, the `abi/plugin.zig` hooks) landed in
+this span; it is code Sushi does not have, so its driver fixes are not applicable unless they point at a bug in our own path.
 
 ## How to run a pass
 
@@ -49,6 +51,16 @@ git -C <mlx-serve checkout> log --format='%h %ad %an %s' --date=short <cursor>..
 | `178c43da` | upstream serves Sushi's GLM and MiMo packs in-process | upstream runs our engine; nothing to port |
 | `c1fd12e8`, `846977ac` | GLM `mtp.0` head (depth 3), its own M5 Ultra rows: MTP / DFlash2 / serial 61 tok/s, code 86 / 99, edit 91 / 111, copy 157 / 182, JSON 92 / 95, thinking 75 / 70, story 65 / 61, llmprobe 78.0 / 81.6 | **skip**: owner decision 2026-10-11 |
 | `89283f81` | simd_qmm for affine projections of 8 to 16 rows on M1-M3 | skip: M1-M3 without a tile only; our GLM groups stop at four rows and run their own affine row tiles |
+| `7a459ffa`, `e8fb6b5b`, `76949c1f` | MTP and DFlash resume after a reasoning budget closes the thought | ported for Qwen and MiMo MTP: `abf08717` (rounds capped so the close lands where serial does); GLM DFlash2 and DeepSeek DSpark still decode the answer plain |
+| `181eb7a9` | DeepSeek fused decode kernels for 1 to 6 rows | skip: its weight kernels take only upstream's mxfp8 trunk and affine experts (no STQ layer); top-k, attention, index scores and once-per-expert reads are ours already; its NAX partials change the sum order; more launch fusion bounds at 0.1 to 0.15 ms a token. The review found the router read as stored: `8fe10823` |
+| `468cd811` | fold a post-normed block's output norm into the decode seam; reuse the draft mask | not applicable: neither Qwen nor DeepSeek has a block output norm; the mask is upstream's `spark2_5` model, not DSpark |
+| `24e3646b` | Qwen GDN state stays merged across batched ticks | covered: `PersistentSsmGroup` in `forwardMoeBatchedRows`, on by default |
+| `29c016e9`, `393e7cf5`, `8af32167`, `a80e3915` | expert streaming: next-layer lookahead, GPU-ceiling fill, scatter reads | covered or skip: DeepSeek predicts three layers ahead for 2 to 16 rows; one-row lookahead bounds at +0.4 ms a token cold and -0.3 warm; budget 108 already reaches the GPU ceiling; each STQ projection is its own read job |
+| `3b2f1202`, `ba0088f7` | `--prefill-decode-share` 0.25 by default; admit small requests at prefill chunk boundaries | default ported without the width cap: `536127a2`; chunk-boundary admission (GLM, MiMo) open |
+| `431ee238` | decode-end checkpoint so an agent turn reuses the generated reply | open: Qwen and GLM restore only at prefill points (DeepSeek has its thought point, MiMo its ring) |
+| `5d51b138`, `c24807ea` | idle flush oldest owed first; `--shutdown-persist-secs` | not reproduced (no short entry in 7,841 flushes: writer-armed commits write whole); replaced by the 8192-token SSD grid to 1M (`b3ebb282`); the flag dropped by the owner 2026-10-28 |
+| `9ccdcfc5`, `64b6e535`, `fce88572` | GLM dense DFlash slot keeps speculating; int8 Q/K hd-256 prefill attention; median-of-5 n-gram calibration | skip: owner 2026-10-28 takes Qwen and DeepSeek speed only, byte-exact; the int8 path changes output; the calibration has no near-margin case |
+| `5d37cc82`, `3bb6cce0` | DeepSeek C>1 batching | skip: owner rule, no batching on a streamed DeepSeek |
 | `d9b3243a` | `prefillDqGemm` off by default on CUDA | not served; the same dequantize-plus-dense-GEMM lever is ours for A6 at exactly 2048 rows, with its ruled-out range ([glm5-kernels](glm5-kernels.md)) |
 
 MiMo: no upstream performance commit since the fork that Sushi lacks.
@@ -138,6 +150,23 @@ at the v1.2.1 pin, so they are not an upstream optimization. One line per stage;
 | `2e22c489` | a `PrefillDoesNotFit` refusal quotes the bytes it compared | message only: ours is a fixed string | optional; S |
 | `b0145204` | `/v1/completions` `echo` with prompt logprobs | feature: ours refuses `echo` by name (`echoRejectReason`); GLM prefill reads only the last row's logits, so prompt logprobs would be a new head pass | skip; L |
 
+| `261e43df` | DeepSeek DSML closers with no opener leaked as the answer | **HAS-BUG** | fixed: `07051636` |
+| `046b6476`, `3b2f1202` | bare `<invoke>` after native dialects, prose openers, doubled GLM `<arg_key>`, special-token opener before `function=` | **HAS-BUG** | fixed: `125b7fa0`, `8af4da80`, `cdc7dc1b` |
+| `fdf146ec`, `9f774007`, `e551d56e` | Responses: replay plaintext `reasoning` items into their assistant turn | **HAS-BUG**: every reasoning input item was dropped | fixed: `bd3aa730` |
+| `60f4cae9`, `4f7b2988`, `94f45e0f` | `launch codex` passes a base-instructions file | **HAS-GAP**: codex's fallback names an `apply_patch` it no longer declares | fixed: `fa616f49` (no env kill switch) |
+| `0c0e9038` | DeepSeek top-k launched 1024 threads; M1/M2 grant 832 | **HAS-BUG** (M1/M2) | fixed: `6b84c34a`; the chunk half was fixed already (`prefillScoreHeadDim`) |
+| `3b2f1202` | GIF and BMP image input | **HAS-BUG** | fixed: `2a5ee782` |
+| `046b6476` | API key in a debug log; leaked default-device handle | **HAS-BUG** | fixed: `3f491972`, `e8eea45c` |
+| `94670d96` (#932), `6e15b046` | purgeable pages count as available; cache reserve capped at half the room, 1024 floor | **HAS-BUG** | fixed: `041190a0`, `76cb7812` |
+| `431ee238` | a prompt that does not fit unloads idle resident models first | **HAS-BUG** (needs two resident models) | open; low |
+| `9c7fb2ae` | SIGTERM drain; unbounded inference-thread join | partial: our cancel wakes the connection directly; the join hangs only if a streamed step never returns | optional; S |
+| `ba3c92dc`, `4c500856`, `f4a8ec88`, `0d983921`, `9c511c47`, `fdb7d36a`, `8721c1d9` | control text as special tokens, SSD-first index after swap-remove, `input_image` in tool output, SIGTERM mid-prefill, f32 GDN, Claude-style invoke, bare-string `image_url` | fixed already | closed |
+| `fce88572`, `3b2f1202` (seeded draws), `49bb6be0`, `47a87795`, `4782e801` | n-gram calibration, unkeyed verify draws, DeepSeek indexer barrier, 12 GiB margin, fp8 scale grid under 8 | not reached | closed |
+
+The rest of `7b83ef30..e1d2013c` is upstream's own plugin host and drivers (MiMo/DeepSeek streamed banks, MTP scratch,
+module-owned slots, tensor-parallel hosts, AuxHooks, plugin drafter), CUDA, GGUF, media, the app and model families we
+do not serve: not applicable.
+
 Items of the previous pass, checked as done: GLM tokenizer `ignore_merges` (`7c7bdcb1`), predraft after budget/EOS
 (`9a6a605c`), K/V 16-byte alignment guard (`aec87e66`), request-outcome metrics counted once (`518d887b`, `0f0b1adb`),
 disk free-space probe only before a store (`fecf6f35`), MTP sidecar admission (`00ea1b23`). Router top-k registers and
@@ -153,7 +182,7 @@ or deferred HC, per-core KDA, the NAX indexer and sparse kernel, and the confide
 
 ## Not reviewed
 
-Everything the filter in step 1 drops, and upstream commits dated after `7b83ef30`. This pass dropped: the Linux/CUDA
+Everything the filter in step 1 drops, and upstream commits dated after `e1d2013c`. This pass dropped: the Linux/CUDA
 work (`34ca46f2`, `20cec717`, `1b00c65a`), the app and web console (`7203ac0f`, `ed11df73`, `4d1eb3ba`, `ada6187f`), media
 and launcher features (`30768579`, `3563ee8e`), the release commit's Kokoro, MiniMax and LoRA parts (`d9b3243a`), DSpark
 opt-outs on the embedded engines (`97f10c36`) and the Linux CI cache change (`7b83ef30`).
