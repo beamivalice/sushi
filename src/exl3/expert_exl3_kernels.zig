@@ -10462,14 +10462,39 @@ fn mimoChainBytesMatch(c: MimoMoeCase) !void {
     try std.testing.expectEqualSlices(u8, try bf16Bytes(s, ys[0], &cs[0]), try bf16Bytes(s, ys[1], &cs[1]));
 }
 
+fn mcgReadersExact(comptime n: u32) !void {
+    try weightReaderExact(n, .mcg, .w16, true, .lane);
+    inline for (.{ .nax, .simdmat }) |reader| try weightReaderExact(n, .mcg, .w16, true, reader);
+}
+
+/// The sample's rates inside (or outside) [lo, hi], in ascending order.
+fn sampleCount(comptime lo: u32, comptime hi: u32, comptime inside: bool) usize {
+    var n: usize = 0;
+    for (exl3.ADMITTED_SAMPLE) |v| {
+        if ((v >= lo and v <= hi) == inside) n += 1;
+    }
+    return n;
+}
+
+fn sampleRates(comptime lo: u32, comptime hi: u32, comptime inside: bool) [sampleCount(lo, hi, inside)]u32 {
+    var out: [sampleCount(lo, hi, inside)]u32 = undefined;
+    var n: usize = 0;
+    for (exl3.ADMITTED_SAMPLE) |v| {
+        if ((v >= lo and v <= hi) == inside) {
+            out[n] = v;
+            n += 1;
+        }
+    }
+    return out;
+}
+
 // Every rate the format admits takes the fast arms: a rate that falls back to the
 // generic reader fails here. K4 (n64) keeps its own packed prefill branch.
 test "exl3 every admitted rate takes the fast arms, bit-identical to the generic reader" {
     const w12: exl3.Decode = .{ .codebook = .mcg, .window = .w12 };
-    inline for (exl3.Rate.min_n / 2..exl3.Rate.max_n / 2 + 1) |half| {
-        const n: u32 = 2 * half;
-        try weightReaderExact(n, .mcg, .w16, true, .lane);
-        inline for (.{ .nax, .simdmat }) |reader| try weightReaderExact(n, .mcg, .w16, true, reader);
+    inline for (12..33) |half| try mcgReadersExact(2 * half);
+    inline for (comptime sampleRates(24, 64, false)) |n| try mcgReadersExact(n);
+    for (exl3.ADMITTED_SAMPLE) |n| {
         for ([_]usize{ 1, 4 }) |rows| {
             try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = w12, .seed = 418 + n + rows, .banks = MIMO_BANKS, .x_scale = 3 });
         }
@@ -10522,9 +10547,11 @@ test "exl3 every K1.5 to K2 rate takes the fast arms at every window, bit-identi
         const n: u32 = 2 * half;
         inline for (exl3.Window.min_bits..17) |bits| {
             const win = comptime exl3.Window.fromBits(bits).?;
-            const dec: exl3.Decode = .{ .codebook = .mcg, .window = win };
-            const seed: u64 = 100 * n + bits;
             inline for (.{ .lane, .nax, .simdmat }) |reader| try weightReaderExact(n, .mcg, win, false, reader);
+        }
+        for ([_]exl3.Window{ .w8, .w12, .w15, .w16 }) |win| {
+            const dec: exl3.Decode = .{ .codebook = .mcg, .window = win };
+            const seed: u64 = 100 * n + win.bits();
             for ([_]usize{ 1, 4 }) |rows| {
                 try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = seed + rows, .banks = MIMO_BANKS, .x_scale = 3 });
                 try glmLaneChainBytesMatch(n, dec, rows, seed + rows);
@@ -10768,7 +10795,7 @@ test "exl3 PAIR1's 2^12 folded into the stores keeps every byte of the decode, v
 // A SPEC1 table whose pair differs at every rate, decoded by every reader at the bank's own rate. A reader that
 // took one pair for every bank, or the legacy pair, or another rate's row, fails against the host decode.
 const SPEC1_PER_RATE: exl3.Decode = .{ .codebook = .spec1, .window = .w12, .table = codebook_tables.indexOf("spec1-test-per-rate") };
-const PER_RATE_NS = [_]u32{ 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64 };
+const PER_RATE_NS = sampleRates(24, 64, true);
 
 fn perRate(win: exl3.Window) exl3.Decode {
     return .{ .codebook = .spec1, .window = win, .table = SPEC1_PER_RATE.table };
@@ -10837,7 +10864,7 @@ test "exl3 SPEC1 per-rate table: the 2^12 folded into the stores keeps every byt
 
 // The rates beyond the K1.5 to K4 run, K1 to K1.375 and K4.125 to K8, with SPEC1's own table rows and the test
 // table's: each reader, the prefill GEMM, the decode chain and the f32-truth bar, as at the rates above.
-const SPEC1_WIDE_NS = [_]u32{ 16, 18, 20, 22, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128 };
+const SPEC1_WIDE_NS = sampleRates(24, 64, false);
 
 test "exl3 SPEC1 below K1.5 and above K4: every reader decodes every rate with its own row" {
     inline for (.{ SPEC1_W15, SPEC1_PER_RATE }) |dec| inline for (SPEC1_WIDE_NS) |n| {
@@ -10849,7 +10876,7 @@ test "exl3 SPEC1 below K1.5 and above K4: every reader decodes every rate with i
 test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and the f32-truth bar hold" {
     defer gemm_simdmat_force = null;
     for ([_]exl3.Decode{ SPEC1_W15, SPEC1_PER_RATE }) |dec| {
-        for ([_]u32{ 16, 72, 80, 96, 112, 128 }) |n| {
+        for (SPEC1_WIDE_NS) |n| {
             const rate: exl3.Rate = .{ .n = n };
             naxBodyBytesMatch(rate, dec, 2560, 640, 900 + n) catch |e| if (e != error.SkipZigTest) return e;
             for ([_]?bool{ null, true, false }) |simdmat| {
