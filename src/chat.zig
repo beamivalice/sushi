@@ -5603,7 +5603,13 @@ fn parseArgKeyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
             const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
             const ak_close_len = tagLenAt(text[ak_close..], "</arg_key") orelse
                 tagLenAt(text[ak_close..], "</arg_value") orelse break;
-            const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
+            // A doubled opener (`<arg_key><arg_key>K`) keys on the last one.
+            var real_start = key_start;
+            while (std.mem.indexOfPos(u8, text, real_start, "<arg_key")) |n| {
+                if (n >= ak_close) break;
+                real_start = n + (tagLenAt(text[n..], "<arg_key") orelse break);
+            }
+            const key = std.mem.trim(u8, text[real_start..ak_close], " \t\n\r");
             i = ak_close + ak_close_len;
             while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
             const av_len = tagLenAt(text[i..], "<arg_value") orelse break;
