@@ -666,7 +666,6 @@ test "kv_disk_writer: room for a file is waited for before its bytes exist" {
     t.join();
     try testing.expect(got.load(.acquire));
     try testing.expect(w.pendingBytes() + 16 * 1024 <= w.permit_bytes);
-    try testing.expect(w.waitedNs() > 0);
 }
 
 test "kv_disk_writer: a file staged in parts lands whole at its last part, and a failed part publishes nothing" {

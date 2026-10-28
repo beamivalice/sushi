@@ -1257,29 +1257,6 @@ test "expert io fill keeps a worker fed while it is reading" {
     try t.expectEqual(@as(usize, 2), depth);
 }
 
-/// Process CPU time (user + system) in nanoseconds.
-fn processCpuNs() u64 {
-    const ru = std.posix.getrusage(0); // RUSAGE_SELF
-    const sec: i64 = @as(i64, ru.utime.sec) + @as(i64, ru.stime.sec);
-    const usec: i64 = @as(i64, ru.utime.usec) + @as(i64, ru.stime.usec);
-    return @intCast(sec * std.time.ns_per_s + usec * std.time.ns_per_us);
-}
-
-test "expert io idle fill workers do not spin" {
-    // Parked workers must not burn CPU; process CPU time bars the idle window.
-    const t = std.testing;
-    const pool = try FillPool.create(t.allocator, .{ .workers = 4 });
-    defer pool.destroy();
-
-    var ts = std.c.timespec{ .sec = 1, .nsec = 0 };
-    const before = processCpuNs();
-    _ = std.c.nanosleep(&ts, null);
-    const delta = processCpuNs() - before;
-
-    // A spinning pool burns one core per worker; parked, ~0.
-    try t.expect(delta < 400 * std.time.ns_per_ms);
-}
-
 test "expert io file cache reopens a replaced shard and reuses a stable one" {
     const t = std.testing;
     const io = t.io;

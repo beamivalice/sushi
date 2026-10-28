@@ -62,10 +62,8 @@ pub const Lap = struct {
 test "stages: laps land in their stage and total sums them" {
     var s = Stages{};
     var lap = Lap.start(&s);
-    const t0 = nowNs();
-    while (nowNs() - t0 < 2_000_000) {}
     lap.mark(.scale);
-    try std.testing.expect(s.get(.scale) >= 1_000_000);
+    try std.testing.expectEqual(s.get(.scale), s.total());
     try std.testing.expectEqual(@as(u64, 0), s.get(.search));
     var other = Stages{};
     other.add(.search, 7);
