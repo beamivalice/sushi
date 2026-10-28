@@ -103,6 +103,8 @@ echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
 grep -q 'wire_api = "responses"' ~/.sushi/codex/config.toml || OK=0
 grep -q "model_context_window = $ADV_CTX" ~/.sushi/codex/config.toml || OK=0
 grep -q "base_url = \"$BASE/v1\"" ~/.sushi/codex/config.toml || OK=0
+grep -q "^model_instructions_file = \"$HOME/.sushi/codex/model-instructions.md\"" ~/.sushi/codex/config.toml || OK=0
+grep -q 'exec_command' ~/.sushi/codex/model-instructions.md || OK=0
 if [ "$OK" = 1 ]; then
     run_test "codex config targets /v1/responses with the advertised context" PASS
 else

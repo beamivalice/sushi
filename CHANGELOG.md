@@ -14,6 +14,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **DeepSeek-V4.1-Flash no longer aborts on M1 and M2 Macs**: the indexer's top-k kernel probes the largest threadgroup the GPU runs (832 threads there, not 1024) at load, with identical picks.
 
+- **`sushi launch codex` gives local models codex's current tool contract**: the launch writes `~/.sushi/codex/model-instructions.md` and points `model_instructions_file` at it, so models stop receiving fallback instructions that name an `apply_patch` tool codex no longer declares and end edit turns with no change.
 - **GLM-5.3-Flash decode uses fewer GPU launches per MoE layer**: the shared expert now runs inside the routed experts' pair and down launches, for a serial token (two fewer), for batched requests and for DFlash2 verify rows (four fewer), with byte-identical output.
 - **`--vision-bf16` keeps a bf16 image tower as stored**: DeepSeek-V4.1 and Qwen skip the load-time 8-bit requantization and bill the full tower (about 0.47 GB and 0.30 GB more memory) for the stored tower's exact image quality.
 - **Qwen3.8-Flash-Next decode uses fewer GPU launches per MoE layer**: the shared expert, its gate logit and the gated add now run inside the routed experts' pair, down and finish launches, for a serial token (four fewer) and for MTP and DFlash2 verify rows (seven or more fewer), on both the one-bank and the rate-grouped packs, with byte-identical output.

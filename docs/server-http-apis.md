@@ -331,6 +331,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Every model id and URL in the zsh script is one single-quoted word (`appendQuoted`) and every config writer escapes
   them for its format (JSON/TOML/YAML `Esc`): ids come from folder names or a `--url` server, so never interpolate bare.
+- codex gets `model_instructions_file` (`~/.sushi/codex/model-instructions.md`, written each launch from `src/assets/codex_model_instructions.md`): without it codex sends fallback instructions naming an `apply_patch` tool it no longer declares; keep the asset's tool list equal to codex's declared tools.
 - opencode runs the newest version among every `opencode` on PATH, not the first (an old npm or `~/.opencode` copy
   would otherwise shadow Homebrew's 2.x); `--standalone` is probed on that binary.
 - Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long

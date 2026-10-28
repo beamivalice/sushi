@@ -447,23 +447,27 @@ pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, c
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
+/// Replaces codex's fallback base instructions, which name tools it no longer declares.
+pub const codex_instructions = @embedFile("assets/codex_model_instructions.md");
+
 /// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
 /// variant), pointing at our /v1/responses. Keyless: no `env_key` and
 /// `requires_openai_auth` unset means codex skips login; the loopback server
 /// ignores keys anyway.
-pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
+pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget, instructions_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\# written by sushi — dedicated CODEX_HOME, regenerated at each launch.
         \\model = "{f}"
         \\model_provider = "sushi"
         \\model_context_window = {d}
+        \\model_instructions_file = "{f}"
         \\
         \\[model_providers.sushi]
         \\name = "sushi (local)"
         \\base_url = "{f}/v1"
         \\wire_api = "responses"
         \\
-    , .{ esc(model), budget.context, esc(base_url) });
+    , .{ esc(model), budget.context, esc(instructions_path), esc(base_url) });
 }
 
 /// hermes `config.yaml` — mirrors what `hermes setup`'s custom-endpoint flow
@@ -851,8 +855,11 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             try writeAgentFile(allocator, io, "omp", "models.yml", yml);
         },
         .codex => {
-            const toml = try codexConfigToml(allocator, base_url, model, budget);
+            const instr_path = try std.fmt.allocPrint(allocator, "{s}/.sushi/codex/model-instructions.md", .{homeDir()});
+            defer allocator.free(instr_path);
+            const toml = try codexConfigToml(allocator, base_url, model, budget, instr_path);
             defer allocator.free(toml);
+            try writeAgentFile(allocator, io, "codex", "model-instructions.md", codex_instructions);
             try writeAgentFile(allocator, io, "codex", "config.toml", toml);
         },
         .hermes => {
@@ -1124,12 +1131,18 @@ test "omp models.yml: buffered tool calls have no provider progress deadline" {
 }
 
 test "codex config: responses wire API, keyless, context at the root" {
-    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:12345", "m1", .{ .context = 90112, .output = 22528 });
+    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:12345", "m1", .{ .context = 90112, .output = 22528 }, "/h/o\"me/.sushi/codex/model-instructions.md");
     defer t.allocator.free(toml);
     try t.expect(std.mem.indexOf(u8, toml, "wire_api = \"responses\"") != null);
     try t.expect(std.mem.indexOf(u8, toml, "model_context_window = 90112") != null);
     try t.expect(std.mem.indexOf(u8, toml, "base_url = \"http://127.0.0.1:12345/v1\"") != null);
     try t.expect(std.mem.indexOf(u8, toml, "env_key") == null);
+    try t.expect(std.mem.indexOf(u8, toml, "\nmodel_instructions_file = \"/h/o\\\"me/.sushi/codex/model-instructions.md\"\n") != null);
+}
+
+test "codex instructions file is the embedded asset and names no undeclared tool" {
+    try t.expectEqualStrings(@embedFile("assets/codex_model_instructions.md"), codex_instructions);
+    try t.expect(std.mem.indexOf(u8, codex_instructions, "apply_patch") == null);
 }
 
 test "pi models.json and opencode config parse as JSON and stay single-quote-free" {
@@ -1654,7 +1667,7 @@ test "config writers escape ids and urls so hostile ones stay data" {
     defer aider_parsed.deinit();
     try t.expect(aider_parsed.value.object.get("openai/" ++ id) != null);
 
-    const codex = try codexConfigToml(t.allocator, "http://h:1", id, FALLBACK_BUDGET);
+    const codex = try codexConfigToml(t.allocator, "http://h:1", id, FALLBACK_BUDGET, "/x");
     defer t.allocator.free(codex);
     try t.expect(std.mem.indexOf(u8, codex, "\nmodel = \"a\\\"b\\\\c'd\"\n") != null);
 

@@ -17,6 +17,11 @@ The confidence calibration and row choice in src/dflash_policy.zig follow
 mlx-serve src/dflash_policy.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE.
 
+The codex launch instructions in src/assets/codex_model_instructions.md follow
+mlx-serve src/assets/codex_model_instructions.md (https://github.com/ddalcu/mlx-serve),
+Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; the tool list is
+adjusted to what codex-cli 0.154 declares.
+
 The DeepSeek-V4.1 image plan, letterbox box and aligner unfold in src/dsv41_vision.zig
 follow mlx-serve src/dsv41_vision.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; their numbers are
