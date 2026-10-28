@@ -24914,111 +24914,11 @@ pub fn verifySharedHardware() bool {
     return value;
 }
 
-// Same subchunk and shuffle reduction as Apple's MLX qmv_wide_impl (MIT).
-const VERIFY_WIDE_SOURCE =
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint kl = lane % 8, r = threadgroup_position_in_grid.y * 8 + sg * 4 + lane / 8;
-    \\uint v0 = threadgroup_position_in_grid.x * NV;
-    \\uint row = min(r, uint(N - 1));
-    \\device const uchar* wr = reinterpret_cast<device const uchar*>(w) + size_t(row) * K;
-    \\float result[NV] = {0};
-    \\for (uint g = kl; g < K / 64; g += 8) {
-    \\    float scale = float(sc[size_t(row) * (K / 64) + g]);
-    \\    float bias = float(bi[size_t(row) * (K / 64) + g]);
-    \\    #pragma unroll
-    \\    for (uint chunk = 0; chunk < 8; ++chunk) {
-    \\        uint k0 = g * 64 + chunk * 8;
-    \\        float dq[8];
-    \\        #pragma unroll
-    \\        for (uint i = 0; i < 8; ++i) dq[i] = scale * float(wr[k0 + i]) + bias;
-    \\        #pragma unroll
-    \\        for (uint v = 0; v < NV; ++v) {
-    \\            uint input_row = min(v0 + v, uint(M - 1));
-    \\            float acc = 0;
-    \\            #pragma unroll
-    \\            for (uint i = 0; i < 8; ++i) acc += float(x[size_t(input_row) * K + k0 + i]) * dq[i];
-    \\            result[v] += acc;
-    \\        }
-    \\    }
-    \\}
-    \\for (uint v = 0; v < NV; ++v) {
-    \\    result[v] += simd_shuffle_down(result[v], 4);
-    \\    result[v] += simd_shuffle_down(result[v], 2);
-    \\    result[v] += simd_shuffle_down(result[v], 1);
-    \\}
-    \\if (kl == 0 && r < N) {
-    \\    for (uint v = 0; v < NV; ++v)
-    \\        if (v0 + v < M) y[size_t(v0 + v) * N + r] = T(result[v]);
-    \\}
-;
-var verify_wide_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const VerifyWideKey = struct { m: c_int, n: c_int, k: c_int, nv: c_int };
-var verify_wide_configs = QsaCfgCache(VerifyWideKey, 1){};
-
-fn verifyWideProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, nv: c_int) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or (nv != 4 and nv != 6 and nv != 8 and nv != 12)) return null;
-    if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
-    if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return null;
-    const xs = mlx.getShape(x);
-    const ws = mlx.getShape(w);
-    const ss = mlx.getShape(sc);
-    if (xs.len != 3 or xs[0] != 1 or xs[1] < 6 or xs[1] > 12 or ws.len != 2 or ss.len != 2) return null;
-    const m = xs[1];
-    const k = xs[2];
-    const n = ws[0];
-    if ((k != 640 and k != 2560 and k != 6144) or n < 8 or @mod(n, 8) != 0 or ws[1] != @divExact(k, 4) or ss[0] != n or ss[1] != @divExact(k, 64) or !std.mem.eql(c_int, ss, mlx.getShape(bi))) return null;
-    const kernel = blk: {
-        if (verify_wide_kernel) |value| break :blk value;
-        const ins = [_][*:0]const u8{ "x", "w", "sc", "bi" };
-        const outs = [_][*:0]const u8{"y"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const value = mlx.mlx_fast_metal_kernel_new("verify_dense_wide", iv, ov, VERIFY_WIDE_SOURCE, "", true, false);
-        if (value.ctx == null) return error.MetalKernelCompileFailed;
-        verify_wide_kernel = value;
-        break :blk value;
-    };
-    const key = VerifyWideKey{ .m = m, .n = n, .k = k, .nv = nv };
-    const config = blk: {
-        if (verify_wide_configs.get(key)) |hit| break :blk hit[0];
-        const value = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(value);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ 1, m, n }, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, @intCast(@divTrunc(m + nv - 1, nv) * 32), @intCast(@divExact(n, 8) * 2), 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(value, 32, 2, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(value, "T", .bfloat16));
-        inline for (.{ "M", "N", "K", "NV" }, .{ m, n, k, nv }) |name, number| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(value, name, number));
-        verify_wide_configs.put(key, .{value});
-        break :blk value;
-    };
-    const iv = mlx.mlx_vector_array_new_data(&.{ x, w, sc, bi }, 4);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    var ov = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, config, s));
-    var result = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(result);
-    try mlx.check(mlx.mlx_vector_array_get(&result, ov, 0));
-    return result;
-}
-
 pub const VerifyProjectionKind = enum { shared, gdn, lm_head, attention };
 
 fn verifySharedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
     return verifyJoinedProjection(s, x, w, sc, bi, widths, .shared);
 }
-
-fn verifyGdnProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
-    return verifyJoinedProjection(s, x, w, sc, bi, widths, .gdn);
-}
-
-fn verifyAttnProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
-    return verifyJoinedProjection(s, x, w, sc, bi, widths, .attention);
-}
-
 
 pub fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int, comptime kind: VerifyProjectionKind) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or widths.len < 2 or widths.len > 8) return null;
@@ -31528,10 +31428,10 @@ test "verify GDN projections preserve solo qmv values across request widths" {
             const x = try attn256RandBf16(prng.random(), &.{ 1, total, k }, s);
             defer _ = mlx.mlx_array_free(x);
             if (total > 12 or lengths[0] > 6) {
-                try testing.expect((try verifyGdnProjection(s, x, w, sc, bi, lengths[0..count])) == null);
+                try testing.expect((try verifyJoinedProjection(s, x, w, sc, bi, lengths[0..count], .gdn)) == null);
                 continue;
             }
-            const grouped = (try verifyGdnProjection(s, x, w, sc, bi, lengths[0..count])) orelse return error.GdnProjectionDeclined;
+            const grouped = (try verifyJoinedProjection(s, x, w, sc, bi, lengths[0..count], .gdn)) orelse return error.GdnProjectionDeclined;
             defer _ = mlx.mlx_array_free(grouped);
             var offset: c_int = 0;
             for (lengths[0..count]) |width| {
@@ -31550,16 +31450,16 @@ test "verify GDN projections preserve solo qmv values across request widths" {
         const x = try attn256RandBf16(prng.random(), &.{ 1, 8, k }, s);
         defer _ = mlx.mlx_array_free(x);
         for ([_][]const c_int{ &.{ 1, 7 }, &.{8}, &.{ 2, 2 }, &.{ 0, 8 } }) |widths| {
-            try testing.expect((try verifyGdnProjection(s, x, w, sc, bi, widths)) == null);
+            try testing.expect((try verifyJoinedProjection(s, x, w, sc, bi, widths, .gdn)) == null);
         }
-        try testing.expect((try verifyGdnProjection(s, x, w, sc, .{}, &.{ 4, 4 })) == null);
+        try testing.expect((try verifyJoinedProjection(s, x, w, sc, .{}, &.{ 4, 4 }, .gdn)) == null);
         const wide = try attn256RandBf16(prng.random(), &.{ 1, 25, k }, s);
         defer _ = mlx.mlx_array_free(wide);
-        try testing.expect((try verifyGdnProjection(s, wide, w, sc, bi, &.{ 5, 5, 5, 5, 5 })) == null);
+        try testing.expect((try verifyJoinedProjection(s, wide, w, sc, bi, &.{ 5, 5, 5, 5, 5 }, .gdn)) == null);
         const old = vqmm_mixed_plain_test_force;
         vqmm_mixed_plain_test_force = true;
         defer vqmm_mixed_plain_test_force = old;
-        try testing.expect((try verifyGdnProjection(s, x, w, sc, bi, &.{ 4, 4 })) == null);
+        try testing.expect((try verifyJoinedProjection(s, x, w, sc, bi, &.{ 4, 4 }, .gdn)) == null);
     }
 }
 
@@ -31590,10 +31490,10 @@ test "verify attention projections preserve solo qmv values across request width
             const x = try attn256RandBf16(prng.random(), &.{ 1, total, k }, s);
             defer _ = mlx.mlx_array_free(x);
             if (total > 12 or lengths[0] > 6) {
-                try testing.expect((try verifyAttnProjection(s, x, w, sc, bi, lengths[0..count])) == null);
+                try testing.expect((try verifyJoinedProjection(s, x, w, sc, bi, lengths[0..count], .attention)) == null);
                 continue;
             }
-            const grouped = (try verifyAttnProjection(s, x, w, sc, bi, lengths[0..count])) orelse return error.AttnProjectionDeclined;
+            const grouped = (try verifyJoinedProjection(s, x, w, sc, bi, lengths[0..count], .attention)) orelse return error.AttnProjectionDeclined;
             defer _ = mlx.mlx_array_free(grouped);
             var offset: c_int = 0;
             for (lengths[0..count]) |width| {
@@ -31612,16 +31512,16 @@ test "verify attention projections preserve solo qmv values across request width
         const x = try attn256RandBf16(prng.random(), &.{ 1, 8, k }, s);
         defer _ = mlx.mlx_array_free(x);
         for ([_][]const c_int{ &.{ 1, 7 }, &.{8}, &.{ 2, 2 }, &.{ 0, 8 } }) |widths| {
-            try testing.expect((try verifyAttnProjection(s, x, w, sc, bi, widths)) == null);
+            try testing.expect((try verifyJoinedProjection(s, x, w, sc, bi, widths, .attention)) == null);
         }
-        try testing.expect((try verifyAttnProjection(s, x, w, sc, .{}, &.{ 4, 4 })) == null);
+        try testing.expect((try verifyJoinedProjection(s, x, w, sc, .{}, &.{ 4, 4 }, .attention)) == null);
         const wide = try attn256RandBf16(prng.random(), &.{ 1, 25, k }, s);
         defer _ = mlx.mlx_array_free(wide);
-        try testing.expect((try verifyAttnProjection(s, wide, w, sc, bi, &.{ 5, 5, 5, 5, 5 })) == null);
+        try testing.expect((try verifyJoinedProjection(s, wide, w, sc, bi, &.{ 5, 5, 5, 5, 5 }, .attention)) == null);
         const old = vqmm_mixed_plain_test_force;
         vqmm_mixed_plain_test_force = true;
         defer vqmm_mixed_plain_test_force = old;
-        try testing.expect((try verifyAttnProjection(s, x, w, sc, bi, &.{ 4, 4 })) == null);
+        try testing.expect((try verifyJoinedProjection(s, x, w, sc, bi, &.{ 4, 4 }, .attention)) == null);
     }
 }
 
@@ -50560,48 +50460,6 @@ test "verify expert reduction preserves unsort multiply and sum" {
         const actual = (try verifyExpertReduce(s, down, inverse, scores)) orelse return error.ExpertReduceDeclined;
         defer _ = mlx.mlx_array_free(actual);
         try testing.expect(try qsaArraysAllEqual(expected, actual, s));
-    }
-}
-
-test "the wide dense verify tile preserves the stock QMV reduction" {
-    if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0x719E);
-    for ([_][2]c_int{ .{ 2560, 10240 }, .{ 2560, 6144 }, .{ 6144, 2560 }, .{ 640, 2560 } }) |shape| {
-        const k = shape[0];
-        const n = shape[1];
-        const weights = try attn256RandBf16(prng.random(), &.{ n, k }, s);
-        defer _ = mlx.mlx_array_free(weights);
-        var triple = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(triple);
-        try mlx.check(mlx.mlx_quantize(&triple, weights, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, s));
-        var w = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(w);
-        var sc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sc);
-        var bi = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(bi);
-        try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
-        try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
-        try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
-        for ([_]c_int{ 6, 8, 12 }) |m| {
-            const x = try attn256RandBf16(prng.random(), &.{ 1, m, k }, s);
-            defer _ = mlx.mlx_array_free(x);
-            const cpu = mlx.mlx_default_cpu_stream_new();
-            defer _ = mlx.mlx_stream_free(cpu);
-            try testing.expect((try verifyWideProjection(cpu, x, w, sc, bi, 6)) == null);
-            try testing.expect((try verifyWideProjection(s, .{}, w, sc, bi, 6)) == null);
-            try testing.expect((try verifyWideProjection(s, x, w, sc, .{}, 6)) == null);
-            try testing.expect((try verifyWideProjection(s, x, w, sc, bi, 7)) == null);
-            var reference = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(reference);
-            try mlx.check(mlx.mlx_quantized_matmul(&reference, x, w, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", s));
-            for ([_]c_int{ 4, 6, 8, 12 }) |nv| {
-                const got = (try verifyWideProjection(s, x, w, sc, bi, nv)) orelse return error.WideTileDeclined;
-                defer _ = mlx.mlx_array_free(got);
-                try testing.expect(try qsaArraysAllEqual(reference, got, s));
-            }
-        }
     }
 }
 
