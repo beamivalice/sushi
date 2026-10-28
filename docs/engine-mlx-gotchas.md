@@ -145,8 +145,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   `tests/test_tokenizer_reference.sh` compares the three real tokenizer files to HF on CPU without loading weights.
   Its synthetic inputs are normalized first to isolate Split/BPE: the older missing NFC-normalizer behavior on
   decomposed text is a separate, still-open issue. `TOKENIZER_CASES_JSON` can add an already-normalized prompt pack.
-- The cased `llama3` grammar needs `\p{Lu}` in the Split regex: contractions plus `\p{N}{1,3}` is also GLM's plain
-  Llama-3 pattern, which is the gpt2 path with `.letters` word rules and 3-digit groups. The BPE `ignore_merges` flag
+- GLM's Split regex is the plain Llama-3 pattern (contractions plus `\p{N}{1,3}`): the gpt2 path with `.letters` word
+  rules and 3-digit groups. The BPE `ignore_merges` flag
   (GLM sets it) is honoured in `bpeMerge`. The parity script covers GLM, Qwen and MiMo on code and tool-call text.
 - DeepSeek's `Scope.out` handle belongs to the caller: a `block` result chained through a loop in a scope must be
   adopted with `sc.keep` or it leaks every iteration (the DSpark draft leaked its stage outputs per round). Guard: the

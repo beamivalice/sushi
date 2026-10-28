@@ -280,8 +280,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   no request, so `request_id`, `max_tokens`, `generated_tokens` and `elapsed_seconds` are 0.
 - An entry a live row restored from is listed once, as that row: the dedupe keys on an internal entry id that
   `/metrics.json` does not emit.
-- `/props` `template_fallbacks` counts renders where the model's own chat template raised and the generic format
-  answered ([server-tool-calling](server-tool-calling.md#templates)); the count is process-wide, and it is zero when
+- `/props` `template_fallbacks` counts renders where a `<|im_end|>` model's own chat template raised and ChatML
+  answered (other models refuse with 500 `chat template unusable`, uncounted) ([server-tool-calling](server-tool-calling.md#templates)); the count is process-wide, and it is zero when
   every prompt is the checkpoint's own.
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
   each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.

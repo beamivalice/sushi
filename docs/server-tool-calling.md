@@ -33,14 +33,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - One-shot CLI prompts carry the same thinking fields through the chat request policy; no CLI render may hardcode thinking off.
 
-- **Control bytes**: ONE raw byte <0x20 in history kills the strict render → SILENT `fallbackFormatChat` (model loses
-  its stop token). Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A
+- **Control bytes**: ONE raw byte <0x20 in history kills the strict render → `fallbackFormatChat` on a `<|im_end|>` model
+  (ChatML, the stop token kept), a named 500 `chat template unusable: <jinja error>` on any other. Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A
   NUL byte truncated the rendered prompt (`jinja_render_chat` returns its LENGTH; tell: the same `prompt=` count on
   consecutive turns).
 - **A parse or runtime gap in jinja.cpp is the same silent downgrade**: GLM-5.3's `m.content.0.output` (a number after
   a dot) failed to parse on EVERY tool message, so each agent turn after a tool result ran in the untrained generic
   format and broke prefix reuse. Fixed in `lib/jinja_cpp` (`x.0` is `x[0]`; `x.1.0` is two subscripts, never a float);
-  the pack template is a committed fixture. A fallback logs `jinja render failed (…)` at warn on every render and
+  the pack template is a committed fixture. Only a model whose turns end in `<|im_end|>` (Qwen, MiMo) has a fallback
+  format, ChatML; GLM and DeepSeek answer a raise or a missing template with 500 `chat template unusable: <reason>` on
+  every generative surface, streamed or not. A fallback logs `jinja render failed (…)` at warn on every render and
   counts into `/props.template_fallbacks`: nonzero on a model that ships a template means a broken prompt, so grep
   that line first. A new template ships its fixture and a no-fallback case in the `format corpus` tool-traffic test.
   Cross-check suspect templates against Python Jinja2 on the same JSON before blaming the model.
@@ -51,11 +53,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
 - A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`
   stay OBJECTS (a history call whose arguments are empty, null, an array, a scalar or malformed text embeds `{}`:
-  `arguments|items` on anything else raises into the silent fallback); history tool_calls carry `"id"`; only a refusing template gets `noThinkTailSuffix`.
+  `arguments|items` on anything else raises into the silent fallback); history tool_calls carry `"id"`; `noThinkTailSuffix` closes the block a template opens unconditionally (GLM-5.3's
+  `<|assistant|><think>`) when thinking is off.
 - **A system turn past index 0 renders where the template allows it**: a template that raises on it or drops it gets
   it folded into the leading system (`templateProbeRendersLateSystem`, every surface); MiMo's role loop keeps it in
   place, byte for byte. The fold rewrites every earlier byte of the prompt, so the two byte-pinned stock Qwen3.8
-  templates (`qwenLateSystemTemplate`: the one the Flash-Next packs ship, and the 2.4T one) get ONLY their
+  templates (`qwenLateSystemTemplate`: the one the Flash-Next packs ship, fixture `qwen38_flash_next_chat_template.jinja`) get ONLY their
   "System message must be at the beginning" branch replaced and render the note in place; any other revision keeps
   the fold. The adapter runs only when a late system turn exists, so a prompt without one is byte-identical; a second
   LEADING system turn is now a turn of its own too. `QWEN_MID_SYSTEM_MODEL_DIR=<pack> zig build test
@@ -88,7 +91,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   partial values, never ship raw markup as content. Model-mangled arg JSON → `looseRepairToolCallJson`, never drop
   the whole call. A tag parser never bails on ONE missing delimiter.
 - **Claude's `<function_calls><invoke name=…><parameter name=…>` is a call** when no other family matched
-  (`BARE_INVOKE`, ATEM's grammar without the namespace; qwen4_exp writes it after Claude transcripts). It is
+  (`BARE_INVOKE`; qwen4_exp writes it after Claude transcripts). It is
   `inferred`, so an undeclared name stays prose. The stream gate holds `<function_calls>` and `<invoke ` with every
   growing prefix (`invokeOpenerHoldsForTools`); the scrubber cuts it only beside a `<parameter ` or `</invoke>`
   (`bareInvokeMarkupCut`), and the parser reads it only beside one of them too (`parseInvokeToolCalls`), so prose
@@ -156,7 +159,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Thinking-off is enforced in the PROMPT; generated reasoning is ALWAYS delivered (every site splits via
   `splitThinkBlock(text, true, …)`).
 - **A thought is decided at its first byte when no opener can start it** (`chat.thinkOpenerPossible`: every opener
-  starts with `<` or is a Muse `assistant` / `to=` header); otherwise the three stream sites wait for 7 bytes. On the
+  starts with `<`); otherwise the three stream sites wait for 7 bytes. On the
   surface budget path (`armThinkBound` declined) the budget then counts from that earlier consumption.
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
   a close tag still arriving wait (`chat.settledReasoning` on the tools path, `chat.openThoughtFlush` /
