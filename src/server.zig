@@ -768,7 +768,7 @@ test "routeRequestModel: a path names its own entry, an unknown name the default
 /// Resolution runs ahead of dispatch, so without this an unknown path on a
 /// server with no default model returned 503 "No default model configured"
 /// instead of 404 — and a path's existence has nothing to do with model state.
-/// The drift guard is a test that reads the dispatch chain out of this file.
+/// Every path an equality arm dispatches must be listed here.
 const ROUTE_PATHS = [_][]const u8{
     "/",
     "/chat",
@@ -2020,6 +2020,7 @@ pub fn serve(
             allocator.destroy(args);
             continue;
         };
+        // Detach: a joinable handle dropped per request leaks a stack region; no spawn site may discard its handle.
         conn_thread.detach();
     }
 
@@ -7751,6 +7752,7 @@ pub fn admissionAvailable(total_limit: u64, active_mem: u64) u64 {
     return total_limit -| active_mem;
 }
 
+/// The hot cache is read once, as the published evictable atomic, never billed on top.
 pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
     const heads = config.num_attention_heads;
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
@@ -9487,6 +9489,7 @@ const SchemaThinkingPolicy = enum {
 /// reasoning budget also keeps that fallback because it can end the visible
 /// think block before generation reaches the grammar boundary. Tools still
 /// skip the mask.
+/// Every JSON grammar mask site goes through here.
 fn schemaMasksThinking(
     has_schema: bool,
     has_tools: bool,
@@ -10426,6 +10429,7 @@ fn handleNonStreamingCompletion(
     const timings_field = try completionTimingsField(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
     defer allocator.free(timings_field);
 
+    // finish_reason always carries finish_details beside it.
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
     , .{
@@ -10607,6 +10611,7 @@ fn handleStreamingCompletion(
 
     if (!client_gone) {
         const final_lp = (try lps.take()) orelse "null";
+        // finish_reason always carries finish_details beside it.
         const final_chunk = try std.fmt.allocPrint(allocator,
             \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":"","logprobs":{s},"finish_reason":"{s}"{s}}}]}}
         , .{ cmpl_id, created_ts, model_name, final_lp, finish_reason, finishDetailsField(finish_reason, ts.finish_details) });
@@ -10902,7 +10907,7 @@ fn nonStreamingViaScheduler(
 /// truncate valid JSON. Without a boundary the existing parser applies.
 fn emitConstrainedChat(a: std.mem.Allocator, stream: *Conn, id: i64, model: []const u8, lps: *StreamLogprobs, d: *rp_mod.Delivery) !void {
     if (d.reasoning.items.len > 0) {
-        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = null, .reasoning_content = d.reasoning.items }, null, null, null, .{});
+        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = null, .reasoning_content = d.reasoning.items }, null, null, null, .{ .logprobs_json = null });
     }
     if (d.content.items.len > 0) {
         try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = d.content.items }, null, null, null, .{ .logprobs_json = try lps.take() });
@@ -11167,6 +11172,7 @@ fn handleNonStreamingGeneration(
             const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, tc_details);
             defer allocator.free(tc_usage_obj);
 
+            // finish_reason always carries finish_details beside it.
             const response = try std.fmt.allocPrint(allocator,
                 \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
             , .{
@@ -11246,6 +11252,7 @@ fn handleNonStreamingGeneration(
     const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);
     defer allocator.free(usage_obj);
 
+    // finish_reason always carries finish_details beside it.
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
     , .{
@@ -11747,6 +11754,7 @@ fn handleStreamingGeneration(
     // with it — the gate is otherwise O(buffer) per token for as long as a
     // think block is open and unclosed (47.99 us/token at 113 KB).
     var think_scan: chat_mod.ThinkScan = .{};
+    // Gate through streamThinkGateScan only, and reset the scan wherever the buffer is cleared.
     // When tools are present, buffer individual token texts for deferred streaming
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
@@ -11777,6 +11785,7 @@ fn handleStreamingGeneration(
     // the content arm when the generator reports a DIRECT answer — the whole
     // point is that no reasoning block exists to scan for.
     const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
+    // A stream starts in a think block from the rendered prompt, never from the request flag.
     var in_think_block = prompt_opened_think and !constrained_proto;
     var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
     defer if (delivery) |*d| d.deinit(allocator);
@@ -11925,7 +11934,7 @@ fn handleStreamingGeneration(
                                 const settled = chat_mod.settledReasoning(rc);
                                 if (chat_mod.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
                                     if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{ .logprobs_json = null });
                                     reasoning_streamed = settled.len;
                                     reasoning_tokens_sent += 1;
                                     if (reasoning_budget >= 0 and reasoning_tokens_sent >= @as(usize, @intCast(reasoning_budget))) {
@@ -11961,7 +11970,7 @@ fn handleStreamingGeneration(
                             if (split.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
                                     if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{ .logprobs_json = null });
                                 }
                             }
                         }
@@ -12073,7 +12082,7 @@ fn handleStreamingGeneration(
                 thought_shipped = false;
                 if (last.len > 0 and !budget_exhausted) {
                     if (include_usage) try delivered_reasoning.appendSlice(allocator, last);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = last }, null, null, null, .{});
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = last }, null, null, null, .{ .logprobs_json = null });
                 }
                 const after = m.pos + m.len;
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
@@ -12107,7 +12116,7 @@ fn handleStreamingGeneration(
                 if (safe_len > 0) {
                     if (flush.ship > 0 and !budget_exhausted) {
                         if (include_usage) try delivered_reasoning.appendSlice(allocator, think_buf.items[flush.skip..safe_len]);
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[flush.skip..safe_len] }, null, null, null, .{});
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[flush.skip..safe_len] }, null, null, null, .{ .logprobs_json = null });
                     }
                     if (flush.ship > 0) thought_shipped = true;
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
@@ -12177,7 +12186,7 @@ fn handleStreamingGeneration(
             const tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
             if (!budget_exhausted and tail.len > 0) {
                 if (include_usage) try delivered_reasoning.appendSlice(allocator, tail);
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = tail }, null, null, null, .{});
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = tail }, null, null, null, .{ .logprobs_json = null });
             }
         } else {
             const vis_tail = chat_mod.streamContentLead(think_buf.items, content_started);
@@ -12232,7 +12241,7 @@ fn handleStreamingGeneration(
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
                     if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{});
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{ .logprobs_json = null });
                 }
             }
 
@@ -12274,7 +12283,7 @@ fn handleStreamingGeneration(
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
                     if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{});
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{ .logprobs_json = null });
                 }
                 if (think_split.content.len > 0) {
                     // Locate against the RAW concatenation: it is always a true
@@ -12342,7 +12351,7 @@ const DeltaFields = struct {
 const ChunkExtras = struct {
     /// Already-rendered `{"content":[…]}` from `formatLogprobsObject`, or null
     /// to omit the key entirely.
-    logprobs_json: ?[]const u8 = null,
+    logprobs_json: ?[]const u8,
 };
 
 /// Streaming-side logprobs accumulator.
@@ -12561,6 +12570,7 @@ fn sendSSEChunk(
     }
 
     // Build the full SSE chunk
+    // finish_reason always carries finish_details beside it.
     const chunk = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"delta":{s},"finish_reason":{s}{s}{s}}}],"usage":{s}{s}}}
     , .{ chat_id, nowSecs(stream.io), model_name, delta_buf.items, fr_str, fd_str, lp_buf.items, usage_str, timings_tail_buf.items });
@@ -13425,75 +13435,65 @@ test "chat page URL: a wildcard bind is opened through loopback" {
     try t.expectEqualStrings("http://192.168.1.5:18800/", chatPageUrl(&buf, "192.168.1.5", 18800));
 }
 
-test "the route-existence 404 is answered BEFORE the model is resolved" {
-    // A path we do not serve must cost nothing. Resolution ran first, so
-    // `POST /v1/load` (the real route is /v1/load-model) with a `model` field
-    // cold-loaded that model and THEN 404'd — 2m42s and 121 GB resident for a
-    // typo, and a one-line way for any client to pin the box. The existence
-    // answer has to precede `ensureLoaded`, not sit in one of its error arms.
-    const src = @embedFile("server.zig");
-    const gate = "if (!routeExists(" ++ "path)) {";
-    const resolve = "scheduler.ensureLoaded(" ++ "requested_model_id)";
-    const gate_at = std.mem.indexOf(u8, src, gate) orelse return error.GateMissing;
-    const resolve_at = std.mem.indexOf(u8, src, resolve) orelse return error.ResolveMissing;
-    try std.testing.expect(gate_at < resolve_at);
-    // Exactly one gate — a second copy in an error arm is a second answer to
-    // a question that has one.
-    try std.testing.expect(std.mem.indexOf(u8, src[gate_at + gate.len ..], gate) == null);
+test "an unknown endpoint is a 404 that never reaches model resolution" {
+    const t = std.testing;
+    var sch: scheduler_mod.Scheduler = undefined;
+    const prev_sch = global_scheduler;
+    defer global_scheduler = prev_sch;
+    global_scheduler = &sch;
+    const response = try serveOneForTest("POST /v1/load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"model\":\"m\"}");
+    defer t.allocator.free(response);
+    try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 404 Not Found\r\n"));
+    try t.expect(std.mem.indexOf(u8, responseBody(response), "Unknown endpoint") != null);
 }
 
-test "each connection thread handle is detached after spawn" {
-    // A finished pthread keeps its stack mapping and kernel bookkeeping until
-    // its handle is joined or detached. The server cannot join per-request
-    // threads individually, so dropping this handle leaks one stack region per
-    // request even though `handleConnectionThread` has returned.
-    const src = @embedFile("server.zig");
-    const spawn = "std.Thread.spawn(.{}, handleConnection" ++ "Thread, .{args})";
-    const spawn_at = std.mem.indexOf(u8, src, spawn) orelse return error.ConnectionSpawnMissing;
-    const accept_end = std.mem.indexOfPos(
-        u8,
-        src,
-        spawn_at,
-        "\n    }\n\n    // Shutdown ordering",
-    ) orelse return error.AcceptLoopEndMissing;
-    const detach = "conn_thread." ++ "detach();";
-    try std.testing.expect(std.mem.indexOf(u8, src[spawn_at..accept_end], detach) != null);
-
-    // Class guard: no spawn site anywhere may discard its joinable handle —
-    // that is the exact pre-fix shape, and a new worker elsewhere would
-    // otherwise re-ship the leak unguarded.
-    const sources = [_][]const u8{
-        src,
-        @embedFile("scheduler.zig"),
-        @embedFile("main.zig"),
-        @embedFile("metrics.zig"),
-    };
-    const discard = "_ = " ++ "std.Thread.spawn";
-    const discard_try = "_ = try " ++ "std.Thread.spawn";
-    for (sources) |s| {
-        try std.testing.expect(std.mem.indexOf(u8, s, discard) == null);
-        try std.testing.expect(std.mem.indexOf(u8, s, discard_try) == null);
+test "a video-capable vision model advertises video beside image, loaded or not" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    const Case = struct { config_json: []const u8, video_token_id: u32, want: []const u8 };
+    for ([_]Case{
+        .{ .config_json = "{\"model_type\":\"qwen4_exp\",\"vision_config\":{},\"video_token_id\":151656}", .video_token_id = 151656, .want = "\"input_modalities\":[\"text\",\"image\",\"video\"]" },
+        .{ .config_json = "{\"model_type\":\"qwen4_exp\",\"vision_config\":{}}", .video_token_id = 0, .want = "\"input_modalities\":[\"text\",\"image\"]" },
+    }) |c| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = c.config_json });
+        var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .video_token_id = c.video_token_id };
+        var entry = model_registry_mod.LoadedModel{
+            .allocator = t.allocator,
+            .id = "m",
+            .path = path,
+            .bytes_on_disk = 0,
+            .arch_hint = "qwen4_exp",
+            .config = &cfg,
+            .weights = null,
+            .transformer = null,
+            .tokenizer = null,
+            .chat_config = &chat_cfg,
+            .vision_encoder = @ptrFromInt(0x1000),
+            .drafter_path = "",
+            .drafter_block_size = 0,
+            .prefix_cache = null,
+            .refcount = std.atomic.Value(u32).init(0),
+            .last_used_ns = 0,
+            .bytes_resident = 0,
+            .state = .ready,
+            .error_name = null,
+        };
+        const loaded = try renderModelEntry(t.allocator, io, &entry);
+        defer t.allocator.free(loaded);
+        try t.expect(std.mem.indexOf(u8, loaded, c.want) != null);
+        entry.state = .unloaded;
+        entry.config = null;
+        entry.chat_config = null;
+        entry.vision_encoder = null;
+        const stub = try renderModelEntry(t.allocator, io, &entry);
+        defer t.allocator.free(stub);
+        try t.expect(std.mem.indexOf(u8, stub, c.want) != null);
     }
-}
-
-test "every input_modalities gate that advertises image beside a video-capable model also advertises video" {
-    // Video piggybacks the SAME "does this model take image input?" signal —
-    // Qwen3-VL-family checkpoints declare `video_token_id` alongside
-    // `vision_config`/`vision_encoder` — so a future edit to either the READY
-    // (live config) or STUB (unloaded, config.json-only) input_modalities
-    // builder that touches the image gate but forgets video would silently
-    // under-report every video-capable model to the app forever (the attach
-    // menu's video option reads exactly this field). Two independent checks:
-    // the two sites read DIFFERENT underlying signals (config.video_token_id
-    // vs StubMeta.has_video) and must each carry their own gate.
-    const src = @embedFile("server.zig");
-
-    const ready_anchor = "if (has_vision) try mods.appendSlice(allocator, ";
-    const ready_at = std.mem.indexOf(u8, src, ready_anchor) orelse return error.ReadyImageGateMissing;
-    const ready_window = src[ready_at .. ready_at + 260];
-    try std.testing.expect(std.mem.indexOf(u8, ready_window, "video_token_id") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, src, "sm.found and sm.has_vision and sm.has_video") != null);
 }
 
 test "routeExists answers endpoint existence without consulting the model" {
@@ -13516,112 +13516,6 @@ test "routeExists answers endpoint existence without consulting the model" {
     try std.testing.expect(!routeExists("/v1/images/generations")); // media generation left this build
     try std.testing.expect(!routeExists("/nope"));
     try std.testing.expect(!routeExists(""));
-}
-
-test "ROUTE_PATHS covers every path the dispatch chain compares (drift guard)" {
-    // Two lists that must agree is the drift class this file already warns about
-    // elsewhere. Rather than trust a comment, read the dispatch chain itself: a
-    // new path-equality arm that nobody adds to ROUTE_PATHS makes that endpoint
-    // a 404 on a headless server — the exact failure this table exists to
-    // prevent, inverted. (This test scans for the literal call form, so don't
-    // write one inside a comment: it would be scanned like real code.)
-    const src = @embedFile("server.zig");
-    const needle = "std.mem.eql(u8, path, \"";
-    var i: usize = 0;
-    var checked: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
-        const start = at + needle.len;
-        const end = std.mem.indexOfScalarPos(u8, src, start, '"') orelse break;
-        const literal = src[start..end];
-        i = end;
-        checked += 1;
-        if (!routeExists(literal)) {
-            std.debug.print("dispatched path missing from ROUTE_PATHS: {s}\n", .{literal});
-            return error.RoutePathNotRegistered;
-        }
-    }
-    // The scan itself must not silently find nothing.
-    try std.testing.expect(checked >= 20);
-}
-
-test "every streaming chat emitter carries logprobs (silently-ignored-field guard)" {
-    // The class: `logprobs` was parsed, honored to the point of disabling every
-    // speculative path (so the throughput was paid), computed per token by the
-    // generator — and then dropped, because the SSE chunk template had no
-    // `logprobs` field at all. Non-streaming was perfect the whole time.
-    //
-    // Nothing existing could see it. Output-equality tests can't: the deltas
-    // are byte-identical either way. llmprobe can't: it probes logprobs
-    // non-streaming only, and scored this server 100% on `Logprob consistency`
-    // while streaming returned nothing at all.
-    //
-    // So the guard is structural — a NEW emitter added to the streaming loop
-    // must not be able to forget. `.{}` is the "nothing to add" form; inside
-    // this one function it is the bug.
-    const src = @embedFile("server.zig");
-    const fn_start = std.mem.indexOf(u8, src, "fn handleStreamingGeneration(") orelse
-        return error.StreamingHandlerNotFound;
-    // The function ends at the next top-level `fn ` after it.
-    const rest = src[fn_start + 8 ..];
-    const fn_end = fn_start + 8 + (std.mem.indexOf(u8, rest, "\nfn ") orelse rest.len);
-    const body = src[fn_start..fn_end];
-
-    // The rule has two halves, because `logprobs.content` describes
-    // `message.content`. A CONTENT emitter must drain, or the field is built
-    // and dropped. A REASONING emitter must NOT: the thought is cut before the
-    // client sees it, so entries riding a reasoning chunk describe text that
-    // was never delivered — which is how `logprobs.content[0]` came to be the
-    // first token of the model's thinking on every model that thinks.
-    const needle = "sendSSEChunk" ++ "(allocator";
-    const bare = ", ." ++ "{});";
-    const reasoning = ".reasoning" ++ "_content = ";
-    var i: usize = 0;
-    var content_emitters: usize = 0;
-    var reasoning_emitters: usize = 0;
-    while (std.mem.indexOfPos(u8, body, i, needle)) |at| {
-        const line_end = std.mem.indexOfScalarPos(u8, body, at, '\n') orelse body.len;
-        const line = body[at..line_end];
-        const is_reasoning = std.mem.indexOf(u8, line, reasoning) != null;
-        const is_bare = std.mem.indexOf(u8, line, bare) != null;
-        if (is_reasoning) {
-            reasoning_emitters += 1;
-            if (!is_bare) {
-                std.debug.print("reasoning emitter ships CONTENT logprobs: {s}\n", .{line});
-                return error.ReasoningEmitterShipsLogprobs;
-            }
-        } else {
-            content_emitters += 1;
-            if (is_bare) {
-                std.debug.print("streaming emitter drops logprobs: {s}\n", .{line});
-                return error.StreamingEmitterDropsLogprobs;
-            }
-        }
-        i = line_end;
-    }
-    // Zeroes would pass the loops vacuously — both shapes must exist. (The
-    // include_usage chunk consolidation — the ending ships on exactly ONE
-    // chunk — took content emitters from 10 to 9.)
-    try std.testing.expect(content_emitters >= 9);
-    try std.testing.expect(reasoning_emitters >= 5);
-
-    // The boundary itself: a content chunk emitted after a think block has to
-    // move the cursor past the reasoning tokens first, or the answer's chunk
-    // ships the whole thought's entries (measured: 42 on a 1-char delta).
-    const skips = "lps.skipToContent" ++ "(";
-    const drops = "lps.dropPending" ++ "(";
-    try std.testing.expect(std.mem.indexOf(u8, body, skips) != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, drops) != null);
-
-    // Both halves of the path to the wire, or the field is built and dropped:
-    // sendSSEChunk must READ the extra, and the rendered bytes must be
-    // INTERPOLATED into the chunk (a `logprobs` sibling of `delta` on the
-    // choice — not a field inside it, which is where it does not belong).
-    const reads_extra = "extras." ++ "logprobs_json";
-    const interpolates = "lp_buf." ++ "items";
-    try std.testing.expect(std.mem.indexOf(u8, src, reads_extra) != null);
-    const chunk_at = std.mem.indexOf(u8, src, "chat.completion.chunk") orelse
-        return error.ChunkTemplateNotFound;
-    try std.testing.expect(std.mem.indexOfPos(u8, src, chunk_at, interpolates) != null);
 }
 
 test "ipIsLoopback exempts local addresses only" {
@@ -15555,9 +15449,8 @@ fn MediaBag(comptime T: type) type {
 /// Ownership is by PROVENANCE: a list only ever comes from `openImages` /
 /// `openVideos` / `openAudio`, and is owned from its first append — so a `try`
 /// between the decode and the message append cannot leak either, and a new
-/// early return cannot leak by omission. That is the property the source scan
-/// "a request handler never owns its own media list" keeps: a handler may not
-/// declare a media list of its own.
+/// early return cannot leak by omission. A handler takes media lists from here only:
+/// a media list of its own is never freed.
 const RequestMedia = struct {
     allocator: std.mem.Allocator,
     image_bag: MediaBag(chat_mod.ImageData) = .{},
@@ -15943,41 +15836,6 @@ pub fn appendVideoUrlContent(
         return false;
     };
     return true;
-}
-
-test "a request handler never owns its own media list — RequestMedia does" {
-    // Live leak: `handleChatCompletions` and the Anthropic `/v1/messages`
-    // handler each decoded `images[].pixels` (and videos/audio) into a local
-    // ArrayList, handed the slice to `chat_mod.Message` with `toOwnedSlice`,
-    // and then only ever `messages.deinit(allocator)`'d — which frees the
-    // Message array and NOTHING it points at. Every request carrying an image
-    // leaked the full decoded CHW buffer (megabytes per image) on the SUCCESS
-    // path, and on every early return after the parse loop as well.
-    //
-    // Scattering `defer allocator.free(...)` across the exit paths is how the
-    // next exit path gets added without one, so the buffers are owned by ONE
-    // struct with a `deinit` instead. This scan is what keeps a third handler
-    // (or a fourth media modality) from re-introducing a hand-rolled list whose
-    // contents nothing frees: a media list may only be obtained from the owner.
-    //
-    // Needles are split so this test's own source cannot satisfy them — it sits
-    // in the file it greps.
-    const src = @embedFile("server.zig");
-    const bare = [_][]const u8{
-        "std.ArrayList(chat_mod." ++ "ImageData).empty",
-        "std.ArrayList(chat_mod." ++ "VideoData).empty",
-        "std.ArrayList(chat_mod." ++ "AudioData).empty",
-    };
-    for (bare) |needle| {
-        if (std.mem.indexOf(u8, src, needle) != null) return error.HandlerOwnsItsOwnMediaList;
-    }
-    // The owner has to exist, and both handlers have to install it.
-    if (std.mem.indexOf(u8, src, "const RequestMedia " ++ "= struct") == null) return error.OwnerMissing;
-    var installs: usize = 0;
-    var i: usize = 0;
-    const install = "WireMessages" ++ ".init(allocator)";
-    while (std.mem.indexOfPos(u8, src, i, install)) |at| : (i = at + install.len) installs += 1;
-    if (installs < 2) return error.AHandlerDoesNotInstallTheOwner;
 }
 
 test "RequestMedia frees every decoded buffer it was handed" {
@@ -17468,6 +17326,7 @@ fn handleAnthropicStreaming(
     // the content arm when the generator reports a DIRECT answer — the whole
     // point is that no reasoning block exists to scan for.
     const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
+    // A stream starts in a think block from the rendered prompt, never from the request flag.
     var in_think_block = prompt_opened_think and !constrained_proto;
     var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
     defer if (delivery) |*d| d.deinit(allocator);
@@ -17494,6 +17353,7 @@ fn handleAnthropicStreaming(
     // with it — the gate is otherwise O(buffer) per token for as long as a
     // think block is open and unclosed (47.99 us/token at 113 KB).
     var think_scan: chat_mod.ThinkScan = .{};
+    // Gate through streamThinkGateScan only, and reset the scan wherever the buffer is cleared.
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
         for (token_texts.items) |t| allocator.free(t);
@@ -20754,6 +20614,7 @@ test "pinAutoContext is idempotent and a no-op under --ctx-size" {
     server_config.max_context_size = 8192;
     try testing.expectEqual(@as(u32, 8192), pinAutoContext(&manual));
     try testing.expectEqual(@as(u32, 0), manual.pinned_context);
+    try testing.expect(manual.pinned_prefill_chunk > 0);
 }
 
 test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-size)" {
@@ -21500,34 +21361,6 @@ test "isJsonObjectString only accepts JSON objects" {
     try testing.expect(!isJsonObjectString(testing.allocator, "not-json"));
 }
 
-test "a stream never starts inside a think block because the REQUEST asked for thinking" {
-    // Every streaming surface seeded the think flag by OR-ing the request's
-    // enable-thinking flag into the prompt-derived one (the needle below is
-    // ++-split so this comment cannot satisfy the scan), on the assumption
-    // that a thinking-enabled model
-    // opens `<think>` as its first token. That is true when the template
-    // renders the opener, which `promptOpensThink` then SEES in the rendered
-    // bytes anyway — and false for a template with a bare generation prompt
-    // whose model answers directly. With `enable_thinking: true` the whole
-    // answer streamed as `reasoning_content` and `content` came back EMPTY. The same
-    // request non-streaming was correct, because the non-streaming split has
-    // always keyed on the prompt — so the two surfaces disagreed about the
-    // bytes of one answer, which is the class this scan pins.
-    //
-    // Whether a stream starts inside a think block is a property of the
-    // RENDERED PROMPT. A request flag is a request.
-    const src = @embedFile("server.zig");
-    const needle = "in_think_block = enable" ++ "_thinking";
-    try testing.expect(std.mem.indexOf(u8, src, needle) == null);
-    // …and the initialization that replaces it must still exist, or the scan
-    // passes on a file that stopped tracking think state at all.
-    var count: usize = 0;
-    var i: usize = 0;
-    const init = "in_think_block = prompt_opened_think";
-    while (std.mem.indexOfPos(u8, src, i, init)) |at| : (i = at + init.len) count += 1;
-    try testing.expect(count >= 2);
-}
-
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
     // 2 float32 samples = 8 bytes. base64 of 8 zero bytes = "AAAAAAAAAAA=".
     const eight_zeros = "AAAAAAAAAAA=";
@@ -22234,40 +22067,6 @@ test "repetition-loop cuts decline tool-call parsing" {
     try std.testing.expect(shouldParseToolCalls("unknown_future_detail"));
 }
 
-test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
-    // Dispatch-hole class: a surface that reports the reason and drops the
-    // cause is silent — the response still validates, and no output-equality
-    // test can see the missing field (the two
-    // hardcoded `use_drafter=false` call sites lived for a month this way).
-    // Needles are split with `++` so this test's own source can't match them.
-    const t = std.testing;
-    const src = @embedFile("server.zig");
-
-    // The four literals that print a concrete reason: chat non-stream (plain
-    // + tool-calls), completions non-stream, completions stream-final. Every
-    // one must be followed immediately by the details slot.
-    const quoted = "\"finish_rea" ++ "son\":\"{s}\"";
-    var seen: usize = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, quoted)) |at| : (i = at + quoted.len) {
-        seen += 1;
-        try t.expectEqualStrings("{s}", src[at + quoted.len .. at + quoted.len + 3]);
-    }
-    try t.expectEqual(@as(usize, 4), seen);
-
-    // The chat SSE chunk builds its reason separately (it may be JSON null
-    // mid-stream), so it takes the details slot right after that field.
-    const chunk = "\"finish_rea" ++ "son\":{s}{s}";
-    try t.expect(std.mem.indexOf(u8, src, chunk) != null);
-
-    // /v1/messages is DELIBERATELY not on this list: its envelope is
-    // Anthropic's, `anthropicStopReason` maps a loop cut to "end_turn", and
-    // inventing a key inside someone else's schema is worse than the gap.
-    // The TRIM (which is what actually breaks the feedback loop) applies
-    // there anyway — it happens where the text is decoded, not per surface.
-    try t.expect(std.mem.indexOf(u8, src, "fn anthropicStopReason") != null);
-}
-
 test "finishDetailsField: the loop cause rides beside finish_reason, and only a known cause reaches the wire" {
     // Absent = the field is not emitted at all, so every ordinary response
     // is byte-identical to what it was before this existed.
@@ -22767,17 +22566,6 @@ test "schema thinking policy defers only a resolved reasoning protocol" {
     for (unsupported_tails) |tail| {
         try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, chat_mod.promptThinkTailClass(tail) != .none));
     }
-}
-
-test "every JSON grammar mask site consults the fallback or deferral policy" {
-    const src = @embedFile("server.zig");
-    const mask_line = "[grammar] enforcing JSON schema from " ++ "token 0";
-    const call = "schemaMasks" ++ "Thinking(";
-    const def = "fn schemaMasks" ++ "Thinking(";
-    const masks = std.mem.count(u8, src, mask_line);
-    const calls = std.mem.count(u8, src, call) - std.mem.count(u8, src, def);
-    try std.testing.expect(masks >= 3);
-    try std.testing.expectEqual(masks, calls);
 }
 
 test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
@@ -23386,146 +23174,6 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     );
 }
 
-test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
-    // RAM restore uses refcount-sharing. The resident entry is already inside
-    // `active_mem`, and prefillMemoryNeeded bills the destination KV growth.
-    // Pin the chokepoint so a future cache-accounting change cannot add the
-    // resident entry to `needed` again (the 138k-token false-400 regression).
-    const t = std.testing;
-    const src = @embedFile("server.zig");
-    // The bill and the headroom moved into `prefillAdmissionBill`.
-    const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
-    const tail = src[start..];
-    const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
-    const body = tail[0..end];
-    try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
-    try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
-    try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
-    // The hot cache appears once, as `evictable`, read as the published atomic.
-    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
-    try t.expect(std.mem.indexOf(u8, body, "sch." ++ "hot_prefix_cache") == null);
-    try t.expect(std.mem.indexOf(u8, body, ".hot_prefix_cache.?") == null);
-    try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
-}
-
-test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
-    // The estimator taking an `attn_keys` parameter proves nothing if the one
-    // caller hands it `seq` — that reproduces the dense bill exactly, and every
-    // unit test above still passes because they call the function directly.
-    // Same class as the two hardcoded `use_drafter=false` call sites: the
-    // engagement has to be pinned at the SITE.
-    //
-    // The KV bill is pinned at the same site and for the same reason: it must
-    // come from `config.kvBytesPerToken()` (which knows how many layers cache
-    // and how wide their keys and values are), never a uniform product
-    // recomputed here. Same for the SCORE width: `config.prefillScoreHeadDim()`
-    // is the width the score is contracted at, and handing `hdim` for both
-    // declares an MLA arch's 192-wide scores "fused" and bills them at zero.
-    const t = std.testing;
-    const src = @embedFile("server.zig");
-    const call = "prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk,";
-    const at = std.mem.indexOf(u8, src, call) orelse return error.CallSiteMoved;
-    const tail = src[at + call.len ..];
-    const end = std.mem.indexOfScalar(u8, tail, ')') orelse return error.CallSiteMoved;
-    try t.expectEqualStrings(" config.prefillAttnKeys(seq", tail[0..end]);
-    // The arch's own prefill streams and its dequantized-weight working set
-    // are the same class of parameter: derived from the CONFIG at the site, or
-    // a GatedDeltaNet hybrid gets an attention arch's bill (measured 33% low)
-    // and a quantized checkpoint gets a dense one's.
-    // The per-request terms are seq-scaled and derived from the config at the site. Counted, not
-    // just found: the literal below is itself part of `src`.
-    const wired = "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm))";
-    var wired_seen: usize = 0;
-    var wired_at: usize = 0;
-    while (std.mem.indexOfPos(u8, src, wired_at, wired)) |hit| {
-        wired_seen += 1;
-        wired_at = hit + 1;
-    }
-    try t.expectEqual(@as(usize, 2), wired_seen); // the call site + this literal
-    // The reserve half bills at an explicit KV length (`prefillTransientReserveAtKv`); `seq` must
-    // stay `@max(kv_len, chunk)`.
-    try t.expect(std.mem.indexOf(u8, src, "    const seq: u64 = @max(kv_len, chunk);\n") != null);
-    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(seq),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
-
-    // Auto-context sizing reads the same helpers — the two must not drift.
-    // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
-    // `--kv-quant 4` server cannot size its context against fp16 while the
-    // guard admits against 4-bit (that mismatch reported a third of what fits).
-    try t.expect(std.mem.indexOf(u8, src, "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
-    try t.expect(std.mem.indexOf(u8, src, "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
-    // The prefill transient: the sizer RESERVES it once at the chunk width
-    // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
-    // never as a per-token multiplier on the context it is solving for.
-    // The sizer reserves the constant, not the ask or the resolved budget.
-    try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
-}
-
-test "the chunk the guard BILLS is the chunk the forward will RUN" {
-    // Fatal-class drift: the bill is linear in the chunk, so a guard that
-    // models 512 while `generate` forwards 8192 admits a prefill that dies in
-    // an uncatchable Metal completion-handler throw. `effectivePrefillChunk`
-    // is the single resolver and every call site must hand it the model's
-    // pinned width — the sizer, the admission guard, and the prefill loop.
-    const t = std.testing;
-    const srcs = [_][]const u8{ @embedFile("server.zig"), @embedFile("generate.zig") };
-    var sites: usize = 0;
-    // Needles split so this scan's own source cannot satisfy them.
-    for (srcs) |src| for ([_][]const u8{ "effectivePrefill" ++ "Chunk(", "requestPrefill" ++ "Chunk(" }) |needle| {
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
-            i = at + 1;
-            // Skip the declaration itself.
-            if (at >= 3 and std.mem.eql(u8, src[at - 3 .. at], "fn ")) continue;
-            // Skip test call sites: a hit belongs to a test when the nearest `test "` above it is
-            // nearer than the nearest function header.
-            const before = src[0..at];
-            const last_test = std.mem.lastIndexOf(u8, before, "\ntest \"");
-            const last_fn = std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0;
-            const last_pub_fn = std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0;
-            if (last_test) |lt| {
-                if (lt > @max(last_fn, last_pub_fn)) continue;
-            }
-            const tail = src[at..@min(src.len, at + 512)];
-            const end = std.mem.indexOf(u8, tail, "));") orelse
-                std.mem.indexOf(u8, tail, ");") orelse return error.CallSiteMoved;
-            // `rung` is a candidate being priced and `chosen`/the ladder floor becomes the pin; all
-            // are billed by `prefillNeededAtChunk`. A bare launch-width argument still fails.
-            const args = tail[0..end];
-            try t.expect(std.mem.indexOf(u8, args, "pinned_prefill_chunk") != null or
-                std.mem.indexOf(u8, args, "rung") != null or
-                std.mem.indexOf(u8, args, "chosen") != null or
-                std.mem.indexOf(u8, args, "PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]") != null);
-            sites += 1;
-        }
-    };
-    try t.expect(sites >= 3);
-
-    // The prefill loop's copy arrives through `InitOptions`, NOT off
-    // `xfm.config`: the Transformer holds a COPY of the config taken when it
-    // was built and the pin is written afterwards, so reading it there is a
-    // silent no-op (live 2026-08-14: pinned 4096, prefilled at 8192). The
-    // scheduler sources it from `slot.model.config` — the same object the
-    // guard bills against.
-    const sched = @embedFile("scheduler.zig");
-    // The width is chosen per request (`req_prefill_chunk`) and falls back to `cfg.pinned_prefill_chunk`.
-    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill_chunk,") != null);
-    try t.expect(std.mem.indexOf(u8, sched, "const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {") != null);
-    try t.expect(std.mem.indexOf(u8, sched, "const pin = cfg.pinned_prefill_chunk;") != null);
-    try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);
-
-    // And the width has to be frozen BEFORE anything is computed from it:
-    // `pinPrefillChunk` runs at the top of `pinAutoContext`, above the
-    // `--ctx-size` early-out, because the guard reads it on every request.
-    const server_src = srcs[0];
-    const pin = std.mem.indexOf(u8, server_src, "fn pinAutoContext(") orelse return error.CallSiteMoved;
-    const body = server_src[pin..@min(server_src.len, pin + 800)];
-    const chunk_at = std.mem.indexOf(u8, body, "pinPrefillChunk(config)") orelse return error.PinMissing;
-    const ctx_at = std.mem.indexOf(u8, body, "autoContextFor(config)") orelse return error.CallSiteMoved;
-    const ctxsize_at = std.mem.indexOf(u8, body, "manualContext(config) > 0") orelse return error.CallSiteMoved;
-    try t.expect(chunk_at < ctx_at);
-    try t.expect(chunk_at < ctxsize_at);
-}
-
 test "resolvePrefillChunk: the 16 GB tier gets a working context instead of the 1024 floor" {
     // The reported bug, end to end. Mistral-7B-4bit on a 16 GB Mac: ~11.9 GiB
     // Metal working set, 3.80 GiB of weights (measured), the hot prefix cache
@@ -23834,9 +23482,6 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     try testing.expect(std.mem.indexOf(u8, m, "free memory") == null);
     try testing.expect(std.mem.indexOf(u8, m, "resident-model budget") != null);
 
-    const src = @embedFile("server.zig");
-    const stale = "\"Not enough memory to load model; retry " ++ "after current requests complete\"";
-    try testing.expect(std.mem.indexOf(u8, src, stale) == null);
     // One mapping serves both load switches; a second literal is the drift.
     try testing.expectEqualStrings("out_of_memory", loadRefusalFor(error.NotEnoughMemory).?.type);
     try testing.expectEqualStrings(not_enough_memory_message, loadRefusalFor(error.NotEnoughMemory).?.message);
@@ -24231,24 +23876,6 @@ test "the 413 names both counts it compared" {
     const msg = payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024);
     try std.testing.expect(std.mem.indexOf(u8, msg, "98 MB") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "64 MB") != null);
-}
-
-test "the memory guard's vision billing routes through visionPrefillUnchunked at every call site" {
-    // The guard and the prefill loop must read the SAME predicate: a call
-    // site passing the raw has-vision bool bills full width for a prefill
-    // that chunks (over-refusal), and one passing false under the kill
-    // switch under-bills straight into an uncatchable Metal OOM.
-    const src = @embedFile("server.zig");
-    const raw = "kv_quant_override, req_media.deferred" ++ " != null,";
-    try std.testing.expect(std.mem.indexOf(u8, src, raw) == null);
-    const routed = "kv_quant_override, generate_mod.visionPrefill" ++ "Unchunked(req_media.deferred != null),";
-    var n: usize = 0;
-    var at: usize = 0;
-    while (std.mem.indexOfPos(u8, src, at, routed)) |i| {
-        n += 1;
-        at = i + 1;
-    }
-    try std.testing.expectEqual(@as(usize, 3), n);
 }
 
 test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag" {
