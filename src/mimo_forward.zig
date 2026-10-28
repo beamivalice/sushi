@@ -849,8 +849,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     return logits;
 }
 
-// ── DiffusionGemma bidirectional canvas decoder ──
-
 /// MiMo decode or verify rows whose FP8 QKV left V scaled, on a kv8 or kv6 g64 cache: Q/K rope and
 /// the K/V quantize run as one dispatch and K/V append already quantized. Null = composed path.
 pub fn mimoDecodePrep(

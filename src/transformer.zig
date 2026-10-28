@@ -2408,7 +2408,7 @@ pub fn fused256Enabled() bool {
 /// same-session A/B on the 27B: +2.9%/+2.3%/+4.6% at 8K/16K/32K.
 /// The SLIDING-BAND arm (window > 0) has no such competition — composed
 /// computes full-width scores + a GB-scale mask while the kernel
-/// block-skips outside the band (gemma-26B 99K: 317 -> 712 tok/s) — so it
+/// block-skips outside the band — so it
 /// rides the master switch alone and never chunks.
 pub const Fused256CausalMode = enum { all, off };
 
@@ -2497,7 +2497,7 @@ pub const FUSED256_MIN_Q_LEN: c_int = 16;
 
 /// Try the fused flash prefill kernel (sushi_attn_pd, see `fusedPdDims`).
 /// Returns null when a precondition doesn't hold — the caller falls back to
-/// the composed path. `window` > 0 adds the sliding-band mask (Gemma local layers,
+/// the composed path. `window` > 0 adds the sliding-band mask (sliding-window layers,
 /// createSlidingWindowMask semantics: key masked when row_abs - col >=
 /// window); 0 = plain bottom-right causal. Free function (stream param) so
 /// the MTP head can use it too.
@@ -12619,15 +12619,8 @@ pub const ForwardCtx = struct {
     /// Scoped to the TRUNK: the qwen4 MTP head's forward builds its own ctx
     /// and its single QSA layer is not part of this tally.
     qsa_arms: QsaArmCounts = .{},
-    /// DiffusionGemma encoder pass: multiply each layer's output by the
-    /// ENCODER layer scalar instead of the decoder's. Set by the diffusion
-    /// runner for prompt prefill and committed-canvas re-encode passes.
-    use_encoder_scalars: bool = false,
     /// Return the post-final-norm hidden instead of logits (caller frees
-    /// either way), skipping the 262K-vocab lm_head projection. Set by the
-    /// DiffusionGemma encoder pass (which exists only to fill the KV cache)
-    /// and by the LTX text encoder (which wants the residual stream, not a
-    /// next token).
+    /// either way), skipping the lm_head projection.
     skip_lm_head: bool = false,
     stream_in: ?mlx.mlx_array = null,
     skip_ple: bool = false,
@@ -24735,14 +24728,6 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     }
 }
 
-/// DiffusionGemma packs each expert's gate and up projections in one tensor
-/// `experts.gate_up_proj` of shape [E, 2*M, X], gate rows first (HF chunks
-/// the projected output in halves: gate = [..., :M], up = [..., M:]).
-/// Slicing axis 1 maps the packed layout onto MoeMlpWeights' separate
-/// switch_gate_*/switch_up_* fields with zero forward-pass changes; the same
-/// split serves the packed-u32 weight, its scales, and its biases (all share
-/// the [E, rows, X] expert-output layout — quant groups run along axis 2).
-/// Caller owns both returned arrays.
 /// Join N same-input-width projections into one by stacking their OUTPUT rows.
 /// Quantization survives the join untouched: affine groups run along the INPUT
 /// axis, so rows stay independent and the scales/biases concatenate on the same
@@ -41299,7 +41284,7 @@ test "splitMaskedSdpa256: verify-width array-mask rows split through the vector 
     try std.testing.expect((try splitMaskedSdpa256(s, q2, k, v, scale, m2)) == null);
 }
 
-test "fusedSdpaPrefill: sliding-band parity vs composed 'array' mask (Gemma local layers)" {
+test "fusedSdpaPrefill: sliding-band parity vs composed 'array' mask (sliding layers)" {
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;

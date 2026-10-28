@@ -70,8 +70,6 @@ pub const QuantMode = enum {
     }
 };
 
-pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
-
 pub const isExpertStreamingArch = expert_quant.isExpertStreamingArch;
 
 /// DeepSeek-V4.1's MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
@@ -935,12 +933,6 @@ pub const ModelConfig = struct {
         return self.has_hybrid_layers or self.full_attention_interval > 0;
     }
 
-    /// Block-diffusion checkpoint (DiffusionGemma): generation is the canvas
-    /// denoising loop, not autoregressive decode.
-    pub fn isDiffusion(self: *const ModelConfig) bool {
-        return self.canvas_length > 0;
-    }
-
     /// Pure-config half of "can this arch ride the batched GatedDeltaNet
     /// decode kernel?" (`Transformer.forwardMoeBatchedDecode`) — a dense
     /// GDN trunk with periodic full attention, i.e. the qwen3_5 family.
@@ -978,17 +970,6 @@ pub const ModelConfig = struct {
         return self.isQwen4() and self.full_attention_interval > 0;
     }
 
-    /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
-    /// shared-expert branch, sigma-MoE router, 7 norms, layer_scalar, v_norm,
-    /// proportional RoPE on full layers). DiffusionGemma reuses the Gemma 4
-    /// 26B-A4B decoder verbatim, so transformer.zig's gemma4 forward/binding
-    /// paths key on this rather than on the model_type string.
-    pub fn isGemma4Layers(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "gemma4") or
-            std.mem.eql(u8, self.model_type, "diffusion_gemma");
-    }
-
-    /// Additive + dedup-guarded, like every terminator merge here.
     pub const NgramTableSource = enum { quantized, bf16_override, bf16_streamed };
 
     /// The override outranks the layout; only the HF bf16 checkpoint carries the table
@@ -1008,28 +989,6 @@ pub const ModelConfig = struct {
             self.eos_token_ids[self.num_eos_tokens] = id;
             self.num_eos_tokens += 1;
         }
-    }
-
-    /// Gemma's chat template always ends turns with `<end_of_turn>` (id 106)
-    /// and emits `<eos>` (id 1) at sequence end, so both must be stop tokens
-    /// for EVERY Gemma family (gemma3 / gemma4 / diffusion_gemma). Some
-    /// checkpoints declare only a SCALAR `eos_token_id: 1` (e.g. the
-    /// abliterated text-only `-lm-` builds) — gating the 106 add on
-    /// `num_eos_tokens == 0` then leaves it out and it leaks into output as
-    /// repeated `<end_of_turn>`. Merge both ADDITIVELY + dedup-guarded (never
-    /// removes a config-declared stop). Same leak class as the Qwen2.5-Coder
-    /// `<|im_end|>` merge performed at load time (main.zig / scheduler doLoad).
-    pub fn ensureGemmaTerminators(self: *ModelConfig) void {
-        if (!self.isEosToken(1)) self.addEosToken(1);
-        if (!self.isEosToken(106)) self.addEosToken(106);
-    }
-
-    /// NoPE layers (muse_glimmer: layer_rope_theta[i] == 0). The released
-    /// checkpoint's NoPE layers are exactly its full-attention layers, but the
-    /// two facts stay independently parsed — layer_types drives masking,
-    /// layer_rope_theta drives rotation.
-    pub fn layerSkipsRope(self: *const ModelConfig, layer_idx: u32) bool {
-        return layer_idx < 128 and self.layer_no_rope[layer_idx];
     }
 
     /// SDPA softmax scale: 1/sqrt(query_pre_attn_scalar).
@@ -3404,48 +3363,13 @@ fn loadSafetensorsFileMode(
 }
 
 /// True if the safetensors weight `key` should be retained for the text
-/// forward pass. Audio is always dropped; vision is dropped unless
-/// `load_vision` is set. MTP-style head tensors (`*.mtp.*`) on Qwen3.5/3.6
-/// checkpoints are kept (the binder ignores them, but the loader doesn't
-/// need to know that).
+/// forward pass: a vision tower (the Qwen pack's `vision_tower.`, the
+/// Qwen3-VL/GLM `model.visual.`) is dropped unless `load_vision` is set.
+/// MTP-style head tensors (`*.mtp.*`) are kept (the binder ignores them, but
+/// the loader doesn't need to know that).
 pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
-    // Gemma 4 12B `gemma4_unified` is encoder-free: it ships a tiny vision
-    // patch embedder (`vision_embedder.*` + `embed_vision.*`) and a raw-waveform
-    // audio projection (`embed_audio.*`) instead of the SigLIP vision tower and
-    // conformer audio tower of earlier Gemma 4 variants. Those embedders are
-    // wired in src/vision.zig (UnifiedEmbedder), so keep them under the same
-    // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
-    const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
-        std.mem.startsWith(u8, key, "embed_vision.") or
-        std.mem.startsWith(u8, key, "vision_embedder.") or
-        std.mem.startsWith(u8, key, "embed_audio.") or
-        std.mem.startsWith(u8, key, "multi_modal_projector.") or
-        std.mem.startsWith(u8, key, "language_model.multi_modal_projector.");
-    // The heavy SigLIP-era conformer audio tower is still not wired — drop it.
-    const is_audio_tower = std.mem.startsWith(u8, key, "audio_tower.") or
-        std.mem.startsWith(u8, key, "language_model.audio_multi_modal_projector.");
-    if (is_audio_tower) return false;
-    // DiffusionGemma nests its (not-yet-wired) vision tower under
-    // model.encoder.* — always drop it so a 26B text load doesn't carry
-    // ~1 GB of dead tower weights. The encoder LAYER SCALARS
-    // (model.encoder.language_model.layers.N.layer_scalar) must survive:
-    // they're the only untied encoder text params and the causal encoder
-    // pass multiplies by them instead of the decoder's layer_scalar.
-    if (std.mem.startsWith(u8, key, "model.encoder.vision_tower.") or
-        std.mem.startsWith(u8, key, "model.encoder.embed_vision.")) return false;
-    // Muse-Glimmer nests its tower/adapter/projection under "model."; the
-    // mlx-community re-nest drops that prefix (its bare "vision_tower." already
-    // rides the is_vision gate above). Both follow --no-vision.
-    if (!load_vision and (std.mem.startsWith(u8, key, "model.vision_tower.") or
-        std.mem.startsWith(u8, key, "model.vision_adapter.") or
-        std.mem.startsWith(u8, key, "model.vision_projection.") or
-        std.mem.startsWith(u8, key, "vision_adapter.") or
-        std.mem.startsWith(u8, key, "vision_projection.") or
-        // avlp12's Qwen3.8 "Alis" packs spell the Qwen3-VL tower
-        // `model.visual.` (pure rename of `vision_tower.`).
-        std.mem.startsWith(u8, key, "model.visual."))) return false;
-    if (is_vision and !load_vision) return false;
-    return true;
+    if (load_vision) return true;
+    return !(std.mem.startsWith(u8, key, "vision_tower.") or std.mem.startsWith(u8, key, "model.visual."));
 }
 
 // ── Tests ──
@@ -4100,54 +4024,13 @@ test "shouldKeepWeightKey accepts orphan MTP head weights on Qwen3.5/3.6 checkpo
     try testing.expect(shouldKeepWeightKey("model.mtp.0.shared_head.head.weight", false));
 }
 
-test "shouldKeepWeightKey filters audio and gated vision weights" {
-    // Regression: the existing filter should still reject audio and reject
-    // vision when load_vision is false.
-    try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
+test "shouldKeepWeightKey gates the vision tower on load_vision" {
     try testing.expect(!shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", false));
     // qwen4_exp / Alis packs spell the Qwen3-VL tower `model.visual.` — --no-vision drops it too.
     try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", false));
     try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
-}
-
-test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision enabled" {
-    // gemma4_unified is encoder-free: vision_embedder.* (patch embedder),
-    // embed_vision.* and embed_audio.* (raw projections) ARE wired in
-    // src/vision.zig (UnifiedEmbedder), so they must be kept under load_vision.
-    // The heavy SigLIP-era conformer audio_tower.* stays dropped.
-    try testing.expect(shouldKeepWeightKey("vision_embedder.patch_dense.weight", true));
-    try testing.expect(shouldKeepWeightKey("embed_vision.embedding_projection.weight", true));
-    try testing.expect(shouldKeepWeightKey("embed_audio.embedding_projection.weight", true));
-    // Gated off by --no-vision.
-    try testing.expect(!shouldKeepWeightKey("vision_embedder.patch_dense.weight", false));
-    try testing.expect(!shouldKeepWeightKey("embed_audio.embedding_projection.weight", false));
-    // The conformer audio tower is never wired — always dropped.
-    try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
-}
-
-test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nestings" {
-    // Ours nests the tower under `model.`; mlx-community re-nests it bare.
-    // Both spellings ride the same gate --no-vision flips.
-    try testing.expect(!shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", false));
-    try testing.expect(!shouldKeepWeightKey("model.vision_adapter.fc1.weight", false));
-    try testing.expect(!shouldKeepWeightKey("model.vision_projection.weight", false));
-    try testing.expect(!shouldKeepWeightKey("vision_adapter.fc1.weight", false));
-    try testing.expect(!shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", false));
-    try testing.expect(shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", true));
-    try testing.expect(shouldKeepWeightKey("model.vision_adapter.fc1.weight", true));
-    try testing.expect(shouldKeepWeightKey("model.vision_projection.weight", true));
-    try testing.expect(shouldKeepWeightKey("vision_adapter.fc1.weight", true));
-    try testing.expect(shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", true));
-    // avlp12 Alis spells the Qwen3-VL tower `model.visual.` — same gate, or
-    // --no-vision cannot drop it and we hold ~0.9 GB we never read.
-    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
-    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
-    // Text weights are never touched either way.
-    try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
-    try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
-    try testing.expect(shouldKeepWeightKey("language_model.lm_head.weight", false));
 }
 
 test "parseVisionProcessorDefaultsFromJson supports current and legacy Qwen layouts" {
@@ -4218,42 +4101,6 @@ test "ModelConfig text-only qwen3_5 has no qwen_vision" {
     const config = try parseConfigFromJson(testing.allocator, json);
     try testing.expect(!config.qwen_vision);
     try testing.expect(!config.has_vision);
-}
-
-test "ModelConfig keeps explicit gemma3 head counts (12b)" {
-    // Regression guard for the fix above: a gemma3 text_config that DOES ship
-    // head counts must keep them, never get clobbered by the HF-default fill.
-    const json =
-        \\{
-        \\  "model_type": "gemma3",
-        \\  "text_config": {
-        \\    "model_type": "gemma3_text",
-        \\    "hidden_size": 3840,
-        \\    "num_hidden_layers": 48,
-        \\    "num_attention_heads": 16,
-        \\    "num_key_value_heads": 8,
-        \\    "head_dim": 256,
-        \\    "sliding_window": 1024
-        \\  },
-        \\  "quantization": {"bits": 4, "group_size": 32}
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expectEqual(@as(u32, 16), config.num_attention_heads);
-    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
-    try testing.expectEqual(@as(u32, 256), config.head_dim);
-}
-
-test "ensureGemmaTerminators is additive and dedup-guarded" {
-    var c = ModelConfig{};
-    c.addEosToken(1); // config-provided scalar eos
-    c.ensureGemmaTerminators();
-    try testing.expect(c.isEosToken(1));
-    try testing.expect(c.isEosToken(106));
-    try testing.expectEqual(@as(u32, 2), c.num_eos_tokens);
-    // Idempotent: re-running adds nothing.
-    c.ensureGemmaTerminators();
-    try testing.expectEqual(@as(u32, 2), c.num_eos_tokens);
 }
 
 test "bailing_hybrid gate arm is SELECTED by the bound, never defaulted" {
@@ -4343,19 +4190,6 @@ test "parseConfigFromJson unknown quantization mode → error" {
         \\}
     ;
     try expectError(error.UnsupportedQuantMode, parseConfigFromJson(testing.allocator, json));
-}
-
-test "shouldKeepWeightKey drops DiffusionGemma encoder vision tower (text-only v1)" {
-    // DiffusionGemma nests its vision tower under model.encoder.* — distinct
-    // from the bare vision_tower.* prefixes of earlier checkpoints. Until the
-    // tower is wired, those tensors must be dropped even with load_vision on,
-    // and ALWAYS dropped when vision is off.
-    try testing.expect(!shouldKeepWeightKey("model.encoder.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight", false));
-    try testing.expect(!shouldKeepWeightKey("model.encoder.embed_vision.embedding_projection.weight", false));
-    // Trunk + diffusion weights always survive.
-    try testing.expect(shouldKeepWeightKey("model.decoder.layers.0.experts.gate_up_proj.weight", false));
-    try testing.expect(shouldKeepWeightKey("model.decoder.self_conditioning.gate_proj.weight", false));
-    try testing.expect(shouldKeepWeightKey("model.encoder.language_model.layers.0.layer_scalar", false));
 }
 
 test "narrowsLoadedF16 catches per-channel tables, not matmul operands" {
