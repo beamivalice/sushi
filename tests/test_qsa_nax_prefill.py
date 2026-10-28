@@ -13,7 +13,7 @@ import urllib.request
 
 p = argparse.ArgumentParser()
 p.add_argument('--url', default='http://127.0.0.1:18765')
-p.add_argument('--model', default='ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit')
+p.add_argument('--model', default='Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw')
 p.add_argument('--log', type=Path, required=True)
 p.add_argument('--nax', choices=('on', 'off'), required=True)
 args = p.parse_args()

@@ -10,7 +10,7 @@
 # early with ~3k tokens of text after it, so any reuse past PAST_BAR can only come from rows
 # computed under that image, whatever the checkpoint answers.
 set -u
-MODEL="${MEDIA_PERSIST_MODEL:-${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-2.6bpw}}"
+MODEL="${MEDIA_PERSIST_MODEL:-${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}}"
 PORT="${2:-11461}"
 # GLM's original template has no thinking-off mode, so the field a body carries is per model.
 # Assigned in two steps: a brace inside ${:-} has to be escaped, and the backslash survives.

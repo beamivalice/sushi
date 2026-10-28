@@ -15,9 +15,9 @@
 
 set -uo pipefail
 
-MODELS_ROOT="${1:-$HOME/.sushi/models}"
+MODELS_ROOT="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}}"
 PORT="${2:-19060}"
-LOADED_MODEL="${3:-gemma-4-e4b-it-4bit}"
+LOADED_MODEL="${3:-Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 BINARY="${BINARY:-./zig-out/bin/sushi}"
 
 [[ -x "$BINARY" ]] || { echo "Build first" >&2; exit 1; }

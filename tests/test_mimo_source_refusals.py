@@ -17,7 +17,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="mimo-refusals-", dir=root / ".zig-cache") as home:
         env = dict(os.environ, HOME=home)
         args = [
-            str(binary), "--model", source, "--no-mtp", ,
+            str(binary), "--model", source, "--no-mtp",
             "--no-vision", "--ctx-size", "4096",
         ]
         cases = [

@@ -28,7 +28,7 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
     exit 1
 fi
 LOG=$(mktemp)
-"$BIN" --serve --model "$MODEL_A" --model-dir "$HOME/.sushi/models" --host 127.0.0.1 --port "$PORT" \
+"$BIN" --serve --model "$MODEL_A" --model-dir "${SUSHI_MODELS_DIR:-$HOME/.sushi/models}" --host 127.0.0.1 --port "$PORT" \
     --ctx-size 8192 --prefix-cache-mem 1024GB --prefix-cache-disk off --log-level info >"$LOG" 2>&1 &
 SRV=$!
 cleanup() { kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; rm -f "$LOG"; }

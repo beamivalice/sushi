@@ -21,7 +21,7 @@
 
 set -u
 MODELS="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
-MODEL="${DFLASH2_QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-Sushi-2.6bpw}"
+MODEL="${DFLASH2_QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 DRAFTER="${DFLASH2_QWEN_DRAFTER:-$MODELS/incoai/Qwen3.8-Flash-Next-DFlash2}"
 PORT="${1:-11331}"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"

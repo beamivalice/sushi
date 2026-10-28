@@ -10,7 +10,7 @@
 # `--no-vision` (tower absent, text works, media 400s by name). SKIPs without the pack.
 #   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_exp.sh [port]
 set -u
-MODEL="${QWEN4_MODEL:-$HOME/.sushi/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
+MODEL="${QWEN4_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11411}"
 BIN="${SUSHI_BIN:-./zig-out/bin/sushi}"
 LOG="$HOME/.sushi/runs/qwen4-live/server-$PORT.log"

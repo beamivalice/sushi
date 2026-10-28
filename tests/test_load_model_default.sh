@@ -21,7 +21,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/sushi"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
-MODELS_ROOT="${MODELS_ROOT:-$HOME/.sushi/models}"
+MODELS_ROOT="${MODELS_ROOT:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}}"
 BOOT_MODEL="${BOOT_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 SWITCH_MODEL="${SWITCH_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 if [ ! -f "$BOOT_MODEL/config.json" ] || [ ! -f "$SWITCH_MODEL/config.json" ]; then
@@ -97,13 +97,14 @@ esac
 
 # ── [3] A request that OMITS `model` routes to the new default. The response
 # echoes the resolved model's config `model_type` when the request names none,
-# so the arch tells the two models apart (lfm2 vs qwen3_5_moe).
+# so the arch tells the two models apart (qwen4_exp vs mimo_v2).
+WANT_ARCH="$(python3 -c "import sys,json;print(json.load(open(sys.argv[1]+'/config.json'))['model_type'])" "$SWITCH_MODEL")"
 ECHOED="$(curl -s --max-time 120 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}' | python3 -c \
     "import sys,json;print(json.load(sys.stdin).get('model',''))")"
-check "[3] aliased request answered by the new default (model=$ECHOED)" \
-    "$([ "$ECHOED" = "qwen3_5_moe" ] && echo 1 || echo 0)"
+check "[3] aliased request answered by the new default (model=$ECHOED, want $WANT_ARCH)" \
+    "$([ "$ECHOED" = "$WANT_ARCH" ] && echo 1 || echo 0)"
 
 echo ""
 echo "load-model default: $PASS passed, $FAIL failed"

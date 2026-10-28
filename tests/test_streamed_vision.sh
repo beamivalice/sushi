@@ -18,7 +18,7 @@
 # STREAM_VISION_BODY merges into each request (GLM: '{"reasoning_effort":"low","max_tokens":1024}').
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-MODEL="${STREAM_VISION_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2.3bpw}"
+MODEL="${STREAM_VISION_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2.4bpw}"
 BUDGET="${STREAM_VISION_BUDGET:-32}"
 EXTRA="${STREAM_VISION_BODY:-}"
 [ -n "$EXTRA" ] || EXTRA='{"enable_thinking":false,"max_tokens":64}'

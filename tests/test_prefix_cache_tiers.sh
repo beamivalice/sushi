@@ -14,13 +14,13 @@
 #  5. After a restart the appended turn restores its own prompt from SSD.
 #
 # Each boot takes the GPU lock (scripts/gpu-lock.sh, owner GPU_LOCK_OWNER).
-# Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), MODEL (default GLM-5.3-Flash-Sushi-2.5bpw),
+# Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), MODEL (default GLM-5.3-Flash-Sushi-2.4bpw),
 # PORT (default 18951), BINARY, TIERS_MEM (default 200MB), TIERS_WORDS (default 9000), TIERS_ARMS (default
 # "hybrid ssd").
 
 set -uo pipefail
 
-MODEL="${MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2.5bpw}"
+MODEL="${MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2.4bpw}"
 PORT="${PORT:-18951}"
 BIN="${BINARY:-./zig-out/bin/sushi}"
 BASE="http://127.0.0.1:$PORT"

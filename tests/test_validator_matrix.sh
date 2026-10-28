@@ -4,7 +4,7 @@
 # served architectures (qwen4_exp, mimo_v2).
 #
 # Per model, two layers:
-#   1. llmprobe (~/projects/agents/llmprobe) in auto
+#   1. llmprobe (LLMPROBE_DIR: the llmprobe checkout) in auto
 #      mode — compliance suites for /v1/responses, /v1/chat/completions and
 #      /v1/messages against a server this script boots and tears down.
 #   2. The pi 2-turn agentic html case (multi-turn tool calls: create
@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 BINARY="${BINARY:-$REPO/zig-out/bin/sushi}"
 PORT="${PORT:-11298}"
-LLMPROBE_DIR="${LLMPROBE_DIR:-$HOME/projects/agents/llmprobe}"
+LLMPROBE_DIR="${LLMPROBE_DIR:-}"
 LLMPROBE_MJS="$LLMPROBE_DIR/bin/dist/llmprobe.mjs"
 RESULTS="$REPO/tests/validator-results"
 SUMMARY="$RESULTS/summary.tsv"
@@ -62,8 +62,8 @@ if [[ ! -x "$BINARY" ]]; then
     echo "[fatal] $BINARY not found — build first: zig build -Doptimize=ReleaseFast"
     exit 1
 fi
-if [[ -z "${SKIP_PROBE:-}" && ! -f "$LLMPROBE_MJS" ]]; then
-    echo "[fatal] llmprobe bundle missing: $LLMPROBE_MJS (cd $LLMPROBE_DIR && npm run build:cli)"
+if [[ -z "${SKIP_PROBE:-}" && ( -z "$LLMPROBE_DIR" || ! -f "$LLMPROBE_MJS" ) ]]; then
+    echo "[fatal] llmprobe bundle missing: set LLMPROBE_DIR to the llmprobe checkout ($LLMPROBE_MJS; build: npm run build:cli)"
     exit 1
 fi
 

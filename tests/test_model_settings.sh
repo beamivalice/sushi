@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/sushi"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
-MODELS_ROOT="${MODELS_ROOT:-$HOME/.sushi/models}"
+MODELS_ROOT="${MODELS_ROOT:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}}"
 MODEL_A="${MODEL_A:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 MODEL_B="${MODEL_B:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-4bpw}"
 STREAM_MODEL="${STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen/Qwen3.8-Flash-Next}"

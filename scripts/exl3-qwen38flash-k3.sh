@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve the resident Sushi-3bpw pack.
+# Serve the resident Sushi-STQ-2.75bpw pack.
 # Extra arguments are appended, e.g. ./exl3-qwen38flash-k3.sh --port 11235.
 set -euo pipefail
 
@@ -12,7 +12,7 @@ if [[ ! -x "$binary" ]]; then
 fi
 
 exec "$binary" serve \
-  --model "${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw" \
+  --model "${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw" \
   --host 127.0.0.1 \
   --port 12345 \
   --ctx-size 1048576 \

@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-MODEL="${GLM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2.3bpw}"
+MODEL="${GLM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2.4bpw}"
 PORT="${PORT:-19091}"
 BIN="${BINARY:-./zig-out/bin/sushi}"
 BASE="http://127.0.0.1:$PORT"

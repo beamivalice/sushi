@@ -32,7 +32,7 @@ PORT=${1:-8135}
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
-MODELS_ROOT="$HOME/.sushi/models"
+MODELS_ROOT="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
 CHAT_A="${STRESS_CHAT_A:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 CHAT_B="${STRESS_CHAT_B:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 N_AGENTS=${N_AGENTS:-3}

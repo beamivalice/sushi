@@ -11,7 +11,7 @@
 
 set -e
 
-ROOT="${1:-$HOME/.sushi/models}"
+ROOT="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}}"
 PORT="${2:-8097}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'

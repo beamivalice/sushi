@@ -10,7 +10,7 @@ setopt nonomatch
 mode=$1; tag=$2; shift 2
 D=${0:A:h}/fixtures/qwen4_ab
 O=${QWEN4_AB_OUT:-$HOME/.sushi/runs/qwen4-ab}; mkdir -p $O
-PACK=${QWEN4_MODEL:-$HOME/.sushi/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}
+PACK=${QWEN4_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
 BIN=${SUSHI_BIN:-./zig-out/bin/sushi}
 PORT=${QWEN4_AB_PORT:-11414}
 LOG=$O/${mode}_$tag.log

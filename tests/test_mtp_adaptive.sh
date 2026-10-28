@@ -28,9 +28,7 @@ trap 'rm -rf "$WORK"; [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null' EX
 MODEL="${MTP_ADAPTIVE_MODEL:-}"
 if [ -z "$MODEL" ]; then
     for cand in \
-        "${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit" \
-        "$HOME/.sushi/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit" \
-        "$HOME/.sushi/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"; do
+        "${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"; do
         [ -d "$cand" ] && { MODEL="$cand"; break; }
     done
 fi

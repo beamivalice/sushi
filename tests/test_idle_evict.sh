@@ -15,7 +15,7 @@
 
 set -e
 
-ROOT="${1:-$HOME/.sushi/models}"
+ROOT="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}}"
 PORT="${2:-8098}"
 BASE="http://127.0.0.1:$PORT"
 CYCLES="${IDLE_EVICT_CYCLES:-6}"
