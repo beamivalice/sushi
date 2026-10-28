@@ -4696,7 +4696,7 @@ fn testWriteCacheLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: 
     view.deinit();
 }
 
-fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
+pub fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
     var written: u32 = 0;
     while (written < tokens) {
         const step: u32 = @min(64, tokens - written);

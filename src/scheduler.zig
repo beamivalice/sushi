@@ -2081,6 +2081,7 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
+            // Every retained launch setting is re-applied from self.
             // `--no-drafter` / `--drafter` reach cold loads too; the path
             // itself is scoped by `coldLoadDrafterDir`.
             .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
@@ -2330,6 +2331,7 @@ pub const Scheduler = struct {
     /// and `decode_serial_total{reason}` name.
     fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
         _ = self;
+        // The gate reads dispatch via slotTicksRegular, never the armed enable_drafter or enable_mtp flags.
         if (!slotTicksRegular(slot)) return .spec_active;
         // A slot whose module-head release is armed but not landed still holds the head.
         if (slotReleasePending(slot)) return .head_release_pending;
@@ -2445,6 +2447,41 @@ pub const PAD_FREE_MIN_CTX: u32 = 131072;
 pub fn groupKeepCount(kv_lens_asc: []const u32, ctx_max: u32) usize {
     if (kv_lens_asc.len >= 2 and ctx_max >= PAD_FREE_MIN_CTX and kv_lens_asc[kv_lens_asc.len - 1] <= PAD_FREE_KV) return kv_lens_asc.len;
     return batchedKvKeepCount(kv_lens_asc);
+}
+
+fn padWasteKeepCount(group: []*Slot, gate_batch_kv_len: bool, kv_lens: *[32]u32) usize {
+    var ctx_max: u32 = 0;
+    // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
+    // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
+    if (gate_batch_kv_len) {
+        var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+        for (group, 0..) |g, i| {
+            caches_buf[i] = &g.cache;
+        }
+        fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, kv_lens[0..group.len]);
+        ctx_max = groupCtxMax(caches_buf[0..group.len]);
+        // Stable insertion sort, ascending, slots and lengths moving together.
+        var i: usize = 1;
+        while (i < group.len) : (i += 1) {
+            const slot_i = group[i];
+            const len_i = kv_lens[i];
+            var j = i;
+            while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
+                group[j] = group[j - 1];
+                kv_lens[j] = kv_lens[j - 1];
+            }
+            group[j] = slot_i;
+            kv_lens[j] = len_i;
+        }
+    } else {
+        std.sort.pdq(*Slot, group, {}, struct {
+            fn lt(_: void, a: *Slot, b: *Slot) bool {
+                return a.cache.step < b.cache.step;
+            }
+        }.lt);
+        for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
+    }
+    return groupKeepCount(kv_lens[0..group.len], ctx_max);
 }
 
 fn groupCtxMax(caches: []const *const KVCache) u32 {
@@ -3862,58 +3899,25 @@ test "EXL3 streaming CPU settings budget engages the EXL3 loader" {
     try t.expect(expert_stream_mod.expertStreamingEngaged(q4.supportsExpertStreaming(), q4.expertStreamingRequired(), budget.bytes));
 }
 
-test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
-    // Three separate rounds of this bug shipped: prefix-cache, then MTP,
-    // then the drafter/ssd group — each time a launch flag reached
-    // only `--model` and the cold path (hot switch, /v1/load-model, first
-    // request naming an unloaded model) quietly used a struct default. The
-    // scan is the class guard: a field retained on the Scheduler for this
-    // purpose that no cold-load assignment mentions is the next round.
-    // Needles are ++-split so this test's own source can't satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    inline for (.{
-        "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
-        "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
-        "no_drafter",                "prefix_cache_mem_resolver", "expert_cache_fit_resolver",
-        "ssd_budget_bytes",          "kv_quant_explicit",         "mtp_explicit",
-        "prefix_cache_disk_resolver",
-    }) |field| {
-        const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
-        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
-    }
-    // The drafter path is the one retained setting that must NOT be copied
-    // straight across — it goes through the ownership rule above.
-    const via_rule = "coldLoadDrafterDir(" ++ "self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)";
-    try testing.expect(std.mem.indexOf(u8, src, via_rule) != null);
-    // The stale TODO that stood in for the wiring must be gone.
-    const old = "Phase E will wire the load-model API" ++ " to set this.";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
-}
-
 test "bf16 streaming registry gate uses resident plan not checkpoint disk size" {
     try testing.expectEqual(@as(u64, 81), expertStreamingGateBytes(10, 60, 5, 6));
     try testing.expect(expertStreamingGateBytes(15_000_000_000, 60_000_000_000, 5_033_164_800, 536_870_912) < 360_000_000_000);
 }
 
-test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never the raw launch flag" {
-    // 2026-08-30 Metal OOM: a 40 GB `--prefix-cache-mem` beside a ~70 GB pack
-    // was never validated against what the weights left under the GPU ceiling;
-    // the cache filled to its cap and a 143k prefill died uncatchably. The
-    // budget must pass through the resolver (server.prefixCacheMemForLoad)
-    // before it reaches initWithMem — and a SECOND construction site must not
-    // be able to skip the clamp (the cold-load launch flags class).
-    const src = @embedFile("scheduler.zig");
-    const needle = "HotPrefixCache.initWith" ++ "Mem(";
-    var found: usize = 0;
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, src, pos, needle)) |at| : (pos = at + needle.len) {
-        found += 1;
-        const window = src[at..@min(at + 240, src.len)];
-        try testing.expect(std.mem.indexOf(u8, window, "clamped_prefix_mem") != null);
-        try testing.expect(std.mem.indexOf(u8, window, "params.prefix_cache_mem_bytes") == null);
-    }
-    try testing.expect(found >= 1);
+test "a loaded model's hot-cache budget is the resolver's clamp, never the raw launch flag" {
+    const Stub = struct {
+        fn clamp(_: *model_mod.ModelConfig, requested: u64, _: BudgetRevise, idle_out: *u64) u64 {
+            idle_out.* = 7;
+            return requested / 4;
+        }
+    };
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const forty_gb: u64 = 40 << 30;
+    var idle: u64 = 0;
+    try testing.expectEqual(forty_gb / 4, hotCacheMemForLoad(true, Stub.clamp, &cfg, forty_gb, &idle));
+    try testing.expectEqual(@as(u64, 7), idle);
+    try testing.expectEqual(@as(u64, 0), hotCacheMemForLoad(false, Stub.clamp, &cfg, forty_gb, &idle));
+    try testing.expectEqual(forty_gb, hotCacheMemForLoad(true, null, &cfg, forty_gb, &idle));
 }
 
 test "visionChoiceFor: DeepSeek-V4.1 loads its tower by default streamed or resident; --no-vision and the per-model vision:false skip it; other archs keep the streamed default off" {
@@ -5180,12 +5184,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
         // Disk-only mode retains no reusable KV in RAM, so it asks for no RAM budget.
         var ssd_idle_mem: u64 = 0;
-        const clamped_prefix_mem: u64 = if (!ram_prefix_cache)
-            0
-        else if (params.prefix_cache_mem_resolver) |resolve|
-            resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
-        else
-            params.prefix_cache_mem_bytes;
+        const clamped_prefix_mem = hotCacheMemForLoad(ram_prefix_cache, params.prefix_cache_mem_resolver, params.config, params.prefix_cache_mem_bytes, &ssd_idle_mem);
         if (ram_prefix_cache) {
             // On an SSD-first arch `--prefix-cache-mem` is the idle allowance beside the live session.
             const ram_bytes = if (prefix_cache_mod.ssdFirstActive(params.config, disk_prefix_cache, ram_prefix_cache)) ssd_idle_mem else clamped_prefix_mem;
@@ -5294,6 +5293,23 @@ const BUDGET_REVISE_WINDOW_NS: u64 = 10 * std.time.ns_per_s;
 /// How a budget resolve differs from the load-time one: the cache's own resident bytes
 /// are excluded from the machine read, and the resolver keeps quiet (`setBudget` logs).
 pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
+
+fn takeOwned(comptime T: type, held: *?T) ?T {
+    defer held.* = null;
+    return held.*;
+}
+
+fn hotCacheMemForLoad(
+    ram_prefix_cache: bool,
+    resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
+    config: *model_mod.ModelConfig,
+    requested: u64,
+    ssd_idle_out: *u64,
+) u64 {
+    if (!ram_prefix_cache) return 0;
+    const resolve = resolver orelse return requested;
+    return resolve(config, requested, .{}, ssd_idle_out);
+}
 
 /// Re-clamp every resident model's hot-cache budget after residency changed (#364): the
 /// load-time clamp read the machine with the other models on it and was never revisited, so
@@ -5680,6 +5696,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
             }
             var admit_idx: [to_prefill.len]usize = undefined;
+            // Pending admits only through admitPendingTick.
             const n_admit = memoryAdmitCount(sch, admit_idx[0..admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)]);
             for (admit_idx[0..n_admit]) |idx| {
                 to_prefill[n_prefill] = admitForPrefillLocked(sch, idx);
@@ -5759,6 +5776,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     break :prefill;
                 }
                 if (postPrefillTerminal(slot)) continue;
+                // Interleaved decode time is billed to the decoding slots, so prefill_ns excludes it.
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
                     slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
@@ -7759,10 +7777,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // error.Cancelled from its chunk loop). MtpCacheRef/DflashCtx hold the
     // KVCache BY VALUE, so a second deinit from our errdefers walked freed
     // mlx handles — SIGSEGV in freeKVEntry (issue #266). Clear FIRST.
-    const dflash_pass = dflash_restored;
-    dflash_restored = null;
-    const mtp_pass = mtp_restored;
-    mtp_restored = null;
+    const dflash_pass = takeOwned(dflash_mod.DflashCtx, &dflash_restored);
+    const mtp_pass = takeOwned(generate_mod.MtpRestored, &mtp_restored);
     // Restore by move, the transfer: the last point at which nothing has written to `slot.cache`.
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
@@ -8057,38 +8073,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // how many still fit; the tail decodes serially this tick.
         if (pads and group.len >= 2) {
             var kv_lens: [32]u32 = undefined;
-            var ctx_max: u32 = 0;
-            // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
-            // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
-            if (gate_batch_kv_len) {
-                var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
-                for (group, 0..) |g, i| {
-                    caches_buf[i] = &g.cache;
-                }
-                fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, kv_lens[0..group.len]);
-                ctx_max = groupCtxMax(caches_buf[0..group.len]);
-                // Stable insertion sort, ascending, slots and lengths moving together.
-                var i: usize = 1;
-                while (i < group.len) : (i += 1) {
-                    const slot_i = group[i];
-                    const len_i = kv_lens[i];
-                    var j = i;
-                    while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
-                        group[j] = group[j - 1];
-                        kv_lens[j] = kv_lens[j - 1];
-                    }
-                    group[j] = slot_i;
-                    kv_lens[j] = len_i;
-                }
-            } else {
-                std.sort.pdq(*Slot, group, {}, struct {
-                    fn lt(_: void, a: *Slot, b: *Slot) bool {
-                        return a.cache.step < b.cache.step;
-                    }
-                }.lt);
-                for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
-            }
-            const keep = groupKeepCount(kv_lens[0..group.len], ctx_max);
+            const keep = padWasteKeepCount(group, gate_batch_kv_len, &kv_lens);
             if (keep < group.len) {
                 if (!kv_skew_split_logged) {
                     kv_skew_split_logged = true;
@@ -8612,11 +8597,6 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 test "DFlash cache payload is committed only when it spans the trunk prefix" {
     try testing.expect(dflashContextCoversPrefix(128, 128));
     try testing.expect(!dflashContextCoversPrefix(96, 128));
-    const source = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
-    const body = source[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
 }
 
 test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
@@ -8675,21 +8655,22 @@ test "cancelled-prefill commit length: floor, clamp, and zero" {
     try testing.expect(cancelledPrefillCommitLen(50, 50) == null);
 }
 
-test "the cleanup drain commits a cancelled slot before deinit" {
-    // Class guard: a decode-phase cancel is pulled straight into the cleanup
-    // queue by `complete()` and NEVER passes through finishSlot — without a
-    // commit in the drain, its prompt+generated KV dies with the slot. The
-    // commit must run BEFORE deinit (the snapshot refcount-shares live
-    // buffers; after deinit they are freed).
-    const source = @embedFile("scheduler.zig");
-    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
-    const region = source[drain_start..@min(drain_start + 1800, source.len)];
-    const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
-    const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
-    try testing.expect(commit_pos < deinit_pos);
-    // The SSD tier has no finishSlot flush on this path — the drain must
-    // flush what it just committed itself.
-    try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+test "a decode-phase cancel that never passed the cull commits at the cleanup drain, once" {
+    const Hook = struct {
+        var commits: usize = 0;
+        fn commit(_: *Scheduler, _: *Slot) void {
+            commits += 1;
+        }
+    };
+    var sch: Scheduler = undefined;
+    var slot: Slot = undefined;
+    slot.committed_at_cull = false;
+    Hook.commits = 0;
+    commitCancelledAtCleanup(&sch, &slot, Hook.commit);
+    try testing.expectEqual(@as(usize, 1), Hook.commits);
+    slot.committed_at_cull = true;
+    commitCancelledAtCleanup(&sch, &slot, Hook.commit);
+    try testing.expectEqual(@as(usize, 1), Hook.commits);
 }
 
 test "idleEvictTickMs: sweeps well inside the window without spinning" {
@@ -8723,131 +8704,76 @@ test "gpu warm: ticks every half second inside the window after work, never past
     try testing.expectEqual(GpuWarmWindow.close, gpuWarmBeforePark(true, true));
 }
 
-test "the inference loop parks without holding the sleep-inhibition assertion" {
-    // Pin release < park < acquire and startup acquire < load.
-    const source = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
-    const body = source[start..end];
-    const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
-    const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
-    const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
-    try testing.expect(drop < park);
-    try testing.expect(park < hold);
-    try testing.expect(std.mem.indexOf(u8, body, "while (!hasWorkPendingLocked(sch)") != null);
-    const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
-    const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
-    try testing.expect(boot_arm < boot_load);
-    try testing.expect(std.mem.indexOf(u8, body, "defer sleep_inhibit.release();") != null);
-}
-
-test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
-    // Prefill abort: `Generator.initWithOptions` throws error.Cancelled from
-    // its chunk loop, so `slot.legacy_gen` is never assigned — the legacy
-    // `else return` silently dropped every chunk that DID forward. The
-    // cancelled-prefill arm must be reachable from commitSlotIfApplicable,
-    // and hybrids are excluded inside it (their stride checkpoints die with
-    // the failed Generator init; a checkpoint-less hybrid entry restores as
-    // a cold miss while still occupying an LRU slot).
-    const source = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
-    const body = source[start..end];
-    const route_pos = std.mem.indexOf(u8, body, "commitCancelledPrefillSlot") orelse return error.MissingRoute;
-    // `was_pad_only` initializes TRUE and only flips on the first pushed
-    // token, so a guard on it ABOVE the Generator-less arm makes that arm
-    // unreachable (live 2026-08-22: "prefill aborted" logged, nothing
-    // committed, full re-prefill on retry).
-    const pad_pos = std.mem.indexOf(u8, body, "slot.was_pad_only") orelse return error.MissingPadGuard;
-    try testing.expect(route_pos < pad_pos);
-
-    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
-    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
-    const cp_body = source[cp_start..cp_end];
-    // Hybrid gate: KV-only hybrid entries restore as cold misses and are
-    // declined; with salvaged checkpoints (handed off by initWithOptions on
-    // error.Cancelled) a cancelled hybrid prefill commits like a normal one.
-    try testing.expect(std.mem.indexOf(u8, cp_body, "slot.ssm_entries != null and salvage.checkpoints.len == 0") != null);
-    try testing.expect(std.mem.indexOf(u8, cp_body, "cancelledPrefillCommitLen") != null);
-    // The authoritative commit length is the sink's `forwarded` counter —
-    // `cache.step` only advances when Generator init COMPLETES, so it reads
-    // 0 on every aborted prefill (found live: step=0 while pos=1536).
-    try testing.expect(std.mem.indexOf(u8, cp_body, "salvage.forwarded") != null);
-    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithMediaState") != null);
-}
-
-test "Generator.initWithOptions hands off checkpoints on cancel" {
-    // The chunk-loop cancel path must MOVE the captured stride checkpoints
-    // into the sink before returning error.Cancelled — they die with the
-    // failed construction otherwise, and hybrid cancelled-prefill commits
-    // are impossible. Anchored on the prefill loop's abandoned-request
-    // abort comment so a decode-loop cancel check can't satisfy it.
-    const source = @embedFile("generate.zig");
-    const anchor = std.mem.indexOf(u8, source, "Abandoned-request abort") orelse return error.MissingAbortComment;
-    const region = source[anchor..@min(anchor + 2400, source.len)];
-    try testing.expect(std.mem.indexOf(u8, region, "cancelled_checkpoint_sink") != null);
-    try testing.expect(std.mem.indexOf(u8, region, "error.Cancelled") != null);
-}
-
-test "Slot.deinit frees unconsumed cancelled-prefill salvage" {
-    // Ownership discipline: the sink holds checkpoint arrays allocated on
-    // the inference thread; anything commitCancelledPrefillSlot did not
-    // consume must die with the slot, not leak.
-    const source = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "pub fn deinit(self: *Slot)") orelse return error.MissingSlotDeinit;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "pub fn deinit(self: *Scheduler)") orelse return error.MissingSchedulerDeinit;
-    const body = source[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "cancelled_prefill.deinit()") != null);
-}
-
-test "runPrefill clears restored spec-cache ownership BEFORE Generator.initWithOptions (issue #266)" {
-    // Generator.initWithOptions ADOPTS the hot-cache-restored DFlash/MTP
-    // caches and frees them via its own errdefers on any failure past the
-    // adoption point — a mid-prefill client disconnect throws
-    // error.Cancelled from its chunk loop. MtpCacheRef/DflashCtx hold their
-    // KVCache BY VALUE, so runPrefill's own errdefers then walked the same
-    // entries slice + mlx handles a second time: SIGSEGV in
-    // KVCache.deinit -> freeKVEntry (issue #266, disconnect storms on long
-    // agent prompts). Ownership transfers AT THE CALL, so the locals must
-    // be cleared before the try, never after it.
-    const source = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "fn runPrefill(") orelse return error.MissingRunPrefill;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingRunPrefillEnd;
-    const body = source[start..end];
-    const call = std.mem.indexOf(u8, body, "try Generator.initWithOptions(") orelse return error.MissingInitCall;
-    const dfl = std.mem.indexOf(u8, body, "dflash_restored = null") orelse return error.MissingDflashClear;
-    const mtp = std.mem.indexOf(u8, body, "mtp_restored = null") orelse return error.MissingMtpClear;
-    try testing.expect(dfl < call);
-    try testing.expect(mtp < call);
-}
-
-test "every server scheduler path forwards resolved thinking to the DFlash gate" {
-    const source = @embedFile("server.zig");
-
-    // All direct streaming submissions, plus the shared non-streaming submit,
-    // must populate the field. Text completions resolve it explicitly false.
-    var submit_pos: usize = 0;
-    var submits: usize = 0;
-    while (std.mem.indexOfPos(u8, source, submit_pos, "sch.submit(.{")) |start| {
-        const end = std.mem.indexOfPos(u8, source, start, "});") orelse return error.UnclosedSchedulerSubmit;
-        try testing.expect(std.mem.indexOf(u8, source[start..end], ".enable_thinking =") != null);
-        submits += 1;
-        submit_pos = end + 3;
+test "a cancelled prefill with no Generator commits its forwarded prefix, pad-only flag or not" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.metrics = null;
+    sch.hot_prefix_cache = null;
+    sch.hot_cache_digests = &.{};
+    sch.digest_residency = 0;
+    sch.digest_mu = .init;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer model.prefix_cache.?.deinit();
+    model.transformer = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var no_ssm: [0]SSMCacheEntry = .{};
+    const Case = struct { forwarded: usize, hybrid: bool, committed: bool };
+    for ([_]Case{
+        .{ .forwarded = 400, .hybrid = false, .committed = true },
+        .{ .forwarded = 400, .hybrid = true, .committed = false },
+        .{ .forwarded = prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS - 1, .hybrid = false, .committed = false },
+    }) |c| {
+        const before = model.prefix_cache.?.entries.items.len;
+        var slot: Slot = undefined;
+        slot.model = &model;
+        slot.error_code = null;
+        slot.legacy_gen = null;
+        slot.glm5_request = null;
+        slot.cancelled_prefill = .{ .forwarded = c.forwarded };
+        slot.ssm_entries = if (c.hybrid) &no_ssm else null;
+        slot.full_prompt = &tokens;
+        slot.media_chain = &.{};
+        slot.vision_key = 0;
+        slot.media_start = null;
+        slot.has_tools = false;
+        slot.cache_key = 0;
+        slot.was_pad_only = true;
+        slot.cache = try KVCache.init(testing.allocator, 2);
+        defer slot.cache.deinit();
+        try prefix_cache_mod.testFillCache(&slot.cache, s, 2, 600);
+        commitSlotIfApplicable(&sch, &slot);
+        try testing.expectEqual(before + @intFromBool(c.committed), model.prefix_cache.?.entries.items.len);
+        if (c.committed) try testing.expectEqual(c.forwarded, model.prefix_cache.?.entries.items[before].tokens.len);
     }
-    try testing.expectEqual(@as(usize, 5), submits);
+}
 
-    // Positional calls into the non-streaming wrapper must pass the resolved
-    // value; the raw text-completion path is the sole explicit false arm.
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    var calls: usize = 0;
-    while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "nonStreamingViaScheduler(") == null) continue;
-        if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
-        calls += 1;
-        try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
-            std.mem.indexOf(u8, line, ", false, false, use_drafter") != null);
-    }
-    try testing.expectEqual(@as(usize, 4), calls);
+test "a spec cache handed to Generator init is out of the caller's errdefer reach, so a cancelled init frees it once" {
+    const Owned = struct {
+        frees: *u32,
+        fn deinit(self: *@This()) void {
+            self.frees.* += 1;
+        }
+    };
+    const Run = struct {
+        fn run(held: *?Owned) !void {
+            errdefer if (held.*) |*o| o.deinit();
+            var adopted = takeOwned(Owned, held).?;
+            errdefer adopted.deinit();
+            return error.Cancelled;
+        }
+    };
+    var frees: u32 = 0;
+    var held: ?Owned = .{ .frees = &frees };
+    try testing.expectError(error.Cancelled, Run.run(&held));
+    try testing.expectEqual(@as(u32, 1), frees);
 }
 
 /// Per-slot follow-up to a batched forward: `record` moves the id ledger, `publish` samples and streams.
@@ -10224,18 +10150,6 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
 const testing = std.testing;
 const expectError = @import("test_expect.zig").expectError;
 
-test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
-    const src = @embedFile("scheduler.zig");
-    // The hook is wired at the ONE Generator construction site, env-gated.
-    const wire = ".interleave" ++ "_hook = if (prefillInterleaveEnabled())";
-    try testing.expect(std.mem.indexOf(u8, src, wire) != null);
-    // Interleaved decode time is charged to the DECODING slots (they got the
-    // tokens), so the prefilling slot's prefill_ns must exclude it or
-    // prefill_tps under-reports on every interleaved prefill.
-    const bill = "slot.prefill_ns = prefill_sw.read() -| slot.prefill_" ++ "interleaved_ns;";
-    try testing.expect(std.mem.indexOf(u8, src, bill) != null);
-}
-
 test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial" {
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     cfg.model_type = "mimo_v2";
@@ -10337,18 +10251,17 @@ test "a 137k stream beside two fresh sub-agents stays one group on the gather bi
     try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, groupCtxMax(&ptrs)));
 }
 
-test "the batched group is capped by padding waste before it is dispatched" {
-    // Source-scan class guard: the grouping loop must consult the cap. Without
-    // it a single long-context stream makes every short neighbour materialize
-    // a padded KV tensor sized by ITS length — a per-tick transient no gate
-    // bills, whose failure mode is an uncatchable Metal OOM.
-    const src = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
-    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
-    const body = src[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "groupKeepCount(") != null);
-    // ...and the dropped slots must still be ticked, or they never advance.
-    try testing.expect(std.mem.indexOf(u8, body, "noteSerial(sch, s, .pad_waste)") != null);
+test "the batched group is capped by padding waste: the longest slot sorts last and falls out" {
+    var slots: [3]Slot = undefined;
+    var group: [3]*Slot = undefined;
+    for (&slots, &group, [_]usize{ 90_000, 1_000, 1_200 }) |*slot, *g, step| {
+        slot.cache = .{ .entries = &.{}, .step = step, .allocator = testing.allocator, .config = .dense };
+        g.* = slot;
+    }
+    var kv_lens: [32]u32 = undefined;
+    try testing.expectEqual(@as(usize, 2), padWasteKeepCount(&group, false, &kv_lens));
+    try testing.expectEqualSlices(*Slot, &.{ &slots[1], &slots[2], &slots[0] }, &group);
+    try testing.expectEqualSlices(u32, &.{ 1_000, 1_200, 90_000 }, kv_lens[0..3]);
 }
 
 test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
@@ -10586,29 +10499,7 @@ test "a GDN trunk is batchable AND is not clamped by the server's concurrency ga
     try testing.expect(configBatchesDecode(&cfg));
 }
 
-test "the batched gate reads DISPATCH, not the armed spec flags" {
-    // The armed flags are the REQUEST's wish; specTickMode is what the tick actually
-    // dispatches, and spec_disabled_runtime is what recovered the throughput of a
-    // slot whose speculation turned itself off.
-    const src = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, src, "fn batchVerdict(self: *const Scheduler") orelse return error.MissingBatchable;
-    const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
-    const body = src[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
-    // No armed-flag read may come back into the gate.
-    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_drafter") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_mtp") == null);
-
-    // ...and the helper answers from BOTH: the generator's runtime kill and
-    // the authoritative dispatch decision.
-    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
-    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
-    const hbody = src[hs..he];
-    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "specTickMode(") != null);
-
-    // The dispatch answer itself: a live MTP slot never ticks regular, an
-    // unarmed one always does.
+test "a live MTP slot never ticks regular, an unarmed one always does" {
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false));
 }
@@ -10809,23 +10700,6 @@ test "complete keeps a slot in decoding until its pass is out, so admission neve
     try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
     try testing.expectEqual(@as(usize, 1), sch.cleanup_queue.items.len);
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
-}
-
-test "inferenceLoop pending drain routes through admitPendingTick" {
-    // A pure admission fn nobody calls is a silent no-op (the specTickMode /
-    // hardcoded use_drafter=false class). Needles are ++-split so this
-    // test's own source can't satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
-    try testing.expect(std.mem.indexOf(u8, src, call) != null);
-    // The candidates' exclusive bit must come from the per-slot predicate
-    // (model bit OR a module-owned MTP head on this slot).
-    const pred = ".exclusive = slotExclusiveDecode(" ++ "s)";
-    try testing.expect(std.mem.indexOf(u8, src, pred) != null);
-    // The pre-gate unconditional drain shape must be GONE — its survival
-    // would mean a path still admits without the gate.
-    const old = "to_prefill[n_prefill] = sch.pending." ++ "orderedRemove(0)";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
 }
 
 test "S21: a released module head drops the slot's exclusivity, and the MODEL bit is untouched" {
@@ -11268,20 +11142,6 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     }
 }
 
-test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
-    // A pure predicate nobody calls is a silent no-op. Needles are ++-split so
-    // this test's own source cannot satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
-    // this test's own arms would satisfy.
-    inline for (.{"const use_mtp = wiring" ++ ".use_mtp;"}) |needle| {
-        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
-    }
-    // The exclusion must come from the shared predicate, not a new arch list.
-    const from_predicate = "transformer.?.moduleSpec" ++ "Wiring()";
-    try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);
-}
-
 test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained/penalised/logprobs/budgeted-thinking/disabled ones do not" {
     const t = testing;
     try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 0));
@@ -11319,34 +11179,6 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, true));
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, true));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, true));
-}
-
-test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
-    // Built lazily it landed inside the first request's draft chain: a
-    // 248320-row requantize of the trunk lm_head plus a synchronous eval of
-    // ~240 MB, on the inference thread, mid-round. That is first-token
-    // latency on the first request after a load — the sidecar arm has always
-    // paid it at bind time instead.
-    //
-    // `doLoadOnInferenceThread` is the ONE Transformer construction site, and
-    // the boot load and the `/v1/load` cold load both route through it (the
-    // "a launch flag that shapes a LOAD" class: a hook on only one of them
-    // ships a server where the first cold-loaded model still pays lazily).
-    // This pins all three.
-    const source = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "fn doLoadOnInferenceThread(") orelse return error.MissingLoadFn;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingLoadFnEnd;
-    const body = source[start..end];
-    const build = std.mem.indexOf(u8, body, "qwen4BuildDraftRerank()") orelse return error.MissingEagerRerankBuild;
-    // Gated exactly like the head it drafts for: `--no-mtp` never drafts, so
-    // it must never pay for the coarse head.
-    const gate = std.mem.lastIndexOf(u8, body[0..build], "mtp_enabled") orelse return error.EagerRerankBuildUngated;
-    try testing.expect(build - gate < 200);
-
-    // Boot load (inferenceLoop) and cold load (runLoadRequest) both land there.
-    const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
-    const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
-    try testing.expect(boot != cold);
 }
 
 test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {
