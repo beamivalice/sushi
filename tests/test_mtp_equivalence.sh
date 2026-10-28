@@ -32,7 +32,7 @@
 # sidecar (every mtp.sidecar_rel_paths location) or a sharded/monolithic
 # checkpoint carrying one of mtp_marker_keys works.
 # Calibrated auto-depth surfaces can additionally pin their live dispatch arm:
-#   MTP_EXPECT_AUTO_PROFILE=g17_nax_q4_gs64 MTP_EXPECT_AUTO_DEPTH=8 \
+#   MTP_EXPECT_AUTO_PROFILE=g17_nax_qwen4_q4_gs64 MTP_EXPECT_AUTO_DEPTH=6 \
 #     MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh
 #
 # MoE trunks (35B-A3B, qwen4_exp) keep MTP default-OFF per request; set
