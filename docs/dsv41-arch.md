@@ -43,7 +43,19 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   the Engram rows, the MTP/DSpark tensors and (under `--no-vision`) the vision/aligner/image tensors and `bias_vl`, read by name from the shard headers. FP8
   linears become MLX `mxfp8`: the u8 codes viewed as u32 and each 32-row scale row repeated down its 32 rows. FP4 experts
   are MLX `mxfp4` exactly (the int8 viewed as u32, low nibble first; proven bit for bit against a numpy decode of a real
-  expert). The head is widened to f32; the embedding stays bf16.
+  expert). The head is widened to f32; a dense embedding stays bf16. An affine embedding (an STQ pack's 4-bit g64 triple, `embed.weight/scales/biases`) is [read from the shard by row](#embed-ssd), not loaded.
+<a id="embed-ssd"></a>
+- **Token embedding on SSD** (`src/dsv41_embed.zig`): a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`)
+  is left out of the resident load and of the trunk term (`dsv41_source.embedOnSsd`, the one test for both), 0.37 GB on the
+  STQ pack. A forward `pread`s the rows of its token ids (`Ssd.read`: each distinct id once, 16 rows a thread, `F_RDADVISE`
+  first, page cache on, read-ahead off) and `Embed.rows` dequantizes them with the resident call, over the same stored bytes
+  (scales and biases cast to the activation dtype as the loader cast them), so the rows are bit-identical. The page cache
+  keeps the common tokens' rows hot. A prefill chunk's pass is told the prompt tokens after it (`ForwardCtx.ahead_ids`)
+  and reads the next chunk's rows on a thread while it runs (`aheadEmbed`, ~2.3 KB a token of host memory, unbilled);
+  the next pass takes them when its ids are the same, else reads its own. Decode and a DSpark draft read their few rows
+  inline. The DSpark draft embeds `[t1, noise_id...]` through the same table; MTP stages, the head and the vision tower
+  never touch it. A dense embedding (the FP8 checkpoint's bf16 table) stays resident. Load logs
+  `[dsv41] token embedding on SSD (0.37 GB freed to the expert cache)`.
 - **Routed experts** (`src/dsv41_stream.zig`): the shared expert cache reads each layer's picked experts from the shards
   into slabs (layout `mxfp4_w123`, `layers.L.ffn.experts.E.w1|w3|w2.{weight,scale}`; w1 gate, w3 up, w2 down) and the
   layer gathers them as `mxfp4`. The slab path gives the resident path's logits bit for bit on a tiny pack, with a cache

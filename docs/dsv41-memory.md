@@ -8,12 +8,12 @@ prefill that borrows decoder pools and the fully resident load. Index: [CLAUDE.m
 
 | term | GB |
 |---|---|
-| trunk (resident STQ banks, embedding, head) | 4.78 |
+| trunk (resident STQ banks, head; the 0.37 GB embedding is read from SSD) | 4.41 |
 | DSpark stages (resident) | 3.92 |
 | union workspace (one layer's 384 experts at the widest layer) | 3.70 |
 | bounce + selected | 0.60 |
 | MLX buffer pool, decode cap (`dsv41_pool_bytes`, 1 GiB) | 1.07 |
-| expert cache | 89.0 |
+| expert cache | 89.4 |
 
 Routed experts by layer, rate-sized (shard headers): the encoder (layers 0-19) holds 57.13 GB (6.8-9.6 MB an
 expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The cache holds 75% of it.

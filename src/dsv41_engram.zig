@@ -235,10 +235,12 @@ pub const Table = struct {
         _ = std.c.close(self.fd);
     }
 
-    pub const TensorAt = struct { file: []const u8, start: u64, shape: [2]u64 };
+    /// `dtype` is the position of the stored dtype among the ones `locate` was offered.
+    pub const TensorAt = struct { file: []const u8, start: u64, shape: [2]u64, dtype: usize = 0 };
 
-    /// Where `name` sits: the shard the index names for it, or the first shard whose header lists it.
-    fn locate(a: std.mem.Allocator, dir_path: []const u8, name: []const u8, dtype: []const u8) !TensorAt {
+    /// Where `name` sits: the shard the index names for it, or the first shard whose header lists it. Its stored dtype
+    /// must be one of `dtypes`.
+    pub fn locate(a: std.mem.Allocator, dir_path: []const u8, name: []const u8, dtypes: []const []const u8) !TensorAt {
         const io = std.Io.Threaded.global_single_threaded.io();
         var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
         defer dir.close(io);
@@ -250,16 +252,16 @@ pub const Table = struct {
                 named = f.string;
             };
         } else |_| {}
-        if (named) |file| return try inShard(a, dir_path, file, name, dtype) orelse error.EngramTableMissing;
+        if (named) |file| return try inShard(a, dir_path, file, name, dtypes) orelse error.EngramTableMissing;
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-            if (try inShard(a, dir_path, try a.dupe(u8, entry.name), name, dtype)) |t| return t;
+            if (try inShard(a, dir_path, try a.dupe(u8, entry.name), name, dtypes)) |t| return t;
         }
         return error.EngramTableMissing;
     }
 
-    fn inShard(a: std.mem.Allocator, dir_path: []const u8, file: []const u8, name: []const u8, dtype: []const u8) !?TensorAt {
+    fn inShard(a: std.mem.Allocator, dir_path: []const u8, file: []const u8, name: []const u8, dtypes: []const []const u8) !?TensorAt {
         if (std.mem.indexOfAny(u8, file, "/\\") != null) return error.EngramTableMissing;
         const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir_path, file }, 0);
         const fd = try expert_io.openHinted(path, .{ .nocache = false, .readahead_off = false });
@@ -271,13 +273,16 @@ pub const Table = struct {
         const dt = meta.object.get("dtype") orelse return error.EngramTableHeader;
         const shape = meta.object.get("shape") orelse return error.EngramTableHeader;
         const offs = meta.object.get("data_offsets") orelse return error.EngramTableHeader;
-        if (dt != .string or !std.mem.eql(u8, dt.string, dtype) or shape != .array or shape.array.items.len != 2 or offs != .array or offs.array.items.len != 2)
+        if (dt != .string or shape != .array or shape.array.items.len != 2 or offs != .array or offs.array.items.len != 2)
             return error.EngramTableHeader;
         const r = shape.array.items[0];
         const c = shape.array.items[1];
         const lo = offs.array.items[0];
         if (r != .integer or c != .integer or lo != .integer or r.integer < 0 or c.integer < 0 or lo.integer < 0) return error.EngramTableHeader;
-        return .{ .file = file, .start = header.data_start + @as(u64, @intCast(lo.integer)), .shape = .{ @intCast(r.integer), @intCast(c.integer) } };
+        const which = for (dtypes, 0..) |d, i| {
+            if (std.mem.eql(u8, d, dt.string)) break i;
+        } else return error.EngramTableHeader;
+        return .{ .file = file, .start = header.data_start + @as(u64, @intCast(lo.integer)), .shape = .{ @intCast(r.integer), @intCast(c.integer) }, .dtype = which };
     }
 
     /// Layer `layer`'s table in the checkpoint at `dir_path`.
@@ -287,9 +292,9 @@ pub const Table = struct {
         const a = arena.allocator();
         var name_buf: [96]u8 = undefined;
         const wname = try std.fmt.bufPrint(&name_buf, "layers.{d}.engram.embed.weight", .{layer});
-        const w = try locate(a, dir_path, wname, "F8_E4M3");
+        const w = try locate(a, dir_path, wname, &.{"F8_E4M3"});
         const sname = try std.fmt.bufPrint(&name_buf, "layers.{d}.engram.embed.scale", .{layer});
-        const s = try locate(a, dir_path, sname, "F8_E8M0");
+        const s = try locate(a, dir_path, sname, &.{"F8_E8M0"});
         if (!std.mem.eql(u8, w.file, s.file)) return error.EngramTableSplit;
         if (w.shape[0] != rows or s.shape[0] != rows) return error.EngramTableSize;
         if (w.shape[1] != head_dim or s.shape[1] * 32 != head_dim) return error.EngramTableGeometry;
@@ -454,7 +459,7 @@ pub const Table = struct {
 };
 
 /// Sets `first[i]` to the earliest position holding `ids[i]` and returns how many positions repeat an earlier one.
-fn firstOccurrences(gpa: std.mem.Allocator, ids: []const u32, first: []u32) !usize {
+pub fn firstOccurrences(gpa: std.mem.Allocator, ids: []const u32, first: []u32) !usize {
     var seen: std.AutoHashMapUnmanaged(u32, u32) = .empty;
     defer seen.deinit(gpa);
     try seen.ensureTotalCapacity(gpa, @intCast(ids.len));
@@ -735,7 +740,7 @@ fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
 /// macOS `struct radvisory`.
 const Radvisory = extern struct { ra_offset: i64, ra_count: c_int };
 
-fn rdadvise(fd: c_int, off: u64, len: usize) void {
+pub fn rdadvise(fd: c_int, off: u64, len: usize) void {
     var ra: Radvisory = .{ .ra_offset = @intCast(off), .ra_count = @intCast(len) };
     _ = std.c.fcntl(fd, std.c.F.RDADVISE, &ra);
 }

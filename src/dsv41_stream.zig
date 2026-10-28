@@ -825,7 +825,7 @@ test "dsv41 stq: the served STQ pack (trunk banks, affine embedding, streamed ra
         defer served.deinit();
         try scaleRouters(&sc, served.m);
         try testing.expect(served.m.layers[0].wq_b.stq != null and served.m.layers[0].wo_a.stq != null and served.m.head.stq != null);
-        try testing.expect(served.m.embed.scales.ctx != null);
+        try testing.expect(served.m.embed.ssd != null);
         served.m.fused = false;
         var tr: model.Trace = .{ .gpa = testing.allocator };
         defer tr.deinit();

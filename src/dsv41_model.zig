@@ -13,6 +13,7 @@ const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const engram = @import("dsv41_engram.zig");
+const embed_ssd = @import("dsv41_embed.zig");
 const source = @import("dsv41_source.zig");
 const owned_mod = @import("dsv41_owned.zig");
 const model_mod = @import("model.zig");
@@ -100,21 +101,40 @@ pub const Stq = struct {
     }
 };
 
-/// The embedding as MLX's affine triple, gathered by row and dequantized.
+/// The embedding as MLX's affine triple, gathered by row and dequantized. A pack's triple stays in its shard (`ssd`):
+/// the rows of a forward are read from it and dequantized the same way.
 pub const Embed = struct {
     w: A,
     scales: A = none,
     biases: A = none,
     bits: c_int = 0,
     group: c_int = 0,
+    ssd: ?*embed_ssd.Ssd = null,
 
-    pub fn rows(self: *const Embed, sc: *Scope, ids: A, dt: mlx.mlx_dtype) !A {
-        if (self.scales.ctx == null) return sc.take(self.w, ids, 0);
+    /// `ids` as the array `ids_a` and as `host`; `raw` holds their rows when they were read ahead (the caller frees it).
+    pub fn rows(self: *const Embed, sc: *Scope, ids_a: A, host: []const u32, raw: ?embed_ssd.Ssd.Raw, dt: mlx.mlx_dtype) !A {
+        if (self.ssd) |ssd| {
+            const own = raw orelse try ssd.read(sc.a, host);
+            defer if (raw == null) own.deinit(sc.a);
+            const n: c_int = @intCast(host.len);
+            const words: c_int = @intCast(ssd.len[0] / 4);
+            const groups: c_int = @intCast(ssd.len[1] / @as(u32, if (ssd.sdtype == .float32) 4 else 2));
+            const wt = try sc.keep(mlx.mlx_array_new_data(own.w.ptr, &[_]c_int{ n, words }, 2, .uint32));
+            const sa = try sc.keep(mlx.mlx_array_new_data(own.s.ptr, &[_]c_int{ n, groups }, 2, ssd.sdtype));
+            const ba = try sc.keep(mlx.mlx_array_new_data(own.b.ptr, &[_]c_int{ n, groups }, 2, ssd.sdtype));
+            return self.dequantRows(sc, wt, try sc.astype(sa, dt), try sc.astype(ba, dt), dt);
+        }
+        if (self.scales.ctx == null) return sc.take(self.w, ids_a, 0);
+        return self.dequantRows(sc, try sc.take(self.w, ids_a, 0), try sc.take(self.scales, ids_a, 0), try sc.take(self.biases, ids_a, 0), dt);
+    }
+
+    fn dequantRows(self: *const Embed, sc: *Scope, wt: A, scales: A, biases: A, dt: mlx.mlx_dtype) !A {
         var o = mlx.mlx_array_new();
-        return sc.res(mlx.mlx_dequantize(&o, try sc.take(self.w, ids, 0), try sc.take(self.scales, ids, 0), try sc.take(self.biases, ids, 0), mlx.mlx_optional_int.some(self.group), mlx.mlx_optional_int.some(self.bits), "affine", none, .{ .value = dt, .has_value = true }, sc.s), &o);
+        return sc.res(mlx.mlx_dequantize(&o, wt, scales, biases, mlx.mlx_optional_int.some(self.group), mlx.mlx_optional_int.some(self.bits), "affine", none, .{ .value = dt, .has_value = true }, sc.s), &o);
     }
 
     pub fn vocab(self: *const Embed) usize {
+        if (self.ssd) |ssd| return ssd.rows;
         return dim(self.w, 0);
     }
 };
@@ -635,6 +655,8 @@ pub const Model = struct {
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
     engram_ahead_used: u64 = 0,
+    /// The next chunk's embedding rows, read from the SSD table while this one runs (`aheadEmbed`).
+    embed_ahead: ?*embed_ssd.Ahead = null,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
     engram_wait_ns: u64 = 0,
     engram_forwards: u64 = 0,
@@ -666,6 +688,11 @@ pub const Model = struct {
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
+        self.dropEmbedAhead();
+        if (self.embed.ssd) |ssd| {
+            ssd.close();
+            self.gpa.destroy(ssd);
+        }
         for (self.engrams) |*e| closeEngram(e);
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -687,6 +714,11 @@ pub const Model = struct {
     fn dropAhead(self: *Model) void {
         if (self.engram_ahead) |pf| pf.finish();
         self.engram_ahead = null;
+    }
+
+    fn dropEmbedAhead(self: *Model) void {
+        if (self.embed_ahead) |ah| ah.finish();
+        self.embed_ahead = null;
     }
 
     fn own(self: *Model, x: A) !A {
@@ -813,7 +845,15 @@ fn loadLin(m: *Model, w: *model_mod.Weights, base: []const u8, dense: ?mlx.mlx_d
 }
 
 /// `embed.weight` dense, or MLX's affine triple with `embed.scales` and `embed.biases` (bits and group from the shapes).
-fn loadEmbed(m: *Model, w: *model_mod.Weights) !Embed {
+fn loadEmbed(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !Embed {
+    // The loader leaves a pack's affine triple in its shard: the rows come from there.
+    if (w.get("embed.weight") == null) {
+        const ssd = try m.gpa.create(embed_ssd.Ssd);
+        errdefer m.gpa.destroy(ssd);
+        ssd.* = try embed_ssd.Ssd.open(m.gpa, dir_path, m.cfg.dim);
+        log.info("[dsv41] token embedding on SSD ({d:.2} GB freed to the expert cache)\n", .{@as(f64, @floatFromInt(ssd.stored)) / 1e9});
+        return .{ .w = none, .bits = ssd.bits, .group = ssd.group, .ssd = ssd };
+    }
     const scales = w.get("embed.scales") orelse return .{ .w = try loadDense(m, w, "embed.weight", m.act) };
     defer for ([_][]const u8{ "embed.weight", "embed.scales", "embed.biases" }) |n| source.drop(w, n);
     const wt = try getW(w, "embed.weight");
@@ -1112,7 +1152,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     };
     errdefer m.deinit();
     const c = &m.cfg;
-    m.embed = try loadEmbed(m, weights);
+    m.embed = try loadEmbed(m, weights, dir_path);
     m.head = if (try loadStq(m, weights, "head")) |q| .{ .w = none, .stq = q } else .{ .w = try loadDense(m, weights, "head.weight", .float32) };
     m.norm = try loadDense(m, weights, "norm.weight", m.act);
     if (m.embed.vocab() != c.vocab or m.head.outDim() != c.vocab) {
@@ -2638,7 +2678,13 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     defer sc.a.free(host);
     for (host, ids) |*o, t| o.* = @intCast(t);
     const id_arr = try sc.ints(host, &.{ci(L)});
-    var emb = try m.embed.rows(&sc, id_arr, m.act); // [L, dim]
+    var read_ahead: ?embed_ssd.Ssd.Raw = null;
+    defer if (read_ahead) |r| r.deinit(gpa);
+    if (m.embed_ahead) |ah| {
+        read_ahead = ah.take(ids);
+        m.dropEmbedAhead();
+    }
+    var emb = try m.embed.rows(&sc, id_arr, ids, read_ahead, m.act); // [L, dim]
     var img: A = none;
     errdefer if (img.ctx != null) {
         _ = mlx.mlx_array_free(img);
@@ -3071,17 +3117,28 @@ pub fn extendVision(m: *Model, ids: []const u32, want: Want, span: usize, vision
 /// this chunk runs, and the next pass starts with them when it is that chunk. Any other pass reads its own.
 pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision: ?VisionRows, ahead: []const u32) !A {
     errdefer m.dropAhead();
+    errdefer m.dropEmbedAhead();
     const st = try ensureState(m);
     transient_peak.begin();
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
+    aheadEmbed(m, ahead);
     planCed(m, &pass, want);
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
     const logits = try finishPass(m, &pass, want);
     transient_peak.end(if (st.verify != null) .dspark_verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len);
     return logits;
+}
+
+/// Starts reading the SSD embedding rows of `ids`, the request's next chunk, so they arrive while this one runs.
+/// Host memory: one chunk's rows, ~2.3 KB a token. A failure leaves the next pass to read its own.
+fn aheadEmbed(m: *Model, ids: []const u32) void {
+    const ssd = m.embed.ssd orelse return;
+    m.dropEmbedAhead();
+    if (ids.len == 0) return;
+    m.embed_ahead = embed_ssd.Ahead.start(m.gpa, ssd, ids) catch null;
 }
 
 /// At debug level: the Engram wait of each wide chunk, and the mean of every 64 decode forwards.
@@ -3288,7 +3345,9 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const hc = c.hc_mult;
     var in: [cfg_mod.max_block]i32 = undefined;
     for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);
-    const emb = try m.embed.rows(&sc, try sc.ints(in[0..B], &.{ci(B)}), m.act);
+    var in_ids: [cfg_mod.max_block]u32 = undefined;
+    for (in_ids[0..B], in[0..B]) |*o, v| o.* = @intCast(v);
+    const emb = try m.embed.rows(&sc, try sc.ints(in[0..B], &.{ci(B)}), in_ids[0..B], null, m.act);
     var x = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(c.dim) }));
     var pre = try sc.broadcast(try sc.astype(try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0)), .float32), &.{ ci(B), ci(hc) });
     var dummy = try Shared.init(gpa, 1);
@@ -5549,4 +5608,59 @@ test "dsv41 owned: every weight array of an STQ load with DSpark lies in a sushi
     try testing.expect(m.built.ragged > 0 and m.built.widened > 0 and m.built.stacks > 0);
     const audit = try memoryAudit(m);
     try testing.expectEqual(outside, audit.mlx_arrays);
+}
+
+test "dsv41 embed: the rows gathered from the SSD table are the resident table's bits, read cold or ahead" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    for ([_]struct { name: []const u8, esize: usize }{ .{ .name = "BF16", .esize = 2 }, .{ .name = "F16", .esize = 2 }, .{ .name = "F32", .esize = 4 } }) |stored| {
+        var td = testing.tmpDir(.{});
+        defer td.cleanup();
+        try embed_ssd.writeTriple(io, td.dir, stored.name, stored.esize);
+        var buf: [512]u8 = undefined;
+        const dir = buf[0..try td.dir.realPath(io, &buf)];
+        var ssd = try embed_ssd.Ssd.open(testing.allocator, dir, embed_ssd.test_dim);
+        defer ssd.close();
+        const file = try td.dir.readFileAlloc(io, "model-00001-of-00001.safetensors", testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(file);
+
+        var sc = Scope.init(testing.allocator, cpu);
+        defer sc.deinit();
+        const rows: c_int = embed_ssd.test_rows;
+        const groups: c_int = embed_ssd.test_groups;
+        const resident: Embed = .{
+            .w = try sc.keep(mlx.mlx_array_new_data(file[ssd.off[0]..].ptr, &[_]c_int{ rows, embed_ssd.test_words }, 2, .uint32)),
+            .scales = try sc.astype(try sc.keep(mlx.mlx_array_new_data(file[ssd.off[1]..].ptr, &[_]c_int{ rows, groups }, 2, ssd.sdtype)), .bfloat16),
+            .biases = try sc.astype(try sc.keep(mlx.mlx_array_new_data(file[ssd.off[2]..].ptr, &[_]c_int{ rows, groups }, 2, ssd.sdtype)), .bfloat16),
+            .bits = ssd.bits,
+            .group = ssd.group,
+        };
+        const served: Embed = .{ .w = none, .bits = ssd.bits, .group = ssd.group, .ssd = &ssd };
+        try testing.expectEqual(resident.vocab(), served.vocab());
+        // The first and last rows, repeats, and a run past the threading threshold.
+        var ids: [70]u32 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast((i * 13 + i / 7) % embed_ssd.test_rows);
+        ids[0] = 0;
+        ids[1] = embed_ssd.test_rows - 1;
+        ids[2] = 0;
+        for ([_][]const u32{ ids[0..1], ids[0..3], &ids }) |set| {
+            var as_i32: [70]i32 = undefined;
+            for (set, 0..) |id, i| as_i32[i] = @intCast(id);
+            const id_arr = try sc.ints(as_i32[0..set.len], &.{@intCast(set.len)});
+            const want = try hostRows(&sc, try resident.rows(&sc, id_arr, set, null, .bfloat16));
+            defer testing.allocator.free(want);
+            const got = try hostRows(&sc, try served.rows(&sc, id_arr, set, null, .bfloat16));
+            defer testing.allocator.free(got);
+            try testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(want)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(got)));
+            const ahead = try embed_ssd.Ahead.start(testing.allocator, &ssd, set);
+            defer ahead.finish();
+            const raw = ahead.take(set).?;
+            defer raw.deinit(testing.allocator);
+            const warm = try hostRows(&sc, try served.rows(&sc, id_arr, set, raw, .bfloat16));
+            defer testing.allocator.free(warm);
+            try testing.expectEqualSlices(f32, want, warm);
+            try testing.expect(std.mem.indexOfNone(u8, std.mem.sliceAsBytes(want), &.{0}) != null);
+        }
+    }
 }
