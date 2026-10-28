@@ -125,9 +125,9 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 
   One `sushi bench` run each on an M5 Max 128 GB (DSpark on, one request); 108 is the
   [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md).
-- **Above 108 on a 128 GB Mac, raise the user wire limit too.** macOS caps the memory a process may wire at
+- **111 on a 128 GB Mac needs the user wire limit raised.** macOS caps the memory a process may wire at
   `vm.global_user_wire_limit`, 116.8 GB by default on 128 GB, separately from `iogpu.wired_limit_mb`. Past 108 the load
-  crosses it and prefill slows down (7% at 111, 15% at 114) with no error. Raising it restores full speed:
+  crosses it and prefill slows down (7% at 111) with no error. Raising it brings 111's prefill back to 108's speed:
   ```bash
   sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000   # resets at reboot
   ```

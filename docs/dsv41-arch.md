@@ -55,7 +55,9 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   the next pass takes them when its ids are the same, else reads its own. Decode and a DSpark draft read their few rows
   inline. The DSpark draft embeds `[t1, noise_id...]` through the same table; MTP stages, the head and the vision tower
   never touch it. A dense embedding (the FP8 checkpoint's bf16 table) stays resident. Load logs
-  `[dsv41] token embedding on SSD (0.37 GB freed to the expert cache)`.
+  `[dsv41] token embedding on SSD (0.37 GB freed to the expert cache)`. Live (873b0fd4 vs 09977e23, budget 108, AC, fans
+  max, one A then one B): +1 slot a layer (270 -> 271 serial, 260 -> 261 DSpark), 512-token decode byte-identical at
+  46.8 / 46.9 tok/s serial and 52.0 / 52.2 DSpark, cold 32,888-token prefill 792.7 / 790.4 tok/s.
 - **Routed experts** (`src/dsv41_stream.zig`): the shared expert cache reads each layer's picked experts from the shards
   into slabs (layout `mxfp4_w123`, `layers.L.ffn.experts.E.w1|w3|w2.{weight,scale}`; w1 gate, w3 up, w2 down) and the
   layer gathers them as `mxfp4`. The slab path gives the resident path's logits bit for bit on a tiny pack, with a cache
