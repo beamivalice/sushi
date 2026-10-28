@@ -48,3 +48,29 @@ pub const Stopwatch = struct {
         s.started_at = std.Io.Timestamp.now(s.io, .boot);
     }
 };
+
+/// Clock ties and rollback must not alias independent response envelopes.
+pub fn nextCompletionId(counter: *std.atomic.Value(i64), now_ms: i64) i64 {
+    var previous = counter.load(.monotonic);
+    while (true) {
+        const next = @max(now_ms, previous + 1);
+        previous = counter.cmpxchgWeak(previous, next, .monotonic, .monotonic) orelse return next;
+    }
+}
+
+/// Diagnostic switches are off for empty values and values beginning with `0`.
+pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
+    const v = raw orelse return false;
+    return v[0] != 0 and v[0] != '0';
+}
+
+pub fn diagEnvOn(name: [*:0]const u8) bool {
+    return diagEnvValueOn(std.c.getenv(name));
+}
+/// Cache the effective switch once.
+pub fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
+    if (cache.*) |v| return v;
+    const v = diagEnvOn(name);
+    cache.* = v;
+    return v;
+}

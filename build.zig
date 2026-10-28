@@ -168,6 +168,26 @@ pub fn build(b: *std.Build) void {
     );
     const test_build = b.step("test-build", "Compile unit tests without running them");
     const test_step = b.step("test", "Run unit tests");
+    // The host root links no MLX: a file in it that reaches MLX fails the link, so this tier can run beside a live server.
+    const test_host_step = b.step("test-host", "Run the unit tests that link no MLX");
+    const host_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests_host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
+        },
+    });
+    host_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    host_mod.addIncludePath(b.path("lib/jinja_cpp"));
+    host_mod.linkSystemLibrary("c++", .{});
+    const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = test_filter orelse &.{} });
+    test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+    const run_host_tests = b.addRunArtifact(host_tests);
+    test_host_step.dependOn(&run_host_tests.step);
+    if (test_filter == null) test_step.dependOn(&run_host_tests.step);
     // A filtered run stays one binary: bucket filters OR with the user's, they cannot narrow it.
     const unit_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
         b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .root_module = test_mod, .filters = f })}) catch @panic("OOM")
@@ -205,18 +225,19 @@ pub fn build(b: *std.Build) void {
 }
 
 /// The unit tests compile as several binaries in parallel: one LLVM module is single-threaded.
-/// A test's name starts with `<file stem>.`, so a bucket is a list of stems used as filters, and
-/// the last bucket takes every src/*.zig stem the others do not name.
+/// A test's name is `<file stem>.test.<name>`, or `<file stem>.<Struct>.test.<name>` inside a struct, so a bucket is
+/// a list of `<stem>.test.` filters plus one filter per nested test; the last bucket takes every MLX stem the others
+/// do not name.
 const test_buckets = [_][]const []const u8{
-    &.{ "transformer", "gdn_decode", "cli", "repl_tools", "repl_input", "update", "launch" },
-    &.{ "generate", "scheduler", "prefix_cache", "kv_disk_cache", "kv_disk_writer", "restore_dump", "mtp", "dflash" },
-    &.{ "server", "chat", "format_corpus_test", "tool_traffic_replay_test", "responses", "ws", "reasoning_protocol", "json_grammar", "json_schema", "regex", "token_mask", "tokenizer" },
+    &.{ "transformer", "gdn_decode", "cli", "launch" },
+    &.{ "generate", "scheduler", "prefix_cache", "kv_disk_cache", "restore_dump", "mtp", "dflash" },
+    &.{ "server", "responses" },
 };
 
 fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
     const io = b.graph.io;
+    const host_stems = hostStems(b);
     var stems: std.ArrayList([]const u8) = .empty;
-    // A test inside a struct is named `<stem>.<Struct>.test.<name>`, which no stem filter selects.
     var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     var src = buildRootHandle(b).openDir(io, "src", .{ .iterate = true }) catch |e| std.debug.panic("src/: {t}", .{e});
     defer src.close(io);
@@ -224,6 +245,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
     while (it.next(io) catch |e| std.debug.panic("src/: {t}", .{e})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
         const stem = entry.name[0 .. entry.name.len - ".zig".len];
+        if (isHostStem(host_stems, stem)) continue;
         stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
         const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
         var lines = std.mem.splitScalar(u8, source, '\n');
@@ -243,8 +265,8 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
     }.lt);
     const bucket = b.allocator.alloc(usize, stems.items.len) catch @panic("OOM");
     for (stems.items, bucket) |stem, *k| k.* = namedBucket(stem[0 .. stem.len - ".test.".len]);
-    // A filter matches anywhere in a name, so "dflash." also selects glm5_dflash's tests: stems
-    // that contain one another must share a bucket, or their tests would run twice.
+    // A filter matches anywhere in a name, so "ws.test." also selects dspark_rows's tests: stems
+    // that end with one another must share a bucket, or their tests would run twice.
     var moved = true;
     while (moved) {
         moved = false;
@@ -259,6 +281,10 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
             }
         }
     }
+    // A host file's tests run only in test-host, so no MLX filter may select them.
+    for (host_stems) |h| for (stems.items) |a| {
+        if (std.mem.endsWith(u8, h, a[0 .. a.len - ".test.".len])) std.debug.panic("host test file {s} would also run in the MLX bucket of {s}", .{ h, a });
+    };
     var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
     for (0..test_buckets.len + 1) |i| {
         var filters: std.ArrayList([]const u8) = .empty;
@@ -274,6 +300,25 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
         out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items })) catch @panic("OOM");
     }
     return out.items;
+}
+
+/// The host tier's files are the imports of src/tests_host.zig, the one list.
+fn hostStems(b: *std.Build) []const []const u8 {
+    const source = buildRootHandle(b).readFileAlloc(b.graph.io, "src/tests_host.zig", b.allocator, .limited(1 << 20)) catch |e| std.debug.panic("src/tests_host.zig: {t}", .{e});
+    var stems: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const head = "    _ = @import(\"";
+        const tail = ".zig\");";
+        if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) continue;
+        stems.append(b.allocator, line[head.len .. line.len - tail.len]) catch @panic("OOM");
+    }
+    return stems.items;
+}
+
+fn isHostStem(host_stems: []const []const u8, stem: []const u8) bool {
+    for (host_stems) |h| if (std.mem.eql(u8, h, stem)) return true;
+    return false;
 }
 
 fn namedBucket(stem: []const u8) usize {

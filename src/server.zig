@@ -226,14 +226,7 @@ const nowMs = io_util.nowMs;
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const Stopwatch = io_util.Stopwatch;
 
-/// Clock ties and rollback must not alias independent response envelopes.
-pub fn nextCompletionId(counter: *std.atomic.Value(i64), now_ms: i64) i64 {
-    var previous = counter.load(.monotonic);
-    while (true) {
-        const next = @max(now_ms, previous + 1);
-        previous = counter.cmpxchgWeak(previous, next, .monotonic, .monotonic) orelse return next;
-    }
-}
+const nextCompletionId = io_util.nextCompletionId;
 
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
 /// transport instead of HTTP/SSE. When `Conn.ws_mode` is set, `sendResponse`
@@ -27189,33 +27182,8 @@ test "MiMo MTP state bill is constant and follows retained storage" {
     try t.expectEqual(smaller, prefillRequestTerms(&cfg, 1024, 2048, 4, 512, .{}).state_bytes);
 }
 
-/// A byte-level tokenizer spelling every byte as its own token, plus `specials`
-/// as atomic ids from 256 up. Strings live in `arena`.
-pub fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, specials: []const []const u8) !Tokenizer {
-    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
-    for (0..256) |b| {
-        var buf: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
-        const s = try arena.dupe(u8, buf[0..n]);
-        try tok.vocab.put(s, @intCast(b));
-        try tok.id_to_token.put(@intCast(b), s);
-        try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
-    }
-    for (specials, 0..) |sp, i| {
-        const id: u32 = @intCast(256 + i);
-        try tok.special_tokens.put(sp, id);
-        try tok.id_to_token.put(id, sp);
-    }
-    return tok;
-}
-
-pub fn deinitTestTokenizer(tok: *Tokenizer) void {
-    tok.vocab.deinit();
-    tok.id_to_token.deinit();
-    tok.merge_ranks.deinit();
-    tok.special_tokens.deinit();
-    tok.unicode_to_byte.deinit();
-}
+const byteTokenizerForTests = tokenizer_mod.byteTokenizerForTests;
+const deinitTestTokenizer = tokenizer_mod.deinitTestTokenizer;
 
 /// One surface's forced tool_choice, end to end without a model: its wire
 /// shapes parse, the prompt renders through each family's template, the force

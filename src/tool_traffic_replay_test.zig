@@ -69,7 +69,7 @@ fn hardFail(comptime what: []const u8, idx: usize, detail: []const u8) void {
 
 test "tool traffic replay: captured agent traffic survives parse + schema coercion" {
     g_fail_count = 0;
-    dump_soft = @import("transformer.zig").diagEnvOn("REPLAY_DUMP_SOFT");
+    dump_soft = @import("io_util.zig").diagEnvOn("REPLAY_DUMP_SOFT");
     var line_it = std.mem.splitScalar(u8, fixture, '\n');
     var idx: usize = 0;
     var records: usize = 0;

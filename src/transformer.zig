@@ -21764,11 +21764,7 @@ pub fn decodeProfileSession(rows: c_int) void {
     decode_prof_enabled = null;
 }
 
-/// Diagnostic switches are off for empty values and values beginning with `0`.
-pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
-    const v = raw orelse return false;
-    return v[0] != 0 and v[0] != '0';
-}
+pub const diagEnvValueOn = io_util_mod.diagEnvValueOn;
 /// SUSHI_MOE_DUMP=<dir> writes one forward's MoE tensors as raw f32, with shapes in filenames.
 var moe_dump_dir: ?[]const u8 = null;
 var moe_dump_asked: bool = false;
@@ -22187,16 +22183,8 @@ test "speculative expert compute runs at decode widths without an imatrix captur
     try testing.expect(!expertSpecApplies(true, &.{ 1, 1, 10 }));
 }
 
-pub fn diagEnvOn(name: [*:0]const u8) bool {
-    return diagEnvValueOn(std.c.getenv(name));
-}
-/// Cache the effective switch once.
-pub fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
-    if (cache.*) |v| return v;
-    const v = diagEnvOn(name);
-    cache.* = v;
-    return v;
-}
+pub const diagEnvOn = io_util_mod.diagEnvOn;
+pub const diagEnvOnCached = io_util_mod.diagEnvOnCached;
 
 /// Whether decode should try the in-place gather-qmv kernels at all.
 ///

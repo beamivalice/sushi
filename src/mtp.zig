@@ -2150,3 +2150,42 @@ test "mtp: row-axis coarse logits equal each solo readout" {
         }
     }
 }
+
+test "format corpus: MTP cost profiles classify full target tensor surfaces" {
+    const Case = struct {
+        bits: u32,
+        group_size: u32,
+        target: MtpNaxTargetSurface,
+        want: MtpCostProfile,
+    };
+    const cases = [_]Case{
+        .{ .bits = 8, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q8_gs32 },
+        .{ .bits = 4, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q4_gs32 },
+        .{ .bits = 4, .group_size = 64, .target = .uniform_quantized_embedding, .want = .generic },
+        .{ .bits = 4, .group_size = 64, .target = .uniform_bf16_embedding, .want = .g17_nax_q4_gs64 },
+        .{ .bits = 6, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .g17_nax_q6_gs64 },
+        .{ .bits = 8, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .g17_nax_q8_gs64 },
+        .{ .bits = 8, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .generic },
+        .{ .bits = 6, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .generic },
+        .{ .bits = 4, .group_size = 64, .target = .oqe_quantized_embedding, .want = .g17_nax_oq4e_q4_gs64 },
+        .{ .bits = 4, .group_size = 64, .target = .none, .want = .generic },
+        .{ .bits = 4, .group_size = 32, .target = .uniform_bf16_embedding, .want = .generic },
+        .{ .bits = 8, .group_size = 32, .target = .oqe_quantized_embedding, .want = .generic },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqual(
+            case.want,
+            m5NaxCostProfileForFingerprint(case.bits, case.group_size, case.target),
+        );
+    }
+
+    // A sidecar's quantization label never selects a calibrated target
+    // surface by itself. Unsupported sidecars remain generic for every target.
+    inline for (std.meta.tags(MtpNaxTargetSurface)) |target| {
+        try testing.expectEqual(
+            MtpCostProfile.generic,
+            m5NaxCostProfileForFingerprint(3, 32, target),
+        );
+    }
+}

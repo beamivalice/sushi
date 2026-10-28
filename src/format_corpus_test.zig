@@ -39,13 +39,12 @@
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
-const mtp = @import("mtp.zig");
 const stop_sequences = @import("stop_sequences.zig");
 
 test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
     const Worker = struct {
         fn run(counter: *std.atomic.Value(i64), ids: *[64]i64) void {
-            for (ids) |*id| id.* = @import("server.zig").nextCompletionId(counter, 1234);
+            for (ids) |*id| id.* = @import("io_util.zig").nextCompletionId(counter, 1234);
         }
     };
     var counter = std.atomic.Value(i64).init(0);
@@ -163,9 +162,9 @@ test "format corpus: control-token text in a user, system or tool message stays 
     const a = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
-    const server = @import("server.zig");
-    var tok = try server.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<|im_start|>", "<|im_end|>" });
-    defer server.deinitTestTokenizer(&tok);
+    const tokenizer_mod = @import("tokenizer.zig");
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<|im_start|>", "<|im_end|>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
     const think = tok.specialTokenId("<think>").?;
     const im_end = tok.specialTokenId("<|im_end|>").?;
     const im_start = tok.specialTokenId("<|im_start|>").?;
@@ -211,9 +210,9 @@ test "format corpus: marking literal control text keeps media offsets on the sam
     const a = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
-    const server = @import("server.zig");
-    var tok = try server.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
-    defer server.deinitTestTokenizer(&tok);
+    const tokenizer_mod = @import("tokenizer.zig");
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
 
     const content = "a <think> b </think> c";
     for ([_]usize{ 0, 2, 3, 10, content.len }) |at| {
@@ -223,45 +222,6 @@ test "format corpus: marking literal control text keeps media offsets on the sam
         const tail = try tok.markLiteralSpecials(arena_state.allocator(), content[at..]);
         const got = marked[0].content[marked[0].media_parts.?[0].at..];
         try testing.expectEqualStrings(tail, got);
-    }
-}
-
-test "format corpus: MTP cost profiles classify full target tensor surfaces" {
-    const Case = struct {
-        bits: u32,
-        group_size: u32,
-        target: mtp.MtpNaxTargetSurface,
-        want: mtp.MtpCostProfile,
-    };
-    const cases = [_]Case{
-        .{ .bits = 8, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q8_gs32 },
-        .{ .bits = 4, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q4_gs32 },
-        .{ .bits = 4, .group_size = 64, .target = .uniform_quantized_embedding, .want = .generic },
-        .{ .bits = 4, .group_size = 64, .target = .uniform_bf16_embedding, .want = .g17_nax_q4_gs64 },
-        .{ .bits = 6, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .g17_nax_q6_gs64 },
-        .{ .bits = 8, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .g17_nax_q8_gs64 },
-        .{ .bits = 8, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .generic },
-        .{ .bits = 6, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .generic },
-        .{ .bits = 4, .group_size = 64, .target = .oqe_quantized_embedding, .want = .g17_nax_oq4e_q4_gs64 },
-        .{ .bits = 4, .group_size = 64, .target = .none, .want = .generic },
-        .{ .bits = 4, .group_size = 32, .target = .uniform_bf16_embedding, .want = .generic },
-        .{ .bits = 8, .group_size = 32, .target = .oqe_quantized_embedding, .want = .generic },
-    };
-
-    for (cases) |case| {
-        try testing.expectEqual(
-            case.want,
-            mtp.m5NaxCostProfileForFingerprint(case.bits, case.group_size, case.target),
-        );
-    }
-
-    // A sidecar's quantization label never selects a calibrated target
-    // surface by itself. Unsupported sidecars remain generic for every target.
-    inline for (std.meta.tags(mtp.MtpNaxTargetSurface)) |target| {
-        try testing.expectEqual(
-            mtp.MtpCostProfile.generic,
-            mtp.m5NaxCostProfileForFingerprint(3, 32, target),
-        );
     }
 }
 

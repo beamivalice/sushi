@@ -1631,6 +1631,34 @@ fn hasByteLevel(pt: std.json.Value) bool {
 
 // ── Tests ──
 
+/// A byte-level tokenizer spelling every byte as its own token, plus `specials`
+/// as atomic ids from 256 up. Strings live in `arena`.
+pub fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, specials: []const []const u8) !Tokenizer {
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    for (0..256) |b| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
+        const s = try arena.dupe(u8, buf[0..n]);
+        try tok.vocab.put(s, @intCast(b));
+        try tok.id_to_token.put(@intCast(b), s);
+        try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
+    }
+    for (specials, 0..) |sp, i| {
+        const id: u32 = @intCast(256 + i);
+        try tok.special_tokens.put(sp, id);
+        try tok.id_to_token.put(id, sp);
+    }
+    return tok;
+}
+
+pub fn deinitTestTokenizer(tok: *Tokenizer) void {
+    tok.vocab.deinit();
+    tok.id_to_token.deinit();
+    tok.merge_ranks.deinit();
+    tok.special_tokens.deinit();
+    tok.unicode_to_byte.deinit();
+}
+
 const testing = std.testing;
 
 test "tokenHasNewline: byte-level spells the line break as U+010A, sentencepiece as itself or <0x0A>" {

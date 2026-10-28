@@ -20,7 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const transformer_mod = @import("transformer.zig");
+const io_util = @import("io_util.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
@@ -764,7 +764,7 @@ pub fn persistEnabled() bool {
 
 pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
     for (raws) |raw| {
-        if (transformer_mod.diagEnvValueOn(raw)) return true;
+        if (io_util.diagEnvValueOn(raw)) return true;
     }
     return false;
 }
@@ -775,7 +775,7 @@ fn qwen4ProfileArmed() bool {
         const s = std.mem.span(entry);
         if (!std.mem.startsWith(u8, s, "QWEN4_PROFILE_")) continue;
         const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
-        if (transformer_mod.diagEnvValueOn(@ptrCast(s[eq + 1 ..].ptr))) return true;
+        if (io_util.diagEnvValueOn(@ptrCast(s[eq + 1 ..].ptr))) return true;
     }
     return false;
 }
