@@ -3386,7 +3386,6 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // arg_key/arg_value body. When it matched, the generic scans are skipped
     // but the shared safety net at the bottom still runs.
     try parseArgKeyToolCalls(allocator, effective_text, &calls);
-    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -3762,6 +3761,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             try parseMiniCpm5ToolCalls(allocator, effective_text, &calls);
         }
     }
+
+    // Inferred `<invoke>` runs last among the tag families: a native call can carry
+    // invoke-shaped text inside a value.
+    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
 
     // If no <tool_call> tags, try to find raw JSON tool call(s).
     if (calls.items.len == 0) {
@@ -5241,6 +5244,15 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
         var args_json: ?[]const u8 = null;
         if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
             const body_all = seg[te + 1 ..];
+            // An inferred opener must own a parameter or close before the next opener,
+            // else it is prose and would borrow the next call's body.
+            if (d.inferred) {
+                const own = body_all[0 .. std.mem.indexOf(u8, body_all, d.invoke) orelse body_all.len];
+                if (std.mem.indexOf(u8, own, d.param ++ " ") == null and std.mem.indexOf(u8, own, d.invoke_close) == null) {
+                    pos = after_tag;
+                    continue;
+                }
+            }
             const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
             args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
             pos = if (body_end < body_all.len)
