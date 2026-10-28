@@ -81,7 +81,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--prefix-cache-entries` | `32` → hot-cache capacity, `0` disables all reuse; a bad value silently becomes 1 (main.zig:840) | user | help, usage, engine-prefix-cache; 41 tests, 2 scripts | keep |
 | `--prefix-cache-mem` | off → RAM retention with this byte budget, `0` or `off` keeps it off (main.zig:843) | machine | help, usage, engine-prefix-cache; 19 tests, 2 scripts | keep |
 | `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep |
-| `--ssm-checkpoint-max` | `16` → checkpoints kept per entry, `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
+| `--ssm-checkpoint-max` | `16` → checkpoint states held in memory per entry (the SSD restore points are never thinned by it), `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
 
 ## Sampling and reasoning defaults
 

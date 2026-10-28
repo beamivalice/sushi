@@ -149,6 +149,9 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 
 - `--prefix-cache-disk 20GB` sizes the SSD prefix cache (on by default, capped at 20 GB); `--prefix-cache-entries 1`
   keeps one conversation, raise it to 4-8 for several agents; `--prefix-cache-mem 1GB` also keeps prefixes in RAM.
+- A restore point sits every 8192 tokens and at each prompt's end, so a 1M-token conversation takes about 0.9 GB of
+  SSD (DeepSeek), 7-14 GB of points plus 16 GB of rows (Qwen) or 24 GB (GLM): raise `--prefix-cache-disk` for long
+  contexts. A conversation past the budget drops its oldest points first.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt.
 - `--prefill-chunk 2048` caps the prompt step per forward; a request that does not fit steps down.
 

@@ -13,12 +13,16 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   - the KDA conv and recurrence of every linear layer, an `SSMCheckpoint` of 147,619,840 bytes;
   - latent rows [0,P) and pooled rows [0,P/4), a prefix of the entry's `MlaRows`.
   One `MlaRows` (every row through the entry's newest checkpoint) serves all of the entry's checkpoints.
-- **Checkpoints sit on a 2048-token grid and at the prompt end.**
-  - The grid is absolute multiples of GLM's widest chunk (`glm_checkpoint_stride`), never a request's width.
-  - A narrower chunk divides 2048, and `nextChunkEnd` ends a chunk on every grid point, so every grid point is a
+- **Checkpoints sit on an 8192-token grid and at the prompt end, all the way to 1M tokens.**
+  - Chunks end on a 2048 grid (`glm_checkpoint_stride`: absolute multiples of GLM's widest chunk, never a request's
+    width); a checkpoint is captured and kept only at the 8192 multiples of it (`glm_capture_stride`) and the prompt end.
+  - A narrower chunk divides 2048, and `nextChunkEnd` ends a chunk on every grid point, so every restore point is a
     real chunk boundary whatever widths a request steps through.
   - The prompt-end backoff grows to 30-33 so its position is a pool boundary (`glmSnapshotBackoff`).
-  - At most 8 per entry (`glm5_prefix.checkpoint_cap`), thinned span-preserving with a dense newest quarter.
+  - The SSD tier keeps up to 160 per entry (`kv_disk_cache.SSM_DISK_MAX_PER_ENTRY`: the grid to 1M plus the prompt-end
+    points); no count thins it below that. `--ssm-checkpoint-max` and `glm5_prefix.checkpoint_cap` (8) bound only the
+    states held in memory. When one conversation alone outgrows the SSD budget its oldest points go first
+    ([engine-prefix-cache](engine-prefix-cache.md#checkpoints-on-ssd)).
 - **A restore on the grid is bit-identical to cold when both run the same chunk widths from that point on.** That
   holds at the 2048 default. The suffix runs the same absolute chunks, tail merge, backoff and final span.
   - A request stepped down to narrower tail chunks near 1M matches only a cold run that steps down the same way.
@@ -77,7 +81,7 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
 - **SSD tier**:
   - Rows go in the usual chunk files as a dense pseudo-cache of two entries per layer (`glm5_prefix.diskEntries`).
     kv8 is keyed `{off, 8, 64}`, which the manifest keeps.
-  - KDA checkpoints go in `s{pos}` files, at most 8 per entry, the window in the spec sidecar.
+  - KDA checkpoints go in `s{pos}` files, up to 160 per entry (a 1M conversation holds about 125 of 141 MiB), the window in the spec sidecar.
   - `spec.safetensors` is replaced in place before the manifest commits and equal windows share a size, so it carries a
     `d.pos`/`m.pos` = `base:step` stamp; a load that finds it absent or different declines the spec (trunk restores).
   - A restore reads only its own checkpoint file (`DiskTier.restoreIntoKda`); the QSA check that rereads the

@@ -4650,7 +4650,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
-        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints at every prefill chunk and the prompt end (<= {d} per entry, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
+        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
     }
     if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
         const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
@@ -5253,11 +5253,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .oldest;
-            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isGlm5())
-                @import("glm5_prefix.zig").checkpoint_cap
-            else if (params.config.isDsv41())
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isDsv41())
                 @import("dsv41_prefix.zig").disk_checkpoint_cap
-            else if (params.config.longCtxGated() or !ram_prefix_cache)
+            else if (params.config.isGlm5() or params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;

@@ -1067,7 +1067,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// Stack bound for the shed simulation; a longer list falls back to billing every lower checkpoint.
-    const SHED_SIM_MAX: usize = 128;
+    const SHED_SIM_MAX: usize = 192;
 
     /// The last retained checkpoint inherits the latest checkpoint's pooled bank.
     /// Price its sliced shape before allocating/copying any multi-GB KV prefix.
@@ -13218,6 +13218,104 @@ test "GLM SSD-only: past the checkpoint cap the loop-end checkpoint still reache
     @memcpy(other[0..1400], &first);
     for (other[1400..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
     try expectGlmRestoreLikeCold(&hc, &fx.net, 8, &other, 1384);
+}
+
+test "GLM SSD-only: a restore at an 8192 grid point reads SSD like a cold prefill" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    fx.net.cfg.max_position_embeddings = 2 * kv_disk_cache.POINT_GRID;
+    var first: [8300]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var hc = try glmSsdOnlyCache(io, base, "glm-wt-grid", 0, true);
+    defer hc.deinit();
+    hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
+    // The grid point closes the first chunk; the loop's end follows it before the final span.
+    var turn = try GlmPrefill.run(&hc, &fx.net, 8, &first, &.{ kv_disk_cache.POINT_GRID, 40 });
+    defer turn.deinit();
+    try testing.expect(turn.peak_held <= 2);
+    _ = try turn.commitSsdOnly(&hc, 8, &first);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    const on_disk = &hc.disk.?.entries.items[0];
+    try testing.expectEqualSlices(u32, &.{ kv_disk_cache.POINT_GRID, kv_disk_cache.POINT_GRID + 40 }, on_disk.ssm_positions);
+    var other: [8400]u32 = undefined;
+    try expectGlmRestoreLikeCold(&hc, &fx.net, 8, glmDiverging(&other, &first, kv_disk_cache.POINT_GRID + 8), kv_disk_cache.POINT_GRID);
+}
+
+test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD, holding two states, and a grid point restores its state" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const generate_mod = @import("generate.zig");
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const len = 40_000;
+    var tokens: [len]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, len);
+    var srcs: [5][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qwen-grid", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.cp_thin = .min_span_recency;
+    hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+
+    var cps = std.ArrayList(SSMCheckpoint).empty;
+    errdefer {
+        for (cps.items) |*cp| cp.deinit(testing.allocator);
+        cps.deinit(testing.allocator);
+    }
+    const stride = generate_mod.effectiveSsmCheckpointStride(256, 8192);
+    const loop_end = len - 1 - generate_mod.SSM_SNAPSHOT_BACKOFF;
+    var peak: usize = 0;
+    var pos: usize = 0;
+    while (pos < loop_end) {
+        pos = generate_mod.nextChunkEnd(pos, loop_end, 8192, true, stride, 0, true);
+        if (pos % stride == 0) {
+            try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[cps.items.len], pos, s));
+            peak = @max(peak, pcHeld(cps.items));
+        }
+        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, cps.items, std.math.maxInt(u64), s);
+    }
+    try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], loop_end, s));
+    try testing.expect(peak <= 2);
+
+    const owned = try cps.toOwnedSlice(testing.allocator);
+    _ = try hc.commitWithSsm(&cache, &tokens, false, owned, null, null);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    try testing.expectEqualSlices(u32, &.{ 8192, 16384, 24576, 32768, loop_end }, hc.disk.?.entries.items[0].ssm_positions);
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst = pcEmptySsm();
+    defer pcFreeHybrid(&dst);
+    try testing.expectEqual(@as(u32, 16384), try hc.disk.?.restoreIntoHybrid(&cache2, &dst, 0, 16384, s));
+    try testing.expectEqual(@as(f32, 200), pcSsmVal(dst[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 1000), pcSsmVal(dst[0].ssm_state, 0, s));
 }
 
 test "GLM SSD-only: a checkpoint whose write failed is not a restore point" {

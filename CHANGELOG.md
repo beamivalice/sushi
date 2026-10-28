@@ -7,14 +7,12 @@ earlier history is mlx-serve's, in that project's changelog.
 ## Unreleased
 
 - **A running stream keeps a quarter of the time while another request prefills**: `--prefill-decode-share` now defaults to 0.25 (was 0), so a concurrent decode no longer advances one token per prefill chunk; the share only adds decode ticks between chunks and never narrows a prefill chunk, on any model.
+- **Every model keeps SSD restore points every 8192 tokens, to 1M tokens**: Qwen and GLM no longer thin a long conversation to 16 and 8 points, so an edit deep in a long prompt restores from the point just below it; raise `--prefix-cache-disk` for 1M-token conversations, since one that outgrows the budget drops its oldest points first. `--ssm-checkpoint-max` now caps only the states held in memory.
 - **`/v1/responses` keeps the model's own reasoning in a tool loop**: a replayed plaintext `reasoning` item now reaches the prompt on its assistant turn (it was dropped), so a thinking model keeps its chain of thought between tool calls and the prefix cache hits; encrypted or malformed reasoning items are still ignored.
 - **Tool-call parsing handles five more malformed shapes**: stray DeepSeek `</｜DSML｜` closers no longer leak as the answer, a `<tool_call>` whose value holds an `<invoke>` stays that call, prose `<invoke>` openers no longer take the next call's arguments, a doubled GLM `<arg_key>` keeps a clean key, and a special token written in place of `<` before `function=` still parses.
 - **A small-memory Mac gets a usable default context**: the prefix cache's reserve no longer takes more than half of the free GPU memory when sizing the context, and a context that would fit under 1024 tokens is served as 1024.
-
 - **Image input accepts GIF (first frame) and BMP** beside JPEG, PNG and WebP.
-
 - **DeepSeek-V4.1-Flash no longer aborts on M1 and M2 Macs**: the indexer's top-k kernel probes the largest threadgroup the GPU runs (832 threads there, not 1024) at load, with identical picks.
-
 - **`sushi launch codex` gives local models codex's current tool contract**: the launch writes `~/.sushi/codex/model-instructions.md` and points `model_instructions_file` at it, so models stop receiving fallback instructions that name an `apply_patch` tool codex no longer declares and end edit turns with no change.
 - **A reasoning budget no longer turns MTP off for the answer**: Qwen and MiMo re-seed their MTP head after the forced thought close and keep speculating, and the close lands at the same token as without MTP, with byte-identical output.
 - **GLM-5.3-Flash decode uses fewer GPU launches per MoE layer**: the shared expert now runs inside the routed experts' pair and down launches, for a serial token (two fewer), for batched requests and for DFlash2 verify rows (four fewer), with byte-identical output.

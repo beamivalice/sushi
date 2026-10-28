@@ -12,7 +12,8 @@ const nil = Arr{ .ctx = null };
 
 pub const pool_size: usize = 4;
 
-/// KDA checkpoints one entry or one prefill keeps: each is 141 MiB of FP32 state.
+/// KDA states one entry or one prefill holds in memory: each is 141 MiB of FP32 state. The SSD tier keeps
+/// every restore point beyond it.
 pub const checkpoint_cap: u32 = 8;
 
 /// KDA states an SSD-only prefill holds in RAM at once: the checkpoint just taken and the one before it,
