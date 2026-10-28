@@ -1,6 +1,6 @@
 //! Per-model settings (`~/.sushi/model-settings.json`): context size, KV
 //! quant, MTP and `preserve_thinking` that follow the MODEL, applied at every load construction
-//! site. Keyed by the model's absolute path (dir, or the `.gguf` file).
+//! site. Keyed by the model's absolute path.
 //! The app edits the file; the server owns applying it. A malformed file is
 //! logged and treated as empty: a settings typo must never stop a load.
 const std = @import("std");

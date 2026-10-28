@@ -8373,13 +8373,6 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses");
 }
 
-/// `meta.engine` in /v1/models: "gguf" for a GGUF stub (which no engine in
-/// this build loads), "mlx" for everything else.
-fn modelEngineName(path: []const u8, arch_hint: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
-    return "mlx";
-}
-
 fn modelQuantizationLabel(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
     if (config.expert_layout == .exl3_k4) {
         var rate_buf: [8]u8 = undefined;
@@ -8491,7 +8484,7 @@ fn renderModelEntry(
             efforts_part,
             mods.items,
             config.model_type,
-            modelEngineName(entry.path, entry.arch_hint),
+            "mlx",
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -8625,11 +8618,7 @@ fn renderModelEntry(
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
-    // "gguf" for GGUF paths/stubs, "mlx" for everything else.
-    const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(entry.path, entry.arch_hint),
-    });
-    defer allocator.free(engine_part);
+    const engine_part = "\"engine\":\"mlx\",";
 
     // Top-level twins of meta.context_length (issue #188): openai-models-list
     // discovery clients read row-level max_model_len/context_length. Unloaded
@@ -24789,12 +24778,6 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
     }
 }
 
-test "modelEngineName: GGUF stubs report gguf, everything else mlx" {
-    try testing.expectEqualStrings("mlx", modelEngineName("/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v41"));
-    try testing.expectEqualStrings("gguf", modelEngineName("/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName("/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName("/m/qwen4", "qwen4_exp"));
-}
 test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tokens" {
     // /v1/completions ignored its `logprobs` field entirely (hardcoded 0) while
     // still emitting the key, so a client read "no alternatives exist" rather

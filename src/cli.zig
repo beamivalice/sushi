@@ -964,24 +964,15 @@ fn treeEntryDescends(kind: std.Io.File.Kind) bool {
 }
 
 fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
-    if (dir.statFile(io, "config.json", .{})) |st| {
-        if (st.kind == .file) return true;
-    } else |_| {}
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file and entry.kind != .sym_link) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
-        const st = dir.statFile(io, entry.name, .{}) catch continue;
-        if (st.kind == .file) return true;
-    }
-    return false;
+    const st = dir.statFile(io, "config.json", .{}) catch return false;
+    return st.kind == .file;
 }
 
 fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
     const bytes = dirBytesOneLevel(io, dir);
-    // TYPE from the same classification serving uses (gguf → chat via the
-    // embedded engines, media modalities, embed, drafter, unsupported) so
-    // the list is honest about which rows `run` can actually chat with.
+    // TYPE from the same classification serving uses (chat, embed, drafter,
+    // unsupported) so the list is honest about which rows `run` can actually
+    // chat with.
     const abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name }) catch null;
     defer if (abs) |a| allocator.free(a);
     const kind_label: []const u8 = blk: {

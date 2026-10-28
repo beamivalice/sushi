@@ -13572,7 +13572,7 @@ pub const Transformer = struct {
     /// tokenizer's `special: true` set minus template-emitted markers and
     /// EOS ids (`tokenizer.reservedOutputIds`). Owned here, freed in deinit;
     /// samplers reference it non-owning via `SamplingParams.suppress_mask`.
-    /// Null = suppression off (kill switch, no chat template, GGUF engines).
+    /// Null = suppression off (kill switch, no chat template).
     suppress_mask: ?mlx.mlx_array = null,
     /// Overthinking-marker mask (`[vocab]` bool, `think_penalty.markerIds`), built once at load;
     /// owned here, read by the Generator's think penalty. Null = no penalty can apply.
