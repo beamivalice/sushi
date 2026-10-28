@@ -250,7 +250,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   the encode and its bill (`visionEncodeBill`) cover the blocks after it, and a block the restore cuts through is
   encoded whole. The slot's splice offset is the placeholder rows in the prefix less the rows skipped.
 - **A patch-grid image is held as its file, never as f32 patches**: the connection thread base64-decodes the payload,
-  reads the size from the JPEG/PNG/WebP header and plans the grid with the processor's resize rule (`planImage`), so
+  reads the size from the JPEG/PNG/GIF/BMP/WebP header and plans the grid with the processor's resize rule (`planImage`), so
   the prompt places its rows and the request keeps the compressed bytes (`ImageData.undecoded`); a 1080p screenshot is
   19.8 MB of patches on DeepSeek-V4.1. The media key is unchanged, a hash of the decoded pixels: `keyMedia` decodes
   `decode_workers` (8) images at a time on that many threads (`ImageDecodeWindow`), feeds each to the chain and frees
@@ -267,7 +267,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen_vision.zig` / `src/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
   image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
   `src/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
-  `stb_image` + libwebp decode image input.
+  `stb_image` (JPEG, PNG, GIF first frame, BMP) + libwebp decode image input; `lib/stb_image_impl.c` names the formats compiled in.
 
 ## Config reading
 

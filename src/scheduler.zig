@@ -481,7 +481,7 @@ fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const Defer
     if (req.error_name) |name| {
         defer allocator.free(name);
         if (std.mem.eql(u8, name, image_undecodable_error)) {
-            refusal.* = MediaRefusal.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG or WebP image", .{skip.images + req.failed_image + 1});
+            refusal.* = MediaRefusal.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG, GIF, BMP or WebP image", .{skip.images + req.failed_image + 1});
             return error.MediaRefused;
         }
         var text: [320]u8 = undefined;

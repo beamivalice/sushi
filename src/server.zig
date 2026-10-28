@@ -14761,12 +14761,12 @@ fn imageCountFault(n_images: usize) MediaFault {
 
 /// Why an image URL did not decode, in words a client can act on.
 fn imageRejectReason(url: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, url, "data:")) return "remote URLs are not fetched; send a base64 data URL (data:image/jpeg|png|webp;base64,...)";
-    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return "the data URL is not base64 (data:image/jpeg|png|webp;base64,...)";
+    if (!std.mem.startsWith(u8, url, "data:")) return "remote URLs are not fetched; send a base64 data URL (data:image/jpeg|png|gif|bmp|webp;base64,...)";
+    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return "the data URL is not base64 (data:image/jpeg|png|gif|bmp|webp;base64,...)";
     for (url[sep + 8 ..]) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '/' and c != '=') return "the base64 payload is malformed";
     }
-    return "the payload is not a readable JPEG, PNG or WebP image";
+    return "the payload is not a readable JPEG, PNG, GIF, BMP or WebP image";
 }
 
 fn responsesMediaRefusal(pi: *const responses_mod.ParsedInput) ?MediaFault {
@@ -15506,7 +15506,7 @@ fn prepareRequestMedia(
     }
     var bad_image: usize = 0;
     const chain = keyMedia(allocator, config, placed.items, flat.images, flat.videos, &bad_image) catch |err| switch (err) {
-        error.ImageUndecodable => return .{ .refused = MediaFault.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG or WebP image", .{bad_image + 1}) },
+        error.ImageUndecodable => return .{ .refused = MediaFault.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG, GIF, BMP or WebP image", .{bad_image + 1}) },
         else => return err,
     };
     var ready: PreparedMedia = .{ .chain = chain };
@@ -15605,7 +15605,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
     return .{ .samples = raw_buf };
 }
 
-/// Decode a JPEG/PNG image buffer to float32 CHW pixels, resized to target_size.
+/// Decode a JPEG/PNG/GIF/BMP image buffer to float32 CHW pixels, resized to target_size.
 /// Uses stb_image for decoding, then nearest-neighbor resize + CHW conversion.
 /// Decode an image content URL into preprocessed float32 CHW pixels. Supports:
 ///   data:image/x-mlx-pixels;base64,... (already-preprocessed float32 CHW)
@@ -15763,7 +15763,7 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
     }
 
     if (std.mem.startsWith(u8, mime, "data:image/")) {
-        // JPEG/PNG/WebP — decode + resize + convert to float32 CHW (Gemma) or
+        // JPEG/PNG/GIF/BMP/WebP — decode + resize + convert to float32 CHW (Gemma) or
         // smart-resized merge-order pixel_values (Qwen3-VL).
         const started = monotonicNs();
         const img = decodeImageToPixels(allocator, raw_buf, vp);
@@ -15788,7 +15788,7 @@ fn isDecodedImageMime(mime: []const u8) bool {
     return std.mem.startsWith(u8, mime, "data:image/") and !std.mem.eql(u8, mime, "data:image/x-mlx-pixels");
 }
 
-/// The pixel size of a JPEG/PNG/WebP file, read from its header: stb first, as the decode tries them.
+/// The pixel size of a JPEG/PNG/GIF/BMP/WebP file, read from its header: stb first, as the decode tries them.
 fn imageHeaderSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -15837,7 +15837,7 @@ fn decodeEncodedImage(allocator: std.mem.Allocator, encoded: []const u8, config:
     return decodeImageToPixels(allocator, encoded, visionPreprocFromConfig(config));
 }
 
-/// One `image_url` as the request holds it: a patch-grid tower's JPEG/PNG/WebP stays encoded until its
+/// One `image_url` as the request holds it: a patch-grid tower's JPEG/PNG/GIF/BMP/WebP stays encoded until its
 /// tower call, anything else decodes here.
 fn imageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     if (vp.mode != .gemma) if (std.mem.indexOf(u8, url, ";base64,")) |sep| {
@@ -16049,7 +16049,7 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    // stb first (JPEG/PNG) — 4 channels so transparency composites onto white.
+    // stb first (JPEG/PNG/GIF/BMP) — 4 channels so transparency composites onto white.
     if (stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4)) |rgba| {
         defer stb.stbi_image_free(rgba);
         const total_px: usize = @intCast(w * h);
@@ -16442,7 +16442,7 @@ test "an undecodable image is refused naming its message and the reason" {
     const cases = [_]Case{
         .{ .url = "https://example.com/shot.png", .reason = "remote URLs are not fetched" },
         .{ .url = "data:image/png;base64,@@@@", .reason = "base64 payload is malformed" },
-        .{ .url = "data:image/png;base64,AAAA", .reason = "not a readable JPEG, PNG or WebP" },
+        .{ .url = "data:image/png;base64,AAAA", .reason = "not a readable JPEG, PNG, GIF, BMP or WebP" },
     };
     for (cases) |c| {
         const body = try std.fmt.allocPrint(std.testing.allocator, "{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}},{{\"role\":\"assistant\",\"content\":\"ok\"}},{{\"role\":\"user\",\"content\":[{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{s}\"}}}}]}}]}}", .{c.url});
@@ -28994,5 +28994,23 @@ test "count_tokens: both routes render a body to the same prompt, schema, tools,
         try t.expectEqualSlices(u32, served.ids, counted.ids);
         try t.expectEqual(served.enable_thinking, counted.enable_thinking);
         try t.expectEqual(served.has_tools, counted.has_tools);
+    }
+}
+
+const test_gif_2x2 = [_]u8{ 71, 73, 70, 56, 57, 97, 2, 0, 2, 0, 129, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 44, 0, 0, 0, 0, 2, 0, 2, 0, 0, 2, 3, 68, 52, 5, 0, 59 };
+const test_bmp_2x2 = [_]u8{ 66, 77, 70, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 24, 0, 0, 0, 0, 0, 16, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0 };
+
+test "image input decodes GIF and BMP: red, green over blue, white" {
+    const a = std.testing.allocator;
+    const want = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 };
+    for ([_][]const u8{ &test_gif_2x2, &test_bmp_2x2 }) |bytes| {
+        const img = decodeRgbOwned(a, bytes) orelse return error.DecodeFailed;
+        defer img.deinit(a);
+        try std.testing.expectEqual(@as(u32, 2), img.w);
+        try std.testing.expectEqual(@as(u32, 2), img.h);
+        try std.testing.expectEqualSlices(u8, &want, img.rgb);
+        const size = imageHeaderSize(bytes) orelse return error.DecodeFailed;
+        try std.testing.expectEqual(@as(u32, 2), size.w);
+        try std.testing.expectEqual(@as(u32, 2), size.h);
     }
 }
