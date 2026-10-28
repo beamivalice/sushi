@@ -7,7 +7,10 @@ const mlx = @import("mlx_host").mlx;
 pub const format = @import("expert_exl3.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
 pub const glm_group2 = @import("glm_group2.zig");
-pub const glm_fold = @import("glm_fold.zig");pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
+pub const glm_fold = @import("glm_fold.zig");
+pub const qwen_riders = @import("qwen_riders.zig");
+pub const qwen_fold = @import("qwen_fold.zig");
+pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
 pub const codebook_tables = @import("codebook_tables.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],

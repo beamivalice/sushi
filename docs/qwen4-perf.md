@@ -659,7 +659,7 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
 - The llmprobe cells swing 5-10% within an arm, as tokens per round varies. The server's own round log, summed over
   every request in the boot, puts the branch 0.9% faster: no regression.
 - `tests/test_mtp_equivalence.sh` on the branch binary: 18 passed, 0 failed.
-- **The shared expert inside the routed launches is priced, not built.** Flash-Next's shared expert is gate qmv, up qmv,
+- **The shared expert inside the routed launches was priced here, and is built since ([below](#shared-fold)).** Flash-Next's shared expert is gate qmv, up qmv,
   geglu, down qmv: 4 launches x 48 layers = 192 per serial token and per MTP verify round (the rows kernels at 2 to 8
   rows, same count). The stand-in above puts the whole shared expert at 0.62 of the 17.99 ms forward (3.4% at most), and
   the launches alone at 0.6-1.5 us each (the tail fold: 144 launches, 0.09 ms) are 0.1-0.3 ms, 0.7-1.6%. A fused launch
@@ -667,6 +667,53 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
   threadgroup needs the whole geglu product of gate and up, so it recomputes it. DeepSeek's shared expert is a trellis
   bank of the routed chain's own family, where the same fusion landed
   ([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)).
+
+<a id="shared-fold"></a>
+## Flash-Next: the shared expert rides the routed launches
+
+`exl3/qwen_riders.zig` (the shared kernels), `exl3/qwen_fold.zig` (one-bank MCG layers: Sushi-4bpw, Sushi-2bpw),
+`rate_groups.moeGatedSharedFolded` (rate-grouped STQ layers: Sushi-STQ-2.75bpw), glue `qwen4_shared.folded`, called
+from `moeMLP2WithRouter`'s tail-shared branch. The shared gate/up/SwiGLU kernel becomes extra threadgroups of the
+routed pair launch and the shared down those of the fused-mid down launch (`fuse.zig`); the finish reduce adds
+`sigmoid(gate) * shared` per row. The riders keep MLX's one-row affine8 qmv order (`qmv_fast` for K%256==0 and N%8==0,
+`qmv` otherwise: the 640 -> 2560 down is the second, the N=1 gate logit too), which is what the verify rows kernels give
+every row, so each row is the separate chain's bytes. At two or more rows the shared-expert gate logit (N=1, which
+MLX runs as one qmv per row plus a concat) is one more threadgroup per row of the gate/up launch, and the sigmoid,
+multiply and add tail is the reduce's (`gate[row]`); at one row the router kernel's logit is passed in as before.
+
+- **Launches per MoE layer** (resident, both formats): serial 1 row, 7 (shared gate, up, SwiGLU, down; routed pair,
+  down, reduce) -> 3, 192 fewer per token. Rows 2 to 8 (MTP verify of one request through `moeVerifyRowsSolo`, DFlash2
+  rows): 4 shared + about 2S+1 logit (a slice and a qmv per row, a concat) + 3 routed + 3 tail (sigmoid, multiply, add)
+  -> 3.
+- **Not reached**: expert streaming (`streamedMoeResult` computes the shared expert early on its own), the joined
+  multi-request `moeVerifyRows` (shared projections and gate tail are separate there), the MTP head's MoE
+  (`mtpMoeRows`), 9 to 16 rows and prefill, `--qwen-standin`, shared banks that are not affine8 g64/g128 with K a
+  multiple of 128, a gate/up pair at two rates, a prepared-chain bank (hidden 5120). Each declines before any launch.
+- **Proof** (`qwen4_shared.zig`): bytes equal to the production separate chain (`qmatmulBits` rows path, `fusedSwiGLU`,
+  `moeWithGatedShared` / `moeRagged`), real 2560/640/top-10 geometry, 1 to 8 rows, MCG at n64, n32 and n44/n44/n64, spec1
+  grouped at n32/44/64 (down n48), shared g128 and g64, large and small gains, router logit and rider logit, either
+  part's threadgroups first, three launches a layer; one decline test.
+- **Chain per layer** (`SUSHI_QWEN_FOLD_UBENCH=1`, main test binary, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
+  fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over distinct banks, 64 experts, random
+  routes; separate = production shared chain incl. its N=1 logit; uncommitted tree on `a9853b3e`, us):
+
+  | rows | one-bank separate | fused | routed only | grouped separate | fused | routed only |
+  |---|---|---|---|---|---|---|
+  | 1 | 125.3 | 115.4 | 105.3 | 129.9 | 118.8 | 108.9 |
+  | 2 | 176.8 | 146.5 | 132.4 | 227.1 | 164.8 | 130.2 |
+  | 3 | 213.7 | 181.5 | 166.8 | 214.7 | 174.0 | 158.5 |
+  | 4 | 248.5 | 216.0 | 197.5 | 241.6 | 201.4 | 187.7 |
+  | 6 | 308.7 | 283.5 | 256.6 | 305.2 | 270.1 | 251.4 |
+  | 8 | 382.7 | 356.6 | 320.8 | 379.2 | 341.1 | 315.9 |
+
+  Fused / separate: one-bank 0.92 0.83 0.85 0.87 0.92 0.93, grouped 0.91 0.73 0.81 0.83 0.89 0.90. Routed threadgroups
+  first is level with or ahead of shared first. One-row separate cells moved 106 to 150 us across runs on a shared box
+  (the fused / separate ratio stayed 0.90 to 0.95); the one-row ubench separate arm also pays the logit qmv that the live
+  router kernel folds, so the live one-row gain is smaller.
+- Live (d1e22b96, 512 greedy tokens on a 14k-char code prompt, AC, fans max, one A then one B, GPU lock): byte-identical
+  on STQ-2.75bpw and Sushi-4bpw, MTP and `--no-mtp`. MTP round 28.24 -> 28.14 ms (STQ) and 24.29 -> 24.10 ms (4bpw);
+  `--no-mtp` decode 63.2 / 63.4 and 62.3 / 62.0 tok/s: a tie that drops 192 launches a serial token. The
+  `[qwen] shared expert rides the routed launches engaged` log line shows the fold is on.
 
 <a id="verify-rows8"></a>
 ## Flash-Next: verify at 2 to 8 rows costs the same per row (4d7f575c to 8044906b)

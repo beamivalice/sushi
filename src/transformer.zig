@@ -19278,6 +19278,7 @@ pub const Transformer = struct {
             const fold_shared = shared != null and moeDumpDir() == null;
             const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
             if (tail_shared and moeDumpDir() == null) {
+                if (try @import("qwen4_shared.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), routed.gate_logit)) |folded| return folded;
                 const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
                 defer _ = mlx.mlx_array_free(down);
                 const own_logit = routed.gate_logit.ctx == null;
@@ -23609,7 +23610,7 @@ const SWIGLU_SOURCE =
 /// `mlx_sigmoid` tabulated over every 16-bit float pattern, indexed [bf16, f16].
 var swiglu_sig_tables: [2]?mlx.mlx_array = @splat(null);
 
-fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
+pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
     const slot: usize = switch (dt) {
         .bfloat16 => 0,
         .float16 => 1,

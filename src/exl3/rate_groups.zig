@@ -12,6 +12,7 @@ const kernels = @import("expert_exl3_kernels.zig");
 const group_layout = @import("layout.zig");
 const root = @import("root.zig");
 const fuse = @import("fuse.zig");
+const riders = @import("qwen_riders.zig");
 
 const max_groups = group_layout.max_groups;
 
@@ -1152,6 +1153,183 @@ pub fn moeDecodeClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *con
     const sdown = try getOut(down_ov, 1);
     defer _ = mlx.mlx_array_free(sdown);
     return try reduceFused(s, down, rb, slots, scores, sdown, se, rows, topk, out_dtype);
+}
+
+// ---- Qwen's shared expert inside the unprepared decode chain ----
+
+const QwenKey = struct {
+    down: bool,
+    rows: c_int,
+    topk: c_int,
+    width: c_int,
+    group: c_int,
+    logit_group: c_int,
+    logit: bool,
+    hidden: c_int,
+    inter: c_int,
+    funnel: bool,
+    tiles: c_int,
+    tile_major: bool,
+    classes: [max_groups]RateClass,
+    class_count: usize,
+    dec: exl3.Decode,
+    b_first: bool,
+};
+
+var qwen_stages: std.AutoHashMapUnmanaged(QwenKey, FusedStage) = .empty;
+var qwen_layers: usize = 0;
+var qwen_launches: usize = 0;
+/// Layers run folded, and the GPU launches they issued; test seams.
+pub fn qwenFoldedCount() usize {
+    return qwen_layers;
+}
+pub fn qwenLaunchCount() usize {
+    return qwen_launches;
+}
+
+fn qwenStage(k: QwenKey) !*const FusedStage {
+    if (qwen_stages.getPtr(k)) |f| return f;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const classes = k.classes[0..k.class_count];
+    const nslots = k.rows * k.topk;
+    const layout: kernels.GemvLayout = .{ .funnel = k.funnel, .tiles = k.tiles };
+    const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group };
+    const head = try headerOf(k.dec);
+    const a: fuse.Part = if (k.down) .{
+        .launch = try decodeLaunch(alloc, .{ .in_dim = k.inter, .out_dim = k.hidden, .nslots = nslots, .topk = 0, .down = true, .layout = layout }),
+        .body = try mixedText(alloc, .down, classes, 0, 0, k.tile_major),
+        .ins = &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots", "meta" },
+        .outs = &.{"y"},
+        .header = head,
+    } else .{
+        .launch = try decodeLaunch(alloc, .{ .in_dim = k.hidden, .out_dim = k.inter, .nslots = nslots, .topk = k.topk, .down = false, .layout = layout }),
+        .body = try mixedText(alloc, .pair, classes, 0, 0, k.tile_major),
+        .ins = &.{ "x", "suhg", "suhu", "tg", "tu", "slots", "meta" },
+        .outs = &.{ "yg", "yu" },
+        .header = head,
+    };
+    const b = if (k.down) try riders.downPart(alloc, geo, k.rows) else try riders.gateUpPart(alloc, geo, k.rows, k.logit);
+    const src = try fuse.source(alloc, a, b);
+    const header_text = try fuse.header(alloc, a, b);
+    var name: std.ArrayList(u8) = .empty;
+    try name.print(alloc, "sushi_qwen_rg_fold_{s}_{s}_w{d}", .{ if (k.down) "down" else "pair", @tagName(k.dec.codebook), k.dec.window.bits() });
+    if (k.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[k.dec.table.?].digest});
+    for (classes) |c| try name.print(alloc, "_{d}x{d}", .{ c.gate, c.up });
+    if (k.logit) try name.appendSlice(alloc, "_logit");
+    if (k.tile_major) try name.appendSlice(alloc, "_tm");
+    try name.append(alloc, 0);
+    var slot: ?mlx.mlx_fast_metal_kernel = null;
+    const kernel = try kernels.getNamedKernel(&slot, @ptrCast(name.items.ptr), try fuse.insOf(alloc, a, b), try fuse.outsOf(alloc, a, b), src, header_text);
+    const built: FusedStage = .{ .kernel = kernel, .cfg = try fuse.config(alloc, a.launch, b.launch, k.b_first) };
+    try qwen_stages.put(std.heap.page_allocator, k, built);
+    return qwen_stages.getPtr(k).?;
+}
+
+/// `moeRagged`'s decode chain with the gated shared expert `sh` riding its pair and down launches, for one to eight rows
+/// of `x` [1, rows, hidden]: the routed sum plus `sigmoid(gate) * shared`, bf16, in `x`'s shape. `gate` [rows] is the
+/// shared-expert gate's bf16 logit unless `sh.logit` names its bank. Null where the chain or the riders do not serve the
+/// inputs (the prepared chain, a prefill-only bank); nothing has run then.
+pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s) or rb.prefill_only or preparedOn(rb)) return null;
+    if (rb.tile_major and !kernels.gemvLayout(1).funnel) return null;
+    const route = riders.Routing.of(x, inds, scores) orelse return null;
+    const rows = route.rows;
+    const topk = route.topk;
+    const hidden = mlx.getShape(x)[2];
+    if (hidden != rb.hidden) return null;
+    const geo = riders.geometry(sh, hidden) orelse return null;
+    const want_logit = sh.logit != null;
+    if (!want_logit) {
+        const g = gate orelse return null;
+        if (mlx.mlx_array_dtype(g) != .bfloat16 or mlx.mlx_array_size(g) != @as(usize, @intCast(rows))) return null;
+    }
+    dec.requireTable() catch return null;
+
+    kernels.setDecodeParams(dec);
+    const nslots = rows * topk;
+    var pc: [max_groups]RateClass = undefined;
+    var dc: [max_groups]RateClass = undefined;
+    const pair_classes = classesOf(rb, false, &pc);
+    const down_classes = classesOf(rb, true, &dc);
+    logEngaged(.decode, rb, pair_classes.len, down_classes.len);
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows, hidden }, 2, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, inds, &[_]c_int{nslots}, 1, s));
+    var slots = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(slots);
+    try mlx.check(mlx.mlx_astype(&slots, flat, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{nslots}, 1, s));
+
+    const pair_layout = kernels.gemvLayout(@divExact(rb.inter, 16));
+    var key: QwenKey = .{
+        .down = false,
+        .rows = rows,
+        .topk = topk,
+        .width = geo.width,
+        .group = geo.group,
+        .logit_group = geo.logit_group,
+        .logit = want_logit,
+        .hidden = rb.hidden,
+        .inter = rb.inter,
+        .funnel = pair_layout.funnel,
+        .tiles = pair_layout.tiles,
+        .tile_major = rb.tile_major,
+        .classes = std.mem.zeroes([max_groups]RateClass),
+        .class_count = pair_classes.len,
+        .dec = kernels.activeDecode(),
+        .b_first = fused_shared_first,
+    };
+    @memcpy(key.classes[0..pair_classes.len], pair_classes);
+    var buf: [11]mlx.mlx_array = undefined;
+    const rider_in = riders.gateUpInputs(sh, x2, &buf);
+    var pair_in: [18]mlx.mlx_array = undefined;
+    pair_in[0..7].* = .{ x2, rb.suh[0], rb.suh[1], rb.trellis[0], rb.trellis[1], slots, rb.meta };
+    @memcpy(pair_in[7..][0..rider_in.len], rider_in);
+    const pair_ov = try kernels.applyOuts(s, (try qwenStage(key)).kernel, pair_in[0 .. 7 + rider_in.len], (try qwenStage(key)).cfg, if (want_logit) 4 else 3);
+    defer _ = mlx.mlx_vector_array_free(pair_ov);
+    const ig = try getOut(pair_ov, 0);
+    defer _ = mlx.mlx_array_free(ig);
+    const iu = try getOut(pair_ov, 1);
+    defer _ = mlx.mlx_array_free(iu);
+    const mid = try getOut(pair_ov, 2);
+    defer _ = mlx.mlx_array_free(mid);
+    const logit_out: ?mlx.mlx_array = if (want_logit) try getOut(pair_ov, 3) else null;
+    defer if (logit_out) |l| {
+        _ = mlx.mlx_array_free(l);
+    };
+
+    const down_layout = kernels.gemvLayout(@divExact(rb.hidden, 16));
+    key.down = true;
+    key.funnel = down_layout.funnel;
+    key.tiles = down_layout.tiles;
+    key.classes = std.mem.zeroes([max_groups]RateClass);
+    key.class_count = down_classes.len;
+    @memcpy(key.classes[0..down_classes.len], down_classes);
+    const down_stage = try qwenStage(key);
+    const down_ov = try kernels.applyOuts(s, down_stage.kernel, &.{ ig, iu, rb.trellis[2], rb.svh[0], rb.svh[1], rb.suh[2], slots, rb.meta, mid, sh.down.weight, sh.down.scales, sh.down.biases }, down_stage.cfg, 2);
+    defer _ = mlx.mlx_vector_array_free(down_ov);
+    const down = try getOut(down_ov, 0);
+    defer _ = mlx.mlx_array_free(down);
+    const shared_out = try getOut(down_ov, 1);
+    defer _ = mlx.mlx_array_free(shared_out);
+
+    qwen_layers += 1;
+    // Pair, down, reduce.
+    qwen_launches += 3;
+    const y = try kernels.downFinishReduceWithShared(s, down, rb.svh[2], slots, sc, rb.hidden, rows, topk, .bfloat16, shared_out, logit_out orelse gate.?, false);
+    defer _ = mlx.mlx_array_free(y);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const xs = mlx.getShape(x);
+    try mlx.check(mlx.mlx_reshape(&out, y, xs.ptr, xs.len, s));
+    return out;
 }
 
 /// Whether a decode chain prepares its inputs once per slot, at DeepSeek's geometry: a threadgroup of the fused chain
