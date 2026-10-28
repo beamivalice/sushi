@@ -125,6 +125,12 @@ under 50 °C, one run each); no `TransientCapExceeded` over that prefill, an ima
 512`. The peak diagnostic slows a cold prefill by itself (a diag run read 414 tok/s on the same prompt): never time
 with it on.
 
+**A larger budget slows prefill past 108.** The same 225,674-token cold prefill (09977e23, AC, fans max, each run
+started under 50 °C, wired 125000): budget 108 764.7 tok/s, 111 709.1, 114 647.0. The bill admits all three with 1M
+context, but at 111 and 114 a 2048-row chunk's compute (`other_ms`) ran 2.9x and 3.3x the 108 chunk's while its SSD
+fill fell, which reads as the GPU paging near the wired limit rather than a sushi cost. 108 stays the recommended
+128 GB launch.
+
 <a id="owned-weights"></a>
 ## Weight memory sushi owns
 
