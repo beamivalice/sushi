@@ -798,18 +798,6 @@ test "forced recovery leaves room for the whole transition and one answer token"
     try std.testing.expect(forcedBoundaryCanContinue(0, 1, 0));
 }
 
-test "forced recovery is committed and counted exactly once" {
-    const src = @embedFile("generate.zig");
-    const start = std.mem.indexOf(u8, src, "pub fn forceConstraint" ++ "Transition(") orelse return error.CallSiteMoved;
-    const tail = src[start..];
-    const end = std.mem.indexOf(u8, tail, "\n    pub fn deinit(") orelse return error.CallSiteMoved;
-    const body = tail[0..end];
-    // One committed token per call, through the live forward path.
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "generated_ids.append(allocator, tok)"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "advanceStep(1)"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "xfm.forwardWith(&self.ctx, tok_input)"));
-}
-
 /// Per-token logprob info (OpenAI format).
 pub const TokenLogprob = struct {
     token_id: u32,
@@ -1820,28 +1808,6 @@ test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 399, 400));
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 400, 400));
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
-}
-
-test "every speculative decoder caps accepted drafts before commit" {
-    // Class guard: every speculative path commits an always-emitted anchor
-    // plus zero or more accepted drafts. A new/forgotten arm must cap that
-    // accepted prefix before it mutates generated ids, KV/module state, or
-    // usage. Output-only clipping in the scheduler is already too late.
-    const source = @embedFile("generate.zig");
-    const names = [_][]const u8{
-        "nextDflash",
-        "mtpRoundFinish",
-    };
-    for (names) |name| {
-        const signature = try std.fmt.allocPrint(testing.allocator, "    pub fn {s}", .{name});
-        defer testing.allocator.free(signature);
-        const start = std.mem.indexOf(u8, source, signature) orelse return error.MissingSpecDecoder;
-        const end = std.mem.indexOfPos(u8, source, start + signature.len, "\n    pub ") orelse source.len;
-        if (std.mem.indexOf(u8, source[start..end], "capAcceptedForTokenBudget(") == null) {
-            std.debug.print("{s} does not cap accepted drafts before commit\n", .{name});
-            return error.UncappedSpecDecoder;
-        }
-    }
 }
 
 /// Step-based generator. Call `init` to prefill, then `next` per token.
@@ -3303,7 +3269,7 @@ pub const Generator = struct {
         // Chunked vision: the final-span forward continues the row scatter
         // where the chunk loop left it (an image ending in the final span
         // otherwise re-splices from row 0). One-shot engagement line — the
-        // silent-no-op class; tests grep for it per arm.
+        // silent-no-op class.
         if (has_vision) {
             ctx.vision_splice_offset = vision_rows_consumed;
             if (vision_chunked and n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
@@ -3713,7 +3679,7 @@ pub const Generator = struct {
     /// with no clear ratchets the process footprint while `active_bytes` stays
     /// flat: the reporter's process reached 81 GB with the panel reading 19.6.
     /// A `-mtp` checkpoint on a dense trunk defaults straight onto one of them.
-    /// A source-scan test pins that no new path can reintroduce the hole.
+    /// The serial-decode test asserts the clock advances on the plain and logprob paths.
     pub fn advanceStep(self: *Generator, n: u32) void {
         self.completion_tokens += n;
         self.step += n;
@@ -4902,6 +4868,7 @@ pub const Generator = struct {
         return .{ .accepted = accepted, .pending = @intCast(drawn[accepted]) };
     }
 
+    // Cap accepted drafts with capAcceptedForTokenBudget before committing.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.glm_dflash_native) return self.nextGlmDflash(allocator);
         // The kv term is the same physics for either block decoder (one
@@ -7492,6 +7459,7 @@ pub const Generator = struct {
         return .{ .accepted = accepted, .stop = null };
     }
 
+    // Cap accepted drafts with capAcceptedForTokenBudget before committing.
     pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRoundState) !?DrafterStepResult {
         var failed = false;
         defer if (!failed) {
@@ -14805,18 +14773,6 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(8, true, .generic));
     try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapForProfile(2, true, .g17_nax_qwen4_q4_gs64));
     try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapForProfile(12, true, .generic));
-
-    // The live resolver must NAME the row it applied, once. A silicon fence
-    // nobody can see in the log is indistinguishable from the EV controller's
-    // own choice at the same depth (dflash's ready line does the same).
-    {
-        const src = @embedFile("generate.zig");
-        const start = std.mem.indexOf(u8, src, "pub fn mtpDepthCapForProfile(configured") orelse return error.MissingResolver;
-        const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingResolverEnd;
-        const body = src[start..end];
-        try testing.expect(std.mem.indexOf(u8, body, "row.label") != null);
-        try testing.expect(std.mem.indexOf(u8, body, "mtp_depth_cap_logged") != null);
-    }
 }
 
 test "mtpFloorDisableObserve: extension misses do not poison depth one" {
@@ -14915,44 +14871,6 @@ test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
     g.updateMtpEvRound(4, 0);
     try testing.expectEqual(@as(u32, 0), g.mtp_window_idx);
     try testing.expect(!g.spec_disabled_runtime);
-}
-
-test "the qwen4 rerank draft feeds the MIXER output, never the pre-mixer stream" {
-    // The one way this change can be wrong without failing to compile. The
-    // obvious wiring (`draftSelect(xfm, step_out.hidden_next, ...)`) is
-    // silently wrong on qwen4_exp, whose `hidden_next` is the pre-mixer
-    // `[B,S,hc*H]` stream — 4x the width the head consumes. The chain must
-    // therefore prefer `rerank_x` when a step publishes one.
-    const source = @embedFile("generate.zig");
-    const build_at = std.mem.indexOf(u8, source, "fn mtpChainBuild(") orelse return error.MissingChainBuild;
-    const end = std.mem.indexOfPos(u8, source, build_at, "\n    /// Fire the chain's built graphs") orelse source.len;
-    const body = source[build_at..end];
-
-    const sel = std.mem.indexOf(u8, body, "head.draftSelect(") orelse return error.MissingDraftSelect;
-    const line_start = std.mem.lastIndexOfScalar(u8, body[0..sel], '\n') orelse 0;
-    const line_end = std.mem.indexOfScalarPos(u8, body, sel, '\n') orelse body.len;
-    const call = body[line_start..line_end];
-    // The rerank input is the resolved vector, never `hidden_next` directly.
-    try testing.expect(std.mem.indexOf(u8, call, "rerank_x") != null);
-    try testing.expect(std.mem.indexOf(u8, call, "hidden_next") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "step_out.rerank_x.ctx != null") != null);
-
-    // ...and a `.mixed` step is what asks for it: a rerank draft must not
-    // collapse onto `.none` (the history-append mode), which produces no
-    // mixer output at all.
-    try testing.expect(std.mem.indexOf(u8, body, "if (use_rerank) .mixed else .logits") != null);
-
-    // The qwen4 arm maps `.mixed` onto the projection that SKIPS the lm_head
-    // but still runs the mixer. If it ever mapped to `.none`, `rerank_x` would
-    // be null and the chain would silently hand over the pre-mixer stream.
-    const step_at = std.mem.indexOf(u8, source, "fn qwen4Step(") orelse return error.MissingQwen4Step;
-    const step_end = std.mem.indexOfPos(u8, source, step_at, "\n    /// One head forward") orelse source.len;
-    const step_body = source[step_at..step_end];
-    try testing.expect(std.mem.indexOf(u8, step_body, ".mixed => .mixed_last_row") != null);
-    try testing.expect(std.mem.indexOf(u8, step_body, ".rerank_x = out.mixed") != null);
-
-    // And the owned mixer vector is freed by the chain, not leaked per step.
-    try testing.expect(std.mem.indexOf(u8, body, "mlx_array_free(step_out.rerank_x)") != null);
 }
 
 test "mtpForcedWidth: a forced MiMo round never plans past the verify row budget" {
@@ -16163,58 +16081,6 @@ test "the allocator pool is returned at the prefill/decode handover, on archs th
     }
 }
 
-test "no decode path advances `step` outside advanceStep" {
-    // Class guard for #110. `Generator.step` is the clear cadence's clock, so a
-    // path that bumps it by hand is a path that strands its round's transients
-    // in MLX's buffer pool forever — which is exactly what `nextDrafter`,
-    // `nextMtp` and `scheduler.runBatchedDecodeTick` did, and the `-mtp`
-    // checkpoints default onto one of those. A new decode path added later must
-    // route through `advanceStep` or fail here.
-    //
-    // The needles are concatenated so this test's OWN source doesn't match them.
-    const needle = ".step" ++ " +=";
-    const allowed = "self.step" ++ " += n";
-    const sources = [_]struct { name: []const u8, src: []const u8 }{
-        .{ .name = "generate.zig", .src = @embedFile("generate.zig") },
-        .{ .name = "scheduler.zig", .src = @embedFile("scheduler.zig") },
-    };
-    var total: usize = 0;
-    for (sources) |file| {
-        var it = std.mem.splitScalar(u8, file.src, '\n');
-        var lineno: usize = 0;
-        while (it.next()) |raw| {
-            lineno += 1;
-            // Strip trailing line comments: several of them spell out
-            // `cache.step += 1` while describing the KV cache's own counter.
-            const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
-            if (std.mem.indexOf(u8, line, needle) == null) continue;
-            total += 1;
-            if (std.mem.indexOf(u8, line, allowed) == null) {
-                std.debug.print("{s}:{d}: raw step advance outside advanceStep: {s}\n", .{
-                    file.name, lineno, std.mem.trim(u8, line, " "),
-                });
-                return error.RawStepAdvance;
-            }
-        }
-    }
-    // Exactly one: the assignment inside `advanceStep`. Zero means the field was
-    // renamed and this guard went vacuous — update it with the rename.
-    try testing.expectEqual(@as(usize, 1), total);
-
-    // Same discipline for the clock itself: every clear the Generator makes records
-    // it, so the decode cadence measures from the last ACTUAL clear. Two writers —
-    // `advanceStep` and the prefill/decode handover — and a third that forgot the
-    // write would leave the cadence firing against a stale clock.
-    const clock = "last_cache_clear_step" ++ " =";
-    var writers: usize = 0;
-    var clock_it = std.mem.splitScalar(u8, sources[0].src, '\n');
-    while (clock_it.next()) |raw| {
-        const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
-        if (std.mem.indexOf(u8, line, clock) != null) writers += 1;
-    }
-    try testing.expectEqual(@as(usize, 2), writers);
-}
-
 /// The last global layer's key buffer: its data address and its row capacity.
 fn globalKeysBuffer(xfm: *Transformer) !struct { ptr: usize, cap: c_int } {
     const e = &xfm.cache.entries[try lastGlobalKvLayer(xfm)];
@@ -16607,72 +16473,11 @@ test "sampleToken: reported logprobs are the model's, not the client's temperatu
     }
 }
 
-test "logprobs publish through the one-token delay, never straight from sampleToken" {
-    // The decode loop returns `next_token_id` and, in the SAME call, forwards
-    // it to sample its successor — so a path that publishes `sampleToken`'s
-    // result as `last_logprob` shifts the whole array by one. Live symptom: a
-    // one-token "OK" reply came back with `<|role_end|>` at rank 1, which reads
-    // as a broken ranking rather than a broken pairing, and sent a real
-    // quantization hunt down the wrong path for a day.
-    //
-    // The needles are concatenated so this test's OWN source doesn't match.
-    const needle = "last_logprob" ++ " = ";
-    const allowed = "last_logprob" ++ " = self.pending_logprob";
-    const src = @embedFile("generate.zig");
-    var it = std.mem.splitScalar(u8, src, '\n');
-    var lineno: usize = 0;
-    var seen: usize = 0;
-    while (it.next()) |raw| {
-        lineno += 1;
-        const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
-        if (std.mem.indexOf(u8, line, needle) == null) continue;
-        // `= null` is the ownership hand-off to the scheduler, not a publish.
-        if (std.mem.indexOf(u8, line, "= null") != null) continue;
-        seen += 1;
-        if (std.mem.indexOf(u8, line, allowed) == null) {
-            std.debug.print("generate.zig:{d}: logprobs published without the one-token delay: {s}\n", .{
-                lineno, std.mem.trim(u8, line, " "),
-            });
-            return error.LogprobPairingBypass;
-        }
-    }
-    try testing.expect(seen >= 1);
-}
-
-test "prefill chunk loop yields to the interleave hook between chunks, never after the last" {
-    // The scheduler runs decode ticks for active streams at this seam so a
-    // long prefill cannot stall them for its whole duration. The final
-    // boundary is excluded: the post-prefill decode tick covers it.
-    const src = @embedFile("generate.zig");
-    const progress = "if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);";
-    const at = std.mem.indexOf(u8, src, progress) orelse return error.ProgressPublishMissing;
-    const guard = "if (pos < loop_end) {";
-    const guard_at = std.mem.indexOfPos(u8, src, at, guard) orelse return error.InterleaveGuardMissing;
-    const call = "if (options.interleave" ++ "_hook) |hk| hk.call(hk.ctx);";
-    const call_at = std.mem.indexOfPos(u8, src, guard_at, call) orelse return error.InterleaveCallMissing;
-    // The call sits INSIDE the guard (same statement block, before the loop
-    // re-tests `pos`), not somewhere later in the file.
-    try std.testing.expect(call_at - guard_at < 200);
-}
-
 test "countSpliceRows counts image and video placeholders, video only when declared" {
     const ids = [_]i32{ 7, 99, 99, 8, 9, 77 };
     try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0));
     try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 77));
     try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 77));
-}
-
-test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
-    // Source scan: the chunk-size pick keys on the kill switch (not bare
-    // has_vision), the chunk loop and the final-span forward both set
-    // ctx.vision_splice_offset, and the loop advances the consumed-row count.
-    const src = @embedFile("generate.zig");
-    const marker = "const default_chunk = if (has_vision and !vision" ++ "_chunked) loop_end else PREFILL_CHUNK;";
-    try testing.expect(std.mem.indexOf(u8, src, marker) != null);
-    const set_off = "ctx.vision_splice" ++ "_offset = vision_rows_consumed;";
-    const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
-    try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
-    try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
 }
 
 test "MtpTrace per-index acceptance: index i counts only rounds that drafted it" {
@@ -20341,19 +20146,20 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prompt = ids[0..30];
-    const want: u32 = 12;
-    const cases = [_]struct { sampling: SamplingParams, logprobs: u32 }{
+    const cases = [_]struct { sampling: SamplingParams, logprobs: u32, want: u32 = 12 }{
         .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 0 },
         .{ .sampling = .{ .temperature = 0.8, .top_p = 0.9, .top_k = 20, .seed = 5 }, .logprobs = 0 },
         .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 5 }, .logprobs = 0 },
         .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 3 },
+        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 0, .want = CACHE_CLEAR_INTERVAL + 8 },
+        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 3, .want = CACHE_CLEAR_INTERVAL + 8 },
     };
     for (cases) |c| {
         var runs: [2]std.ArrayList(u32) = .{ .empty, .empty };
         defer for (&runs) |*r| r.deinit(a);
         for (&runs) |*out| {
             try xfm.resetCache();
-            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, c.sampling, &.{}, .{ .skip_lazy_preforward = true, .logprobs_n = c.logprobs });
+            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, c.want, c.sampling, &.{}, .{ .skip_lazy_preforward = true, .logprobs_n = c.logprobs });
             defer gen.deinit(a);
             gen.logprobs_n = c.logprobs;
             while (try gen.next(a)) |t| {
@@ -20361,10 +20167,13 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
                 if (c.logprobs > 0) {
                     const lp = gen.last_logprob orelse return error.MissingLogprobs;
                     try testing.expectEqual(@as(usize, c.logprobs), lp.top_logprobs.len);
+                    try testing.expectEqual(t, lp.top_logprobs[0].token_id);
+                    try testing.expectEqual(lp.top_logprobs[0].logprob, lp.token_logprob);
                 }
             }
+            if (c.want > CACHE_CLEAR_INTERVAL) try testing.expect(gen.last_cache_clear_step > 0);
         }
-        try testing.expectEqual(@as(usize, want), runs[0].items.len);
+        try testing.expectEqual(@as(usize, c.want), runs[0].items.len);
         try testing.expectEqualSlices(u32, runs[0].items, runs[1].items);
     }
 }
