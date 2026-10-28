@@ -351,7 +351,7 @@ pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []c
 }
 
 pub const DiscoveredModel = struct {
-    /// Model id (subdirectory basename, e.g. "gemma-4-e4b-it-4bit").
+    /// Model id (subdirectory basename, e.g. "Qwen3.8-Flash-Next-4bit").
     id: []const u8,
     /// Absolute path to the model directory.
     path: []const u8,
@@ -734,7 +734,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // `text_config` may omit fields the root still carries) — the same merge
     // `model.zig parseConfigFromJson` does. Reading the root alone made
     // /v1/models report hidden=0 / layers=0 / ctx=0 / is_moe=false for every
-    // unloaded Gemma 3/4 and Qwen-VL model.
+    // unloaded model with a nested `text_config`.
     const text_cfg: ?std.json.ObjectMap = if (root.get("text_config")) |tc|
         (if (tc == .object) tc.object else null)
     else

@@ -194,8 +194,8 @@ pub const PREFILL_SCORES_BUDGET_BYTES: u64 = 4 << 30;
 /// (repeating chunk sizes let the MLX allocator cache reuse score buffers).
 pub const PREFILL_CHUNK_FLOOR: usize = 512;
 
-/// MLX's fused SDPA kernels cover head_dim <= 128. Every Gemma-4 and
-/// Qwen3.5/3.6 checkpoint ships head_dim=256, which falls back to the
+/// MLX's fused SDPA kernels cover head_dim <= 128. A head_dim=256 trunk
+/// falls back to the
 /// composed path that MATERIALIZES a [heads, chunk, total_kv] bf16 score
 /// tensor per layer — at an 8K chunk × 255K ctx × 16 heads that is ~67 GB
 /// and an uncatchable Metal command-buffer OOM. Cap the chunk so ONE layer's
@@ -209,16 +209,14 @@ pub const PREFILL_CHUNK_FLOOR: usize = 512;
 /// prefillEvalCadence / prefillMemoryNeeded, which drop their score term via
 /// transformer.prefillHeadDimFused): the fused kernel removes the SCORE
 /// transient, but a big chunk still scales the OTHER per-chunk transients
-/// (MoE gather buffers, per-chunk KV concat) — measured LIVE on
-/// gemma-4-26B-A4B at a 99K prompt: fused @ chunk 8192 = 736 tok/s / 61.2 GB
-/// peak vs fused @ chunk 1024 = 712 tok/s / 39.5 GB. +3% speed is not worth
+/// (MoE gather buffers, per-chunk KV concat): +3% speed is not worth
 /// +22 GB peak (a 64 GB Mac dies), so the cap stays keyed on raw head_dim.
 ///
 /// `sliding_band_arch` (config.has_sliding_window) picks the policy family:
-/// archs WITHOUT sliding-band layers (qwen3_5/3_6: GDN + full attention)
+/// archs WITHOUT sliding-band layers (GDN + full attention)
 /// additionally cap the auto chunk at 2048 — composed-causal prefill
 /// measured strictly faster and ~9 GB lighter there (see the inline
-/// comment). Gemma keeps the formula-only policy for its fused band layers.
+/// comment). Sliding-band archs keep the formula-only policy for their fused band layers.
 /// `score_head_dim` is the width the SCORE tensor is contracted at
 /// (`ModelConfig.prefillScoreHeadDim`) — not necessarily `head_dim`. An MLA arch
 /// scores at 192 while storing 128-wide values, and reading `head_dim` there
@@ -235,7 +233,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // any context past ~256k — measures nothing. What still scales with the
     // chunk is the MoE gather and the ringed-SWA staging, and those are what
     // `server.resolvePrefillChunk` prices against this machine; the 4096 cap
-    // is the measured gemma-26B MoE lesson carried over as a ceiling only.
+    // is the measured MoE lesson carried over as a ceiling only.
     // 2048 is the default (a 64k prompt prefills within noise of 4096); an
     // explicit `--prefill-chunk` may raise it to that ceiling.
     if (head_dim == 192 and transformer_mod.prefillHeadDimFused(head_dim)) {
@@ -247,10 +245,10 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // starved the dequant+GEMM qmm route, which needs M >= 2048 to engage
     // (the 64K rung was the ladder's weakest for exactly this reason).
     // MoE keeps the 4096 cap: expert-gather transients scale with the chunk
-    // (the gemma-26B@99K lesson: +3% speed for +22 GB peak is a bad trade).
+    // (+3% speed for +22 GB peak is a bad trade).
     // DENSE hybrids have no gather transients and a full-size chunk halves
     // the per-chunk dequant sweeps: chunk 8192 measured +1.4% over 4096 at
-    // the 8K rung on Qwen3.6-27B dense (M4 Max, 2026-07-30), flat at 32K.
+    // the 8K rung, flat at 32K.
     // Never raises a caller-lowered base.
     if (head_dim == 256 and !sliding_band_arch and transformer_mod.fused256CausalMode() == .all) {
         // A long-context-gated MoE prices the 8192 rung per request in `chooseRequestPrefillChunk`
@@ -261,7 +259,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
     // M4 Max): 8K 225 -> 235.8 tok/s and peak 28.9 -> 19.8 GB at chunk
     // 2048; 32K 205.4 -> 209.3. Chunk boundaries ARE block-level causal
-    // skipping for composed attention. Sliding-band archs (gemma) keep big
+    // skipping for composed attention. Sliding-band archs keep big
     // chunks — their local layers run the fused band kernel, which
     // block-skips in-kernel and wants the fewest KV re-walks (26B@99K:
     // 712 tok/s at the formula chunk).
@@ -1670,8 +1668,8 @@ fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Transformer, ctx
 /// was true before `prefillDqGemm`: since the dq route only engages at
 /// M >= 2048, a fine stride pushes EVERY projection of EVERY chunk onto the
 /// slow small-M qmm path, and the per-chunk fixed costs (graph build, eval
-/// barrier, MTP history capture) multiply on top. Measured on Qwen3.6-27B
-/// dense GDN (M4 Max, 2026-07-30): stride 256 chunked an 8K prompt into 33
+/// barrier, MTP history capture) multiply on top. Measured on a 27B
+/// dense GDN trunk (M4 Max): stride 256 chunked an 8K prompt into 33
 /// pieces at 211 tok/s vs 254 at coarse chunks — a 17-20% cold-prefill tax at
 /// every context length, which is how llm_context_benchmarks read us 19%
 /// behind oMLX. MoE pays even more (expert re-streaming, ~25%).
@@ -2209,7 +2207,7 @@ pub const Generator = struct {
     // assistant call proposes the whole block and the M5 NAX verify lane makes
     // wide blocks cheap. Per-draft percentage therefore penalizes block 16
     // even when it is decisively profitable. The stable cross-width signal is
-    // accepted drafts per verify round. M5 Muse sweeps put code/tool traffic at
+    // accepted drafts per verify round. M5 sweeps put code/tool traffic at
     // 4.4-15.0 accepted/round and the regressing prose/vision class at
     // 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
     // workloads accepting 62-86% remain above it as well.
@@ -2752,14 +2750,14 @@ pub const Generator = struct {
         // Chunked prefill: large prompts are processed in PREFILL_CHUNK-sized pieces
         // to bound peak activation memory. Each chunk fills KV cache entries for its
         // positions, gets eval'd, and intermediates are freed before the next chunk.
-        // Without chunking, Gemma-4 MoE's 2 MLPs × 4 stacked layers can spike to
+        // Without chunking, a MoE's stacked layers can spike to
         // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
         // Vision requests skip chunking since image token positions must be visible
         // in a single forward pass for spliceVisionEmbeddings to work correctly.
         // PREFILL_CHUNK comes from the module-level `prefill_chunk_override`
         // (set by --prefill-chunk in main.zig).
         //
-        // Safety cap: on unfused head dims (>128 — every Gemma-4/Qwen3.5/3.6)
+        // Safety cap: on unfused head dims (>128)
         // the composed SDPA materializes [heads, chunk, total_kv] scores per
         // layer, so the chunk shrinks with the prompt's FINAL KV length to keep
         // that one tensor bounded (boundedPrefillChunk). Warm-path restores
@@ -3130,7 +3128,7 @@ pub const Generator = struct {
                     // off-boundary, and the always-on end-of-prompt snapshot
                     // then hits exactly that re-execution — capturing an
                     // un-evaluated state re-ran the whole last chunk's GDN
-                    // scan (measured −4% on an 8K Qwen3.6-27B prefill). The
+                    // scan (measured −4% on an 8K 27B prefill). The
                     // states are ~KB-to-MB scale; evaluating them alongside
                     // the KV costs nothing measurable.
                     if (want_ssm_cp) if (ctx.ssm_entries) |entries| {
@@ -7279,7 +7277,7 @@ pub const Generator = struct {
         // verify's slice_update writes to COPY-on-write every full-attention
         // layer's WHOLE buffer — ~4.3 GB per round at 64k context, the
         // dominant round cost at long context. On a GDN trunk (every real MTP
-        // target is qwen3_5-family hybrid) rollback needs only the pre-verify
+        // target is a GDN hybrid) rollback needs only the pre-verify
         // LENGTH (KV truncate is offset-only; the stale tail past it is
         // unreachable) plus the verify pass's per-position SSM capture, so no
         // snapshot is taken at all. A hypothetical pure-attention target
@@ -7975,7 +7973,7 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(re_logits);
         } else {
             // GDN trunk whose verify pass produced no capture — cannot roll
-            // back safely. Unreachable on real targets (every qwen3_5-family
+            // back safely. Unreachable on real targets (every
             // GDN layer populates the capture when capture_ssm_seq is set);
             // pinned by tests/test_mtp_equivalence.sh.
             _ = mlx.mlx_array_free(re_new_hidden);
@@ -8031,7 +8029,7 @@ pub const Generator = struct {
 
     // ── MTP adaptive depth ──
     // Unlike the drafter's binary gate, the MTP head has a useful fallback
-    // BETWEEN "full depth" and "off": depth 1. Measured on Qwen3.6-27B
+    // BETWEEN "full depth" and "off": depth 1. Measured on a 27B GDN trunk
     // (M4 Max, greedy): creative content runs 48% per-draft at depth 2
     // (a regression vs AR) but 73% at depth 1 (1.11× AR); code runs 89% at
     // depth 2 (1.45× AR). A windowed controller demotes/promotes between
@@ -8261,7 +8259,7 @@ pub const Generator = struct {
     /// Round-cost model in units of the fixed round cost (verify-forward
     /// floor + round eval/read + commit ≈ 1.0 ≈ 32 ms on the 27B since the
     /// deferred history append). Ratios are machine-stable where absolute ms
-    /// are not. Refit via SUSHI_MTP_TRACE on Qwen3.6-27B GDN (M4 Max,
+    /// are not. Refit via SUSHI_MTP_TRACE on a 27B GDN trunk (M4 Max,
     /// 2026-07-13, saturated fixed depths, same-session sweep AFTER the
     /// deferred-append round shape landed): T(1)=42.0, T(3)=62.6,
     /// T(6)=111.6, T(7)=114.9 ms — the surface is PIECEWISE: ~10.3 ms
@@ -11983,7 +11981,7 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
 /// Stall clock for the request timeout: the deadline measures time since the
 /// last PRODUCED token, not since the request started. A wall-clock request
 /// timeout kills legitimate long generations — live capture 2026-07-03:
-/// Qwen3.6-27B writing a 33KB file in one tool call decodes for >300s at
+/// A 27B trunk writing a 33KB file in one tool call decodes for >300s at
 /// ~30 tok/s and was guillotined mid-call by the 300s default, which then
 /// surfaced as a "butchered" path-only tool call. Progress is detected from
 /// the generated-token COUNT at each check, so every decode path (regular,
@@ -12008,8 +12006,8 @@ pub const StallClock = struct {
 /// token cycle over and over. Returns true when the last `reps` repetitions of
 /// some period-`p` cycle (1 ≤ p ≤ `max_period`) are byte-identical.
 ///
-/// Motivation: Gemma 4 12B sometimes collapses after a large/confusing tool
-/// result and spams the thinking opener `<|channel>thought` forever; with no
+/// Motivation: a model sometimes collapses after a large/confusing tool
+/// result and spams its thinking opener forever; with no
 /// repeat penalty (the default) and a now-generous `max_tokens`, nothing else
 /// stops it. The decode loop calls this each tick and cuts the slot short.
 ///
@@ -13483,7 +13481,7 @@ test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
     const P = degenerate_loop_max_period;
     const R = degenerate_loop_reps;
 
-    // Gemma 4 12B failure mode: the model spams the thinking opener
+    // Failure mode: the model spams the thinking opener
     // `<|channel>thought\n` — model that as a 3-token cycle. After enough
     // identical repetitions the tail is a pure period-3 loop → fire.
     {
@@ -14171,8 +14169,8 @@ test "boundedPrefillChunk: fused head dims and short contexts keep the base chun
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true, false, false));
     // hd 256 but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
     // = 2 GiB scores, inside the 4 GiB budget -> full chunk kept. This is the
-    // fleet-protection property: every Gemma-4 / Qwen3.5/3.6 checkpoint ships
-    // head_dim 256, so typical prompts must keep full prefill throughput.
+    // fleet-protection property: every head_dim 256 checkpoint must keep
+    // full prefill throughput on typical prompts.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false, false));
     // Degenerate inputs never cap.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true, false, false));
@@ -14190,16 +14188,16 @@ test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel a
 }
 
 test "boundedPrefillChunk: long context shrinks to the scores budget, floored and rounded" {
-    // gemma-4-26B geometry (16 heads): budget/(16*ctx*2) …
+    // 16-head geometry: budget/(16*ctx*2) …
     // ctx 32768 -> exactly 4096.
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true, false, false));
     // ctx 100000 -> raw 1342, rounded down to the 512 grain -> 1024.
     try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false, false));
     // ctx 262144 (the PR-#69 255K case) -> 512.
     try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true, false, false));
-    // Qwen3.6-27B geometry (24 heads) at 262144: raw 341 -> floor 512.
+    // 24-head geometry at 262144: raw 341 -> floor 512.
     try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true, false, false));
-    // e4b geometry (8 heads) at 131072: exactly 2048.
+    // 8-head geometry at 131072: exactly 2048.
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true, false, false));
 }
 
@@ -14253,23 +14251,23 @@ test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
 test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE caps at 4096, dense keeps the full chunk" {
     // With the causal arm FUSED (default since the budgeted-dispatch flip) no
     // score tensor exists, so the scores-budget formula is moot for the
-    // qwen3_5/3_6 class — and its old shrink to 1024 at 64K starved the
+    // non-sliding hd-256 class — and its old shrink to 1024 at 64K starved the
     // dequant+GEMM qmm route (engages at M >= 2048): the 64K rung was the
     // ladder's weakest for exactly this reason.
     std.debug.assert(transformer_mod.fused256_override == null);
-    // DENSE hybrids (Qwen3.6-27B class): no expert-gather transients, and a
+    // DENSE hybrids: no expert-gather transients, and a
     // full-size chunk halves per-chunk dequant sweeps — chunk 8192 measured
-    // +1.4% over 4096 at the 8K rung (M4 Max, 2026-07-30), flat at 32K.
+    // +1.4% over 4096 at the 8K rung, flat at 32K.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, false, false));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 65536, false, false, false));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false, false));
     // MoE keeps the 4096 cap: expert-gather transients scale with the chunk
-    // (gemma-26B@99K: +3% speed for +22 GB peak is a bad trade).
+    // (+3% speed for +22 GB peak is a bad trade).
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false, true, false));
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false, true, false));
     // Never raises a caller-lowered base.
     try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false, false, false));
-    // Sliding-band archs (gemma: fused band kernel wants big chunks) keep
+    // Sliding-band archs (fused band kernel wants big chunks) keep
     // the formula-only policy.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false, false));
     // Fused head dims never cap regardless of arch.
@@ -14331,7 +14329,7 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, PREFILL_CHUNK));
     // Sub-chunk strides coarsen on ALL archs: they push every projection under
     // prefillDqGemm's M>=2048 floor (slow small-M qmm) and multiply per-chunk
-    // fixed costs. Measured on Qwen3.6-27B dense (M4 Max, 2026-07-30): stride
+    // fixed costs. Measured on a 27B dense trunk (M4 Max): stride
     // 256 = 33 chunks at 8K = 211 tok/s vs 254 coarse.
     try testing.expectEqual(@as(usize, 8192), effectiveSsmCheckpointStride(256, PREFILL_CHUNK));
     // A larger explicit stride is respected (never shrunk).

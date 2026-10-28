@@ -473,7 +473,6 @@ pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: 
     mcfg.weight_prefix = mtp_prefix;
     mcfg.num_hidden_layers = 1;
     mcfg.full_attention_interval = 1; // layer 0 is the full-attention layer
-    mcfg.linear_attn_tail_from = 0;
     mcfg.ple_layer_idx = -1;
     mcfg.expert_streaming = false;
     const ml = try initMoeLayers(allocator, mcfg, weights, name_buf, s);
@@ -2193,11 +2192,10 @@ pub fn gatedFullAttnProjected(
     defer _ = mlx.mlx_array_free(gate);
 
     if (cfg.attn_output_gate) {
-        // Mirror mlx-lm qwen3_next.py:130-134: reshape Q-proj output to [B, S, H, D*2]
+        // Reshape the Q-proj output to [B, S, H, D*2]
         // then `mx.split(_, 2, axis=-1)` into (queries, gate). The single split op
         // replaces our prior two-slice pattern (2 dispatches → 1 dispatch). Adds up
-        // across all `full_attention_interval` layers — was the dominant Qwen 3.5/3.6
-        // hybrid decode gap vs mlx-lm (5.7% → ~tied).
+        // across all `full_attention_interval` layers.
         const q_gate_shape = [_]c_int{ batch, seq_len, h_count, hd * 2 };
         var q_gate_r = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_gate_r);
@@ -2297,7 +2295,7 @@ pub fn gatedFullAttnProjected(
         k_rope = pair[1];
         fused_qk = true;
     }
-    // hd-256 sibling (qwen3.5/3.6 full-attention layers), decode AND
+    // hd-256 sibling (full-attention layers), decode AND
     // spec-verify widths (S 1..16) — the hd-128 gate above never fires
     // there, so those layers paid the composed chain on every step.
     if (!fused_qk and batch == 1 and hd == 256 and seq_len <= 32 and
@@ -2336,7 +2334,7 @@ pub fn gatedFullAttnProjected(
         // per-token cos/sin on the prefill chunk (3D t/h/w angles at image
         // tokens), and scalar RoPE at offset+delta on decode (decode tokens are
         // text → t=h=w). Plain scalar partial RoPE otherwise (zero-cost for
-        // text-only qwen3_5). YaRN needs nothing here: the M-RoPE tables are
+        // text-only). YaRN needs nothing here: the M-RoPE tables are
         // filled from the scaled spectrum + mscale at the one choke point
         // (`mropeCosSinAt`), and the scalar arms take the freqs array below.
         if (ctx.mrope_cos_cur) |cos| {

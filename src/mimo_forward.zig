@@ -825,8 +825,8 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     if (self.imatrix) |c| try c.observeLinear(.lm_head, final_normed);
 
     // Speculative-decoding capture: slice the post-final-norm hidden
-    // at the LAST position only. Used by PLD verify-fusion and the
-    // Gemma 4 assistant drafter as `h_prev`. Caller frees the captured
+    // at the LAST position only. Used by PLD verify-fusion as `h_prev`.
+    // Caller frees the captured
     // array.
     if (ctx.capture_hidden) |target| {
         try capturePrefillHiddenLast(self.s, target, final_normed, !ctx.verify_rows);

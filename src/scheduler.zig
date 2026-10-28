@@ -763,13 +763,10 @@ pub const Slot = struct {
         if (config.swaRingTokens() > 0) cache.setSwaRing(config.sliding_window);
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
-        // uses to allocate `xfm.ssm_entries` (transformer.zig: `has_hybrid_layers`
-        // OR `full_attention_interval > 0`). Without this branch the
-        // slot's `ctx.ssm_entries` is null and `forwardMoeWith`'s
-        // linear-attention layers crash on `ctx.ssm_entries.?` for Qwen 3.5/3.6
-        // MoE (which carries GatedDeltaNet inside its MoE structure but does
-        // NOT set `has_hybrid_layers`). Pure-attention MoE (qwen3_moe, Gemma 4
-        // MoE — isMoe() but interval == 0) must NOT get entries: a non-null
+        // uses to allocate `xfm.ssm_entries` (`needsSsmEntries`). Without this
+        // branch the slot's `ctx.ssm_entries` is null and the
+        // linear-attention layers crash on `ctx.ssm_entries.?`. Pure-attention
+        // MoE (isMoe() but interval == 0) must NOT get entries: a non-null
         // slice makes the hot prefix cache treat the model as hybrid and
         // cold-prefill every request.
         var ssm_entries: ?[]SSMCacheEntry = null;
@@ -1113,8 +1110,7 @@ pub const Slot = struct {
     /// the handler sat blocked in `waitNext` for the whole multi-minute
     /// prefill, never noticed the disconnect, and abandoned giant prefills
     /// piled up serially behind every client retry (the server looked dead
-    /// while the GPU ground ghosts; observed live with Claude Code + a
-    /// 40K-token MCP prompt on gemma-4-12b).
+    /// while the GPU ground ghosts).
     pub fn waitNextTimeout(self: *Slot, timeout_ms: i64) ?NextResult {
         while (true) {
             self.out_mu.lockUncancelable(self.io);
@@ -1183,13 +1179,13 @@ pub const Slot = struct {
 /// thread (CPU only — stb_image / libwebp). The inference thread wraps this
 /// in an `mlx_array` via `mlx_array_new_data` and runs the vision encoder.
 pub const VisionImagePixels = struct {
-    /// Raw bytes holding float32 pixel data. Gemma: CHW (3 × H × W × 4). Qwen3-VL:
+    /// Raw bytes holding float32 pixel data. Qwen3-VL:
     /// merge-order pixel_values (N × C·tps·ps·ps × 4). Borrowed; must outlive the
     /// encodeVision call (which blocks until completion).
     pixels: []const u8,
     width: u32,
     height: u32,
-    /// Qwen3-VL only: full patch grid (0 ⇒ Gemma CHW). Selects QwenVision.
+    /// Qwen3-VL only: full patch grid. Selects QwenVision.
     grid_h: u32 = 0,
     grid_w: u32 = 0,
     /// `pixels` is still the encoded file; the encode decodes it (`ImageDecodeWindow`).
@@ -1222,7 +1218,7 @@ pub const VisionEncodeRequest = struct {
     /// Per-video pre-patchified pixel buffers. Borrowed; must outlive the call.
     /// Qwen-only (video_token_id != 0) — empty on every other arch.
     videos: []const VisionVideoPixels = &.{},
-    /// Gemma 4 12B unified audio: per-clip raw float32-LE 16 kHz mono sample
+    /// Audio: per-clip raw float32-LE 16 kHz mono sample
     /// buffers. Borrowed; must outlive the call. The inference thread frames
     /// each into 640-sample tokens and projects them through the audio embedder.
     audio: []const []const u8 = &.{},
@@ -2393,7 +2389,7 @@ fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
 /// Batched decode pads every slot's KV to the group's LONGEST (`padAndStackBatchedKV`),
 /// so the tensor it builds is `N x kv_max`, not `sum(kv_len)`. A group mixing one
 /// 100k-token stream with three 1k ones therefore materializes ~100x the bytes the
-/// short slots need — on a qwen3_5 trunk (hd 256, `--ctx-size` up to 262144) that is
+/// short slots need — on a qwen4_exp trunk (hd 256, `--ctx-size` up to 262144) that is
 /// ~410 MB per full-attention layer, ~6.5 GB across the 16 of them, and NOTHING bills
 /// it: it is a per-tick transient, invisible to `prefillTransientReserve` and to the
 /// load-time gate. An uncatchable Metal OOM is the failure mode.
@@ -5059,7 +5055,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
-    // skips a cold path — observed savings on Gemma 4 E4B 4-bit.
+    // skips a cold path.
     if (params.warmup_eager) {
         const warmup_start = std.Io.Timestamp.now(sch.io, .awake);
         xfm_ptr.warmup() catch |err| {
@@ -5144,8 +5140,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const ram_prefix_cache = params.prefix_cache_ram_enabled;
     // Phase 3 persists hybrid recurrent state too: the disk tier is allowed whenever the RAM tier
     // accepts the arch — pure-attention always, hybrid iff SSM checkpoints are enabled.
-    const has_ssm_layers = params.config.has_hybrid_layers or
-        params.config.full_attention_interval > 0;
+    const has_ssm_layers = params.config.full_attention_interval > 0;
     const disk_ok = !has_ssm_layers or enable_ssm_cps;
     const cache_applies = params.prefix_cache_capacity > 0 and
         prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps);
@@ -7454,15 +7449,13 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     var hot_checked_out: bool = false;
     // The DFlash assistant's context rides the prefix cache: a restore
     // forwards no trunk layers, so without it the assistant starts every
-    // reused turn blind and drafts against nothing. Measured on Muse 4-bit,
-    // 160-token generations: a full-prefix hit cost 92.6% -> 66.5% per-draft
-    // acceptance and 80.2 -> 60.9 tok/s. Adopted by the Generator below.
+    // reused turn blind and drafts against nothing. Adopted by the Generator below.
     var dflash_restored: ?dflash_mod.DflashCtx = null;
     errdefer if (dflash_restored) |*dc| dc.deinit();
     // The MTP head's committed history rides the prefix cache the same way:
     // it is built from trunk hiddens, a restore forwards nothing, and a
     // blind start collapses acceptance (measured ~70 -> ~38 tok/s on warm
-    // Qwen3.6-27B echo). Adopted by the Generator below.
+    // echo). Adopted by the Generator below.
     var mtp_restored: ?generate_mod.MtpRestored = null;
     errdefer if (mtp_restored) |*mr| mr.cache.deinit();
     // Phase D: per-slot model — pull transformer + prefix cache off the
@@ -8255,9 +8248,9 @@ fn publishBlockTokens(slot: *Slot, gen: *Generator, tokens: []const u32) ?[]cons
 /// attributed to the slot whose forward raised it instead of the next request's prefill.
 /// The repetition-loop guard every decode tick runs first. True = the slot was finished here.
 fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
-    // Stop a runaway repetition loop before generating more. Some models (seen
-    // on Gemma 4 12B after a large/confusing tool result) collapse into spamming
-    // one short cycle — e.g. the thinking opener `<|channel>thought` — forever;
+    // Stop a runaway repetition loop before generating more. Some models
+    // collapse after a large/confusing tool result into spamming
+    // one short cycle — e.g. the thinking opener — forever;
     // with no repeat penalty by default and a generous max_tokens, nothing else
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
@@ -10073,7 +10066,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     }
 
     // Two batched kernels: the standard one, and the GatedDeltaNet twin for
-    // hybrid trunks (qwen3_5 family). `batchedGdnReady` is the runtime half of
+    // hybrid trunks. `batchedGdnReady` is the runtime half of
     // the gate — a slot that has not prefilled yet carries no recurrent state
     // to merge, so that tick stays serial rather than merging a wrong width.
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
@@ -10083,7 +10076,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // Position source is per PATH: a GDN trunk positions from the slot's
     // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
     // linear layer there, so it reads 0 forever and every batched token was
-    // roped at position 0 (qwen3_5 batched diverged from serial at token 14).
+    // roped at position 0.
     for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn or use_mimo) slot.moe_seq_offset else slot.cache.step);
     if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
         // A slot with no recurrent state yet cannot join the merge. Decode the

@@ -29,12 +29,11 @@
 //! claims (crash between chunk write and meta rename) is sliced down at
 //! restore, never trusted.
 //!
-//! Phase 3 — hybrid SSM archs (qwen3_5/3_6 GatedDeltaNet, lfm2, nemotron_h):
+//! Phase 3 — hybrid SSM archs (GatedDeltaNet):
 //! the RAM tier's per-position `SSMCheckpoint`s persist beside the chunks as
 //!   <base>/<fingerprint>/e<id>/s0002048.safetensors   SSM state at pos 2048
-//! keyed "l{i}.conv"/"l{i}.ssm" (absent key = null state — LFM2 gated-conv
-//! layers have no ssm_state, plain-attention layers in the hybrid have
-//! neither), with the per-layer `initialized` flags in the safetensors
+//! keyed "l{i}.conv"/"l{i}.ssm" (absent key = null state — plain-attention
+//! layers in the hybrid have neither), with the per-layer `initialized` flags in the safetensors
 //! metadata map ("init"). Checkpoint files are immutable once written (keyed
 //! by position); extend commits append only NEW positions, bounded per entry
 //! by `SSM_DISK_MAX_PER_ENTRY` (evict-lowest — the newest positions are where
@@ -1539,8 +1538,8 @@ pub const DiskTier = struct {
         var cp: transformer_mod.SSMCheckpoint = .{ .pos = pos, .layers = layers };
         errdefer cp.deinit(self.allocator);
 
-        // Absent key = null state (LFM2 gated-conv layers have no ssm_state;
-        // plain-attention layers in the hybrid have neither) — that's a valid
+        // Absent key = null state (plain-attention layers in the hybrid have
+        // neither) — that's a valid
         // shape, not corruption.
         for (layers, 0..) |*l, li| {
             const ckey = try std.fmt.allocPrint(self.allocator, "l{d}.conv\x00", .{li});
@@ -1982,7 +1981,7 @@ pub const DiskTier = struct {
         // land in `tokens`). Persist the prefix covered by the record —
         // positions beyond it are unusable for matching anyway.
         // The KV extent is the initialized layers' offset, NOT `step`: on
-        // hybrid archs (qwen3_5/3_6 GDN) `cache.step` only bumps on layer 0,
+        // hybrid archs (GDN) `cache.step` only bumps on layer 0,
         // which is a GatedDeltaNet layer that never writes KV, so it stays 0
         // while the full-attention layers carry offset == prompt position.
         // `max(step, max initialized offset)` is correct for both — equal on
@@ -5782,8 +5781,8 @@ fn ssmArrVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
 }
 
 /// Three-layer synthetic hybrid SSM state, covering the full null-state
-/// matrix: (0) a GatedDeltaNet layer with both conv+ssm, (1) an LFM2
-/// gated-conv layer with conv only (null ssm_state), (2) a plain-attention
+/// matrix: (0) a GatedDeltaNet layer with both conv+ssm, (1) a layer
+/// with conv only (null ssm_state), (2) a plain-attention
 /// layer in the hybrid (uninitialized, both null). `conv_base`/`ssm_base`
 /// make each capture position's values distinguishable, so a restore-side
 /// conv/ssm KEY SWAP fails the value checks (the K/V-swap lesson).
@@ -5817,10 +5816,9 @@ fn freeHybridEntries(e: *[3]SSMCacheEntry) void {
 }
 
 test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
-    // qwen3_5/3_6 GatedDeltaNet + lfm2 gated-conv (null ssm_state) + plain
-    // attention (uninitialized) in one entry. No local hybrid checkpoint of
-    // lfm2/nemotron_h exists, so those archs are covered here purely by the
-    // null-state layer shapes (same SSMCacheEntrySnapshot contract).
+    // GatedDeltaNet + a conv-only layer (null ssm_state) + plain
+    // attention (uninitialized) in one entry: the null-state layer shapes
+    // (same SSMCacheEntrySnapshot contract).
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -5889,7 +5887,7 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     try testing.expectEqual(@as(f32, 200.0 + 23.0), ssmArrVal(dst[0].conv_state, 23, s));
     try testing.expectEqual(@as(f32, 600.0), ssmArrVal(dst[0].ssm_state, 0, s));
     try testing.expectEqual(@as(f32, 600.0 + 31.0), ssmArrVal(dst[0].ssm_state, 31, s));
-    // Layer 1: LFM2 gated-conv — conv present (base 10200), ssm stays null.
+    // Layer 1: conv only — conv present (base 10200), ssm stays null.
     try testing.expect(dst[1].initialized);
     try testing.expectEqual(@as(f32, 10_200.0), ssmArrVal(dst[1].conv_state, 0, s));
     try testing.expect(dst[1].ssm_state.ctx == null);

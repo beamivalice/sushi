@@ -151,9 +151,9 @@ fn structFields(comptime T: type) []const WeightField {
 // of the input/state storage dtype.
 // The recurrence exists ONCE, specialized on two independent axes:
 //
-//   `vectorized` — where the forget gate lives. qwen3.5's GatedDeltaNet has one
+//   `vectorized` — where the forget gate lives. Flash-Next's GatedDeltaNet has one
 //     scalar per (token, value head), so `g` is [B,T,Hv]. KDA (Kimi Delta
-//     Attention, bailing_hybrid) gates per KEY CHANNEL, so `g` is [B,T,Hv,Dk]
+//     Attention, GLM) gates per KEY CHANNEL, so `g` is [B,T,Hv,Dk]
 //     and each state element decays by its own factor. Mirrors mlx-lm's
 //     `_make_gated_delta_kernel(vectorized=…)`, which parameterizes the same
 //     three lines.
@@ -927,8 +927,8 @@ fn vqmmBnOverride() c_int {
 /// spill/occupancy past 7 live Vec8 row vectors), so 8+ falls back to stock.
 ///
 /// WIDENING THE TILE IS DISPROVEN. The activation-traffic arithmetic above
-/// predicts bn=8 should nearly halve the dominant read; measured on the Muse
-/// 4-bit trunk shapes it is 5-8% SLOWER at every width (M=5: 45.9 ms vs 43.0
+/// predicts bn=8 should nearly halve the dominant read; measured on 4-bit
+/// trunk shapes it is 5-8% SLOWER at every width (M=5: 45.9 ms vs 43.0
 /// whole-forward, same direction at M 2/3/4). The x rows are 66 KB and stay
 /// cache-resident, so the "traffic" was never leaving the cache — the extra
 /// accumulators just cost occupancy. The ceiling below admits the 8-column
@@ -938,7 +938,7 @@ pub const VQMM_MAX_ACC: c_int = 40;
 /// Simdgroups per threadgroup, each owning a K partition. Wide-N shapes
 /// already emit N/bn threadgroups, so the grid does not need more
 /// parallelism there — 2 keeps the reduction cheap, and the sweep agrees:
-/// on the Muse trunk shapes at M=5 the whole-forward estimate is 42.4 ms at
+/// on 4-bit trunk shapes at M=5 the whole-forward estimate is 42.4 ms at
 /// 2, 42.5 at 1, 44.5 at 4, 49.0 at 8.
 fn vqmmKParts(N: c_int) c_int {
     return if (N >= 4096) 2 else 4;
@@ -1020,8 +1020,8 @@ var vqmm_scalar_tick: u64 = 0;
 /// in one `inputs_arr`. With the cache full, the K call evicts slot 0 and lands
 /// there; the N call then frees slot 0 again — which is now K's array — so the
 /// caller carried a dangling handle into `mlx_vector_array_new_data`. Observed
-/// live 2026-08-07 on a 40-layer qwen3_5_moe (GatedDeltaNet + MoE + a 248k
-/// vocab: enough distinct (K, N) pairs to overflow 16 slots) as SIGBUS building
+/// on a 40-layer GatedDeltaNet + MoE trunk with a 248k
+/// vocab (enough distinct (K, N) pairs to overflow 16 slots) as SIGBUS building
 /// the vector and SIGSEGV freeing it — one request killed the server, and the
 /// surfaces probed after it all read as 0%.
 ///
@@ -1890,7 +1890,7 @@ fn runVerifyQmmNax(
 // MLX's fused SDPA (steel_attention) ships bd 64/96/128 and a 256 dsplit and
 // nothing else, so two widths fall back to the composed path that
 // MATERIALIZES a [heads, chunk, total_kv] bf16 score tensor per layer: 256
-// (every Gemma-4 and Qwen3.5/3.6 checkpoint — 26.8 GB/layer at a 102K prompt,
+// (a head_dim 256 trunk — 26.8 GB/layer at a 102K prompt,
 // the long-context OOM class commit 7550895 budgeted around), and the
 // asymmetric 192/128 that mimo_v2's global layers and MLA score at (32 GiB at
 // a 512k prompt). `BDK`/`BDV` are the two widths; see `fusedPdDims`. This kernel started as a
@@ -1899,7 +1899,7 @@ fn runVerifyQmmNax(
 // v2 tiles (BQ=64, BK=32, 8 simdgroups, register-resident Q, uint4 staging
 // — see the geometry comment above ATTN_PD_KERNEL_SOURCE) are our own,
 // picked by micro-bench sweep. An optional sliding-window band covers
-// Gemma's local layers ("array" mask during prefill) too, and an optional
+// sliding-window layers ("array" mask during prefill) too, and an optional
 // per-head sink column mimo_v2's sliding layers. The score tensor
 // never exists — O(tile) working memory — so the three prefill OOM guards
 // (generate.boundedPrefillChunk / prefillEvalCadence / server.prefillMemoryNeeded)
@@ -1954,8 +1954,8 @@ const ATTN_PD_KERNEL_HEADER =
     \\
 ;
 
-// v2 tile geometry (2026-07-12 micro-bench sweep on the M4 Max, Qwen 24q/4kv
-// and Gemma geometries): BQ=64 with 8 simdgroups halves the K/V staging walks
+// v2 tile geometry (2026-07-12 micro-bench sweep on the M4 Max, 24q/4kv
+// geometry): BQ=64 with 8 simdgroups halves the K/V staging walks
 // per query row vs the v1 32-row tile; BK=32 halves the per-column softmax
 // rescale + barrier overhead; Q lives in REGISTERS loaded straight from
 // global (no Q smem at all — that memory goes to the wider K tile); staging
@@ -6536,8 +6536,7 @@ pub const SLIDING_TRIM_UNBOUNDED: usize = std.math.maxInt(usize);
 /// layer: at width 1 it has always returned `window`, but a block-wide verify
 /// used to fall through untrimmed and read the ENTIRE cache on every sliding
 /// layer, so a 3:1 local:global model paid full attention on 75% of its layers
-/// once past the window (measured: muse-glimmer verify 51 -> 140 ms from 0.6k
-/// to 17.6k ctx, turning DFlash from 2.28x into 0.74x).
+/// once past the window.
 pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
     if (window == 0 or q_len == 0 or q_len > max_width) return 0;
     return window + @as(u32, @intCast(q_len)) - 1;
@@ -12310,19 +12309,9 @@ pub const FullAttnWeights = struct {
     idx_qk_b: mlx.mlx_array = .{ .ctx = null },
     idx_q_norm: mlx.mlx_array = .{ .ctx = null },
     idx_k_norm: mlx.mlx_array = .{ .ctx = null },
-    // gpt_oss: ADDITIVE projection biases (`self_attn.{q,k,v,o}_proj.bias`).
-    // These are NOT the affine quantizer's `*_b` zero-points above — a gpt_oss
-    // checkpoint carries BOTH spellings on the same projection
-    // (`q_proj.bias` next to `q_proj.biases`), with different shapes and
-    // different meanings. Null-ctx on every other arch.
-    q_bias: mlx.mlx_array = .{ .ctx = null },
-    k_bias: mlx.mlx_array = .{ .ctx = null },
-    v_bias: mlx.mlx_array = .{ .ctx = null },
-    o_bias: mlx.mlx_array = .{ .ctx = null },
-    // gpt_oss: learned per-head attention sinks (`self_attn.sinks`, [n_heads]).
-    // One extra column in the softmax DENOMINATOR, letting a head attend to
-    // "nothing". Passed straight to mlx's fused SDPA, which takes them as a
-    // function constant (`_has_sinks_`) — no unfused fallback.
+    // MiMo: learned per-head attention sinks (`self_attn.attention_sink_bias`,
+    // [n_heads]). One extra column in the softmax DENOMINATOR, letting a head
+    // attend to "nothing". Null-ctx on every other arch.
     sinks: mlx.mlx_array = .{ .ctx = null },
 };
 
@@ -12459,7 +12448,7 @@ pub const MoeLayerWeights = struct {
 // first touch and serve hits thereafter. Uses open addressing with linear probing on
 // a fixed-size array — this fits in L1 and keeps the cost of a lookup to ~5ns,
 // matching the perf commit's intent of "eliminate per-call detect overhead" while
-// supporting mixed-precision quantization (Gemma-4 MoE per-layer bits, etc.).
+// supporting mixed-precision quantization (per-layer bits).
 const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
 pub const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
 
@@ -12549,23 +12538,6 @@ pub const ForwardCtx = struct {
     /// refuses non-standard-path targets so this can never be silently
     /// ignored on an engaged path.
     capture_layers: ?*CaptureLayers = null,
-    /// An additive attention term composed into the standard PREFILL path's
-    /// mask, `[1, 1, q_len, kv_len]` bf16. It must ALREADY be causal: a
-    /// "causal"-mode layer swaps to an array mask carrying this verbatim, so
-    /// a term that only masked padding would drop causality on the
-    /// full-attention layers. Sliding layers ADD it to their band mask.
-    ///
-    /// Entries must be FINITE (the reference's -1e9, not -inf): a left-padded
-    /// prompt has query rows whose every visible key is padding, and an
-    /// all -inf row softmaxes to NaN.
-    ///
-    /// Set only by the LTX text encoder (`ltx_video.gemmaCapture4`), whose
-    /// prompts are left-padded to a fixed width the reference masks out. Null
-    /// everywhere else — and null is what keeps the fused prefill kernels,
-    /// which mask from geometry alone and cannot carry an extra term, on
-    /// their normal path. One-shot forwards only: a chunked prefill would
-    /// need a per-chunk slice of it.
-    prefill_mask_add: ?mlx.mlx_array = null,
     /// PLD spec-decode: when true, the GatedDeltaNet trunk records per-position
     /// SSM/conv state during the verify forward (see `SSMCacheEntry.spec_*`),
     /// so partial-accept rollback needs no re-forward. Set only by `nextPld`
@@ -13665,8 +13637,7 @@ pub const Transformer = struct {
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
     // (refcount-shared with the live forward graph). Set/cleared by
-    // `forwardCaptureHidden`. Used by PLD verify-fusion and the Gemma 4
-    // assistant drafter for h_prev seed.
+    // `forwardCaptureHidden`. Used by PLD verify-fusion for the h_prev seed.
     // Single-threaded: generation runs on one thread per Transformer.
     capture_hidden: ?*mlx.mlx_array = null,
 
@@ -13694,7 +13665,6 @@ pub const Transformer = struct {
     gdn_ones_w: ?mlx.mlx_array = null, // ones([dk]) for parameter-free rms_norm
     gdn_q_scale: ?mlx.mlx_array = null, // bf16 scalar 1/dk
     gdn_k_scale: ?mlx.mlx_array = null, // bf16 scalar 1/sqrt(dk)
-    grouped_norm_ones: ?mlx.mlx_array = null, // k2_horizon: rms_norm ones weight, one group wide
     gdn_eps: ?mlx.mlx_array = null, // f32 scalar rms_norm_eps for the fused norm-gate kernel
     /// PLD spec-decode: mirrors `ForwardCtx.capture_ssm_seq` for the current
     /// forward so `gatedDeltaNet`/`conv1dWithCache` (which don't take the ctx)
@@ -13709,7 +13679,7 @@ pub const Transformer = struct {
 
     // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
     // Keyed by the scales array's ctx pointer (stable for the lifetime of a weight).
-    // Used instead of config.quant_bits so mixed-precision models (Gemma-4 MoE, etc.)
+    // Used instead of config.quant_bits so mixed-precision models
     // with per-layer overrides work correctly while keeping zero per-call FFI overhead
     // after the first touch.
     bits_cache: BitsCache = .{},
@@ -14294,7 +14264,6 @@ pub const Transformer = struct {
         if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
         if (self.gdn_eps) |e| _ = mlx.mlx_array_free(e);
         if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
-        if (self.grouped_norm_ones) |o| _ = mlx.mlx_array_free(o);
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
@@ -14969,7 +14938,7 @@ pub const Transformer = struct {
     ///     exotic dim);
     ///   - the dense-fp16 rebuild of a quantized KV cache (denseView runs
     ///     per layer under --kv-quant, over the FULL cache).
-    /// Budget calibrated LIVE on gemma-4-26B-A4B-qat-4bit (M4 Max):
+    /// Budget calibrated live (M4 Max):
     /// eval-per-layer costs ~4.5% prefill at a 5K prompt (845 MB scores —
     /// below this budget, coarse cadence kept) and ~0% at 102K (3.4 GB
     /// scores — flips to per-layer, peak 51.6 -> 27.0 GB, prefill +14%).
@@ -15371,7 +15340,7 @@ pub const Transformer = struct {
 
     /// Pre-fault weight pages and trigger first-touch kernel compiles before
     /// the first real request so cold prefill doesn't pay 800+ms of GPU page
-    /// faulting (measured on Gemma 4 E4B 4-bit). Runs three forward passes:
+    /// faulting. Runs three forward passes:
     ///   1. [1, 1] decode-shape: faults embed matrix + compiles decode kernel
     ///   2. [1, 8] prefill-shape: compiles short-prefill kernel
     /// then resets the cache so the first real request starts from clean state.
@@ -15597,9 +15566,8 @@ pub const Transformer = struct {
 
     /// Run a forward pass and ALSO capture the post-final-norm hidden state
     /// at the LAST position into `*out_hidden`. Used by PLD verify-fusion
-    /// (which re-uses the captured hidden as part of partial-accept rollback)
-    /// and by the Gemma 4 assistant drafter (which needs `h_prev` as a seed
-    /// for the next drafter step). Caller owns the captured array (must
+    /// (which re-uses the captured hidden as part of partial-accept rollback).
+    /// Caller owns the captured array (must
     /// `mlx_array_free`). Both `forwardStandard` and `forwardMoe` honor the
     /// capture; other families fall through to a regular forward and leave
     /// `*out_hidden` as a default `mlx_array_new()`.
@@ -15652,8 +15620,6 @@ pub const Transformer = struct {
         return self.forwardWith(ctx, token_ids);
     }
 
-    // ── Standard forward pass (Gemma / Llama / Qwen3 / Gemma4) ──
-
     // ── Batched-decode forward pass ──
     //
     // One forward call computes next-token logits for N concurrent requests at
@@ -15674,7 +15640,7 @@ pub const Transformer = struct {
     //   → gather views, pad to common kv_max, concat axis=0
     //   → build [N,1,1,kv_max] additive mask via positions < kv_lens
     //   → SDPA → o_proj → MLP → final_norm → lm_head → softcap → demux.
-    /// Batched decode for a GatedDeltaNet trunk (qwen3_5 family), the hybrid
+    /// Batched decode for a GatedDeltaNet trunk, the hybrid
     /// twin of `forwardBatchedDecode`.
     ///
     /// Why this exists: without it, concurrent requests on a GDN model decode
@@ -16258,8 +16224,6 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_where(&mask, valid, zero, neg_inf, self.s));
         return mask;
     }
-
-    // ── MoE forward pass (Qwen3.5 + Gemma 4) ──
 
     // ── qwen4_exp (Qwen3.8-Flash-Next) ──
 
@@ -16888,18 +16852,6 @@ pub const Transformer = struct {
 
 
 
-    /// SUSHI_DIFFUSION_TRACE=1 debugging aid: print the first 8 values
-    /// of position 0 of a hidden state.
-    var trace_tail_once: bool = true;
-    fn debugTraceHead(label: []const u8, arr: mlx.mlx_array, s: mlx.mlx_stream) void {
-        var f = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(f);
-        mlx.check(mlx.mlx_astype(&f, arr, .float32, s)) catch return;
-        mlx.check(mlx.mlx_array_eval(f)) catch return;
-        const d = mlx.mlx_array_data_float32(f) orelse return;
-        std.debug.print("{s}: {any}\n", .{ label, d[0..8] });
-    }
-
     // ── Full Attention for MoE models (with optional output gate) ──
 
     /// Build per-token interleaved-M-RoPE cos/sin [1,1,seq_len,rope_dims] (bf16).
@@ -17095,28 +17047,6 @@ pub const Transformer = struct {
 
 
 
-
-    // ── Multi-head Latent Attention (bailing_hybrid full-attention layers) ──
-    //
-    // The DeepSeek-V3 shape, in its NAIVE (un-absorbed) form: the compressed
-    // latent is expanded to per-head keys and values before the cache, so the
-    // ordinary KVCache, prefix cache and disk tier all keep working unchanged.
-    // The price is a K/V cache 10x the absorbed form's; the ONE thing that
-    // makes it affordable is that only every layer_group_size-th layer is
-    // attention at all (6 of 24 here) — the rest are KDA, which caches a
-    // fixed-size recurrent state.
-    //
-    //   q      = q_b(q_a_norm(q_a(x)))            → [B,H,S,nope+rope]
-    //   latent = kv_a(x) → [·, kv_lora | k_pe]
-    //   k_nope,v = kv_b(kv_a_norm(latent))        → [B,H,S,nope], [B,H,S,v]
-    //   k_pe   = rope(k_pe), SHARED across heads (one MQA key, broadcast)
-    //   out    = sdpa([q_nope|q_rot], [k_nope|k_pe], v) · sigmoid(g(x))
-    //
-    // RoPE covers the rope slice ENTIRELY and rotates adjacent pairs
-    // (`rope_interleave`), which is mlx's `traditional` mode. The reference
-    // de-interleaves q and k identically before a halves-rotation, and a
-    // consistent permutation of both operands leaves q·k unchanged — so the
-    // traditional kernel is exact here, not an approximation.
 
     /// The angle row for `offset` in the given rope family, rebuilt when the
     /// offset moves (per decode token: 38-of-40 layers hit the cache).
@@ -18989,7 +18919,7 @@ pub const Transformer = struct {
         if (skip_shared) return expert_sum;
 
 
-        // Gemma 4: shared expert is handled separately in forwardMoe, just return expert_sum
+        // No shared-expert gate: the routed sum is the whole output.
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return expert_sum;
         defer _ = mlx.mlx_array_free(expert_sum);
         return self.moeAddGatedShared(expert_sum, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
@@ -19881,8 +19811,8 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
 
     if (mlx.mlx_array_dtype(sc) == .uint8) {
         if (config.quant_mode != .affine) {
-            // A per-tensor override can live INSIDE the fp family: LFM2.5-2.6B-MLX's
-            // mxfp4 build stores `model.embed_tokens` as mxfp8. Every fp mode
+            // A per-tensor override can live INSIDE the fp family: an
+            // mxfp4 build can store `model.embed_tokens` as mxfp8. Every fp mode
             // carries uint8 (E8M0/E4M3) scales, so the scales-dtype rule above
             // cannot separate them and the embedding resolved at the model-wide
             // 4 bits — an `mlx_dequantize` shape rejection, i.e. an MLX error,
@@ -20453,7 +20383,7 @@ pub fn sigmoidBiasRoutingChain(
 // MLX `Sigmoid` two-sided form, same intermediate rounding to the output dtype
 // at the same points. A "more accurate" fused router is still a DIFFERENT
 // model: the first live A/B of this kernel computed the softmax weights in one
-// f32 pass and diverged from the chain on gemma4-26B-A4B at token ~80, which
+// f32 pass and diverged from the chain at token ~80, which
 // is the known INT4 near-tie argmax class amplified by an avoidable numerical
 // change. The tests below therefore assert BIT equality with the chain, not
 // just no-worse-than-reference; only the reduction ORDER over the expert axis
@@ -21529,7 +21459,7 @@ pub const diagEnvOnCached = io_util_mod.diagEnvOnCached;
 ///
 /// So the eligibility predicate is deliberately NARROW — silu activation
 /// (baked into the kernel), matching quant geometry on gate and up — rather
-/// than a model_type list. An arch that does not meet it, gemma4's gelu MoE
+/// than a model_type list. An arch that does not meet it, a gelu MoE
 /// included, keeps stock gather and cannot regress.
 fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: QuantParams) bool {
     if (self.config.hidden_act != .silu) return false;
@@ -21657,7 +21587,7 @@ pub fn fusedQkNormRope(
 ) !?[2]mlx.mlx_array {
     const dt = mlx.mlx_array_dtype(q_flat);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_flat) != .bfloat16) return null;
-    // rd=32 is the qwen3.5/3.6 partial-rotary geometry (0.25 x 128); the
+    // rd=32 is a partial-rotary geometry (0.25 x 128); the
     // shuffle mapping (lane ^ (half_rd/4)) is exact for all three widths.
     if (rd != 32 and rd != 64 and rd != 128) return null;
     if (q_norm_w.ctx == null or k_norm_w.ctx == null) return null;
@@ -21776,8 +21706,8 @@ pub fn ropeAngleRows(
 
 // ── Fused QK-norm+RoPE, hd-256 (mlxfast-challenge qwen35_attention_qk_rms_rope port) ──
 //
-// The hd-128 kernel above never fires on qwen3.5/3.6 full-attention layers
-// (every checkpoint in the family is hd 256), so their decode AND verify
+// The hd-128 kernel above never fires on qwen4_exp full-attention layers
+// (hd 256), so their decode AND verify
 // widths paid the composed per-head RMSNorm → transpose → partial-RoPE chain.
 // This is the 256-wide sibling: 64 threads per (head, position) row, RMS via
 // the same simdgroup-partials tree `rms_single_row` uses, normalized row
@@ -22494,7 +22424,7 @@ pub fn fusedQkNormRope256(
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_in) != .bfloat16) return null;
     // The shuffle-free staged rotation is exact for any even rd <= 256 whose
     // pair partner stays inside the row; the served geometry is rd=64
-    // (qwen3.5/3.6 partial factor 0.25 x 256).
+    // (partial factor 0.25 x 256).
     if (rd != 32 and rd != 64 and rd != 128) return null;
     if (q_norm_w.ctx == null or k_norm_w.ctx == null) return null;
 
@@ -24620,7 +24550,7 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
         // only a performance hint (rhs_indices ARE sorted here), so forcing false is
         // always numerically correct; it just forgoes the sorted-stream optimization.
         // Without this, dense bf16 MoE prefill (the sorted path, S>1) produced fluent
-        // but semantically-wrong output (e.g. Qwen3.6-35B-A3B-bf16 calling clean prompts
+        // but semantically-wrong output (e.g. a bf16 MoE calling clean prompts
         // "jumbled"). Verified byte-identical to mlx-lm once forced false. `sorted` is
         // still honored by the quantized branch below, where gather_qmm handles it
         // correctly.
@@ -29764,7 +29694,7 @@ test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar qu
 }
 
 test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 embed under mxfp4)" {
-    // LiquidAI/LFM2.5-2.6B-MLX/mxfp4 declares a model-wide mxfp4/gs32 AND a
+    // A checkpoint can declare a model-wide mxfp4/gs32 AND a
     // per-tensor override: `"model.embed_tokens": {bits 8, group_size 32,
     // mode "mxfp8"}`. Both modes carry uint8 (E8M0) scales, so the
     // scales-dtype rule cannot tell them apart and the embedding resolved at
@@ -29775,7 +29705,7 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     // The packed geometry states the answer exactly, the same way the affine
     // path already solves off-config sidecar quants.
     const s = mlx.gpuStream();
-    const H = 2048; // lfm2 hidden
+    const H = 2048; // hidden
 
     const mk = struct {
         fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
@@ -30144,7 +30074,7 @@ test "fused MoE router reproduces the softmax routing chain's top-K and beats it
             chain_err = @max(chain_err, @abs(want - @as(f64, chain_got)));
             // BIT equality with the chain: the kernel replicates the chain's
             // arithmetic, and anything else is a different model (a live A/B on
-            // gemma4-26B-A4B diverged at token ~80 when it did not).
+            // a live A/B diverged at token ~80 when it did not).
             try testing.expectEqual(chain_got, got);
         }
     }
@@ -30154,7 +30084,7 @@ test "fused MoE router reproduces the softmax routing chain's top-K and beats it
 test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512/8/4/8 geometry" {
     // Bit equality with the composed chain is the bar, not "close enough": the
     // first live A/B of the plain fused router computed a cleaner softmax and
-    // diverged on gemma4-26B-A4B at token ~80 (the INT4 near-tie class,
+    // diverged at token ~80 (the INT4 near-tie class,
     // triggered by an avoidable numerical change). The geometry is the SHIPPED
     // one on purpose — a group limit tuned at a toy 4x4 cannot see a mask that
     // is right for 4 groups and wrong for 8.
@@ -32642,7 +32572,7 @@ test "appendHybridMlpWeights skips MoE fields with null ctx (UD MoE bf16 router/
         _ = mlx.mlx_array_free(a);
     };
 
-    // UD MoE Qwen3.5 layout: router + shared_expert_gate are bf16 (null s/b);
+    // Unsloth-dynamic MoE layout: router + shared_expert_gate are bf16 (null s/b);
     // routed experts (switch_*) and shared_expert (shared_*) stay quantized.
     const mw: MoeMlpWeights = .{
         .router_w = arrs[0],
@@ -36159,7 +36089,7 @@ test "spec-verify width sweep µbench (SUSHI_VERIFY_WIDTH_UBENCH=1)" {
     const ITERS = 6;
     const BATCH = 16;
 
-    // Muse-Glimmer-30B trunk: hidden 6656, inter 19968, 32/2 heads hd128,
+    // A 30B dense trunk: hidden 6656, inter 19968, 32/2 heads hd128,
     // 52 layers, vocab 202048. `per_layer` counts how many times this shape
     // runs in one layer so the sweep can price a whole forward.
     const shapes = [_]struct { name: []const u8, k: c_int, n: c_int, per_layer: f64, layers: f64 }{
@@ -43906,8 +43836,7 @@ test "spliceVisionRows: video placeholders are scattered like image rows (Qwen v
     // Live 2026-08-26 (qwen4_exp, 4-frame clip): 690 <|video_pad|> tokens were
     // inserted and the tower encoded 690 rows, but the mask keyed on image |
     // audio ids only, so no video row ever reached the prompt and the model
-    // described a clip it never saw. Same hole on qwen3_5 (its e2e bar of
-    // >= 2 of 4 generic subjects was passing on hallucination).
+    // described a clip it never saw.
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const hidden: c_int = 4;

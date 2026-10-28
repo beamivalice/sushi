@@ -316,7 +316,7 @@ pub extern "c" fn mlx_conv3d(res: *mlx_array, input: mlx_array, weight: mlx_arra
 pub extern "c" fn mlx_conv_transpose1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, output_padding: c_int, groups: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_conv_transpose2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, output_padding_0: c_int, output_padding_1: c_int, groups: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_conv_transpose3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, output_padding_0: c_int, output_padding_1: c_int, output_padding_2: c_int, groups: c_int, s: mlx_stream) c_int;
-// Seed-exact noise for diffusion latents (FLUX): pair with mlx_random_key(seed).
+// Seed-exact normal noise: pair with mlx_random_key(seed).
 pub extern "c" fn mlx_random_normal(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, loc: f32, scale: f32, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_argpartition_axis(res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_take_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
@@ -408,20 +408,14 @@ pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
 pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
 pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
-// Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
+// Uniform random integers in [low, high).
 pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 
-// ── Diffusion sampler ops ──
-pub extern "c" fn mlx_cummax(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+// ── Reductions and elementwise ops ──
 pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_isfinite(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_clip(res: *mlx_array, a: mlx_array, a_min: mlx_array, a_max: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_contiguous(res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_mean(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_mean_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_std(res: *mlx_array, a: mlx_array, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_std_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_max(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
 

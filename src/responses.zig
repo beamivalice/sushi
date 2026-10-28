@@ -348,8 +348,7 @@ pub const MediaFault = struct {
 /// + libwebp). Returns null when it appended the image, else the reason it
 /// could not, recorded as `image_fault` so the surface refuses by name.
 /// Appends one entry per tower call an `image_url` expands into — usually one,
-/// but LFM2-VL splits a large source into tiles plus a thumbnail. Appending
-/// rather than returning is what lets a single URL produce several.
+/// so a decoder may produce more than one per URL.
 pub const ImageUrlDecoder = *const fn (
     allocator: std.mem.Allocator,
     list: *std.ArrayList(chat_mod.ImageData),

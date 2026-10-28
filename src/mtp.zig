@@ -21,7 +21,7 @@ const expert_quant = @import("expert_quant.zig");
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
 /// 3-bit draft-only lm_head replaced the old full trunk re-forward): the old
 /// cost model was what made depth 1 optimal. 2026-07-12 validation matrix on
-/// Qwen3.6-27B 4-bit (M4 Max, adaptive controller active, decode tok/s
+/// a 27B 4-bit trunk (M4 Max, adaptive controller active, decode tok/s
 /// depth-3 vs depth-1): code 54.3 vs 43.3 (+25%), coding-agent ladder 2K
 /// 52.1 vs 41.4 (+26%) and 16K 43.9 vs 38.1 (+15%), 2-turn pi agentic
 /// (weighted) 48.6 vs 40.9 (+19%), creative temp-0.8 39.1 vs 37.9 (+3% —
@@ -57,7 +57,7 @@ pub const DepthCap = struct { cap: u32, label: []const u8, measured: bool = fals
 
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro", .measured = true };
-    // Base M4 (2026-08-22, tester report, Qwen3.5-9B-MTPLX 6-bit, 16 GB):
+    // Base M4 (2026-08-22, tester report, a 9B 6-bit trunk, 16 GB):
     // saturated echo, median of 5, decode tok/s by forced depth —
     //   3: 47.44   4: 55.50   5: 47.50   6: 47.28
     // Depth 4 is the only width where the cap BINDS (m_lo == cap), so the

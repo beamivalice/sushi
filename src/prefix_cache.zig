@@ -8,8 +8,7 @@
 //! the best one back into `xfm.cache`, and let the existing
 //! truncate-then-prefill path handle the diverged tail.
 //!
-//! Hybrid SSM/conv architectures (qwen3_5/qwen3_5_moe/qwen3_next/nemotron_h/
-//! lfm2) are excluded in v1: their recurrent state can't be rolled back, so
+//! Hybrid SSM/conv architectures (GatedDeltaNet) are excluded in v1: their recurrent state can't be rolled back, so
 //! prefix reuse must reset on any divergence anyway. Plan 03's spec calls
 //! these "hot tier only" — meaning we keep the single-slot path for them.
 //! `HotPrefixCache.shouldUse(config)` returns false for those archs.
@@ -44,7 +43,7 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 
 /// Minimum forwarded-prefix length for committing a CANCELLED prefill
 /// (client disconnect mid-prefill). Below this an entry is LRU pollution —
-/// chat-template prologues (Gemma=12, Qwen=8, Llama=4 tokens) are identical
+/// chat-template prologues (a handful of tokens) are identical
 /// across every request and "reusable" only in a worthless sense. Same
 /// rationale as an engine session pool's `min_prefix_to_claim`, applied at
 /// commit time instead of claim time.
@@ -157,7 +156,7 @@ pub const LookupResult = struct {
     /// Same contract for the MTP head's committed-history cache: the head's
     /// history is built from trunk hiddens, and a restore forwards NOTHING —
     /// without this every reused prefix drafts against an empty history
-    /// (measured on Qwen3.6-27B echo: ~70 → ~38 tok/s on warm repeats).
+    /// (measured on echo: ~70 → ~38 tok/s on warm repeats).
     mtp_base: ?usize = null,
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
@@ -873,11 +872,8 @@ pub const HotPrefixCache = struct {
     /// every divergence would force a full reset, so we keep the legacy
     /// single-slot path.
     ///
-    /// Both `has_hybrid_layers` and `full_attention_interval > 0` signal
-    /// the model has SSM/GatedDeltaNet layers somewhere — `has_hybrid_layers`
-    /// is set explicitly by the parsers for lfm2 / nemotron_h; the qwen3_5
-    /// family sets `full_attention_interval` to N to mark "every Nth layer
-    /// is full attention, the rest are GatedDeltaNet". Either way the same
+    /// `full_attention_interval > 0` marks "every Nth layer is full attention,
+    /// the rest are GatedDeltaNet": the model has SSM layers, so the
     /// SSM-checkpoint gate applies.
     pub fn shouldUse(
         config: *const model_mod.ModelConfig,
@@ -885,7 +881,7 @@ pub const HotPrefixCache = struct {
     ) bool {
         // deepseek_v41's request state is a checkpoint (`dsv41_prefix`): without them nothing restores.
         if (config.isDsv41()) return enable_ssm_checkpoints;
-        const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
+        const has_ssm_layers = config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
     }
@@ -2012,9 +2008,8 @@ pub const HotPrefixCache = struct {
         // past the committed step, and `commit` snapshots them. Restoring that
         // (then skipping the truncate) left `cache.offset` AHEAD of the matched
         // length that generation tracks (`moe_seq_offset`) — a silent drift that
-        // corrupts RoPE positions and CRASHES the Gemma sliding-window prefill mask
-        // (`broadcast_shapes` mask-vs-KV mismatch; live 2026-07-09 on
-        // gemma-4-26B-A4B at ~16K ctx). truncate is a no-op when the buffer is
+        // corrupts RoPE positions and CRASHES the sliding-window prefill mask
+        // (`broadcast_shapes` mask-vs-KV mismatch). truncate is a no-op when the buffer is
         // already `final_len`, so unconditional clamping is safe and restores the
         // invariant cache.offset == matched. The stale KV tail has no matching
         // token id, so the match can never reach into it — discarding it is correct.
@@ -4394,12 +4389,7 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     // Plain attention: always allowed.
     try testing.expect(HotPrefixCache.shouldUse(&cfg, false));
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
-    // Hybrid (lfm2/nemotron_h-style): only with checkpoints enabled.
-    cfg.has_hybrid_layers = true;
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
-    try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
-    // Qwen3.5-style full_attention_interval-marks-hybrid: same gate.
-    cfg.has_hybrid_layers = false;
+    // full_attention_interval-marks-hybrid: only with checkpoints enabled.
     cfg.full_attention_interval = 4;
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
@@ -4512,9 +4502,8 @@ test "HotPrefixCache: an entry holding the request's first images restores up to
     try testing.expectEqual(@as(usize, 3), cache.findBestRestorableMatch(&request, false, chainKey(&chain), 3, &.{}, dense, false, null).?.shared);
 }
 
-test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (gemma mask crash)" {
-    // Root cause of the live gemma-4-26B-A4B crash (2026-07-09, broadcast_shapes
-    // mask 16890 vs KV 16892 at ~16K ctx): a snapshot committed with a KV buffer
+test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (sliding mask crash)" {
+    // Root cause of a broadcast_shapes crash (mask 16890 vs KV 16892 at ~16K ctx): a snapshot committed with a KV buffer
     // LONGER than its logical token count — PLD/speculative decode leaves stale
     // draft positions in the buffer past the committed step. When the NEXT prompt
     // matches the entry's ENTIRE token sequence but is longer (a partial hit,
@@ -4639,8 +4628,8 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
 test "prefix cache: MTP committed history round-trips, clamped; a history ending short is declined" {
     // Same DflashSnap machinery, second Entry field: the head's history is
     // built from trunk hiddens and a restore forwards nothing, so without
-    // this every reused prefix drafts blind (~70 -> ~38 tok/s on warm echo,
-    // Qwen3.6-27B). Unlike the trunk KV, a history that ends BEFORE the
+    // this every reused prefix drafts blind (~70 -> ~38 tok/s on warm echo).
+    // Unlike the trunk KV, a history that ends BEFORE the
     // matched cursor cannot be adopted — the missing tail's hiddens are
     // unrecoverable, and a gap right below the generation point is worse
     // than a blind start.
@@ -6228,7 +6217,7 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense));
 }
 
-// ── Phase 3: two-tier hybrid restore (Qwen 3.5/3.6 GatedDeltaNet) ──
+// ── Phase 3: two-tier hybrid restore (GatedDeltaNet) ──
 
 const conv_shape_pc = [_]c_int{ 1, 3, 8 };
 const ssm_shape_pc = [_]c_int{ 1, 2, 4, 4 };

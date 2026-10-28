@@ -1027,20 +1027,18 @@ fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
 
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
 /// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
-/// architectures (Qwen3.5/3.6 GatedDeltaNet, Nemotron-H Mamba2, LFM2.5
-/// gated-conv). Set to 0 to disable (fall back to pre-Phase-1 behavior:
+/// architectures (Flash-Next GatedDeltaNet). Set to 0 to disable (fall back to pre-Phase-1 behavior:
 /// hybrid models bypass the hot prefix cache entirely). Override via
 /// `--ssm-checkpoint-stride N`.
 ///
 /// Default 256. The stride forces a prefill CHUNK boundary at every multiple
 /// (to snapshot SSM/sliding-window state mid-prompt). On dense / non-MoE-hybrid
-/// models (dense Gemma sliding-window, LFM2, Nemotron-H) prefill is
-/// compute-bound, so a fine 256 stride is ~free and buys finer warm mid-prompt
-/// reuse — measured <3% cold cost on Qwen3.5-4B. **MoE models are different**:
-/// their prefill is memory-bound on the per-expert weights, and every extra
-/// chunk re-streams ~all expert weights from HBM, so a fine stride silently
-/// costs ~25% cold prefill on 26B/35B-class MoE (an 850-token prompt = 4
-/// chunks = ~4x expert-weight traffic). To avoid that, the prefill loop
+/// models prefill is compute-bound, so a fine 256 stride is ~free and buys
+/// finer warm mid-prompt reuse. **MoE models are different**: their prefill is
+/// memory-bound on the per-expert weights, and every extra chunk re-streams
+/// ~all expert weights from HBM, so a fine stride silently costs cold prefill
+/// on a MoE (an 850-token prompt = 4 chunks = ~4x expert-weight traffic). To
+/// avoid that, the prefill loop
 /// **coarsens this stride to >= PREFILL_CHUNK for MoE models only** (see
 /// `generate.effectiveSsmCheckpointStride`), so MoE prefill is never
 /// over-chunked at any prompt length while non-MoE keeps the fine stride.
@@ -1869,25 +1867,16 @@ pub fn serve(
     // using the per-LoadParams capacity + byte budget. Surface a friendly
     // log line so users see whether the cache engaged.
     if (scheduler.hot_prefix_cache != null) {
-        const ssm_note: []const u8 = if (config.has_hybrid_layers)
-            " [hybrid: SSM checkpoints]"
-        else
-            "";
         if (!prefix_cache_ram_enabled and diskTierOn(config)) {
-            log.info("Prefix cache: SSD ONLY (RAM retention off){s}\n", .{ssm_note});
+            log.info("Prefix cache: SSD ONLY (RAM retention off)\n", .{});
         } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB)\n", .{ prefix_cache_capacity, cap_mb });
         } else {
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
-        }
-        if (config.has_hybrid_layers) {
-            log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ ssm_checkpoint_stride, ssm_checkpoint_max });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited)\n", .{prefix_cache_capacity});
         }
     } else if (prefix_cache_capacity > 0) {
-        if (config.has_hybrid_layers and ssm_checkpoint_stride == 0) {
-            log.info("Hot prefix cache: requested capacity={d} but model is hybrid and --ssm-checkpoint-stride is 0 — disabled\n", .{prefix_cache_capacity});
-        } else if (config.full_attention_interval > 0) {
+        if (config.full_attention_interval > 0) {
             log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{prefix_cache_capacity});
         } else {
             log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{prefix_cache_capacity});
@@ -3269,8 +3258,8 @@ pub fn streamingRowPart(buf: []u8, candidate: bool, required: bool, ssd_budget_g
 ///
 /// Reserving the whole cache budget — not just its current residency — budgets
 /// for STEADY STATE. Over an agentic session the hot cache fills to its cap, so
-/// an auto-context computed against an empty cache (24k tokens on a 16 GB Mac,
-/// 2026-06-19 live qwen3_5_moe) later collides with the filled 2 GB cache plus a
+/// an auto-context computed against an empty cache (24k tokens on a 16 GB Mac)
+/// later collides with the filled 2 GB cache plus a
 /// large cold MoE prefill and the command buffer OOMs. Subtracting it up front
 /// keeps the reported context stable across the session and within the ceiling
 /// once the cache is full. The 0.64 factor (two ×4/5 margins) absorbs the
@@ -3335,12 +3324,10 @@ fn defaultKvBits(config: *const model_mod.ModelConfig) u64 {
 ///
 /// It is a one-off reserve, not a per-token cost. `computeMemoryContext` used
 /// to bill the MLP envelope (`8 × max(hidden, ffn) × 2`) against every token of
-/// CONTEXT: 272 KB/token beside a 64 KB/token KV cache on a qwen3_5 27B, i.e.
+/// CONTEXT: 272 KB/token beside a 64 KB/token KV cache, i.e.
 /// 81% of the budget spent on a transient that never scales with the context
 /// length, which caps a 16 GB Mac under 4k tokens whatever the weights cost.
-/// Measured on the shipped 4-bit 27B (2026-08-14): the peak above steady state
-/// is flat in prompt length and tracks the chunk — 3.34 GB at chunk 2048 for
-/// prompts from 3k to 51k tokens.
+/// The peak above steady state is flat in prompt length and tracks the chunk.
 ///
 /// Same estimator as the admission guard with the KV term zeroed, because the
 /// KV cache is exactly what the sizer is solving for.
@@ -5269,7 +5256,7 @@ test "ssd budget parses GiB and admits against the wired limit" {
     try t.expectEqual(@as(u64, 1), wiredLimitMbForBudget(1, 0));
 }
 
-/// A stand-in for the deployed long-context pack: qwen3_5-shaped GDN+MoE trunk with a QSA
+/// A stand-in for the deployed long-context pack: a GDN+MoE trunk with a QSA
 /// indexer. Declares `qwen4_exp`: every long-context mechanism is gated on it.
 fn longCtxTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
@@ -6591,9 +6578,7 @@ pub fn batchedDecodeRowsBytes(config: *const model_mod.ModelConfig) u64 {
 /// The chunk-independent floor every prefill pays: MLX runtime scratch, the
 /// KV cache's proportional capacity growth (old + new buffer coexist across a
 /// grow), and the graph live-set no other term models. MEASURED as the
-/// intercept of peak-above-steady-state against the chunk, on five checkpoints
-/// spanning 2.6B to 30B (M4 Max, 2026-08-14): 0.39 GB (qwen3_5 27B), 0.67
-/// (qwen3_5 4B), 0.81 (lfm2 2.6B), ~0.1 (gemma4 26B-A4B), 1.27 (muse 30B). It
+/// intercept of peak-above-steady-state against the chunk. It
 /// does NOT scale with the weights — a dense bf16 checkpoint pays it too — so
 /// it is billed as what it measures as: a constant.
 const PREFILL_RUNTIME_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
@@ -6763,15 +6748,13 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // with its own prefill streams (linear-attention layers, MoE gather-sort
     // expansion — `prefillStreamBytesPerToken`) adds to it. Floored at the
     // historical 3-envelope bill so no arch's admission ever LOOSENS: that
-    // figure is measured 1.7x-5x conservative on plain attention archs (muse,
-    // lfm2) and would be a 33% UNDER-bill on a GatedDeltaNet hybrid.
+    // figure is conservative on plain attention archs and would be a 33%
+    // UNDER-bill on a GatedDeltaNet hybrid.
     const envelope: u64 = @max(3 * mlp, mlp + fwd * stream_per_tok);
     // The dequant+GEMM prefill route (transformer.prefillDqGemm) materializes
     // a bf16 copy of the weight it is about to multiply plus its transpose,
     // and only at forwards wide enough to take that route. Measured against
-    // the route off: +0.51 GB on the qwen3_5 27B at chunk
-    // 2048, +0.17-0.21 on the lfm2 2.6B, ~0 at chunk 8192 where the envelope
-    // already dominates.
+    // the route off: ~0 at chunk 8192 where the envelope already dominates.
     const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
         req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
@@ -6781,21 +6764,11 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
 
 /// Per-TOKEN bytes of prefill working set that live OUTSIDE the MLP envelope,
 /// because the arch runs streams the envelope does not model. MEASURED as the
-/// slope of peak-above-steady-state against the prefill chunk (M4 Max,
-/// 2026-08-14, one request per boot, byte-identical across repeats):
-///
-/// | checkpoint | measured B/chunk-token | one MLP envelope | this term |
-/// |---|---|---|---|
-/// | muse_glimmer 30B (dense) | 190,300 | 319,488 | 0 |
-/// | lfm2 2.6B (conv hybrid) | 171,150 | 172,032 | 0 |
-/// | qwen3_5 4B (GatedDeltaNet) | 513,500 | 147,456 | 393,216 |
-/// | qwen3_5 27B (GatedDeltaNet) | 1,263,700 | 278,528 | 983,040 |
-/// | gemma4 26B-A4B (MoE) | 486,800 | 90,112 | 450,560 |
+/// slope of peak-above-steady-state against the prefill chunk.
 ///
 /// Two families need it. A linear-attention hybrid holds one chunk-wide q/k/v
-/// stream per LINEAR layer — all of them, not the ~3 the eval cadence bounds
-/// (48 x 10240 elems on the 27B, 24 x 8192 on the 4B, both landing within 7%
-/// of the measured excess over the envelope). A MoE prefill sorts and gathers,
+/// stream per LINEAR layer — all of them, not the ~3 the eval cadence bounds.
+/// A MoE prefill sorts and gathers,
 /// which replicates the hidden stream `top_k` times per layer alongside the
 /// expert rows, for the 4 layers the MoE eval cadence lets coexist.
 ///
@@ -9717,9 +9690,6 @@ fn handleChatCompletions(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    // NOTE: no `lm.transformer.?` here — the only MLX-specific gate below
-    // reads `config.has_hybrid_layers`, so the transformer is never needed at
-    // this level.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -10004,10 +9974,6 @@ fn handleChatCompletions(
     }
     if (enable_drafter and logprobs_n > 0) {
         log.info("  drafter=disabled (logprobs requested)\n", .{});
-        enable_drafter = false;
-    }
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) {
-        log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
@@ -10341,7 +10307,6 @@ fn handleCompletions(
     else
         lm.dflash != null;
     if (enable_drafter and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
@@ -11555,29 +11520,6 @@ const StreamingTokenStream = struct {
     }
 };
 
-/// Choose the speculative-decoding mode for a streaming request based on
-/// the request flags and the model capabilities. Mirrors the dispatch in
-/// `handleNonStreamingGeneration` so streaming and non-streaming pick the
-/// same path for the same inputs.
-///
-/// Priority: DFlash > MTP > regular (matches the non-streaming dispatch in
-/// `handleNonStreamingGeneration`). The same per-mode disable rules (no
-/// logprobs, no grammar constraint, no hybrid SSM for drafter) apply at the
-/// request-entry parse site; `pickStreamMode` re-enforces them defensively
-/// here so a missed gate at the parse site doesn't crash the dispatch.
-/// Does this trunk's architecture rule the loaded assistant sidecar out?
-///
-/// The hybrid veto exists for the GEMMA cross-attention drafter, whose
-/// multi-token verify was never wired for a recurrent trunk. A DFlash/DSpark
-/// sidecar is a different mechanism — it reads the trunk's own layer captures
-/// and rolls the conv state back from the verify pass's per-position capture
-/// — so a hybrid target is exactly what LiquidAI ships DSpark FOR. ONE
-/// predicate, because this gate is re-derived on four request surfaces and a
-/// missed site decodes serial with everything else looking healthy.
-pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) bool {
-    return has_hybrid_layers and !dflash_loaded;
-}
-
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 
 /// The ONE request-level spec dispatch, shared by every surface x stream /
@@ -11585,11 +11527,8 @@ pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 /// `scheduler.specInitWiring`. A loaded DFlash sidecar is an explicit choice
 /// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
 /// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
-/// false` hand the round back to MTP. The gemma cross-attention drafter
-/// stays below MTP. logprobs and a grammar constraint disable every mode; a repeat or presence
+/// false` hand the round back to MTP. logprobs and a grammar constraint disable every mode; a repeat or presence
 /// penalty disables only the sidecar and the drafter, since MTP shifts its verify rows for it.
-/// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
-/// already applied at every surface's parse site.
 pub fn requestSpecModes(
     enable_drafter: bool,
     enable_mtp: bool,
@@ -15878,10 +15817,7 @@ const RequestMedia = struct {
 };
 
 /// Decode one `image_url` into as many entries as the model's processor makes
-/// of it — one per tower call. Only LFM2-VL ever yields more than one: past its
-/// single-tile token budget it splits the source into a tile grid plus a
-/// thumbnail, and each piece is encoded separately. Every other arch appends
-/// exactly one entry. Returns false when nothing could be decoded (a remote
+/// of it. Returns false when nothing could be decoded (a remote
 /// URL, bad base64, an unreadable payload) so the caller can refuse by name
 /// instead of answering a prompt the image silently fell out of.
 pub fn appendImageUrlContent(
@@ -15906,8 +15842,7 @@ fn resampleFilterFor(vp: chat_mod.VisionPreproc) vision_common.Filter {
 
 /// A decoded source image as packed RGB8, owned by `allocator`. One owner and
 /// one free path — stb and libwebp buffers are copied out and released here, so
-/// callers that need the pixels for more than one pass (LFM2-VL's tiles) do not
-/// juggle three different deallocators.
+/// callers do not juggle three different deallocators.
 const DecodedRgb = struct {
     rgb: []u8,
     w: u32,
@@ -15978,8 +15913,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
     // processor's pixel_values. `grid_h/grid_w` carry the full patch grid;
-    // token count = (gh/merge)·(gw/merge). Qwen bounds the PIXEL area, muse the
-    // merged-token count, and their patch orders differ — see muse_vision.zig.
+    // token count = (gh/merge)·(gw/merge). Qwen bounds the PIXEL area.
     if (vp.mode != .gemma) {
         const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
         const plan = planImage(vp, src_w, src_h) orelse return null;
@@ -16861,7 +16795,6 @@ fn handleAnthropicMessages(
     else
         lm_default_enable_drafter;
     if (enable_drafter and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -17126,7 +17059,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     }
 
     // Thinking config. An absent `thinking` object consults the arch default
-    // (muse+tools delivers its always-on reasoning as thinking blocks rather
+    // (an arch that always reasons delivers it as thinking blocks rather
     // than paying for it and discarding it); a PRESENT object decides
     // explicitly, exactly as before.
     var enable_thinking = if (root.get("thinking") == null)
@@ -18925,7 +18858,6 @@ fn handleResponsesInner(
     else
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, 0);
@@ -21123,7 +21055,7 @@ test "getEffectiveContextLength computes safe default from GPU memory" {
 
 test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regression)" {
     const GB: u64 = 1 << 30;
-    // qwen3_5_moe footprint that OOM'd a 16 GB Mac: 32 layers, 4 kv heads, head_dim 256.
+    // A footprint that OOM'd a 16 GB Mac: 32 layers, 4 kv heads, head_dim 256.
     const kv_per_tok: u64 = 32 * 2 * 4 * 256 * 2; // 131072
     const work_per_tok: u64 = 8 * 9216 * 2; //        147456
     const per_tok: u64 = kv_per_tok + work_per_tok;
@@ -21295,7 +21227,7 @@ test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker
 
 test "auto-context tightens under external memory pressure vs the pre-fix static ceiling (#64)" {
     const GB: u64 = 1 << 30;
-    // qwen3_5_moe 35B-A3B footprint (per-token KV + working envelope).
+    // A 35B-A3B MoE footprint (per-token KV + working envelope).
     const per_tok: u64 = 328 * 1024;
     const static_max: u64 = 115 * GB;
     const active: u64 = 26 * GB;
@@ -21335,7 +21267,7 @@ test "safeContextForBudget floors when memory is exhausted and caps at max_pos" 
 
 test "kvBytesPerTokenAtBits: the KV bill follows the CONFIGURED quant width" {
     const t = std.testing;
-    // qwen3_5 27B dense: 16 caching layers x 4 kv heads x 256 head_dim x (K+V) x 2 B.
+    // Dense: 16 caching layers x 4 kv heads x 256 head_dim x (K+V) x 2 B.
     const dense: u64 = 16 * 4 * 256 * 2 * 2; // 65536
 
     // Dense/off bills fp16 verbatim — no change for anyone not using --kv-quant.
@@ -21823,13 +21755,11 @@ test "a stream never starts inside a think block because the REQUEST asked for t
     // enable-thinking flag into the prompt-derived one (the needle below is
     // ++-split so this comment cannot satisfy the scan), on the assumption
     // that a thinking-enabled model
-    // opens `<think>` as its first token. That is true for Qwen and Gemma —
-    // whose templates render the opener, which `promptOpensThink` then SEES in
-    // the rendered bytes anyway — and false for LFM2-VL, whose generation
-    // prompt is a bare `<|im_start|>assistant\n` and whose model answers
-    // directly. With `enable_thinking: true` the whole answer streamed as
-    // `reasoning_content` and `content` came back EMPTY (live 2026-08-13: the
-    // app renders it as a Thinking block with no reply under it). The same
+    // opens `<think>` as its first token. That is true when the template
+    // renders the opener, which `promptOpensThink` then SEES in the rendered
+    // bytes anyway — and false for a template with a bare generation prompt
+    // whose model answers directly. With `enable_thinking: true` the whole
+    // answer streamed as `reasoning_content` and `content` came back EMPTY. The same
     // request non-streaming was correct, because the non-streaming split has
     // always keyed on the prompt — so the two surfaces disagreed about the
     // bytes of one answer, which is the class this scan pins.
@@ -22759,8 +22689,7 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
         .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = true, .default_budget = -1, .want = -1 },
         // ...but `--reasoning-budget` still binds there.
         .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = 4096, .want = 4096 },
-        // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse,
-        // Ling): the effort word reaches no template, so the budget is the ONLY
+        // Non-consuming template: the effort word reaches no template, so the budget is the ONLY
         // thing it does and every mapping stays exactly as it shipped.
         .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 1024 },
         .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 2048 },
@@ -23192,7 +23121,7 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
     try t.expectEqual(@as(u32, 24), dense.attnCacheLayerCount());
     try t.expectEqual(@as(u64, 24 * 8 * 256 * 2), dense.kvBytesPerToken());
 
-    // bailing_hybrid (Ling 3.0): 6 of 24 layers are attention, and MLA stores
+    // A hybrid with 6 of 24 layers attention, whose MLA stores
     // a 192-wide key against a 128-wide value. Billing it as a uniform arch
     // charged 196608 B/token against a real 61440 — a 3.2x over-bill that
     // pinned auto-context to under a third of what fits.
@@ -23310,7 +23239,7 @@ test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch
 }
 
 test "prefillMemoryNeeded: the SCORE width decides the score term, not the stored width" {
-    // bailing_hybrid: MLA contracts scores over qk_head_dim 192 while storing
+    // MLA contracts scores over qk_head_dim 192 while storing
     // values at v_head_dim 128 and declaring head_dim 128. mlx has a fused
     // vector kernel for that pair at DECODE and falls back to the composed
     // path at prefill widths, so the [heads, chunk, seq] score tensor is real —
@@ -23415,7 +23344,7 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
     }
 }
 
-test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwen3_5 twin keeps" {
+test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the same trunk without qwen4_exp keeps" {
     const t = std.testing;
     var twin = model_mod.ModelConfig{};
     twin.num_hidden_layers = 40;
@@ -23531,40 +23460,33 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
     ));
 }
 
-test "prefillMemoryNeeded: every prefill peak the box measured, re-derived for the conv_state compaction" {
+test "prefillMemoryNeeded: a GDN trunk's prefill peaks stay covered" {
     // Peak GPU bytes above steady state for ONE request on a clean boot
     // (`--prefix-cache-entries 0 --no-mtp --no-drafter`, /props
-    // peak_bytes minus active_bytes, M4 Max, 2026-08-14) — byte-identical
-    // across repeat boots, so these are exact figures, not samples. An
-    // estimate BELOW a peak we have actually seen is the case that ends in an
-    // uncatchable Metal OOM instead of a 400, so every row must be covered.
-    // Pre-fix this function billed 5 of these 8 shapes short, worst 0.58x.
-    // The qwen3.5 rows are the measured peaks minus the exact conv_state pin the compaction removed ((linear_layers - 5) x chunk x qkv x 2); the packs are not on the box to re-measure.
+    // peak_bytes minus active_bytes, M4 Max) — byte-identical across repeat
+    // boots, so these are exact figures, not samples. An estimate BELOW a peak
+    // we have actually seen ends in an uncatchable Metal OOM instead of a 400.
+    // The rows are the measured peaks minus the exact conv_state pin the
+    // compaction removed ((linear_layers - 5) x chunk x qkv x 2).
     const t = std.testing;
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
 
-    // qwen3_5 27B: hidden 5120, ffn 17408, 64 layers / 16 caching, hd 256,
+    // Hidden 5120, ffn 17408, 64 layers / 16 caching, hd 256,
     // 48 GatedDeltaNet layers x (2x16x128 + 48x128) elems x 2 B of stream.
     const q27_stream: u64 = 5 * (2 * 16 * 128 + 48 * 128) * 2;
     const q27_dq: u64 = 3 * 17408 * 5120 * 2;
     try t.expect(prefillMemoryNeeded(9320, 24, 4, 65536, 256, 256, 5120, 17408, 16, 2048, 9320, q27_stream, q27_dq, .{}) >= 2_174_449_280);
     try t.expect(prefillMemoryNeeded(9270, 24, 4, 65536, 256, 256, 5120, 17408, 16, 8192, 9270, q27_stream, q27_dq, .{}) >= 3_623_797_120);
-    // qwen3_5 4B: hidden 2560, ffn 9216, 32 layers / 8 caching, 24 GDN layers.
+    // Hidden 2560, ffn 9216, 32 layers / 8 caching, 24 GDN layers.
     const q4_stream: u64 = 5 * (2 * 16 * 128 + 32 * 128) * 2;
     const q4_dq: u64 = 3 * 9216 * 2560 * 2;
     try t.expect(prefillMemoryNeeded(9340, 16, 4, 32768, 256, 256, 2560, 9216, 16, 1024, 9340, q4_stream, q4_dq, .{}) >= 1_329_232_896);
     try t.expect(prefillMemoryNeeded(9270, 16, 4, 32768, 256, 256, 2560, 9216, 16, 8192, 9270, q4_stream, q4_dq, .{}) >= 2_559_863_168);
-    // gemma4 26B-A4B MoE: hidden 2816, top_k 8 x moe 704, 30 sliding layers.
+    // A MoE trunk: hidden 2816, top_k 8 x moe 704.
     const g4_stream: u64 = 4 * 8 * 2 * (2816 + 704) * 2;
     const g4_dq: u64 = 3 * 5632 * 2816 * 2;
     try t.expect(prefillMemoryNeeded(8204, 16, 8, 245760, 256, 256, 2816, 5632, 16, 4096, 8204, g4_stream, g4_dq, .{}) >= 3_960_000_000);
-    // lfm2 2.6B conv hybrid at the narrowest chunk measured: no stream term,
-    // and the forward is under the dequant route's minimum width.
-    try t.expect(prefillMemoryNeeded(10089, 32, 8, 16384, 64, 64, 2048, 10752, 16, 256, 10089, 0, 3 * 10752 * 2048 * 2, .{}) >= 782_000_000);
-    try t.expect(prefillMemoryNeeded(10206, 32, 8, 16384, 64, 64, 2048, 10752, 16, 8192, 10206, 0, 3 * 10752 * 2048 * 2, .{}) >= 2_527_000_000);
-    // muse_glimmer 30B dense: hidden 6656, ffn 19968, 52 layers, hd 128.
-    try t.expect(prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 3 * 19968 * 6656 * 2, .{}) >= 2_178_000_000);
 }
 
 test "prefillMemoryNeeded: the new terms fire only where the measurement put them" {
@@ -23601,8 +23523,7 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
     const narrow_with = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, dq, .{});
     const narrow_without = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, 0, .{});
     try t.expectEqual(narrow_with, narrow_without);
-    // A dense checkpoint passes 0 and is billed nothing for it (measured: a
-    // bf16 lfm2 sits within 0.19 GB of the 8-bit one, which IS this term).
+    // A dense checkpoint passes 0 and is billed nothing for it.
     try t.expectEqual(flat2k, prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0, .{}));
 
     // An arch with neither keeps the 3-envelope bill it had, plus the floor —
@@ -23614,7 +23535,7 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
 
 test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for plain attention" {
     const t = std.testing;
-    // qwen3_5 27B: 64 layers, every 4th full — 48 GatedDeltaNet layers, each
+    // 64 layers, every 4th full — 48 GatedDeltaNet layers, each
     // holding a chunk-wide q/k/v stream (2 x 16 x 128 key + 48 x 128 value).
     var q27 = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     q27.num_hidden_layers = 64;
@@ -23630,7 +23551,7 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
     q4.linear_num_value_heads = 32;
     try t.expectEqual(@as(u64, 5 * (2 * 16 * 128 + 32 * 128) * 2), prefillStreamBytesPerToken(&q4));
 
-    // gemma4 26B-A4B: no linear layers, but a MoE prefill gathers a top_k-fold
+    // No linear layers, but a MoE prefill gathers a top_k-fold
     // copy of the hidden stream beside the expert rows, for the 4 layers the
     // MoE eval cadence lets coexist.
     var g4 = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
@@ -23641,21 +23562,20 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
     g4.moe_intermediate_size = 704;
     try t.expectEqual(@as(u64, 4 * 8 * 2 * (2816 + 704) * 2), prefillStreamBytesPerToken(&g4));
 
-    // A plain attention arch (muse, llama, mistral) declares neither and is
+    // A plain attention arch declares neither and is
     // billed exactly what it was billed before this term existed.
     var dense = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     dense.num_hidden_layers = 52;
     dense.hidden_size = 6656;
     try t.expectEqual(@as(u64, 0), prefillStreamBytesPerToken(&dense));
 
-    // lfm2's conv layers are NOT linear-attention layers: it declares no
-    // linear head geometry, and its measured slope is one MLP envelope — the
-    // term must not invent a stream for it.
-    var lfm2 = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
-    lfm2.num_hidden_layers = 30;
-    lfm2.full_attention_interval = 4;
-    lfm2.hidden_size = 2048;
-    try t.expectEqual(@as(u64, 0), prefillStreamBytesPerToken(&lfm2));
+    // Non-attention layers without linear head geometry are NOT
+    // linear-attention layers: the term must not invent a stream for them.
+    var conv = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
+    conv.num_hidden_layers = 30;
+    conv.full_attention_interval = 4;
+    conv.hidden_size = 2048;
+    try t.expectEqual(@as(u64, 0), prefillStreamBytesPerToken(&conv));
 }
 
 test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the route's kill switch" {
@@ -24510,8 +24430,7 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
     // `logprobs.content` is defined as the tokens of the message content, but we
     // built it from the whole generation — so on every model that thinks, entry
     // 0 was the first token of the *reasoning* and the array lined up with
-    // nothing the client could see. Measured on Qwen3.6-27B (3 builds),
-    // Qwen3.6-35B-A3B, gemma-4-31b, gemma-4-e4b, Qwen3-4B and LFM2.5.
+    // nothing the client could see.
     const allocator = std.testing.allocator;
 
     var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
@@ -24973,7 +24892,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     try t.expect(!adaptive);
     try t.expect(hook_installed != adaptive);
 
-    // A qwen3_5 slot keeps the flat bound, hook and all.
+    // A slot without the adaptive hook keeps the flat bound.
     try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptive));
     try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
     try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive));

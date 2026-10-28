@@ -77,7 +77,7 @@ pub fn smartResizeDefault(height: u32, width: u32) Resized {
 }
 
 /// Resampling kernels, matching Pillow's. Qwen's processor asks for BICUBIC,
-/// Muse-Glimmer's for LANCZOS.
+/// the Lanczos arm's.
 pub const Filter = enum {
     bilinear,
     bicubic,

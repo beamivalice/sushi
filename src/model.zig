@@ -37,14 +37,12 @@ pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 /// scales only) but share the packed-u32 weight layout, so supporting them is
 /// a matter of skipping the biases fetch and passing the right mode string to
 /// the mlx quantized ops. Tag names match the mlx-c mode strings exactly.
-/// Upper bound on a vision tower's per-layer type table (muse ships 50).
+/// Upper bound on a vision tower's per-layer type table.
 pub const MAX_VISION_LAYERS = 64;
 
 /// A MiMo-ViT block's attention: all patches, or a band over the image's
 /// patches in row-major or column-major merge-unit order.
 pub const MimoVitAttn = enum { full, row, col };
-
-/// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
 
 pub const QuantMode = enum {
     affine,
@@ -77,7 +75,7 @@ pub const dsv41_pool_bytes: u64 = 1 << 30;
 
 pub const ModelConfig = struct {
     // Architecture identity
-    model_type: []const u8 = "gemma3",
+    model_type: []const u8 = "",
     weight_prefix: []const u8 = "language_model.model",
 
     // Core dimensions
@@ -147,7 +145,7 @@ pub const ModelConfig = struct {
     expert_vision_tower_bytes: u64 = 0,
     expert_vision_encode_bytes: u64 = 0,
 
-    // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
+    // Attention scale: 1/sqrt(query_pre_attn_scalar)
     query_pre_attn_scalar: u32 = 256,
 
     // Architectural differences between model families
@@ -157,12 +155,10 @@ pub const ModelConfig = struct {
     scale_embeddings: bool = true,
     has_pre_ff_norm: bool = true,
     has_qk_norm: bool = true,
-    // Learned per-head attention sinks (gpt_oss `self_attn.sinks`, [n_heads]):
+    // Learned per-head attention sinks (MiMo `self_attn.attention_sink_bias`):
     // one extra logit column that lands in the softmax DENOMINATOR only, so
-    // every head can attend to "nothing". mlx's fused SDPA takes them
-    // natively (`mlx_fast_scaled_dot_product_attention`'s `sinks` argument);
-    // this flag is what makes the loader fetch the weight and the forward
-    // pass it instead of the null array.
+    // every head can attend to "nothing". This flag is what makes the loader
+    // fetch the weight and the forward pass it instead of the null array.
     has_attn_sinks: bool = false,
     attn_sinks_global: bool = true,
     attn_sinks_sliding: bool = true,
@@ -196,7 +192,7 @@ pub const ModelConfig = struct {
     /// Store the recurrent state in f32 between tokens; `--qwen-gdn 16` keeps bf16.
     gdn_state_f32: bool = true,
 
-    // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
+    // KDA (Kimi Delta Attention, GLM) variations on the
     // GatedDeltaNet recurrence:
     //   - the forget gate is PER CHANNEL ([B,T,H,Dk]) rather than per head, so
     //     the fused kernel indexes `g` by the key channel (kda_vector_gate);
@@ -217,7 +213,7 @@ pub const ModelConfig = struct {
     /// deepseek_v41's own geometry, parsed once from config.json.
     dsv41: ?dsv41_config.Config = null,
 
-    // Multi-head Latent Attention (bailing_hybrid's full-attention layers,
+    // Multi-head Latent Attention (GLM's full-attention layers,
     // DeepSeek-V3 shape): low-rank Q (q_a_proj → q_a_layernorm → q_b_proj) and
     // a single compressed KV latent (kv_a_proj_with_mqa → kv_lora_rank latent
     // + qk_rope_head_dim shared rope key) expanded per head by kv_b_proj.
@@ -237,9 +233,7 @@ pub const ModelConfig = struct {
     // attention, whatever the interval says. The reference's rule is
     // `(idx+1) % group == 0 OR idx >= n_layers // group * group`, i.e. the
     // ragged tail after the last WHOLE group never gets linear attention.
-    // 0 = no tail bound, which is every other hybrid arch (qwen3_next, lfm2).
-    linear_attn_tail_from: u32 = 0,
-    partial_rotary_factor: f32 = 1.0,
+        partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
     // Qwen4-Exp (Qwen3.8-Flash-Next): gated residual streams ("hyper
@@ -337,7 +331,7 @@ pub const ModelConfig = struct {
     num_eos_tokens: u32 = 0,
 
     // Model-author sampling recommendations from generation_config.json
-    // (e.g. Qwen 3.6: temp 1.0 / top_p 0.95 / top_k 20; Gemma 4: top_k 64).
+    // (e.g. temp 1.0 / top_p 0.95 / top_k 20).
     // null = the file or key is absent. Used as defaults for request fields
     // the client OMITTED — Claude Code sends no sampling params at all, and
     // pre-2026-06 it sampled the full untruncated distribution at temp 1.0,
@@ -363,19 +357,18 @@ pub const ModelConfig = struct {
     /// volume, an unreadable fingerprint, a failed init): every bill and budget then runs as without a disk.
     prefix_cache_disk_declined: bool = false,
 
-    // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
+    // Explicit layer type map (true = full/global attention)
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = @splat(false),
 
-    // Vision encoder (Gemma 4 SigLIP)
+    // Vision encoder
     has_vision: bool = false,
     image_token_id: u32 = 0, // 0 = no image token
 
 
-    // Qwen3.5/3.6 vision (Qwen3-VL ViT). Distinct from the Gemma SigLIP fields
-    // above: Qwen ships a fused-qkv ViT with a patch merger, and the text trunk
-    // uses INTERLEAVED M-RoPE (image tokens get 2D grid positions). Populated in
-    // the qwen3_5 arm below. Encoder: src/qwen_vision.zig; M-RoPE: src/mrope.zig.
+    // Flash-Next vision (Qwen3-VL ViT): a fused-qkv ViT with a patch merger, and
+    // the text trunk uses INTERLEAVED M-RoPE (image tokens get 2D grid
+    // positions). Populated in the qwen4_exp arm below. Encoder: src/qwen_vision.zig; M-RoPE: src/mrope.zig.
     qwen_vision: bool = false,
     qv_depth: u32 = 0, // ViT transformer blocks
     qv_hidden: u32 = 0, // ViT hidden size
@@ -417,13 +410,10 @@ pub const ModelConfig = struct {
     vision_start_token_id: u32 = 0,
     vision_end_token_id: u32 = 0,
 
-    // Gemma 4: dual head dimensions and KV sharing
+    // Dual head dimensions and KV sharing (MiMo global layers)
     global_head_dim: u32 = 0, // 0 = same as head_dim
     num_global_key_value_heads: u32 = 0, // 0 = same as num_key_value_heads
 
-
-    // Hybrid layers (LFM2, Nemotron-H): per-layer type dispatch
-    has_hybrid_layers: bool = false,
     attn_fused_qkv: bool = false, // checkpoint ships self_attn.q_k_v_proj = [q | k | v] rows
     has_final_norm: bool = true, // false when a hyper-connection mixer replaces model.norm
     /// How many keys ONE query reads during prefill at this prompt length: every
@@ -438,7 +428,7 @@ pub const ModelConfig = struct {
         if (self.has_explicit_layer_types and layer_idx < 128) {
             return self.layer_is_global[layer_idx];
         }
-        // HF/mlx-lm convention (Gemma 3): the GLOBAL layer closes each group —
+        // HF/mlx-lm convention: the GLOBAL layer closes each group —
         // global when `(idx + 1) % pattern == 0` (layers 5, 11, … for pattern 6).
         return (layer_idx % self.sliding_window_pattern) == self.sliding_window_pattern - 1;
     }
@@ -481,7 +471,6 @@ pub const ModelConfig = struct {
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
         if (self.full_attention_interval == 0) return false;
-        if (self.linear_attn_tail_from != 0 and layer_idx >= self.linear_attn_tail_from) return false;
         return ((layer_idx + 1) % self.full_attention_interval) != 0;
     }
 
@@ -517,7 +506,7 @@ pub const ModelConfig = struct {
     /// linear-attention layers, which carry a FIXED-SIZE recurrent state
     /// instead of a per-token cache — billing them as attention layers made
     /// the memory model charge a uniform arch's footprint for a model
-    /// carrying a fraction of it (bailing_hybrid: 6 of 24).
+    /// carrying a fraction of it.
     pub fn attnCacheLayerCount(self: *const ModelConfig) u32 {
         if (self.full_attention_interval == 0) return self.num_hidden_layers;
         var n: u32 = 0;
@@ -655,7 +644,7 @@ pub const ModelConfig = struct {
         // (`mlaAttnWith` broadcasts the MQA rope key to `num_attention_heads`
         // and caches `[B, num_attention_heads, S, qk_dim]`), so its cache has
         // no grouping to save on — `num_key_value_heads` is the GQA question
-        // and this arch never asks it. Equal on Ling 3.0 (16/16), so the
+        // and this arch never asks it. Equal on today's checkpoints, so the
         // spelling is invisible today and would UNDER-bill the first MLA
         // checkpoint that groups — the direction that ends in an uncatchable
         // Metal OOM rather than a 400.
@@ -777,7 +766,7 @@ pub const ModelConfig = struct {
         return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
     }
 
-    /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
+    /// Qwen3.8-Flash-Next (`qwen4_exp`): a GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
@@ -925,24 +914,24 @@ pub const ModelConfig = struct {
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
-    /// recurrence (LFM2/Nemotron/GDN). Shared by Transformer.init and the scheduler's per-slot
+    /// recurrence (GDN). Shared by Transformer.init and the scheduler's per-slot
     /// allocation — the two predicates MUST agree or slots crash on a null
-    /// `ctx.ssm_entries` (the Qwen3.5-MoE class).
+    /// `ctx.ssm_entries`.
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
         if (self.isGlm5()) return false; // state belongs to glm5_forward.Request
-        return self.has_hybrid_layers or self.full_attention_interval > 0;
+        return self.full_attention_interval > 0;
     }
 
     /// Pure-config half of "can this arch ride the batched GatedDeltaNet
     /// decode kernel?" (`Transformer.forwardMoeBatchedDecode`) — a dense
-    /// GDN trunk with periodic full attention, i.e. the qwen3_5 family.
+    /// GDN trunk with periodic full attention.
     ///
     /// This exists because the answer is needed in TWO places that see
     /// different things: `server.zig` decides whether `--max-concurrent`
     /// clamps to 1 with only a ModelConfig in hand, while
     /// `Transformer.supportsBatchedGdnDecode` also checks the built layer
     /// set. Both MUST read this predicate — when they were hand-rolled
-    /// separately, the server kept clamping qwen3_5 to serial decode while
+    /// separately, the server kept clamping the GDN trunk to serial decode while
     /// the scheduler was happily batching it, so `--max-concurrent 4` (the
     /// obvious serving config) silently DISABLED the batched path.
     ///
@@ -1039,12 +1028,10 @@ pub const ModelConfig = struct {
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
     /// upstream defaults. Community re-quants/distills routinely ship no
-    /// generation_config.json (live 2026-07-13: a Qwen3.6-35B distill served
-    /// to pi resolved omitted fields to the hardcoded 1.0/1.0/off — full
-    /// untruncated tail sampling on a 4-bit MoE — and a 16K-token agent turn
-    /// degenerated into word salad). Same pattern as the gemma3 head-count
-    /// gotcha: when resolution relies on per-arch defaults a minimal
-    /// checkpoint may omit, fill them explicitly.
+    /// generation_config.json (omitted fields then resolve to the hardcoded
+    /// 1.0/1.0/off — full untruncated tail sampling on a 4-bit MoE, which
+    /// degenerates into word salad). When resolution relies on per-arch
+    /// defaults a minimal checkpoint may omit, fill them explicitly.
     ///
     /// Deliberately fills ONLY the truncation knobs (top_k/top_p — what keeps
     /// the tail out of the sample space), never temperature: a null temp stays
@@ -1233,7 +1220,7 @@ pub const GenerationDefaults = struct {
 pub const VisionProcessorDefaults = struct {
     min_pixels: ?u32 = null,
     max_pixels: ?u32 = null,
-    /// Muse: the cap is on MERGED tokens, not pixels.
+    /// The cap is on MERGED tokens, not pixels.
     max_image_tokens: ?u32 = null,
     min_image_tokens: ?u32 = null,
     max_video_tokens: ?u32 = null,
@@ -1414,8 +1401,7 @@ pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
 
 /// I/O-free variant for unit tests and for callers that already have the
 /// config.json bytes in memory. The full I/O-bound `parseConfig` delegates here.
-/// Qwen3-VL-family vision + M-RoPE fields, shared by the qwen3_5 and
-/// qwen4_exp arms (same `vision_config` keys, `rope_parameters.mrope_*`,
+/// Qwen3-VL-family vision + M-RoPE fields of the qwen4_exp arm (`vision_config` keys, `rope_parameters.mrope_*`,
 /// vision token ids). The generic vision_config block already set
 /// `has_vision`; this reads Qwen's own keys into `qv_*`.
 fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
@@ -1485,7 +1471,7 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
 }
 
 /// Flat HF `rope_parameters` carrying `rope_type: "yarn"` — the YaRN context
-/// extension, i.e. exactly what vLLM's `--hf-overrides` recipe for Qwen3.5
+/// extension, i.e. exactly what vLLM's `--hf-overrides` recipe for Qwen
 /// writes:
 ///
 ///   {"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 4.0,
@@ -1821,7 +1807,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     var config = ModelConfig{};
 
     // Detect model_type from top-level (always present)
-    const model_type = if (cfgField(root, "model_type")) |v| try cfgString(v) else "gemma3";
+    const model_type = if (cfgField(root, "model_type")) |v| try cfgString(v) else "";
 
     // Determine which object to read config from: text_config (nested) or root (flat)
     const cfg_obj = if (cfgField(root, "text_config")) |tc_val| try cfgObject(tc_val) else root;
@@ -1876,7 +1862,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (v == .integer and v.integer >= 0) config.bos_token_id = try cfgInt(u32, v);
     }
 
-    // Rope parameters (nested for Qwen3.5)
+    // Rope parameters (nested)
     if (cfg_obj.get("rope_parameters")) |rp_val| {
         if (rp_val == .object) {
             if (cfgField(rp_val.object, "rope_theta")) |v| config.rope_theta = try cfgF32(v);
@@ -1895,7 +1881,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     }
     if (cfgField(cfg_obj, "sliding_window_pattern")) |v| config.sliding_window_pattern = try cfgInt(u32, v);
 
-    // Gemma-specific: dual RoPE bases
+    // Dual RoPE bases (sliding layers)
     if (cfg_obj.get("rope_local_base_freq")) |v| config.rope_local_base_freq = jsonFloat(v);
     if (cfg_obj.get("rope_scaling")) |rs_val| {
         if (rs_val == .object) {
@@ -1903,7 +1889,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
     }
 
-    // Gemma 4: explicit layer_types array
+    // Explicit layer_types array
     if (cfg_obj.get("layer_types")) |lt_val| {
         if (lt_val == .array) {
             config.has_explicit_layer_types = true;
@@ -2360,7 +2346,7 @@ pub const Weights = struct {
 };
 
 /// The generic nestings a text trunk ships under: flat, mlx-community's
-/// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
+/// re-nest, and the VL original. `parseConfigFromJson`
 /// picks from config KEYS; this probe corrects it from the checkpoint.
 const FLAT_PREFIX = "model";
 const NESTED_PREFIX = "language_model.model";
@@ -2379,10 +2365,9 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 ///
 /// Which of the two a converter emits is not reliably declared in config.json,
 /// so `parseConfigFromJson` guesses from `text_config` presence — wrong for any
-/// checkpoint that nests without declaring one (mlx-community LFM2.5-2.6B:
-/// `Lfm2ForCausalLM`, an EMPTY `vision_config`, every weight under
-/// `language_model.model.*`; the guess picked `model` and the load died on
-/// `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
+/// checkpoint that nests without declaring one (an EMPTY `vision_config`,
+/// every weight under `language_model.model.*`; the guess picked `model` and
+/// the load died on `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
 /// both directions, so the weights get the last word.
 ///
 /// Conservative by construction: only the generic spellings participate
@@ -2925,7 +2910,7 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 ///     one f16 and the residual turns f32 at the first layer and STAYS f32,
 ///     so every later weight read is upcast — the YaRN-mscale class,
 ///     one level up. Measured on prism-ml/Ternary-Bonsai-27B-mlx-2bit (the
-///     only f16 checkpoint on hand, qwen3_5 GDN hybrid): 27.99 -> 23.88
+///     only f16 checkpoint on hand, a GDN hybrid): 27.99 -> 23.88
 ///     ms/forward, 14.7%, three paired boots with cooldown.
 ///
 /// Plain multi-dimensional WEIGHTS keep their dtype. They are matmul
@@ -3663,8 +3648,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
 }
 
 test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config" {
-    // Live soak capture 2026-07-13 (stamsam Qwen3.6-35B distill, served to pi):
-    // the community re-quant ships NO generation_config.json, so omitted-field
+    // A community re-quant ships NO generation_config.json, so omitted-field
     // sampling resolution bottomed out at the hardcoded 1.0/1.0/off — full
     // untruncated tail sampling on a 4-bit MoE. A 16K-token turn degenerated
     // into word salad (zero tool calls) and burned the client's whole output
@@ -3853,14 +3837,11 @@ test "ModelConfig eosTokenSlice" {
 }
 
 test "ModelConfig isGlobalLayer with sliding window" {
-    // Gemma 3 convention (HF + mlx-lm): every Nth layer is global, with the
+    // HF/mlx-lm convention: every Nth layer is global, with the
     // pattern anchored at the END of each group — global when
     // `(idx + 1) % pattern == 0`, i.e. layers 5, 11, 17… for pattern 6.
     // The old `% pattern == 0` phase made layer 0 global and layer 5 local —
-    // every layer got the wrong RoPE base/scale and attention scope, which
-    // surfaced as fluent-but-wrong output (spaced digits, broken arithmetic)
-    // on gemma-3-12b. Gemma 4 ships explicit layer_types and never hits this
-    // fallback.
+    // fluent-but-wrong output. Explicit layer_types never hit this fallback.
     var config = ModelConfig{};
     config.has_sliding_window = true;
     config.sliding_window_pattern = 6;
@@ -3894,32 +3875,6 @@ test "ModelConfig isLinearLayer" {
     try testing.expect(config.isLinearLayer(4));
 }
 
-test "linear_attn_tail_from forces full attention past the last whole group" {
-    // A layer count that is NOT a multiple of the group size is where the
-    // reference's second clause bites: with 40 layers, 40//6*6 = 36, so layers
-    // 36..39 are ALL full attention even though (idx+1) % 6 != 0. Dropping the
-    // clause would run four layers through the wrong attention type silently.
-    var config = ModelConfig{};
-    config.num_hidden_layers = 40;
-    config.full_attention_interval = 6;
-    config.linear_attn_tail_from = 40 / 6 * 6; // 36
-    try testing.expect(config.isLinearLayer(34));
-    try testing.expect(!config.isLinearLayer(35)); // (35+1) % 6 == 0
-    try testing.expect(!config.isLinearLayer(36)); // tail clause
-    try testing.expect(!config.isLinearLayer(37));
-    try testing.expect(!config.isLinearLayer(38));
-    try testing.expect(!config.isLinearLayer(39));
-}
-
-test "linear_attn_tail_from is off by default so no existing arch moves" {
-    // qwen3_next/lfm2 set full_attention_interval without a tail bound.
-    var config = ModelConfig{};
-    config.full_attention_interval = 4;
-    try testing.expectEqual(@as(u32, 0), config.linear_attn_tail_from);
-    try testing.expect(config.isLinearLayer(100));
-    try testing.expect(config.isLinearLayer(1000));
-}
-
 test "ModelConfig isLinearLayer disabled" {
     var config = ModelConfig{};
     config.full_attention_interval = 0;
@@ -3948,7 +3903,7 @@ test "ModelConfig isGlobalLayer with explicit layer_types" {
     var config = ModelConfig{};
     config.has_sliding_window = true;
     config.has_explicit_layer_types = true;
-    // Set layer 4 and 9 as global (like Gemma 4 E2B pattern)
+    // Set layer 4 and 9 as global
     config.layer_is_global[4] = true;
     config.layer_is_global[9] = true;
     try testing.expect(!config.isGlobalLayer(0));
@@ -4005,8 +3960,8 @@ test "ModelConfig layerHeadDim" {
     try testing.expectEqual(@as(u32, 512), config.layerHeadDim(4));
 }
 
-test "shouldKeepWeightKey accepts orphan MTP head weights on Qwen3.5/3.6 checkpoints" {
-    // Some Qwen3.5/3.6 checkpoints embed `*.mtp.*` tensors in the MAIN
+test "shouldKeepWeightKey accepts orphan MTP head weights" {
+    // Some checkpoints embed `*.mtp.*` tensors in the MAIN
     // shards (the sidecar-based MTP head in src/mtp.zig loads separately).
     // The safetensors iterator must let them through (they're neither vision
     // nor audio) so the model loads cleanly; the trunk binder ignores them.

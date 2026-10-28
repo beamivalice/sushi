@@ -1,4 +1,4 @@
-//! Interleaved M-RoPE host math for Qwen3.5/3.6 vision-language models.
+//! Interleaved M-RoPE host math for Flash-Next vision-language models.
 //!
 //! Faithful port of mlx-vlm's `rope_utils._interleaved_position_selector` and
 //! `Qwen3_5Model.get_rope_index` (mlx_vlm/models/qwen3_5/language.py). All math
@@ -230,7 +230,7 @@ pub fn computeInvFreq(out: []f64, rotary_dim: usize, theta: f64) void {
 /// YaRN rope scaling (Peng et al., github.com/jquesnelle/yarn) as HF's
 /// `_compute_yarn_parameters` computes it from a `rope_parameters` block with
 /// `rope_type: "yarn"` — the mechanism vLLM exposes through `--hf-overrides`
-/// to stretch Qwen3.5 past its trained window. Pure f64 host math (no MLX), so
+/// to stretch a Qwen trunk past its trained window. Pure f64 host math (no MLX), so
 /// it unit-tests straight against the reference values.
 ///
 /// The trunk ropes every one of its rotary tables (attention, the QSA indexer,

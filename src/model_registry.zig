@@ -235,7 +235,7 @@ pub const LoadedModel = struct {
     /// Iteration 2 (perf-plan Phase 4 #3): LRU cache of chat-template
     /// render+tokenize results, keyed by a digest of (messages, tools,
     /// flags). Targets the warm-reuse path where Jinja+BPE was
-    /// observed at 240 ms on a 1813-tok Gemma prompt — 7× the actual
+    /// observed at 240 ms on a 1813-tok prompt — 7× the actual
     /// Metal prefill on a KV-cache hit. Null when the load's
     /// `tokenize_cache_entries` is 0 (a test disables it).
     tokenize_cache: ?TokenizeCache = null,

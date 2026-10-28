@@ -535,7 +535,7 @@ pub fn main(init: std.process.Init) !void {
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
     var vision = false;
-    var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
+    var drafter_dir: ?[]const u8 = null; // Path to a DFlash2 assistant checkpoint
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     // --mtp: force the head ON where requests do not default to it: an SSD-streamed
@@ -549,7 +549,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default;
     var kv_quant_explicit = false;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
-    // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
+    // 32–64 GB systems running small models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
