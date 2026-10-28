@@ -21,15 +21,6 @@ pub const ImageData = struct {
     // pixel_values and the encoder is QwenVision (see src/qwen_vision.zig).
     grid_h: u32 = 0,
     grid_w: u32 = 0,
-    /// LFM2-VL tiling: a source image past the single-tile budget is split into
-    /// a `tile_rows` x `tile_cols` grid plus a thumbnail, and EACH piece is its
-    /// own entry here — separate patch grid, separate encoder call. `tile_index`
-    /// runs row-major over the tiles, and `tile_index == rows*cols` is the
-    /// thumbnail. All three stay 0 for an untiled image, which is every other
-    /// tower we serve.
-    tile_rows: u16 = 0,
-    tile_cols: u16 = 0,
-    tile_index: u16 = 0,
     /// `pixels` is still the encoded file (JPEG/PNG/WebP) and `width`/`height`/`grid_*` are the plan the
     /// processor will reach; the tower's turn decodes it, so a request holds the compressed bytes only.
     undecoded: bool = false,
@@ -4220,7 +4211,7 @@ fn toolNameChar(c: u8) bool {
 }
 
 /// The trailing identifier run ending at `end` (exclusive): a name that
-/// echoed a channel marker (`<|content_text|>bash`) resolves to the bare NAME.
+/// echoed a channel marker (`<|marker|>bash`) resolves to the bare NAME.
 fn trailingNameRun(text: []const u8, end: usize) []const u8 {
     var start = end;
     while (start > 0 and toolNameChar(text[start - 1])) start -= 1;

@@ -1210,8 +1210,7 @@ pub const GenerationDefaults = struct {
     /// thinking default. null when absent or not a bool.
     enable_thinking: ?bool = null,
     /// `eos_token_id` (scalar or list): HF stops generation on these, and a
-    /// checkpoint may name the chat terminator ONLY here (K2-Horizon's
-    /// `<|ifm|im_end|>` rides beside config.json's `<|ifm|endoftext|>`).
+    /// checkpoint may name the chat terminator ONLY here.
     eos_token_ids: [8]u32 = @splat(0),
     num_eos: usize = 0,
 };
