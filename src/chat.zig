@@ -421,7 +421,7 @@ pub fn renderChatTemplate(
     continue_final: bool,
 ) ![]const u8 {
     // Split the partial reply off FIRST, so every transform below (tool
-    // fallback synthesis, muse's reasoning drop) sees exactly the message list
+    // fallback synthesis) sees exactly the message list
     // an ordinary turn would have. The template must open the assistant turn
     // once, which it only does when the trailing assistant is not in `messages`.
     const prefill = continuationPrefill(messages, continue_final);
@@ -512,30 +512,9 @@ pub fn renderChatTemplate(
         }
     }
 
-    // Muse (harmony convention): reasoning belongs to the CURRENT turn only.
-    // The app round-trips `reasoning_content` on assistant history, and this
-    // template renders it as a to=self segment — so one bad chain (a loop-cut
-    // tail) would replay in the prompt on every later turn. Drop it on
-    // assistant messages before the last user message; tool rounds after it
-    // keep theirs. Families whose templates NEED history reasoning are
-    // untouched — same sniff `noThinkTailSuffix` uses.
-    if (std.mem.indexOf(u8, tpl, "reasoning_strength") != null) {
-        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
-        if (try dropPriorTurnReasoning(fallback_arena.?.allocator(), effective_messages)) |stripped| {
-            effective_messages = stripped;
-        }
-    }
-
     // Serialize messages to JSON — Gemma 4 templates handle role:"tool" natively
     // (producing <|turn>tool in the rendered output). No transformation needed.
-    // Harmony (gpt_oss) indexes into `message.content` after only checking that
-    // the KEY exists, so a null there breaks every tool round-trip. Sniffed off
-    // the template's own channel marker, like the reasoning drop above.
-    const empty_content: EmptyContent = if (std.mem.indexOf(u8, tpl, "<|channel|>") != null)
-        .empty_string
-    else
-        .null_literal;
-    const messages_json = try serializeMessagesJsonFor(allocator, effective_messages, empty_content, chat_config);
+    const messages_json = try serializeMessagesJsonFor(allocator, effective_messages, chat_config);
     defer allocator.free(messages_json);
 
     // Null-terminate strings for C
@@ -554,7 +533,7 @@ pub fn renderChatTemplate(
 
     if (prefill) |partial| {
         const turn = messages[messages.len - 1];
-        if (try renderContinuation(allocator, tmpl_z, extra_z, tools_z, effective_messages, turn, partial, empty_content, chat_config)) |cont| return cont;
+        if (try renderContinuation(allocator, tmpl_z, extra_z, tools_z, effective_messages, turn, partial, chat_config)) |cont| return cont;
     }
 
     // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
@@ -578,10 +557,10 @@ pub fn renderChatTemplate(
         if (prefill) |partial| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{
-                collapsed, contentChannelTail(tpl, collapsed, true), partial,
+                collapsed, contentChannelTail(collapsed), partial,
             });
         }
-        if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
+        if (noThinkTailSuffix(collapsed, enable_thinking)) |suffix| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
         }
@@ -618,14 +597,13 @@ fn renderContinuation(
     history: []const Message,
     turn: Message,
     partial: []const u8,
-    empty_content: EmptyContent,
     chat_config: *const ChatConfig,
 ) !?[]const u8 {
     const turns = try allocator.alloc(Message, history.len + 1);
     defer allocator.free(turns);
     @memcpy(turns[0..history.len], history);
     turns[history.len] = .{ .role = "assistant", .content = partial, .reasoning_content = turn.reasoning_content };
-    const json = try serializeMessagesJsonFor(allocator, turns, empty_content, chat_config);
+    const json = try serializeMessagesJsonFor(allocator, turns, chat_config);
     defer allocator.free(json);
     const json_z = try allocator.dupeSentinel(u8, json, 0);
     defer allocator.free(json_z);
@@ -638,32 +616,6 @@ fn renderContinuation(
     const text = std.mem.trimStart(u8, partial, " \t\r\n");
     const at = std.mem.lastIndexOf(u8, rendered, text) orelse return null;
     return try allocator.dupe(u8, rendered[0 .. at + text.len]);
-}
-
-/// Null `reasoning_content` on assistant messages BEFORE the last user
-/// message (harmony convention: prior-turn analysis is dropped from the
-/// prompt; the current turn's tool rounds keep theirs). Returns null when
-/// nothing would change, so the common no-history-reasoning case allocates
-/// nothing.
-fn dropPriorTurnReasoning(arena: std.mem.Allocator, messages: []const Message) !?[]const Message {
-    var last_user: ?usize = null;
-    for (messages, 0..) |m, i| {
-        if (std.mem.eql(u8, m.role, "user")) last_user = i;
-    }
-    const cut = last_user orelse return null;
-    var any = false;
-    for (messages[0..cut]) |m| {
-        if (std.mem.eql(u8, m.role, "assistant") and m.reasoning_content != null) {
-            any = true;
-            break;
-        }
-    }
-    if (!any) return null;
-    const out = try arena.dupe(Message, messages);
-    for (out[0..cut]) |*m| {
-        if (std.mem.eql(u8, m.role, "assistant")) m.reasoning_content = null;
-    }
-    return out;
 }
 
 /// DSV4's chat template emits `</think></think>` between every user→assistant
@@ -1018,24 +970,6 @@ fn synthesizeToolFallbackMessages(
     return out.toOwnedSlice(arena);
 }
 
-/// How an assistant message with NO content should serialize.
-///
-/// Most templates read `message.content is none` / `if message.content`, and
-/// `null` is what they expect. Harmony (gpt_oss) does BOTH of these in
-/// sequence on every assistant message:
-///
-///     {%- if "content" in message %}
-///         {%- if "<|channel|>analysis<|message|>" in message.content ... %}
-///
-/// The first test asks whether the KEY exists, the second indexes into the
-/// VALUE — so `"content": null` passes the guard and then substring-searches
-/// None. A tool-calling assistant turn is exactly the message that carries no
-/// content, so every tool round-trip hit it (live 2026-08-12: the reply came
-/// back with reasoning and raw `<|channel|>final>` markers in the content).
-/// Serializing `""` satisfies both readings — the key exists, and it is falsy
-/// everywhere the template branches on it.
-pub const EmptyContent = enum { null_literal, empty_string };
-
 /// Deepest `{`/`[` nesting a JSON request may carry: the recursive consumers (echo, schema, template) have no cap of their own.
 pub const max_json_nesting: usize = 256;
 
@@ -1064,11 +998,7 @@ pub fn jsonNestingExceeds(body: []const u8, limit: usize) bool {
 }
 
 pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message) ![]const u8 {
-    return serializeMessagesJsonOpts(allocator, messages, .null_literal);
-}
-
-pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null);
+    return serializeMessagesJsonImpl(allocator, messages, false, null);
 }
 
 /// K2-Horizon's template raises on an assistant turn with NO thinking field,
@@ -1078,8 +1008,8 @@ fn templateRequiresReasoningField(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "'ifm|think'") != null;
 }
 
-pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.image_placeholder);
+pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, chat_config: *const ChatConfig) ![]const u8 {
+    return serializeMessagesJsonImpl(allocator, messages, templateRequiresReasoningField(chat_config.chat_template), chat_config.image_placeholder);
 }
 
 /// `content` as the typed part list vision templates render, each media part
@@ -1136,7 +1066,7 @@ fn appendJoined(allocator: std.mem.Allocator, text: *std.ArrayList(u8), piece: [
     try text.appendSlice(allocator, piece);
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, image_atom: ?[]const u8) ![]const u8 {
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, reasoning_required: bool, image_atom: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1151,10 +1081,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
             if (image_atom) |atom| try appendContentText(allocator, &buf, msg.content, msg.media_parts.?, atom) else try appendContentParts(allocator, &buf, msg.content, msg.media_parts.?);
         } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
-        } else switch (empty_content) {
-            .null_literal => try buf.appendSlice(allocator, "null"),
-            .empty_string => try buf.appendSlice(allocator, "\"\""),
-        }
+        } else try buf.appendSlice(allocator, "null");
 
         if (msg.tool_calls) |tcs| {
             try buf.appendSlice(allocator, ",\"tool_calls\":[");
@@ -1215,7 +1142,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
 ///
 /// `description` is optional in OpenAI's function schema and a no-arg tool
 /// needs no `parameters`, but a template that renders `fn.description | tojson`
-/// (muse) or `tool | tojson` wholesale hits `tojson` on Undefined, which is a
+/// or `tool | tojson` wholesale hits `tojson` on Undefined, which is a
 /// jinja RAISE — i.e. a silent `fallbackFormatChat` with no tools preamble at
 /// all, for a request that was perfectly legal. Returns null when every
 /// function already carries both keys, so the common path re-emits nothing and
@@ -1269,8 +1196,7 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// `reasoning_budget_tokens` or `--reasoning-budget` is someone asking for a
 /// cap on purpose and still applies.
 ///
-/// Substring on the KEY, so a family reading a different one is untouched:
-/// muse's `reasoning_strength` is a near-miss the corpus pins.
+/// Substring on the KEY, so a family reading a different one is untouched.
 pub fn templateConsumesEffort(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
 }
@@ -1405,23 +1331,6 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         if (std.mem.indexOf(u8, chat_config.chat_template, "preserve_thinking") != null) {
             try buf.appendSlice(allocator, if (keep) ",\"preserve_thinking\":true" else ",\"preserve_thinking\":false");
         }
-    }
-
-    // Muse-Glimmer reads `reasoning_strength` (its template default is
-    // 'high' and it has no thinking-off switch — the model always emits a
-    // to=self segment). Map the client's effort onto low|medium|high;
-    // thinking-off drops to 'low'. Only emitted when the template reads it.
-    if (std.mem.indexOf(u8, chat_config.chat_template, "reasoning_strength") != null) {
-        const strength: []const u8 = if (!enable_thinking)
-            "low"
-        else if (effort) |e| blk: {
-            if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) break :blk "low";
-            if (std.mem.eql(u8, e, "medium")) break :blk "medium";
-            break :blk "high";
-        } else "high";
-        try buf.appendSlice(allocator, ",\"reasoning_strength\":\"");
-        try buf.appendSlice(allocator, strength);
-        try buf.append(allocator, '"');
     }
 
     try buf.append(allocator, '}');
@@ -1819,11 +1728,6 @@ test "thinkOpenerPossible: a thought no opener can start is delivered without wa
     try std.testing.expect(thinkOpenerPossible("<"));
     try std.testing.expect(thinkOpenerPossible("<thi"));
     try std.testing.expect(thinkOpenerPossible("\n<|chan"));
-    // Muse headers open with bare text: the context word and the recipient.
-    try std.testing.expect(thinkOpenerPossible("assist"));
-    try std.testing.expect(thinkOpenerPossible("assistant to"));
-    try std.testing.expect(thinkOpenerPossible("to"));
-    try std.testing.expect(thinkOpenerPossible("to=self"));
     try std.testing.expect(!thinkOpenerPossible("too"));
 }
 
@@ -1866,7 +1770,6 @@ const tool_markup_openers = [_][]const u8{
     "</｜DSML｜", // lone closers the model emits after prose with no opener
     "<|tool_call", // Gemma 4
     "<tool_call", // Hermes XML + the plural variants
-    "<atem:", // Muse-Glimmer ATEM (covers function_calls/invoke/parameter)
 };
 
 /// Earliest index of Claude-style `<function_calls>` / `<invoke …>` markup, or null. Like MiniCPM5's,
@@ -2020,496 +1923,11 @@ pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8
 /// split across deltas. Shared by every streaming surface's flush path.
 pub fn isChannelMarkerToken(tt: []const u8) bool {
     return std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
-        std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>") or
-        std.mem.eql(u8, tt, MUSE_START_TAG) or std.mem.eql(u8, tt, MUSE_MSG_TAG) or
-        std.mem.eql(u8, tt, MUSE_EOM_TAG) or std.mem.eql(u8, tt, MUSE_EOT_TAG);
+        std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>");
 }
-
-// ── Muse-Glimmer (muse_glimmer) channel format ──────────────────────────
-//
-// The model emits harmony-style SEGMENTS after the prompt's bare
-// `<|start|>assistant`:
-//   ` to=self<|message|>REASONING<|eom|>` then
-//   `<|start|>assistant to=user<|message|>ANSWER<|eot|>` — or a tool segment
-//   `<|start|>assistant to=<fn><|message|><atem:function_calls>…<|eot|>`.
-// <|start|>/<|message|>/<|eom|>/<|eot|> are single special tokens (ids
-// 200022/200023/200007/200008); the `assistant to=<recipient>` header BETWEEN
-// them is ORDINARY text, which is what makes an unresolved header something
-// every streaming path must hold rather than flush.
-const MUSE_START_TAG = "<|start|>";
-const MUSE_MSG_TAG = "<|message|>";
-const MUSE_EOM_TAG = "<|eom|>";
-const MUSE_EOT_TAG = "<|eot|>";
 
 pub const BARE_THINK_OPENER = "<think>";
 pub const BARE_THINK_CLOSER = "</think>";
-
-// ── gpt_oss / harmony channels ──
-//
-// After the generation prompt's bare `<|start|>assistant`, the model emits
-// channel segments:
-//   `<|channel|>analysis<|message|>REASONING<|end|>`
-//   `<|start|>assistant<|channel|>final<|message|>ANSWER<|return|>`
-//   `<|start|>assistant to=functions.NAME<|channel|>commentary <|constrain|>json`
-//       `<|message|>{args}<|call|>`
-//
-// Muse is this format's descendant and shares `<|start|>`/`<|message|>`, so
-// `<|message|>` alone CANNOT discriminate the two families. `<|channel|>` is
-// harmony's and only harmony's — both routers key on it, one to claim and one
-// to decline.
-const HARMONY_START_TAG = "<|start|>";
-const HARMONY_CHANNEL_TAG = "<|channel|>";
-const HARMONY_MSG_TAG = "<|message|>";
-const HARMONY_END_TAG = "<|end|>";
-const HARMONY_RETURN_TAG = "<|return|>";
-const HARMONY_CALL_TAG = "<|call|>";
-
-const HarmonySegment = struct { channel: []const u8, recipient: []const u8, body: []const u8 };
-
-/// Channel, recipient and body of the segment in text[seg_start..seg_end].
-/// null when the header never resolved — a header still streaming in is never
-/// content.
-///
-/// The recipient is searched for across the WHOLE header because harmony
-/// permits it on either side of the channel name (`assistant to=functions.x
-/// <|channel|>commentary` and `<|channel|>commentary to=functions.x` are the
-/// same call).
-fn harmonySegmentAt(text: []const u8, seg_start: usize, seg_end: usize) ?HarmonySegment {
-    const seg = text[seg_start..seg_end];
-    const msg_rel = std.mem.indexOf(u8, seg, HARMONY_MSG_TAG) orelse return null;
-    const header = seg[0..msg_rel];
-    const chan_rel = std.mem.indexOf(u8, header, HARMONY_CHANNEL_TAG) orelse return null;
-
-    // Channel name = the identifier run right after the marker.
-    const after = header[chan_rel + HARMONY_CHANNEL_TAG.len ..];
-    var n: usize = 0;
-    while (n < after.len and museIsRecipientChar(after[n])) n += 1;
-    const channel = after[0..n];
-
-    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t| blk: {
-        const r = header[t + 3 ..];
-        var m: usize = 0;
-        while (m < r.len and museIsRecipientChar(r[m])) m += 1;
-        break :blk r[0..m];
-    } else "";
-
-    var body = seg[msg_rel + HARMONY_MSG_TAG.len ..];
-    for ([_][]const u8{ HARMONY_END_TAG, HARMONY_RETURN_TAG, HARMONY_CALL_TAG }) |tag| {
-        if (std.mem.indexOf(u8, body, tag)) |e| body = body[0..e];
-    }
-    return .{ .channel = channel, .recipient = recipient, .body = body };
-}
-
-/// gpt_oss channel split. Claims the text only when `<|channel|>` is present.
-/// First segment of each destination wins. A tool segment's body rides out as
-/// content ONLY when there is no final segment, so the KeepingMarkup callers
-/// can still see the call and the trim wrapper cuts it from display — the same
-/// contract muse's splitter honours.
-fn splitHarmonyChannels(text: []const u8) ?ThinkSplit {
-    if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) == null) return null;
-    var reasoning: ?[]const u8 = null;
-    var content: ?[]const u8 = null;
-    var tool_body: ?[]const u8 = null;
-    var routed = false;
-
-    var seg_start: usize = 0;
-    while (true) {
-        const next = std.mem.indexOfPos(u8, text, seg_start + 1, HARMONY_START_TAG);
-        const seg_end = next orelse text.len;
-        if (harmonySegmentAt(text, seg_start, seg_end)) |s| {
-            routed = true;
-            if (std.mem.startsWith(u8, s.recipient, "functions.")) {
-                // A tool call, whatever channel it rode in on.
-                if (tool_body == null) tool_body = s.body;
-            } else if (std.mem.eql(u8, s.channel, "analysis")) {
-                if (reasoning == null) {
-                    const r = std.mem.trim(u8, s.body, "\n ");
-                    if (r.len > 0) reasoning = r;
-                }
-            } else {
-                // `final`, and a bare `commentary` preamble addressed to no
-                // tool — both are user-visible.
-                if (content == null) content = std.mem.trim(u8, s.body, "\n ");
-            }
-        }
-        seg_start = next orelse break;
-    }
-    if (!routed) return null;
-    return .{
-        .reasoning_content = reasoning,
-        .content = content orelse (tool_body orelse ""),
-    };
-}
-
-/// What a harmony segment header at the START of a streaming buffer means.
-/// Mirrors `museThinkOpenerAt`: the streaming loop consumes the header bytes
-/// and latches a close tag, so the close matcher's pos/len model then works on
-/// reasoning that really does begin at byte 0.
-pub const HarmonyOpener = union(enum) {
-    /// `<|channel|>analysis<|message|>` — reasoning follows, closes at <|end|>.
-    /// Payload is the header length to strip.
-    analysis: usize,
-    /// A resolved header for any OTHER channel (`final`, bare `commentary`):
-    /// the answer starts immediately, with no reasoning at all.
-    direct: usize,
-    /// A header still arriving token by token — decide nothing yet, or its
-    /// text leaks as reasoning.
-    growing,
-    not_harmony,
-};
-
-pub fn harmonyThinkOpenerAt(buf: []const u8) HarmonyOpener {
-    var i: usize = 0;
-    if (std.mem.startsWith(u8, buf, HARMONY_START_TAG)) {
-        i = HARMONY_START_TAG.len;
-        while (i < buf.len and museIsRecipientChar(buf[i])) i += 1;
-    } else if (HARMONY_START_TAG.len > buf.len and std.mem.startsWith(u8, HARMONY_START_TAG, buf)) {
-        // A strict prefix of `<|start|>` — could still become one.
-        return if (buf.len == 0) .not_harmony else .growing;
-    }
-    const rest = buf[i..];
-    if (!std.mem.startsWith(u8, rest, HARMONY_CHANNEL_TAG)) {
-        // Partial `<|channel|>` still arriving.
-        if (rest.len < HARMONY_CHANNEL_TAG.len and rest.len > 0 and
-            std.mem.startsWith(u8, HARMONY_CHANNEL_TAG, rest)) return .growing;
-        return .not_harmony;
-    }
-    const after_chan = i + HARMONY_CHANNEL_TAG.len;
-    const msg = std.mem.indexOfPos(u8, buf, after_chan, HARMONY_MSG_TAG) orelse return .growing;
-    const hdr_len = msg + HARMONY_MSG_TAG.len;
-    if (std.mem.startsWith(u8, buf[after_chan..], "analysis")) return .{ .analysis = hdr_len };
-    return .{ .direct = hdr_len };
-}
-
-/// Byte length of a leading harmony ANALYSIS header
-/// (`[<|start|>assistant]<|channel|>analysis<|message|>`), or null when `buf`
-/// does not open with one.
-///
-/// The streaming split identifies a reasoning block by a close tag and emits
-/// everything before it, which assumes the reasoning starts at byte 0. Harmony
-/// puts a header there instead, and every byte of it is ordinary text — so
-/// without this the first reasoning delta opens with a literal
-/// `<|channel|>analysis<|message|>` (live 2026-08-12).
-pub fn harmonyAnalysisHeaderLen(buf: []const u8) ?usize {
-    var i: usize = 0;
-    if (std.mem.startsWith(u8, buf, HARMONY_START_TAG)) {
-        // Skip `<|start|>` + the role that follows it.
-        i = HARMONY_START_TAG.len;
-        while (i < buf.len and museIsRecipientChar(buf[i])) i += 1;
-    }
-    if (!std.mem.startsWith(u8, buf[i..], HARMONY_CHANNEL_TAG)) return null;
-    const after_chan = i + HARMONY_CHANNEL_TAG.len;
-    if (!std.mem.startsWith(u8, buf[after_chan..], "analysis")) return null;
-    const msg = std.mem.indexOfPos(u8, buf, after_chan, HARMONY_MSG_TAG) orelse return null;
-    return msg + HARMONY_MSG_TAG.len;
-}
-
-/// Drop a leading harmony segment header of ANY channel — the answer arrives
-/// as its own `<|start|>assistant<|channel|>final<|message|>` segment once the
-/// analysis channel closes, and that header is ordinary text that would
-/// otherwise ride out as the first bytes of content.
-pub fn stripHarmonySegmentHeader(text: []const u8) []const u8 {
-    var i: usize = 0;
-    if (std.mem.startsWith(u8, text, HARMONY_START_TAG)) {
-        i = HARMONY_START_TAG.len;
-        while (i < text.len and museIsRecipientChar(text[i])) i += 1;
-    }
-    if (!std.mem.startsWith(u8, text[i..], HARMONY_CHANNEL_TAG)) return text;
-    const msg = std.mem.indexOfPos(u8, text, i, HARMONY_MSG_TAG) orelse return text;
-    return text[msg + HARMONY_MSG_TAG.len ..];
-}
-
-/// gpt_oss streaming verdict, decided from the channel markers alone.
-/// null = not harmony traffic (fall through to the generic think gate).
-///
-/// The header between `<|channel|>` and `<|message|>` is ORDINARY text —
-/// only the delimiters are single special tokens — so an unresolved header
-/// always HOLDS. Flushing it leaks `analysis` / `commentary to=functions.…`
-/// fragments into the user's stream, which is the muse ` to=user` bug in a
-/// different alphabet.
-fn harmonyStreamVerdict(buf: []const u8) ?StreamThinkGate {
-    if (std.mem.indexOf(u8, buf, HARMONY_CHANNEL_TAG) == null) return null;
-    const seg_start = std.mem.lastIndexOf(u8, buf, HARMONY_START_TAG) orelse 0;
-    const seg = buf[seg_start..];
-    const chan_rel = std.mem.indexOf(u8, seg, HARMONY_CHANNEL_TAG) orelse return .hold_thinking;
-    const msg_rel = std.mem.indexOfPos(u8, seg, chan_rel, HARMONY_MSG_TAG) orelse return .hold_thinking;
-    const header = seg[0..msg_rel];
-
-    const after = header[chan_rel + HARMONY_CHANNEL_TAG.len ..];
-    var n: usize = 0;
-    while (n < after.len and museIsRecipientChar(after[n])) n += 1;
-    const channel = after[0..n];
-
-    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t| blk: {
-        const r = header[t + 3 ..];
-        var m: usize = 0;
-        while (m < r.len and museIsRecipientChar(r[m])) m += 1;
-        break :blk r[0..m];
-    } else "";
-
-    // Tool payload: the tools path buffers before this gate is consulted;
-    // hold defensively on a no-tools request rather than leak raw arguments.
-    if (std.mem.startsWith(u8, recipient, "functions.")) return .hold_thinking;
-    if (std.mem.eql(u8, channel, "analysis")) {
-        const closed = std.mem.indexOf(u8, seg, HARMONY_END_TAG) != null or
-            std.mem.indexOf(u8, seg, HARMONY_RETURN_TAG) != null;
-        return if (closed) .split_think else .hold_thinking;
-    }
-    return .split_think;
-}
-
-/// gpt_oss streaming tool hold: true while a segment header is unresolved
-/// (the next token decides whether it names a tool) or already resolved to a
-/// `functions.` recipient (the body is call arguments — parsed on the end
-/// flush, never streamed).
-fn harmonyHeaderHoldsForTools(buf: []const u8) bool {
-    const chan = std.mem.lastIndexOf(u8, buf, HARMONY_CHANNEL_TAG) orelse return false;
-    // Header runs from the segment's `<|start|>` (the `to=` may sit on either
-    // side of the channel marker) to `<|message|>`. No `<|message|>` yet means
-    // the header is still growing — hold, the next token may name a tool.
-    const msg_rel = std.mem.indexOfPos(u8, buf, chan, HARMONY_MSG_TAG) orelse return true;
-    const seg_start = std.mem.lastIndexOf(u8, buf, HARMONY_START_TAG) orelse 0;
-    return std.mem.indexOf(u8, buf[seg_start..msg_rel], "to=functions.") != null;
-}
-
-fn museIsRecipientChar(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-        (c >= '0' and c <= '9') or c == '_' or c == '-' or c == '.';
-}
-
-const MuseSegment = struct { recipient: []const u8, body: []const u8 };
-
-/// Recipient + body of the segment in text[seg_start..seg_end] (seg_start
-/// sits on a `<|start|>` marker, or 0 for the headerless first segment).
-/// null when the header never resolved — a growing or truncated header is
-/// never content.
-fn museSegmentAt(text: []const u8, seg_start: usize, seg_end: usize) ?MuseSegment {
-    const seg = text[seg_start..seg_end];
-    const msg_rel = std.mem.indexOf(u8, seg, MUSE_MSG_TAG) orelse return null;
-    const header = seg[0..msg_rel];
-    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t|
-        std.mem.trim(u8, header[t + 3 ..], " \n")
-    else
-        "";
-    var body = seg[msg_rel + MUSE_MSG_TAG.len ..];
-    if (std.mem.indexOf(u8, body, MUSE_EOM_TAG)) |e| body = body[0..e];
-    if (std.mem.indexOf(u8, body, MUSE_EOT_TAG)) |e| body = body[0..e];
-    return .{ .recipient = recipient, .body = body };
-}
-
-/// Muse channel split. Claims the text only when `<|message|>` is present —
-/// no other family emits it. First segment of each channel wins (the template
-/// renders one per turn). A tool segment's body (ATEM markup) rides out as
-/// content ONLY when no user segment exists, so the KeepingMarkup callers can
-/// still see it and the trim wrapper cuts it from display.
-fn splitMuseChannels(text: []const u8) ?ThinkSplit {
-    if (std.mem.indexOf(u8, text, MUSE_MSG_TAG) == null) return null;
-    // `<|message|>` is NOT unique to muse: harmony (gpt_oss), muse's own
-    // format ancestor, emits the same marker. Decline harmony traffic here —
-    // its `analysis` header carries no `to=`, so muse's recipient rules would
-    // route the model's private reasoning into user-visible content.
-    if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) != null) return null;
-    var reasoning: ?[]const u8 = null;
-    var content: ?[]const u8 = null;
-    var tool_body: ?[]const u8 = null;
-    var routed = false;
-
-    var seg_start: usize = 0;
-    while (true) {
-        const next = std.mem.indexOfPos(u8, text, seg_start + 1, MUSE_START_TAG);
-        const seg_end = next orelse text.len;
-        if (museSegmentAt(text, seg_start, seg_end)) |s| {
-            routed = true;
-            if (std.mem.eql(u8, s.recipient, "self")) {
-                if (reasoning == null) {
-                    const r = std.mem.trim(u8, s.body, "\n ");
-                    if (r.len > 0) reasoning = r;
-                }
-            } else if (s.recipient.len == 0 or std.mem.eql(u8, s.recipient, "user")) {
-                if (content == null) content = std.mem.trim(u8, s.body, "\n ");
-            } else {
-                if (tool_body == null) tool_body = s.body;
-            }
-        } else if (seg_start == 0) {
-            // Headerless first segment: a prompt-committed `to=user<|message|>`
-            // header puts the model's first bytes straight into BODY. Claim it
-            // as content — but never text that still reads as a (truncated)
-            // recipient header.
-            var body = text[0..seg_end];
-            if (std.mem.indexOf(u8, body, MUSE_EOM_TAG)) |e| body = body[0..e];
-            if (std.mem.indexOf(u8, body, MUSE_EOT_TAG)) |e| body = body[0..e];
-            const c = std.mem.trim(u8, body, "\n ");
-            if (c.len > 0 and museThinkOpenerAt(body) == .not_muse) {
-                routed = true;
-                content = c;
-            }
-        }
-        seg_start = next orelse break;
-    }
-    if (!routed) return null;
-    return .{
-        .reasoning_content = reasoning,
-        .content = content orelse (tool_body orelse ""),
-    };
-}
-
-/// Muse-Glimmer streaming verdict, decided from the channel markers alone.
-/// null = not muse traffic (fall through to the generic think gate). The
-/// recipient header between <|start|> and <|message|> is ORDINARY text, so an
-/// unresolved header always HOLDS — flushing it leaks ` to=user` fragments.
-fn museStreamVerdict(buf: []const u8) ?StreamThinkGate {
-    const has_marker = std.mem.indexOf(u8, buf, MUSE_MSG_TAG) != null or
-        std.mem.indexOf(u8, buf, MUSE_START_TAG) != null or
-        std.mem.indexOf(u8, buf, MUSE_EOM_TAG) != null;
-    if (!has_marker) {
-        // A growing bare header (` to=sel`) carries no marker yet: claim it
-        // only while every byte fits the recipient grammar, so prose that
-        // merely starts with "to=" is released to the generic gate. The
-        // first tokens can be SHORTER than "to=" (" to" leaked live
-        // 2026-08-10) — a strict prefix of it still holds.
-        const t = std.mem.trimStart(u8, buf, " \n");
-        if (t.len < "to=".len) {
-            return if (t.len > 0 and std.mem.startsWith(u8, "to=", t)) .hold_thinking else null;
-        }
-        if (!std.mem.startsWith(u8, t, "to=")) return null;
-        for (t["to=".len..]) |c| {
-            if (!museIsRecipientChar(c)) return null;
-        }
-        return .hold_thinking;
-    }
-    const seg_start = std.mem.lastIndexOf(u8, buf, MUSE_START_TAG) orelse 0;
-    const seg = buf[seg_start..];
-    const msg_rel = std.mem.indexOf(u8, seg, MUSE_MSG_TAG) orelse return .hold_thinking;
-    const header = seg[0..msg_rel];
-    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t|
-        std.mem.trim(u8, header[t + 3 ..], " \n")
-    else
-        "";
-    if (std.mem.eql(u8, recipient, "self")) {
-        const closed = std.mem.indexOf(u8, seg, MUSE_EOM_TAG) != null or
-            std.mem.indexOf(u8, seg, MUSE_EOT_TAG) != null;
-        return if (closed) .split_think else .hold_thinking;
-    }
-    if (recipient.len == 0 or std.mem.eql(u8, recipient, "user")) return .split_think;
-    // Tool recipient: the tools path buffers before this gate is consulted;
-    // hold defensively on a no-tools request rather than leak ATEM markup.
-    return .hold_thinking;
-}
-
-/// Muse streaming tool hold: true while a segment header is unresolved (the
-/// next token decides whether it names a tool) or resolved to a TOOL
-/// recipient (the body is ATEM payload — parse runs on the end flush).
-fn museHeaderHoldsForTools(buf: []const u8) bool {
-    var header_from: usize = 0;
-    if (std.mem.lastIndexOf(u8, buf, MUSE_START_TAG)) |p| {
-        header_from = p + MUSE_START_TAG.len;
-    } else {
-        const lead = std.mem.trimStart(u8, buf, " \n");
-        // A strict prefix of "to=" could still become a header (" to" leaked
-        // as a text delta live 2026-08-10) — hold it.
-        if (lead.len < "to=".len) return lead.len > 0 and std.mem.startsWith(u8, "to=", lead);
-        if (!std.mem.startsWith(u8, lead, "to=")) return false;
-        header_from = buf.len - lead.len;
-    }
-    const seg = buf[header_from..];
-    if (std.mem.indexOf(u8, seg, MUSE_MSG_TAG)) |msg_rel| {
-        const header = seg[0..msg_rel];
-        const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t|
-            std.mem.trim(u8, header[t + 3 ..], " \n")
-        else
-            "";
-        if (recipient.len == 0) return false;
-        if (std.mem.eql(u8, recipient, "self") or std.mem.eql(u8, recipient, "user")) return false;
-        return true;
-    }
-    // Unresolved: hold only while the bytes still fit `assistant to=<r>`.
-    var rest = std.mem.trimStart(u8, seg, " \n");
-    if (std.mem.startsWith(u8, rest, "assistant")) rest = rest["assistant".len..];
-    rest = std.mem.trimStart(u8, rest, " \n");
-    if (rest.len == 0) return true;
-    if (rest.len < "to=".len) return std.mem.startsWith(u8, "to=", rest);
-    if (!std.mem.startsWith(u8, rest, "to=")) return false;
-    for (rest["to=".len..]) |c| {
-        if (!museIsRecipientChar(c)) return false;
-    }
-    return true;
-}
-
-/// Muse-Glimmer opener classification for the no-tools streaming think arm.
-/// The model's first bytes after the prompt's `<|start|>assistant` are a
-/// recipient header in ORDINARY text: ` to=self<|message|>` opens reasoning
-/// (closes at <|eom|>), any other resolved header means the model went
-/// straight to content. Payload sizes are the byte offset just past the
-/// header's `<|message|>`.
-pub const MuseThinkOpener = union(enum) { not_muse, growing, self_opened: usize, direct: usize };
-
-pub fn museThinkOpenerAt(buf: []const u8) MuseThinkOpener {
-    var rest = std.mem.trimStart(u8, buf, " \n");
-    var saw_ctx = false;
-    if (std.mem.startsWith(u8, rest, MUSE_START_TAG)) {
-        rest = rest[MUSE_START_TAG.len..];
-        saw_ctx = true;
-    }
-    if (std.mem.startsWith(u8, rest, "assistant")) {
-        rest = rest["assistant".len..];
-        rest = std.mem.trimStart(u8, rest, " \n");
-        saw_ctx = true;
-    } else if (saw_ctx) {
-        return if (std.mem.startsWith(u8, "assistant", rest)) .growing else .not_muse;
-    }
-    if (std.mem.startsWith(u8, rest, MUSE_MSG_TAG)) {
-        return .{ .direct = buf.len - rest.len + MUSE_MSG_TAG.len };
-    }
-    if (!std.mem.startsWith(u8, rest, "to=")) {
-        if (rest.len < "to=".len and std.mem.startsWith(u8, "to=", rest)) return .growing;
-        return .not_muse;
-    }
-    const after_to = rest["to=".len..];
-    if (std.mem.indexOf(u8, after_to, MUSE_MSG_TAG)) |msg_rel| {
-        const recipient = std.mem.trim(u8, after_to[0..msg_rel], " \n");
-        const consumed = (buf.len - after_to.len) + msg_rel + MUSE_MSG_TAG.len;
-        if (std.mem.eql(u8, recipient, "self")) return .{ .self_opened = consumed };
-        return .{ .direct = consumed };
-    }
-    for (after_to) |c| {
-        if (!museIsRecipientChar(c)) return .not_muse;
-    }
-    return .growing;
-}
-
-/// A muse prompt that ends at `<|start|>assistant` leaves the model to write its own
-/// header, so the plain stream arm must start skipping as if `<|start|>` had just arrived.
-pub fn promptTailOpensMuseHeader(tail: []const u8) bool {
-    return std.mem.endsWith(u8, std.mem.trimEnd(u8, tail, "\n "), MUSE_START_TAG ++ "assistant");
-}
-
-/// The held header bytes between `<|start|>` and `<|message|>` name `self`: the segment is reasoning.
-pub fn museHeaderOpensReasoning(head: []const u8) bool {
-    var rest = std.mem.trimStart(u8, head, " \n");
-    if (std.mem.startsWith(u8, rest, "assistant")) rest = std.mem.trimStart(u8, rest["assistant".len..], " \n");
-    if (!std.mem.startsWith(u8, rest, "to=")) return false;
-    return std.mem.eql(u8, std.mem.trim(u8, rest["to=".len..], " \n"), "self");
-}
-
-/// Length of a COMPLETE next-segment header at the start of `text`
-/// (`<|start|>assistant to=<r><|message|>`), or null when text doesn't start
-/// with one or the header hasn't fully arrived yet.
-pub fn museContentHeaderSkip(text: []const u8) ?usize {
-    if (!std.mem.startsWith(u8, text, MUSE_START_TAG)) return null;
-    const seg = text[MUSE_START_TAG.len..];
-    const msg_rel = std.mem.indexOf(u8, seg, MUSE_MSG_TAG) orelse return null;
-    return MUSE_START_TAG.len + msg_rel + MUSE_MSG_TAG.len;
-}
-
-/// Plain-arm segment-header skip for muse streams: the `<|start|>` marker
-/// token arms it, `<|message|>` disarms — everything between is the
-/// role+recipient header, never content. Both markers are single special
-/// tokens, so exact-match at the delta level is complete.
-pub fn museHeaderSkipNext(skipping: bool, token_text: []const u8) bool {
-    if (std.mem.eql(u8, token_text, MUSE_START_TAG)) return true;
-    if (std.mem.eql(u8, token_text, MUSE_MSG_TAG)) return false;
-    return skipping;
-}
 
 /// template opened (Qwen 3.5/3.6 style: `…assistant\n<think>\n`). Callers
 /// decode the last few prompt tokens and pass the tail here. A thinking-off
@@ -2551,17 +1969,11 @@ pub fn promptThinkTailClass(tail: []const u8) ThinkTailClass {
 /// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
 /// Thinking-off on an always-thinking template otherwise means generating the
 /// whole reasoning pass and discarding it — the prompt-side commit is what
-/// makes thinking-off a real skip.
-///   • Muse: the generation prompt ends bare `<|start|>assistant`; spending
-///     the header (` to=user<|message|>`, byte-exactly what the template
-///     renders for history content turns) makes `to=self` unreachable. Never
-///     with tools — a tool call is a `to=<fn>` header.
-///   • Unconditional think opener (LFM2.5 class): close the block the
-///     template opened. Thinking-off Qwen-style renders end CLOSED and never
-///     match; no tools gate — tool calls ride outside the think block.
-fn noThinkTailSuffix(tpl: []const u8, rendered: []const u8, enable_thinking: bool, has_tools: bool) ?[]const u8 {
+/// makes thinking-off a real skip. A think block the template opened unconditionally is closed;
+/// thinking-off Qwen-style renders end CLOSED and never match.
+fn noThinkTailSuffix(rendered: []const u8, enable_thinking: bool) ?[]const u8 {
     if (enable_thinking) return null;
-    const tail = contentChannelTail(tpl, rendered, !has_tools);
+    const tail = contentChannelTail(rendered);
     return if (tail.len > 0) tail else null;
 }
 
@@ -2572,19 +1984,9 @@ fn noThinkTailSuffix(tpl: []const u8, rendered: []const u8, enable_thinking: boo
 /// channel so no reasoning pass runs, and a CONTINUATION needs the same thing
 /// for a different reason — the partial text is prose the user has already
 /// read, so a prompt that lands inside a think block would return the rest of
-/// their answer as reasoning. Written twice, the muse and LFM2.5 cases would
-/// drift apart the first time a third family joined.
-///
-/// `allow_channel_commit` is thinking-off's extra gate: with tools present it
-/// declines to commit muse's `to=user`, since that would forbid the tool call
-/// the model may be about to make. A continuation always passes true — it is
-/// resuming prose by construction.
-fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commit: bool) []const u8 {
-    if (allow_channel_commit and std.mem.indexOf(u8, tpl, "reasoning_strength") != null and
-        std.mem.endsWith(u8, rendered, "<|start|>assistant"))
-    {
-        return " to=user<|message|>";
-    }
+/// their answer as reasoning. Written twice, the thinking-off and continuation
+/// cases would drift apart.
+fn contentChannelTail(rendered: []const u8) []const u8 {
     const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
     if (k2ThinkOpenerAt(tail)) |opener| {
         inline for (k2_think_openers) |o| {
@@ -2646,14 +2048,6 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
 /// Every arm below returns raw slices; the cut is applied ONCE in the wrapper
 /// above so a new arm cannot forget it.
 pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
-    // gpt_oss / harmony channel segments (`analysis` / `final` /
-    // `commentary to=functions.X`). Keyed on `<|channel|>`; must run BEFORE
-    // the muse arm, which shares the `<|message|>` marker.
-    if (splitHarmonyChannels(text)) |split| return split;
-    // Muse-Glimmer channel segments (`to=self` / `to=user` / tool). Keyed on
-    // the `<|message|>` marker, minus harmony's `<|channel|>`; runs regardless
-    // of the `thinking` flag because the headers need stripping either way.
-    if (splitMuseChannels(text)) |split| return split;
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         const think_tag = "<|channel>thought\n";
@@ -2873,16 +2267,11 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 /// in a glued "thought" because `<|channel>` flushed before "thought"
 /// arrived and completed the opener).
 /// Can a thought that begins with `buf` still grow into an opener the streaming gates strip?
-/// Every opener starts with `<` or is a Muse header (`assistant`, `to=`), so any other first
-/// byte is decided at once instead of waiting for the gates' 7 bytes.
+/// Every opener starts with `<`, so any other first byte is decided at once instead of waiting
+/// for the gates' 7 bytes.
 pub fn thinkOpenerPossible(buf: []const u8) bool {
     const rest = std.mem.trimStart(u8, buf, " \n");
-    if (rest.len == 0 or rest[0] == '<') return true;
-    for ([_][]const u8{ "assistant", "to=" }) |word| {
-        const n = @min(rest.len, word.len);
-        if (std.mem.eql(u8, rest[0..n], word[0..n])) return true;
-    }
-    return false;
+    return rest.len == 0 or rest[0] == '<';
 }
 
 pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
@@ -2936,14 +2325,6 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
     if (std.mem.indexOf(u8, buf, "</｜DSML｜") != null) return true;
 
-    // Muse-Glimmer ATEM: everything from the wrapper on is call payload.
-    if (std.mem.indexOf(u8, buf, "<atem:") != null) return true;
-    // Muse segment-header hold: between <|start|> and <|message|> only the
-    // role+recipient text flows, and a non-self/user recipient names a TOOL.
-    if (museHeaderHoldsForTools(buf)) return true;
-    // gpt_oss/harmony segment-header hold: same shape, `<|channel|>`-keyed.
-    if (harmonyHeaderHoldsForTools(buf)) return true;
-
     // `<tool…` family: walk every `<tool` occurrence, accept the first one
     // whose terminator is valid (mirrors parseToolCalls' acceptance rule).
     var scan: usize = 0;
@@ -2973,8 +2354,6 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         // fragment and leaked the rest of the tag. The rungs are DERIVED in the
         // test, so a future gap fails there instead of shipping.
         "<f", "<fu", "<fun", "<func", "<funct", "<functi", "<functio", "<function",
-        // Muse ATEM (a fused multi-char BPE fragment can end mid-marker)
-        "<a", "<at", "<ate", "<atem", "<atem:",
         // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
         // splits too in case the tokenizer spells the marker in pieces)
         "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
@@ -2989,7 +2368,7 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 }
 
 /// Streaming-only: does a `<function …` opener anywhere in `buf` still hold?
-/// Three arrival states, mirroring `museHeaderHoldsForTools` above:
+/// Three arrival states:
 ///
 ///   unresolved (no `>` yet)        → HOLD; the next token may complete a call
 ///   resolved WITH a quoted name=   → HOLD; it is a MiniCPM5 V3 call
@@ -3178,10 +2557,6 @@ pub fn streamThinkGateScan(
     prompt_opened_think: bool,
     scan: *ThinkScan,
 ) StreamThinkGate {
-    // Harmony (gpt_oss) decides before muse — both emit <|message|>, and only
-    // the <|channel|> marker tells them apart.
-    if (harmonyStreamVerdict(buf)) |v| return v;
-    if (museStreamVerdict(buf)) |v| return v;
     scan.advance(buf);
     const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
         scan.saw_channel_thought or
@@ -3194,12 +2569,6 @@ pub fn streamThinkGateScan(
 }
 
 pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bool, prompt_opened_think: bool) StreamThinkGate {
-    // Harmony (gpt_oss) channels decide first — the muse arm below shares the
-    // <|message|> marker and would otherwise claim this traffic.
-    if (harmonyStreamVerdict(buf)) |v| return v;
-    // Muse channels decide early — the recipient header is ordinary text and
-    // must never flush unresolved.
-    if (museStreamVerdict(buf)) |v| return v;
     const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
         std.mem.indexOf(u8, buf, "<|channel>thought") != null or
         indexOfThinkOpenTag(buf, 0) != null or
@@ -3393,17 +2762,6 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // inner `<tool…>` blocks get a chance — this is what makes the outer
     // `<tool_calls>` wrapper case work.
     //
-    // Muse-Glimmer ATEM (`<atem:invoke name="X">`): distinctive namespace
-    // prefix no other family emits; the generic `<tool` scan never sees it
-    // (the bytes after `<` are `atem`, not `tool`). Runs on the FULL text —
-    // tool segments arrive wrapped in channel headers the think-strip above
-    // would misjudge.
-    try parseInvokeToolCalls(allocator, text, &calls, ATEM_INVOKE);
-    // gpt_oss / harmony (`to=functions.NAME<|channel|>commentary…<|message|>`):
-    // the name lives in the header, not the payload, so no generic scan can
-    // recover it. Runs on the FULL text for the same reason ATEM does — the
-    // call arrives wrapped in channel headers the think-strip would misjudge.
-    try parseHarmonyToolCalls(allocator, text, &calls);
     // DeepSeek-V4 native DSML (`<｜DSML｜invoke …>`): distinctive fullwidth-bar
     // marker no other family emits, and the generic `<tool` scan never sees
     // it (the byte before "tool_calls" is `｜`, not `<`).
@@ -3780,15 +3138,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // raw-JSON guessing fallback below — an explicit recognized tag always
     // wins over heuristic inference.
     if (calls.items.len == 0) {
-        // Never scan a gpt-oss/harmony transcript for this dialect. Harmony owns
-        // its own format and its arm has already run; what is left is its
-        // ANALYSIS channel — reasoning the user never sees as an answer. A
-        // harmony model explaining `<function name="get_time"></function>` was
-        // being turned into a real `get_time({})` call by this fallback, an
-        // invocation nobody requested. A MiniCPM5 checkpoint never emits
-        // `<|channel|>`, so this costs the dialect nothing.
-        const harmony_owned = std.mem.indexOf(u8, effective_text, HARMONY_CHANNEL_TAG) != null;
-        if (!harmony_owned and std.mem.indexOf(u8, effective_text, "<function") != null) {
+        if (std.mem.indexOf(u8, effective_text, "<function") != null) {
             try parseMiniCpm5ToolCalls(allocator, effective_text, &calls);
         }
     }
@@ -5156,14 +4506,7 @@ fn dsmlValueIsJson(allocator: std.mem.Allocator, value: []const u8) bool {
     return true;
 }
 
-// ── ATEM tool calls (Muse-Glimmer / `muse_glimmer`) ────────────────────
-//
-//   <atem:function_calls>
-//   <atem:invoke name="weather.get">
-//   <atem:parameter name="city">Paris</atem:parameter>
-//   <atem:parameter name="detailed">false</atem:parameter>
-//   </atem:invoke>
-//   </atem:function_calls>
+// ── Claude-style `<invoke>` tool calls ──
 //
 // String parameters are RAW bytes (the reference explicitly does not strip
 // spaces — the Hermes trim gap stays Hermes'); lists/objects/bools/null/
@@ -5179,68 +4522,10 @@ const InvokeDialect = struct {
     /// Not the model's own dialect: kept only when it names a declared tool (`filterInferredBySchema`).
     inferred: bool,
 };
-const ATEM_INVOKE: InvokeDialect = .{ .invoke = "<atem:invoke", .param = "<atem:parameter", .param_close = "</atem:parameter>", .invoke_close = "</atem:invoke>", .inferred = false };
 /// Claude's spelling of the same grammar (`<function_calls><invoke name="X"><parameter name="k">`),
 /// which models trained on Claude transcripts emit in place of their own (qwen4_exp).
 const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true };
 const FUNCTION_CALLS_TAG = "<function_calls>";
-
-/// gpt_oss / harmony tool calls. Structurally unlike every other family here:
-/// the function NAME is not in the payload at all, it is the segment header's
-/// recipient (`to=functions.NAME`), and the body is already a JSON arguments
-/// object rather than a markup block to assemble.
-///
-///     <|start|>assistant to=functions.get_weather<|channel|>commentary
-///     <|constrain|>json<|message|>{"location":"SF"}<|call|>
-///
-/// Keyed on `to=functions.` sitting in a resolved channel header, a shape no
-/// other family emits. A body that is not a COMPLETE balanced JSON object is
-/// a truncated call: ship the name with `{}` rather than a fragment, per the
-/// same rule the ATEM and DSML parsers follow.
-fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
-    if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) == null) return;
-    var seg_start: usize = 0;
-    while (true) {
-        const next = std.mem.indexOfPos(u8, text, seg_start + 1, HARMONY_START_TAG);
-        const seg_end = next orelse text.len;
-        defer seg_start = next orelse text.len;
-
-        const seg = text[seg_start..seg_end];
-        // Only a RESOLVED header can name a call — an unterminated one is
-        // still arriving and its recipient may yet change.
-        const msg_rel = std.mem.indexOf(u8, seg, HARMONY_MSG_TAG) orelse {
-            if (next == null) break;
-            continue;
-        };
-        const header = seg[0..msg_rel];
-        const fn_at = std.mem.indexOf(u8, header, "to=functions.") orelse {
-            if (next == null) break;
-            continue;
-        };
-        const raw_name = header[fn_at + "to=functions.".len ..];
-        var n: usize = 0;
-        while (n < raw_name.len and museIsRecipientChar(raw_name[n])) n += 1;
-        // A tool name never carries a channel marker (corpus invariant).
-        const name_slice = raw_name[0..n];
-        if (name_slice.len == 0) {
-            if (next == null) break;
-            continue;
-        }
-
-        var body = seg[msg_rel + HARMONY_MSG_TAG.len ..];
-        for ([_][]const u8{ HARMONY_CALL_TAG, HARMONY_END_TAG, HARMONY_RETURN_TAG }) |tag| {
-            if (std.mem.indexOf(u8, body, tag)) |e| body = body[0..e];
-        }
-        const args_src = balancedJsonObject(std.mem.trim(u8, body, " \n\t\r")) orelse "{}";
-
-        const name = try allocator.dupe(u8, name_slice);
-        errdefer allocator.free(name);
-        const arguments = try allocator.dupe(u8, args_src);
-        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
-
-        if (next == null) break;
-    }
-}
 
 fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), comptime d: InvokeDialect) !void {
     // An inferred dialect's opener alone is prose ("wrap it in <invoke name=\"bash\">", even naming a declared
@@ -5301,7 +4586,7 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
     }
 }
 
-/// Assemble `<parameter name="k">v</parameter>` runs (ATEM's namespaced or Claude's bare) into a JSON
+/// Assemble `<parameter name="k">v</parameter>` runs into a JSON
 /// object string. A value that parses as COMPLETE JSON keeps its spelled type;
 /// everything else is a raw string, exact bytes. Keys are escaped + deduped
 /// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
@@ -9761,9 +9046,6 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/dsv41_chat_template.jinja")));
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/glm53_chat_template.jinja")));
 
-    // Muse reads `reasoning_strength` — the near-miss. Matching it would strip
-    // the budget from a family the word never reaches, silently uncapping it.
-    try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
     // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, Ling,
     // Nemotron, llama, mistral) reads neither: thinking is a bool there.
     try testing.expect(!templateConsumesEffort(
@@ -9773,17 +9055,14 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
 
 test "renderChatTemplate: a tool with no description/parameters still renders (no silent fallback)" {
     // OpenAI's schema makes `description` optional and a no-arg tool needs no
-    // `parameters`, but muse's template dumps all three through `tojson`, and
-    // `tojson` RAISES on Undefined — so a description-less tool killed the
-    // render and fell back to ChatML with no tools preamble at all (found
-    // 2026-08-14 by a sweep whose own test tool omitted the key). Every family
-    // that dumps `tool | tojson` wholesale is one missing key from the same
-    // class, so the defaults are filled for ALL templates, not just this one.
+    // `parameters`, but a template that dumps those keys through `tojson` RAISES
+    // on Undefined and fell back to ChatML with no tools preamble at all. The
+    // defaults are filled for ALL templates.
     const allocator = testing.allocator;
     var config = ChatConfig{
-        .chat_template = @embedFile("fixtures/muse_chat_template.jinja"),
+        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
         .bos_token = null,
-        .eos_token = "<|eot|>",
+        .eos_token = "<|im_end|>",
         .add_bos_token = false,
         .allocator = allocator,
     };
@@ -9793,13 +9072,12 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     const bare =
         \\[{"type":"function","function":{"name":"note"}}]
     ;
+    const before = template_fallbacks.load(.monotonic);
     const rendered = try renderChatTemplate(allocator, &messages, &config, bare, null, true, null, false);
     defer allocator.free(rendered);
-    // The muse tools preamble proves the REAL template ran; the fallback emits
-    // ChatML markers instead and would carry no tools text at all.
-    try testing.expect(std.mem.indexOf(u8, rendered, "In this environment you have access to a set of tools") != null);
+    try testing.expectEqual(before, template_fallbacks.load(.monotonic));
+    try testing.expect(std.mem.indexOf(u8, rendered, "# Tools") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"note\"") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
 
     // A COMPLETE declaration re-emits nothing: null means the caller keeps the
     // client's own bytes, so no request that works today is re-serialized
@@ -12774,111 +12052,6 @@ test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hol
     try testing.expect(!streamShouldBufferForTools("the ｜ character is fun"));
 }
 
-test "renderChatTemplate: muse_glimmer shipped template renders byte-identical to python jinja2 (hermetic)" {
-    // src/fixtures/muse_chat_template.jinja is the VERBATIM template
-    // meta-models/Muse-Glimmer-30B ships; muse_render_reference.txt is python
-    // jinja2's render of the exact message set below (regenerate with the
-    // script in the fixture header if either changes). Byte equality pins:
-    // <|start|>role<|message|>…<|eot|> framing, PRIOR-turn reasoning dropped
-    // before the template runs (harmony convention — the reference is jinja2's
-    // render of the message set with that field already nulled; the
-    // current-turn keep arm is pinned by the drops-PRIOR-turn test below),
-    // tool calls as to=<fn> ATEM blocks with dict arguments
-    // (string params RAW, bools bare), tool results as
-    // "<|start|>tool <name><|message|><tool_output …>", the namespaced tool
-    // catalog + "# Valid recipients" line, and the bare "<|start|>assistant"
-    // generation prompt (NO <|message|> — the model emits its own recipient).
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
-    const expected = @embedFile("fixtures/muse_render_reference.txt");
-
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = "<|begin_of_text|>",
-        .eos_token = "<|end_of_text|>",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    const tools_json =
-        \\[{"type": "function", "function": {"name": "weather.get", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
-    ;
-    // Alphabetical argument keys on purpose: a sorted-map JSON layer must
-    // produce the same parameter order as python's insertion-ordered dicts.
-    const tc = [_]ToolCall{.{ .id = "call_1", .name = "weather.get", .arguments = "{\"city\": \"Paris\", \"detailed\": false, \"units\": \"celsius\"}" }};
-    const messages = [_]Message{
-        .{ .role = "system", .content = "You are a helpful assistant." },
-        .{ .role = "user", .content = "What's the weather in Paris?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need the weather tool." },
-        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
-        .{ .role = "user", .content = "thanks, and in kelvin?" },
-    };
-
-    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
-    defer allocator.free(rendered);
-    try testing.expectEqualStrings(expected, rendered);
-}
-
-test "renderChatTemplate: muse thinking-off no-tools commits the to=user channel" {
-    // Thinking off must SKIP the reasoning pass, not generate-and-discard it:
-    // spending the recipient header in the prompt makes a `to=self` segment
-    // unreachable. Tools stay bare — a tool call is a `to=<fn>` header.
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = "<|begin_of_text|>",
-        .eos_token = "<|end_of_text|>",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
-
-    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
-    defer allocator.free(off);
-    try testing.expect(std.mem.endsWith(u8, off, "<|start|>assistant to=user<|message|>"));
-
-    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
-    defer allocator.free(on);
-    try testing.expect(std.mem.endsWith(u8, on, "<|start|>assistant"));
-
-    const tools_json =
-        \\[{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
-    ;
-    const off_tools = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
-    defer allocator.free(off_tools);
-    try testing.expect(std.mem.endsWith(u8, off_tools, "<|start|>assistant"));
-}
-
-test "renderChatTemplate: muse template dedups a client-supplied reasoning directive" {
-    // Upstream a4e59da (#35): a system prompt already carrying a "Reasoning
-    // effort/strength" line used to get the template's own "Reasoning
-    // strength: high." appended after it — two conflicting directives, ours
-    // stomping the client's. The template now normalizes the spelling and
-    // skips its own line. Rendered through OUR jinja.cpp because the fix
-    // rides the `replace`/`lower` filters and the `in` operator — a silently
-    // no-op filter keeps the duplicate while the render still succeeds.
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = "<|begin_of_text|>",
-        .eos_token = "<|end_of_text|>",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    const messages = [_]Message{
-        .{ .role = "system", .content = "Be terse.\nReasoning effort: low." },
-        .{ .role = "user", .content = "hi" },
-    };
-    const r = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
-    defer allocator.free(r);
-    try testing.expect(std.mem.indexOf(u8, r, "Reasoning strength: low.") != null);
-    try testing.expect(std.mem.indexOf(u8, r, "Reasoning effort") == null);
-    const first = std.mem.indexOf(u8, r, "Reasoning strength").?;
-    try testing.expect(std.mem.indexOfPos(u8, r, first + 1, "Reasoning strength") == null);
-}
-
 test "renderChatTemplate: thinking-off closes a template-opened think block (LFM2.5 class)" {
     // LFM2.5's template opens `<think>` unconditionally; thinking-off used to
     // mean generating the whole reasoning pass and discarding it. Closing the
@@ -13009,445 +12182,6 @@ test "renderChatTemplate: continuation is declined when the last message is not 
     try testing.expect(std.mem.endsWith(u8, cont, "<|im_start|>assistant"));
 }
 
-test "renderChatTemplate: muse commits its content channel before the partial reply" {
-    // Muse's turn header is `<|start|>assistant to=<recipient><|message|>`, and
-    // an uncommitted header means the model picks the channel — including
-    // `to=self`, which would make the continuation reasoning.
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = "<|begin_of_text|>",
-        .eos_token = "<|return|>",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    const messages = [_]Message{
-        .{ .role = "user", .content = "hi" },
-        .{ .role = "assistant", .content = "Hello, I was say" },
-    };
-    const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
-    defer allocator.free(cont);
-    try testing.expect(std.mem.endsWith(u8, cont, " to=user<|message|>Hello, I was say"));
-}
-
-test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current tool round's" {
-    // Harmony (muse's format ancestor) drops analysis from turns before the
-    // last user message. Without that, the app's reasoning round-trip renders
-    // every old chain — a loop-cut tail included — as a to=self history
-    // segment the model reads back on every later turn (live 2026-08-10: one
-    // repetition-primed turn poisoned the rest of the chat).
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = "<|begin_of_text|>",
-        .eos_token = "<|end_of_text|>",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    // Prior turn: assistant reasoning BEFORE the last user message → dropped;
-    // its content survives.
-    const prior = [_]Message{
-        .{ .role = "user", .content = "hi" },
-        .{ .role = "assistant", .content = "hello there", .reasoning_content = "waffling chain" },
-        .{ .role = "user", .content = "and again?" },
-    };
-    const r1 = try renderChatTemplate(allocator, &prior, &config, null, null, true, null, false);
-    defer allocator.free(r1);
-    try testing.expect(std.mem.indexOf(u8, r1, "to=self") == null);
-    try testing.expect(std.mem.indexOf(u8, r1, "waffling chain") == null);
-    try testing.expect(std.mem.indexOf(u8, r1, "hello there") != null);
-
-    // Current turn: a tool round AFTER the last user message keeps its chain —
-    // that is where the model needs it.
-    const tools_json =
-        \\[{"type": "function", "function": {"name": "weather.get", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
-    ;
-    const tc = [_]ToolCall{.{ .id = "call_1", .name = "weather.get", .arguments = "{\"city\": \"Paris\"}" }};
-    const current = [_]Message{
-        .{ .role = "user", .content = "weather in Paris?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need the weather tool." },
-        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
-    };
-    const r2 = try renderChatTemplate(allocator, &current, &config, tools_json, null, true, null, false);
-    defer allocator.free(r2);
-    try testing.expect(std.mem.indexOf(u8, r2, "<|start|>assistant to=self<|message|>Need the weather tool.<|eom|>") != null);
-
-    // A non-muse template that persists history reasoning is
-    // untouched — the round-trip rule stays per-family.
-    const generic_tpl = "{%- for m in messages -%}{%- if m.get('reasoning_content') -%}<think>{{ m['reasoning_content'] }}</think>{%- endif -%}{{ m['role'] }}: {{ m['content'] }}\n{%- endfor -%}";
-    var generic = ChatConfig{
-        .chat_template = generic_tpl,
-        .bos_token = "",
-        .eos_token = "",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    const r3 = try renderChatTemplate(allocator, &prior, &generic, null, null, true, null, false);
-    defer allocator.free(r3);
-    try testing.expect(std.mem.indexOf(u8, r3, "<think>waffling chain</think>") != null);
-}
-
-test "splitMuseChannels: headerless first segment (prompt-committed header) is content" {
-    // With `to=user<|message|>` committed in the prompt, the model's first
-    // bytes are BODY. If it then re-opens a segment, the leading text must
-    // survive as content, not vanish.
-    const split = splitMuseChannels("answer<|eom|><|start|>assistant to=self<|message|>notes").?;
-    try testing.expectEqualStrings("answer", split.content);
-    try testing.expectEqualStrings("notes", split.reasoning_content.?);
-    // A truncated bare header is still never content.
-    const hdr = splitMuseChannels(" to=self<|eom|><|start|>assistant to=user<|message|>hi").?;
-    try testing.expectEqualStrings("hi", hdr.content);
-    try testing.expect(hdr.reasoning_content == null);
-}
-
-test "harmonyAnalysisHeaderLen: measures the header the streaming split must skip" {
-    // With and without the leading <|start|>assistant (the generation prompt
-    // commits that part on the FIRST segment, so the model's first bytes are
-    // the bare <|channel|>).
-    const bare = "<|channel|>analysis<|message|>thinking...";
-    try std.testing.expectEqual(@as(?usize, "<|channel|>analysis<|message|>".len), harmonyAnalysisHeaderLen(bare));
-    const full = "<|start|>assistant<|channel|>analysis<|message|>x";
-    try std.testing.expectEqual(@as(?usize, "<|start|>assistant<|channel|>analysis<|message|>".len), harmonyAnalysisHeaderLen(full));
-    // A header still arriving has no length yet — the split must not fire.
-    try std.testing.expectEqual(@as(?usize, null), harmonyAnalysisHeaderLen("<|channel|>analysis"));
-    // Only the ANALYSIS channel: `final` is content, not reasoning.
-    try std.testing.expectEqual(@as(?usize, null), harmonyAnalysisHeaderLen("<|channel|>final<|message|>hi"));
-    try std.testing.expectEqual(@as(?usize, null), harmonyAnalysisHeaderLen("plain text"));
-}
-
-test "stripHarmonySegmentHeader: drops a leading segment header of any channel" {
-    try std.testing.expectEqualStrings(
-        "The answer.",
-        stripHarmonySegmentHeader("<|start|>assistant<|channel|>final<|message|>The answer."),
-    );
-    try std.testing.expectEqualStrings(
-        "Working.",
-        stripHarmonySegmentHeader("<|channel|>commentary<|message|>Working."),
-    );
-    // Nothing to strip — returned untouched, never truncated.
-    try std.testing.expectEqualStrings("plain content", stripHarmonySegmentHeader("plain content"));
-    try std.testing.expectEqualStrings(
-        "<|start|>assistant<|channel|>fin",
-        stripHarmonySegmentHeader("<|start|>assistant<|channel|>fin"),
-    );
-}
-
-test "splitHarmonyChannels: analysis→reasoning, final→content, headers stripped" {
-    // What gpt-oss emits after the generation prompt's bare `<|start|>assistant`.
-    const text = "<|channel|>analysis<|message|>Let me think.<|end|>" ++
-        "<|start|>assistant<|channel|>final<|message|>The answer is 4.<|return|>";
-    const split = splitHarmonyChannels(text).?;
-    try std.testing.expectEqualStrings("Let me think.", split.reasoning_content.?);
-    try std.testing.expectEqualStrings("The answer is 4.", split.content);
-}
-
-test "splitHarmonyChannels: commentary to=functions.X is a TOOL body, never content" {
-    // A tool call rides the commentary channel with a `functions.` recipient.
-    // Routing it to content would print raw JSON at the user; routing it to
-    // reasoning would lose the call entirely.
-    const text = "<|channel|>analysis<|message|>Need weather.<|end|>" ++
-        "<|start|>assistant to=functions.get_weather<|channel|>commentary <|constrain|>json<|message|>" ++
-        "{\"location\":\"SF\"}<|call|>";
-    const split = splitHarmonyChannels(text).?;
-    try std.testing.expectEqualStrings("Need weather.", split.reasoning_content.?);
-    try std.testing.expectEqualStrings("{\"location\":\"SF\"}", split.content);
-}
-
-test "splitHarmonyChannels: recipient may sit AFTER the channel name" {
-    // Harmony allows `<|channel|>commentary to=functions.x`; the header is
-    // scanned as a whole so both orderings resolve to the same recipient.
-    const text = "<|start|>assistant<|channel|>commentary to=functions.ping<|message|>{}<|call|>";
-    const split = splitHarmonyChannels(text).?;
-    try std.testing.expectEqualStrings("{}", split.content);
-    try std.testing.expect(split.reasoning_content == null);
-}
-
-test "splitHarmonyChannels: bare commentary (no recipient) is user-visible content" {
-    const text = "<|channel|>commentary<|message|>Working on it.<|end|>";
-    const split = splitHarmonyChannels(text).?;
-    try std.testing.expectEqualStrings("Working on it.", split.content);
-}
-
-test "splitHarmonyChannels: an unresolved header is never content" {
-    // A header still streaming in (no <|message|> yet) must not be claimed.
-    try std.testing.expect(splitHarmonyChannels("<|channel|>anal") == null);
-    try std.testing.expect(splitHarmonyChannels("<|start|>assistant<|channel|>fin") == null);
-}
-
-test "splitHarmonyChannels: declines muse traffic (no <|channel|> marker)" {
-    // Both families emit <|message|>, so the muse router cannot be the one
-    // that keys on it alone — <|channel|> is the discriminator, and harmony
-    // must not claim a muse turn (or vice versa).
-    try std.testing.expect(splitHarmonyChannels(" to=self<|message|>notes<|eom|>") == null);
-}
-
-test "splitMuseChannels: declines harmony traffic (<|channel|> present)" {
-    // The mirror of the case above. Without this, gpt-oss reasoning routes
-    // through muse's recipient rules — an `analysis` header carries no `to=`,
-    // so it would land in CONTENT and the answer would be preceded by the
-    // model's private reasoning.
-    const harmony = "<|channel|>analysis<|message|>secret<|end|>" ++
-        "<|start|>assistant<|channel|>final<|message|>hi<|return|>";
-    try std.testing.expect(splitMuseChannels(harmony) == null);
-}
-
-test "splitMuseChannels: to=self reasoning + to=user content, headers stripped" {
-    // The exact shape muse emits after the prompt's `<|start|>assistant`.
-    const text = " to=self<|message|>Let me think.<|eom|><|start|>assistant to=user<|message|>The answer is 4.";
-    const split = splitThinkBlock(text, true, false);
-    try testing.expectEqualStrings("Let me think.", split.reasoning_content.?);
-    try testing.expectEqualStrings("The answer is 4.", split.content);
-
-    // Direct answer: no reasoning segment at all.
-    const direct = splitThinkBlock(" to=user<|message|>Hi there.", true, false);
-    try testing.expect(direct.reasoning_content == null);
-    try testing.expectEqualStrings("Hi there.", direct.content);
-
-    // Length-truncated mid-thought: reasoning so far, never content.
-    const cut = splitThinkBlock(" to=self<|message|>Half a thou", true, false);
-    try testing.expectEqualStrings("Half a thou", cut.reasoning_content.?);
-    try testing.expectEqualStrings("", cut.content);
-
-    // A trailing partial header after <|eom|> is dropped, not content.
-    const partial = splitThinkBlock(" to=self<|message|>R done.<|eom|><|start|>assistant to=us", true, false);
-    try testing.expectEqualStrings("R done.", partial.reasoning_content.?);
-    try testing.expectEqualStrings("", partial.content);
-
-    // Non-muse text (no <|message|> marker) is never claimed.
-    const plain = splitThinkBlock("just prose with to=user in it", true, false);
-    try testing.expect(plain.reasoning_content == null);
-    try testing.expectEqualStrings("just prose with to=user in it", plain.content);
-}
-
-test "splitMuseChannels: tool segment markup never rides out as content (wrapper cut)" {
-    const text = " to=self<|message|>Need the tool.<|eom|><|start|>assistant to=weather.get<|message|><atem:function_calls>\n<atem:invoke name=\"weather.get\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
-    // Display split: the ATEM markup is CUT from content.
-    const split = splitThinkBlock(text, true, false);
-    try testing.expectEqualStrings("Need the tool.", split.reasoning_content.?);
-    try testing.expectEqualStrings("", split.content);
-    // KeepingMarkup split: the markup survives for the tool parser.
-    const keeping = splitThinkBlockKeepingMarkup(text, true, false);
-    try testing.expect(std.mem.indexOf(u8, keeping.content, "<atem:invoke") != null);
-}
-
-test "serializeMessagesJsonOpts: harmony gets \"\" for empty content, everyone else keeps null" {
-    // The harmony template guards with `if \"content\" in message` and then
-    // does `\"…\" in message.content`. A null passes the first and breaks the
-    // second, and the message that carries no content is precisely the
-    // tool-calling assistant turn — so this is the whole tool round-trip.
-    const allocator = testing.allocator;
-    const messages = [_]Message{
-        .{ .role = "user", .content = "weather?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &[_]ToolCall{
-            .{ .id = "call_1", .name = "get_weather", .arguments = "{\"location\":\"SF\"}" },
-        } },
-    };
-
-    const harmony = try serializeMessagesJsonOpts(allocator, &messages, .empty_string);
-    defer allocator.free(harmony);
-    const hp = try std.json.parseFromSlice(std.json.Value, allocator, harmony, .{});
-    defer hp.deinit();
-    const hmsg = hp.value.array.items[1].object;
-    try testing.expect(hmsg.get("content").? == .string);
-    try testing.expectEqualStrings("", hmsg.get("content").?.string);
-    // The tool call itself still round-trips.
-    try testing.expectEqualStrings(
-        "get_weather",
-        hmsg.get("tool_calls").?.array.items[0].object.get("function").?.object.get("name").?.string,
-    );
-
-    // Every other family keeps the null it has always been given.
-    const legacy = try serializeMessagesJson(allocator, &messages);
-    defer allocator.free(legacy);
-    const lp = try std.json.parseFromSlice(std.json.Value, allocator, legacy, .{});
-    defer lp.deinit();
-    try testing.expect(lp.value.array.items[1].object.get("content").? == .null);
-}
-
-test "parseHarmonyToolCalls: name comes from the HEADER, arguments from the body" {
-    // gpt-oss puts the tool name in the segment header's recipient
-    // (`to=functions.NAME`) and the arguments — already JSON — in the body.
-    // Nothing in the body names the function, so a body-only parser finds
-    // an anonymous JSON object and infers nothing.
-    const text = "<|start|>assistant to=functions.get_weather<|channel|>commentary " ++
-        "<|constrain|>json<|message|>{\"location\": \"SF\", \"unit\": \"c\"}<|call|>";
-    var calls: std.ArrayList(ParsedToolCall) = .empty;
-    defer {
-        for (calls.items) |tc| {
-            std.testing.allocator.free(tc.name);
-            std.testing.allocator.free(tc.arguments);
-        }
-        calls.deinit(std.testing.allocator);
-    }
-    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
-    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
-    try std.testing.expectEqualStrings("get_weather", calls.items[0].name);
-    try std.testing.expectEqualStrings("{\"location\": \"SF\", \"unit\": \"c\"}", calls.items[0].arguments);
-    try std.testing.expect(!calls.items[0].inferred);
-}
-
-test "parseHarmonyToolCalls: recipient after the channel name parses the same" {
-    const text = "<|start|>assistant<|channel|>commentary to=functions.ping<|message|>{\"n\":1}<|call|>";
-    var calls: std.ArrayList(ParsedToolCall) = .empty;
-    defer {
-        for (calls.items) |tc| {
-            std.testing.allocator.free(tc.name);
-            std.testing.allocator.free(tc.arguments);
-        }
-        calls.deinit(std.testing.allocator);
-    }
-    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
-    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
-    try std.testing.expectEqualStrings("ping", calls.items[0].name);
-    try std.testing.expectEqualStrings("{\"n\":1}", calls.items[0].arguments);
-}
-
-test "parseHarmonyToolCalls: truncated arguments ship NAME + {}, never a fragment" {
-    // Cut mid-value. The call is real (the header resolved), so the name must
-    // survive, but a partial value must never be presented as an argument.
-    const text = "<|start|>assistant to=functions.search<|channel|>commentary<|message|>{\"q\": \"how do I";
-    var calls: std.ArrayList(ParsedToolCall) = .empty;
-    defer {
-        for (calls.items) |tc| {
-            std.testing.allocator.free(tc.name);
-            std.testing.allocator.free(tc.arguments);
-        }
-        calls.deinit(std.testing.allocator);
-    }
-    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
-    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
-    try std.testing.expectEqualStrings("search", calls.items[0].name);
-    try std.testing.expectEqualStrings("{}", calls.items[0].arguments);
-}
-
-test "parseHarmonyToolCalls: analysis and final segments are NOT tool calls" {
-    const text = "<|channel|>analysis<|message|>thinking<|end|>" ++
-        "<|start|>assistant<|channel|>final<|message|>done<|return|>";
-    var calls: std.ArrayList(ParsedToolCall) = .empty;
-    defer {
-        for (calls.items) |tc| {
-            std.testing.allocator.free(tc.name);
-            std.testing.allocator.free(tc.arguments);
-        }
-        calls.deinit(std.testing.allocator);
-    }
-    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
-    try std.testing.expectEqual(@as(usize, 0), calls.items.len);
-}
-
-test "parseHarmonyToolCalls: two tool segments both parse" {
-    const text = "<|start|>assistant to=functions.a<|channel|>commentary<|message|>{\"x\":1}<|call|>" ++
-        "<|start|>assistant to=functions.b<|channel|>commentary<|message|>{\"y\":2}<|call|>";
-    var calls: std.ArrayList(ParsedToolCall) = .empty;
-    defer {
-        for (calls.items) |tc| {
-            std.testing.allocator.free(tc.name);
-            std.testing.allocator.free(tc.arguments);
-        }
-        calls.deinit(std.testing.allocator);
-    }
-    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
-    try std.testing.expectEqual(@as(usize, 2), calls.items.len);
-    try std.testing.expectEqualStrings("a", calls.items[0].name);
-    try std.testing.expectEqualStrings("b", calls.items[1].name);
-}
-
-test "parseAtemToolCalls: canonical block — raw strings, spelled types, schema untouched" {
-    const allocator = testing.allocator;
-    const text = " to=weather.get<|message|><atem:function_calls>\n<atem:invoke name=\"weather.get\">\n<atem:parameter name=\"city\">Paris, France</atem:parameter>\n<atem:parameter name=\"detailed\">false</atem:parameter>\n<atem:parameter name=\"days\">3</atem:parameter>\n<atem:parameter name=\"tags\">[\"trip\", \"eu\"]</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    try testing.expectEqualStrings("weather.get", calls[0].name);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    try testing.expectEqualStrings("Paris, France", obj.get("city").?.string);
-    try testing.expectEqual(false, obj.get("detailed").?.bool);
-    try testing.expectEqual(@as(i64, 3), obj.get("days").?.integer);
-    try testing.expectEqual(@as(usize, 2), obj.get("tags").?.array.items.len);
-}
-
-test "parseAtemToolCalls: multiline string values keep exact bytes (no trimming)" {
-    const allocator = testing.allocator;
-    const text = "<atem:invoke name=\"fs.write\">\n<atem:parameter name=\"content\">line one\n  \"quoted\" line\n</atem:parameter>\n</atem:invoke>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 1), calls.len);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    // Exact bytes incl. the trailing newline — the reference does not strip.
-    try testing.expectEqualStrings("line one\n  \"quoted\" line\n", parsed.value.object.get("content").?.string);
-}
-
-test "parseAtemToolCalls: truncation salvages NAME + completed params, never fragments" {
-    const allocator = testing.allocator;
-    // Cut mid-value: the completed param ships, the fragment is dropped.
-    {
-        const text = "<atem:invoke name=\"weather.get\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n<atem:parameter name=\"units\">celsi";
-        const calls = (try parseToolCalls(allocator, text)).?;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        try testing.expectEqual(@as(usize, 1), calls.len);
-        try testing.expectEqualStrings("weather.get", calls[0].name);
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-        defer parsed.deinit();
-        try testing.expectEqualStrings("Paris", parsed.value.object.get("city").?.string);
-        try testing.expect(parsed.value.object.get("units") == null);
-    }
-    // Cut right after the opener: NAME + {}.
-    {
-        const text = "<atem:function_calls>\n<atem:invoke name=\"weather.get\">";
-        const calls = (try parseToolCalls(allocator, text)).?;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        try testing.expectEqual(@as(usize, 1), calls.len);
-        try testing.expectEqualStrings("weather.get", calls[0].name);
-        try testing.expectEqualStrings("{}", calls[0].arguments);
-    }
-}
-
-test "parseAtemToolCalls: parallel invokes each parse; dropped wrapper still parses" {
-    const allocator = testing.allocator;
-    const text = "<atem:invoke name=\"a.one\">\n<atem:parameter name=\"x\">1</atem:parameter>\n</atem:invoke>\n<atem:invoke name=\"a.two\">\n<atem:parameter name=\"y\">two</atem:parameter>\n</atem:invoke>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    try testing.expectEqual(@as(usize, 2), calls.len);
-    try testing.expectEqualStrings("a.one", calls[0].name);
-    try testing.expectEqualStrings("a.two", calls[1].name);
-}
-
 test "parseToolCalls: Claude-style bare <invoke> markup is an inferred call" {
     const allocator = testing.allocator;
     const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x && ls -la</parameter>\n<parameter name=\"timeout\">30</parameter>\n</invoke>\n</function_calls>";
@@ -13480,97 +12214,6 @@ test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; pr
         }
     }
     try testing.expect(!streamShouldBufferForTools("I <invoked> the <function_callback> helper"));
-}
-
-test "muse streaming gate: headers hold, self holds then splits, user splits" {
-    // Growing bare header — never flush the ` to=…` text. The sub-"to="
-    // prefixes are the live 2026-08-10 leak (" to" shipped as a text delta
-    // on a thinking-off /v1/messages stream).
-    try testing.expect(museStreamVerdict(" t") == StreamThinkGate.hold_thinking);
-    try testing.expect(museStreamVerdict(" to") == StreamThinkGate.hold_thinking);
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to", true, false, false));
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to=se", true, false, false));
-    // Reasoning in progress streams via hold_thinking; <|eom|> splits.
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to=self<|message|>thinking…", true, false, false));
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2(" to=self<|message|>done<|eom|>", true, false, false));
-    // Direct answer resolves to a split (the handler strips the header once).
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2(" to=user<|message|>Hi", true, false, false));
-    // A next-segment header mid-stream holds again.
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to=self<|message|>d<|eom|><|start|>assistant to=w", true, false, false));
-    // Prose that merely starts with to= releases at the first non-recipient byte.
-    try testing.expect(museStreamVerdict("to=5 grams of flour") == null);
-    // The memoized gate agrees on the muse arms.
-    var scan = ThinkScan{};
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGateScan(" to=self<|message|>done<|eom|>", true, false, false, &scan));
-}
-
-test "muse streamShouldBufferForTools: tool headers hold, self/user release" {
-    // Unresolved header could still name a tool — including sub-"to="
-    // prefixes (the live " to" text-delta leak).
-    try testing.expect(streamShouldBufferForTools(" t"));
-    try testing.expect(streamShouldBufferForTools(" to"));
-    try testing.expect(streamShouldBufferForTools(" to=weath"));
-    try testing.expect(streamShouldBufferForTools(" to=self<|message|>r<|eom|><|start|>assistant to=wea"));
-    // Resolved tool recipient keeps holding (body is ATEM payload).
-    try testing.expect(streamShouldBufferForTools(" to=weather.get<|message|>"));
-    // ATEM markup anywhere holds.
-    try testing.expect(streamShouldBufferForTools("<atem:function_calls>"));
-    try testing.expect(streamShouldBufferForTools("prefix <atem"));
-    // Resolved self/user releases so reasoning/content can stream.
-    try testing.expect(!streamShouldBufferForTools(" to=self<|message|>thinking about tools"));
-    try testing.expect(!streamShouldBufferForTools(" to=user<|message|>plain answer"));
-    // Ordinary prose that starts with to= releases at the first space.
-    try testing.expect(!streamShouldBufferForTools("to=5 grams"));
-}
-
-test "museThinkOpenerAt: self opens reasoning, others answer directly, partials grow" {
-    try testing.expectEqual(MuseThinkOpener.growing, museThinkOpenerAt(" to=se"));
-    switch (museThinkOpenerAt(" to=self<|message|>")) {
-        .self_opened => |hl| try testing.expectEqual(@as(usize, " to=self<|message|>".len), hl),
-        else => return error.TestUnexpectedResult,
-    }
-    switch (museThinkOpenerAt(" to=user<|message|>Hi")) {
-        .direct => |hl| try testing.expectEqual(@as(usize, " to=user<|message|>".len), hl),
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expectEqual(MuseThinkOpener.not_muse, museThinkOpenerAt("Okay, the user wants X."));
-    // Complete next-segment header skip; incomplete returns null.
-    try testing.expectEqual(@as(usize, "<|start|>assistant to=user<|message|>".len), museContentHeaderSkip("<|start|>assistant to=user<|message|>Hello").?);
-    try testing.expect(museContentHeaderSkip("<|start|>assistant to=us") == null);
-}
-
-test "serializeExtraContext: muse maps effort onto reasoning_strength" {
-    const allocator = testing.allocator;
-    var muse = ChatConfig{
-        .chat_template = "…{%- set rs = reasoning_strength if reasoning_strength is defined else 'high' -%}…",
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    const cases = [_]struct { thinking: bool, effort: ?[]const u8, want: []const u8 }{
-        .{ .thinking = true, .effort = null, .want = "\"reasoning_strength\":\"high\"" },
-        .{ .thinking = true, .effort = "low", .want = "\"reasoning_strength\":\"low\"" },
-        .{ .thinking = true, .effort = "medium", .want = "\"reasoning_strength\":\"medium\"" },
-        .{ .thinking = true, .effort = "xhigh", .want = "\"reasoning_strength\":\"high\"" },
-        .{ .thinking = false, .effort = null, .want = "\"reasoning_strength\":\"low\"" },
-    };
-    for (cases) |case| {
-        const r = try serializeExtraContext(allocator, &muse, case.thinking, case.effort);
-        defer allocator.free(r);
-        try testing.expect(std.mem.indexOf(u8, r, case.want) != null);
-    }
-    // Non-muse templates never see the key.
-    var plain = ChatConfig{
-        .chat_template = "{{ messages }}",
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    const r = try serializeExtraContext(allocator, &plain, true, null);
-    defer allocator.free(r);
-    try testing.expect(std.mem.indexOf(u8, r, "reasoning_strength") == null);
 }
 
 test "ThinkScan: incremental gate matches the fresh gate at every prefix length" {
@@ -14037,26 +12680,6 @@ test "parseToolCalls minicpm5: unrecognized param passes through untouched" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("5000", parsed.value.object.get("timeout_ms").?.string);
-}
-
-test "parseToolCalls minicpm5: a harmony ANALYSIS channel is never scanned for this dialect" {
-    // gpt-oss/harmony (upstream #247) landed a reasoning transcript format whose
-    // analysis channel carries the model's private thinking. This dialect's
-    // fallback scanned that text too, so a harmony model merely EXPLAINING the
-    // MiniCPM5 syntax produced a real, unrequested `get_time({})` call.
-    // Introduced by adding this arm - before it, `<function name=` parsed nowhere.
-    const analysis = "<|start|>assistant<|channel|>analysis<|message|>The user asks about <function name=\"get_time\"></function> syntax.<|end|>";
-    if (try parseToolCalls(testing.allocator, analysis)) |calls| {
-        defer freeParsedCalls(calls);
-        std.debug.print("harmony analysis became a call: {s}({s})\n", .{ calls[0].name, calls[0].arguments });
-        return error.HarmonyAnalysisBecameToolCall;
-    }
-
-    // The dialect itself is untouched: no harmony markers, still parses.
-    const plain = "<function name=\"get_time\"></function>";
-    const c = (try parseToolCalls(testing.allocator, plain)) orelse return error.ExpectedToolCall;
-    defer freeParsedCalls(c);
-    try testing.expectEqualStrings("get_time", c[0].name);
 }
 
 test "minicpm5 COMBINED: parser and scrubber agree on the same bytes" {
@@ -14566,19 +13189,6 @@ test "appendJsonString: invalid UTF-8 becomes U+FFFD, valid multibyte is byte-ex
     try testing.expectEqualStrings("\"a\u{FFFD}\"", buf.items);
 }
 
-test "a muse header the MODEL writes at position 0 is resolved, self means reasoning" {
-    // The prompt ends at `<|start|>assistant`; the model's ` to=self<|message|>` used to
-    // stream as content because only a `<|start|>` TOKEN armed the header skip.
-    try std.testing.expect(promptTailOpensMuseHeader("...<|eot|><|start|>assistant"));
-    try std.testing.expect(promptTailOpensMuseHeader("<|start|>assistant\n"));
-    try std.testing.expect(!promptTailOpensMuseHeader("<|start|>assistant to=user<|message|>"));
-    try std.testing.expect(museHeaderOpensReasoning(" to=self"));
-    try std.testing.expect(museHeaderOpensReasoning("assistant to=self\n"));
-    try std.testing.expect(!museHeaderOpensReasoning(" to=user"));
-    try std.testing.expect(!museHeaderOpensReasoning(" to=selfish"));
-    try std.testing.expect(!museHeaderOpensReasoning(""));
-}
-
 test "a model-opened think block latches from its own opener token" {
     // Both openers are dropped from visible deltas as channel markers, so without
     // this latch the whole thought streams as the answer (LFM2.5-8B-A1B, Gemma 4).
@@ -14597,9 +13207,9 @@ test "K2-Horizon: the rendered prompt opens one of three think tags; thinking-of
     try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
     try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_faster>\n"));
     try testing.expect(!promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|thinker>\n"));
-    try testing.expectEqualStrings("</ifm|think_fast>", contentChannelTail("", "<|ifm|im_start|>assistant\n<ifm|think_fast>\n", true));
-    try testing.expectEqualStrings("</ifm|think>", contentChannelTail("", "x<ifm|think>\n", true));
-    try testing.expectEqualStrings("</think>", contentChannelTail("", "x<think>\n", true));
+    try testing.expectEqualStrings("</ifm|think_fast>", contentChannelTail("<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
+    try testing.expectEqualStrings("</ifm|think>", contentChannelTail("x<ifm|think>\n"));
+    try testing.expectEqualStrings("</think>", contentChannelTail("x<think>\n"));
 }
 
 test "serializeMessagesJson: a string-content template gets each image as its atom where it sits, blank-line joined" {
@@ -14611,7 +13221,7 @@ test "serializeMessagesJson: a string-content template gets each image as its at
         .{ .role = "user", .content = "plain" },
     };
     var cfg = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = "<IMG>" };
-    const json = try serializeMessagesJsonFor(a, &msgs, .null_literal, &cfg);
+    const json = try serializeMessagesJsonFor(a, &msgs, &cfg);
     defer a.free(json);
     try testing.expectEqualStrings(
         "[{\"role\":\"user\",\"content\":\"<IMG>\\n\\nAAAAA\\n\\n<IMG>\\n\\nBBB\"}," ++
@@ -14620,7 +13230,7 @@ test "serializeMessagesJson: a string-content template gets each image as its at
     );
     // Without the atom the same message renders as typed parts.
     cfg.image_placeholder = null;
-    const typed = try serializeMessagesJsonFor(a, msgs[0..1], .null_literal, &cfg);
+    const typed = try serializeMessagesJsonFor(a, msgs[0..1], &cfg);
     defer a.free(typed);
     try testing.expect(std.mem.indexOf(u8, typed, "{\"type\":\"image\"}") != null);
 }
@@ -14633,13 +13243,13 @@ test "K2-Horizon: assistant history always carries a thinking field, and the eff
         .{ .role = "assistant", .content = "hello" },
         .{ .role = "assistant", .content = "again", .reasoning_content = "why" },
     };
-    const json = try serializeMessagesJsonFor(testing.allocator, &messages, .null_literal, &cfg);
+    const json = try serializeMessagesJsonFor(testing.allocator, &messages, &cfg);
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"content\":\"hello\",\"reasoning_content\":\"\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"why\"") != null);
     // Other families keep omitting the key.
     const plain = ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
-    const json2 = try serializeMessagesJsonFor(testing.allocator, messages[0..2], .null_literal, &plain);
+    const json2 = try serializeMessagesJsonFor(testing.allocator, messages[0..2], &plain);
     defer testing.allocator.free(json2);
     try testing.expect(std.mem.indexOf(u8, json2, "reasoning_content") == null);
 
@@ -14943,7 +13553,7 @@ test "chat: V4.1 renders images as the release's encoder does, an atom for each 
     const tpl_z = try a.dupeSentinel(u8, cfg.chat_template, 0);
     defer a.free(tpl_z);
     for (cases) |c| for ([_]struct { mode: []const u8, want: []const u8 }{ .{ .mode = "chat", .want = c.chat }, .{ .mode = "thinking", .want = c.thinking } }) |arm| {
-        const json = try serializeMessagesJsonFor(a, c.msgs, .null_literal, &cfg);
+        const json = try serializeMessagesJsonFor(a, c.msgs, &cfg);
         defer a.free(json);
         const json_z = try a.dupeSentinel(u8, json, 0);
         defer a.free(json_z);

@@ -73,8 +73,6 @@ pub const Kind = enum {
     /// `chat.BARE_THINK_OPENER` / `BARE_THINK_CLOSER`).
     bare_think,
     gemma,
-    harmony,
-    muse,
 };
 
 pub const BARE_THINK_OPENER = "<think>";
@@ -193,24 +191,6 @@ pub const Protocol = struct {
                 self.addHeader("<|channel>thought\n", .reasoning);
                 self.addHeader("<|channel>thought", .reasoning);
                 self.addHeader("<|channel>\n", .json_body);
-            },
-            .harmony => {
-                _ = self.setCloser("<|end|>");
-                inline for (.{ "<|start|>assistant", "" }) |prefix| {
-                    self.addHeader(prefix ++ "<|channel|>analysis<|message|>", .reasoning);
-                    self.addHeader(prefix ++ "<|channel|>final<|message|>", .json_body);
-                    self.addHeader(prefix ++ "<|channel|>commentary<|message|>", .json_body);
-                    self.addHeader(prefix ++ " to=user<|channel|>final<|message|>", .json_body);
-                    self.addHeader(prefix ++ "<|channel|>final to=user<|message|>", .json_body);
-                }
-            },
-            .muse => {
-                _ = self.setCloser("<|eom|>");
-                inline for (.{ "<|start|>assistant", "" }) |prefix| {
-                    self.addHeader(prefix ++ " to=self<|message|>", .reasoning);
-                    self.addHeader(prefix ++ " to=user<|message|>", .json_body);
-                    self.addHeader(prefix ++ "<|message|>", .json_body);
-                }
             },
         }
     }
@@ -1561,8 +1541,6 @@ test "constrained split clips a stop before payload and preserves unrelated tags
 test "channel formats require their final header before JSON" {
     const cases = .{
         .{ Kind.gemma, "<|turn>model\n<|channel>thought\n", "work<channel|><|channel>\n{}" },
-        .{ Kind.harmony, "<|start|>assistant<|channel|>analysis<|message|>", "work<|end|><|start|>assistant<|channel|>final<|message|>{}" },
-        .{ Kind.muse, "<|start|>assistant to=self<|message|>", "work<|eom|><|start|>assistant to=user<|message|>{}" },
     };
     inline for (cases) |case| {
         var p = Protocol{ .kind = case[0] };
@@ -1676,16 +1654,10 @@ fn expectRoutedAtEverySplit(kind: Kind, prompt: []const u8, text: []const u8, ex
 test "channel routing and masks agree at every token split, including repeated reasoning" {
     const json = "{\"note\":\"<think> and <|channel|> are data\"}";
     try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "<|channel>thought\nfirst<channel|><|channel>thought\nsecond<channel|><|channel>\n" ++ json, "first\nsecond", json);
-    try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>analysis<|message|>first<|end|><|start|>assistant<|channel|>analysis<|message|>second<|end|><|start|>assistant<|channel|>final<|message|>" ++ json, "firstsecond", json);
-    try expectRoutedAtEverySplit(.muse, "<|start|>assistant", " to=self<|message|>first<|eom|><|start|>assistant to=self<|message|>second<|eom|><|start|>assistant to=user<|message|>" ++ json, "firstsecond", json);
 }
 
 test "channel formats allow direct answers through their content headers" {
     try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "<|channel>\n{}", "", "{}");
-    try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>final<|message|>{}", "", "{}");
-    try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>commentary<|message|>{}", "", "{}");
-    try expectRoutedAtEverySplit(.muse, "<|start|>assistant", " to=user<|message|>{}", "", "{}");
-    try expectRoutedAtEverySplit(.muse, "<|start|>assistant", "<|message|>{}", "", "{}");
 }
 
 fn asciiRecovery(a: std.mem.Allocator, text: []const u8) !struct { table: []SuffixRun, tokens: []u32 } {
@@ -1702,7 +1674,7 @@ test "every channel header prefix recovers to JSON without duplicating partial h
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for ([_]Kind{ .gemma, .harmony, .muse }) |kind| {
+    for ([_]Kind{.gemma}) |kind| {
         var p = Protocol{ .kind = kind };
         p.configureChannels();
         const close = try asciiRecovery(a, p.closerText());
@@ -1744,7 +1716,7 @@ test "every channel header prefix recovers to JSON without duplicating partial h
 }
 
 test "thinking off constrains final headers even after a prompt committed analysis" {
-    for ([_]Kind{ .gemma, .harmony, .muse }) |kind| {
+    for ([_]Kind{.gemma}) |kind| {
         var p = Protocol{ .kind = kind };
         p.configureChannels();
         const reasoning_header = p.headers[0].text;
@@ -1774,37 +1746,29 @@ test "thinking off constrains final headers even after a prompt committed analys
 }
 
 test "special-token channel headers preserve identity and never become JSON input" {
-    var p = Protocol{ .kind = .harmony };
+    var p = Protocol{ .kind = .gemma };
     p.configureChannels();
-    try testing.expect(p.startFromPrompt("<|start|>assistant"));
+    try testing.expect(p.startFromPrompt("<|turn>model\n<|channel>thought\n"));
     const specials = [_]Special{
-        .{ .id = 0, .text = "<|channel|>" },
-        .{ .id = 1, .text = "<|message|>" },
-        .{ .id = 2, .text = "<|end|>" },
-        .{ .id = 3, .text = "<|start|>" },
+        .{ .id = 0, .text = "<|channel>" },
+        .{ .id = 1, .text = "<channel|>" },
     };
     @memcpy(p.specials[0..specials.len], &specials);
     p.special_len = specials.len;
-    p.closer_atomic = 2;
+    p.closer_atomic = 1;
     var state = p.startState();
-    _ = observeProtocolToken(&p, &state, 0, null);
-    _ = observeProtocolToken(&p, &state, 100, "analysis");
-    _ = observeProtocolToken(&p, &state, 1, null);
     try testing.expectEqual(Phase.reasoning, state.phase);
     _ = observeProtocolToken(&p, &state, 100, "reason");
-    _ = observeProtocolToken(&p, &state, 2, null);
+    _ = observeProtocolToken(&p, &state, 1, null);
     try testing.expectEqual(Phase.header, state.phase);
-    _ = observeProtocolToken(&p, &state, 3, null);
-    _ = observeProtocolToken(&p, &state, 100, "assistant");
     _ = observeProtocolToken(&p, &state, 0, null);
-    _ = observeProtocolToken(&p, &state, 100, "final");
-    try testing.expectEqualStrings("", observeProtocolToken(&p, &state, 1, null).?);
+    try testing.expectEqualStrings("", observeProtocolToken(&p, &state, 100, "\n").?);
     try testing.expectEqual(Phase.json_body, state.phase);
     try testing.expect(!state.invalid);
 }
 
 test "channel masks reject malformed transitions and invalid crossing payloads" {
-    inline for (.{ Kind.gemma, Kind.harmony, Kind.muse }) |kind| {
+    inline for (.{Kind.gemma}) |kind| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();

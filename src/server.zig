@@ -1331,15 +1331,6 @@ fn nameIds(allocator: std.mem.Allocator, tok: *const Tokenizer, tools_json: []co
     return .{ .flat = flat, .slices = slices };
 }
 
-fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
-    const c = lm.config orelse return false;
-    if (!std.mem.eql(u8, c.model_type, "muse_glimmer") or prompt_ids.len == 0) return false;
-    const n = @min(prompt_ids.len, 8);
-    const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - n ..], false) catch return false;
-    defer allocator.free(tail);
-    return chat_mod.promptTailOpensMuseHeader(tail);
-}
-
 /// A generated tag needs one unambiguous literal spelling in the template.
 /// Dynamic or conflicting spellings retain the unsupported-format fallback.
 fn templateThinkOpener(template: []const u8) ?[]const u8 {
@@ -1392,11 +1383,7 @@ fn resolveReasoningProtocol(
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
 
     const template = chat_config.chat_template;
-    const kind: rp_mod.Kind = if (std.mem.indexOf(u8, template, "<|channel|>") != null)
-        .harmony
-    else if (std.mem.indexOf(u8, template, "<|eom|>") != null)
-        .muse
-    else if (std.mem.indexOf(u8, template, "<|channel>") != null)
+    const kind: rp_mod.Kind = if (std.mem.indexOf(u8, template, "<|channel>") != null)
         .gemma
     else
         .bare_think;
@@ -1462,7 +1449,7 @@ fn resolveReasoningProtocol(
         proto.special_len += 1;
     }
     for ([_][]const u8{
-        "<|start|>", "<|channel|>", "<|message|>", "<|channel>", "<channel|>", "<|end|>", "<|eom|>",
+        "<|channel>", "<channel|>",
     }) |text| {
         if (tok.specialTokenId(text)) |id| {
             proto.specials[proto.special_len] = .{ .id = id, .text = text };
@@ -11694,7 +11681,6 @@ fn handleStreamingGeneration(
     var ve_local = deferred_media;
     defer if (ve_local) |d| d.deinit();
 
-    const config = lm.config.?;
     const chat_id = nextCompletionId(&completion_id_counter, nowMs(stream.io));
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed buffered output is
@@ -11811,7 +11797,7 @@ fn handleStreamingGeneration(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-    const gated_stream = has_tools or (sampling.constraint == null and std.mem.eql(u8, config.model_type, "gpt_oss"));
+    const gated_stream = has_tools;
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to
@@ -11836,12 +11822,6 @@ fn handleStreamingGeneration(
     // opener — the template must have injected one", which is the very case
     // that has to be told apart at the end-of-stream flush below.
     var saw_think_open = false;
-    // Muse-Glimmer: dropping a segment header in the plain arm — <|start|>
-    // arms it, <|message|> disarms; the role+recipient text between them is
-    // ordinary tokens that must never reach the client as content.
-    var muse_skip_header = promptOpensMuseHeader(allocator, lm, tok, prompt_ids);
-    var muse_head = std.ArrayList(u8).empty; // header bytes held while skipping
-    defer muse_head.deinit(allocator);
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
@@ -12071,49 +12051,6 @@ fn handleStreamingGeneration(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .analysis) {
-                    // gpt_oss: `[<|start|>assistant]<|channel|>analysis<|message|>`
-                    // opens a reasoning segment that closes at <|end|>. Consume
-                    // the header — every byte of it is ordinary text, and the
-                    // close matcher below assumes reasoning starts at byte 0.
-                    const skip = switch (chat_mod.harmonyThinkOpenerAt(think_buf.items)) {
-                        .analysis => |hl| hl,
-                        else => unreachable,
-                    };
-                    saw_think_open = true;
-                    think_close_tag = "<|end|>";
-                    var skip2 = skip;
-                    while (skip2 < think_buf.items.len and think_buf.items[skip2] == '\n') skip2 += 1;
-                    const remaining = try allocator.dupe(u8, think_buf.items[skip2..]);
-                    think_buf.clearAndFree(allocator);
-                    try think_buf.appendSlice(allocator, remaining);
-                    allocator.free(remaining);
-                    skipped_think_open = true;
-                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .growing) {
-                    // Harmony header still arriving — wait, or `<|channel|>anal`
-                    // leaks as reasoning.
-                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .self_opened) {
-                    // Muse-Glimmer reasoning segment (` to=self<|message|>`) —
-                    // closes at <|eom|>. The direct-answer header
-                    // (` to=user<|message|>`) is handled by the close matcher
-                    // below (immediate close, empty reasoning), and .growing
-                    // deliberately falls through to wait for more tokens.
-                    const skip = switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
-                        .self_opened => |hl| hl,
-                        else => unreachable,
-                    };
-                    saw_think_open = true;
-                    think_close_tag = "<|eom|>";
-                    var skip2 = skip;
-                    while (skip2 < think_buf.items.len and think_buf.items[skip2] == '\n') skip2 += 1;
-                    const remaining = try allocator.dupe(u8, think_buf.items[skip2..]);
-                    think_buf.clearAndFree(allocator);
-                    try think_buf.appendSlice(allocator, remaining);
-                    allocator.free(remaining);
-                    skipped_think_open = true;
-                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .growing) {
-                    // Muse header still arriving token by token — wait before
-                    // deciding, or the ` to=self` text leaks as reasoning.
                 } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                     // Gemma 4 think format — switch close tag
                     saw_think_open = true;
@@ -12151,36 +12088,7 @@ fn handleStreamingGeneration(
             // families.
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-            // Muse: a resolved non-self header is a DIRECT answer — close at 0
-            // with empty reasoning (the header bytes are the "tag"); a
-            // reasoning segment closes at its <|eom|> (gated on the muse
-            // opener having latched think_close_tag).
-            const muse_close: ?struct { pos: usize, len: usize } = blk_m: {
-                switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
-                    .direct => |hl| break :blk_m .{ .pos = 0, .len = hl },
-                    else => {},
-                }
-                if (std.mem.eql(u8, think_close_tag, "<|eom|>")) {
-                    if (std.mem.indexOf(u8, think_buf.items, "<|eom|>")) |p| break :blk_m .{ .pos = p, .len = "<|eom|>".len };
-                }
-                break :blk_m null;
-            };
-            // Harmony (gpt_oss): the analysis channel closes at <|end|> (or
-            // <|return|>, if the model skipped straight to a return). Its
-            // reasoning also has a HEADER prefix to drop, which the pos/len
-            // shape can't express — `harmony_reason_from` below carries that.
-            const harmony_close: ?struct { pos: usize, len: usize } = blk_h: {
-                if (!std.mem.eql(u8, think_close_tag, "<|end|>")) break :blk_h null;
-                if (std.mem.indexOf(u8, think_buf.items, "<|end|>")) |q|
-                    break :blk_h .{ .pos = q, .len = "<|end|>".len };
-                // The model can skip straight to the return without an <|end|>.
-                if (std.mem.indexOf(u8, think_buf.items, "<|return|>")) |q|
-                    break :blk_h .{ .pos = q, .len = "<|return|>".len };
-                break :blk_h null;
-            };
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
-                if (harmony_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
-                if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -12203,22 +12111,6 @@ fn handleStreamingGeneration(
                 } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                     content_after = content_after[10..];
                 }
-                // Harmony: the answer arrives as a whole new segment —
-                // `<|start|>assistant<|channel|>final<|message|>` — and every
-                // byte of that header is ordinary text that would otherwise
-                // ride out as content.
-                content_after = chat_mod.stripHarmonySegmentHeader(content_after);
-                // Strip a muse next-segment header (<|start|>assistant
-                // to=user<|message|>). A header still ARRIVING (start marker,
-                // no message marker yet) arms the plain-arm skip instead —
-                // its remaining tokens drop until <|message|> passes.
-                if (chat_mod.museContentHeaderSkip(content_after)) |hl| {
-                    content_after = content_after[hl..];
-                } else if (std.mem.startsWith(u8, content_after, "<|start|>")) {
-                    muse_skip_header = true;
-                    content_after = "";
-                }
-                if (std.mem.indexOf(u8, content_after, "<|eot|>")) |et| content_after = content_after[0..et];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     // The reasoning above this point never reaches the client,
@@ -12254,22 +12146,6 @@ fn handleStreamingGeneration(
             }
         } else {
             defer allocator.free(token_text);
-            // Muse segment-header skip: everything between <|start|> and
-            // <|message|> is the role+recipient header, never content.
-            const was_skipping = muse_skip_header;
-            muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
-            if (was_skipping or muse_skip_header) {
-                if (muse_skip_header) try muse_head.appendSlice(allocator, token_text);
-                // `<|message|>` resolved a header the model wrote: `to=self` is reasoning.
-                if (was_skipping and !muse_skip_header and !content_started and chat_mod.museHeaderOpensReasoning(muse_head.items)) {
-                    in_think_block = true;
-                    saw_think_open = true;
-                    skipped_think_open = true;
-                    think_close_tag = "<|eom|>";
-                }
-                if (!muse_skip_header) muse_head.clearRetainingCapacity();
-                continue;
-            }
             // Skip Gemma 4 channel tags that leak after thinking blocks
             // A think block the MODEL opens: seeded like a template-injected one.
             // Checked before the marker skip, which would swallow a bare `<think>`.
@@ -15523,7 +15399,7 @@ test "a MiMo image is resized and normalized the vendor way, in Qwen2-VL patch o
 
 test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma format)" {
     // Live crash 2026-08-11: the app preprocesses images into Gemma's square
-    // `x-mlx-pixels` buffer unless it recognises the arch, so Muse-Glimmer got
+    // `x-mlx-pixels` buffer unless it recognises the arch, so a patch-grid model got
     // one. That buffer carries NO patch grid, so the encode routed to the SigLIP
     // `forward` — whose weights are null sentinels on a patch-grid encoder —
     // and killed the server. The original image is unrecoverable from it (already
@@ -17530,7 +17406,6 @@ fn handleAnthropicStreaming(
     // Pick speculative-decoding mode (regular / drafter / MTP). The token-
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
-    const config = lm.config.?;
     const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -17609,7 +17484,7 @@ fn handleAnthropicStreaming(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-    const gated_stream = has_tools or (sampling.constraint == null and std.mem.eql(u8, config.model_type, "gpt_oss"));
+    const gated_stream = has_tools;
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to
@@ -17624,10 +17499,6 @@ fn handleAnthropicStreaming(
     // that the remaining text has no template-opened semantics.
     var think_closed = false;
     var content_started = false;
-    // Muse-Glimmer plain-arm segment-header skip (<|start|>…<|message|>).
-    var muse_skip_header = promptOpensMuseHeader(allocator, lm, tok, prompt_ids);
-    var muse_head = std.ArrayList(u8).empty; // header bytes held while skipping
-    defer muse_head.deinit(allocator);
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
     var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
@@ -17837,44 +17708,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .analysis) {
-                    // gpt_oss: `[<|start|>assistant]<|channel|>analysis<|message|>`
-                    // opens a reasoning segment that closes at <|end|>. Consume
-                    // the header — every byte of it is ordinary text, and the
-                    // close matcher below assumes reasoning starts at byte 0.
-                    const skip = switch (chat_mod.harmonyThinkOpenerAt(think_buf.items)) {
-                        .analysis => |hl| hl,
-                        else => unreachable,
-                    };
-                    think_close_tag = "<|end|>";
-                    var skip2 = skip;
-                    while (skip2 < think_buf.items.len and think_buf.items[skip2] == '\n') skip2 += 1;
-                    const remaining = try allocator.dupe(u8, think_buf.items[skip2..]);
-                    think_buf.clearAndFree(allocator);
-                    try think_buf.appendSlice(allocator, remaining);
-                    allocator.free(remaining);
-                    skipped_think_open = true;
-                } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .growing) {
-                    // Harmony header still arriving — wait, or `<|channel|>anal`
-                    // leaks as reasoning.
-                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .self_opened) {
-                    // Muse-Glimmer reasoning segment (` to=self<|message|>`) —
-                    // closes at <|eom|>. The direct-answer header closes via
-                    // the muse arm in the close matcher below.
-                    const mskip = switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
-                        .self_opened => |hl| hl,
-                        else => unreachable,
-                    };
-                    think_close_tag = "<|eom|>";
-                    var skip: usize = mskip;
-                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
-                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
-                    think_buf.clearAndFree(allocator);
-                    try think_buf.appendSlice(allocator, remaining);
-                    allocator.free(remaining);
-                    skipped_think_open = true;
-                } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .growing) {
-                    // Muse header still arriving token by token — wait.
                 } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
                     // Partial prefix of `<|channel>thought` — wait for more tokens.
                 } else if (think_buf.items.len < 32 and chat_mod.endsWithPartialThinkOpen(think_buf.items)) {
@@ -17898,35 +17731,7 @@ fn handleAnthropicStreaming(
             // Check for the close tag — accept whichever appears first.
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-            // Muse: a resolved non-self header is a DIRECT answer — close at 0
-            // with empty reasoning; a reasoning segment closes at its <|eom|>
-            // (gated on the muse opener having latched think_close_tag).
-            const muse_close: ?struct { pos: usize, len: usize } = blk_m: {
-                switch (chat_mod.museThinkOpenerAt(think_buf.items)) {
-                    .direct => |hl| break :blk_m .{ .pos = 0, .len = hl },
-                    else => {},
-                }
-                if (std.mem.eql(u8, think_close_tag, "<|eom|>")) {
-                    if (std.mem.indexOf(u8, think_buf.items, "<|eom|>")) |p| break :blk_m .{ .pos = p, .len = "<|eom|>".len };
-                }
-                break :blk_m null;
-            };
-            // Harmony (gpt_oss): the analysis channel closes at <|end|> (or
-            // <|return|>, if the model skipped straight to a return). Its
-            // reasoning also has a HEADER prefix to drop, which the pos/len
-            // shape can't express — `harmony_reason_from` below carries that.
-            const harmony_close: ?struct { pos: usize, len: usize } = blk_h: {
-                if (!std.mem.eql(u8, think_close_tag, "<|end|>")) break :blk_h null;
-                if (std.mem.indexOf(u8, think_buf.items, "<|end|>")) |q|
-                    break :blk_h .{ .pos = q, .len = "<|end|>".len };
-                // The model can skip straight to the return without an <|end|>.
-                if (std.mem.indexOf(u8, think_buf.items, "<|return|>")) |q|
-                    break :blk_h .{ .pos = q, .len = "<|return|>".len };
-                break :blk_h null;
-            };
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
-                if (harmony_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
-                if (muse_close) |m| break :blk .{ .pos = m.pos, .len = m.len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -17951,21 +17756,7 @@ fn handleAnthropicStreaming(
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
                 if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
                 if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
-                // Harmony: the answer arrives as a whole new segment —
-                // `<|start|>assistant<|channel|>final<|message|>` — and every
-                // byte of that header is ordinary text that would otherwise
-                // ride out as content.
-                content_after = chat_mod.stripHarmonySegmentHeader(content_after);
                 if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
-                // Muse next-segment header: strip when complete, arm the
-                // plain-arm skip when still arriving.
-                if (chat_mod.museContentHeaderSkip(content_after)) |hl| {
-                    content_after = content_after[hl..];
-                } else if (std.mem.startsWith(u8, content_after, "<|start|>")) {
-                    muse_skip_header = true;
-                    content_after = "";
-                }
-                if (std.mem.indexOf(u8, content_after, "<|eot|>")) |et| content_after = content_after[0..et];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     content_started = true;
@@ -17999,20 +17790,6 @@ fn handleAnthropicStreaming(
         } else {
             // Regular content token
             defer allocator.free(token_text);
-            // Muse segment-header skip: <|start|>…<|message|> is never content.
-            const was_skipping = muse_skip_header;
-            muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
-            if (was_skipping or muse_skip_header) {
-                if (muse_skip_header) try muse_head.appendSlice(allocator, token_text);
-                // `<|message|>` resolved a header the model wrote: `to=self` is reasoning.
-                if (was_skipping and !muse_skip_header and !content_started and chat_mod.museHeaderOpensReasoning(muse_head.items)) {
-                    in_think_block = true;
-                    skipped_think_open = true;
-                    think_close_tag = "<|eom|>";
-                }
-                if (!muse_skip_header) muse_head.clearRetainingCapacity();
-                continue;
-            }
             // A think block the MODEL opens: seeded like a template-injected one.
             // Checked before the marker skip, which would swallow a bare `<think>`.
             if (!content_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
