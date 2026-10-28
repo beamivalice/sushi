@@ -22,43 +22,19 @@ const expert_stream = @import("expert_stream.zig");
 const expert_quant = @import("expert_quant.zig");
 const sushi_exl3 = @import("sushi_exl3");
 
-/// Architecture allow-list for discovery. Must stay in sync with the
-/// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
-/// silently skips any subdirectory whose `config.json` declares a
-/// `model_type` outside this list — that prevents `--model-dir` from
-/// picking up partially-downloaded or unsupported checkpoints which would otherwise
-/// crash the server when the tokenizer for the unknown arch is loaded.
-///
-/// `gemma4_assistant` is deliberately excluded: those are speculative-
-/// decoding drafters, not standalone primary models. Bare `gemma4`/`qwen3`
-/// drafters can't decode on their own, and users shouldn't see them in
-/// `/v1/models`.
+/// Architecture allow-list for discovery: the four served archs. Discovery
+/// silently skips any subdirectory whose `config.json` declares another
+/// `model_type`, so `--model-dir` never picks up a partially-downloaded or
+/// unsupported checkpoint that would crash the tokenizer load.
 const supported_model_types = [_][]const u8{
-    "gemma3",           "gemma3_text",
-    "gemma4",           "gemma4_text",
-    "gemma4_unified",   "gemma4_unified_text",
-    "diffusion_gemma",  "qwen2",
-    "qwen3",            "qwen3_5",
-    "qwen3_5_text",     "qwen3_5_moe",
-    "qwen3_5_moe_text", "qwen3_moe",
-    "qwen3_moe_text",   "qwen3_next",
-    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
-    "llama",     "mistral",
-    "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
-    "nemotron_h",
-    "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
-    "muse_glimmer_text",
-    "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
-    "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
-    "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
-    "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
+    "qwen4_exp", // Qwen3.8-Flash-Next
+    "qwen4_exp_text",
     "mimo_v2", // MiMo-V2.6-Flash: resident EXL3 packs (text + image), or the original checkpoint streamed.
-    "glm5_next", // GLM-5.3-Flash (MLA + KDA hybrid MoE)
-    "deepseek_v41", // DeepSeek-V4.1-Flash: the original checkpoint, experts streamed (text only).
+    "glm5_next", // GLM-5.3-Flash
+    "deepseek_v41", // DeepSeek-V4.1-Flash: the original checkpoint, experts streamed.
 };
 
 fn isSupportedModelType(model_type: []const u8) bool {
-    if (std.mem.startsWith(u8, model_type, "lfm2")) return true;
     for (supported_model_types) |t| {
         if (std.mem.eql(u8, model_type, t)) return true;
     }
@@ -897,11 +873,11 @@ test "discoverModels finds flat and org/repo model dirs" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "flat-model");
-    try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
     // HF-style org/repo layout — the DownloadManager / `sushi pull`
     // convention. Must be discovered with id "org/name".
     try tmp.dir.createDirPath(io, "mlx-community/nested-model");
-    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
     // Junk that must not surface: an org dir with a non-model child, and a
     // dot-dir.
     try tmp.dir.createDirPath(io, "empty-org/not-a-model");
@@ -913,10 +889,10 @@ test "discoverModels finds flat and org/repo model dirs" {
     try std.testing.expectEqual(@as(usize, 2), result.models.len);
     try std.testing.expectEqualStrings("flat-model", result.models[0].id);
     try std.testing.expectEqualStrings("/models-root/flat-model", result.models[0].path);
-    try std.testing.expectEqualStrings("gemma3", result.models[0].model_type);
+    try std.testing.expectEqualStrings("mimo_v2", result.models[0].model_type);
     try std.testing.expectEqualStrings("mlx-community/nested-model", result.models[1].id);
     try std.testing.expectEqualStrings("/models-root/mlx-community/nested-model", result.models[1].path);
-    try std.testing.expectEqualStrings("qwen3", result.models[1].model_type);
+    try std.testing.expectEqualStrings("glm5_next", result.models[1].model_type);
 }
 
 fn writeStreamingQuantFixture(io: std.Io, dir: std.Io.Dir, model_type: []const u8) !void {
@@ -994,7 +970,7 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
     var moe_dir = try root.dir.openDir(io, "moe", .{ .iterate = true });
     defer moe_dir.close(io);
     try writeStreamingQuantFixture(io, q4_dir, "qwen4_exp");
-    try writeStreamingQuantFixture(io, moe_dir, "qwen3_5_moe");
+    try writeStreamingQuantFixture(io, moe_dir, "not_qwen4");
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try root.dir.realPath(io, &root_buf);
@@ -1010,7 +986,7 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
         expert_quant.Layout.quantized_split,
         expert_quant.layoutOfDir(allocator, io, "qwen4_exp", q4_path, 1).?,
     );
-    try std.testing.expect(expert_quant.layoutOfDir(allocator, io, "qwen3_5_moe", moe_path, 1) == null);
+    try std.testing.expect(expert_quant.layoutOfDir(allocator, io, "not_qwen4", moe_path, 1) == null);
 
     try std.testing.expectEqual(
         expert_quant.Layout.quantized_split,
@@ -1020,15 +996,10 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
 
     var result = try discoverModels(io, allocator, root_path);
     defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 2), result.models.len);
-    for (result.models) |m| {
-        if (std.mem.eql(u8, m.model_type, "qwen4_exp")) {
-            try std.testing.expect(m.streaming_index_complete);
-        } else {
-            try std.testing.expectEqualStrings("qwen3_5_moe", m.model_type);
-            try std.testing.expect(!m.streaming_index_complete);
-        }
-    }
+    // The foil's type is no served arch, so discovery lists only the qwen4 pack.
+    try std.testing.expectEqual(@as(usize, 1), result.models.len);
+    try std.testing.expectEqualStrings("qwen4_exp", result.models[0].model_type);
+    try std.testing.expect(result.models[0].streaming_index_complete);
 }
 
 test "qwen4 streaming index completeness requires every target bank and PLE shard" {
@@ -1091,13 +1062,13 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
     // a duplicate entry — it fails the whole registry init, i.e. the server
     // does not start. De-dup is not tidiness here.
     try a_dir.dir.createDirPath(io, "org/shared");
-    try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
     try a_dir.dir.createDirPath(io, "org/only-in-a");
-    try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
     try b_dir.dir.createDirPath(io, "org/shared");
-    try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"deepseek_v41\"}" });
     try b_dir.dir.createDirPath(io, "org/only-in-b");
-    try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/config.json", .data = "{\"model_type\":\"mistral\"}" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
 
     // `discoverModels` opens by ABSOLUTE path (the openDirAbsolute UB class),
     // and a testing tmpDir is `<cwd>/.zig-cache/tmp/<sub_path>`.
@@ -1127,7 +1098,7 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
         // registry stores a path nothing can open.
         try std.testing.expect(m.path.len > 0 and m.path[0] == '/');
     }
-    try std.testing.expectEqualStrings("qwen3", shared_type);
+    try std.testing.expectEqualStrings("glm5_next", shared_type);
     try std.testing.expect(saw_a and saw_b);
 
     // One root behaves exactly like `discoverModels` — the multi path is the
@@ -1159,7 +1130,7 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
     // bytes_on_disk feeds /v1/models, the app's RAM column AND
     // scheduler.gateEstimateBytes — all of which saw ~0 for a 121 GB model.
     try tmp.dir.createDirPath(io, "blobs");
-    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/cfg", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/cfg", .data = "{\"model_type\":\"mimo_v2\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "blobs/w1", .data = "0123456789" });
     try tmp.dir.createDirPath(io, "org/snap-model");
     try tmp.dir.symLink(io, "../../blobs/cfg", "org/snap-model/config.json", .{});
@@ -1174,12 +1145,10 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
 }
 
 test "modelKindFromType labels every family (list TYPE column + run preflight)" {
-    // Chat: MLX archs, and DiffusionGemma (which was missing from the
-    // discovery allowlist despite being servable).
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("gemma4"));
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen3_5_moe"));
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("diffusion_gemma"));
-    try testing.expect(isSupportedModelType("diffusion_gemma"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen4_exp"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("mimo_v2"));
+    try testing.expectEqual(ModelKind.unsupported, modelKindFromType("gemma4"));
+    try testing.expectEqual(ModelKind.unsupported, modelKindFromType("qwen3_5_moe"));
     // Drafter sidecars, and genuinely unsupported archs (media
     // generation included: it is no longer served).
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("flux2-klein-4b"));
@@ -1187,7 +1156,7 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
     // DFlash sidecars ride the same `*_assistant` suffix rule — never listed
     // as primary models.
-    try testing.expectEqual(ModelKind.drafter, modelKindFromType("muse_glimmer_assistant"));
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("glm5_next_assistant"));
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("vit"));
     // Labels stay column-friendly.
     try testing.expectEqualStrings("chat", ModelKind.chat.label());
@@ -1307,26 +1276,13 @@ test "lessThanById sorts ascending" {
     try testing.expect(!lessThanById({}, a, a));
 }
 
-test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
-    // Regression for the "[discovery] skip ...: unsupported model_type
-    // 'qwen3_moe'" warning: Qwen3-30B-A3B / Qwen3-Coder-30B-A3B must be
-    // discoverable by the model manager, not silently skipped.
-    try testing.expect(isSupportedModelType("qwen3_moe"));
-    try testing.expect(isSupportedModelType("qwen3_moe_text"));
-    // Sibling arches still recognized.
-    try testing.expect(isSupportedModelType("qwen3_5_moe"));
-    try testing.expect(isSupportedModelType("qwen3"));
-    // A genuinely unknown arch is still rejected.
-    try testing.expect(!isSupportedModelType("totally_made_up_arch"));
-}
-
-test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
-    // Regression for "[discovery] skip ...: unsupported model_type
-    // 'gemma3_text'": text-only Gemma 3 abliterated checkpoints
-    // (mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit) ship a flat
-    // top-level model_type "gemma3_text" and must be discoverable, not skipped.
-    try testing.expect(isSupportedModelType("gemma3_text"));
-    try testing.expect(isSupportedModelType("gemma3"));
+test "the supported model_type list is the served four" {
+    for (@import("model.zig").served_model_types) |t| try testing.expect(isSupportedModelType(t));
+    try testing.expect(isSupportedModelType("qwen4_exp_text"));
+    try testing.expectEqual(@as(usize, 5), supported_model_types.len);
+    for ([_][]const u8{ "qwen3", "qwen3_moe", "qwen3_5_moe", "gemma3_text", "gemma4", "llama", "lfm2", "lfm2_vl", "bert", "totally_made_up_arch" }) |t| {
+        try testing.expect(!isSupportedModelType(t));
+    }
 }
 
 test "isSupportedQuantMode accepts affine, mxfp4 and mxfp8, rejects nvfp4 and unknown" {
@@ -1405,7 +1361,7 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     // MoE chat model (Qwen3-Coder-30B-A3B shape), chat template present.
     {
         const json =
-            \\{"model_type":"qwen3_moe","vocab_size":151936,"hidden_size":2048,
+            \\{"model_type":"qwen4_exp","vocab_size":151936,"hidden_size":2048,
             \\"num_hidden_layers":48,"max_position_embeddings":262144,
             \\"num_experts":128,"num_experts_per_tok":8,"quantization":{"bits":8,"group_size":64}}
         ;
@@ -1423,7 +1379,7 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     // Dense model, no template → no chat caps; no quant block → 0 bits.
     {
         const json =
-            \\{"model_type":"qwen2","hidden_size":5120,"num_attention_heads":40,
+            \\{"model_type":"qwen4_exp","hidden_size":5120,"num_attention_heads":40,
             \\"max_position_embeddings":32768}
         ;
         const m = parseStubMeta(a, json, false);
@@ -1435,25 +1391,24 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     }
     // Vision: vision_config on a non-_text arch → has_vision.
     {
-        const m = parseStubMeta(a, "{\"model_type\":\"gemma4\",\"vision_config\":{\"hidden_size\":1152}}", true);
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"vision_config\":{\"hidden_size\":1152}}", true);
         try testing.expect(m.has_vision);
     }
     // …but a `_text` arch with a vestigial vision_config must NOT report vision.
     {
-        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe_text\",\"vision_config\":{}}", true);
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen4_exp_text\",\"vision_config\":{}}", true);
         try testing.expect(!m.has_vision);
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the
     // root alone reported hidden=0, layers=0, ctx=0, is_moe=false on /v1/models
-    // for EVERY unloaded Gemma 3/4 and Qwen-VL model (which is most of them),
+    // for EVERY unloaded multimodal model (which is most of them),
     // so a client couldn't tell a 128-expert MoE from a dense model without
     // cold-loading 16 GB of weights. Same class as the "Config fields omitted
     // by nested text_config" gotcha, different parser.
     {
-        // gemma-4-26B-A4B-it-qat-4bit's real shape.
         const json =
-            \\{"model_type":"gemma4","vision_config":{"hidden_size":1152},
+            \\{"model_type":"qwen4_exp","vision_config":{"hidden_size":1152},
             \\"quantization":{"bits":4,"group_size":32},
             \\"text_config":{"vocab_size":262144,"hidden_size":2560,"num_hidden_layers":62,
             \\"max_position_embeddings":131072,"num_experts":128,"top_k_experts":8}}
@@ -1473,16 +1428,16 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     // reporting 0 (mirrors the model.zig text_config merge).
     {
         const json =
-            \\{"model_type":"gemma3","max_position_embeddings":8192,
+            \\{"model_type":"qwen4_exp","max_position_embeddings":8192,
             \\"text_config":{"hidden_size":3840}}
         ;
         const m = parseStubMeta(a, json, true);
         try testing.expectEqual(@as(u32, 3840), m.hidden_size);
         try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
     }
-    // Qwen3.5/3.6 MoE nests its expert count too (Ornith-1.0-35B: 256 experts).
+    // A MoE nests its expert count too.
     {
-        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe\",\"text_config\":{\"num_experts\":256}}", true);
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"text_config\":{\"num_experts\":256}}", true);
         try testing.expect(m.is_moe);
     }
     // Malformed → found=false.
@@ -1498,7 +1453,7 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "m");
-    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen3_5\",\"hidden_size\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen4_exp\",\"hidden_size\":8}" });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(io, &path_buf);
     const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});

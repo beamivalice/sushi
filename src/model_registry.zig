@@ -170,7 +170,7 @@ pub const LoadedModel = struct {
 
     /// Identifier exposed via `/v1/models` and the request `model` field.
     /// Allocator-owned dupe of the discovery id (path basename, e.g.
-    /// "gemma-4-e4b-it-4bit"). Also used as the StringHashMap key — the map
+    /// "Qwen3.8-Flash-Next-Sushi-4bpw"). Also used as the StringHashMap key — the map
     /// stores this slice directly, so it must outlive the entry's presence
     /// in `ModelRegistry.entries`.
     id: []const u8,
@@ -1458,20 +1458,20 @@ test "ModelRegistry: peekByPath dedupes org/name discovery ids against basename 
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
     // Discovery registered this model under its org/name id (two-level scan).
-    const stub = try reg.registerStubWithArch("mlx-community/gemma-x", "/models/mlx-community/gemma-x", 64, "gemma4");
+    const stub = try reg.registerStubWithArch("mlx-community/q4-x", "/models/mlx-community/q4-x", 64, "qwen4_exp");
     // The --model path registration must find the SAME entry via its path
-    // (basename "gemma-x" doesn't match the org/name id) — otherwise the
+    // (basename "q4-x" doesn't match the org/name id) — otherwise the
     // same weights end up registered twice and can double-load.
-    const by_path = reg.peekByPath("/models/mlx-community/gemma-x");
+    const by_path = reg.peekByPath("/models/mlx-community/q4-x");
     try testing.expect(by_path != null);
     try testing.expectEqual(stub, by_path.?);
     // Trailing slash normalizes.
-    try testing.expectEqual(stub, reg.peekByPath("/models/mlx-community/gemma-x/").?);
+    try testing.expectEqual(stub, reg.peekByPath("/models/mlx-community/q4-x/").?);
     try testing.expect(reg.peekByPath("/models/elsewhere") == null);
     // registerByPath also resolves through the path before creating a stub
     // (basename fast path misses, path match hits, no filesystem probe).
-    const id = try reg.registerByPath(io, "/models/mlx-community/gemma-x/");
-    try testing.expectEqualStrings("mlx-community/gemma-x", id);
+    const id = try reg.registerByPath(io, "/models/mlx-community/q4-x/");
+    try testing.expectEqualStrings("mlx-community/q4-x", id);
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
 }
 
@@ -1898,7 +1898,7 @@ test "grammar token-byte table is per MODEL, never a process-wide singleton" {
     // Two resident models, two vocabularies, the SAME ids meaning different
     // bytes. A table built for one and handed to the other maps every id to
     // the wrong bytes, so the JSON grammar mask allows tokens whose real
-    // bytes are off-schema — live 2026-08-11, muse served under LFM2.5's
+    // bytes are off-schema — live 2026-08-11, one model served under another's
     // table answered a `json_object` request with "## Attributes".
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
@@ -2090,14 +2090,14 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     defer reg.deinit();
 
     // The first chat-capable load IS promoted...
-    const chat = try reg.registerStub("gemma", "/m/gemma", 64);
+    const chat = try reg.registerStub("mimo", "/m/mimo", 64);
     var chat_cfg = model_mod.ModelConfig{};
-    chat_cfg.model_type = "gemma4";
+    chat_cfg.model_type = "mimo_v2";
     chat.config = &chat_cfg;
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat, 64);
     reg.mutex.unlock(reg.io);
-    try testing.expectEqualStrings("gemma", reg.default_id);
+    try testing.expectEqualStrings("mimo", reg.default_id);
 
     // ...and the alias resolves to it now.
     const via_alias = try reg.ensureLoaded("sushi");
@@ -2107,7 +2107,7 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // A promoted default follows the latest chat load...
     const chat2 = try reg.registerStub("qwen", "/m/qwen", 64);
     var chat2_cfg = model_mod.ModelConfig{};
-    chat2_cfg.model_type = "qwen3";
+    chat2_cfg.model_type = "glm5_next";
     chat2.config = &chat2_cfg;
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat2, 64);
@@ -2115,11 +2115,11 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     try testing.expectEqualStrings("qwen", reg.default_id);
 
     // ...but an explicit default is never stolen.
-    try reg.setDefault("gemma");
+    try reg.setDefault("mimo");
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat2, 64);
     reg.mutex.unlock(reg.io);
-    try testing.expectEqualStrings("gemma", reg.default_id);
+    try testing.expectEqualStrings("mimo", reg.default_id);
 
     // The configs are STACK-allocated test doubles — detach them before
     // registry deinit tries to free entry-owned configs.
@@ -2137,7 +2137,7 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
 
     // One model present at boot.
     try tmp.dir.createDirPath(io, "org/first");
-    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "org/first/model.safetensors", .data = "0123" });
 
     const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});

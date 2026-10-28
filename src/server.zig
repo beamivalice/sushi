@@ -5065,7 +5065,7 @@ test "a quantized pack is streaming capable and only the dense one is streaming 
 test "the streaming markers read the ONE arch gate: no other arch carries them" {
     const t = std.testing;
     var buf: [96]u8 = undefined;
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "gguf", "" }) |arch| {
+    for ([_][]const u8{ "qwen4_exp_text", "not_a_served_arch", "gguf", "" }) |arch| {
         try t.expect(!streamingStubMarker(arch, true, true));
         try t.expect(!streamingRequiredMarker(arch, 0, false, true, true));
         try t.expectEqualStrings("", streamingRowPart(&buf, streamingStubMarker(arch, true, true), false, 60));

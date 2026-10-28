@@ -2045,7 +2045,7 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Unknown alias-shaped name → null; upstream families are not served.
     try testing.expect(resolveShortName("doesnotexist") == null);
     try testing.expect(resolveShortName("qwen3.8-flash-next:nosuchtag") == null);
-    try testing.expect(resolveShortName("gemma4") == null);
+    try testing.expect(resolveShortName("unlisted-pack") == null);
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
@@ -2057,7 +2057,7 @@ test "pull: only the beamster org, an alias or beamster/<repo>, before anything 
     try testing.expectError(error.NotBeamster, checkPullable("https://huggingface.co/Qwen/Qwen3.8-Flash-Next"));
     try testing.expectError(error.NotBeamster, checkPullable("beamster-fake/pack"));
     try testing.expectError(error.NotBeamster, checkPullable("beamster/a/b"));
-    try testing.expectError(error.UnknownModel, checkPullable("gemma4"));
+    try testing.expectError(error.UnknownModel, checkPullable("unlisted-pack"));
     try testing.expect(!isBeamsterRepo("beamster/"));
     try testing.expect(!isBeamsterRepo("beamster"));
 }
