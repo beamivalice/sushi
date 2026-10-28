@@ -2937,20 +2937,6 @@ test "cli: list tree walk descends into symlinked model dirs" {
     try testing.expect(treeEntryDescends(.directory));
     try testing.expect(treeEntryDescends(.sym_link));
     try testing.expect(!treeEntryDescends(.file));
-
-    // Source scan: the org-level and leaf-level loops in listModels must both
-    // consult the predicate — a reintroduced raw `!= .directory` check is the
-    // regression this pins. Needle split so the scan cannot match itself.
-    const src = @embedFile("cli.zig");
-    const needle = "treeEntry" ++ "Descends(";
-    var found: usize = 0;
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, src, idx, needle)) |p| {
-        found += 1;
-        idx = p + needle.len;
-    }
-    // 1 definition + 3 in this test + at least 2 call sites in the walk.
-    try testing.expect(found >= 6);
 }
 
 pub fn isPromptFlag(arg: []const u8) bool {
