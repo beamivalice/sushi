@@ -7237,6 +7237,13 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "api_error",
             .message = "generation failed",
         },
+        error.ChatTemplateUnusable => .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = std.fmt.bufPrint(buf, "chat template unusable: {s}", .{chat_mod.templateRefusal()}) catch "chat template unusable",
+        },
         else => .{
             .status_line = "500 Internal Server Error",
             .code = 500,
@@ -9991,7 +9998,7 @@ fn handleChatCompletions(
     const continue_final = continueFinalMessageRequested(root, messages.items);
     var tokenize_sw = Stopwatch.init(stream.io);
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final);
+    var prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return sendGenerationError(allocator, stream, err, .openai);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -10009,7 +10016,7 @@ fn handleChatCompletions(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final);
+            prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return sendGenerationError(allocator, stream, err, .openai);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -16997,10 +17004,13 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    p.ids = if (route == .messages)
-        try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, p.tool_choice_instruction, enable_thinking, effort_word, p.continue_final)
+    p.ids = (if (route == .messages)
+        cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, p.tool_choice_instruction, enable_thinking, effort_word, p.continue_final)
     else
-        try chat_mod.formatChat(allocator, tok, messages.items, &render_config, effective_tools_json, p.tool_choice_instruction, enable_thinking, effort_word, p.continue_final);
+        chat_mod.formatChat(allocator, tok, messages.items, &render_config, effective_tools_json, p.tool_choice_instruction, enable_thinking, effort_word, p.continue_final)) catch |err| {
+        try sendGenerationError(allocator, stream, err, .anthropic);
+        return false;
+    };
     if (output_cfg.schema != null and !p.has_tools and enable_thinking and reasoning_budget < 0) {
         p.schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, p.ids, &p.schema_proto, true);
     }
@@ -17017,10 +17027,13 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
             allocator.free(p.ids);
             p.ids = &.{};
             enable_thinking = false;
-            p.ids = if (route == .messages)
-                try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, p.tool_choice_instruction, false, effort_word, p.continue_final)
+            p.ids = (if (route == .messages)
+                cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, p.tool_choice_instruction, false, effort_word, p.continue_final)
             else
-                try chat_mod.formatChat(allocator, tok, messages.items, &render_config, effective_tools_json, p.tool_choice_instruction, false, effort_word, p.continue_final);
+                chat_mod.formatChat(allocator, tok, messages.items, &render_config, effective_tools_json, p.tool_choice_instruction, false, effort_word, p.continue_final)) catch |err| {
+                try sendGenerationError(allocator, stream, err, .anthropic);
+                return false;
+            };
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => p.schema_proto_active = false,
@@ -28210,13 +28223,17 @@ const CountTokensFixture = struct {
 
     /// The whole HTTP response count_tokens writes for `body`.
     fn post(f: *CountTokensFixture, body: []const u8) ![]u8 {
+        return f.postTo(handleAnthropicCountTokens, body);
+    }
+
+    fn postTo(f: *CountTokensFixture, handler: *const fn (std.mem.Allocator, *Conn, []const u8, *LoadedModel) anyerror!void, body: []const u8) ![]u8 {
         const t = std.testing;
         var sv: [2]std.posix.fd_t = undefined;
         try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0); // AF_UNIX, SOCK_STREAM
         defer _ = std.c.close(sv[1]);
         var conn: Conn = undefined;
         Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
-        try handleAnthropicCountTokens(t.allocator, &conn, body, &f.lm);
+        try handler(t.allocator, &conn, body, &f.lm);
         _ = std.c.close(sv[0]);
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(t.allocator);
@@ -28257,6 +28274,32 @@ const CountTokensFixture = struct {
         return @intCast(ids.len);
     }
 };
+
+test "a refused chat template answers a named 500 on every generative surface, streamed or not" {
+    const t = std.testing;
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.chat_cfg.chat_template = "{{ raise_exception('no turn format') }}";
+    f.chat_cfg.eos_token = "<|endoftext|>";
+    const Case = struct { handler: *const fn (std.mem.Allocator, *Conn, []const u8, *LoadedModel) anyerror!void, body: []const u8 };
+    const cases = [_]Case{
+        .{ .handler = handleChatCompletions, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+        .{ .handler = handleChatCompletions, .body = "{\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+        .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+        .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+        .{ .handler = handleAnthropicCountTokens, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+        .{ .handler = handleResponses, .body = "{\"input\":\"hi\"}" },
+        .{ .handler = handleResponses, .body = "{\"stream\":true,\"input\":\"hi\"}" },
+    };
+    for (cases) |c| {
+        const response = try f.postTo(c.handler, c.body);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 500 "));
+        try t.expect(std.mem.indexOf(u8, responseBody(response), "chat template unusable: ") != null);
+        try t.expect(std.mem.indexOf(u8, responseBody(response), "no turn format") != null);
+    }
+}
 
 const count_tokens_sample = @embedFile("fixtures/count_tokens_sample.json");
 const count_tokens_tools_body =

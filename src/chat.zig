@@ -428,6 +428,7 @@ pub fn renderChatTemplate(
     const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
 
     if (chat_config.chat_template.len == 0) {
+        if (!fallbackIsChatMl(chat_config)) return refuseTemplate("the model has no chat template and no fallback format");
         const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
         if (prefill) |partial| {
             defer allocator.free(base);
@@ -567,10 +568,14 @@ pub fn renderChatTemplate(
         return collapsed;
     }
 
-    // WARN, not debug: a failed render silently swaps the prompt into
-    // fallbackFormatChat's ChatML — for families whose stop/turn tokens
-    // differ (Gemma 4's <|turn>) that means degenerate generation, so the
-    // downgrade must be visible at the default log level.
+    // WARN, not debug: a failed render silently swaps a ChatML model's prompt into
+    // fallbackFormatChat's format, so the downgrade must be visible at the default
+    // log level. Any other model has no fallback: its turn tokens are not ChatML's.
+    if (!fallbackIsChatMl(chat_config)) {
+        const reason = if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "the template failed to render";
+        log.warn("jinja render failed ({s}), and this model has no fallback chat format\n", .{reason});
+        return refuseTemplate(reason);
+    }
     _ = template_fallbacks.fetchAdd(1, .monotonic);
     if (jinja_c.jinja_last_error()) |e| {
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
@@ -1348,6 +1353,26 @@ const SpecialEntry = struct {
     text: []const u8,
     id: u32,
 };
+
+threadlocal var template_refusal_buf: [160]u8 = undefined;
+threadlocal var template_refusal_len: usize = 0;
+
+/// Why the last render on this thread was refused; the HTTP error names it.
+pub fn templateRefusal() []const u8 {
+    return template_refusal_buf[0..template_refusal_len];
+}
+
+fn refuseTemplate(reason: []const u8) error{ChatTemplateUnusable} {
+    template_refusal_len = @min(reason.len, template_refusal_buf.len);
+    @memcpy(template_refusal_buf[0..template_refusal_len], reason[0..template_refusal_len]);
+    return error.ChatTemplateUnusable;
+}
+
+/// The fallback format is ChatML, so only a model whose turns end with `<|im_end|>` may use it.
+fn fallbackIsChatMl(chat_config: *const ChatConfig) bool {
+    const eos = chat_config.eos_token orelse return false;
+    return std.mem.indexOf(u8, eos, "<|im_end|>") != null;
+}
 
 /// Fallback chat formatting (ChatML) for when Jinja rendering fails.
 fn fallbackFormatChat(
@@ -8713,94 +8738,14 @@ test "real Qwen pack loaded through ChatConfig keeps late notes in place" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, next, "<tools>"));
 }
 
-test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallback (hermetic)" {
-    // src/fixtures/qwen38_chat_template.jinja is verbatim from
-    // Qwen/Qwen3.8-2.4T-A95B, the first public Qwen3.8 checkpoint (the VL
-    // siblings keep this body and re-add the vision macro). Qwen3.8 added two
-    // raise_exception gates that make our previous extra-context values
-    // unrenderable on this family:
-    //   - `enable_thinking is false` -> 'Disabling thinking is not supported.'
-    //   - reasoning_effort outside (xhigh, medium, low) -> raise, and we sent
-    //     "high" on every thinking request, "no_think" on every off one.
-    // A raise is a silent fallbackFormatChat, and this family's fallback is
-    // ChatML too, so the downgrade shows up only as a missing tools preamble.
-    // Both arms pinned.
+test "renderChatTemplate: the Flash-Next template renders its own efforts and thinking-off (hermetic)" {
+    // The template answers thinking-off with a CLOSED `<think>\n\n</think>\n\n`
+    // and no reasoning-instructions preamble (its effort validation lives INSIDE
+    // the thinking-on branch), so thinking-off must not be forced onto the
+    // thinking-on arm. The effort mapping is keyed on `'xhigh'`: the template
+    // raises on OpenAI's "high".
     const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/qwen38_chat_template.jinja");
-
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = null,
-        .eos_token = "<|im_end|>",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    const tools_json =
-        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
-    ;
-    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
-    const messages = [_]Message{
-        .{ .role = "system", .content = "You are helpful." },
-        .{ .role = "user", .content = "What time is it?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc },
-        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
-    };
-
-    // Thinking ON, no client effort: OUR default, which is deliberately NOT
-    // the checkpoint's (see qwen38EffortFor) — xhigh reasons without a bound
-    // and a client that sends nothing gets no bound either.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<function=get_time>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<parameter=timezone>\nUTC\n</parameter>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response>\n12:34 UTC\n</tool_response>") != null);
-        // Unconditional think opener at the generation prompt.
-        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n"));
-        try testing.expect(promptTailOpensThink(rendered));
-    }
-    // OpenAI's "high" is this family's "xhigh"; "medium" injects no preamble.
-    {
-        const hi = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high", false);
-        defer allocator.free(hi);
-        try testing.expect(std.mem.indexOf(u8, hi, "Reasoning effort is set to xhigh.") != null);
-
-        const med = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "medium", false);
-        defer allocator.free(med);
-        try testing.expect(std.mem.indexOf(u8, med, "Reasoning effort is set to") == null);
-        try testing.expect(std.mem.indexOf(u8, med, "You have access to the following functions:") != null);
-    }
-    // Thinking OFF: the template REFUSES to disable thinking, so the render
-    // must stay on the low-effort arm and the block the template opened is
-    // closed in the prompt (noThinkTailSuffix) instead.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
-        try testing.expect(std.mem.endsWith(u8, rendered, "</think>"));
-        try testing.expect(!promptTailOpensThink(rendered));
-    }
-}
-
-test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" {
-    // Same family, DIFFERENT gates: `qwen38_chat_template.jinja` (2.4T-A95B)
-    // raises on `enable_thinking is false`, while the 27B's template answers
-    // that arm the 3.6 way — a CLOSED `<think>\n\n</think>\n\n` and no
-    // reasoning-instructions preamble at all (its effort validation lives
-    // INSIDE the thinking-on branch). Sniffing the shared `'xhigh'` literal
-    // for both decisions forced every thinking-off request onto the
-    // thinking-on arm at effort low, which injects a system line the
-    // checkpoint never renders for that arm and leaves the block to be closed
-    // by `noThinkTailSuffix` instead of by the template. The effort mapping is
-    // still keyed on `'xhigh'` (both templates raise on OpenAI's "high"); only
-    // the enable_thinking override is keyed on the refusal itself.
-    const allocator = testing.allocator;
-    const tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+    const tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
 
     var config = ChatConfig{
         .chat_template = tpl,
@@ -12576,11 +12521,27 @@ test "GLM-5.3 template: parallel results come back in the order of the calls" {
     );
 }
 
+test "a template that raises or is missing is refused unless the model ends turns with <|im_end|>" {
+    const user = [_]Message{.{ .role = "user", .content = "hi" }};
+    for ([_][]const u8{ "{{ raise_exception('refused') }}", "" }) |tpl| {
+        for ([_]?[]const u8{ null, "<|endoftext|>", "<｜end▁of▁sentence｜>" }) |eos| {
+            var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = eos, .add_bos_token = false, .allocator = testing.allocator };
+            const before = template_fallbacks.load(.monotonic);
+            try testing.expectError(error.ChatTemplateUnusable, renderChatTemplate(testing.allocator, &user, &config, null, null, true, null, false));
+            try testing.expectEqual(before, template_fallbacks.load(.monotonic));
+        }
+        var chatml = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+        const rendered = try renderChatTemplate(testing.allocator, &user, &chatml, null, null, true, null, false);
+        defer testing.allocator.free(rendered);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n"));
+    }
+}
+
 test "a template that raises counts one generic fallback" {
     var config = ChatConfig{
         .chat_template = "{{ raise_exception('refused') }}",
         .bos_token = null,
-        .eos_token = null,
+        .eos_token = "<|im_end|>",
         .add_bos_token = false,
         .allocator = testing.allocator,
     };
