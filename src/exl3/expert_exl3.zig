@@ -235,6 +235,9 @@ pub fn packedHalfwords(k: u32) usize {
 
 /// K1 to K8 in 1/8-bit steps. An odd n would leave a tile's bitstream short of
 /// a whole uint32 word, which every reader indexes by.
+/// The packed rates a sweep tests: every shipped pack's rate and the table's ends.
+pub const ADMITTED_SAMPLE = [_]u32{ 16, 22, 24, 26, 28, 32, 36, 40, 42, 44, 48, 52, 56, 64, 66, 96, 128 };
+
 pub fn kFromPackedDim(packed_hw: usize) ?Rate {
     if (packed_hw % 2 != 0) return null;
     if (packed_hw < Rate.min_n or packed_hw > Rate.max_n) return null;
