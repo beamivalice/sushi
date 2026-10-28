@@ -6,6 +6,7 @@ const std = @import("std");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const gpu_clock = @import("gpu_clock.zig");
+const box = @import("bench_box.zig");
 const testing = std.testing;
 
 pub const window: usize = 8192;
@@ -423,73 +424,8 @@ pub const Report = struct {
     clock: gpu_clock.RunSummary = .{},
     /// Why the run stopped early; empty for a complete run.
     aborted: []const u8 = "",
-    cooldown: ?Cooldown = null,
+    cooldown: ?box.Cooldown = null,
 };
-
-/// The target and the cap of the idle between the arms; the same rule `tests/bench.sh` applies before a boot.
-pub const cooldown_target_c: f64 = 50;
-pub const cooldown_cap_s: u32 = 180;
-const cooldown_poll_s: u32 = 10;
-
-pub const Cooldown = struct {
-    waited_s: u32,
-    start_c: ?f64 = null,
-    end_c: ?f64 = null,
-};
-
-/// No reading means the fixed wait: only the cap ends it.
-pub fn cooldownDone(die_c: ?f64, waited_s: u32) bool {
-    if (waited_s >= cooldown_cap_s) return true;
-    return if (die_c) |t| t < cooldown_target_c else false;
-}
-
-/// The hottest `topTemps` sensor of a `fanctl status` document; null when it holds none or is not that document.
-pub fn hottestDie(allocator: std.mem.Allocator, status: []const u8) ?f64 {
-    const parsed = std.json.parseFromSlice(struct { topTemps: []const struct { celsius: f64 } }, allocator, status, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
-    var hottest: ?f64 = null;
-    for (parsed.value.topTemps) |t| hottest = if (hottest) |h| @max(h, t.celsius) else t.celsius;
-    return hottest;
-}
-
-fn fanctlRun(a: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]u8 {
-    const r = std.process.run(a, io, .{ .argv = argv, .stdout_limit = .limited(1 << 20) }) catch return null;
-    a.free(r.stderr);
-    const ok = switch (r.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (ok) return r.stdout;
-    a.free(r.stdout);
-    return null;
-}
-
-fn readDie(a: std.mem.Allocator, io: std.Io) ?f64 {
-    const out = fanctlRun(a, io, &.{ "fanctl", "status" }) orelse return null;
-    defer a.free(out);
-    return hottestDie(a, out);
-}
-
-/// Fans to max, then idles until the hottest die is under the target or the cap passes; the server stays up.
-fn cooldownBetweenArms(a: std.mem.Allocator, io: std.Io) Cooldown {
-    if (fanctlRun(a, io, &.{ "fanctl", "max", "--ttl", "900" })) |out| a.free(out);
-    var clock = io_util.Stopwatch.init(io);
-    const start_c = readDie(a, io);
-    var die = start_c;
-    while (true) {
-        const waited: u32 = @intCast(clock.read() / std.time.ns_per_s);
-        if (cooldownDone(die, waited)) break;
-        std.Io.sleep(io, .fromSeconds(cooldown_poll_s), .real) catch {};
-        die = readDie(a, io);
-    }
-    const waited: u32 = @intCast(clock.read() / std.time.ns_per_s);
-    if (start_c) |s| {
-        log.info("[bench] arms cooldown: {d:.0} C -> {d:.0} C in {d} s\n", .{ s, die orelse s, waited });
-    } else {
-        log.info("[bench] arms cooldown: {d} s (no fanctl)\n", .{waited});
-    }
-    return .{ .waited_s = waited, .start_c = start_c, .end_c = die };
-}
 
 fn writeThousands(w: *std.Io.Writer, v: f64) !void {
     const n: u64 = @intFromFloat(@round(@max(v, 0)));
@@ -885,9 +821,13 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     const sampler = startSampler(gpa, io);
     defer if (sampler) |s| s.stop();
     var aborted: []const u8 = "";
-    var cooldown: ?Cooldown = null;
+    var cooldown: ?box.Cooldown = null;
     arms: for ([_]Arm{ .code, .prose }) |arm| {
-        if (arm == .prose) cooldown = cooldownBetweenArms(a, io);
+        if (arm == .prose) {
+            const c = box.cooldown(a, io);
+            if (c.start_c) |t| log.info("[bench] arms cooldown: {d:.0} C -> {d:.0} C in {d} s\n", .{ t, c.end_c orelse t, c.waited_s }) else log.info("[bench] arms cooldown: {d} s (no fanctl)\n", .{c.waited_s});
+            cooldown = c;
+        }
         var ids: std.ArrayList(u32) = .empty;
         switch (arm) {
             .code => {
@@ -1246,34 +1186,6 @@ test "bench report: GPU clock columns beside the tok/s, the header line, and an 
     try testing.expect(std.mem.indexOf(u8, md2, "Code MHz") == null);
     try testing.expect(std.mem.indexOf(u8, md2, "GPU MHz") == null);
     try testing.expect(std.mem.indexOf(u8, md2, "## Warnings") == null);
-}
-
-test "bench cooldown: stops under 50 C, is capped at 180 s, and waits the full cap without a reading" {
-    try testing.expect(cooldownDone(49.9, 0));
-    try testing.expect(!cooldownDone(50.0, 0));
-    try testing.expect(!cooldownDone(87, 170));
-    try testing.expect(cooldownDone(87, 180));
-    try testing.expect(!cooldownDone(null, 0));
-    try testing.expect(!cooldownDone(null, 170));
-    try testing.expect(cooldownDone(null, 180));
-}
-
-test "bench cooldown: the hottest die in a fanctl status document, and nothing from a bad one" {
-    const status =
-        \\{
-        \\  "fans" : [ { "actualRPM" : 5356, "index" : 0, "mode" : 0 } ],
-        \\  "state" : "max",
-        \\  "topTemps" : [
-        \\    { "celsius" : 55.165626525878906, "key" : "TCMb" },
-        \\    { "celsius" : 87, "key" : "TCHP" },
-        \\    { "celsius" : 47.078125, "key" : "TCDX" }
-        \\  ]
-        \\}
-    ;
-    try testing.expectEqual(@as(f64, 87), hottestDie(testing.allocator, status).?);
-    try testing.expectEqual(@as(?f64, null), hottestDie(testing.allocator, "{\"topTemps\":[]}"));
-    try testing.expectEqual(@as(?f64, null), hottestDie(testing.allocator, "not json"));
-    try testing.expectEqual(@as(?f64, null), hottestDie(testing.allocator, "{\"state\":\"max\"}"));
 }
 
 test "bench report: the protocol line names the cooldown between the arms" {

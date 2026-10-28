@@ -35,5 +35,7 @@ test {
     _ = @import("update.zig");
     _ = @import("ws.zig");
     _ = @import("gpu_clock.zig");
+    _ = @import("bench_box.zig");
+    _ = @import("ubench_report.zig");
     _ = @import("mrope.zig");
 }

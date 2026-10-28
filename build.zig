@@ -95,14 +95,7 @@ pub fn build(b: *std.Build) void {
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     mod.linkSystemLibrary("webp", .{});
 
-    if (macos_sdk_frameworks) |fw_path| {
-        mod.addFrameworkPath(.{ .cwd_relative = fw_path });
-    }
-    mod.linkFramework("IOKit", .{});
-    mod.linkFramework("CoreFoundation", .{});
-    mod.linkFramework("Foundation", .{});
-    mod.linkFramework("Metal", .{});
-    mod.linkFramework("IOSurface", .{});
+    linkApple(mod, macos_sdk_frameworks);
 
     const exe = b.addExecutable(.{
         .name = "sushi",
@@ -151,14 +144,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     test_mod.linkSystemLibrary("webp", .{});
 
-    if (macos_sdk_frameworks) |fw_path| {
-        test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
-    }
-    test_mod.linkFramework("IOKit", .{});
-    test_mod.linkFramework("CoreFoundation", .{});
-    test_mod.linkFramework("Foundation", .{});
-    test_mod.linkFramework("Metal", .{});
-    test_mod.linkFramework("IOSurface", .{});
+    linkApple(test_mod, macos_sdk_frameworks);
 
     const test_filter = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat for several)");
     const qwen_preprocess_fixture = b.option(
@@ -222,6 +208,64 @@ pub fn build(b: *std.Build) void {
     });
     test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
     test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
+
+    guardBenchFiles(b);
+    const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
+    ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
+}
+
+/// `sushi-ubench`: the microbench harness and the bench bodies, a binary of its own. It stamps the commit it was
+/// built from so a stale or dirty binary refuses to take a number.
+fn addUbench(b: *std.Build, build_options: *std.Build.Step.Options, target: std.Build.ResolvedTarget, macos_sdk_frameworks: ?[]const u8) *std.Build.Step.Compile {
+    // A run step that always runs: a configure-time read would stay cached across commits.
+    const stamp_run = b.addSystemCommand(&.{ "sh", "-c", stamp_script });
+    stamp_run.setCwd(b.path("."));
+    stamp_run.has_side_effects = true;
+    const stamp = b.createModule(.{ .root_source_file = stamp_run.captureStdOut(.{ .basename = "ubench_stamp.zig" }) });
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/ubench_main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "ubench_stamp", .module = stamp },
+        },
+    });
+    addMlxLib(b, mod);
+    _ = addExl3Module(b, mod, target, .ReleaseFast);
+    linkApple(mod, macos_sdk_frameworks);
+    return b.addExecutable(.{ .name = "sushi-ubench", .root_module = mod });
+}
+
+const stamp_script =
+    \\printf 'pub const commit = "%s";\npub const dirty = %s;\npub const repo = "%s";\n' \
+    \\  "$(git rev-parse HEAD)" "$(test -n "$(git status --porcelain --untracked-files=no)" && echo true || echo false)" "$(pwd -P)"
+;
+
+/// A microbench file holds no `test` block: a bench is timed by `sushi-ubench`, never run by the suite.
+/// `ubench_report.zig` is the harness's host tier and keeps its tests.
+fn guardBenchFiles(b: *std.Build) void {
+    const io = b.graph.io;
+    const files = [_][]const u8{ "src/ubench_qwen4.zig", "src/ubench_mimo2.zig", "src/ubench_glm5.zig", "src/ubench_dsv41.zig", "src/ubench_shared.zig", "src/exl3/ubench.zig", "src/encoder/ubench.zig" };
+    for (files) |path| {
+        const source = buildRootHandle(b).readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch continue;
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| {
+            const at = std.mem.indexOf(u8, line, "test \"") orelse continue;
+            if (std.mem.trim(u8, line[0..at], " ").len == 0)
+                std.debug.panic("{s} holds a test block: a microbench is never a test ({s})", .{ path, line });
+        }
+    }
+}
+
+fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void {
+    if (macos_sdk_frameworks) |fw_path| module.addFrameworkPath(.{ .cwd_relative = fw_path });
+    module.linkFramework("IOKit", .{});
+    module.linkFramework("CoreFoundation", .{});
+    module.linkFramework("Foundation", .{});
+    module.linkFramework("Metal", .{});
+    module.linkFramework("IOSurface", .{});
 }
 
 /// The unit tests compile as several binaries in parallel: one LLVM module is single-threaded.
@@ -246,6 +290,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
         const stem = entry.name[0 .. entry.name.len - ".zig".len];
         if (isHostStem(host_stems, stem)) continue;
+        if (std.mem.startsWith(u8, stem, "ubench_")) continue;
         stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
         const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
         var lines = std.mem.splitScalar(u8, source, '\n');

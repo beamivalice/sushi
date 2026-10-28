@@ -12,6 +12,8 @@ pub const qwen_riders = @import("qwen_riders.zig");
 pub const qwen_fold = @import("qwen_fold.zig");
 pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
 pub const codebook_tables = @import("codebook_tables.zig");
+/// The microbench bodies `sushi-ubench` runs; its host root supplies `report`.
+pub const ubench = @import("ubench.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],
 /// `suh` F16 [E, in], `svh` F16 [E, out].

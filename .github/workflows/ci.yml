@@ -59,6 +59,10 @@ jobs:
       - name: Build sushi (Zig, ReleaseFast)
         run: zig build -Doptimize=ReleaseFast
 
+      # Compile only: a microbench needs a quiet box and a GPU, so nothing runs.
+      - name: Build sushi-ubench
+        run: zig build ubench
+
       - name: Smoke test sushi binary
         run: |
           ./zig-out/bin/sushi --version
