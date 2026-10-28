@@ -9264,23 +9264,6 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     return true;
 }
 
-/// Why this group cannot take the merged `[N, S]` verify forward, or null for a shape that
-/// may: a qwen4 trunk's batched sub-paths are decode-shaped and uncertified past width 1.
-pub fn mergedVerifyDeclineReason(has_qwen4: bool, width: u32) ?[]const u8 {
-    if (has_qwen4 and width > 1) return "qwen4 trunk past verify width 1";
-    return null;
-}
-
-pub const VerifyShape = enum { solo, row_axis, merged };
-
-pub fn verifyShapeFor(rows: usize, has_qwen4: bool, width: u32) VerifyShape {
-    if (rows <= 1) return .solo;
-    if (mergedVerifyDeclineReason(has_qwen4, width) != null) return .row_axis;
-    return .merged;
-}
-
-var merged_verify_decline_logged: bool = false;
-
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A MiMo verify keeps each row's decode arithmetic only in its own solo forward.
@@ -11676,26 +11659,6 @@ test "a slot with no pipeline state is stop-checked before it joins a batch, EOS
     gen.step = 8;
     try testing.expect(try batchEntryStops(&gen));
     try testing.expectEqualStrings("length", gen.finish_reason);
-}
-
-test "merged verify: an uncertified [N,S] shape is declined by name, never dispatched" {
-    try testing.expect(mergedVerifyDeclineReason(true, 5) != null);
-    try testing.expect(mergedVerifyDeclineReason(true, 2) != null);
-    // Width 1 is a plain batched decode row, not a verify.
-    try testing.expect(mergedVerifyDeclineReason(true, 1) == null);
-    // Other GDN trunks keep the padded merged forward they had.
-    try testing.expect(mergedVerifyDeclineReason(false, 5) == null);
-}
-
-test "group verify: ragged widths keep ONE forward, never a solo cohort per width" {
-    // The row-axis form runs each row at its own width, so a mixed group is never split.
-    try testing.expectEqual(VerifyShape.row_axis, verifyShapeFor(4, true, 9));
-    try testing.expectEqual(VerifyShape.row_axis, verifyShapeFor(2, true, 2));
-    try testing.expectEqual(VerifyShape.merged, verifyShapeFor(4, false, 9));
-    try testing.expectEqual(VerifyShape.merged, verifyShapeFor(2, false, 3));
-    // One row is a solo round on every trunk.
-    try testing.expectEqual(VerifyShape.solo, verifyShapeFor(1, true, 5));
-    try testing.expectEqual(VerifyShape.solo, verifyShapeFor(1, false, 5));
 }
 
 test "group cost geometry rejects partial rounds and keeps complete cache formats" {

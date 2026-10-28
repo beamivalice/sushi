@@ -298,17 +298,6 @@ pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slidin
     return if (pinned_prefill_chunk == 0) width else @min(width, pinned_prefill_chunk);
 }
 
-/// Read an unsigned integer from an environment variable, falling back to
-/// `default` when unset, empty, or unparseable. Uses libc getenv to stay
-/// allocator-free at call sites.
-fn readEnvUsize(name: [:0]const u8, default: usize) usize {
-    const raw = std.c.getenv(name.ptr);
-    if (raw == null) return default;
-    const slice = std.mem.sliceTo(raw.?, 0);
-    if (slice.len == 0) return default;
-    return std.fmt.parseInt(usize, slice, 10) catch default;
-}
-
 /// Truthy if the env var is exactly "1". Anything else (unset, "0", "true",
 /// "yes") is false — keep matching surface tight to avoid surprises.
 fn readEnvBool(name: [:0]const u8) bool {
@@ -16079,26 +16068,6 @@ test "the allocator pool is returned at the prefill/decode handover, on archs th
         var cfg = model_mod.ModelConfig{ .model_type = mt };
         try t.expect(!clearsPoolAtPrefillEnd(&cfg));
     }
-}
-
-/// The last global layer's key buffer: its data address and its row capacity.
-fn globalKeysBuffer(xfm: *Transformer) !struct { ptr: usize, cap: c_int } {
-    const e = &xfm.cache.entries[try lastGlobalKvLayer(xfm)];
-    try mlx.check(mlx.mlx_array_eval(e.keys));
-    const ptr: usize = if (mlx.mlx_array_dtype(e.keys) == .uint32)
-        @intFromPtr(mlx.mlx_array_data_uint32(e.keys).?)
-    else
-        @intFromPtr(mlx.mlx_array_data_bfloat16(e.keys).?);
-    return .{ .ptr = ptr, .cap = mlx.getShape(e.keys)[2] };
-}
-
-fn lastGlobalKvLayer(xfm: *Transformer) !usize {
-    var layer = xfm.cache.entries.len;
-    while (layer > 0) {
-        layer -= 1;
-        if (xfm.config.isGlobalLayer(@intCast(layer)) and xfm.cache.entries[layer].initialized) return layer;
-    }
-    return error.NoGlobalLayer;
 }
 
 /// Do two caches hold the same first `rows` rows in every stored buffer of `layer`?
