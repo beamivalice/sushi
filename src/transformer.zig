@@ -1498,7 +1498,7 @@ pub fn sdpaForceFused(q: mlx.mlx_array, k: mlx.mlx_array) bool {
 var nax_sdpa_dispatch_logged = false;
 
 /// Family-wide NAX readiness: the hardware probe passes. This intentionally says nothing about a specific
-/// M/K/N dispatch; controller decisions use verifyQmmNaxEnabledForM instead.
+/// M/K/N dispatch.
 pub fn verifyQmmNaxEnabled() bool {
     return verifyQmmEnabled() and verifyQmmNaxAvailable();
 }
@@ -1509,37 +1509,6 @@ pub fn naxMinMForBits(bits: u32) c_int {
     // plain lane, five thermally-settled counterbalanced pairs). Packed q4/q6
     // still lose there, so their measured takeover remains M=8.
     return if (bits == 8) 7 else 8;
-}
-
-fn naxMinM() c_int {
-    return naxMinMForBits(4);
-}
-
-/// Exact NAX-dispatch predicate, pure over the runtime gates and shape. Keep
-/// controller policy behind this seam so a kill switch, takeover-width tweak,
-/// or ineligible projection geometry can never advertise a NAX cost profile
-/// while verifyQmm would actually fall through to stock qmm.
-pub fn verifyQmmNaxEnabledForMFrom(
-    m: c_int,
-    K: c_int,
-    N: c_int,
-    verify_on: bool,
-    available: bool,
-    min_m: c_int,
-) bool {
-    return verify_on and vqmmLaneFor(m, K, N, available, min_m) == .nax;
-}
-
-/// Runtime form of verifyQmmNaxEnabledForMFrom.
-pub fn verifyQmmNaxEnabledForM(m: c_int, K: c_int, N: c_int) bool {
-    return verifyQmmNaxEnabledForMFrom(
-        m,
-        K,
-        N,
-        verifyQmmEnabled(),
-        verifyQmmNaxAvailable(),
-        naxMinM(),
-    );
 }
 
 const VQMM_NAX_HEADER: [:0]const u8 =
@@ -3556,7 +3525,6 @@ const SharedProjKind = enum { qmatmul, mtp_rows, verify_rows };
 
 
 
-pub const VerifyKernel = enum { dense_tiles, hc_rows, route_pack };
 pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 test "shared expert gate tail admits the joined verifier envelope only" {
@@ -4404,7 +4372,6 @@ fn getQsaAttnQKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 pub var qsa_attn_kernel_override: ?bool = null;
-var qsa_attn_kernel_env: ?bool = null;
 
 pub fn qsaAttnKernelEnabled() bool {
     return qsa_attn_kernel_override orelse true;
@@ -6517,7 +6484,6 @@ var verify_fail_after_flush: ?usize = null;
 pub var deferred_ple_group_syncs: u64 = 0;
 /// Slots one batched forward carries (twin of `scheduler.MAX_BATCH_GROUP`).
 pub const MAX_BATCH_ROWS = 32;
-var std_batched_logged: bool = false; // one-shot log guard
 pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) SlidingView {
     const span: u32 = if (cfg.has_sliding_window)
         slidingTailSpan(cfg.sliding_window, @intCast(seq_len), SLIDING_TRIM_UNBOUNDED)
@@ -18898,12 +18864,6 @@ pub const Transformer = struct {
 /// `mlx_matmul(x, w_t)` lands the contraction over the input axis. Used by
 /// Unsloth Dynamic checkpoints that leave linear-attention projections
 /// unquantized while quantizing the rest. Caller owns the returned array.
-/// Exported for module-owned archs that load a dense weight outside
-/// `initMoeLayers`' owned-list machinery.
-pub fn transposeBf16WeightPub(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    return transposeBf16Weight(w, s);
-}
-
 fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     // Swap the last two axes for any rank: 2D weights [out, in] → [in, out];
     // stacked MoE expert tensors [experts, out, in] → [experts, in, out].
@@ -19579,66 +19539,6 @@ pub fn affineParamsFromGeometry(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32
     return .{ .bits = geom.bits, .group_size = geom.group_size, .mode = .affine };
 }
 
-/// Gather rows out of a QUANTIZED table and dequantize only those rows.
-///
-/// The naive shape — dequantize the whole table, then `take` — reads the packed
-/// weights AND writes a full float copy of the table on every call. For a
-/// 157184x2560 8-bit embedding that is ~0.4 GB in + ~0.8 GB out to look up a
-/// handful of rows, i.e. ~15% of a decode token on a 157k-vocab model spent
-/// producing 157183 rows nobody reads.
-///
-/// Quantization here is per-ROW-group along the last axis, so a row's scales
-/// and biases are exactly the ones at the same index — gathering first is
-/// arithmetically identical, not an approximation, and the guard test pins that
-/// as BIT equality. `ids` may have any shape; the result is
-/// `ids.shape ++ [in_dim]` (mlx `take` semantics on axis 0).
-///
-/// `global_scale` is per-TENSOR (mxfp families), so it rides through
-/// unchanged; `biases` may be a null handle for bias-less modes.
-pub fn gatherQuantizedRows(
-    s: mlx.mlx_stream,
-    w: mlx.mlx_array,
-    scales: mlx.mlx_array,
-    biases: mlx.mlx_array,
-    ids: mlx.mlx_array,
-    group_size: u32,
-    bits: u32,
-    mode: QuantMode,
-    global_scale: mlx.mlx_array,
-    out_dtype: mlx.mlx_optional_dtype,
-) !mlx.mlx_array {
-    var taken_w = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(taken_w);
-    try mlx.check(mlx.mlx_take_axis(&taken_w, w, ids, 0, s));
-
-    var taken_s = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(taken_s);
-    try mlx.check(mlx.mlx_take_axis(&taken_s, scales, ids, 0, s));
-
-    // `mlx_take_axis` on a null handle aborts, so bias-less modes gather none.
-    var taken_b = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(taken_b);
-    if (biases.ctx != null) {
-        try mlx.check(mlx.mlx_take_axis(&taken_b, biases, ids, 0, s));
-    }
-
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_dequantize(
-        &out,
-        taken_w,
-        taken_s,
-        taken_b,
-        mlx.mlx_optional_int.some(@intCast(group_size)),
-        mlx.mlx_optional_int.some(@intCast(bits)),
-        mode.cstr(),
-        global_scale,
-        out_dtype,
-        s,
-    ));
-    return out;
-}
-
 /// The fp mode a solved (bits, group_size) pair belongs to. Each format
 /// DEFINES its block size — MXFP8/MXFP4 are 32 — so the pair
 /// names exactly one of them. Anything else is a layout we don't serve;
@@ -19667,33 +19567,6 @@ fn fpParamsFromGeometry(config: *const ModelConfig, w_cols: u32, s_cols: u32, in
     if (bits == config.quant_bits and group_size == config.quant_group_size) return null;
     const mode = fpQuantModeFor(bits, group_size) orelse return null;
     return .{ .bits = bits, .group_size = group_size, .mode = mode };
-}
-
-/// Per-weight (bits, group_size, mode) solved from packed geometry ALONE, for
-/// callers that have no `ModelConfig` to consult — an MTP sidecar file carries
-/// weights and nothing else. The mode is separated on the same evidence
-/// `computeQuantParams` uses: affine is the only mode whose checkpoints ship
-/// per-group biases, and every fp mode stores fp8-encoded `uint8` scales, so
-/// bias-less + uint8 scales resolves through the (bits, group_size) table.
-pub fn quantParamsFromGeometry(
-    w: mlx.mlx_array,
-    sc: mlx.mlx_array,
-    biases_present: bool,
-    in_dim: u32,
-) ?QuantParams {
-    if (sc.ctx == null or in_dim == 0) return null;
-    if (biases_present or mlx.mlx_array_dtype(sc) != .uint8) {
-        return affineParamsFromGeometry(w, sc, in_dim);
-    }
-    const w_shape = mlx.getShape(w);
-    const s_shape = mlx.getShape(sc);
-    if (w_shape.len < 2 or s_shape.len < 2) return null;
-    const w_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
-    const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
-    if (w_cols == 0 or s_cols == 0) return null;
-    if ((w_cols * 32) % in_dim != 0 or in_dim % s_cols != 0) return null;
-    const mode = fpQuantModeFor((w_cols * 32) / in_dim, in_dim / s_cols) orelse return null;
-    return .{ .bits = (w_cols * 32) / in_dim, .group_size = in_dim / s_cols, .mode = mode };
 }
 
 pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
@@ -24453,43 +24326,6 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     }
 }
 
-/// Join N same-input-width projections into one by stacking their OUTPUT rows.
-/// Quantization survives the join untouched: affine groups run along the INPUT
-/// axis, so rows stay independent and the scales/biases concatenate on the same
-/// axis as the packed codes. Returns an owned array (caller records it in
-/// `owned_bf16`); a null-ctx member means "this triple is dense", which the
-/// caller resolves before calling.
-///
-/// Used by KDA, whose checkpoint ships q/k/v as three separate projections and
-/// three separate depthwise convs where the forward wants one of each — doing
-/// it at load keeps the recurrence's hot path identical to GatedDeltaNet's.
-/// Whether a set of same-role projections can be JOINED on the output-row
-/// axis. `cols` is each one's trailing dim — the PACKED width for a quantized
-/// weight, the input width for a dense one. They must all agree: mlx's
-/// concatenate needs identical trailing dims (a mismatch is an MLX-level
-/// error, which is uncatchable and takes the process with it), and a joined
-/// weight resolves ONE (bits, group_size) from its packed geometry, so a trio
-/// quantized at mixed widths would serve two thirds of its rows at the wrong
-/// scale even if the concatenate somehow succeeded. Pure so the predicate is
-/// testable without building arrays.
-fn joinableCols(cols: []const c_int) bool {
-    if (cols.len == 0) return false;
-    for (cols[1..]) |c| {
-        if (c != cols[0]) return false;
-    }
-    return true;
-}
-
-fn concatRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
-}
-
 // ── Prefill-width dequant+GEMM qmm route ──
 // Stock MLX qmm_t runs a 32x32x32 steel tile; at prefill widths (M >= 2048)
 // on the qwen 27B shapes that underuses the compute units by ~10% (µbench,
@@ -26308,12 +26144,6 @@ fn getWeightFmtOpt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const
 fn getLayerWeightOpt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) ?mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "{s}.layers.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
     return weights.get(name);
-}
-
-/// `feed_forward.<name>.<suffix>` into a caller-owned scratch buffer. The
-/// dense-MLP spelling is per-converter, so the three names are data.
-fn ffKey(buf: *[64]u8, name: []const u8, suffix: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "feed_forward.{s}.{s}", .{ name, suffix }) catch unreachable;
 }
 
 fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
@@ -31729,80 +31559,6 @@ test "moeRouterThreadGroup keeps a full simdgroup and caps at 256" {
     try testing.expectEqual(@as(c_int, 256), moeRouterThreadGroup(2048));
 }
 
-test "gatherQuantizedRows is BIT-identical to dequantizing the whole table and taking rows" {
-    // The whole point of the helper is that it is not an approximation:
-    // quantization groups run along the LAST axis, so a row's scales/biases are
-    // exactly the ones at the same index and gathering first cannot change a
-    // single bit. Anything weaker than bit equality would leave room for a
-    // "close enough" lookup table, which is how a checkpoint's embedding drifts
-    // from its lm_head.
-    const s = mlx.gpuStream();
-    const V = 96;
-    const IN = 256;
-    const gs = 64;
-    const bits = 8;
-
-    const host = try std.testing.allocator.alloc(f32, V * IN);
-    defer std.testing.allocator.free(host);
-    for (host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 251)) - 125)) * 0.013;
-    const sh = [_]c_int{ V, IN };
-    const w_f32 = mlx.mlx_array_new_data(host.ptr, &sh, 2, .float32);
-    defer _ = mlx.mlx_array_free(w_f32);
-    var w_bf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(w_bf);
-    try mlx.check(mlx.mlx_astype(&w_bf, w_f32, .bfloat16, s));
-
-    var qvec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(qvec);
-    try mlx.check(mlx.mlx_quantize(&qvec, w_bf, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
-    var q = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q);
-    var sc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sc);
-    var bi = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(bi);
-    try mlx.check(mlx.mlx_vector_array_get(&q, qvec, 0));
-    try mlx.check(mlx.mlx_vector_array_get(&sc, qvec, 1));
-    try mlx.check(mlx.mlx_vector_array_get(&bi, qvec, 2));
-
-    // A 2-D id array, because that is the live shape ([batch, seq]) and the
-    // result must come back as ids.shape ++ [IN], not flattened.
-    const ids_host = [_]i32{ 0, 7, 95, 42, 42, 13 };
-    const ids_sh = [_]c_int{ 2, 3 };
-    const ids = mlx.mlx_array_new_data(&ids_host, &ids_sh, 2, .int32);
-    defer _ = mlx.mlx_array_free(ids);
-    var ids32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ids32);
-    try mlx.check(mlx.mlx_astype(&ids32, ids, .uint32, s));
-
-    const got = try gatherQuantizedRows(s, q, sc, bi, ids32, gs, bits, .affine, .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true });
-    defer _ = mlx.mlx_array_free(got);
-
-    // Reference: the shape the helper replaces — dequantize everything, take.
-    var deq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(deq);
-    try mlx.check(mlx.mlx_dequantize(&deq, q, sc, bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
-    var want = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(want);
-    try mlx.check(mlx.mlx_take_axis(&want, deq, ids32, 0, s));
-
-    const shape_got = mlx.getShape(got);
-    try testing.expectEqual(@as(usize, 3), shape_got.len);
-    try testing.expectEqual(@as(c_int, 2), shape_got[0]);
-    try testing.expectEqual(@as(c_int, 3), shape_got[1]);
-    try testing.expectEqual(@as(c_int, IN), shape_got[2]);
-
-    const n = mlx.mlx_array_size(want);
-    const flat = [_]c_int{@intCast(n)};
-    var gf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gf);
-    try mlx.check(mlx.mlx_reshape(&gf, got, &flat, 1, s));
-    var wf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wf);
-    try mlx.check(mlx.mlx_reshape(&wf, want, &flat, 1, s));
-    try testing.expectEqual(@as(f32, 0.0), try maxAbsDiffF32(gf, wf, s));
-}
-
 test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefill shapes)" {
     // Centerpiece TDD gate for fully-dense bf16 MoE. Proves the dense gather_mm
     // path (gatherExpertMm with null scales + generalized transposeBf16Weight)
@@ -33483,21 +33239,6 @@ test "GDN verify recurrence matches serial state rounding at every position" {
     try qkvExpectBitsEqual(s, ref2, state_seq_full);
 }
 
-test "joinableCols: a KDA q/k/v trio joins only when all three are quantized alike" {
-    const t = std.testing;
-    // Uniform 4-bit: all three pack to the same width.
-    try t.expect(joinableCols(&[_]c_int{ 192, 192, 192 }));
-    // Dense bf16: the trailing dim is the input width, still uniform.
-    try t.expect(joinableCols(&[_]c_int{ 1536, 1536, 1536 }));
-    // Bias-less quant: no scales at all, all zeros — uniform.
-    try t.expect(joinableCols(&[_]c_int{ 0, 0, 0 }));
-    // q at 8-bit beside k/v at 4-bit: mlx's concatenate rejects this at a
-    // level we cannot catch, so the loader has to see it first.
-    try t.expect(!joinableCols(&[_]c_int{ 384, 192, 192 }));
-    try t.expect(!joinableCols(&[_]c_int{ 192, 192, 96 }));
-    try t.expect(!joinableCols(&[_]c_int{}));
-}
-
 test "GDN vectorized-gate kernel: a per-channel gate that is UNIFORM per head equals the scalar kernel" {
     // KDA gates each state element by its own key channel. The invariant that
     // pins the indexing: broadcast a per-head decay across that head's Dk
@@ -34959,29 +34700,6 @@ test "mixedNaxShapeEnabled keeps measured q5/q6/q8 wins and rejects narrow regre
     try testing.expect(!mixedNaxShapeEnabled(5, 32, 5120));
     try testing.expect(!mixedNaxShapeEnabled(6, 128, 5120));
     try testing.expect(!mixedNaxShapeEnabled(8, 32, 5120));
-}
-
-test "verifyQmmNaxEnabledForMFrom mirrors flags, min-M, and dispatch geometry" {
-    const K: c_int = 5120;
-    const N: c_int = 151936;
-
-    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, 8));
-    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, false, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, false, 8));
-
-    // The takeover knob is part of controller readiness, not just kernel
-    // dispatch: min-M 9 leaves M=8 on stock even though M=9 is NAX.
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, 9));
-    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, 9));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(9, K, N, true, true, 10));
-    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, 5));
-
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, 5184, N, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 151940, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 480, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(1, K, N, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(17, K, N, true, true, 8));
 }
 
 test "NAX availability rejects compiler versions and malformed GPU identifiers" {
@@ -50125,8 +49843,6 @@ test "logical capture includes every defined state and the separate final state"
     defer _ = mlx.mlx_array_free(d);
     try testing.expect(!try qsaArraysAllEqual(a, d, stream));
 }
-
-const VerifyRetentionResult = struct { logits: []mlx.mlx_array, build_ms: f64, eval_ms: f64 };
 
 fn verifyRollbackEvalStorage(entry: *const KVCacheEntry) !void {
     const vec = mlx.mlx_vector_array_new();
