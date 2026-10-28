@@ -8270,13 +8270,12 @@ pub fn ssmSnapshot(src: *const SSMCacheEntry) SSMCacheEntrySnapshot {
     // We must guard each field independently — the two states are populated by
     // DIFFERENT code paths and either may legitimately be null even when
     // `initialized == true`:
-    //   - LFM2 `gatedConv` writes only `conv_state` (sets `initialized=true`),
-    //     so `ssm_state.ctx == null` for the lifetime of that layer.
-    //   - Mamba2/GatedDeltaNet flip the order: `conv1dWithCache` sets
-    //     `initialized=true` BEFORE the recurrence body initializes
-    //     `ssm_state`, so a snapshot taken in the middle would see a null
-    //     ssm_state. (Currently snapshots are only taken between full forward
-    //     passes, but defensive null-handling prevents future regressions.)
+    //   - An attention layer of a hybrid trunk holds neither.
+    //   - GatedDeltaNet: `conv1dWithCache` sets `initialized=true` BEFORE the
+    //     recurrence body initializes `ssm_state`, so a snapshot taken in the
+    //     middle would see a null ssm_state. (Currently snapshots are only
+    //     taken between full forward passes, but defensive null-handling
+    //     prevents future regressions.)
     //
     // Calling `mlx_array_set` with a null source aborts the process via mlx-c's
     // default error handler ("expected a non-empty mlx_array"), so we cannot
@@ -8361,7 +8360,7 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
     dst.ssm_state = mlx.mlx_array_new();
     dst.initialized = snap.initialized;
     // Mirror snapshot's per-field null guard — the snapshot may legitimately
-    // have a null ssm_state (LFM2 gated_conv layers) or null conv_state.
+    // have a null ssm_state or null conv_state.
     if (snap.conv_state.ctx != null) {
         try mlx.check(mlx.mlx_array_set(&dst.conv_state, snap.conv_state));
     }
@@ -8482,7 +8481,7 @@ fn splitSpecCaptures(s: mlx.mlx_stream, m: *const SSMCacheEntry, e: *SSMCacheEnt
 /// only takes the fast path when capture succeeded.
 /// `verify_len` is the number of positions the verify forward ran (T). A
 /// GatedDeltaNet layer records it implicitly in `spec_state_seq`, but a
-/// CONV-ONLY layer (LFM2's gated conv — no recurrent ssm_state at all) has
+/// conv-only capture (no recurrent ssm_state at all) has
 /// only `spec_conv_input`, whose leading `kernel-1` rows cannot be told from
 /// verify positions without it. Passing it explicitly is what lets one helper
 /// roll back both shapes.
@@ -11539,7 +11538,7 @@ pub fn captureSsmCheckpoint(
         };
         errdefer ssmSnapshotDeinit(&out);
         // Per-field null guards mirror `ssmSnapshot` — either state may
-        // legitimately be null (LFM2 gated_conv never sets ssm_state).
+        // legitimately be null.
         const live_conv = if (src.group) |g| (if (g.live and src.group_layer < g.layers.len) g.layers[src.group_layer].conv_state else src.conv_state) else src.conv_state;
         const live_ssm = if (src.group) |g| (if (g.live and src.group_layer < g.layers.len) g.layers[src.group_layer].ssm_state else src.ssm_state) else src.ssm_state;
         const live_ple = ssmLiveAux(src);
@@ -12363,9 +12362,7 @@ pub const PleWeights = struct {
 
 
 pub const LinearAttnWeights = struct {
-    // For separate projections (qwen3_5_moe): qkv=QKV, z=Z, a=A, b=B
-    // For combined projections (qwen3_next): qkv=QKVZ, b=BA, z/a unused
-    combined_proj: bool = false,
+    // Separate projections: qkv=QKV, z=Z, a=A, b=B
     qkv_w: mlx.mlx_array,
     qkv_s: mlx.mlx_array,
     qkv_b: mlx.mlx_array,
@@ -12455,7 +12452,6 @@ pub const MoeLayerWeights = struct {
     ple: ?PleWeights = null,
 };
 
-// ── Hybrid layer weights (LFM2, Nemotron-H) ──
 
 // ── Quantization params cache ──
 // A tiny lock-free pointer → (bits, group_size) cache. Quantized weights are loaded
@@ -14824,7 +14820,7 @@ pub const Transformer = struct {
         return result;
     }
 
-    // ── Conv1d with cache (shared by GatedDeltaNet, LFM2, Mamba2) ──
+    // ── Conv1d with cache (GatedDeltaNet) ──
 
     /// Prepends cached conv state, applies depthwise conv1d, updates cache.
     /// If apply_silu is true, applies SiLU activation after conv.
@@ -16904,16 +16900,6 @@ pub const Transformer = struct {
         std.debug.print("{s}: {any}\n", .{ label, d[0..8] });
     }
 
-    // ── Hybrid forward pass (LFM2, Nemotron-H) ──
-
-    // ── Gated Convolution (LFM2) ──
-
-    // ── Mamba2 SSM (Nemotron-H) ──
-
-    // ── Hybrid attention (LFM2, Nemotron-H) ──
-
-    // ── Simple (ungated) MLP with ReLU^2 (Nemotron-H) ──
-
     // ── Full Attention for MoE models (with optional output gate) ──
 
     /// Build per-token interleaved-M-RoPE cos/sin [1,1,seq_len,rope_dims] (bf16).
@@ -17210,7 +17196,7 @@ pub const Transformer = struct {
         const conv_dim: c_int = key_dim * 2 + value_dim;
         const kernel: c_int = @intCast(cfg.linear_conv_kernel_dim);
 
-        // Projections: combined (qkvz+ba) or separate (qkv+z+a+b)
+        // Projections: the caller's, or separate (qkv+z+a+b)
         var qkv: mlx.mlx_array = undefined;
         var z_proj: mlx.mlx_array = undefined;
         var a_proj: mlx.mlx_array = undefined;
@@ -17224,84 +17210,6 @@ pub const Transformer = struct {
             z_proj = values.z;
             a_proj = values.a;
             b_proj = values.b;
-        } else if (la.combined_proj) {
-            // Combined QKVZ: output is interleaved by key-head groups.
-            // Reshape to [B, S, nk, per_head], split per-head into q/k/v/z, then flatten back.
-            const vph = @divExact(num_v_heads, num_k_heads); // value heads per key head group
-            const qkvz_raw = try self.qmatmul(x, la.qkv_w, la.qkv_s, la.qkv_b);
-            defer _ = mlx.mlx_array_free(qkvz_raw);
-            const per_head = dk + dk + vph * dv + vph * dv;
-            const gh_shape = [_]c_int{ batch, seq_len, num_k_heads, per_head };
-            var qkvz_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(qkvz_g);
-            try mlx.check(mlx.mlx_reshape(&qkvz_g, qkvz_raw, &gh_shape, 4, self.s));
-
-            const strides4 = [_]c_int{ 1, 1, 1, 1 };
-            // q: [B,S,nk,dk]
-            var q_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(q_g);
-            try mlx.check(mlx.mlx_slice(&q_g, qkvz_g, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, seq_len, num_k_heads, dk }, 4, &strides4, 4, self.s));
-            // k: [B,S,nk,dk]
-            var k_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k_g);
-            try mlx.check(mlx.mlx_slice(&k_g, qkvz_g, &[_]c_int{ 0, 0, 0, dk }, 4, &[_]c_int{ batch, seq_len, num_k_heads, dk * 2 }, 4, &strides4, 4, self.s));
-            // v: [B,S,nk,vph*dv]
-            const v_off = dk * 2;
-            const v_end = v_off + vph * dv;
-            var v_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(v_g);
-            try mlx.check(mlx.mlx_slice(&v_g, qkvz_g, &[_]c_int{ 0, 0, 0, v_off }, 4, &[_]c_int{ batch, seq_len, num_k_heads, v_end }, 4, &strides4, 4, self.s));
-            // z: [B,S,nk,vph*dv]
-            var z_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(z_g);
-            try mlx.check(mlx.mlx_slice(&z_g, qkvz_g, &[_]c_int{ 0, 0, 0, v_end }, 4, &[_]c_int{ batch, seq_len, num_k_heads, per_head }, 4, &strides4, 4, self.s));
-
-            // Flatten: q/k -> [B,S,key_dim], v/z -> [B,S,value_dim]
-            const flat3_qk = [_]c_int{ batch, seq_len, key_dim };
-            const flat3_vz = [_]c_int{ batch, seq_len, value_dim };
-            var q_flat = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(q_flat);
-            var k_flat = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k_flat);
-            var v_flat = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(v_flat);
-            try mlx.check(mlx.mlx_reshape(&q_flat, q_g, &flat3_qk, 3, self.s));
-            try mlx.check(mlx.mlx_reshape(&k_flat, k_g, &flat3_qk, 3, self.s));
-            try mlx.check(mlx.mlx_reshape(&v_flat, v_g, &flat3_vz, 3, self.s));
-            z_proj = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_reshape(&z_proj, z_g, &flat3_vz, 3, self.s));
-
-            // Concatenate [q, k, v] -> qkv [B,S,conv_dim]
-            const qkv_arr = [_]mlx.mlx_array{ q_flat, k_flat, v_flat };
-            const qkv_vec = mlx.mlx_vector_array_new_data(&qkv_arr, 3);
-            defer _ = mlx.mlx_vector_array_free(qkv_vec);
-            qkv = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_concatenate_axis(&qkv, qkv_vec, 2, self.s));
-
-            // Combined BA: interleaved by key-head groups
-            const ba_raw = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
-            defer _ = mlx.mlx_array_free(ba_raw);
-            const ba_per_head = vph * 2;
-            const ba_shape = [_]c_int{ batch, seq_len, num_k_heads, ba_per_head };
-            var ba_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(ba_g);
-            try mlx.check(mlx.mlx_reshape(&ba_g, ba_raw, &ba_shape, 4, self.s));
-            var b_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(b_g);
-            var a_g = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(a_g);
-            try mlx.check(mlx.mlx_slice(&b_g, ba_g, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, seq_len, num_k_heads, vph }, 4, &strides4, 4, self.s));
-            try mlx.check(mlx.mlx_slice(&a_g, ba_g, &[_]c_int{ 0, 0, 0, vph }, 4, &[_]c_int{ batch, seq_len, num_k_heads, ba_per_head }, 4, &strides4, 4, self.s));
-            const flat3_ba = [_]c_int{ batch, seq_len, num_v_heads };
-            b_proj = mlx.mlx_array_new();
-            a_proj = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_reshape(&b_proj, b_g, &flat3_ba, 3, self.s));
-            try mlx.check(mlx.mlx_reshape(&a_proj, a_g, &flat3_ba, 3, self.s));
-        } else if (qwen4Standin().gdn_proj) {
-            qkv = try standinOnes(&[_]c_int{ batch, seq_len, conv_dim }, self.s);
-            z_proj = try standinOnes(&[_]c_int{ batch, seq_len, value_dim }, self.s);
-            a_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
-            b_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
         } else {
             const proj = try self.gdnProjGpu(x, la);
             qkv = proj.qkv;
@@ -19588,17 +19496,13 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 }
             }
         } else if (layer_is_moe) {
-            // Qwen3.5 MoE — also serves Qwen3-30B-A3B (`qwen3_moe`), which shares
-            // this exact router/switch_mlp layout. Each `*_s`/`*_b` is loaded
-            // optionally — Unsloth Dynamic checkpoints (e.g. Qwen3.6-A3B UD) leave
-            // the router (`mlp.gate`) and the shared-expert gate
-            // (`mlp.shared_expert_gate`) as plain bf16, with no scales/biases.
-            // The shared-expert WEIGHTS themselves are also optional: qwen3_moe
-            // (Qwen3-30B-A3B / Coder) dropped the shared expert entirely
-            // (shared_expert_intermediate_size: 0, no mlp.shared_expert.*). When
-            // absent they bind to empty handles and `shared_expert_gate_w` stays
-            // null, which makes moeMLP early-return the routed-expert sum without
-            // ever reading them — so no MISSING WEIGHT crash. The
+            // Each `*_s`/`*_b` is loaded optionally — a plain-bf16 router
+            // (`mlp.gate`) and shared-expert gate (`mlp.shared_expert_gate`) carry
+            // no scales/biases. The shared-expert WEIGHTS themselves are also
+            // optional: when absent they bind to empty handles and
+            // `shared_expert_gate_w` stays null, which makes moeMLP early-return
+            // the routed-expert sum without ever reading them — so no MISSING
+            // WEIGHT crash. The
             // `maybeTransposeForBf16` calls below pre-transpose bf16 weights from
             // `[out, in]` → `[in, out]` so `qmatmulBits` can dispatch to plain
             // `mlx_matmul`; they no-op on already-quantized AND on empty handles.
@@ -19734,9 +19638,7 @@ pub fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeigh
 pub fn appendLinearAttnWeights(vec: mlx.mlx_vector_array, la: *const LinearAttnWeights) void {
     inline for (comptime structFields(LinearAttnWeights)) |field| {
         if (comptime field.type != mlx.mlx_array) continue;
-        const za_field = comptime std.mem.startsWith(u8, field.name, "z_") or std.mem.startsWith(u8, field.name, "a_");
-        const skip_za = za_field and la.combined_proj;
-        if (!skip_za) {
+        {
             const arr = @field(la, field.name);
             // Plain-bf16 layers (Unsloth Dynamic) carry null scales/biases — skip those.
             if (arr.ctx != null) {
@@ -28329,10 +28231,8 @@ test "kvLenForBatching: the batched cap reads the ATTENTION layers, never layer 
     // `KVCache.step` advances on global layer 0 only, so on a linear-layer-0 trunk it reads 0
     // forever; the probe is "is entry 0 initialized?", not an arch list.
     const families = [_]struct { layers: u32, first_attn: u32, len: usize }{
-        .{ .layers = 48, .first_attn = 3, .len = 60_000 }, // qwen3_5 / qwen4_exp GDN
-        .{ .layers = 16, .first_attn = 2, .len = 4_096 }, // lfm2 gated-conv
-        .{ .layers = 52, .first_attn = 4, .len = 1_000 }, // nemotron_h mamba2
-        .{ .layers = 32, .first_attn = 7, .len = 131_072 }, // bailing_hybrid KDA
+        .{ .layers = 48, .first_attn = 3, .len = 60_000 }, // qwen4_exp GDN
+        .{ .layers = 32, .first_attn = 7, .len = 131_072 }, // glm5_next KDA
     };
     for (families) |f| {
         var cache = try KVCache.init(testing.allocator, f.layers);
@@ -32413,7 +32313,7 @@ test "qwen4 expert streaming targets only the trunk bank" {
     try std.testing.expect(!shouldStreamExpertBank(&config, "language_model.mtp"));
     config.expert_streaming = false;
     try std.testing.expect(!shouldStreamExpertBank(&config, "language_model.model"));
-    var moe = ModelConfig{ .model_type = "qwen3_5_moe", .weight_prefix = "language_model.model", .expert_streaming = true };
+    var moe = ModelConfig{ .model_type = "not_a_served_arch", .weight_prefix = "language_model.model", .expert_streaming = true };
     try std.testing.expect(!shouldStreamExpertBank(&moe, "language_model.model"));
 }
 
@@ -32695,7 +32595,6 @@ test "appendLinearAttnWeights skips fields with null ctx (plain bf16 layers)" {
 
     // Simulate the UD layout: weights set, scales/biases null.
     const la: LinearAttnWeights = .{
-        .combined_proj = false,
         .qkv_w = arrs[0],
         .qkv_s = mlx.mlx_array{ .ctx = null },
         .qkv_b = mlx.mlx_array{ .ctx = null },
@@ -34453,7 +34352,7 @@ test "GDN pipelined route: NAX Qwen default, eligibility" {
     gdn_blocked_override = true;
     vqmm_nax_probe_override = true;
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    for ([_][]const u8{ "mimo_v2", "qwen3_5", "qwen3_5_moe" }) |model_type| {
+    for ([_][]const u8{ "mimo_v2", "glm5_next", "not_a_served_arch" }) |model_type| {
         try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute(model_type, 64, 128, 128, 2, 4, false, 2).route);
     }
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
@@ -54559,8 +54458,7 @@ const StreamDeferredRig = struct {
             .conv1d_w = try self.weight(r, &.{ 96, 4, 1 }),
             .norm_w = try self.weight(r, &.{32}),
             .A_log = try self.weight(r, &.{1}), .dt_bias = try self.weight(r, &.{1}),
-            .combined_proj = false,
-        };
+            };
         for (&self.layers) |*layer| layer.* = .{
             .input_norm = none, .post_attn_norm = none, .is_linear = true,
             .attn = .{ .linear = la }, .mlp = .{ .moe = mw },

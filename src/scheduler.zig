@@ -2738,11 +2738,11 @@ test "admissionPassArmed: the evict-to-admit pass runs for every served arch, ne
     const mimo = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 1, .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
     const qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
     const glm = ModelConfig{ .model_type = "glm5_next" };
-    const llama = ModelConfig{ .model_type = "llama", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
+    const unserved = ModelConfig{ .model_type = "not_a_served_arch", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
     try testing.expect(admissionPassArmed(&mimo));
     try testing.expect(admissionPassArmed(&qwen4));
     try testing.expect(admissionPassArmed(&glm));
-    try testing.expect(!admissionPassArmed(&llama));
+    try testing.expect(!admissionPassArmed(&unserved));
     try testing.expect(!admissionPassArmed(null));
 }
 
@@ -3608,7 +3608,7 @@ test "LoadDrafterDir: Flash-Next loads a drafter only when --drafter names it, e
     defer beside.close(io);
     try beside.writeFile(io, .{ .sub_path = "config.json", .data = "{\"architectures\":[\"DFlash2DraftModel\"],\"dflash_config\":{\"block_size\":8,\"mask_token_id\":7,\"target_layer_ids\":[1,3]}}" });
     const qwen = ModelConfig{ .model_type = "qwen4_exp" };
-    const other = ModelConfig{ .model_type = "qwen3_5" };
+    const other = ModelConfig{ .model_type = "not_a_served_arch" };
     const beside_qwen = LoadDrafterDir.resolve(io, a, &qwen, false, "", model_dir);
     defer beside_qwen.deinit(a);
     try testing.expectEqualStrings("", beside_qwen.dir);
@@ -3811,7 +3811,7 @@ test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the p
     const t = testing;
     const GiB: u64 = 1 << 30;
     var moe = model_mod.ModelConfig{
-        .model_type = "qwen3_5_moe",
+        .model_type = "not_a_served_arch",
         .num_hidden_layers = 48,
         .num_experts = 512,
         .num_experts_per_tok = 10,
@@ -10386,7 +10386,7 @@ test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.ste
     try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 60_000 }, &kv_lens);
 
     // Every other hybrid keeps `cache.step` (the cap stays dead there, pending a multi-stream measurement).
-    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "lfm2", "nemotron_h", "bailing_hybrid" }) |mt| {
+    for ([_][]const u8{ "mimo_v2", "glm5_next", "not_a_served_arch" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt };
         for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, &cfg));
     }
@@ -10402,7 +10402,7 @@ test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.ste
 test "an attention-first trunk's batching lengths are unchanged by the fix" {
     // Dense / attention-first archs are byte-identical across this change.
     const lens = [_]usize{ 1_000, 1_000, 1_000, 100_000 };
-    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    var unserved = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     var caches: [4]KVCache = undefined;
     var built: usize = 0;
     defer for (caches[0..built]) |*c| c.deinit();
@@ -10413,7 +10413,7 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
         caches[i].step = len;
         caches[i].entries[0].initialized = true;
         caches[i].entries[0].offset = len;
-        kv_lens[i] = batchKvLenOf(&caches[i], &llama);
+        kv_lens[i] = batchKvLenOf(&caches[i], &unserved);
     }
     try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 1_000, 100_000 }, &kv_lens);
     var q4b = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
@@ -10441,12 +10441,12 @@ test "batchKvLenOf bills qwen4 selected length when the gather arm is on" {
     try testing.expectEqual(@as(u32, 2052), batchKvLenOf(&cache, &q4));
     transformer_mod.qsa_batched_gather_override = false;
     try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &q4));
-    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    var unserved = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     cache.step = 162_000;
     cache.entries[0].initialized = true;
     cache.entries[0].offset = 162_000;
     transformer_mod.qsa_batched_gather_override = true;
-    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &llama));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &unserved));
 }
 
 test "batchKvLenOf bills raw when the gather switch for that width is off" {
@@ -10571,10 +10571,8 @@ test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw k
     try testing.expectEqual(@as(u32, 2052), q4.batchedEffectiveKvLen(64_000, true, min_kv));
     try testing.expectEqual(@as(u32, 8000), q4.batchedEffectiveKvLen(8000, true, min_kv));
     try testing.expectEqual(@as(u32, 162_000), q4.batchedEffectiveKvLen(162_000, false, min_kv));
-    var llama = model_mod.ModelConfig{ .model_type = "llama" };
-    try testing.expectEqual(@as(u32, 162_000), llama.batchedEffectiveKvLen(162_000, true, min_kv));
-    var q35 = model_mod.ModelConfig{ .model_type = "qwen3_5" };
-    try testing.expectEqual(@as(u32, 162_000), q35.batchedEffectiveKvLen(162_000, true, min_kv));
+    var unserved = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
+    try testing.expectEqual(@as(u32, 162_000), unserved.batchedEffectiveKvLen(162_000, true, min_kv));
 
     const billed = [_]u32{
         q4.batchedEffectiveKvLen(16_384, true, min_kv),
@@ -10633,14 +10631,8 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
     // A new arch on the shared moe forward must default to SERIAL, not ride
     // a kernel that never modelled its state.
     {
-        var lfm2 = std.mem.zeroes(model_mod.ModelConfig);
-        lfm2.model_type = "lfm2";
-        lfm2.has_hybrid_layers = true;
-        try testing.expect(!lfm2.supportsBatchedGdnDecode());
-    }
-    {
         var kda = std.mem.zeroes(model_mod.ModelConfig);
-        kda.model_type = "bailing_hybrid";
+        kda.model_type = "glm5_next";
         kda.full_attention_interval = 4;
         kda.kda_vector_gate = true;
         try testing.expect(!kda.supportsBatchedGdnDecode());
@@ -10648,7 +10640,7 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
     {
         // Pure attention: not a GDN trunk at all, rides the standard kernel.
         var dense = std.mem.zeroes(model_mod.ModelConfig);
-        dense.model_type = "qwen3";
+        dense.model_type = "not_a_served_arch";
         try testing.expect(!dense.supportsBatchedGdnDecode());
     }
     {
@@ -12601,7 +12593,7 @@ test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitte
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
     defer sch.prefilling.deinit(allocator);
-    var plain = ModelConfig{ .model_type = "qwen3", .num_hidden_layers = 1 };
+    var plain = ModelConfig{ .model_type = "not_a_served_arch", .num_hidden_layers = 1 };
     var model: LoadedModel = undefined;
     model.config = &plain;
     model.transformer = null;
@@ -12710,7 +12702,7 @@ test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
     const s = mlx.gpuStream();
     const kv_bytes: usize = 64 << 20;
     var mimo = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 1, .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
-    var plain = ModelConfig{ .model_type = "qwen3", .num_hidden_layers = 1 };
+    var plain = ModelConfig{ .model_type = "not_a_served_arch", .num_hidden_layers = 1 };
     try testing.expect(mimo.reservesKvCapacity() and !plain.reservesKvCapacity());
     for ([_]*ModelConfig{ &mimo, &plain }) |cfg| {
         var model: LoadedModel = undefined;
@@ -13792,7 +13784,7 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"not_a_served_arch\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
     var buf: [std.fs.max_path_bytes]u8 = undefined;

@@ -16364,17 +16364,7 @@ test "the allocator pool is returned at the prefill/decode handover, on archs th
     // MiMo reserves its KV up front too: a 256k request parked 3.2 GiB there, and the next admission read it as spent.
     var mimo = model_mod.ModelConfig{ .model_type = "mimo_v2", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
     try t.expect(clearsPoolAtPrefillEnd(&mimo));
-    for ([_][]const u8{
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_next",
-        "lfm2",
-        "nemotron_h",
-        "bailing_hybrid",
-        "llama",
-        "gemma4",
-        "muse_glimmer",
-    }) |mt| {
+    for ([_][]const u8{ "glm5_next", "deepseek_v41", "not_a_served_arch" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt };
         try t.expect(!clearsPoolAtPrefillEnd(&cfg));
     }
@@ -17510,7 +17500,7 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
 
     // Every other arch: zero, which leaves `nextCapacityReserved` == `nextCapacity`.
-    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama" }) |mt| {
+    for ([_][]const u8{ "glm5_next", "deepseek_v41", "not_a_served_arch" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
         try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
     }

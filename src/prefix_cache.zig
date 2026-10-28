@@ -12391,67 +12391,6 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
     }
 }
 
-test "HotPrefixCache: SSD-only LFM2 conv state survives background flush and restart" {
-    const a = testing.allocator;
-    const io = testing.io;
-    const s = mlx.gpuStream();
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var path: [512]u8 = undefined;
-    const base = path[0..try tmp.dir.realPath(io, &path)];
-    var config = model_mod.ModelConfig{ .model_type = "lfm2", .has_hybrid_layers = true };
-    try testing.expect(HotPrefixCache.shouldUse(&config, true));
-    try testing.expect(ssdFirstActive(&config, true, false));
-    var tokens: [600]u32 = undefined;
-    for (&tokens, 0..) |*token, i| token.* = @intCast(i + 7);
-    for (0..2) |boot| {
-        var hc = HotPrefixCache.initWithMem(a, 0, 0);
-        hc.ssd_first = true;
-        hc.disk = try kv_disk_cache.DiskTier.init(a, io, base, "lfm-conv", 0, 128);
-        hc.disk.?.ssd_first = true;
-        hc.disk.?.enableBackgroundWriter();
-        defer hc.deinit();
-        try testing.expect(hc.disk.?.writer != null);
-        var cache = try KVCache.init(a, 3);
-        defer cache.deinit();
-        if (boot == 0) {
-            var written: u32 = 0;
-            while (written < tokens.len) : (written += 64) {
-                try testWriteCacheLayer(&cache, s, 1, written, @intCast(@min(64, tokens.len - written)));
-            }
-            var source = pcEmptySsm();
-            defer pcFreeHybrid(&source);
-            _ = mlx.mlx_array_free(source[0].conv_state);
-            source[0].conv_state = pcArange(s, &conv_shape_pc, 300);
-            source[0].initialized = true;
-            const cps = try a.alloc(SSMCheckpoint, 1);
-            cps[0] = try transformer_mod.captureSsmCheckpoint(a, &source, 512, s);
-            const status = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
-            try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
-            try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
-            try testing.expectEqual(@as(usize, tokens.len), status.disk_only);
-            hc.flushPendingDisk(s);
-            hc.disk.?.drainWriter();
-            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        } else {
-            var restored = pcEmptySsm();
-            defer pcFreeHybrid(&restored);
-            var offset: usize = 0;
-            const hit = try hc.lookupAndRestore(&cache, &offset, &restored, s, &tokens, false, 0, null, null);
-            try testing.expectEqual(@as(usize, 512), hit.matched);
-            try testing.expectEqual(@as(usize, 512), offset);
-            try testing.expect(!cache.entries[0].initialized);
-            try testing.expect(cache.entries[1].initialized);
-            try testing.expectEqual(@as(usize, 512), cache.entries[1].offset);
-            try testing.expect(restored[0].initialized);
-            try testing.expectEqual(@as(f32, 300), pcSsmVal(restored[0].conv_state, 0, s));
-            try testing.expect(restored[0].ssm_state.ctx == null);
-        }
-        try testing.expectEqual(@as(usize, 0), hc.entryCount());
-        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
-    }
-}
-
 test "SSD-only ring checkpoints survive restart without idle RAM" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;

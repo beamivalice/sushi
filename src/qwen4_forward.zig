@@ -2750,12 +2750,10 @@ pub fn projectRows(s: mlx.mlx_stream, comptime decode: bool, comptime kind: Veri
 }
 
 pub fn gdnDecodeRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
-    if (la.combined_proj) return null;
     return self.verifyRowsJoined(.gdn, true, inputs, entries, &.{}, generations, layer, la);
 }
 
 pub fn gdnVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
-    if (la.combined_proj) return null;
     return self.verifyRowsJoined(.gdn, false, inputs, entries, &.{}, generations, layer, la);
 }
 

@@ -826,7 +826,7 @@ test "an encoder request arms the rows tap without the environment variable, and
     defer col.deinit();
     try testing.expectEqual(@as(usize, 2), col.rows_tap.?.layer);
     try testing.expectEqual(@as(usize, 0), col.path.len);
-    try testing.expect((try Collector.forModel(alloc, mlx.gpuStream(), "lfm2", 3, 4)) == null);
+    try testing.expect((try Collector.forModel(alloc, mlx.gpuStream(), "not_a_served_arch", 3, 4)) == null);
 }
 
 test "a collector armed only for rows has no file to flush" {

@@ -1052,14 +1052,8 @@ pub const ModelConfig = struct {
     /// (this runs AFTER generation_config.json parse, nulls only).
     pub fn applyFamilySamplingDefaults(self: *ModelConfig) void {
         const t = self.model_type;
-        // Qwen 3.x family only — Qwen2.5's upstream defaults differ (top_p
-        // 0.8); never guess numbers the family didn't document.
-        const is_qwen = std.mem.eql(u8, t, "qwen3") or
-            std.mem.eql(u8, t, "qwen3_moe") or
-            std.mem.eql(u8, t, "qwen3_5_moe") or
-            std.mem.eql(u8, t, "qwen4_exp") or
-            std.mem.eql(u8, t, "qwen3_next");
-        if (is_qwen) {
+        // Qwen's own recommendation for the family; never guess numbers another one didn't document.
+        if (std.mem.eql(u8, t, "qwen4_exp")) {
             if (self.gen_top_k == null) self.gen_top_k = 20;
             if (self.gen_top_p == null) self.gen_top_p = 0.95;
         }
@@ -3570,12 +3564,10 @@ test "loadWeights ignores an index that names no shard on disk (re-sharded uploa
 }
 
 test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {
-    // mlx-community/LFM2.5-2.6B-{8bit,nvfp4} declare `Lfm2ForCausalLM` with NO
-    // text_config (just an empty `vision_config`), yet ship every weight under
+    // A checkpoint can declare no text_config yet ship every weight under
     // `language_model.model.*`. The config-key guess picked "model" and the
-    // load died on `MISSING WEIGHT: model.embed_tokens.weight` (live
-    // 2026-08-04). The same class shipped in the opposite direction before, so
-    // the probe corrects either way.
+    // load died on `MISSING WEIGHT: model.embed_tokens.weight`. The same class
+    // shipped in the opposite direction before, so the probe corrects either way.
     const allocator = testing.allocator;
     const put = struct {
         fn add(w: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
@@ -3584,13 +3576,13 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         }
     }.add;
 
-    // Nested checkpoint, flat guess → re-pointed (the LFM2.5 crash).
+    // Nested checkpoint, flat guess → re-pointed.
     {
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "language_model.model.embed_tokens.weight");
         try put(&w, allocator, "language_model.model.layers.0.self_attn.q_proj.weight");
-        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "model" };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "model" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     }
@@ -3599,7 +3591,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "model.embed_tokens.weight");
-        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "language_model.model" };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "language_model.model" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("model", config.weight_prefix);
     }
@@ -3610,7 +3602,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         defer w.deinit();
         try put(&w, allocator, "model.embed_tokens.weight");
         try put(&w, allocator, "language_model.model.embed_tokens.weight");
-        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "language_model.model" };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "language_model.model" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     }
@@ -3620,9 +3612,9 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "language_model.model.embed_tokens.weight");
-        var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = "backbone" };
+        var config = ModelConfig{ .model_type = "deepseek_v41", .weight_prefix = "" };
         resolveWeightPrefix(&config, &w);
-        try testing.expectEqualStrings("backbone", config.weight_prefix);
+        try testing.expectEqualStrings("", config.weight_prefix);
     }
     // A prefix that is a strict PREFIX of the key's first segment must not
     // count as a hit ("model" vs "model_extra.*").
@@ -3631,21 +3623,20 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         defer w.deinit();
         try put(&w, allocator, "model_extra.embed_tokens.weight");
         try put(&w, allocator, "language_model.model.embed_tokens.weight");
-        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "model" };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "model" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     }
-    // mlx-community/Muse-Glimmer-30B-4bit (live 2026-08-11): meta's config
-    // keeps text_config, so the guess is the VL-original "model.language_model"
-    // — but mlx_lm convert re-nests every text weight under
-    // "language_model.model.*". The third spelling joins the probe.
+    // A VL-original config guesses "model.language_model" while the converted
+    // checkpoint re-nests every text weight under "language_model.model.*".
+    // The third spelling joins the probe.
     {
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "language_model.model.embed_tokens.weight");
         try put(&w, allocator, "language_model.lm_head.weight");
         try put(&w, allocator, "vision_tower.layers.0.norm1.weight");
-        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "model.language_model" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     }
@@ -3654,7 +3645,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "model.language_model.embed_tokens.weight");
-        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "model.language_model" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("model.language_model", config.weight_prefix);
     }
@@ -3665,7 +3656,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "model.language_model.embed_tokens.weight");
-        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "language_model.model" };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "language_model.model" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("model.language_model", config.weight_prefix);
     }
@@ -3679,24 +3670,24 @@ test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when t
     // into word salad (zero tool calls) and burned the client's whole output
     // budget. Qwen's own recommendation for the family is top_k 20/top_p 0.95;
     // fill exactly the truncation knobs, never temperature.
-    var qwen = ModelConfig{ .model_type = "qwen3_5_moe" };
+    var qwen = ModelConfig{ .model_type = "qwen4_exp" };
     qwen.applyFamilySamplingDefaults();
     try testing.expectEqual(@as(?u32, 20), qwen.gen_top_k);
     try testing.expectEqual(@as(?f32, 0.95), qwen.gen_top_p);
     try testing.expectEqual(@as(?f32, null), qwen.gen_temperature);
 
     // Families without a documented upstream recommendation stay null.
-    var llama = ModelConfig{ .model_type = "llama" };
-    llama.applyFamilySamplingDefaults();
-    try testing.expectEqual(@as(?u32, null), llama.gen_top_k);
-    try testing.expectEqual(@as(?f32, null), llama.gen_top_p);
+    var other = ModelConfig{ .model_type = "mimo_v2" };
+    other.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?u32, null), other.gen_top_k);
+    try testing.expectEqual(@as(?f32, null), other.gen_top_p);
 
 }
 
 test "applyFamilySamplingDefaults never overrides explicit generation_config values" {
     // The checkpoint's own generation_config.json (parsed before this runs)
     // always wins — the family fallback fills NULLS only.
-    var config = ModelConfig{ .model_type = "qwen3_5_moe" };
+    var config = ModelConfig{ .model_type = "qwen4_exp" };
     config.gen_top_k = 40;
     config.gen_top_p = 0.8;
     config.gen_temperature = 0.6;
@@ -3705,7 +3696,7 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
     try testing.expectEqual(@as(?f32, 0.8), config.gen_top_p);
     try testing.expectEqual(@as(?f32, 0.6), config.gen_temperature);
     // Partial file: only the missing knob is filled.
-    var partial = ModelConfig{ .model_type = "qwen3" };
+    var partial = ModelConfig{ .model_type = "qwen4_exp" };
     partial.gen_top_p = 0.8;
     partial.applyFamilySamplingDefaults();
     try testing.expectEqual(@as(?u32, 20), partial.gen_top_k);
@@ -3715,7 +3706,7 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
 test "defaultEnableThinking: opt-in per arch, and every existing arch stays off" {
     // No prior arch opts in — including the families whose templates merely
     // MENTION enable_thinking, which is not evidence of a thinking-on default.
-    for ([_][]const u8{ "qwen3", "qwen3_5_moe", "llama" }) |t| {
+    for ([_][]const u8{"not_a_served_arch"}) |t| {
         const c = ModelConfig{ .model_type = t };
         try testing.expect(!c.defaultEnableThinking());
     }
@@ -3754,7 +3745,7 @@ test "effortArms: every engine word on each served arch" {
     for (served_model_types) |t| try testing.expect(findEffortArm(effortArms(t).?, parseEffort("minimal").?) == null);
     try testing.expect(parseEffort("ultra") == null);
     // Inherited arches keep the legacy ladder.
-    try testing.expect(effortArms("qwen3_5_moe") == null);
+    try testing.expect(effortArms("not_a_served_arch") == null);
 }
 
 test "defaultEnableThinking: the checkpoint's own generation_config default outranks the arch allowlist" {
@@ -3762,11 +3753,11 @@ test "defaultEnableThinking: the checkpoint's own generation_config default outr
     // its own generation_config declares it — this is the case a silent
     // request used to lose (3 tokens and no reasoning where the same weights
     // reason for ~1000 tokens under a runner that obeys the template).
-    var on = ModelConfig{ .model_type = "qwen3" };
+    var on = ModelConfig{ .model_type = "not_a_served_arch" };
     on.gen_enable_thinking = true;
     try testing.expect(on.defaultEnableThinking());
     // And a checkpoint that declares thinking OFF turns an opted-in arch off.
-    var off = ModelConfig{ .model_type = "bailing_hybrid" };
+    var off = ModelConfig{ .model_type = "mimo_v2" };
     off.gen_enable_thinking = false;
     try testing.expect(!off.defaultEnableThinking());
 }
@@ -4090,46 +4081,33 @@ test "parseConfig prefers processor_config and fills missing Qwen bounds from pr
     try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);
 }
 
-test "ModelConfig text-only qwen3_5 has no qwen_vision" {
-    const json =
-        \\{
-        \\  "model_type": "qwen3_5_text",
-        \\  "hidden_size": 1024,
-        \\  "rope_parameters": {"rope_theta": 10000000, "partial_rotary_factor": 0.25}
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(!config.qwen_vision);
-    try testing.expect(!config.has_vision);
-}
-
-test "bailing_hybrid gate arm is SELECTED by the bound, never defaulted" {
+test "the KDA gate arm is SELECTED by the bound, never defaulted" {
     // `kdaGateChain` with bound 0 computes exp(0) = 1: a decay that never
     // forgets, on a checkpoint that merely omitted the key. The arms are fla's
     // two, and the absent case belongs to the softplus chain (which is
     // elementwise, so it serves a per-channel gate unchanged).
-    var bounded = ModelConfig{ .model_type = "bailing_hybrid" };
+    var bounded = ModelConfig{ .model_type = "glm5_next" };
     bounded.kda_vector_gate = true;
     bounded.kda_gate_lower_bound = -5;
     try testing.expect(bounded.kdaUsesBoundedGate());
 
-    var unbounded = ModelConfig{ .model_type = "bailing_hybrid" };
+    var unbounded = ModelConfig{ .model_type = "glm5_next" };
     unbounded.kda_vector_gate = true; // per-channel gate, softplus form
     try testing.expect(!unbounded.kdaUsesBoundedGate());
 
     // A per-HEAD gate is never the bounded arm regardless of the field.
-    var per_head = ModelConfig{ .model_type = "qwen3_5_moe" };
+    var per_head = ModelConfig{ .model_type = "glm5_next" };
     per_head.kda_gate_lower_bound = -5;
     try testing.expect(!per_head.kdaUsesBoundedGate());
 }
 
-test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
+test "parseConfigFromJson quantized checkpoint → quant_bits from key" {
     // Same arch but with a "quantization" block: quant_bits must reflect it so
     // the mandatory scale/bias fetches still fire (a missing scale is a clear
     // MISSING WEIGHT error, not a silent dense fallback). Guards the default flip.
     const json =
         \\{
-        \\  "model_type": "qwen3_5_moe",
+        \\  "model_type": "not_a_served_arch",
         \\  "text_config": {"hidden_size": 2048, "num_experts": 256},
         \\  "quantization": {"bits": 4, "group_size": 64}
         \\}
@@ -4149,7 +4127,7 @@ test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
     // whole server. Live bite: prism-ml/Bonsai-27B-mlx-1bit.
     const json_1bit =
         \\{
-        \\  "model_type": "qwen3_5",
+        \\  "model_type": "not_a_served_arch",
         \\  "text_config": {"hidden_size": 5120},
         \\  "quantization": {"bits": 1, "group_size": 128}
         \\}
@@ -4158,7 +4136,7 @@ test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
 
     const json_7bit =
         \\{
-        \\  "model_type": "qwen3",
+        \\  "model_type": "not_a_served_arch",
         \\  "hidden_size": 1024,
         \\  "quantization": {"bits": 7, "group_size": 64}
         \\}
@@ -4169,7 +4147,7 @@ test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
 test "parseConfigFromJson explicit affine mode keeps biases" {
     const json =
         \\{
-        \\  "model_type": "qwen3",
+        \\  "model_type": "not_a_served_arch",
         \\  "hidden_size": 1024,
         \\  "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
         \\}
@@ -4184,7 +4162,7 @@ test "parseConfigFromJson unknown quantization mode → error" {
     // in the weight loader with a misleading MISSING WEIGHT error.
     const json =
         \\{
-        \\  "model_type": "qwen3",
+        \\  "model_type": "not_a_served_arch",
         \\  "hidden_size": 1024,
         \\  "quantization": {"group_size": 32, "bits": 4, "mode": "fp99"}
         \\}
@@ -4221,7 +4199,7 @@ test "narrowsLoadedF16 catches per-channel tables, not matmul operands" {
 }
 
 test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
-    // Verbatim shape of Qwen3.6 / Gemma 4 checkpoints' generation_config.json.
+    // Verbatim shape of a Qwen checkpoint's generation_config.json.
     const json =
         \\{"bos_token_id": 248044, "do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95}
     ;
@@ -4309,7 +4287,7 @@ test "expert streaming is a capability of every qwen4 pack and required only by 
     defer quant_config.deinit(t.allocator);
     try t.expectEqual(@as(u32, 4), quant_config.quant_bits);
     try t.expect(quant_config.supportsExpertStreaming() and !quant_config.expertStreamingRequired());
-    var other = ModelConfig{ .model_type = "qwen3_5_moe", .num_hidden_layers = 48, .num_experts = 512, .num_experts_per_tok = 10, .hidden_size = 2560, .moe_intermediate_size = 640 };
+    var other = ModelConfig{ .model_type = "not_a_served_arch", .num_hidden_layers = 48, .num_experts = 512, .num_experts_per_tok = 10, .hidden_size = 2560, .moe_intermediate_size = 640 };
     try t.expect(!other.supportsExpertStreaming() and !other.expertStreamingRequired());
 }
 
@@ -4819,19 +4797,7 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
     try t.expect(qwen4.longCtxGated());
     try t.expect(qwen4.ssdFirstCapable());
 
-    for ([_][]const u8{
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_next",
-        "lfm2",
-        "nemotron_h",
-        "bailing_hybrid",
-        "llama",
-        "mistral",
-        "gemma3",
-        "gemma4",
-        "muse_glimmer",
-    }) |mt| {
+    for ([_][]const u8{ "mimo_v2", "glm5_next", "deepseek_v41", "not_a_served_arch" }) |mt| {
         var cfg = ModelConfig{ .model_type = mt };
         try t.expect(!cfg.longCtxGated());
         try t.expect(!cfg.ssdFirstCapable());
@@ -4976,7 +4942,7 @@ test "isExpertStreamingArch admits only implemented streaming families" {
     const t = std.testing;
     try t.expect(isExpertStreamingArch("qwen4_exp"));
     try t.expect(isExpertStreamingArch("mimo_v2"));
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "gguf", "" }) |mt| {
+    for ([_][]const u8{ "qwen4_exp_text", "mimo_v2_text", "not_a_served_arch", "gguf", "" }) |mt| {
         try t.expect(!isExpertStreamingArch(mt));
         var c = ModelConfig{
             .model_type = mt,
@@ -5326,12 +5292,12 @@ test "mimo_v2 bills per-layer KV geometry and the sliding window once per slot" 
 }
 
 test "a non-ringing sliding arch keeps the uniform KV bill" {
-    // gemma4 slides too, but stores every layer full-length, so its bill must
+    // An arch outside the ring slides too, but stores every layer full-length, so its bill must
     // stay the uniform `layers x kv_heads x 2*head_dim x 2`: per-layer geometry
     // would read `global_head_dim` 512 and move a number whose bytes are still
     // there.
     var g = ModelConfig{};
-    g.model_type = "gemma4";
+    g.model_type = "not_a_served_arch";
     g.num_hidden_layers = 48;
     g.num_key_value_heads = 8;
     g.head_dim = 256;
@@ -5481,8 +5447,8 @@ test "mimo_v2 streaming leaves trunk keys intact and excludes only routed banks"
 
 test "the loader refuses a model_type this build does not serve, by name, before reading the checkpoint" {
     const missing = "/nonexistent/sushi-arch-gate";
-    const llama = ModelConfig{ .model_type = "llama" };
-    try std.testing.expectError(error.ArchitectureUnsupported, loadWeightsForConfig(std.testing.io, std.testing.allocator, missing, &llama, false));
+    const unserved = ModelConfig{ .model_type = "not_a_served_arch" };
+    try std.testing.expectError(error.ArchitectureUnsupported, loadWeightsForConfig(std.testing.io, std.testing.allocator, missing, &unserved, false));
     // The served archs pass the gate and fail on the missing directory instead.
     for ([_][]const u8{ "qwen4_exp", "mimo_v2" }) |mt| {
         const cfg = ModelConfig{ .model_type = mt };
@@ -5542,17 +5508,17 @@ test "parseConfigFromJson: a wrong-typed or out-of-range field is a named error,
         "null",
         "{\"model_type\":5}",
         "{\"model_type\":\"qwen4_exp\",\"text_config\":7}",
-        "{\"model_type\":\"llama\",\"hidden_size\":\"4096\"}",
-        "{\"model_type\":\"llama\",\"vocab_size\":-1}",
-        "{\"model_type\":\"llama\",\"num_hidden_layers\":4294967296}",
-        "{\"model_type\":\"llama\",\"rms_norm_eps\":\"1e-6\"}",
-        "{\"model_type\":\"llama\",\"quantization\":[]}",
-        "{\"model_type\":\"llama\",\"quantization\":{\"bits\":\"4\"}}",
-        "{\"model_type\":\"llama\",\"eos_token_id\":-2}",
-        "{\"model_type\":\"llama\",\"eos_token_id\":[1,-2]}",
-        "{\"model_type\":\"llama\",\"num_experts\":-1}",
-        "{\"model_type\":\"llama\",\"bos_token_id\":4294967296}",
-        "{\"model_type\":\"llama\",\"image_token_id\":-7}",
+        "{\"model_type\":\"not_a_served_arch\",\"hidden_size\":\"4096\"}",
+        "{\"model_type\":\"not_a_served_arch\",\"vocab_size\":-1}",
+        "{\"model_type\":\"not_a_served_arch\",\"num_hidden_layers\":4294967296}",
+        "{\"model_type\":\"not_a_served_arch\",\"rms_norm_eps\":\"1e-6\"}",
+        "{\"model_type\":\"not_a_served_arch\",\"quantization\":[]}",
+        "{\"model_type\":\"not_a_served_arch\",\"quantization\":{\"bits\":\"4\"}}",
+        "{\"model_type\":\"not_a_served_arch\",\"eos_token_id\":-2}",
+        "{\"model_type\":\"not_a_served_arch\",\"eos_token_id\":[1,-2]}",
+        "{\"model_type\":\"not_a_served_arch\",\"num_experts\":-1}",
+        "{\"model_type\":\"not_a_served_arch\",\"bos_token_id\":4294967296}",
+        "{\"model_type\":\"not_a_served_arch\",\"image_token_id\":-7}",
         qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"vision_config\":{\"depth\":-1}"),
         qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":-1}"),
         qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":262144,\"factor\":\"4\"}"),
@@ -5935,7 +5901,7 @@ test "thinking policy: default_reasoning_effort is the word a request naming non
     try testing.expectEqualStrings("medium", defaultReasoningEffort(&qwen).?);
     try testing.expectEqualStrings("medium", defaultReasoningEffort(&qwen_on).?);
     try testing.expectEqualStrings("off", defaultReasoningEffort(&qwen_off).?);
-    try testing.expect(defaultReasoningEffort(&ModelConfig{ .model_type = "llama" }) == null);
+    try testing.expect(defaultReasoningEffort(&ModelConfig{ .model_type = "not_a_served_arch" }) == null);
     think_effort_flag = .medium;
     try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
     think_effort_flag = .xhigh;

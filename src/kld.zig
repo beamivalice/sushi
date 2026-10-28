@@ -2143,7 +2143,7 @@ test "kld: the first EOS position bounds the scored span, and no EOS means the w
 
 test "kld records the budget that shaped the load, never the raw flag" {
     const GiB: u64 = 1 << 30;
-    var moe = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    var moe = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     try testing.expectEqual(@as(u64, 0), capturedSsdBudgetGb(&moe, 60 * GiB));
     moe.expert_ssd_budget_bytes = 60 * GiB;
     try testing.expectEqual(@as(u64, 0), capturedSsdBudgetGb(&moe, 60 * GiB));

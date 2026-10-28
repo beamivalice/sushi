@@ -1799,7 +1799,7 @@ test "layout resolution is qwen4_exp only: the same index declares nothing for a
         \\{"weight_map":{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.weight":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.scales":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.biases":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.weight":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.scales":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.biases":"a"}}
     ;
     try t.expect(isExpertStreamingArch("qwen4_exp"));
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "" }) |mt| {
+    for ([_][]const u8{ "qwen4_exp_text", "mimo_v2_text", "not_a_served_arch", "" }) |mt| {
         try t.expect(!isExpertStreamingArch(mt));
         try t.expect(layoutFromIndexJson(t.allocator, mt, split, 1) == null);
         try t.expect(layoutFromIndexJson(t.allocator, mt, fused, 1) == null);
@@ -2061,7 +2061,7 @@ test "mimo_v2 is the only additional expert streaming architecture" {
     try t.expect(isExpertStreamingArch("qwen4_exp"));
     try t.expect(isExpertStreamingArch("mimo_v2"));
     try t.expect(!isExpertStreamingArch("mimo_v2_text"));
-    try t.expect(!isExpertStreamingArch("qwen3_5_moe"));
+    try t.expect(!isExpertStreamingArch("not_a_served_arch"));
 }
 
 test "real quantized pack resolves nine regions per layer and the per expert bill" {

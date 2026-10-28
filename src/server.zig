@@ -3052,7 +3052,7 @@ test "MiMo honors the declared wired limit streamed or resident, without enablin
     c.expert_streaming = false;
     try std.testing.expectEqual(floor, wiredCeilingFloorForRam(&c, 128 << 30));
     // An arch the engine does not serve keeps the free-RAM ceiling.
-    const other = model_mod.ModelConfig{ .model_type = "llama" };
+    const other = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     try std.testing.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(&other, 128 << 30));
 }
 
@@ -5047,7 +5047,7 @@ test "bf16 streaming marker is a property of the checkpoint, not of the launch f
     try std.testing.expect(streamingStubMarker("qwen4_exp", true, true));
     try std.testing.expect(!streamingStubMarker("qwen4_exp", false, true));
     try std.testing.expect(!streamingStubMarker("qwen4_exp", true, false));
-    try std.testing.expect(!streamingStubMarker("qwen3_5_moe", true, true));
+    try std.testing.expect(!streamingStubMarker("not_a_served_arch", true, true));
 }
 
 test "a quantized pack is streaming capable and only the dense one is streaming required" {
@@ -5055,7 +5055,7 @@ test "a quantized pack is streaming capable and only the dense one is streaming 
     try std.testing.expect(streamingRequiredMarker("qwen4_exp", 0, false, true, true));
     try std.testing.expect(!streamingRequiredMarker("qwen4_exp", 4, false, true, true));
     try std.testing.expect(!streamingRequiredMarker("qwen4_exp", 8, false, true, true));
-    try std.testing.expect(!streamingRequiredMarker("qwen3_5_moe", 0, false, true, true));
+    try std.testing.expect(!streamingRequiredMarker("not_a_served_arch", 0, false, true, true));
     // A pack with no `quantization` block names no config-wide width, so the
     // width alone cannot tell it from a dense checkpoint.
     try std.testing.expect(!streamingRequiredMarker("mimo_v2", 0, true, true, true));
@@ -5794,7 +5794,7 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false, true));
     try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     var dense = model_mod.ModelConfig{};
-    dense.model_type = "qwen3";
+    dense.model_type = "not_a_served_arch";
     try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true, true));
     try t.expect(prefix_cache_mod.ssdFirstActive(&dense, true, false));
     prefix_cache_mod.ssd_first_override = false;
@@ -6061,7 +6061,7 @@ test "clampReserveWidth: the load-time reserve is a promise to the FIRST request
     per_request_chunk_override = null;
 
     var other = qwen4RequestTestConfig();
-    other.model_type = "qwen3_5";
+    other.model_type = "not_a_served_arch";
     const neutral = planHotCache(&other, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
     try t.expectEqual(neutral.chunk, neutral.reserve_chunk);
 }
@@ -6265,7 +6265,7 @@ test "chooseRequestPrefillChunk: the explicit flag caps it, the gate outranks it
 
     // Another arch keeps the load-time pin exactly.
     var other = qwen4RequestTestConfig();
-    other.model_type = "qwen3_5";
+    other.model_type = "not_a_served_arch";
     try t.expect(!other.perRequestPrefillChunk());
     try t.expectEqual(pin, chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
     try t.expect(cfg.perRequestPrefillChunk());
@@ -6397,7 +6397,7 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
 
     // A non-qwen4 arch is untouched end to end.
     var other = qwen4RequestTestConfig();
-    other.model_type = "qwen3_5";
+    other.model_type = "not_a_served_arch";
     const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{});
     const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expectEqual(pin, other_pre);
@@ -21178,7 +21178,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     var cfg = qwen4ExpLive364kConfig();
     try t.expect(wiredCeilingFloorForRam(&cfg, total_ram) > 0);
     try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(null, total_ram));
-    for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "bailing_hybrid" }) |mt| {
+    for ([_][]const u8{"not_a_served_arch"}) |mt| {
         var other = cfg;
         other.model_type = mt;
         try t.expect(!other.longCtxGated());
@@ -21367,7 +21367,7 @@ test "auto-context on a 16 GB profile: activations are a chunk reserve, not a pe
     const dense_kv: u64 = 16 * 4 * 256 * 2 * 2;
     const per_tok = kvBytesPerTokenAtBits(dense_kv, 4);
 
-    var cfg = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    var cfg = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     cfg.num_attention_heads = 24;
     cfg.num_key_value_heads = 4;
     cfg.head_dim = 256;
@@ -21975,7 +21975,7 @@ test "renderPropsBody omits chat_template" {
     config.quant_bits = 4;
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
-    config.model_type = "gemma4";
+    config.model_type = "not_a_served_arch";
 
     const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 0, "");
     defer testing.allocator.free(body);
@@ -22028,7 +22028,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     });
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
-    config.model_type = "qwen3_5";
+    config.model_type = "not_a_served_arch";
     const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -22061,7 +22061,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 3 << 30), pc.get("disk_used_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5), pc.get("disk_entries").?.integer);
 
-    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "llama", .kv_quant = "q4", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
+    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "q4", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(exact);
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
@@ -22116,7 +22116,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     var config = model_mod.ModelConfig{};
-    config.model_type = "gemma4";
+    config.model_type = "not_a_served_arch";
     config.vocab_size = 32000;
     config.hidden_size = 4096;
     config.num_hidden_layers = 32;
@@ -22949,7 +22949,7 @@ test "effort refusal and /v1/models list name the model's accepted words" {
     const row = try reasoningEffortsJson(allocator, &.{ .model_type = "qwen4_exp" });
     defer allocator.free(row);
     try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"default_reasoning_effort\":\"medium\"", row);
-    const legacy = try reasoningEffortsJson(allocator, &.{ .model_type = "llama" });
+    const legacy = try reasoningEffortsJson(allocator, &.{ .model_type = "not_a_served_arch" });
     defer allocator.free(legacy);
     try std.testing.expectEqualStrings("", legacy);
 }
@@ -23185,7 +23185,7 @@ test "isStatusRoute: only /props reaches the shared release" {
 test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V widths" {
     const t = std.testing;
     // Uniform arch: every layer caches, K and V are both head_dim wide.
-    var dense = model_mod.ModelConfig{ .model_type = "qwen3" };
+    var dense = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     dense.num_hidden_layers = 24;
     dense.num_key_value_heads = 8;
     dense.head_dim = 128;
@@ -23196,7 +23196,7 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
     // a 192-wide key against a 128-wide value. Billing it as a uniform arch
     // charged 196608 B/token against a real 61440 — a 3.2x over-bill that
     // pinned auto-context to under a third of what fits.
-    var ling = model_mod.ModelConfig{ .model_type = "bailing_hybrid" };
+    var ling = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     ling.num_hidden_layers = 24;
     ling.num_attention_heads = 16;
     ling.num_key_value_heads = 16;
@@ -23225,7 +23225,7 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
     try t.expectEqual(@as(u64, 24 * 8 * 256 * 2), gqa.kvBytesPerToken());
 
     // A hybrid WITHOUT MLA still drops its linear layers from the bill.
-    var gdn = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    var gdn = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     gdn.num_hidden_layers = 40;
     gdn.num_key_value_heads = 2;
     gdn.head_dim = 256;
@@ -23616,14 +23616,14 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
     const t = std.testing;
     // qwen3_5 27B: 64 layers, every 4th full — 48 GatedDeltaNet layers, each
     // holding a chunk-wide q/k/v stream (2 x 16 x 128 key + 48 x 128 value).
-    var q27 = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    var q27 = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     q27.num_hidden_layers = 64;
     q27.full_attention_interval = 4;
     q27.linear_num_key_heads = 16;
     q27.linear_num_value_heads = 48;
     try t.expectEqual(@as(u64, 5 * (2 * 16 * 128 + 48 * 128) * 2), prefillStreamBytesPerToken(&q27));
 
-    var q4 = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    var q4 = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     q4.num_hidden_layers = 32;
     q4.full_attention_interval = 4;
     q4.linear_num_key_heads = 16;
@@ -23633,7 +23633,7 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
     // gemma4 26B-A4B: no linear layers, but a MoE prefill gathers a top_k-fold
     // copy of the hidden stream beside the expert rows, for the 4 layers the
     // MoE eval cadence lets coexist.
-    var g4 = model_mod.ModelConfig{ .model_type = "gemma4" };
+    var g4 = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     g4.num_hidden_layers = 30;
     g4.hidden_size = 2816;
     g4.num_experts = 128;
@@ -23643,7 +23643,7 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
 
     // A plain attention arch (muse, llama, mistral) declares neither and is
     // billed exactly what it was billed before this term existed.
-    var dense = model_mod.ModelConfig{ .model_type = "muse_glimmer" };
+    var dense = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     dense.num_hidden_layers = 52;
     dense.hidden_size = 6656;
     try t.expectEqual(@as(u64, 0), prefillStreamBytesPerToken(&dense));
@@ -23651,7 +23651,7 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
     // lfm2's conv layers are NOT linear-attention layers: it declares no
     // linear head geometry, and its measured slope is one MLP envelope — the
     // term must not invent a stream for it.
-    var lfm2 = model_mod.ModelConfig{ .model_type = "lfm2" };
+    var lfm2 = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     lfm2.num_hidden_layers = 30;
     lfm2.full_attention_interval = 4;
     lfm2.hidden_size = 2048;
@@ -23660,7 +23660,7 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
 
 test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the route's kill switch" {
     const t = std.testing;
-    var cfg = model_mod.ModelConfig{ .model_type = "muse_glimmer" };
+    var cfg = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     cfg.hidden_size = 6656;
     cfg.intermediate_size = 19968;
     cfg.intermediate_size_declared = true;
@@ -24968,7 +24968,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     try t.expect(hook_installed);
 
     var other = qwen4RequestTestConfig();
-    other.model_type = "qwen3_5";
+    other.model_type = "not_a_served_arch";
     const adaptive = scheduler_mod.adaptiveChunkWidthFor(&other);
     try t.expect(!adaptive);
     try t.expect(hook_installed != adaptive);
@@ -25002,7 +25002,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     const t = std.testing;
 
     var other = qwen4RequestTestConfig();
-    other.model_type = "qwen3_5";
+    other.model_type = "not_a_served_arch";
     try t.expect(!other.perRequestPrefillChunk());
     try t.expect(!adaptivePrefillChunkEnabled(&other));
     const off = adaptivePrefillChunkEnabled(&other);
@@ -25163,7 +25163,7 @@ test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned 
     const t = std.testing;
     const cfg = qwen4RequestTestConfig();
     var other = qwen4RequestTestConfig();
-    other.model_type = "qwen3_5_moe";
+    other.model_type = "not_a_served_arch";
 
     try t.expect(adaptivePrefillChunkEnabled(&cfg));
     // Another arch never adapts; one switch disables both.
@@ -25501,7 +25501,7 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
     const ctx_kv: u64 = 20 * GiB;
 
     // Every other arch: the ask is spoken for, the context is not, no HOT_CACHE_FLOOR.
-    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mistral" }) |mt| {
+    for ([_][]const u8{ "glm5_next", "not_a_served_arch" }) |mt| {
         var cfg = longCtxTestConfig();
         cfg.model_type = mt;
         const baseline: u64 = (ceiling - (weights + ask)) / PREFILL_RESERVE_BUDGET_SHARE;
@@ -25537,13 +25537,13 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
 
     // A 27B-class GDN pack: `ssmCheckpointBytes()` is non-zero here.
     var q35 = qwen4ExpOomConfig();
-    q35.model_type = "qwen3_5_moe";
+    q35.model_type = "not_a_served_arch";
     try t.expect(q35.ssmCheckpointBytes() > 0);
     try t.expect(retainedSsmCheckpointBytes(&q35, seq, 0, chunk) > 0);
 
     // Supplies the donating case so the qwen4_exp assertion below is falsifiable; the ungated loop reads 0 through `.{}`.
     const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000, .will_donate = true };
-    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
+    for ([_][]const u8{ "glm5_next", "not_a_served_arch" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
         const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, warm);
@@ -25581,7 +25581,7 @@ test "prefillRequestTerms: a loaded DFlash2 assistant bills its window and chunk
     const short = prefillRequestTerms(&cfg, 100, 8192, 8, chunk, .{});
     try t.expectEqual(cfg.dflash_window_bytes * 4 + cfg.dflash_capture_bytes_per_token * 100 + 64 * 1024 * 1024, short.dflash_bytes);
     var other = cfg;
-    other.model_type = "qwen3_5_moe";
+    other.model_type = "not_a_served_arch";
     try t.expectEqual(@as(u64, 0), prefillRequestTerms(&other, seq, 8192, 8, chunk, .{}).dflash_bytes);
 }
 
@@ -25620,7 +25620,7 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     try t.expectEqual(cfg.qsaRingBytes(), off.qsa_ring_bytes);
     try t.expectEqual(reserved * statePerTokenBilled(&cfg), off.state_bytes);
     var other = cfg;
-    other.model_type = "qwen3_5_moe";
+    other.model_type = "not_a_served_arch";
     const other_on = prefillRequestTerms(&other, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
     try t.expectEqual(@as(u64, 0), other_on.mtp_head_kv_bytes);
 }
@@ -25814,7 +25814,7 @@ test "ctxSizingCacheReserve: the advertised context is unchanged on every other 
 
     var q4 = longCtxTestConfig(); // declares qwen4_exp
     var other = longCtxTestConfig();
-    other.model_type = "qwen3_5_moe";
+    other.model_type = "not_a_served_arch";
 
     for ([_]u64{ 0, 2 * GiB, 10 * GiB, 60 * GiB }) |ask| {
         prefix_cache_mem_bytes = ask;
@@ -26112,7 +26112,7 @@ test "a MiMo slot bills the decode rebuilds the other rows of its batched decode
     cfg.expert_streaming = true;
     try t.expectEqual(@as(u64, 0), batchedDecodeRowsBytes(&cfg));
     var plain = mimoV2BillConfig();
-    plain.model_type = "qwen3";
+    plain.model_type = "not_a_served_arch";
     try t.expectEqual(@as(u64, 0), batchedDecodeRowsBytes(&plain));
 }
 
@@ -26147,7 +26147,7 @@ test "the sliding ring is billed once per slot and staged per chunk token" {
     try t.expectEqual(full.swaRingTokens() * 40 * 3 * (192 + 128) * 2, full.swaRingBytes());
     // An arch that stores every layer full-length keeps a zero ring.
     var plain = cfg;
-    plain.model_type = "qwen3";
+    plain.model_type = "not_a_served_arch";
     try t.expectEqual(@as(u64, 0), slotRingBytes(&plain, 16));
     try t.expectEqual(@as(u64, 0), prefillStreamBytesPerToken(&plain));
 }
@@ -26213,7 +26213,7 @@ test "a ringed arch's kv-quant dequant scratch is one layer's rebuild, not the m
 
     // Every arch whose caching layers share one geometry keeps the generic term.
     var plain = cfg;
-    plain.model_type = "qwen3";
+    plain.model_type = "not_a_served_arch";
     try t.expectEqual(@as(u64, 0), kvDequantScratchBytes(&plain, seq, 1024));
 
     // fp16 KV never rebuilds anything, whatever the arch.
@@ -26264,7 +26264,7 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
 
     // Every arch outside the gate keeps exactly the terms it had.
     var plain = cfg;
-    plain.model_type = "qwen3";
+    plain.model_type = "not_a_served_arch";
     try t.expect(!plain.reservesKvCapacity());
     try t.expectEqual(PrefillRequestTerms{}, prefillRequestTerms(&plain, seq, 2048, 8, chunk, .{}));
     try t.expectEqual(@as(u64, 0), generate_mod.reservedPrefillTokens(&plain, seq, 2048, chunk));
@@ -26298,7 +26298,7 @@ test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sh
 
     // An arch with no ring never acquires the band term.
     var plain = cfg;
-    plain.model_type = "qwen3";
+    plain.model_type = "not_a_served_arch";
     transformer_mod.fused256_override = true;
     try t.expectEqual(@as(u64, 0), slidingBandScoreBytes(&plain, chunk));
 }
@@ -26448,7 +26448,7 @@ test "mimo_v2 admission credits the hot cache: a gap the cache covers is an evic
 
     // Both halves read one predicate: the credits ride exactly where the inference thread evicts.
     var other = cfg;
-    other.model_type = "llama";
+    other.model_type = "not_a_served_arch";
     const q4 = qwen4RequestTestConfig();
     for ([_]*const model_mod.ModelConfig{ &cfg, &other, &q4 }) |c| {
         const b = creditedAdmissionBill(c, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096);
@@ -27343,7 +27343,7 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     defer prefix_cache_ram_enabled = saved_ram;
     var gated = longCtxTestConfig();
     var other = longCtxTestConfig();
-    other.model_type = "qwen3_5_moe";
+    other.model_type = "not_a_served_arch";
     const configs = [_]*model_mod.ModelConfig{ &gated, &other };
     for ([_]u64{ 0, 2 << 30, 60 << 30 }) |ask| {
         prefix_cache_mem_bytes = ask;
