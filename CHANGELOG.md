@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1 reads its routers as stored**: the BF16 router weights are no longer widened to f32 at load, so the logits are bit-identical, each decode step reads half the router bytes, and 0.16 GB returns to the expert cache.
 - **A running stream keeps a quarter of the time while another request prefills**: `--prefill-decode-share` now defaults to 0.25 (was 0), so a concurrent decode no longer advances one token per prefill chunk; the share only adds decode ticks between chunks and never narrows a prefill chunk, on any model.
 - **Every model keeps SSD restore points every 8192 tokens, to 1M tokens**: Qwen and GLM no longer thin a long conversation to 16 and 8 points, so an edit deep in a long prompt restores from the point just below it; raise `--prefix-cache-disk` for 1M-token conversations, since one that outgrows the budget drops its oldest points first. `--ssm-checkpoint-max` now caps only the states held in memory.
 - **`/v1/responses` keeps the model's own reasoning in a tool loop**: a replayed plaintext `reasoning` item now reaches the prompt on its assistant turn (it was dropped), so a thinking model keeps its chain of thought between tool calls and the prefix cache hits; encrypted or malformed reasoning items are still ignored.

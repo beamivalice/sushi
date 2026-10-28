@@ -240,13 +240,13 @@ fn raggedSlot(key: []const u8) ?usize {
 }
 
 /// How many times the built tensor is as large as the stored one: an fp8 weight's block scale is repeated down its
-/// 32 rows, and the bf16 tensors the forward holds in f32 (the heads, the routers, the confidence head) double; an
+/// 32 rows, and the bf16 tensors the forward holds in f32 (the heads, the confidence head) double; an
 /// expert's per-row scales are stored as built.
 fn widening(key: []const u8) u64 {
     if (std.mem.indexOf(u8, key, ".ffn.experts.") != null) return 1;
     if (std.mem.endsWith(u8, key, ".scale")) return 32;
     if (std.mem.eql(u8, key, "head.weight")) return 2;
-    for ([_][]const u8{ ".markov_head.head.weight", ".ffn.gate.weight", ".confidence_head.proj.weight" }) |tail|
+    for ([_][]const u8{ ".markov_head.head.weight", ".confidence_head.proj.weight" }) |tail|
         if (std.mem.endsWith(u8, key, tail)) return 2;
     return 1;
 }
@@ -412,8 +412,8 @@ test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    // The f32 gate widens to 1.2 MB; the scale grid is rebuilt by MLX at 32x, unrounded.
-    const trunk = expert_io.pageRoundUp(mib + 100) + 4000 + expert_io.pageRoundUp(1_200_000) + (2 * mib + 1) * 32;
+    // The scale grid is rebuilt by MLX at 32x, unrounded; the gate is held as stored.
+    const trunk = expert_io.pageRoundUp(mib + 100) + 4000 + 600_000 + (2 * mib + 1) * 32;
     try testing.expectEqual(trunk, try residentBytes(testing.io, testing.allocator, root));
     // The two groups' trellis bytes are one region, their scales another.
     try testing.expectEqual(expert_io.pageRoundUp(3 * mib + 100) + expert_io.pageRoundUp(100), try dsparkBytes(testing.io, testing.allocator, root));
@@ -461,4 +461,18 @@ test "dsv41 source: the bytes an SSD embedding frees go to the expert cache in t
     try testing.expect(freed.slots_per_layer - resident.slots_per_layer <= 1);
     const spare = budget - (resident.trunk_bytes + resident.mtp_bytes + resident.workspace_bytes + resident.selected_bytes + resident.bounce_bytes) - resident.cache_bytes;
     try testing.expectEqual(freed.slots_per_layer - resident.slots_per_layer, (spare + table) / (40 * 9_620_000));
+}
+
+test "dsv41 source: a router weight is billed at its stored size, in the trunk and in a DSpark stage" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gate = 3 * (1 << 20) + 100;
+    try writeShard(tmp.dir, "model-a.safetensors", &.{
+        .{ "layers.3.ffn.gate.weight", gate },
+        .{ "mtp.0.ffn.gate.weight", gate },
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    try testing.expectEqual(expert_io.pageRoundUp(gate), try residentBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(expert_io.pageRoundUp(gate), try dsparkBytes(testing.io, testing.allocator, root));
 }

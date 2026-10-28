@@ -250,7 +250,7 @@ const Layer = struct {
     ratio: u8,
     comp: ?CompW,
     idx: ?IdxW,
-    gate_w: A, // f32 [E, dim]
+    gate_w: A, // [E, dim] as stored; the kernels widen it
     gate_bias: A, // f32 [1, E]
     /// The bias an image span's rows pick experts by (`noaux_tc_for_vl`); none on a pack without a tower.
     gate_bias_vl: A = none,
@@ -844,6 +844,11 @@ fn loadLin(m: *Model, w: *model_mod.Weights, base: []const u8, dense: ?mlx.mlx_d
     return .{ .w = if (dense) |dt| try m.ownCast(wt, dt) else try m.ownCast(wt, mlx.mlx_array_dtype(wt)) };
 }
 
+/// `name` kept in its stored dtype.
+fn loadStored(m: *Model, w: *model_mod.Weights, name: []const u8) !A {
+    return loadDense(m, w, name, mlx.mlx_array_dtype(try getW(w, name)));
+}
+
 /// `embed.weight` dense, or MLX's affine triple with `embed.scales` and `embed.biases` (bits and group from the shapes).
 fn loadEmbed(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !Embed {
     // The loader leaves a pack's affine triple in its shard: the rows come from there.
@@ -1024,7 +1029,7 @@ fn loadLayer(m: *Model, w: *model_mod.Weights, pfx: []const u8, id: usize, li: u
         .ratio = r,
         .comp = null,
         .idx = null,
-        .gate_w = try loadDense(m, w, try lkey(&b, pfx, id, "ffn.gate.weight"), .float32),
+        .gate_w = try loadStored(m, w, try lkey(&b, pfx, id, "ffn.gate.weight")),
         .gate_bias = undefined,
         .shared = .{
             try loadLin(m, w, try lkey(&base, pfx, id, "ffn.shared_experts.w1"), act),
@@ -1947,13 +1952,13 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !kernels.Routes 
         const logits = if (dim(h, 0) <= NARROW_ROWS and c.dim % 8 == 0)
             try kernels.gateLogits(sc, h, ly.gate_w)
         else
-            try sc.matmul(try sc.astype(h, .float32), try sc.t2(ly.gate_w));
+            try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32)));
         var r = try kernels.route(sc, logits, bias, K, norm, c.route_scale);
         r.logits = logits;
         try traceRoutes(m, li, logits, r);
         return r;
     }
-    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(ly.gate_w)); // [L, E]
+    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32))); // [L, E]
     const scores = try sc.op1(mlx.mlx_sqrt, try sc.op2(mlx.mlx_logaddexp, logits, try sc.f(0)));
     const idx = try topkRows(sc, m, try sc.add(scores, bias), K);
     var wts = try sc.takeAlong(scores, idx, -1);
@@ -2881,7 +2886,7 @@ fn prefetchTarget(m: *const Model, li: usize, rows: usize) ?usize {
 fn predictLogits(sc: *Scope, m: *const Model, h: A, j: usize) !A {
     const w = m.layers[j].gate_w;
     if (fusedOn(sc, m) and m.cfg.dim % 8 == 0) return kernels.gateLogits(sc, h, w);
-    return sc.matmul(try sc.astype(h, .float32), try sc.t2(w));
+    return sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(w, .float32)));
 }
 
 /// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias), best first.
@@ -5282,7 +5287,7 @@ fn expectMaskedRoute(sc: *Scope, full: *Model, cut: *Model, d: *const expert_usa
     const idx = try sc_mod.hostI32(try sc.astype(r.idx, .int32));
     const wts = try sc_mod.hostF32(r.wts);
 
-    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(full.layers[li].gate_w));
+    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(full.layers[li].gate_w, .float32)));
     const scores = try sc.op1(mlx.mlx_sqrt, try sc.op2(mlx.mlx_logaddexp, logits, try sc.f(0)));
     const sel = try sc_mod.hostF32(try sc.add(scores, full.layers[li].gate_bias));
     for (0..rows) |row| {
@@ -5318,6 +5323,53 @@ fn routerRows(sc: *Scope, dim_: usize, rows: usize, seed: u64) !A {
     var prng = std.Random.DefaultPrng.init(seed);
     for (data) |*v| v.* = prng.random().floatNorm(f32);
     return sc.floats(data, &.{ ci(rows), ci(dim_) });
+}
+
+/// Every router of `dir`'s model, as stored, against the same router widened to f32: the bytes of the logits,
+/// the picks and their weights, at each row count's arm, fused kernels on and off.
+fn expectStoredRouterExact(dir: []const u8) !void {
+    const s = mlx.gpuStream();
+    const m = try tinyModel(dir, .{ .act = .float32, .experts = false, .dspark = true }, s);
+    defer m.deinit();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const Bits = struct { logits: []const f32, idx: []const i32, wts: []const f32 };
+    const bits = struct {
+        fn of(sc_: *Scope, m_: *Model, li: usize, h: A) !Bits {
+            const r = try router(sc_, m_, li, h, none);
+            return .{ .logits = try sc_mod.hostF32(r.logits), .idx = try sc_mod.hostI32(try sc_.astype(r.idx, .int32)), .wts = try sc_mod.hostF32(r.wts) };
+        }
+    }.of;
+    for (m.layers, 0..) |*ly, li| {
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(ly.gate_w));
+        const stored = ly.gate_w;
+        defer ly.gate_w = stored;
+        const widened = try sc.astype(stored, .float32);
+        for ([_]bool{ true, false }) |fused| {
+            m.fused = fused;
+            for ([_]usize{ 1, 2, 6, 16, 17, 64 }) |rows| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dt| {
+                const h = try sc.astype(try routerRows(&sc, m.cfg.dim, rows, 0x6a7e + rows + li), dt);
+                const got = try bits(&sc, m, li, h);
+                ly.gate_w = widened;
+                const want = try bits(&sc, m, li, h);
+                ly.gate_w = stored;
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits), std.mem.sliceAsBytes(got.logits));
+                try testing.expectEqualSlices(i32, want.idx, got.idx);
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.wts), std.mem.sliceAsBytes(got.wts));
+            };
+        }
+    }
+}
+
+test "dsv41 router: a bf16 router stays bf16 once loaded and routes bit for bit as its f32 widening (DSV41_TINY, DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var ran = false;
+    for ([_][:0]const u8{ "DSV41_TINY", "DSV41_STQ_TINY" }) |env| {
+        const raw = std.c.getenv(env) orelse continue;
+        try expectStoredRouterExact(std.mem.span(raw));
+        ran = true;
+    }
+    if (!ran) return error.SkipZigTest;
 }
 
 test "dsv41 drop: the router with experts masked picks the top-k of the kept experts and weights them as the normal path, bit for bit on the CPU stream (DSV41_TINY)" {
