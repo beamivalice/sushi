@@ -11591,7 +11591,7 @@ test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP he
     r = requestSpecModes(true, true, false, true, plain, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
     try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, plain, 0));
-    // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
+    // enable_drafter:false hands the round back to MTP.
     r = requestSpecModes(false, true, true, true, plain, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
     // logprobs / grammar disable every spec mode, dflash included.

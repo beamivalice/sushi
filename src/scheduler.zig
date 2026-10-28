@@ -4953,18 +4953,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.err("DFlash assistant at {s} is incompatible with target: {s}\n", .{ drafter_dir, @errorName(err) });
                 return err;
             };
-        } else d.bind(xfm_ptr) catch |err| {
+        } else {
             d.deinit();
             sch.allocator.destroy(d);
-            log.err(
-                "DFlash assistant at {s} is incompatible with target: {s}\n" ++
-                    "  (assistant+target must share hidden_size, the mask token and\n" ++
-                    "  target_layer_ids must exist in the target, and the target must\n" ++
-                    "  run the standard dense-attention forward path)\n",
-                .{ drafter_dir, @errorName(err) },
-            );
-            return err;
-        };
+            log.err("--drafter: a DFlash2 assistant serves Qwen3.8-Flash-Next and GLM-5.3-Flash only\n", .{});
+            return error.DflashTargetMismatch;
+        }
         dflash_ptr = d;
         const wide_lane = dflash_mod.wideVerifyLaneAvailable();
         const block_cap = dflash_mod.blockCapForMachine(chip_mod.chipBrand());

@@ -87,10 +87,9 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer parsed.deinit();
     if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
-    // The DFlash contract outranks model_type: v1 assistants at least carry a
-    // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
-    // from its trunk family without this probe (one predicate, shared with
-    // the loader's own detection).
+    // The DFlash contract outranks model_type: a DFlash2 sidecar is
+    // config-indistinguishable from its trunk family without this probe (one
+    // predicate, shared with the loader's own detection).
     if (dflash.isDflashConfigJson(root)) return .drafter;
     const mt_val = root.get("model_type") orelse return .missing_or_unparseable;
     if (mt_val != .string) return .missing_or_unparseable;
@@ -306,7 +305,7 @@ pub const ModelKind = enum {
     pub fn describe(self: ModelKind) []const u8 {
         return switch (self) {
             .chat => "a chat model",
-            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
+            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside its Qwen3.8-Flash-Next or GLM-5.3-Flash target)",
             .unsupported => "an architecture sushi does not support",
         };
     }
@@ -1152,8 +1151,6 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     // Drafter sidecars, and genuinely unsupported archs (media
     // generation included: it is no longer served).
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("flux2-klein-4b"));
-    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_assistant"));
-    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
     // DFlash sidecars ride the same `*_assistant` suffix rule — never listed
     // as primary models.
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("glm5_next_assistant"));
@@ -1173,7 +1170,7 @@ test "classifyModelPath: drafter dirs classify; junk is null" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "drafter");
-    try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"gemma4_assistant\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"glm5_next_assistant\"}" });
     try tmp.dir.createDirPath(io, "junk");
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

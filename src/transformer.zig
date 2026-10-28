@@ -13634,13 +13634,6 @@ pub const Transformer = struct {
     // (Unsloth Dynamic checkpoints — null for the common all-quantized case).
     moe_owned_bf16: ?[]mlx.mlx_array = null,
 
-    // When non-null, the next forward pass captures the post-final-norm
-    // hidden state at the last position into the pointed-to array
-    // (refcount-shared with the live forward graph). Set/cleared by
-    // `forwardCaptureHidden`. Used by PLD verify-fusion for the h_prev seed.
-    // Single-threaded: generation runs on one thread per Transformer.
-    capture_hidden: ?*mlx.mlx_array = null,
-
 
     // Vision: set before prefill when images are present, cleared after.
     // Shape: [B, num_image_tokens, hidden_size]. Spliced at image_token_id positions.
@@ -15080,7 +15073,7 @@ pub const Transformer = struct {
             .cache = &self.cache,
             .moe_seq_offset = &self.moe_seq_offset,
             .ssm_entries = self.ssm_entries,
-            .capture_hidden = self.capture_hidden,
+            .capture_hidden = null,
             .vision_embeddings = self.vision_embeddings,
             .glm5_request = if (self.glm5_request) |*request| request else null,
         };
@@ -15562,24 +15555,6 @@ pub const Transformer = struct {
         try testing.expectEqual(@as(usize, 3), specWarmGroupSeq(7, 2, 6));
         try testing.expectEqual(@as(usize, 2), specWarmGroupSeq(7, 3, 6));
         try testing.expectEqual(@as(usize, 3), specWarmGroupSeq(16, 2, 2));
-    }
-
-    /// Run a forward pass and ALSO capture the post-final-norm hidden state
-    /// at the LAST position into `*out_hidden`. Used by PLD verify-fusion
-    /// (which re-uses the captured hidden as part of partial-accept rollback).
-    /// Caller owns the captured array (must
-    /// `mlx_array_free`). Both `forwardStandard` and `forwardMoe` honor the
-    /// capture; other families fall through to a regular forward and leave
-    /// `*out_hidden` as a default `mlx_array_new()`.
-    pub fn forwardCaptureHidden(
-        self: *Transformer,
-        token_ids: mlx.mlx_array,
-        out_hidden: *mlx.mlx_array,
-    ) !mlx.mlx_array {
-        std.debug.assert(self.capture_hidden == null); // re-entrant call
-        var ctx = self.defaultCtx();
-        ctx.capture_hidden = out_hidden;
-        return self.forwardWith(&ctx, token_ids);
     }
 
     /// Variant of `forwardWith` that overrides `ctx.capture_hidden` for this

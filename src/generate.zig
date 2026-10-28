@@ -1906,11 +1906,10 @@ pub const Generator = struct {
     pending_token: mlx.mlx_array = .{},
     has_pending_token: bool = false,
 
-    // ── Spec-decode shared state (DFlash) ──
+    // ── Spec-decode shared state ──
     // Post-final-norm hidden state at the last produced token's position.
-    // Owned by the Generator (freed in `deinit`). Captured by
-    // `forwardCaptureHidden` during prefill final-token forward and every
-    // verify forward; the drafter's h_prev seed.
+    // Owned by the Generator (freed in `deinit`). Captured during the prefill
+    // final-token forward and every verify forward; the MTP head's h_prev seed.
     last_hidden: mlx.mlx_array = .{},
     has_last_hidden: bool = false,
     /// PRNG for the DFlash stochastic-verify accept test (probability-
@@ -4971,11 +4970,8 @@ pub const Generator = struct {
         }
 
         // ── Phase 1: one assistant forward drafts all m tokens ──
-        // Row mapping is the export's convention (`anchor_row_drafts`):
-        // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
-        // ALL rows starting at the anchor — so DSpark needs only m noise rows
-        // for the same m drafts and the same verify width.
-        const noise_rows: u32 = if (model.config.anchor_row_drafts) m_full else bs;
+        // DFlash reads mask rows 1..bs-1 (anchor row dropped).
+        const noise_rows: u32 = bs;
         const noise_ids = try allocator.alloc(i32, noise_rows);
         defer allocator.free(noise_ids);
         noise_ids[0] = @intCast(t1);
@@ -4997,13 +4993,12 @@ pub const Generator = struct {
         const draft_logits_all = try model.draftLogits(xfm, blk_hidden);
         defer _ = mlx.mlx_array_free(draft_logits_all);
 
-        // Slice the m draft rows: DFlash drops the anchor row (1..bs-1),
-        // DSpark reads every row (0..m) — the anchor row IS draft 0.
+        // Slice the m draft rows: DFlash drops the anchor row (1..bs-1).
         const dl_shape = mlx.getShape(draft_logits_all);
         var draft_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_logits);
         {
-            const row0: c_int = if (model.config.anchor_row_drafts) 0 else 1;
+            const row0: c_int = 1;
             const start = [_]c_int{ 0, row0, 0 };
             const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m_full)), dl_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
@@ -5025,90 +5020,11 @@ pub const Generator = struct {
         // accept through min(1, p/q) with q read off the traced path —
         // exact by construction.
         const use_selector = model.selector != null;
-        // DSpark: the block's base logits are position-parallel, but each
-        // position's draft is picked from logits CORRECTED by the token
-        // drafted at the previous one (the Markov bigram bias). Chaining it
-        // is what the head is for — dropping it drafts every position from
-        // an uncorrected distribution the sidecar was never trained to emit.
-        const use_markov = model.markov != null;
         var sel_path: ?dflash_mod.SelectedPath = null;
         defer if (sel_path) |*sp| sp.deinit(allocator);
-        var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
-        defer if (draft_q.ctx != null) {
-            _ = mlx.mlx_array_free(draft_q);
-        };
         var draft_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_ids);
-        if (use_markov) {
-            const mh = &model.markov.?;
-            const ids_i32 = try allocator.alloc(i32, m);
-            defer allocator.free(ids_i32);
-            var q_rows: ?[]mlx.mlx_array = null;
-            defer if (q_rows) |rows| {
-                for (rows) |r| _ = mlx.mlx_array_free(r);
-                allocator.free(rows);
-            };
-            if (stochastic) {
-                const rows = try allocator.alloc(mlx.mlx_array, m);
-                for (rows) |*r| r.* = .{ .ctx = null };
-                q_rows = rows;
-            }
-            var prev: u32 = t1;
-            var step: u32 = 0;
-            while (step < m) : (step += 1) {
-                var base_row = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(base_row);
-                {
-                    const start = [_]c_int{ 0, @intCast(step), 0 };
-                    const stop = [_]c_int{ 1, @as(c_int, @intCast(step)) + 1, dl_shape[2] };
-                    const strides = [_]c_int{ 1, 1, 1 };
-                    try mlx.check(mlx.mlx_slice(&base_row, draft_logits, &start, 3, &stop, 3, &strides, 3, s));
-                }
-                const corrected = try mh.stepLogits(base_row, prev, s);
-                defer _ = mlx.mlx_array_free(corrected);
-                if (stochastic) {
-                    // Sample the step from the request's own filtered
-                    // distribution and keep the row as q — the accept ratio
-                    // and the reject residual both need the density the
-                    // draft was actually drawn from.
-                    const qrow = try filteredProbsBlock(corrected, self.sampling, s);
-                    var logq = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(logq);
-                    try mlx.check(mlx.mlx_log(&logq, qrow, s));
-                    const null_key = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(null_key);
-                    var sampled = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(sampled);
-                    try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
-                    try mlx.check(mlx.mlx_array_eval(sampled));
-                    const sd = mlx.mlx_array_data_int32(sampled) orelse return error.MlxArrayDataNull;
-                    prev = @intCast(sd[0]);
-                    q_rows.?[step] = qrow;
-                } else {
-                    var amax = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(amax);
-                    try mlx.check(mlx.mlx_argmax_axis(&amax, corrected, 2, false, s));
-                    var as_i32 = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(as_i32);
-                    try mlx.check(mlx.mlx_astype(&as_i32, amax, .int32, s));
-                    try mlx.check(mlx.mlx_array_eval(as_i32));
-                    const ad = mlx.mlx_array_data_int32(as_i32) orelse return error.MlxArrayDataNull;
-                    prev = @intCast(ad[0]);
-                }
-                ids_i32[step] = @intCast(prev);
-            }
-            if (q_rows) |rows| {
-                const vec = mlx.mlx_vector_array_new();
-                defer _ = mlx.mlx_vector_array_free(vec);
-                for (rows) |r| _ = mlx.mlx_vector_array_append_value(vec, r);
-                draft_q = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_concatenate_axis(&draft_q, vec, 0, s));
-            }
-            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
-            const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
-            defer _ = mlx.mlx_array_free(host_arr);
-            try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
-        } else if (use_selector) {
+        if (use_selector) {
             const sel_temp: f32 = if (stochastic) self.sampling.temperature else 0.0;
             sel_path = try dflash_mod.selectPath(
                 allocator,
@@ -5250,11 +5166,7 @@ pub const Generator = struct {
                 const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
                 defer _ = mlx.mlx_array_free(target_p);
                 const p_draft = try probAt(target_p, drafts[k], s);
-                const accept_prob: f32 = if (draft_q.ctx != null) blk: {
-                    const q_row = try sliceProbRow(draft_q, k, s);
-                    defer _ = mlx.mlx_array_free(q_row);
-                    break :blk specAcceptProb(p_draft, try probAt(q_row, drafts[k], s));
-                } else if (sel_path) |*sp| blk: {
+                const accept_prob: f32 = if (sel_path) |*sp| blk: {
                     // Selector-sampled draft: q is the traced step's own
                     // candidate softmax — exact, no GPU read.
                     const kk = sp.cand_ids.len / @as(usize, m_full);
@@ -5296,9 +5208,7 @@ pub const Generator = struct {
                     // norm(max(0, p − q)) against the q the draft was drawn
                     // from — a one-hot here is the WRONG residual for a
                     // sampled draft, and wrong silently.
-                    const q_row = if (draft_q.ctx != null)
-                        try sliceProbRow(draft_q, accepted, s)
-                    else if (sel_path) |*sp|
+                    const q_row = if (sel_path) |*sp|
                         try selectorQRow(sp, accepted, m_full, vl_shape[2], s)
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
@@ -10936,28 +10846,6 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
     return probs;
 }
 
-/// Proposal densities for EVERY row of a `[1, m, V]` draft-logit block, as
-/// `[m, V]`. One filter pass and (at the call site) one categorical over m
-/// rows, rather than m of each — the draft block is on the critical path
-/// ahead of the verify forward.
-fn filteredProbsBlock(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
-    const shape = mlx.getShape(logits_3d);
-    var rows = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(rows);
-    const rows_shape = [_]c_int{ shape[0] * shape[1], shape[2] };
-    try mlx.check(mlx.mlx_reshape(&rows, logits_3d, &rows_shape, 2, s));
-    if (sampling.suppress_mask) |m| {
-        var masked = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(masked);
-        try applySuppressMask(&masked, rows, m, s);
-        _ = mlx.mlx_array_free(rows);
-        rows = masked;
-    }
-    const owned = rows;
-    rows = .{ .ctx = null };
-    return filteredProbsRows(owned, sampling, s);
-}
-
 /// Read `probs[0, token_id]` as f32. Forces realization with a single eval.
 fn probAt(probs: mlx.mlx_array, token_id: u32, s: mlx.mlx_stream) !f32 {
     const idx_val: i32 = @intCast(token_id);
@@ -11024,19 +10912,6 @@ fn pldOneHotRow(index: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const out_shape = [_]c_int{ 1, vocab };
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&out, mask_f32, &out_shape, 2, s));
-    return out;
-}
-
-/// One row of a `[m, V]` density block as its own `[1, V]` array, so it can
-/// feed `probAt` and `sampleResidual` (both row-shaped). Caller owns it.
-fn sliceProbRow(rows_2d: mlx.mlx_array, row: u32, s: mlx.mlx_stream) !mlx.mlx_array {
-    const shape = mlx.getShape(rows_2d);
-    const start = [_]c_int{ @intCast(row), 0 };
-    const stop = [_]c_int{ @as(c_int, @intCast(row)) + 1, shape[1] };
-    const strides = [_]c_int{ 1, 1 };
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_slice(&out, rows_2d, &start, 2, &stop, 2, &strides, 2, s));
     return out;
 }
 
@@ -14696,85 +14571,6 @@ test "spec sampling exactness: a greedy tail (depth 0 sampled, argmax after it, 
     }
     // The argmax tail lands (0.17 of rounds here), so the joint is not the target by rejection alone.
     try testing.expect(tail_accepts > N / 10);
-}
-
-test "filteredProbsBlock: every draft row is the SAME density the sample is drawn from" {
-    // Exactness rests on q being the true proposal: the draft must be drawn
-    // from byte-for-byte the row handed to `specAcceptProb`. The way that
-    // breaks silently is filtering the two differently — so pin that a row
-    // is a normalized distribution supported ONLY on the kept set, and that
-    // `mlx_random_categorical` over log(q) can never land outside it.
-    const s = mlx.gpuStream();
-    const allocator = testing.allocator;
-    const V: c_int = 8;
-    const M: c_int = 3;
-    // Three rows with deliberately different argmaxes, so a row-blind
-    // implementation (broadcasting one row's mask) fails.
-    const raw = [_]f32{
-        5.0, 4.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 1.0, 4.0, 5.0, 0.0,
-        0.0, 9.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0,
-    };
-    const shape = [_]c_int{ 1, M, V };
-    const logits = mlx.mlx_array_new_data(&raw, &shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(logits);
-
-    var sampling = SamplingParams{};
-    sampling.temperature = 0.8;
-    sampling.top_k = 2;
-    const q = try filteredProbsBlock(logits, sampling, s);
-    defer _ = mlx.mlx_array_free(q);
-    try mlx.check(mlx.mlx_array_eval(q));
-    const qsh = mlx.getShape(q);
-    try testing.expectEqual(M, qsh[0]);
-    try testing.expectEqual(V, qsh[1]);
-
-    const data = mlx.mlx_array_data_float32(q) orelse return error.MlxArrayDataNull;
-    // Per row: sums to 1, and exactly top_k entries carry mass.
-    const want_support = [_][2]usize{ .{ 0, 1 }, .{ 5, 6 }, .{ 1, 3 } };
-    for (0..@intCast(M)) |r| {
-        var sum: f32 = 0;
-        var nonzero: usize = 0;
-        for (0..@intCast(V)) |c| {
-            const v = data[r * @as(usize, @intCast(V)) + c];
-            sum += v;
-            if (v > 0) nonzero += 1;
-        }
-        try testing.expect(@abs(sum - 1.0) < 1e-5);
-        try testing.expectEqual(@as(usize, 2), nonzero);
-        for (want_support[r]) |c| {
-            try testing.expect(data[r * @as(usize, @intCast(V)) + c] > 0);
-        }
-    }
-
-    // Draw the way nextDflash does and assert every sample is in q's support.
-    var logq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logq);
-    try mlx.check(mlx.mlx_log(&logq, q, s));
-    var draws: usize = 0;
-    while (draws < 24) : (draws += 1) {
-        const null_key = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(null_key);
-        var sampled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sampled);
-        try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
-        var ids = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ids);
-        try mlx.check(mlx.mlx_astype(&ids, sampled, .int32, s));
-        try mlx.check(mlx.mlx_array_eval(ids));
-        const idd = mlx.mlx_array_data_int32(ids) orelse return error.MlxArrayDataNull;
-        for (0..@intCast(M)) |r| {
-            const tok: usize = @intCast(idd[r]);
-            // q(draft) > 0 is what keeps the accept ratio finite.
-            try testing.expect(data[r * @as(usize, @intCast(V)) + tok] > 0);
-            // And `sliceProbRow` must hand back THAT row, not another.
-            const row = try sliceProbRow(q, @intCast(r), s);
-            defer _ = mlx.mlx_array_free(row);
-            const got = try probAt(row, @intCast(tok), s);
-            try testing.expectApproxEqAbs(data[r * @as(usize, @intCast(V)) + tok], got, 1e-6);
-        }
-    }
-    _ = allocator;
 }
 
 test "specAcceptProb: full Leviathan ratio, q-clamped" {
