@@ -568,10 +568,9 @@ pub fn renderChatTemplate(
     }
 
     // WARN, not debug: a failed render silently swaps the prompt into
-    // fallbackFormatChat's generic format — for families whose stop/turn
-    // tokens differ (Gemma 4's <|turn> vs the fallback's <start_of_turn>)
-    // that means degenerate generation, so the downgrade must be visible
-    // at the default log level.
+    // fallbackFormatChat's ChatML — for families whose stop/turn tokens
+    // differ (Gemma 4's <|turn>) that means degenerate generation, so the
+    // downgrade must be visible at the default log level.
     _ = template_fallbacks.fetchAdd(1, .monotonic);
     if (jinja_c.jinja_last_error()) |e| {
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
@@ -1368,7 +1367,7 @@ const SpecialEntry = struct {
     id: u32,
 };
 
-/// Fallback chat formatting for when Jinja rendering fails.
+/// Fallback chat formatting (ChatML) for when Jinja rendering fails.
 fn fallbackFormatChat(
     allocator: std.mem.Allocator,
     messages: []const Message,
@@ -1380,135 +1379,56 @@ fn fallbackFormatChat(
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
-    const is_chatml = chat_config.eos_token != null and
-        std.mem.indexOf(u8, chat_config.eos_token.?, "<|im_end|>") != null;
-
     const has_system = messages.len > 0 and std.mem.eql(u8, messages[0].role, "system");
 
-    if (is_chatml) {
-        // ChatML format (Qwen3, etc.)
-        if (tools_json != null and !has_system) {
+    if (tools_json != null and !has_system) {
+        try result.appendSlice(allocator, "<|im_start|>system\n");
+        try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+        try result.appendSlice(allocator, "<|im_end|>\n");
+    }
+
+    for (messages) |msg| {
+        if (std.mem.eql(u8, msg.role, "system") and tools_json != null) {
             try result.appendSlice(allocator, "<|im_start|>system\n");
+            try result.appendSlice(allocator, msg.content);
+            try result.appendSlice(allocator, "\n\n");
             try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
             try result.appendSlice(allocator, "<|im_end|>\n");
-        }
-
-        for (messages) |msg| {
-            if (std.mem.eql(u8, msg.role, "system") and tools_json != null) {
-                try result.appendSlice(allocator, "<|im_start|>system\n");
+        } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
+            try result.appendSlice(allocator, "<|im_start|>assistant\n");
+            if (msg.content.len > 0) {
                 try result.appendSlice(allocator, msg.content);
-                try result.appendSlice(allocator, "\n\n");
-                try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
-                try result.appendSlice(allocator, "<|im_end|>\n");
-            } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-                try result.appendSlice(allocator, "<|im_start|>assistant\n");
-                if (msg.content.len > 0) {
-                    try result.appendSlice(allocator, msg.content);
-                    try result.appendSlice(allocator, "\n");
-                }
-                for (msg.tool_calls.?) |tc| {
-                    try result.appendSlice(allocator, "<tool_call>\n");
-                    try result.appendSlice(allocator, "{\"name\": \"");
-                    try result.appendSlice(allocator, tc.name);
-                    try result.appendSlice(allocator, "\", \"arguments\": ");
-                    try result.appendSlice(allocator, tc.arguments);
-                    try result.appendSlice(allocator, "}\n</tool_call>");
-                }
-                try result.appendSlice(allocator, "<|im_end|>\n");
-            } else if (std.mem.eql(u8, msg.role, "tool")) {
-                try result.appendSlice(allocator, "<|im_start|>user\n");
-                try result.appendSlice(allocator, "<tool_response>\n");
-                try result.appendSlice(allocator, msg.content);
-                try result.appendSlice(allocator, "\n</tool_response>");
-                try result.appendSlice(allocator, "<|im_end|>\n");
-            } else {
-                try result.appendSlice(allocator, "<|im_start|>");
-                try result.appendSlice(allocator, msg.role);
                 try result.appendSlice(allocator, "\n");
-                try result.appendSlice(allocator, msg.content);
-                try result.appendSlice(allocator, "<|im_end|>\n");
             }
-        }
-        try result.appendSlice(allocator, "<|im_start|>assistant\n");
-        if (std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null) {
-            if (enable_thinking) {
-                try result.appendSlice(allocator, "<think>\n");
-            } else {
-                try result.appendSlice(allocator, "<think>\n\n</think>\n\n");
+            for (msg.tool_calls.?) |tc| {
+                try result.appendSlice(allocator, "<tool_call>\n");
+                try result.appendSlice(allocator, "{\"name\": \"");
+                try result.appendSlice(allocator, tc.name);
+                try result.appendSlice(allocator, "\", \"arguments\": ");
+                try result.appendSlice(allocator, tc.arguments);
+                try result.appendSlice(allocator, "}\n</tool_call>");
             }
-        }
-    } else {
-        // Gemma/Llama-style format
-        if (chat_config.bos_token) |bos| {
-            try result.appendSlice(allocator, bos);
-        }
-
-        const is_llama = std.mem.indexOf(u8, chat_config.chat_template, "start_header_id") != null;
-
-        if (is_llama) {
-            // Llama 3 format with tool support
-            try result.appendSlice(allocator, "<|start_header_id|>system<|end_header_id|>\n\n");
-            if (tools_json != null) {
-                try result.appendSlice(allocator, "Environment: ipython\n");
-            }
-            if (has_system) {
-                try result.appendSlice(allocator, messages[0].content);
-            } else {
-                try result.appendSlice(allocator, "You are a helpful assistant.");
-            }
-            if (tools_json != null) {
-                try result.appendSlice(allocator, "\n\n");
-                try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
-            }
-            try result.appendSlice(allocator, "<|eot_id|>");
-
-            const start_idx: usize = if (has_system) 1 else 0;
-            for (messages[start_idx..]) |msg| {
-                if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-                    try result.appendSlice(allocator, "<|start_header_id|>assistant<|end_header_id|>\n\n");
-                    for (msg.tool_calls.?) |tc| {
-                        try result.appendSlice(allocator, "{\"name\": \"");
-                        try result.appendSlice(allocator, tc.name);
-                        try result.appendSlice(allocator, "\", \"parameters\": ");
-                        try result.appendSlice(allocator, tc.arguments);
-                        try result.appendSlice(allocator, "}");
-                    }
-                    try result.appendSlice(allocator, "<|eot_id|>");
-                } else if (std.mem.eql(u8, msg.role, "tool")) {
-                    try result.appendSlice(allocator, "<|start_header_id|>ipython<|end_header_id|>\n\n");
-                    try result.appendSlice(allocator, msg.content);
-                    try result.appendSlice(allocator, "<|eot_id|>");
-                } else {
-                    try result.appendSlice(allocator, "<|start_header_id|>");
-                    try result.appendSlice(allocator, msg.role);
-                    try result.appendSlice(allocator, "<|end_header_id|>\n\n");
-                    try result.appendSlice(allocator, msg.content);
-                    try result.appendSlice(allocator, "<|eot_id|>");
-                }
-            }
-            try result.appendSlice(allocator, "<|start_header_id|>assistant<|end_header_id|>\n\n");
+            try result.appendSlice(allocator, "<|im_end|>\n");
+        } else if (std.mem.eql(u8, msg.role, "tool")) {
+            try result.appendSlice(allocator, "<|im_start|>user\n");
+            try result.appendSlice(allocator, "<tool_response>\n");
+            try result.appendSlice(allocator, msg.content);
+            try result.appendSlice(allocator, "\n</tool_response>");
+            try result.appendSlice(allocator, "<|im_end|>\n");
         } else {
-            // Gemma-style format
-            if (tools_json != null and !has_system) {
-                try result.appendSlice(allocator, "<start_of_turn>user\n");
-                try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
-                try result.appendSlice(allocator, "<end_of_turn>\n");
-            }
-            for (messages) |msg| {
-                if (std.mem.eql(u8, msg.role, "tool")) {
-                    try result.appendSlice(allocator, "<start_of_turn>user\n");
-                    try result.appendSlice(allocator, "Tool result: ");
-                    try result.appendSlice(allocator, msg.content);
-                    try result.appendSlice(allocator, "<end_of_turn>\n");
-                } else {
-                    try result.appendSlice(allocator, "<start_of_turn>");
-                    try result.appendSlice(allocator, msg.role);
-                    try result.appendSlice(allocator, "\n");
-                    try result.appendSlice(allocator, msg.content);
-                    try result.appendSlice(allocator, "<end_of_turn>\n");
-                }
-            }
-            try result.appendSlice(allocator, "<start_of_turn>model\n");
+            try result.appendSlice(allocator, "<|im_start|>");
+            try result.appendSlice(allocator, msg.role);
+            try result.appendSlice(allocator, "\n");
+            try result.appendSlice(allocator, msg.content);
+            try result.appendSlice(allocator, "<|im_end|>\n");
+        }
+    }
+    try result.appendSlice(allocator, "<|im_start|>assistant\n");
+    if (std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null) {
+        if (enable_thinking) {
+            try result.appendSlice(allocator, "<think>\n");
+        } else {
+            try result.appendSlice(allocator, "<think>\n\n</think>\n\n");
         }
     }
 
@@ -8615,8 +8535,8 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
     // was the first whose history held a tool result with a raw ESC byte (the
     // interactive `npx sv create` output). The Jinja render failed on the
     // unescaped messages JSON and silently downgraded to fallbackFormatChat's
-    // Gemma-2/3 `<start_of_turn>` text format — not special tokens for Gemma
-    // 4, so generation never stopped at turn end. The render must SUCCEED via
+    // text format — not special tokens for Gemma 4, so generation never
+    // stopped at turn end. The render must SUCCEED via
     // the template (template marker present, fallback marker absent).
     const allocator = testing.allocator;
     const tpl =
@@ -8649,7 +8569,7 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
     try testing.expect(std.mem.indexOf(u8, rendered, "<|tool_response>") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "Which template") != null);
     // Fallback format must NOT have been used.
-    try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
 }
 
 test "templateConsumesEffort: the real templates that READ the effort word" {
@@ -9564,52 +9484,6 @@ test "fallbackFormatChat ChatML tool response uses user role" {
     try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>user\n<tool_response>") != null);
     // Should NOT have <|im_start|>tool (invalid role)
     try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>tool") == null);
-}
-
-test "fallbackFormatChat Gemma tool response uses user role" {
-    const allocator = testing.allocator;
-    const messages = [_]Message{
-        .{ .role = "user", .content = "Run ls" },
-        .{ .role = "tool", .content = "file1.txt" },
-    };
-    var config = ChatConfig{
-        .chat_template = "",
-        .bos_token = null,
-        .eos_token = try allocator.dupe(u8, "<eos>"),
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    defer if (config.eos_token) |t| allocator.free(t);
-
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
-    defer allocator.free(result);
-
-    // Gemma tool results should be in user turn
-    try testing.expect(std.mem.indexOf(u8, result, "<start_of_turn>user\nTool result: file1.txt") != null);
-    // Should NOT have <start_of_turn>tool (invalid role)
-    try testing.expect(std.mem.indexOf(u8, result, "<start_of_turn>tool") == null);
-}
-
-test "fallbackFormatChat Llama tool response uses ipython role" {
-    const allocator = testing.allocator;
-    const messages = [_]Message{
-        .{ .role = "tool", .content = "hello" },
-    };
-    var config = ChatConfig{
-        .chat_template = "start_header_id",
-        .bos_token = null,
-        .eos_token = try allocator.dupe(u8, "<|eot_id|>"),
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    defer if (config.eos_token) |t| allocator.free(t);
-
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
-    defer allocator.free(result);
-
-    // Llama tool results use ipython role
-    try testing.expect(std.mem.indexOf(u8, result, "<|start_header_id|>ipython<|end_header_id|>") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "hello") != null);
 }
 
 test "fallbackFormatChat ChatML assistant with empty content and tool_calls" {
