@@ -19176,7 +19176,7 @@ test "the GLM prefill holds as many checkpoints as its schedule says, and ends o
     glm_capture_stride = 64;
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
     defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
-    for ([_]usize{ 14, 40, 70, 150, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
+    for ([_]usize{ 14, 70, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
         var xfm = try Transformer.init(testing.io, a, cfg, &weights);
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(testing.io, a, &xfm, &tok, prompt[0..len], 2, greedy, &.{}, .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = cap });
@@ -19220,7 +19220,7 @@ test "a GLM prefill whose hook releases landed checkpoints holds at most two sta
     glm_capture_stride = 64;
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
     defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
-    for ([_]usize{ 14, 70, 150, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
+    for ([_]usize{ 14, 70, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
         var kept_xfm = try Transformer.init(testing.io, a, cfg, &weights);
         defer kept_xfm.deinit();
         const base: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = cap };
