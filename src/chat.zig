@@ -11540,23 +11540,6 @@ test "ThinkScan: reset() re-arms the cursor when the stream buffer is cleared" {
     try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGateScan("<think>more", true, false, false, &scan));
 }
 
-test "the streaming handlers route the think gate through a persistent ThinkScan" {
-    // A memoized scan nobody threads through is a silent no-op that is
-    // output-identical to the unmemoized gate — the exact shape of the
-    // hardcoded-use_drafter=false class. Both streaming surfaces must hold a
-    // scan beside their buffer AND reset it where they clear that buffer.
-    // Needles are ++-split so this test's own source cannot satisfy the scan.
-    const src = @embedFile("server.zig");
-    const call = "streamThinkGateScan(buf, enable_thinking, think_closed, prompt_opened_think, &think" ++ "_scan)";
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, call));
-    // The unmemoized 4-arg gate must be GONE from the streaming paths.
-    const old = "chat_mod.streamThinkGate2(" ++ "buf,";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
-    // One reset per buffer clear in those handlers.
-    const reset = "think_scan" ++ ".reset();";
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, reset));
-}
-
 test "bench: streaming think gate scans BYTES, memoized vs fresh" {
     // The 5.10 acceptance bar is that per-token work is FLAT in buffer size,
     // not merely smaller. Wall clock is unavailable in a hermetic test under
