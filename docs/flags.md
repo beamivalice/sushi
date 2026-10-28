@@ -48,7 +48,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904); engages on rate-grouped layers too (DeepSeek STQ, any group's pool); does nothing on streamed GLM | user | help, README, engine-expert-streaming; 2 tests | keep: a measured speed-for-exactness tradeoff |
 | `--drop-expert` | `0` off → never load, bill, cache or pick the n least-used routed experts of every layer, ranked by the pack's `expert_usage.json`; a multiple of 8; DeepSeek-V4.1 only, every other arch refuses it at load (main.zig:886, `archFlagRefusal`); `sushi kld compare` takes it, `capture` refuses it ([dsv41-arch](dsv41-arch.md#drop-expert)) | user | help, dsv41-arch, engine-expert-streaming, pack-format; 18 tests | keep: frees expert bytes for re-routed picks; answers change, so score it with `sushi kld compare` |
 | `--prefill-chunk` | `8192` → ceiling on tokens per prefill chunk, auto-capped per model (main.zig:824) | machine | help, usage, engine-memory-admission; 11 tests, 2 scripts | keep |
-| `--prefill-decode-share` | `0` → target decode share of wall time during another request's prefill, 0..0.9 (main.zig:910) | user | help, server-lifecycle; 1 test | keep: latency of live streams against prefill speed |
+| `--prefill-decode-share` | `0.25` → target decode share of wall time during another request's prefill, 0..0.9 (main.zig:910) | user | help, server-lifecycle; 1 test | keep: latency of live streams against prefill speed |
 
 ## KV and attention
 

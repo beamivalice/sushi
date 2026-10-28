@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A running stream keeps a quarter of the time while another request prefills**: `--prefill-decode-share` now defaults to 0.25 (was 0), so a concurrent decode no longer advances one token per prefill chunk; the share only adds decode ticks between chunks and never narrows a prefill chunk, on any model.
 - **`/v1/responses` keeps the model's own reasoning in a tool loop**: a replayed plaintext `reasoning` item now reaches the prompt on its assistant turn (it was dropped), so a thinking model keeps its chain of thought between tool calls and the prefix cache hits; encrypted or malformed reasoning items are still ignored.
 - **Tool-call parsing handles five more malformed shapes**: stray DeepSeek `</｜DSML｜` closers no longer leak as the answer, a `<tool_call>` whose value holds an `<invoke>` stays that call, prose `<invoke>` openers no longer take the next call's arguments, a doubled GLM `<arg_key>` keeps a clean key, and a special token written in place of `<` before `function=` still parses.
 - **A small-memory Mac gets a usable default context**: the prefix cache's reserve no longer takes more than half of the free GPU memory when sizing the context, and a context that would fit under 1024 tokens is served as 1024.

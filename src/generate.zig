@@ -2391,8 +2391,6 @@ pub const Generator = struct {
         /// object the admission guard bills against, so bill and forward cannot
         /// disagree. (Live 2026-08-14: pinned 4096, prefilled at 8192.)
         pinned_prefill_chunk: usize = 0,
-        /// A decode-share ceiling applied after explicit and environment chunk settings.
-        decode_share_width_cap: usize = 0,
         /// Number of tokens per draft round. Default 4 (3 drafter steps +
         /// 1 t1 prepend → length-4 verify forward).
         drafter_block_size: u32 = 4,
@@ -2652,7 +2650,7 @@ pub const Generator = struct {
         // start at ssm_checkpoint_pos_offset, so the final KV length is that
         // offset plus everything we're about to forward.
         const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-        const PREFILL_CHUNK: usize = decodeShareCapped(requestPrefillChunk(
+        const PREFILL_CHUNK: usize = requestPrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -2660,7 +2658,7 @@ pub const Generator = struct {
             xfm.config.isMoe(),
             xfm.config.longCtxGated(),
             options.pinned_prefill_chunk,
-        ), options.decode_share_width_cap);
+        );
         // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
         const trace_enabled = log.isDebug();
         const chunk_peak = trace_enabled and transformer_mod.diagEnvOn("SUSHI_PREFILL_CHUNK_PEAK");
@@ -2849,7 +2847,7 @@ pub const Generator = struct {
             );
             // Admission billed the request's top at `default_chunk`; the chunks before it start at
             // the widest width and step down only where one no longer fits beside the reserved KV.
-            const start_chunk = if (width_is_adaptive) decodeShareCapped(cap_adapt, options.decode_share_width_cap) else 0;
+            const start_chunk = if (width_is_adaptive) cap_adapt else 0;
             if (start_chunk > cur_chunk) {
                 cur_chunk = start_chunk;
                 adapt_state.width_min = @intCast(start_chunk);
@@ -19699,25 +19697,6 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
         try testing.expectEqual(@as(?u32, null), try gen.nextConstrained(a));
     }
     try testing.expectEqualSlices(u32, &.{ 1, 2 }, gen.generated_ids.items);
-}
-
-pub fn decodeShareCapped(width: usize, cap: usize) usize {
-    return if (cap == 0) width else @min(width, cap);
-}
-
-test "decodeShareCapped: the share cap narrows an explicit and an env width" {
-    const saved_override = prefill_chunk_override;
-    const saved_explicit = prefill_chunk_explicit;
-    defer {
-        prefill_chunk_override = saved_override;
-        prefill_chunk_explicit = saved_explicit;
-    }
-    prefill_chunk_override = 8192;
-    prefill_chunk_explicit = true;
-    const explicit = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
-    try std.testing.expectEqual(@as(usize, 8192), explicit);
-    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
-    try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
 }
 
 /// Records what `mimoStepOut` frees instead of freeing it, so a double free is a count, not a crash.

@@ -162,16 +162,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   drafting GLM slot joins as a plain row when its model has company ([glm5-arch](glm5-arch.md#concurrency)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
-- `--prefill-decode-share S` (default 0) targets the fraction of wall time given
+- `--prefill-decode-share S` (default 0.25) targets the fraction of wall time given
   to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
   Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
-  decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables both the share and its width cap.
-- While decoders are live, the share caps the base prefill width at 1024 after explicit/environment chunk settings;
-  normal tail merging still applies. Admission bills the original width, and adaptive widening retains its memory
-  confirmation. An adaptive slot can lift the cap after the other decoders finish; a pinned slot keeps its cap.
-  Hosted decode time is excluded from prefill compute time but remains part of request latency.
-- **GLM prefill chunks never narrow for company** (`prefillShareCapFor`): its numerics depend on chunk boundaries, so a
-  request's output must not depend on what else decodes; it yields only between whole chunks.
+  decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables the share.
+- **The share never narrows a prefill chunk** (any arch): a request's chunk width, bill and numerics do not depend on
+  what else decodes; decoders get time only between whole chunks. Hosted decode time is excluded from prefill compute
+  time but remains part of request latency.
 - **Serial ≠ exclusive**: only a slot driving a module-owned decode state is exclusive (`slotExclusiveDecode`);
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:

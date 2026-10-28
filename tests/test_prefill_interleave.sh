@@ -30,6 +30,14 @@ MODEL="${INTERLEAVE_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8
 WORK="${INTERLEAVE_TEST_OUTPUT_DIR:-$(mktemp -d)}"
 mkdir -p "$WORK"
 SHARE_ONLY="${INTERLEAVE_SHARE_ONLY:-0}"
+SHARE_A="${SHARE_A:-0}"
+SHARE_B="${SHARE_B:-0.5}"
+B_WORDS="${B_WORDS:-6000}"
+# Share-only runs use the real auto chunk width unless one is named; the interleave arms pin 1024.
+if [ -n "${INTERLEAVE_PREFILL_CHUNK:-}" ]; then CHUNK_ARGS=(--prefill-chunk "$INTERLEAVE_PREFILL_CHUNK")
+elif [ "$SHARE_ONLY" = 1 ]; then CHUNK_ARGS=()
+else CHUNK_ARGS=(--prefill-chunk 1024); fi
+export A_COUNT="${A_COUNT:-200}" A_MAX="${A_MAX:-500}"
 SERVER_PID=""
 
 cleanup() {
@@ -49,11 +57,14 @@ if [ ! -d "$MODEL" ]; then
 fi
 
 cat > "$WORK/probe.py" <<'PYEOF'
-import hashlib, json, sys, threading, time, urllib.request
+import hashlib, json, os, sys, threading, time, urllib.request
 
 PORT = int(sys.argv[1])
 B_WORDS = int(sys.argv[2]) if len(sys.argv) > 2 else 1200
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+# GLM-5.3's template has no thinking-off turn; its low effort thinks briefly, and thought tokens count as decode.
+MODEL_TYPE = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/props"))["default_generation_settings"]["model"]
+THINK = {"reasoning_effort": "low"} if MODEL_TYPE == "glm5_next" else {"enable_thinking": False}
 
 def stream(payload, stamps, parts):
     req = urllib.request.Request(URL, data=json.dumps(payload).encode(),
@@ -64,16 +75,17 @@ def stream(payload, stamps, parts):
             if line.startswith("data: ") and line != "data: [DONE]":
                 obj = json.loads(line[6:])
                 for ch in obj.get("choices", []):
-                    d = ch.get("delta", {}).get("content")
+                    delta = ch.get("delta", {})
+                    d = delta.get("content") or delta.get("reasoning_content")
                     if d:
                         stamps.append(time.monotonic())
                         parts.append(d)
 
 a_st, a_tx, b_st = [], [], []
-a = {"model": "sushi", "temperature": 0.0, "max_tokens": 500, "stream": True, "enable_thinking": False,
-     "messages": [{"role": "user", "content": "Count from 1 to 200, one number per line."}]}
+a = {"model": "sushi", "temperature": 0.0, "max_tokens": int(os.environ["A_MAX"]), "stream": True, **THINK,
+     "messages": [{"role": "user", "content": f"Count from 1 to {os.environ['A_COUNT']}, one number per line."}]}
 words = " ".join(f"w{i}" for i in range(B_WORDS))
-b = {"model": "sushi", "temperature": 0.0, "max_tokens": 4, "stream": True, "enable_thinking": False,
+b = {"model": "sushi", "temperature": 0.0, "max_tokens": 4, "stream": True, **THINK,
      "messages": [{"role": "user", "content": f"Summarize in one word. {words}"}]}
 ta = threading.Thread(target=stream, args=(a, a_st, a_tx))
 ta.start()
@@ -81,12 +93,18 @@ deadline = time.monotonic() + 30
 while len(a_st) < 20 and ta.is_alive() and time.monotonic() < deadline:
     time.sleep(0.01)
 assert len(a_st) >= 20, "decoder did not produce 20 chunks before the competing prefill"
+t0 = time.monotonic()
 tb = threading.Thread(target=stream, args=(b, b_st, []))
 tb.start()
 tb.join()
 ta.join()
 gaps = [y - x for x, y in zip(a_st, a_st[1:])]
+# B streams its first token when its prefill ends: that is the window.
+t1 = b_st[0] if b_st else time.monotonic()
+a_in = sum(1 for t in a_st if t0 <= t < t1)
 print(json.dumps({"max_gap_ms": round(max(gaps) * 1000),
+                  "a_tokens_in_prefill": a_in, "a_tok_s_in_prefill": round(a_in / (t1 - t0), 2),
+                  "prefill_window_s": round(t1 - t0, 2), "a_done_before_b": bool(a_st[-1] < t1),
                   "sha": hashlib.sha256("".join(a_tx).encode()).hexdigest()[:12]}))
 PYEOF
 
@@ -95,7 +113,7 @@ run_arm() {
     local log="$WORK/$arm.log"
     SUSHI_PREFILL_INTERLEAVE="$env_val" "$BINARY" --serve --model "$MODEL" \
         --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
-        --prefill-chunk "${INTERLEAVE_PREFILL_CHUNK:-1024}" --prefill-decode-share "$share" --log-level debug --log-file "$log" \
+        ${CHUNK_ARGS[@]+"${CHUNK_ARGS[@]}"} --prefill-decode-share "$share" --log-level debug --log-file "$log" \
         >"$WORK/$arm.stdout" 2>&1 &
     SERVER_PID=$!
     local ready=0
@@ -131,8 +149,24 @@ if [ "$SHARE_ONLY" != 1 ]; then
     run_arm off 0
     run_arm on 1
 fi
-run_arm long 1 6000 0
-run_arm share 1 6000 0.5
+run_arm long 1 "$B_WORDS" "$SHARE_A"
+run_arm share 1 "$B_WORDS" "$SHARE_B"
+
+arm_summary() {
+    python3 - "$WORK" "$1" "$2" <<'PY'
+import json, re, sys
+root, arm, share = sys.argv[1:]
+ms = [int(m.group(1)) for l in open(f"{root}/{arm}.log")
+      for m in [re.search(r"\[interleave\] prefill (\d+) ms", l)] if m]
+for r in ("r1", "r2"):
+    j = json.load(open(f"{root}/{arm}.{r}.json"))
+    print(f"[summary] share={share} {r}: a_tokens_in_prefill={j['a_tokens_in_prefill']} "
+          f"a_tok_s={j['a_tok_s_in_prefill']} window_s={j['prefill_window_s']} a_done_before_b={j['a_done_before_b']}")
+print(f"[summary] share={share} [interleave] prefill ms per request: {ms}")
+PY
+}
+arm_summary long "$SHARE_A"
+arm_summary share "$SHARE_B"
 
 if [ "$SHARE_ONLY" != 1 ]; then
 OFF_GAP=$(python3 -c "import json; print(min(json.load(open('$WORK/off.r1.json'))['max_gap_ms'], json.load(open('$WORK/off.r2.json'))['max_gap_ms']))")
@@ -175,7 +209,7 @@ PY
 }
 LONG_FRAC=$(hosted_frac "$WORK/long.log")
 SHARE_FRAC=$(hosted_frac "$WORK/share.log")
-echo "decode share: hosted fraction today=$LONG_FRAC share0.5=$SHARE_FRAC"
+echo "decode share: hosted fraction today=$LONG_FRAC shareB=$SHARE_FRAC"
 if ! python3 -c "import sys; sys.exit(0 if $SHARE_FRAC > 1.5 * $LONG_FRAC and $SHARE_FRAC > 0 else 1)"; then
     echo "[fail] --prefill-decode-share 0.5 did not raise the decode share of B's prefill (today=$LONG_FRAC share=$SHARE_FRAC)"
     exit 1

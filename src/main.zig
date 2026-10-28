@@ -290,8 +290,8 @@ fn printUsage(io: std.Io) void {
         \\                        any value (default: 1).
         \\  --prefill-decode-share <s>
         \\                      Target decode wall-time share during another
-        \\                        request's prefill (0..0.9); narrows chunks too.
-        \\                        Default 0.
+        \\                        request's prefill (0..0.9); never narrows
+        \\                        chunks. Default 0.25.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.

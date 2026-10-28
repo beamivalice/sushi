@@ -7184,20 +7184,10 @@ pub fn prefillInterleaveEnabled() bool {
     return on;
 }
 
-pub var prefill_decode_share: f32 = 0;
+pub var prefill_decode_share: f32 = 0.25;
 
 pub fn prefillDecodeShare() f32 {
     return if (prefillInterleaveEnabled()) prefill_decode_share else 0;
-}
-
-fn liveDecodingCount(sch: *Scheduler) usize {
-    sch.queue_mu.lockUncancelable(sch.io);
-    defer sch.queue_mu.unlock(sch.io);
-    var count: usize = 0;
-    for (sch.decoding.items) |slot| {
-        if (!slot.cancelled.load(.acquire) and !slot.finished and slot.error_code == null) count += 1;
-    }
-    return count;
 }
 
 const InterleaveCtx = struct {
@@ -7333,9 +7323,7 @@ fn chunkWidthCb(
     const cfg = wc.cfg orelse return cur;
     const pick = prefill_chunk_adapt orelse return cur;
     const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
-    if (!adaptiveChunkWidthFor(cfg)) return next;
-    const share_cap = prefillShareCapFor(cfg, liveDecodingCount(wc.sch), prefillDecodeShare());
-    return if (share_cap == 0) next else @min(next, share_cap);
+    return next;
 }
 
 /// Called with `mu` held; returns with it held. Drops `mu` while waiting so the
@@ -7903,7 +7891,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .vision_rows_before = if (slot.vision_embeddings != null) vision_consumed - vision_skipped else 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = req_prefill_chunk,
-            .decode_share_width_cap = prefillShareCapFor(&xfm_ptr.config, liveDecodingCount(sch), prefillDecodeShare()),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -12880,23 +12867,10 @@ test "the fwd-ubench QSA pooled-key arms interleave composed and fused A B B A i
 
 
 pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
-pub const DECODE_SHARE_PREFILL_CHUNK: u32 = 1024;
 pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
     const v = std.fmt.parseFloat(f32, text) catch return error.InvalidDecodeShare;
     if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
     return @min(v, PREFILL_DECODE_SHARE_MAX);
-}
-/// The decode share's prefill width cap for this model. GLM prefill numerics depend on the chunk
-/// boundaries, so its chunks stay whole whatever else decodes: it yields only between chunks.
-pub fn prefillShareCapFor(cfg: *const ModelConfig, decoding: usize, share: f32) u32 {
-    return if (cfg.isGlm5()) 0 else decodeShareAdmissionCap(decoding, share);
-}
-pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
-    return if (decoding == 0 or share <= 0) 0 else DECODE_SHARE_PREFILL_CHUNK;
-}
-pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
-    const cap = decodeShareAdmissionCap(decoding, share);
-    return if (cap == 0) width else @min(width, cap);
 }
 pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
     if (std.math.isNan(share) or share <= 0) return 0;
@@ -12919,23 +12893,12 @@ pub fn runOwedDecodeTicks(share: f32, chunk_ns: u64, first_ns: u64, ctx: *anyopa
     return result;
 }
 
-test "decode share never narrows a GLM prefill: its chunk boundaries are numerics" {
-    const glm = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    const qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expectEqual(@as(u32, 0), prefillShareCapFor(&glm, 3, 0.5));
-    try testing.expectEqual(DECODE_SHARE_PREFILL_CHUNK, prefillShareCapFor(&qwen4, 3, 0.5));
-    try testing.expectEqual(@as(u32, 0), prefillShareCapFor(&qwen4, 0, 0.5));
-}
-
-test "decode share: a live share caps the width only while someone decodes" {
-    const w = DECODE_SHARE_PREFILL_CHUNK;
-    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(0, 0.5));
-    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(2, 0));
-    try testing.expectEqual(w, decodeShareAdmissionCap(1, 0.5));
-    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 1, 0));
-    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 0, 0.5));
-    try testing.expectEqual(w, decodeShareWidthCap(8192, 1, 0.5));
-    try testing.expectEqual(@as(u32, 512), decodeShareWidthCap(512, 1, 0.5));
+test "decode share: the default is 0.25 and reaches /props" {
+    const saved = prefill_interleave_cached;
+    defer prefill_interleave_cached = saved;
+    prefill_interleave_cached = true;
+    try testing.expectEqual(@as(f32, 0.25), prefill_decode_share);
+    try testing.expectEqual(@as(f32, 0.25), prefillDecodeShare());
 }
 
 test "decode share: parse clamps above 0.9 and rejects anything that is not a share" {
@@ -12997,7 +12960,15 @@ test "decode share: ticks to the budget, keeps one tick at zero, stops when deco
 
 
 
-test "decode share: the kill switch disables the effective share and only live slots count" {
+test "decode share: 0.25 owes a third of the chunk time in ticks" {
+    const ms = std.time.ns_per_ms;
+    var f = FakeDecodeTicks{ .left = 1000, .ns = 10 * ms };
+    const r = runOwedDecodeTicks(0.25, 3000 * ms, 10 * ms, &f, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 100), r.ticks);
+    try testing.expectEqual(@as(u64, 1000 * ms), r.spent_ns);
+}
+
+test "decode share: the kill switch disables the effective share" {
     const saved_share = prefill_decode_share;
     const saved_interleave = prefill_interleave_cached;
     defer { prefill_decode_share = saved_share; prefill_interleave_cached = saved_interleave; }
@@ -13006,26 +12977,6 @@ test "decode share: the kill switch disables the effective share and only live s
     try testing.expectEqual(@as(f32, 0), prefillDecodeShare());
     prefill_interleave_cached = true;
     try testing.expectEqual(@as(f32, 0.5), prefillDecodeShare());
-    var sch: Scheduler = undefined;
-    sch.io = testing.io;
-    sch.queue_mu = .init;
-    var slots: [4]Slot = undefined;
-    var ptrs: [4]*Slot = undefined;
-    for (&slots, &ptrs) |*slot, *ptr| {
-        slot.cancelled = std.atomic.Value(bool).init(false);
-        slot.finished = false;
-        slot.error_code = null;
-        ptr.* = slot;
-    }
-    slots[1].cancelled.store(true, .release);
-    slots[2].finished = true;
-    slots[3].error_code = "test error";
-    sch.decoding = .empty;
-    sch.decoding.items = &ptrs;
-    sch.decoding.capacity = ptrs.len;
-    try testing.expectEqual(@as(usize, 1), liveDecodingCount(&sch));
-    slots[0].finished = true;
-    try testing.expectEqual(@as(usize, 0), liveDecodingCount(&sch));
     try testing.expectEqual(std.math.maxInt(u64), decodeShareBudgetNs(std.math.maxInt(u64), 0.9));
 }
 
@@ -13213,7 +13164,6 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     slot.markError("MlxFailure");
     try testing.expect(slot.waitNextTimeout(0).? == .err);
     try testing.expect(slot.waitNext() == .err);
-    try testing.expectEqual(@as(usize, 0), liveDecodingCount(&sch));
     cullDecoding(&sch);
     try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
 }
