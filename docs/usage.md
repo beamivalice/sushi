@@ -139,7 +139,7 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 - **DSpark** (the checkpoint's drafter) is on by default; `--no-mtp` turns it off. Greedy output is stable across round
   widths and identical between stream and non-stream.
 - **Thinking** is `high` by default; `reasoning_effort` `low`, `high` or `max`, or `off` / `enable_thinking: false`.
-- **Images** are on by default; `--no-vision` frees the 0.97 GB tower for the expert cache.
+- **Images** are on by default; `--no-vision` frees the 0.50 GB tower for the expert cache.
 - **`--drop-expert n`** (multiple of 8) skips the `n` least-used experts a layer, freeing 2.1–2.5 GB at 8 and 4.3–5.0 GB
   at 16. It is lossy: check it with `sushi kld compare` ([dsv41-arch](dsv41-arch.md#drop-expert)).
 - **Refused flags:** `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` and

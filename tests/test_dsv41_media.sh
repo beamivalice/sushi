@@ -99,7 +99,7 @@ echo "[1] the tower loads, is billed and is advertised"
 check "tower load line" "$(grep -c 'Vision encoder: DeepSeek-V4.1 ViT' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 check "[vision] on" "$(grep -c '^\[vision\] on' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 ledger=$(grep -m1 'ssd budget .* GiB: trunk' "$LOG"); echo "  $ledger"
-check "the budget's vision term is the tower, not 0.00" "$(hits "$ledger" 'vision 0\.9[0-9] GB')" "1"
+check "the budget's vision term is the tower, not 0.00" "$(hits "$ledger" 'vision 0\.5[0-9] GB')" "1"
 check "capabilities name vision" "$(hits "$(curl -s "$U/v1/models")" '"vision"')" "1"
 
 echo "[2] answers read the pixels"

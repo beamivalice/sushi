@@ -408,8 +408,8 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
   ([engine-expert-streaming](engine-expert-streaming.md#vision)).
 - **DeepSeek-V4.1's tower is billed in that term**: `dsv41_source.visionBytes` sums the pack's `vision.*`, `aligner.*`,
-  `image_*` and each layer's `bias_vl` as stored (bf16 tower 970,536,960 bytes plus 40 f32 biases of 1,536 bytes on an STQ pack), so the
-  `[expert-stream] ssd budget` line reads `vision 0.97 GB` by default (`0.00` under `--no-vision`, or with `vision: false`);
+  `image_*` and each layer's `bias_vl` as the load holds them (the 322 requantized matrices as affine 8-bit g128 codes, `dsv41_vision.quantizedBytes`, the rest bf16 as stored, plus 40 f32 biases of 1,536 bytes on an STQ pack), so the
+  `[expert-stream] ssd budget` line reads `vision 0.50 GB` by default (`0.00` under `--no-vision`, or with `vision: false`);
   a load without the tower bills 0 and leaves those tensors unread. A request's encode is `dsv41_vision.encodeScratchBytes`
   (activations of the widest block, the 512-query score sheet and the aligner, a bound for the 9,198 patches a 1024-token
   span can hold) plus the f32 patches and three copies of the 5120-wide span rows.

@@ -7,6 +7,7 @@ const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const expert_io = @import("expert_io.zig");
 const log = @import("log.zig");
+const vision = @import("dsv41_vision.zig");
 
 pub const Parts = struct {
     /// Routed experts as stacked-at-load banks (a checkpoint small enough to hold them); streamed ones are not read here.
@@ -144,7 +145,8 @@ pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const
     return sumBytes(io, allocator, dir_path, .trunk);
 }
 
-/// Bytes the vision tower adds once loaded: stored as built, bf16.
+/// Bytes the vision tower adds once loaded: its block and aligner matrices as the affine 8-bit codes they are
+/// requantized to (`dsv41_vision.Dsv41Vision.init`), the rest as stored, bf16.
 pub fn visionBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !u64 {
     return sumBytes(io, allocator, dir_path, .vision);
 }
@@ -188,6 +190,10 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
             const offs = (entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader).array.items;
             if (offs.len != 2 or offs[0] != .integer or offs[1] != .integer) return error.InvalidSafetensorsHeader;
             const bytes: u64 = @intCast(offs[1].integer - offs[0].integer);
+            if (section == .vision) if (requantizedShape(key, entry.value_ptr.object)) |shape| {
+                total +|= vision.quantizedBytes(shape[0], shape[1]);
+                continue;
+            };
             if (raggedSlot(key)) |slot| {
                 ragged[slot] +|= bytes;
                 continue;
@@ -197,6 +203,19 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
     }
     for (ragged) |b| total +|= if (b > 0) expert_io.pageRoundUp(b) else 0;
     return total;
+}
+
+/// The `[out, in]` of a header entry the tower requantizes at load (`dsv41_vision.quantizesAtLoad`), else null.
+fn requantizedShape(key: []const u8, entry: std.json.ObjectMap) ?[2]u64 {
+    const dtype = entry.get("dtype") orelse return null;
+    const shape = entry.get("shape") orelse return null;
+    if (dtype != .string or shape != .array or shape.array.items.len != 2) return null;
+    var dims: [2]u64 = undefined;
+    for (shape.array.items, &dims) |item, *d| {
+        if (item != .integer or item.integer < 0) return null;
+        d.* = @intCast(item.integer);
+    }
+    return if (vision.quantizesAtLoad(key, std.mem.eql(u8, dtype.string, "BF16"), &dims)) dims else null;
 }
 
 /// Bytes a stored tensor holds once built. From `import_min_bytes` it lives in its own page-rounded mapping, built
@@ -345,6 +364,26 @@ test "dsv41 source: the tower's bytes are the vision section, the trunk's exclud
     var text = try loadResident(testing.io, testing.allocator, root, .{});
     defer text.deinit();
     try testing.expect(text.get("vision.blocks.0.attn.wo.weight") == null and text.get("layers.3.ffn.gate.bias") != null);
+}
+
+test "dsv41 source: the tower's bill counts the matrices the load requantizes as their affine 8-bit codes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header =
+        \\{"vision.blocks.0.attn.wqkv.weight":{"dtype":"BF16","shape":[384,256],"data_offsets":[0,196608]},
+        \\"vision.blocks.0.attn.wqkv.bias":{"dtype":"BF16","shape":[384],"data_offsets":[196608,197376]},
+        \\"aligner.w2.weight":{"dtype":"F32","shape":[128,128],"data_offsets":[197376,262912]},
+        \\"vision.patch_embed.proj.weight":{"dtype":"BF16","shape":[256,588],"data_offsets":[262912,563968]}}
+    ;
+    var file: [8 + header.len + 563968]u8 = @splat(0);
+    std.mem.writeInt(u64, file[0..8], header.len, .little);
+    @memcpy(file[8..][0..header.len], header);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "model-a.safetensors", .data = &file });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    // Only the bf16 wqkv matrix of whole groups is requantized; its bias, an f32 matrix and the 588-wide patch embedding stay as stored.
+    const expect = vision.quantizedBytes(384, 256) + 768 + 65536 + 301056;
+    try testing.expectEqual(expect, try visionBytes(testing.io, testing.allocator, root));
 }
 
 test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's trellis tensors as one region each" {

@@ -11955,6 +11955,30 @@ test "every real streamed pack and source on this box plans a streamed load" {
     }
 }
 
+test "a DeepSeek STQ pack's ssd budget bills its tower as the requantized 8-bit codes" {
+    const t = std.testing;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try @import("test_models.zig").packPath(&path_buf, "DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw");
+    var config = model_mod.parseConfig(t.io, t.allocator, path) catch return error.SkipZigTest;
+    defer config.deinit(t.allocator);
+    if (!config.has_vision) return error.SkipZigTest;
+    const stored_tower: u64 = 970_536_960 + 40 * 1536;
+    const report = std.c.getenv("SUSHI_VISION_Q8_REPORT") != null;
+    for ([_]u64{ 96, 108 }) |gb| {
+        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, gb << 30, true);
+        try t.expect(plan.vision.on);
+        // 483M of the tower's 485M parameters at a byte and 4/128 byte each: the codes, scales and biases.
+        try t.expect(plan.split.vision > 490_000_000 and plan.split.vision < 520_000_000);
+        const l = plan.resolved.ledger.?;
+        try t.expectEqual(plan.split.vision, l.vision_bytes);
+        const per_slot = l.cache_bytes / l.slots_per_layer;
+        const fixed = l.trunk_bytes + l.mtp_bytes + l.workspace_bytes + l.selected_bytes + l.bounce_bytes + l.pool_bytes;
+        const slots_stored: u64 = (l.budget_bytes - fixed - stored_tower) / per_slot;
+        try t.expect(plan.cache.slots_per_layer >= slots_stored);
+        if (report) std.debug.print("[vision-q8] ssd budget {d}: tower {d} B (stored {d} B), slots/layer without {d}, with {d} (stored tower: {d}), per slot {d} B\n", .{ gb, plan.split.vision, stored_tower, plan.vision.slots_without, plan.cache.slots_per_layer, slots_stored, per_slot });
+    }
+}
+
 test "planExpertStreamingWith takes a resident drafter out of the expert cache" {
     const t = testing;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

@@ -4,7 +4,7 @@ How `deepseek_v41` spends memory under CED prefill: the ledger, the per-layer ca
 prefill that borrows decoder pools and the fully resident load. Index: [CLAUDE.md](../CLAUDE.md#docs-index); related:
 [dsv41-arch](dsv41-arch.md), [engine-expert-streaming](engine-expert-streaming.md).
 
-## The ledger (an STQ pack, `--ssd-budget-gb 96` = 103.08 GB, no vision tower)
+## The ledger (an STQ pack, `--ssd-budget-gb 96` = 103.08 GB, no vision tower; the [tower](#vision-requant) adds 0.50 GB)
 
 | term | GB |
 |---|---|
@@ -133,6 +133,41 @@ checks ([engine-memory-admission](engine-memory-admission.md#metal-oom)). With b
 prefilled the 225k prompt at 759.0 tok/s; 114 still ran a cold 32,888-token prompt at 622.6 tok/s against 108's 792.7
 (one run each), so 111 is the raised-limit launch.
 
+<a id="vision-requant"></a>
+## The vision tower, requantized
+
+The pack keeps the tower bf16 (266 tensors, 0.971 GB); the load requantizes the 322 block and aligner matrices to MLX
+affine 8-bit, group 128, and frees each bf16 copy as its codes exist ([dsv41-arch](dsv41-arch.md#image-input)). The
+ledger's `vision` term is what the load holds: 501,303,296 B (codes at a byte a weight, a bf16 scale and bias per group,
+the 588-wide patch embedding, norms, biases and the 40 image biases bf16), from `dsv41_source.visionBytes`, which applies
+the load's own rule (`dsv41_vision.quantizesAtLoad`) to the shard headers. The codes are MLX's own allocations, not
+sushi-owned mappings: `[dsv41-mem]` does not count them and `active_bytes` does.
+
+| STQ-1.75bpw, `--ssd-budget-gb` | vision term | slots/layer without tower | with tower | stored bf16 tower would give |
+|---|---|---|---|---|
+| 96 | 0.50 GB | 239 | 238 (-1) | 237 (-2) |
+| 108 | 0.50 GB | 273 | 272 (-1) | 270 (-3) |
+
+A slot a layer is 0.385 GB (the ledger's per-slot bytes). Measured on the real tower (`tower.safetensors` of the
+vision fixture) with house.jpeg letterboxed to a 58 x 93 grid (642 span tokens), requantized against bf16, both in one
+process (`SUSHI_VISION_Q8_REPORT=1`, the `requantized tower stays within bf16's drift` test; base 2db0e8d5 plus this
+change, M5 Max, GPU lock held, QUIET, `taskpolicy -a`):
+
+| stage | cosine | max abs | relative RMS |
+|---|---|---|---|
+| after 16 blocks | 0.99967 | 88 (a massive-activation channel) | 0.0257 |
+| after 31 blocks | 0.99966 | 88 | 0.0260 |
+| final norm | 0.99906 | 0.052 | 0.0434 |
+| span (aligner out) | 0.99957 | 0.045 | 0.0295 |
+
+- Load: 322 linears requantized in 49 ms (`[vision] tower requantized at load: bf16 0.97 GB -> affine8 g128 0.50 GB`).
+  A linear's codes weigh exactly its bill (the aligner's `w1`: 48,660,480 B active for 48,660,480 B billed).
+- Time, 642 tokens, median of 9 interleaved warm runs: bf16 tower 291.9 ms, q8 300.9 ms (+3%); with the aligner 294.0 and
+  303.0 ms. A quantized matmul over 5,394 rows is compute-bound and the dequantizing kernel does not beat bf16's, so the
+  gain is memory, not speed.
+- The encode's transient peak is the same on both arms (1.198 GiB in that process, which also holds the codes); the quantized
+  matmul reads the codes in its kernel and makes no dequantized copy, so `visionEncodeBill` and the phase cap stand.
+
 <a id="owned-weights"></a>
 ## Weight memory sushi owns
 
@@ -145,7 +180,8 @@ The weight load builds every long-lived weight of 1 MiB or more in a mapping of 
   one group (`dsv41_owned.raggedOwned`, into `Ragged.initPools`).
 - f32 widenings (bf16 to f32 is the bits shifted up, as MLX's cast) and the fused-stack bank of `fuseShared` are built
   in regions; the slices into the stack stay views.
-- Left in MLX: tensors under 1 MiB, the meta tables, the rope tables and Engram's q.k product.
+- Left in MLX: tensors under 1 MiB, the meta tables, the rope tables, Engram's q.k product and the vision tower's
+  requantized codes ([above](#vision-requant)).
 - The bill (`dsv41_source.sumBytes`) rounds each tensor from 1 MiB, and each DSpark (stage, projection, part) as one
   region, up to the page. MLX refuses no page-aligned mapping; it also accepts a start inside a page, so the
   `OwnedImportCopied` check is the data-pointer test, not an alignment rule.

@@ -31,7 +31,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 | FFN | every layer MoE: 384 routed experts, top-6, width 2304, one shared expert; `sqrtsoftplus` scores, the f32 bias picks only, normalized, ×1.5; gate clamp 10 |
 | Hyper-connections | 4 streams, 20 Sinkhorn iterations, `hc_eps` 1e-6; two collapses and expansions per layer |
 | Engram | layers 1 and 14: 384M rows × 256 FP8 each (~100 GB per table), 8 heads, 4-grams over a 99092-entry compressed vocabulary, hashed with numpy-seeded multipliers and primes |
-| Loaded by default, skippable | the vision tower (`vision.*`, `aligner.*`, `image_*`, bf16, 0.97 GB) and each layer's `bias_vl`, unless `--no-vision` ([image input](#image-input)); the 3 DSpark stages (`mtp.*`) only without `--no-mtp` |
+| Loaded by default, skippable | the vision tower (`vision.*`, `aligner.*`, `image_*`, bf16 on disk, 0.97 GB; held as affine 8-bit, 0.50 GB) and each layer's `bias_vl`, unless `--no-vision` ([image input](#image-input)); the 3 DSpark stages (`mtp.*`) only without `--no-mtp` |
 
 Storage in the checkpoint: trunk linears `F8_E4M3` with `F8_E8M0` scales on 32×32 blocks; routed experts `I8` holding
 two e2m1 nibbles (low first) with `F8_E8M0` scales per 32 columns; `embed`, `head`, gate bf16; hyper-connection
@@ -703,7 +703,7 @@ as the GLM and Qwen verify kernels have); it is not in this port.
 ## Image input
 
 Images are served by default: the tower loads on every DeepSeek-V4.1 load, streamed or resident, unlike MiMo and GLM
-whose streamed loads leave it off. `--no-vision` (or `vision: false` in model-settings) skips it and saves its 0.97 GB,
+whose streamed loads leave it off. `--no-vision` (or `vision: false` in model-settings) skips it and saves its 0.50 GB,
 and an image without it is a 400; an explicit flag outranks the setting, which outranks the default. One image is `[start] + ([n_w aligner rows] +
 [newline]) * n_h + [end]`, every position of which is `image_token_id` (`<｜deepseek_image｜>`) in the prompt.
 
@@ -715,9 +715,16 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   the grid, so a request holds each image as its file and `planGrid` runs on the size read from the header; the
   patches are built for the media key and again when the tower reaches the image, a window at a time ([server-lifecycle](server-lifecycle.md#request-ownership-and-media)).
 - **Tower** (`Dsv41Vision`, `vision.py`): 32 blocks of pre-norm attention (16 heads, 2-D rope: row angles in the first
-  half of each rotate-half pair, column angles in the second, f32) and a SwiGLU MLP, bf16 as stored, then `Aligner`
+  half of each rotate-half pair, column angles in the second, f32) and a SwiGLU MLP, then `Aligner`
   (zero-pad to multiples of 3, unfold channel-major, `w2(gelu(w1(x)))`). It returns the whole span including the three
   learned delimiter rows. Queries run in chunks of 512; `encodeScratchBytes` bills the worst block.
+- **Requantized at load** (`Dsv41Vision.init`, `quantizesAtLoad`): the pack keeps the tower bf16, and the load turns every
+  block `wqkv`, `wo`, `w1`, `w2` and the aligner's `w1`, `w2` (322 matrices, 483M of the 485M parameters) into MLX
+  affine 8-bit, group 128, run through `mlx_quantized_matmul`, and frees each bf16 copy as its codes exist. The patch
+  embedding (588 wide), norms, biases and delimiters stay bf16. One `[vision] tower requantized at load: ...` line
+  reports it. Against the bf16 tower on house.jpeg at 642 tokens: cosine 0.99906 after the final norm, 0.99957 on the
+  span; the tower runs ~3% slower (a quantized matmul over 5,394 rows is compute-bound, [measured](dsv41-memory.md#vision-requant)).
+  The reference-parity tests build the tower with `initWith(.., false)`.
 - **Trunk** (`dsv41_model.beginPassWith`): the chunk's image positions take the span rows in order
   (`VisionRows.offset` = rows earlier chunks consumed, so a prompt chunks anywhere); they pick experts by the layer's
   `gate_bias_vl` instead of `gate_bias` (the route kernel reads a `[L, E]` bias row by row; `--drop-expert` masks it
@@ -732,7 +739,7 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
 - **Chat**: the template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image as the atom
   where it sat, blank-line joined with its text (the release's `process_image_messages`); `placeMedia` expands the atom
   to `spanRows` tokens.
-- **Bill**: the tower and the image biases (0.97 GB) are the budget line's `vision` term (`dsv41_source.visionBytes`,
+- **Bill**: the tower as requantized and the image biases (0.50 GB) are the budget line's `vision` term (`dsv41_source.visionBytes`,
   `streamingResidentSplit`), a request's encode is billed by `visionEncodeBill`, and a load with the tower keeps
   `largestImageEncodeBytes` beside the budget ([engine-memory-admission](engine-memory-admission.md)).
 

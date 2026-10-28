@@ -21,7 +21,7 @@ pub const VisionEncoder = struct {
     glm5: ?glm5_vision.GlmVision = null,
     dsv41: ?dsv41_vision.Dsv41Vision = null,
 
-    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !VisionEncoder {
         if (config.qwen_vision) {
             const qv = try qwen_vision.QwenVision.init(allocator, config, weights);
             log.info("Vision encoder: Qwen3-VL ViT (depth={d}, hidden={d}, heads={d}, merge={d}, out_hidden={d})\n", .{

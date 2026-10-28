@@ -20,6 +20,8 @@ const cfg_mod = @import("dsv41_config.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const log = @import("log.zig");
 const transient_peak = @import("transient_peak.zig");
+const dflash = @import("dflash.zig");
+const io_util = @import("io_util.zig");
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -194,18 +196,47 @@ pub fn preprocess(allocator: std.mem.Allocator, rgb: []const u8, src_h: u32, src
     return .{ .bytes = bytes, .h = plan.h, .w = plan.w, .grid_h = plan.vit_h, .grid_w = plan.vit_w };
 }
 
-/// A bf16 linear: `w` is `[out, in]`.
+pub const QUANT_BITS: u32 = 8;
+pub const QUANT_GROUP: u32 = 128;
+
+/// Does the tower run the pack tensor `key` quantized? The ViT blocks' and the aligner's bf16 weight matrices
+/// whose input width is whole groups; the patch embedding, norms, biases and delimiters stay as stored.
+pub fn quantizesAtLoad(key: []const u8, bf16: bool, shape: []const u64) bool {
+    if (!bf16 or shape.len != 2 or shape[1] % QUANT_GROUP != 0) return false;
+    if (std.mem.eql(u8, key, "aligner.w1.weight") or std.mem.eql(u8, key, "aligner.w2.weight")) return true;
+    if (!std.mem.startsWith(u8, key, "vision.blocks.")) return false;
+    for ([_][]const u8{ ".attn.wqkv.weight", ".attn.wo.weight", ".mlp.w1.weight", ".mlp.w2.weight" }) |tail|
+        if (std.mem.endsWith(u8, key, tail)) return true;
+    return false;
+}
+
+/// Bytes a quantized `[out, in]` weight holds: the codes and a bf16 scale and bias per group.
+pub fn quantizedBytes(out: u64, in: u64) u64 {
+    return out * in * QUANT_BITS / 8 + 2 * 2 * out * (in / QUANT_GROUP);
+}
+
+/// A linear: `w` is a bf16 `[out, in]`, or `q` holds it as MLX affine codes.
 const Lin = struct {
-    w: A,
+    w: A = none,
     bias: A = none,
+    q: ?dflash.DflashLinear = null,
 
     fn apply(self: Lin, sc: *Scope, x: A) !A {
-        const y = try sc.matmul(x, try sc.t2(self.w));
+        const y = if (self.q) |q| blk: {
+            var o = mlx.mlx_array_new();
+            break :blk try sc.res(mlx.mlx_quantized_matmul(&o, x, q.w, q.scales, q.biases, true, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), "affine", sc.s), &o);
+        } else try sc.matmul(x, try sc.t2(self.w));
         return if (self.bias.ctx != null) sc.add(y, self.bias) else y;
+    }
+
+    /// Frees what the tower owns of this linear: the quantized triple.
+    fn release(self: *Lin) void {
+        if (self.q) |*q| q.deinit();
+        self.q = null;
     }
 };
 
-const Block = struct { norm1: A, norm2: A, wqkv: Lin, wo: Lin, w1: Lin, w2: Lin };
+const Block = struct { norm1: A = none, norm2: A = none, wqkv: Lin = .{}, wo: Lin = .{}, w1: Lin = .{}, w2: Lin = .{} };
 
 fn tensor(weights: *const model.Weights, comptime fmt: []const u8, args: anytype) !A {
     var buf: [128]u8 = undefined;
@@ -216,14 +247,41 @@ fn tensor(weights: *const model.Weights, comptime fmt: []const u8, args: anytype
     };
 }
 
-fn lin(weights: *const model.Weights, comptime fmt: []const u8, args: anytype, out_dim: usize, in_dim: usize, with_bias: bool) !Lin {
-    var l: Lin = .{ .w = try tensor(weights, fmt ++ ".weight", args) };
-    if (with_bias) l.bias = try tensor(weights, fmt ++ ".bias", args);
+/// What the tower's load does to its weights: the map the linears come from, and the quantization it ran.
+const Load = struct {
+    weights: *model.Weights,
+    s: mlx.mlx_stream,
+    quantize: bool,
+    linears: u32 = 0,
+    bf16_bytes: u64 = 0,
+    quant_bytes: u64 = 0,
+};
+
+fn lin(ld: *Load, comptime fmt: []const u8, args: anytype, out_dim: usize, in_dim: usize, with_bias: bool) !Lin {
+    var l: Lin = .{ .w = try tensor(ld.weights, fmt ++ ".weight", args) };
+    if (with_bias) l.bias = try tensor(ld.weights, fmt ++ ".bias", args);
     const shape = mlx.getShape(l.w);
     if (shape.len != 2 or shape[0] != ci(out_dim) or shape[1] != ci(in_dim) or mlx.mlx_array_dtype(l.w) != .bfloat16) {
         log.warn("DEEPSEEK VISION: " ++ fmt ++ " is not a bf16 [{d}, {d}] weight\n", args ++ .{ out_dim, in_dim });
         return error.InvalidVisionWeights;
     }
+    var name_buf: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, fmt ++ ".weight", args);
+    if (!ld.quantize or !quantizesAtLoad(name, true, &.{ out_dim, in_dim })) return l;
+    // The bf16 copy goes as soon as its codes exist: the load holds one linear's worth of both.
+    var q = try dflash.quantizeDense(l.w, QUANT_BITS, QUANT_GROUP, ld.s);
+    errdefer q.deinit();
+    try mlx.check(mlx.mlx_array_eval(q.w));
+    try mlx.check(mlx.mlx_array_eval(q.scales));
+    try mlx.check(mlx.mlx_array_eval(q.biases));
+    const removed = ld.weights.map.fetchRemove(name).?;
+    _ = mlx.mlx_array_free(removed.value);
+    ld.weights.allocator.free(removed.key);
+    ld.linears += 1;
+    ld.bf16_bytes += 2 * out_dim * in_dim;
+    ld.quant_bytes += quantizedBytes(out_dim, in_dim);
+    l.w = none;
+    l.q = q;
     return l;
 }
 
@@ -242,8 +300,14 @@ pub const Dsv41Vision = struct {
     image_end: A,
     image_newline: A,
 
-    /// The tower's handles are borrowed from `weights`, which outlives it.
-    pub fn init(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *const model.Weights) !Dsv41Vision {
+    /// The serving tower: its block and aligner matrices are requantized to affine 8-bit and their bf16 copies leave
+    /// `weights`. The tower's other handles are borrowed from `weights`, which outlives it.
+    pub fn init(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights) !Dsv41Vision {
+        return initWith(allocator, config, weights, true);
+    }
+
+    /// `quantize` false keeps every linear bf16 (the reference-parity tests).
+    pub fn initWith(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights, quantize: bool) !Dsv41Vision {
         const c = config.dsv41 orelse return error.MissingVisionWeights;
         const v = c.vision orelse return error.MissingVisionWeights;
         const d = v.hidden;
@@ -251,34 +315,63 @@ pub const Dsv41Vision = struct {
         const fold = d * v.downsample * v.downsample;
         const blocks = try allocator.alloc(Block, v.layers);
         errdefer allocator.free(blocks);
-        const patch = try lin(weights, "vision.patch_embed.proj", .{}, d, feat, true);
-        for (blocks, 0..) |*b, i| b.* = .{
-            .norm1 = try tensor(weights, "vision.blocks.{d}.norm1.weight", .{i}),
-            .norm2 = try tensor(weights, "vision.blocks.{d}.norm2.weight", .{i}),
-            .wqkv = try lin(weights, "vision.blocks.{d}.attn.wqkv", .{i}, 3 * d, d, true),
-            .wo = try lin(weights, "vision.blocks.{d}.attn.wo", .{i}, d, d, true),
-            .w1 = try lin(weights, "vision.blocks.{d}.mlp.w1", .{i}, 2 * v.inter, d, false),
-            .w2 = try lin(weights, "vision.blocks.{d}.mlp.w2", .{i}, d, v.inter, false),
-        };
-        const self: Dsv41Vision = .{
+        for (blocks) |*b| b.* = .{};
+        var self: Dsv41Vision = .{
             .allocator = allocator,
             .s = mlx.mlx_default_gpu_stream_new(),
             .v = v,
             .out_dim = c.dim,
-            .patch = patch,
+            .patch = .{},
             .blocks = blocks,
-            .norm = try tensor(weights, "vision.norm.weight", .{}),
-            .a_w1 = try lin(weights, "aligner.w1", .{}, c.dim, fold, true),
-            .a_w2 = try lin(weights, "aligner.w2", .{}, c.dim, c.dim, true),
-            .image_start = try tensor(weights, "image_start", .{}),
-            .image_end = try tensor(weights, "image_end", .{}),
-            .image_newline = try tensor(weights, "image_newline", .{}),
+            .norm = none,
+            .a_w1 = .{},
+            .a_w2 = .{},
+            .image_start = none,
+            .image_end = none,
+            .image_newline = none,
         };
+        errdefer {
+            self.release();
+            _ = mlx.mlx_stream_free(self.s);
+        }
+        var ld: Load = .{ .weights = weights, .s = self.s, .quantize = quantize };
+        var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+        self.patch = try lin(&ld, "vision.patch_embed.proj", .{}, d, feat, true);
+        for (blocks, 0..) |*b, i| {
+            b.norm1 = try tensor(weights, "vision.blocks.{d}.norm1.weight", .{i});
+            b.norm2 = try tensor(weights, "vision.blocks.{d}.norm2.weight", .{i});
+            b.wqkv = try lin(&ld, "vision.blocks.{d}.attn.wqkv", .{i}, 3 * d, d, true);
+            b.wo = try lin(&ld, "vision.blocks.{d}.attn.wo", .{i}, d, d, true);
+            b.w1 = try lin(&ld, "vision.blocks.{d}.mlp.w1", .{i}, 2 * v.inter, d, false);
+            b.w2 = try lin(&ld, "vision.blocks.{d}.mlp.w2", .{i}, d, v.inter, false);
+        }
+        self.norm = try tensor(weights, "vision.norm.weight", .{});
+        self.a_w1 = try lin(&ld, "aligner.w1", .{}, c.dim, fold, true);
+        self.a_w2 = try lin(&ld, "aligner.w2", .{}, c.dim, c.dim, true);
+        self.image_start = try tensor(weights, "image_start", .{});
+        self.image_end = try tensor(weights, "image_end", .{});
+        self.image_newline = try tensor(weights, "image_newline", .{});
         log.info("Vision encoder: DeepSeek-V4.1 ViT (depth={d}, hidden={d}, heads={d}, patch={d}, downsample={d})\n", .{ v.layers, d, v.heads, v.patch, v.downsample });
+        if (ld.linears > 0) log.info("[vision] tower requantized at load: bf16 {d:.2} GB -> affine{d} g{d} {d:.2} GB ({d} linears, {d} ms)\n", .{
+            @as(f64, @floatFromInt(ld.bf16_bytes)) / 1e9,
+            QUANT_BITS,
+            QUANT_GROUP,
+            @as(f64, @floatFromInt(ld.quant_bytes)) / 1e9,
+            ld.linears,
+            clock.read() / std.time.ns_per_ms,
+        });
         return self;
     }
 
+    fn release(self: *Dsv41Vision) void {
+        self.patch.release();
+        for (self.blocks) |*b| for ([_]*Lin{ &b.wqkv, &b.wo, &b.w1, &b.w2 }) |l| l.release();
+        self.a_w1.release();
+        self.a_w2.release();
+    }
+
     pub fn deinit(self: *Dsv41Vision) void {
+        self.release();
         self.allocator.free(self.blocks);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -641,7 +734,7 @@ test "dsv41 vision: tower, aligner and span match the reference" {
     var tower_buf: [std.fs.max_path_bytes]u8 = undefined;
     var weights = try loadFile((try fixtureFile(&tower_buf, "tower.safetensors")).ptr);
     defer weights.deinit();
-    var dv = try Dsv41Vision.init(testing.allocator, try releaseConfig(), &weights);
+    var dv = try Dsv41Vision.initWith(testing.allocator, try releaseConfig(), &weights, false);
     defer dv.deinit();
     for ([_][]const u8{ "odd", "photo" }) |case| {
         const grid_arr = try fixtureTensor(&fx, case, "grid");
@@ -691,4 +784,293 @@ test "dsv41 vision: the tokenizer reads the image atom as the config's image tok
     const ids = try tok.encode(testing.allocator, "<\xef\xbd\x9cUser\xef\xbd\x9c><\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>\n\nWhat is this?");
     defer testing.allocator.free(ids);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{c.image_token_id}));
+}
+
+// ── Requantization at load ──
+
+test "dsv41 vision: the load requantizes the block and aligner matrices of whole groups and nothing else" {
+    const bf = true;
+    try testing.expect(quantizesAtLoad("vision.blocks.0.attn.wqkv.weight", bf, &.{ 3072, 1024 }));
+    try testing.expect(quantizesAtLoad("vision.blocks.31.attn.wo.weight", bf, &.{ 1024, 1024 }));
+    try testing.expect(quantizesAtLoad("vision.blocks.5.mlp.w1.weight", bf, &.{ 5632, 1024 }));
+    try testing.expect(quantizesAtLoad("vision.blocks.5.mlp.w2.weight", bf, &.{ 1024, 2816 }));
+    try testing.expect(quantizesAtLoad("aligner.w1.weight", bf, &.{ 5120, 9216 }));
+    try testing.expect(quantizesAtLoad("aligner.w2.weight", bf, &.{ 5120, 5120 }));
+    // The patch embedding is 588 wide; norms, biases and the delimiters are not block matrices.
+    try testing.expect(!quantizesAtLoad("vision.patch_embed.proj.weight", bf, &.{ 1024, 588 }));
+    try testing.expect(!quantizesAtLoad("vision.blocks.0.norm1.weight", bf, &.{1024}));
+    try testing.expect(!quantizesAtLoad("vision.blocks.0.attn.wqkv.bias", bf, &.{3072}));
+    try testing.expect(!quantizesAtLoad("image_start", bf, &.{5120}));
+    try testing.expect(!quantizesAtLoad("layers.3.ffn.gate.weight", bf, &.{ 256, 4096 }));
+    try testing.expect(!quantizesAtLoad("vision.blocks.0.mlp.w2.weight", bf, &.{ 1024, 2800 }));
+    try testing.expect(!quantizesAtLoad("vision.blocks.0.mlp.w2.weight", false, &.{ 1024, 2816 }));
+    // Codes plus a bf16 scale and bias per group.
+    try testing.expectEqual(@as(u64, 1024 * 1024 + 4 * 1024 * 8), quantizedBytes(1024, 1024));
+}
+
+fn putBf16(w: *model.Weights, name: []const u8, shape: []const c_int, seed: u64, scale: f32, base: f32) !void {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const data = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (data) |*x| x.* = base + scale * (prng.random().float(f32) * 2 - 1);
+    const f = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var b = mlx.mlx_array_new();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, cpu));
+    try mlx.check(mlx.mlx_array_eval(b));
+    try w.map.put(try testing.allocator.dupe(u8, name), b);
+}
+
+const tiny_vision: cfg_mod.Vision = .{ .layers = 2, .hidden = 256, .heads = 4, .inter = 256, .patch = 4, .rope_theta = 10000, .downsample = 2, .max_tokens = 64, .min_pixels = 0, .max_wh_ratio = 0 };
+const tiny_dim: u32 = 128;
+
+/// A synthetic tower of the release's structure at widths of whole 128-groups.
+fn tinyTower() !model.Weights {
+    const v = tiny_vision;
+    const d: c_int = @intCast(v.hidden);
+    const inter: c_int = @intCast(v.inter);
+    var w = model.Weights.init(testing.allocator);
+    errdefer w.deinit();
+    var buf: [96]u8 = undefined;
+    var seed: u64 = 1;
+    try putBf16(&w, "vision.patch_embed.proj.weight", &.{ d, 48 }, 1, 0.1, 0);
+    try putBf16(&w, "vision.patch_embed.proj.bias", &.{d}, 2, 0.05, 0);
+    for (0..v.layers) |i| {
+        const Part = struct { name: []const u8, shape: [2]c_int, rank: u2 };
+        const parts = [_]Part{
+            .{ .name = "norm1.weight", .shape = .{ d, 0 }, .rank = 1 },
+            .{ .name = "norm2.weight", .shape = .{ d, 0 }, .rank = 1 },
+            .{ .name = "attn.wqkv.weight", .shape = .{ 3 * d, d }, .rank = 2 },
+            .{ .name = "attn.wqkv.bias", .shape = .{ 3 * d, 0 }, .rank = 1 },
+            .{ .name = "attn.wo.weight", .shape = .{ d, d }, .rank = 2 },
+            .{ .name = "attn.wo.bias", .shape = .{ d, 0 }, .rank = 1 },
+            .{ .name = "mlp.w1.weight", .shape = .{ 2 * inter, d }, .rank = 2 },
+            .{ .name = "mlp.w2.weight", .shape = .{ d, inter }, .rank = 2 },
+        };
+        for (parts) |p| {
+            seed += 1;
+            const norm = std.mem.startsWith(u8, p.name, "norm");
+            try putBf16(&w, try std.fmt.bufPrint(&buf, "vision.blocks.{d}.{s}", .{ i, p.name }), p.shape[0..p.rank], seed, if (norm) 0.1 else 0.1, if (norm) 1 else 0);
+        }
+    }
+    try putBf16(&w, "vision.norm.weight", &.{d}, 80, 0.1, 1);
+    const out: c_int = @intCast(tiny_dim);
+    try putBf16(&w, "aligner.w1.weight", &.{ out, d * 4 }, 81, 0.1, 0);
+    try putBf16(&w, "aligner.w1.bias", &.{out}, 82, 0.05, 0);
+    try putBf16(&w, "aligner.w2.weight", &.{ out, out }, 83, 0.1, 0);
+    try putBf16(&w, "aligner.w2.bias", &.{out}, 84, 0.05, 0);
+    for ([_][]const u8{ "image_start", "image_end", "image_newline" }) |name| try putBf16(&w, name, &.{out}, 70, 0.1, 0);
+    return w;
+}
+
+fn tinyConfig() model.ModelConfig {
+    var cfg: model.ModelConfig = .{};
+    cfg.dsv41 = .{ .dim = tiny_dim, .vision = tiny_vision };
+    return cfg;
+}
+
+test "dsv41 vision: requantized tower holds affine 8-bit g128 codes, frees the bf16 copies and tracks the bf16 tower" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var wq = try tinyTower();
+    defer wq.deinit();
+    var wb = try tinyTower();
+    defer wb.deinit();
+    const before = wq.count();
+    var dq = try Dsv41Vision.init(testing.allocator, tinyConfig(), &wq);
+    defer dq.deinit();
+    var db = try Dsv41Vision.initWith(testing.allocator, tinyConfig(), &wb, false);
+    defer db.deinit();
+
+    // Two blocks of wqkv, wo, w1, w2 and the aligner's two: their bf16 entries leave the map, the rest stay.
+    const linears: u32 = 2 * 4 + 2;
+    try testing.expectEqual(before - linears, wq.count());
+    try testing.expectEqual(before, wb.count());
+    try testing.expect(wq.get("vision.blocks.1.mlp.w2.weight") == null and wq.get("aligner.w1.weight") == null);
+    try testing.expect(wq.get("vision.patch_embed.proj.weight") != null and wq.get("vision.blocks.0.attn.wqkv.bias") != null);
+    try testing.expect(dq.patch.q == null and dq.patch.w.ctx != null);
+
+    var bytes: u64 = 0;
+    for ([_]*const Lin{ &dq.blocks[0].wqkv, &dq.blocks[1].w2, &dq.a_w1 }) |l| {
+        const q = l.q.?;
+        try testing.expectEqual(@as(u32, 8), q.bits);
+        try testing.expectEqual(@as(u32, 128), q.group_size);
+        try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(q.w));
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(q.scales));
+        try testing.expectEqual(@divExact(mlx.getShape(q.w)[1] * 4, 128), mlx.getShape(q.scales)[1]);
+        bytes += mlx.mlx_array_size(q.w) * 4 + (mlx.mlx_array_size(q.scales) + mlx.mlx_array_size(q.biases)) * 2;
+    }
+    try testing.expectEqual(quantizedBytes(768, 256) + quantizedBytes(256, 256) + quantizedBytes(128, 1024), bytes);
+
+    var prng = std.Random.DefaultPrng.init(7);
+    const grid_h: u32 = 6;
+    const grid_w: u32 = 8;
+    var px: [6 * 8 * 48]f32 = undefined;
+    for (&px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+    const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ grid_h * grid_w, 48 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+    const got = try dq.forward(patches, grid_h, grid_w);
+    defer _ = mlx.mlx_array_free(got);
+    const want = try db.forward(patches, grid_h, grid_w);
+    defer _ = mlx.mlx_array_free(want);
+    const cos = try common.cosineSim(got, want, dq.s);
+    errdefer std.debug.print("[dsv41-vision] tiny q8 vs bf16 cosine={d:.6}\n", .{cos});
+    try testing.expect(cos > 0.999);
+}
+
+// ── The requantized tower against the bf16 tower on a real image (the pack's tower, SUSHI_MODELS_DIR) ──
+
+const Gap = struct { cos: f64, max_abs: f64, rel_rms: f64 };
+
+fn gap(got: A, want: A, s: mlx.mlx_stream) !Gap {
+    var f: [2]A = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (f) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    try mlx.check(mlx.mlx_astype(&f[0], got, .float32, s));
+    try mlx.check(mlx.mlx_astype(&f[1], want, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f[0]));
+    try mlx.check(mlx.mlx_array_eval(f[1]));
+    const n = mlx.mlx_array_size(f[0]);
+    const a = mlx.mlx_array_data_float32(f[0]).?[0..n];
+    const b = mlx.mlx_array_data_float32(f[1]).?[0..n];
+    var ab: f64 = 0;
+    var aa: f64 = 0;
+    var bb: f64 = 0;
+    var dd: f64 = 0;
+    var mx: f64 = 0;
+    for (a, b) |x, y| {
+        const dx: f64 = x;
+        const dy: f64 = y;
+        ab += dx * dy;
+        aa += dx * dx;
+        bb += dy * dy;
+        dd += (dx - dy) * (dx - dy);
+        mx = @max(mx, @abs(dx - dy));
+    }
+    return .{ .cos = ab / @sqrt(aa * bb), .max_abs = mx, .rel_rms = @sqrt(dd / bb) };
+}
+
+fn median(xs: []f64) f64 {
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    return xs[xs.len / 2];
+}
+
+test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 tower on house.jpeg at 642 tokens" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tower_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tower_path = try fixtureFile(&tower_buf, "tower.safetensors");
+    const jpeg = std.Io.Dir.cwd().readFileAlloc(testing.io, "tests/fixtures/house.jpeg", a, .limited(1 << 24)) catch return error.SkipZigTest;
+    defer a.free(jpeg);
+    const stb = @import("stb");
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const rgba = stb.stbi_load_from_memory(jpeg.ptr, @intCast(jpeg.len), &w, &h, &ch, 4) orelse return error.SkipZigTest;
+    defer stb.stbi_image_free(rgba);
+    const src_w: u32 = @intCast(w);
+    const src_h: u32 = @intCast(h);
+    const rgb = try a.alloc(u8, @as(usize, src_w) * src_h * 3);
+    defer a.free(rgb);
+    for (0..@as(usize, src_w) * src_h) |i| @memcpy(rgb[i * 3 ..][0..3], rgba[i * 4 ..][0..3]);
+
+    // The picture letterboxed on a 1302 x 812 canvas: a 58 x 93 ViT grid and 20 x 31 aligner cells, 642 span tokens.
+    const cw: u32 = 1302;
+    const chh: u32 = 812;
+    const box = letterbox(src_w, src_h, cw, chh);
+    const fitted = try common.resizeRgbU8(a, rgb, src_h, src_w, box.rh, box.rw, .bicubic);
+    defer a.free(fitted);
+    const canvas = try a.alloc(u8, @as(usize, cw) * chh * 3);
+    defer a.free(canvas);
+    @memset(canvas, 127);
+    for (0..box.rh) |y| @memcpy(canvas[((y + box.y) * cw + box.x) * 3 ..][0 .. @as(usize, box.rw) * 3], fitted[y * box.rw * 3 ..][0 .. @as(usize, box.rw) * 3]);
+    const px = try preprocess(a, canvas, chh, cw, Processor.of((try releaseConfig()).dsv41.?.vision.?));
+    defer a.free(px.bytes);
+    try testing.expectEqual(@as(u32, 58), px.grid_h);
+    try testing.expectEqual(@as(u32, 93), px.grid_w);
+    const patches = mlx.mlx_array_new_data(px.bytes.ptr, &[_]c_int{ ci(px.grid_h * px.grid_w), 588 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+
+    var wb = try loadFile(tower_path.ptr);
+    defer wb.deinit();
+    var wq = try loadFile(tower_path.ptr);
+    defer wq.deinit();
+    var active: [2]usize = undefined;
+    _ = mlx.mlx_get_active_memory(&active[0]);
+    var load = io_util.Stopwatch.init(testing.io);
+    var dq = try Dsv41Vision.init(a, try releaseConfig(), &wq);
+    const load_ms = @as(f64, @floatFromInt(load.read())) / 1e6;
+    defer dq.deinit();
+    _ = mlx.mlx_get_active_memory(&active[1]);
+    var db = try Dsv41Vision.initWith(a, try releaseConfig(), &wb, false);
+    defer db.deinit();
+
+    const stages = [_]struct { name: []const u8, blocks: usize }{ .{ .name = "after 16 blocks", .blocks = 16 }, .{ .name = "after 31 blocks", .blocks = 31 } };
+    const report = std.c.getenv("SUSHI_VISION_Q8_REPORT") != null;
+    var worst_cos: f64 = 1;
+    for (stages) |st| {
+        const got = try dq.towerAfter(patches, px.grid_h, px.grid_w, st.blocks);
+        defer _ = mlx.mlx_array_free(got);
+        const want = try db.towerAfter(patches, px.grid_h, px.grid_w, st.blocks);
+        defer _ = mlx.mlx_array_free(want);
+        const g = try gap(got, want, dq.s);
+        worst_cos = @min(worst_cos, g.cos);
+        if (report) std.debug.print("[vision-q8] {s}: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ st.name, g.cos, g.max_abs, g.rel_rms });
+    }
+    const tower_q = try dq.towerHidden(patches, px.grid_h, px.grid_w);
+    defer _ = mlx.mlx_array_free(tower_q);
+    const tower_b = try db.towerHidden(patches, px.grid_h, px.grid_w);
+    defer _ = mlx.mlx_array_free(tower_b);
+    const gt = try gap(tower_q, tower_b, dq.s);
+    const span_q = try dq.forward(patches, px.grid_h, px.grid_w);
+    defer _ = mlx.mlx_array_free(span_q);
+    const span_b = try db.forward(patches, px.grid_h, px.grid_w);
+    defer _ = mlx.mlx_array_free(span_b);
+    const gs = try gap(span_q, span_b, dq.s);
+    if (report) {
+        std.debug.print("[vision-q8] final norm: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ gt.cos, gt.max_abs, gt.rel_rms });
+        std.debug.print("[vision-q8] span (aligner out): cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ gs.cos, gs.max_abs, gs.rel_rms });
+        std.debug.print("[vision-q8] init {d:.0} ms; active {d:.3} GB -> {d:.3} GB\n", .{ load_ms, @as(f64, @floatFromInt(active[0])) / 1e9, @as(f64, @floatFromInt(active[1])) / 1e9 });
+        var probe: [2]usize = undefined;
+        _ = mlx.mlx_get_active_memory(&probe[0]);
+        var one = try dflash.quantizeDense(wb.get("aligner.w1.weight").?, QUANT_BITS, QUANT_GROUP, dq.s);
+        for ([_]A{ one.w, one.scales, one.biases }) |x| try mlx.check(mlx.mlx_array_eval(x));
+        _ = mlx.mlx_get_active_memory(&probe[1]);
+        one.deinit();
+        std.debug.print("[vision-q8] aligner.w1 quantized: active +{d} B, billed {d} B\n", .{ probe[1] - probe[0], quantizedBytes(5120, 9216) });
+        for ([_]*Dsv41Vision{ &db, &dq }, [_][]const u8{ "bf16", "q8" }) |d, name| {
+            mlx.resetTransientPeak();
+            const o = try d.forward(patches, px.grid_h, px.grid_w);
+            _ = mlx.mlx_array_free(o);
+            std.debug.print("[vision-q8] {s} encode transient peak {d:.3} GiB\n", .{ name, @as(f64, @floatFromInt(mlx.transientPeak())) / (1 << 30) });
+        }
+        // Interleaved in this process, warm: the tower through its final norm, then with the aligner.
+        const reps = 9;
+        var t: [4][reps]f64 = undefined;
+        for (0..reps + 1) |i| {
+            for (0..2) |arm| {
+                const d: *Dsv41Vision = if (arm == 0) &db else &dq;
+                var sw = io_util.Stopwatch.init(testing.io);
+                const o = try d.towerHidden(patches, px.grid_h, px.grid_w);
+                _ = mlx.mlx_array_free(o);
+                const tower_ms = @as(f64, @floatFromInt(sw.read())) / 1e6;
+                sw.reset();
+                const o2 = try d.forward(patches, px.grid_h, px.grid_w);
+                _ = mlx.mlx_array_free(o2);
+                const full_ms = @as(f64, @floatFromInt(sw.read())) / 1e6;
+                if (i > 0) {
+                    t[arm * 2][i - 1] = tower_ms;
+                    t[arm * 2 + 1][i - 1] = full_ms;
+                }
+            }
+        }
+        std.debug.print("[vision-q8] 642 tokens, median of {d}: bf16 tower {d:.1} ms, +aligner {d:.1} ms; q8 tower {d:.1} ms, +aligner {d:.1} ms\n", .{ reps, median(&t[0]), median(&t[1]), median(&t[2]), median(&t[3]) });
+    }
+    try testing.expect(worst_cos > 0.998);
+    try testing.expect(gt.cos > 0.998);
+    try testing.expect(gs.cos > 0.998);
 }
