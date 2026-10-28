@@ -156,6 +156,8 @@ fn routedErr(
 
 /// Rows the chain is held at: one decode row, DSpark's verify block, a decode-width batch, and a prefill chunk.
 const ROW_COUNTS = [_]usize{ 1, 5, 16, 33 };
+// A 16-row batch runs the decode arm the 5-row verify block does.
+const GEOMETRY_ROW_COUNTS = [_]usize{ 1, 5, 33 };
 
 test "dsv41 geometry: the grouped chain at 5120x2304 over n24, n26, n32, n40 and a mixed class holds the f32-truth bar" {
     const t = std.testing;
@@ -186,7 +188,7 @@ test "dsv41 geometry: the grouped chain at 5120x2304 over n24, n26, n32, n40 and
     var rb = try rate_groups.Ragged.init(s, &banks);
     defer rb.deinit();
     defer for (&banks) |*b| bench.freeBank(b);
-    for (ROW_COUNTS) |rows| {
+    for (GEOMETRY_ROW_COUNTS) |rows| {
         const err = try routedErr(alloc, s, &rb, &dense, rnd, hidden, inter, rows, 3, 4);
         if (err >= 0.005) std.debug.print("dsv41 geometry rows {d}: relRms {d}\n", .{ rows, err });
         try t.expect(err < 0.005);
