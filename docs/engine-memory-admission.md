@@ -16,6 +16,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
 - `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- **A load whose owned bytes plus 1 GiB pass the lower of `vm.global_user_wire_limit` and `vm.user_wire_limit` logs one
+  `[mem] warning:` with the `sudo sysctl` fix** (`userWireWarning`, read once after the load): the macOS user-wire cap
+  is independent of `iogpu.wired_limit_mb` and default memsize less `vm.global_no_user_wire_amount` (116.82 GB here).
+  Owned bytes are `ownedBytesTotal` (weight regions plus expert slabs); the 1 GiB is the MLX decode pool, the one ledger
+  term outside them. Warning only. The suggested value is the need or the declared wired limit, rounded up to a GB,
+  at most RAM less 12 GB; when even that is short the line says to shrink the pack or `--ssd-budget-gb`.
+  Measured slowdown past it: [dsv41-memory](dsv41-memory.md).
 - **A command buffer fails (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) once MLX's peak passes the wired limit less
   the GPU memory MLX does not own** (#61). The limit counts AGX "In use system memory", which is system-wide: other
   processes' Metal allocations (WindowServer, every app with a layer) count against it. Measured on an M1 Max 32 GB,

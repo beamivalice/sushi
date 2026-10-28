@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A load that wires more than macOS allows warns at startup**: past `vm.global_user_wire_limit` (116.82 GB by default on a 128 GB Mac) a prefill runs slower, so the log now names the limit and the `sudo sysctl` that raises it.
 - **DeepSeek-V4.1-Flash prefills in about 8 GB less memory**: sushi now owns the pack's weight memory and every forward runs under a hard per-phase cap, so a 2048-row prefill chunk reserves 6.6–7.1 GB instead of 15–16 GB and no longer borrows expert layers. Output and prefill speed are unchanged. A request that would pass its cap fails with a 503 and the server keeps serving.
 - **DeepSeek speculates under JSON schemas**: a `response_format` JSON schema keeps DSpark on, with each draft row checked against the grammar.
 - **A queued request says so**: a streamed request waiting behind another gets an SSE comment naming the queue, and the log shows `[queue]` lines; a shutdown ends queued and running requests with a 503 instead of a truncated `length` finish.

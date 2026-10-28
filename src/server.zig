@@ -2011,6 +2011,7 @@ pub fn serve(
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
+    warnUserWireLimit();
     if (manualContext(config) > 0) {
         const ctx = model_settings.contextPick(server_config.max_context_size, config.ctx_override);
         log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, model_settings.sourceLabel(ctx.source, "--ctx-size") });
@@ -2611,6 +2612,7 @@ fn handleConnection(
     // what clients budget against, and each model has its own dims. Idempotent,
     // and a no-op under `--ctx-size`.
     if (lm.config) |c| _ = pinAutoContext(c);
+    warnUserWireLimit();
 
     // ── Phase C: handlers take `lm` directly and extract their own
     //    locals. handleConnection only needs one decision for every
@@ -3051,6 +3053,51 @@ pub fn wiredLimitBytes() u64 {
         0;
     wired_limit_read = true;
     return wired_limit_bytes_cached;
+}
+
+/// Bytes MLX wires beside the owned weights and slabs: the decode buffer pool (`dsv41_pool_bytes`), the one
+/// ledger term the owned-bytes count lacks.
+pub const USER_WIRE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// RAM a suggested user-wire limit leaves to the rest of the system.
+const USER_WIRE_RAM_FLOOR_BYTES: u64 = 12_000_000_000;
+
+/// PURE: the one-line warning for a load whose wired bytes pass macOS's user-wire cap, else null.
+/// `limits` are `vm.global_user_wire_limit` and `vm.user_wire_limit` (0 = unreadable); the lower binds.
+/// Past it prefill slows down with no error. The suggested value is the need or the declared
+/// `iogpu.wired_limit_mb`, rounded up to a whole GB, never above `total_ram` less a floor.
+pub fn userWireWarning(buf: []u8, owned_bytes: u64, limits: [2]u64, wired_limit: u64, total_ram: u64) ?[]const u8 {
+    const names = [2][]const u8{ "vm.global_user_wire_limit", "vm.user_wire_limit" };
+    const bind: usize = if (limits[0] == 0 or (limits[1] != 0 and limits[1] < limits[0])) 1 else 0;
+    const limit = limits[bind];
+    if (limit == 0) return null;
+    const need = owned_bytes +| USER_WIRE_MARGIN_BYTES;
+    if (need <= limit) return null;
+    const GB: u64 = 1_000_000_000;
+    const cap = total_ram -| USER_WIRE_RAM_FLOOR_BYTES;
+    const suggested = @min((@max(need, wired_limit) +| (GB - 1)) / GB * GB, cap / GB * GB);
+    const head = "[mem] warning: this load wires ~{d:.1} GB but {s} is {d:.1} GB: prefill will run slower. ";
+    const args = .{ @as(f64, @floatFromInt(need)) / 1e9, names[bind], @as(f64, @floatFromInt(limit)) / 1e9 };
+    if (suggested < need)
+        return std.fmt.bufPrint(buf, head ++ "This Mac cannot wire that much: use a smaller pack or a lower --ssd-budget-gb", args) catch null;
+    return std.fmt.bufPrint(buf, head ++ "Raise it: sudo sysctl vm.global_user_wire_limit={d} vm.user_wire_limit={d} (resets at reboot)", args ++ .{ suggested, suggested }) catch null;
+}
+
+fn readSysctlU64(name: [*:0]const u8) u64 {
+    var v: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    return if (sysctlbyname(name, @ptrCast(&v), &len, null, 0) == 0 and len == @sizeOf(u64)) v else 0;
+}
+
+var user_wire_warned = std.atomic.Value(bool).init(false);
+
+/// Warns once per process, after the weights and expert slabs are mapped, when they pass the user-wire cap.
+pub fn warnUserWireLimit() void {
+    if (user_wire_warned.cmpxchgStrong(false, true, .monotonic, .monotonic) != null) return;
+    var buf: [384]u8 = undefined;
+    const limits = [2]u64{ readSysctlU64("vm.global_user_wire_limit"), readSysctlU64("vm.user_wire_limit") };
+    if (userWireWarning(&buf, model_mod.ownedBytesTotal(), limits, wiredLimitBytes(), metrics.getTotalMemBytes())) |line|
+        log.warn("{s}\n", .{line});
 }
 
 var wired_floor_logged = std.atomic.Value(bool).init(false);
@@ -5225,6 +5272,44 @@ test "a loaded streamed row reports its effective budget, an unloaded one the se
     try std.testing.expectEqual(@as(u32, 48), rowSsdBudgetGb(0, 48));
     try std.testing.expectEqual(@as(u32, 60), rowSsdBudgetGb(60 << 30, 48));
     try std.testing.expectEqual(@as(u32, 0), rowSsdBudgetGb(0, 0));
+}
+
+test "the user-wire warning fires when the wired bytes pass the lower macOS limit" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    // M5 Max 128 GB: `vm.global_user_wire_limit` defaults to memsize less 20.62 GB.
+    const ram: u64 = 137_438_953_472;
+    const default_limit: u64 = 116_820_000_000;
+    // A streamed DeepSeek load's owned bytes are its ssd budget less the 1 GiB MLX pool.
+    const owned = struct {
+        fn at(budget_gib: u64) u64 {
+            return (budget_gib - 1) * (1 << 30);
+        }
+    }.at;
+    var buf: [384]u8 = undefined;
+    try t.expect(userWireWarning(&buf, owned(108), .{ default_limit, default_limit }, 125_000 << 20, ram) == null);
+    for ([_]u64{ 111, 114 }) |b| {
+        const line = userWireWarning(&buf, owned(b), .{ default_limit, default_limit }, 125_000 << 20, ram) orelse return error.TestExpectedWarning;
+        try t.expect(std.mem.indexOf(u8, line, "vm.global_user_wire_limit is 116.8 GB") != null);
+        try t.expect(std.mem.indexOf(u8, line, "sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000") != null);
+    }
+    const line = userWireWarning(&buf, owned(111), .{ default_limit, default_limit }, 0, ram).?;
+    try t.expect(std.mem.indexOf(u8, line, "wires ~119.2 GB") != null);
+    try t.expect(std.mem.indexOf(u8, line, "limit=120000000000 ") != null);
+    try t.expect(userWireWarning(&buf, owned(114), .{ 125_000_000_000, 125_000_000_000 }, 125_000 << 20, ram) == null);
+    // The per-process limit binds when it is the lower one; unreadable limits never warn.
+    try t.expect(std.mem.indexOf(u8, userWireWarning(&buf, owned(111), .{ 125_000_000_000, default_limit }, 0, ram).?, "vm.user_wire_limit is") != null);
+    try t.expect(userWireWarning(&buf, owned(114), .{ 0, 0 }, 0, ram) == null);
+    // A 96 GB Mac: the default limit is 15% under memsize; the suggestion stays 12 GB under RAM.
+    const ram96: u64 = 103_079_215_104;
+    const limit96: u64 = 87_600_000_000;
+    try t.expect(userWireWarning(&buf, 80 * GiB, .{ limit96, limit96 }, 0, ram96) == null);
+    const l96 = userWireWarning(&buf, 83 * GiB, .{ limit96, limit96 }, 0, ram96).?;
+    try t.expect(std.mem.indexOf(u8, l96, "limit=91000000000 ") != null);
+    // Past what the Mac may wire, raising the limit cannot help: the line says so.
+    const none = userWireWarning(&buf, 95 * GiB, .{ limit96, limit96 }, 0, ram96).?;
+    try t.expect(std.mem.indexOf(u8, none, "sudo") == null);
+    try t.expect(std.mem.indexOf(u8, none, "--ssd-budget-gb") != null);
 }
 
 test "ssd budget parses GiB and admits against the wired limit" {
