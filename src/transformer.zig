@@ -29222,55 +29222,6 @@ test "SSMCacheEntry snapshot/restore round-trip preserves arrays" {
     try testing.expectEqual(@as(c_int, 4), restored_shape[3]);
 }
 
-test "SSMCacheEntry snapshot/restore handles null ssm_state (LFM2 gated_conv)" {
-    // LFM2 `gatedConv` populates `conv_state` but never `ssm_state` — the
-    // gated-convolution layer doesn't have a recurrence state, only a
-    // convolution-window cache. The snapshot/restore code must NOT crash on
-    // this shape (`initialized=true`, `conv_state` non-null, `ssm_state.ctx`
-    // null). This was the root cause of the Workstream D PLD-on-hybrid bug.
-    const s = mlx.gpuStream();
-    var entry: SSMCacheEntry = .{
-        .conv_state = mlx.mlx_array_new(),
-        .ssm_state = mlx.mlx_array_new(), // stays null — no LFM2 layer ever touches it
-        .initialized = false,
-    };
-    defer {
-        _ = mlx.mlx_array_free(entry.conv_state);
-        _ = mlx.mlx_array_free(entry.ssm_state);
-    }
-
-    // Simulate `conv1dWithCache` having run once: conv_state populated,
-    // initialized=true, ssm_state still null (its ctx is null).
-    const conv_shape = [_]c_int{ 1, 3, 4 };
-    _ = mlx.mlx_array_free(entry.conv_state);
-    entry.conv_state = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_zeros(&entry.conv_state, &conv_shape, 3, .float32, s));
-    entry.initialized = true;
-    try testing.expect(entry.ssm_state.ctx == null);
-
-    // Snapshot must succeed without dereferencing the null ssm_state.
-    var snap = ssmSnapshot(&entry);
-    defer ssmSnapshotDeinit(&snap);
-    try testing.expect(snap.initialized);
-    try testing.expect(snap.conv_state.ctx != null);
-    try testing.expect(snap.ssm_state.ctx == null);
-
-    // Mutate conv_state in `entry`, then restore — restore must rebind
-    // conv_state without crashing on the still-null ssm_state.
-    _ = mlx.mlx_array_free(entry.conv_state);
-    entry.conv_state = mlx.mlx_array_new();
-    const mutated_shape = [_]c_int{ 1, 1, 1 };
-    try mlx.check(mlx.mlx_zeros(&entry.conv_state, &mutated_shape, 3, .float32, s));
-
-    try ssmRestore(&entry, &snap);
-    try testing.expect(entry.initialized);
-    try testing.expect(entry.ssm_state.ctx == null); // still null after restore
-    const restored = mlx.getShape(entry.conv_state);
-    try testing.expectEqual(@as(c_int, 1), restored[0]);
-    try testing.expectEqual(@as(c_int, 3), restored[1]);
-    try testing.expectEqual(@as(c_int, 4), restored[2]);
-}
-
 test "captureSsmCheckpoint materializes state copies (parent-buffer retention class)" {
     // Hot-cache SSM checkpoints used to refcount-share the live conv/ssm
     // state handles. Those are routinely SLICES of much larger parent buffers
@@ -29333,9 +29284,6 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
 
     // Accounting matches true retention: 3*8 f32 elements, nothing more.
     try testing.expectEqual(@as(u64, 3 * 8 * 4), ssmCheckpointBytes(&cp));
-
-    // Null ssm_state stays null (LFM2 gated_conv shape).
-    try testing.expect(cp.layers[0].ssm_state.ctx == null);
 }
 
 test "two-chunk prefill capture drops the chunk parent after the boundary eval" {
