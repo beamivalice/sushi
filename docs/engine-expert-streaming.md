@@ -82,7 +82,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 | Model | Tower (stored) | Largest image (patches) | Encode bill |
 |---|---:|---|---:|
-| Qwen3.8-Flash-Next packs, BF16 source | 897,862,112 B | 1,003,520 px default bound (3,920) | 1.77 GB |
+| Qwen3.8-Flash-Next packs, BF16 source | 897,862,112 B (597,327,776 B billed, [requantized](qwen4-arch.md#vision-tower)) | 1,003,520 px default bound (3,920) | 1.77 GB |
 | MiMo-V2.6-Flash 2.3bpw | 1,457,188,864 B | 1536² engine cap (9,216) | 2.26 GB |
 | GLM-5.3-Flash 2.3/2.5bpw (affine tower) | 493,389,824 B | 8,000 merged tokens (32,000) | ~5.8 GB |
 | GLM-5.3-Flash BF16 source | 1,127,254,016 B | 8,000 merged tokens (32,000) | ~5.8 GB |

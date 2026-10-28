@@ -11927,9 +11927,9 @@ test "every real streamed pack and source on this box plans a streamed load" {
     const t = std.testing;
     const Case = struct { name: []const u8, layout: expert_stream_mod.quant.Layout, tower: u64 };
     for ([_]Case{
-        .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4, .tower = 897_862_112 },
-        .{ .name = "Qwen3.8-Flash-Next-Sushi-4bpw", .layout = .exl3_k4, .tower = 897_862_112 },
-        .{ .name = "Qwen/Qwen3.8-Flash-Next", .layout = .bf16_fused, .tower = 897_862_112 },
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4, .tower = 597_327_776 },
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-4bpw", .layout = .exl3_k4, .tower = 597_327_776 },
+        .{ .name = "Qwen/Qwen3.8-Flash-Next", .layout = .bf16_fused, .tower = 597_327_776 },
         .{ .name = "MiMo-V2.6-Flash-Sushi-2.3bpw", .layout = .exl3_k4, .tower = 1_457_188_864 },
         .{ .name = "GLM-5.3-Flash-Sushi-2.3bpw", .layout = .exl3_k4, .tower = 493_389_824 },
         .{ .name = "GLM-5.3-Flash-Sushi-2.5bpw", .layout = .exl3_k4, .tower = 493_389_824 },

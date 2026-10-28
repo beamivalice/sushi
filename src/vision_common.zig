@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const dflash = @import("dflash.zig");
 
 /// Qwen3VLImageProcessor fallbacks (processing_qwen3_vl.py:96-98). Checkpoint
 /// processor metadata overrides these when present.
@@ -706,4 +707,116 @@ pub fn rmsRatio(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     const bb = try sumProduct(b, b, s);
     if (!std.math.isFinite(aa) or bb <= 0) return std.math.nan(f32);
     return @sqrt(aa / bb);
+}
+
+// ── Towers requantized at load: bf16 matrices become MLX affine 8-bit ──
+
+pub const QUANT_BITS: u32 = 8;
+
+/// Bytes a requantized `[out, in]` weight holds: the codes and a bf16 scale and bias per `group`.
+pub fn quantizedBytes(out: u64, in: u64, group: u64) u64 {
+    return out * in * QUANT_BITS / 8 + 2 * 2 * out * (in / group);
+}
+
+/// `raw` (a bf16 `[out, in]` matrix) as evaluated affine 8-bit codes of `group`; the caller owns `raw` and the result.
+pub fn requantize(raw: mlx.mlx_array, group: u32, s: mlx.mlx_stream) !dflash.DflashLinear {
+    var q = try dflash.quantizeDense(raw, QUANT_BITS, group, s);
+    errdefer q.deinit();
+    for ([_]mlx.mlx_array{ q.w, q.scales, q.biases }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    return q;
+}
+
+/// `x` through the transposed codes of `q`.
+pub fn quantizedMatmul(out: *mlx.mlx_array, x: mlx.mlx_array, q: dflash.DflashLinear, s: mlx.mlx_stream) c_int {
+    return mlx.mlx_quantized_matmul(out, x, q.w, q.scales, q.biases, true, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), "affine", s);
+}
+
+/// A safetensors header entry read as a matrix: its dtype and `[out, in]`; null for any other rank or malformed entry.
+pub const HeaderMatrix = struct { bf16: bool, dims: [2]u64 };
+
+pub fn headerMatrix(entry: std.json.ObjectMap) ?HeaderMatrix {
+    const dtype = entry.get("dtype") orelse return null;
+    const shape = entry.get("shape") orelse return null;
+    if (dtype != .string or shape != .array or shape.array.items.len != 2) return null;
+    var dims: [2]u64 = undefined;
+    for (shape.array.items, &dims) |item, *d| {
+        if (item != .integer or item.integer < 0) return null;
+        d.* = @intCast(item.integer);
+    }
+    return .{ .bf16 = std.mem.eql(u8, dtype.string, "BF16"), .dims = dims };
+}
+
+// ── Test helpers shared by the requantized-tower checks (compiled only into tests) ──
+
+/// `[1]`-valued tensor `base + scale * U(-1, 1)` as bf16 under `name` in `map`.
+pub fn putRandomBf16(allocator: std.mem.Allocator, map: *std.StringHashMap(mlx.mlx_array), name: []const u8, shape: []const c_int, seed: u64, scale: f32, base: f32) !void {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const data = try allocator.alloc(f32, n);
+    defer allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (data) |*x| x.* = base + scale * (prng.random().float(f32) * 2 - 1);
+    const f = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var b = mlx.mlx_array_new();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, cpu));
+    try mlx.check(mlx.mlx_array_eval(b));
+    try map.put(try allocator.dupe(u8, name), b);
+}
+
+pub const Gap = struct { cos: f64, max_abs: f64, rel_rms: f64 };
+
+/// How far `got` is from `want`: cosine, largest absolute difference and ||got - want|| / ||want||, in f64 on the host.
+pub fn gap(got: mlx.mlx_array, want: mlx.mlx_array, s: mlx.mlx_stream) !Gap {
+    var f: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (f) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    try mlx.check(mlx.mlx_astype(&f[0], got, .float32, s));
+    try mlx.check(mlx.mlx_astype(&f[1], want, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f[0]));
+    try mlx.check(mlx.mlx_array_eval(f[1]));
+    const n = mlx.mlx_array_size(f[0]);
+    const a = mlx.mlx_array_data_float32(f[0]).?[0..n];
+    const b = mlx.mlx_array_data_float32(f[1]).?[0..n];
+    var ab: f64 = 0;
+    var aa: f64 = 0;
+    var bb: f64 = 0;
+    var dd: f64 = 0;
+    var mx: f64 = 0;
+    for (a, b) |x, y| {
+        const dx: f64 = x;
+        const dy: f64 = y;
+        ab += dx * dy;
+        aa += dx * dx;
+        bb += dy * dy;
+        dd += (dx - dy) * (dx - dy);
+        mx = @max(mx, @abs(dx - dy));
+    }
+    return .{ .cos = ab / @sqrt(aa * bb), .max_abs = mx, .rel_rms = @sqrt(dd / bb) };
+}
+
+pub fn median(xs: []f64) f64 {
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    return xs[xs.len / 2];
+}
+
+/// tests/fixtures/house.jpeg as interleaved RGB; SkipZigTest when the file is not found from the working directory.
+pub const House = struct { rgb: []u8, w: u32, h: u32 };
+
+pub fn loadHouse(allocator: std.mem.Allocator, io: std.Io) !House {
+    const stb = @import("stb");
+    const jpeg = std.Io.Dir.cwd().readFileAlloc(io, "tests/fixtures/house.jpeg", allocator, .limited(1 << 24)) catch return error.SkipZigTest;
+    defer allocator.free(jpeg);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const rgba = stb.stbi_load_from_memory(jpeg.ptr, @intCast(jpeg.len), &w, &h, &ch, 4) orelse return error.SkipZigTest;
+    defer stb.stbi_image_free(rgba);
+    const px: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h));
+    const rgb = try allocator.alloc(u8, px * 3);
+    for (0..px) |i| @memcpy(rgb[i * 3 ..][0..3], rgba[i * 4 ..][0..3]);
+    return .{ .rgb = rgb, .w = @intCast(w), .h = @intCast(h) };
 }

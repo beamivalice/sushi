@@ -16,6 +16,8 @@ const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const log = @import("log.zig");
 const common = @import("vision_common.zig");
+const dflash = @import("dflash.zig");
+const io_util = @import("io_util.zig");
 
 // ─────────────────────────────────────────────────────────────────────────────
 /// Transient GPU bytes one image's encode needs on top of the resident tower, at
@@ -31,8 +33,8 @@ pub fn encodeScratchBytes(config: *const ModelConfig, n_patches: u64) u64 {
 
 // Qwen3-VL ViT encoder. Mirrors mlx-vlm qwen3_vl/vision.py for a SINGLE still
 // image (grid_thw = [[1, grid_h, grid_w]]): full bidirectional attention over all
-// patches (cu_seqlens trivial), no windowing, no DeepStack. Dense bf16 — even on
-// 4-bit checkpoints the vision tower ships bf16, so no quantized-linear path.
+// patches (cu_seqlens trivial), no windowing, no DeepStack. Packs ship the tower
+// bf16; `init` requantizes its big matrices to affine 8-bit (`quantGroupAtLoad`).
 //
 // forward(patches [N, C*tps*ps*ps], grid_h, grid_w) → [1, N/merge², out_hidden].
 // `patches` is the processor's `pixel_values`, already in merge-block token order
@@ -53,6 +55,67 @@ const QBlock = struct {
     fc1_b: mlx.mlx_array,
     fc2_w: mlx.mlx_array,
     fc2_b: mlx.mlx_array,
+    /// A matrix the load requantized: its codes, and `*_w` is then an empty handle.
+    qkv_q: ?dflash.DflashLinear = null,
+    proj_q: ?dflash.DflashLinear = null,
+    fc1_q: ?dflash.DflashLinear = null,
+    fc2_q: ?dflash.DflashLinear = null,
+
+    fn release(self: *QBlock) void {
+        for ([_]*?dflash.DflashLinear{ &self.qkv_q, &self.proj_q, &self.fc1_q, &self.fc2_q }) |q| {
+            if (q.*) |*codes| codes.deinit();
+            q.* = null;
+        }
+    }
+};
+
+/// The bf16 tower matrices a load requantizes to affine 8-bit, by pack key. The group is 128 where the input width
+/// divides by 128, else 64; a width of neither (the MLP's `fc2`, 4304 wide) stays bf16. The patch embedding (a Conv3d),
+/// position table, norms and biases are not matrices of the blocks and merger.
+pub fn quantGroupAtLoad(key: []const u8, bf16: bool, shape: []const u64) ?u32 {
+    if (!bf16 or shape.len != 2) return null;
+    const rest = for (VISION_PREFIXES) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) break key[prefix.len..];
+    } else return null;
+    const matrix = for ([_][]const u8{ "merger.linear_fc1.weight", "merger.linear_fc2.weight" }) |m| {
+        if (std.mem.eql(u8, rest, m)) break true;
+    } else blk: {
+        const block = "blocks.";
+        if (!std.mem.startsWith(u8, rest, block)) break :blk false;
+        const dot = std.mem.indexOfScalarPos(u8, rest, block.len, '.') orelse break :blk false;
+        _ = std.fmt.parseUnsigned(u32, rest[block.len..dot], 10) catch break :blk false;
+        for ([_][]const u8{ "attn.qkv.weight", "attn.proj.weight", "mlp.linear_fc1.weight", "mlp.linear_fc2.weight" }) |tail|
+            if (std.mem.eql(u8, rest[dot + 1 ..], tail)) break :blk true;
+        break :blk false;
+    };
+    if (!matrix) return null;
+    if (shape[1] % 128 == 0) return 128;
+    if (shape[1] % 64 == 0) return 64;
+    return null;
+}
+
+/// What the tower's load did: the matrices it requantized, their bytes before and after.
+const Load = struct {
+    s: mlx.mlx_stream,
+    linears: u32 = 0,
+    g64: u32 = 0,
+    bf16_bytes: u64 = 0,
+    quant_bytes: u64 = 0,
+
+    /// Requantizes the bf16 matrix `w` (pack key `key`) when the rule asks, frees its copy from `weights`.
+    fn requantize(self: *Load, weights: *Weights, key: []const u8, w: *mlx.mlx_array, q: *?dflash.DflashLinear) !void {
+        const shape = mlx.getShape(w.*);
+        if (shape.len != 2 or mlx.mlx_array_dtype(w.*) != .bfloat16) return;
+        const dims = [2]u64{ @intCast(shape[0]), @intCast(shape[1]) };
+        const group = quantGroupAtLoad(key, true, &dims) orelse return;
+        q.* = try common.requantize(w.*, group, self.s);
+        _ = mlx.mlx_array_free(weights.take(key).?);
+        w.* = .{ .ctx = null };
+        self.linears += 1;
+        if (group == 64) self.g64 += 1;
+        self.bf16_bytes += 2 * dims[0] * dims[1];
+        self.quant_bytes += common.quantizedBytes(dims[0], dims[1], group);
+    }
 };
 
 pub const QwenVision = struct {
@@ -81,8 +144,16 @@ pub const QwenVision = struct {
     merger_fc1_b: mlx.mlx_array,
     merger_fc2_w: mlx.mlx_array,
     merger_fc2_b: mlx.mlx_array,
+    merger_fc1_q: ?dflash.DflashLinear = null,
+    merger_fc2_q: ?dflash.DflashLinear = null,
 
-    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !QwenVision {
+    /// The serving tower: its big bf16 matrices are requantized to affine 8-bit and their copies leave `weights`.
+    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !QwenVision {
+        return initWith(allocator, config, weights, true);
+    }
+
+    /// `quantize` false keeps every matrix bf16 (parity tests against the reference).
+    pub fn initWith(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, quantize: bool) !QwenVision {
         const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
         var kbuf: [256]u8 = undefined;
@@ -154,7 +225,7 @@ pub const QwenVision = struct {
             };
         }
 
-        return QwenVision{
+        var self = QwenVision{
             .s = s,
             .allocator = allocator,
             .depth = depth,
@@ -175,9 +246,39 @@ pub const QwenVision = struct {
             .merger_fc2_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight")),
             .merger_fc2_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.bias")),
         };
+        if (!quantize) return self;
+        errdefer self.release();
+        var ld: Load = .{ .s = s };
+        var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+        for (self.blocks, 0..) |*blk, i| {
+            try ld.requantize(weights, fmtLayer(&kbuf, prefix, i, "attn.qkv.weight"), &blk.qkv_w, &blk.qkv_q);
+            try ld.requantize(weights, fmtLayer(&kbuf, prefix, i, "attn.proj.weight"), &blk.proj_w, &blk.proj_q);
+            try ld.requantize(weights, fmtLayer(&kbuf, prefix, i, "mlp.linear_fc1.weight"), &blk.fc1_w, &blk.fc1_q);
+            try ld.requantize(weights, fmtLayer(&kbuf, prefix, i, "mlp.linear_fc2.weight"), &blk.fc2_w, &blk.fc2_q);
+        }
+        try ld.requantize(weights, fmtKey(&kbuf, prefix, "merger.linear_fc1.weight"), &self.merger_fc1_w, &self.merger_fc1_q);
+        try ld.requantize(weights, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight"), &self.merger_fc2_w, &self.merger_fc2_q);
+        if (ld.linears > 0) log.info("[vision] tower requantized at load: bf16 {d:.2} GB -> affine{d} {s} {d:.2} GB ({d} linears, {d} ms)\n", .{
+            @as(f64, @floatFromInt(ld.bf16_bytes)) / 1e9,
+            common.QUANT_BITS,
+            if (ld.g64 == 0) "g128" else if (ld.g64 == ld.linears) "g64" else "g128/g64",
+            @as(f64, @floatFromInt(ld.quant_bytes)) / 1e9,
+            ld.linears,
+            clock.read() / std.time.ns_per_ms,
+        });
+        return self;
+    }
+
+    fn release(self: *QwenVision) void {
+        for (self.blocks) |*blk| blk.release();
+        for ([_]*?dflash.DflashLinear{ &self.merger_fc1_q, &self.merger_fc2_q }) |q| {
+            if (q.*) |*codes| codes.deinit();
+            q.* = null;
+        }
     }
 
     pub fn deinit(self: *QwenVision) void {
+        self.release();
         _ = mlx.mlx_array_free(self.patch_w);
         self.allocator.free(self.blocks);
     }
@@ -190,13 +291,17 @@ pub const QwenVision = struct {
         return out;
     }
 
-    /// y = x · Wᵀ (+ bias). W is [out, in], x is [..., in].
-    fn denseLinear(self: *QwenVision, x: mlx.mlx_array, w: mlx.mlx_array, b: ?mlx.mlx_array) !mlx.mlx_array {
-        var wt = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wt);
-        try mlx.check(mlx.mlx_transpose(&wt, w, self.s));
+    /// y = x · Wᵀ (+ bias). W is [out, in] (bf16 `w`, or the affine codes `q` when the load requantized it), x is [..., in].
+    fn denseLinear(self: *QwenVision, x: mlx.mlx_array, w: mlx.mlx_array, b: ?mlx.mlx_array, q: ?dflash.DflashLinear) !mlx.mlx_array {
         var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_matmul(&out, x, wt, self.s));
+        if (q) |codes| {
+            try mlx.check(common.quantizedMatmul(&out, x, codes, self.s));
+        } else {
+            var wt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_transpose(&wt, w, self.s));
+            try mlx.check(mlx.mlx_matmul(&out, x, wt, self.s));
+        }
         if (b) |bv| {
             var biased = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_add(&biased, out, bv, self.s));
@@ -508,7 +613,7 @@ pub const QwenVision = struct {
     fn attention(self: *QwenVision, normed: mlx.mlx_array, blk: QBlock, cos: mlx.mlx_array, sin: mlx.mlx_array, n: c_int) !mlx.mlx_array {
         const hd: c_int = @intCast(self.head_dim);
         const heads: c_int = self.headsC();
-        const qkv = try self.denseLinear(normed, blk.qkv_w, blk.qkv_b); // [N, 3*hidden]
+        const qkv = try self.denseLinear(normed, blk.qkv_w, blk.qkv_b, blk.qkv_q); // [N, 3*hidden]
         defer _ = mlx.mlx_array_free(qkv);
         // [N, 3, heads, hd]
         var r = mlx.mlx_array_new();
@@ -588,7 +693,7 @@ pub const QwenVision = struct {
         defer _ = mlx.mlx_array_free(flat);
         const fshape = [_]c_int{ n, @intCast(self.hidden) };
         try mlx.check(mlx.mlx_reshape(&flat, ctt, &fshape, 2, self.s));
-        return self.denseLinear(flat, blk.proj_w, blk.proj_b);
+        return self.denseLinear(flat, blk.proj_w, blk.proj_b, blk.proj_q);
     }
 
     /// Encode one image. `patches` = pixel_values [N, C*tps*ps*ps] (merge order).
@@ -599,7 +704,7 @@ pub const QwenVision = struct {
 
         // patch_embed (Linear) + interpolated pos_embed.
         {
-            const pe = try self.denseLinear(x, self.patch_w, self.patch_b);
+            const pe = try self.denseLinear(x, self.patch_w, self.patch_b, null);
             _ = mlx.mlx_array_free(x);
             x = pe;
         }
@@ -616,7 +721,7 @@ pub const QwenVision = struct {
         defer _ = mlx.mlx_array_free(rope.cos);
         defer _ = mlx.mlx_array_free(rope.sin);
 
-        var dt = mlx.DtypeTrace.begin("qwen3vl-vision", x, if (self.blocks.len > 0) self.blocks[0].qkv_w else null);
+        var dt = mlx.DtypeTrace.begin("qwen3vl-vision", x, if (self.blocks.len > 0 and self.blocks[0].qkv_w.ctx != null) self.blocks[0].qkv_w else null);
         for (self.blocks, 0..) |blk, block_idx| {
             // Attention residual.
             {
@@ -633,11 +738,11 @@ pub const QwenVision = struct {
             {
                 const normed = try self.layerNorm6(x, blk.norm2_w, blk.norm2_b);
                 defer _ = mlx.mlx_array_free(normed);
-                const fc1 = try self.denseLinear(normed, blk.fc1_w, blk.fc1_b);
+                const fc1 = try self.denseLinear(normed, blk.fc1_w, blk.fc1_b, blk.fc1_q);
                 defer _ = mlx.mlx_array_free(fc1);
                 const act = try self.geluTanh(fc1);
                 defer _ = mlx.mlx_array_free(act);
-                const fc2 = try self.denseLinear(act, blk.fc2_w, blk.fc2_b);
+                const fc2 = try self.denseLinear(act, blk.fc2_w, blk.fc2_b, blk.fc2_q);
                 defer _ = mlx.mlx_array_free(fc2);
                 var h = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h, x, fc2, self.s));
@@ -659,11 +764,11 @@ pub const QwenVision = struct {
         defer _ = mlx.mlx_array_free(grouped);
         const gshape = [_]c_int{ n_merged, @intCast(self.hidden * self.merge * self.merge) };
         try mlx.check(mlx.mlx_reshape(&grouped, normed, &gshape, 2, self.s));
-        const m1 = try self.denseLinear(grouped, self.merger_fc1_w, self.merger_fc1_b);
+        const m1 = try self.denseLinear(grouped, self.merger_fc1_w, self.merger_fc1_b, self.merger_fc1_q);
         defer _ = mlx.mlx_array_free(m1);
         const ma = try self.geluExact(m1);
         defer _ = mlx.mlx_array_free(ma);
-        const m2 = try self.denseLinear(ma, self.merger_fc2_w, self.merger_fc2_b);
+        const m2 = try self.denseLinear(ma, self.merger_fc2_w, self.merger_fc2_b, self.merger_fc2_q);
         defer _ = mlx.mlx_array_free(m2);
         // [N_merged, out_hidden] → [1, N_merged, out_hidden].
         var out = mlx.mlx_array_new();
@@ -1290,4 +1395,214 @@ test "qwen vision ubench: encode time and scratch peak per image and video" {
         if (bill < peak) under_billed = true;
     }
     try std.testing.expect(!under_billed);
+}
+
+// ── Requantization at load ──
+
+test "qwen vision: the load requantizes the blocks' and merger's matrices to the widest group their input takes" {
+    const pre = "vision_tower.";
+    try std.testing.expectEqual(@as(?u32, 128), quantGroupAtLoad(pre ++ "blocks.0.attn.qkv.weight", true, &.{ 3456, 1152 }));
+    try std.testing.expectEqual(@as(?u32, 128), quantGroupAtLoad(pre ++ "blocks.26.attn.proj.weight", true, &.{ 1152, 1152 }));
+    try std.testing.expectEqual(@as(?u32, 128), quantGroupAtLoad(pre ++ "blocks.3.mlp.linear_fc1.weight", true, &.{ 4304, 1152 }));
+    try std.testing.expectEqual(@as(?u32, 128), quantGroupAtLoad("model.visual.merger.linear_fc2.weight", true, &.{ 2560, 4608 }));
+    try std.testing.expectEqual(@as(?u32, 64), quantGroupAtLoad(pre ++ "blocks.0.mlp.linear_fc2.weight", true, &.{ 128, 192 }));
+    // `fc2` takes the 4304-wide MLP activation: not a whole 64, so it stays bf16.
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad(pre ++ "blocks.0.mlp.linear_fc2.weight", true, &.{ 1152, 4304 }));
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad(pre ++ "patch_embed.proj.weight", true, &.{ 1152, 2, 16, 16, 3 }));
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad(pre ++ "pos_embed.weight", true, &.{ 2304, 1152 }));
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad(pre ++ "blocks.0.attn.qkv.bias", true, &.{3456}));
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad(pre ++ "blocks.0.norm1.weight", true, &.{1152}));
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad(pre ++ "blocks.x.attn.qkv.weight", true, &.{ 3456, 1152 }));
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad(pre ++ "blocks.0.attn.qkv.weight", false, &.{ 3456, 1152 }));
+    try std.testing.expectEqual(@as(?u32, null), quantGroupAtLoad("model.layers.0.self_attn.q_proj.weight", true, &.{ 4096, 2560 }));
+}
+
+const tiny_hidden: c_int = 128;
+const tiny_inter: c_int = 192;
+
+fn tinyConfig() ModelConfig {
+    var cfg: ModelConfig = .{};
+    cfg.qv_depth = 1;
+    cfg.qv_hidden = 128;
+    cfg.qv_heads = 2;
+    cfg.qv_head_dim = 64;
+    cfg.qv_intermediate = 192;
+    cfg.qv_patch = 4;
+    cfg.qv_temporal_patch = 2;
+    cfg.qv_merge = 2;
+    cfg.qv_num_pos_emb = 16;
+    cfg.qv_out_hidden = 128;
+    return cfg;
+}
+
+/// A synthetic Qwen3-VL tower (channels-first Conv3d, one block, merge 2): fc2 reads 192 wide, so it takes group 64.
+fn tinyTower() !Weights {
+    var w = Weights.init(std.testing.allocator);
+    errdefer w.deinit();
+    const h = tiny_hidden;
+    const m: c_int = h * 4;
+    const P = struct {
+        name: []const u8,
+        shape: []const c_int,
+        scale: f32 = 0.08,
+        base: f32 = 0,
+    };
+    const parts = [_]P{
+        .{ .name = "patch_embed.proj.weight", .shape = &.{ h, 3, 2, 4, 4 } },
+        .{ .name = "patch_embed.proj.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "pos_embed.weight", .shape = &.{ 16, h }, .scale = 0.1 },
+        .{ .name = "blocks.0.norm1.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
+        .{ .name = "blocks.0.norm1.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "blocks.0.norm2.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
+        .{ .name = "blocks.0.norm2.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "blocks.0.attn.qkv.weight", .shape = &.{ 3 * h, h } },
+        .{ .name = "blocks.0.attn.qkv.bias", .shape = &.{3 * h}, .scale = 0.05 },
+        .{ .name = "blocks.0.attn.proj.weight", .shape = &.{ h, h } },
+        .{ .name = "blocks.0.attn.proj.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "blocks.0.mlp.linear_fc1.weight", .shape = &.{ tiny_inter, h } },
+        .{ .name = "blocks.0.mlp.linear_fc1.bias", .shape = &.{tiny_inter}, .scale = 0.05 },
+        .{ .name = "blocks.0.mlp.linear_fc2.weight", .shape = &.{ h, tiny_inter } },
+        .{ .name = "blocks.0.mlp.linear_fc2.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "merger.norm.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
+        .{ .name = "merger.norm.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "merger.linear_fc1.weight", .shape = &.{ m, m } },
+        .{ .name = "merger.linear_fc1.bias", .shape = &.{m}, .scale = 0.05 },
+        .{ .name = "merger.linear_fc2.weight", .shape = &.{ h, m } },
+        .{ .name = "merger.linear_fc2.bias", .shape = &.{h}, .scale = 0.05 },
+    };
+    var buf: [96]u8 = undefined;
+    for (parts, 0..) |p, i| {
+        const name = try std.fmt.bufPrint(&buf, "vision_tower.{s}", .{p.name});
+        try common.putRandomBf16(std.testing.allocator, &w.map, name, p.shape, 100 + i, p.scale, p.base);
+    }
+    return w;
+}
+
+test "qwen vision: requantized tower holds affine 8-bit codes, frees the bf16 copies and tracks the bf16 tower" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var wq = try tinyTower();
+    defer wq.deinit();
+    var wb = try tinyTower();
+    defer wb.deinit();
+    const before = wq.count();
+    var qq = try QwenVision.init(a, tinyConfig(), &wq);
+    defer qq.deinit();
+    var qb = try QwenVision.initWith(a, tinyConfig(), &wb, false);
+    defer qb.deinit();
+
+    // qkv, proj, fc1, fc2 and the merger's two: their bf16 entries leave the map, everything else stays.
+    try std.testing.expectEqual(before - 6, wq.count());
+    try std.testing.expectEqual(before, wb.count());
+    try std.testing.expect(wq.get("vision_tower.blocks.0.attn.qkv.weight") == null and wq.get("vision_tower.merger.linear_fc2.weight") == null);
+    try std.testing.expect(wq.get("vision_tower.patch_embed.proj.weight") != null and wq.get("vision_tower.blocks.0.attn.qkv.bias") != null);
+
+    const blk = qq.blocks[0];
+    const want = [_]struct { q: dflash.DflashLinear, out: u64, in: u64, group: u32 }{
+        .{ .q = blk.qkv_q.?, .out = 384, .in = 128, .group = 128 },
+        .{ .q = blk.fc2_q.?, .out = 128, .in = 192, .group = 64 },
+        .{ .q = qq.merger_fc1_q.?, .out = 512, .in = 512, .group = 128 },
+    };
+    for (want) |c| {
+        try std.testing.expectEqual(@as(u32, 8), c.q.bits);
+        try std.testing.expectEqual(c.group, c.q.group_size);
+        try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(c.q.w));
+        try std.testing.expectEqual(@as(c_int, @intCast(c.in / c.group)), mlx.getShape(c.q.scales)[1]);
+        const bytes = mlx.mlx_array_size(c.q.w) * 4 + (mlx.mlx_array_size(c.q.scales) + mlx.mlx_array_size(c.q.biases)) * 2;
+        try std.testing.expectEqual(common.quantizedBytes(c.out, c.in, c.group), bytes);
+    }
+    try std.testing.expect(qq.blocks[0].qkv_w.ctx == null and qb.blocks[0].qkv_q == null);
+
+    var px: [16 * 96]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    for (&px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+    const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 16, 96 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+    const got = try qq.forward(patches, 4, 4);
+    defer _ = mlx.mlx_array_free(got);
+    const ref = try qb.forward(patches, 4, 4);
+    defer _ = mlx.mlx_array_free(ref);
+    const g = try common.gap(got, ref, qq.s);
+    errdefer std.debug.print("[qwen-vision] tiny q8 vs bf16 cosine={d:.6}\n", .{g.cos});
+    try std.testing.expect(g.cos > 0.999);
+}
+
+fn qwenTowerKey(key: []const u8, _: void) bool {
+    for (VISION_PREFIXES) |p| if (std.mem.startsWith(u8, key, p)) return true;
+    return false;
+}
+
+fn gapLine(name: []const u8, g: common.Gap) void {
+    std.debug.print("[vision-q8] {s}: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ name, g.cos, g.max_abs, g.rel_rms });
+}
+
+test "qwen vision: the requantized tower stays within bf16's drift of the bf16 tower on house.jpeg at 640 tokens" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try @import("test_models.zig").packPath(&dir_buf, "Qwen3.8-Flash-Next-Sushi-4bpw");
+    var config = model_mod.parseConfig(io, a, dir) catch return error.SkipZigTest;
+    defer config.deinit(a);
+    if (!config.qwen_vision) return error.SkipZigTest;
+    const house = try common.loadHouse(a, io);
+    defer a.free(house.rgb);
+
+    // The picture stretched to a 40 x 64 patch grid: 2,560 patches, 640 merged tokens.
+    const rh: u32 = 40 * config.qv_patch;
+    const rw: u32 = 64 * config.qv_patch;
+    const chw = try a.alloc(f32, 3 * @as(usize, rh) * rw);
+    defer a.free(chw);
+    try common.resizeRgbNormalizedChw(a, chw, house.rgb, house.h, house.w, rh, rw, .bicubic);
+    const n: usize = 40 * 64;
+    const feat: usize = 3 * @as(usize, config.qv_temporal_patch) * config.qv_patch * config.qv_patch;
+    const pv = try a.alloc(f32, n * feat);
+    defer a.free(pv);
+    common.buildPixelValues(pv, chw, 3, rh, rw, config.qv_patch, config.qv_temporal_patch, config.qv_merge);
+    const patches = mlx.mlx_array_new_data(pv.ptr, &[_]c_int{ @intCast(n), @intCast(feat) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+
+    const source = @import("dsv41_source.zig");
+    var wb = try source.loadWhere(io, a, dir, {}, qwenTowerKey);
+    defer wb.deinit();
+    var wq = try source.loadWhere(io, a, dir, {}, qwenTowerKey);
+    defer wq.deinit();
+    var active: [2]usize = undefined;
+    _ = mlx.mlx_get_active_memory(&active[0]);
+    var load = @import("io_util.zig").Stopwatch.init(io);
+    var qq = try QwenVision.init(a, config, &wq);
+    const load_ms = @as(f64, @floatFromInt(load.read())) / 1e6;
+    defer qq.deinit();
+    _ = mlx.mlx_get_active_memory(&active[1]);
+    var qb = try QwenVision.initWith(a, config, &wb, false);
+    defer qb.deinit();
+
+    const got = try qq.forward(patches, 40, 64);
+    defer _ = mlx.mlx_array_free(got);
+    const ref = try qb.forward(patches, 40, 64);
+    defer _ = mlx.mlx_array_free(ref);
+    const g = try common.gap(got, ref, qq.s);
+
+    if (std.c.getenv("SUSHI_VISION_Q8_REPORT") != null) {
+        gapLine("merger output", g);
+        std.debug.print("[vision-q8] init {d:.0} ms; active {d:.3} GB -> {d:.3} GB\n", .{ load_ms, @as(f64, @floatFromInt(active[0])) / 1e9, @as(f64, @floatFromInt(active[1])) / 1e9 });
+        for ([_]*QwenVision{ &qb, &qq }, [_][]const u8{ "bf16", "q8" }) |d, name| {
+            mlx.resetTransientPeak();
+            const o = try d.forward(patches, 40, 64);
+            _ = mlx.mlx_array_free(o);
+            std.debug.print("[vision-q8] {s} encode transient peak {d:.3} GiB\n", .{ name, @as(f64, @floatFromInt(mlx.transientPeak())) / (1 << 30) });
+        }
+        const reps = 9;
+        var t: [2][reps]f64 = undefined;
+        for (0..reps + 1) |i| {
+            for ([_]*QwenVision{ &qb, &qq }, 0..) |d, arm| {
+                var sw = @import("io_util.zig").Stopwatch.init(io);
+                const o = try d.forward(patches, 40, 64);
+                _ = mlx.mlx_array_free(o);
+                if (i > 0) t[arm][i - 1] = @as(f64, @floatFromInt(sw.read())) / 1e6;
+            }
+        }
+        std.debug.print("[vision-q8] 640 tokens, median of {d}: bf16 {d:.1} ms, q8 {d:.1} ms\n", .{ reps, common.median(&t[0]), common.median(&t[1]) });
+    }
+    try std.testing.expect(g.cos > 0.998);
 }

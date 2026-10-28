@@ -407,6 +407,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - **A streamed `--vision` load bills its tower in the ssd budget and proves its largest image beside it**: the load
   admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
   ([engine-expert-streaming](engine-expert-streaming.md#vision)).
+- **Qwen's tower is billed as it is held**: the load requantizes the tower's big matrices to affine 8-bit
+  ([qwen4-arch](qwen4-arch.md#vision-tower)), so `indexedResidentSplit` bills 597,327,776 B, not the stored 897,862,112 B,
+  to a resident load and to a streamed `--vision` ledger alike (the rule is `qwen_vision.quantGroupAtLoad` on the shard headers).
 - **DeepSeek-V4.1's tower is billed in that term**: `dsv41_source.visionBytes` sums the pack's `vision.*`, `aligner.*`,
   `image_*` and each layer's `bias_vl` as the load holds them (the 322 requantized matrices as affine 8-bit g128 codes, `dsv41_vision.quantizedBytes`, the rest bf16 as stored, plus 40 f32 biases of 1,536 bytes on an STQ pack), so the
   `[expert-stream] ssd budget` line reads `vision 0.50 GB` by default (`0.00` under `--no-vision`, or with `vision: false`);

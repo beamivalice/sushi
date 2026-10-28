@@ -2529,6 +2529,13 @@ pub const Weights = struct {
         }
     }
 
+    /// Takes `name` out of the map: the caller owns the array, or null when it is absent.
+    pub fn take(self: *Weights, name: []const u8) ?mlx.mlx_array {
+        const removed = self.map.fetchRemove(name) orelse return null;
+        self.allocator.free(removed.key);
+        return removed.value;
+    }
+
     pub fn count(self: *const Weights) u32 {
         return @intCast(self.map.count());
     }
@@ -2709,6 +2716,11 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
             var size: u64 = @intCast(end - start);
             if (tensor.value_ptr.object.get("shape")) |shape| if (shape == .array and shape.array.items.len != 0 and shape.array.items[0] == .integer) {
                 size += expert_quant.rateGroupMetaBytes(canonical, std.math.cast(u64, shape.array.items[0].integer) orelse 0);
+            };
+            // The Qwen tower's matrices are requantized at load (`qwen_vision.QwenVision.init`): billed as the codes.
+            if (is_vision) if (@import("vision_common.zig").headerMatrix(tensor.value_ptr.object)) |m| {
+                if (@import("qwen_vision.zig").quantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
+                    size = @import("vision_common.zig").quantizedBytes(m.dims[0], m.dims[1], group);
             };
             const bucket = if (is_mtp) &mtp else if (is_vision) &tower else &total;
             bucket.* = std.math.add(u64, bucket.*, size) catch return error.InvalidSafetensorsHeader;

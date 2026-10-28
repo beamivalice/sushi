@@ -94,7 +94,7 @@ pub fn loadTower(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8)
     }.f);
 }
 
-fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, ctx: anytype, comptime keep: anytype) !model.Weights {
+pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, ctx: anytype, comptime keep: anytype) !model.Weights {
     var weights = model.Weights.init(allocator);
     errdefer weights.deinit();
     var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
@@ -207,15 +207,8 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
 
 /// The `[out, in]` of a header entry the tower requantizes at load (`dsv41_vision.quantizesAtLoad`), else null.
 fn requantizedShape(key: []const u8, entry: std.json.ObjectMap) ?[2]u64 {
-    const dtype = entry.get("dtype") orelse return null;
-    const shape = entry.get("shape") orelse return null;
-    if (dtype != .string or shape != .array or shape.array.items.len != 2) return null;
-    var dims: [2]u64 = undefined;
-    for (shape.array.items, &dims) |item, *d| {
-        if (item != .integer or item.integer < 0) return null;
-        d.* = @intCast(item.integer);
-    }
-    return if (vision.quantizesAtLoad(key, std.mem.eql(u8, dtype.string, "BF16"), &dims)) dims else null;
+    const m = @import("vision_common.zig").headerMatrix(entry) orelse return null;
+    return if (vision.quantizesAtLoad(key, m.bf16, &m.dims)) m.dims else null;
 }
 
 /// Bytes a stored tensor holds once built. From `import_min_bytes` it lives in its own page-rounded mapping, built

@@ -196,7 +196,6 @@ pub fn preprocess(allocator: std.mem.Allocator, rgb: []const u8, src_h: u32, src
     return .{ .bytes = bytes, .h = plan.h, .w = plan.w, .grid_h = plan.vit_h, .grid_w = plan.vit_w };
 }
 
-pub const QUANT_BITS: u32 = 8;
 pub const QUANT_GROUP: u32 = 128;
 
 /// Does the tower run the pack tensor `key` quantized? The ViT blocks' and the aligner's bf16 weight matrices
@@ -212,7 +211,7 @@ pub fn quantizesAtLoad(key: []const u8, bf16: bool, shape: []const u64) bool {
 
 /// Bytes a quantized `[out, in]` weight holds: the codes and a bf16 scale and bias per group.
 pub fn quantizedBytes(out: u64, in: u64) u64 {
-    return out * in * QUANT_BITS / 8 + 2 * 2 * out * (in / QUANT_GROUP);
+    return common.quantizedBytes(out, in, QUANT_GROUP);
 }
 
 /// A linear: `w` is a bf16 `[out, in]`, or `q` holds it as MLX affine codes.
@@ -224,7 +223,7 @@ const Lin = struct {
     fn apply(self: Lin, sc: *Scope, x: A) !A {
         const y = if (self.q) |q| blk: {
             var o = mlx.mlx_array_new();
-            break :blk try sc.res(mlx.mlx_quantized_matmul(&o, x, q.w, q.scales, q.biases, true, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), "affine", sc.s), &o);
+            break :blk try sc.res(common.quantizedMatmul(&o, x, q, sc.s), &o);
         } else try sc.matmul(x, try sc.t2(self.w));
         return if (self.bias.ctx != null) sc.add(y, self.bias) else y;
     }
@@ -269,14 +268,8 @@ fn lin(ld: *Load, comptime fmt: []const u8, args: anytype, out_dim: usize, in_di
     const name = try std.fmt.bufPrint(&name_buf, fmt ++ ".weight", args);
     if (!ld.quantize or !quantizesAtLoad(name, true, &.{ out_dim, in_dim })) return l;
     // The bf16 copy goes as soon as its codes exist: the load holds one linear's worth of both.
-    var q = try dflash.quantizeDense(l.w, QUANT_BITS, QUANT_GROUP, ld.s);
-    errdefer q.deinit();
-    try mlx.check(mlx.mlx_array_eval(q.w));
-    try mlx.check(mlx.mlx_array_eval(q.scales));
-    try mlx.check(mlx.mlx_array_eval(q.biases));
-    const removed = ld.weights.map.fetchRemove(name).?;
-    _ = mlx.mlx_array_free(removed.value);
-    ld.weights.allocator.free(removed.key);
+    const q = try common.requantize(l.w, QUANT_GROUP, ld.s);
+    _ = mlx.mlx_array_free(ld.weights.take(name).?);
     ld.linears += 1;
     ld.bf16_bytes += 2 * out_dim * in_dim;
     ld.quant_bytes += quantizedBytes(out_dim, in_dim);
@@ -354,7 +347,7 @@ pub const Dsv41Vision = struct {
         log.info("Vision encoder: DeepSeek-V4.1 ViT (depth={d}, hidden={d}, heads={d}, patch={d}, downsample={d})\n", .{ v.layers, d, v.heads, v.patch, v.downsample });
         if (ld.linears > 0) log.info("[vision] tower requantized at load: bf16 {d:.2} GB -> affine{d} g{d} {d:.2} GB ({d} linears, {d} ms)\n", .{
             @as(f64, @floatFromInt(ld.bf16_bytes)) / 1e9,
-            QUANT_BITS,
+            common.QUANT_BITS,
             QUANT_GROUP,
             @as(f64, @floatFromInt(ld.quant_bytes)) / 1e9,
             ld.linears,
@@ -809,20 +802,7 @@ test "dsv41 vision: the load requantizes the block and aligner matrices of whole
 }
 
 fn putBf16(w: *model.Weights, name: []const u8, shape: []const c_int, seed: u64, scale: f32, base: f32) !void {
-    var n: usize = 1;
-    for (shape) |d| n *= @intCast(d);
-    const data = try testing.allocator.alloc(f32, n);
-    defer testing.allocator.free(data);
-    var prng = std.Random.DefaultPrng.init(seed);
-    for (data) |*x| x.* = base + scale * (prng.random().float(f32) * 2 - 1);
-    const f = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
-    defer _ = mlx.mlx_array_free(f);
-    var b = mlx.mlx_array_new();
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, cpu));
-    try mlx.check(mlx.mlx_array_eval(b));
-    try w.map.put(try testing.allocator.dupe(u8, name), b);
+    try common.putRandomBf16(w.allocator, &w.map, name, shape, seed, scale, base);
 }
 
 const tiny_vision: cfg_mod.Vision = .{ .layers = 2, .hidden = 256, .heads = 4, .inter = 256, .patch = 4, .rope_theta = 10000, .downsample = 2, .max_tokens = 64, .min_pixels = 0, .max_wh_ratio = 0 };
@@ -923,60 +903,16 @@ test "dsv41 vision: requantized tower holds affine 8-bit g128 codes, frees the b
 
 // ── The requantized tower against the bf16 tower on a real image (the pack's tower, SUSHI_MODELS_DIR) ──
 
-const Gap = struct { cos: f64, max_abs: f64, rel_rms: f64 };
-
-fn gap(got: A, want: A, s: mlx.mlx_stream) !Gap {
-    var f: [2]A = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-    defer for (f) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    try mlx.check(mlx.mlx_astype(&f[0], got, .float32, s));
-    try mlx.check(mlx.mlx_astype(&f[1], want, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(f[0]));
-    try mlx.check(mlx.mlx_array_eval(f[1]));
-    const n = mlx.mlx_array_size(f[0]);
-    const a = mlx.mlx_array_data_float32(f[0]).?[0..n];
-    const b = mlx.mlx_array_data_float32(f[1]).?[0..n];
-    var ab: f64 = 0;
-    var aa: f64 = 0;
-    var bb: f64 = 0;
-    var dd: f64 = 0;
-    var mx: f64 = 0;
-    for (a, b) |x, y| {
-        const dx: f64 = x;
-        const dy: f64 = y;
-        ab += dx * dy;
-        aa += dx * dx;
-        bb += dy * dy;
-        dd += (dx - dy) * (dx - dy);
-        mx = @max(mx, @abs(dx - dy));
-    }
-    return .{ .cos = ab / @sqrt(aa * bb), .max_abs = mx, .rel_rms = @sqrt(dd / bb) };
-}
-
-fn median(xs: []f64) f64 {
-    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
-    return xs[xs.len / 2];
-}
-
 test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 tower on house.jpeg at 642 tokens" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     var tower_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tower_path = try fixtureFile(&tower_buf, "tower.safetensors");
-    const jpeg = std.Io.Dir.cwd().readFileAlloc(testing.io, "tests/fixtures/house.jpeg", a, .limited(1 << 24)) catch return error.SkipZigTest;
-    defer a.free(jpeg);
-    const stb = @import("stb");
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var ch: c_int = 0;
-    const rgba = stb.stbi_load_from_memory(jpeg.ptr, @intCast(jpeg.len), &w, &h, &ch, 4) orelse return error.SkipZigTest;
-    defer stb.stbi_image_free(rgba);
-    const src_w: u32 = @intCast(w);
-    const src_h: u32 = @intCast(h);
-    const rgb = try a.alloc(u8, @as(usize, src_w) * src_h * 3);
-    defer a.free(rgb);
-    for (0..@as(usize, src_w) * src_h) |i| @memcpy(rgb[i * 3 ..][0..3], rgba[i * 4 ..][0..3]);
+    const house = try common.loadHouse(a, testing.io);
+    defer a.free(house.rgb);
+    const src_w = house.w;
+    const src_h = house.h;
+    const rgb = house.rgb;
 
     // The picture letterboxed on a 1302 x 812 canvas: a 58 x 93 ViT grid and 20 x 31 aligner cells, 642 span tokens.
     const cw: u32 = 1302;
@@ -1017,7 +953,7 @@ test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 
         defer _ = mlx.mlx_array_free(got);
         const want = try db.towerAfter(patches, px.grid_h, px.grid_w, st.blocks);
         defer _ = mlx.mlx_array_free(want);
-        const g = try gap(got, want, dq.s);
+        const g = try common.gap(got, want, dq.s);
         worst_cos = @min(worst_cos, g.cos);
         if (report) std.debug.print("[vision-q8] {s}: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ st.name, g.cos, g.max_abs, g.rel_rms });
     }
@@ -1025,19 +961,19 @@ test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 
     defer _ = mlx.mlx_array_free(tower_q);
     const tower_b = try db.towerHidden(patches, px.grid_h, px.grid_w);
     defer _ = mlx.mlx_array_free(tower_b);
-    const gt = try gap(tower_q, tower_b, dq.s);
+    const gt = try common.gap(tower_q, tower_b, dq.s);
     const span_q = try dq.forward(patches, px.grid_h, px.grid_w);
     defer _ = mlx.mlx_array_free(span_q);
     const span_b = try db.forward(patches, px.grid_h, px.grid_w);
     defer _ = mlx.mlx_array_free(span_b);
-    const gs = try gap(span_q, span_b, dq.s);
+    const gs = try common.gap(span_q, span_b, dq.s);
     if (report) {
         std.debug.print("[vision-q8] final norm: cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ gt.cos, gt.max_abs, gt.rel_rms });
         std.debug.print("[vision-q8] span (aligner out): cos {d:.6} max|d| {d:.4} rel-rms {d:.5}\n", .{ gs.cos, gs.max_abs, gs.rel_rms });
         std.debug.print("[vision-q8] init {d:.0} ms; active {d:.3} GB -> {d:.3} GB\n", .{ load_ms, @as(f64, @floatFromInt(active[0])) / 1e9, @as(f64, @floatFromInt(active[1])) / 1e9 });
         var probe: [2]usize = undefined;
         _ = mlx.mlx_get_active_memory(&probe[0]);
-        var one = try dflash.quantizeDense(wb.get("aligner.w1.weight").?, QUANT_BITS, QUANT_GROUP, dq.s);
+        var one = try dflash.quantizeDense(wb.get("aligner.w1.weight").?, common.QUANT_BITS, QUANT_GROUP, dq.s);
         for ([_]A{ one.w, one.scales, one.biases }) |x| try mlx.check(mlx.mlx_array_eval(x));
         _ = mlx.mlx_get_active_memory(&probe[1]);
         one.deinit();
@@ -1068,7 +1004,7 @@ test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 
                 }
             }
         }
-        std.debug.print("[vision-q8] 642 tokens, median of {d}: bf16 tower {d:.1} ms, +aligner {d:.1} ms; q8 tower {d:.1} ms, +aligner {d:.1} ms\n", .{ reps, median(&t[0]), median(&t[1]), median(&t[2]), median(&t[3]) });
+        std.debug.print("[vision-q8] 642 tokens, median of {d}: bf16 tower {d:.1} ms, +aligner {d:.1} ms; q8 tower {d:.1} ms, +aligner {d:.1} ms\n", .{ reps, common.median(&t[0]), common.median(&t[1]), common.median(&t[2]), common.median(&t[3]) });
     }
     try testing.expect(worst_cos > 0.998);
     try testing.expect(gt.cos > 0.998);
