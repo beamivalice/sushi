@@ -263,54 +263,6 @@ pub fn buildRuns(alloc: std.mem.Allocator, experts: []const u32) !RunTable {
     return .{ .start = start, .len = len, .eid = eid, .n = n };
 }
 
-const GEMV_SOURCE: [:0]const u8 =
-    \\uint gid = uint(thread_position_in_grid.x);
-    \\if (gid >= uint(ODIM)) return;
-    \\constexpr uint TILE = 16u;
-    \\constexpr uint N = uint(NHW);
-    \\constexpr uint PACKED_HW = N;
-    \\constexpr uint word_count = N / 2u;
-    \\constexpr uint IN_TILES = uint(IDIM) / TILE;
-    \\constexpr uint OUT_TILES = uint(ODIM) / TILE;
-    \\const uint tn = gid / TILE;
-    \\const uint local = gid % TILE;
-    \\float acc = 0.0f;
-    \\for (uint tk = 0u; tk < IN_TILES; tk++) {
-    \\  const device ushort* tile = trellis + (tk * OUT_TILES + tn) * PACKED_HW;
-    \\  ushort cw[256];
-    \\  for (uint th = 0u; th < 128u; th++) {
-    \\    const exl3_win wv = exl3_pair_window(th * 2u, N);
-    \\    const uint a = uint(tile[wv.i0 * 2u]) | (uint(tile[wv.i0 * 2u + 1u]) << 16u);
-    \\    const uint b = uint(tile[wv.i1 * 2u]) | (uint(tile[wv.i1 * 2u + 1u]) << 16u);
-    \\    const ulong merged = (ulong(a) << 32) | ulong(b);
-    \\    const uint funnel = uint(merged >> wv.sh);
-    \\    cw[th * 2u] = ushort((funnel >> wv.fresh) & 0xffffu);
-    \\    cw[th * 2u + 1u] = ushort(funnel & 0xffffu);
-    \\  }
-    \\  for (uint slot = 0u; slot < 256u; slot++) {
-    \\    const uint lane = slot / 8u;
-    \\    const uint s = slot % 8u;
-    \\    const uint row0 = (lane & 3u) * 2u;
-    \\    const uint col0 = lane >> 2u;
-    \\    uint pos;
-    \\    switch (s) {
-    \\      case 0u: pos = row0 * 16u + col0; break;
-    \\      case 1u: pos = (row0 + 1u) * 16u + col0; break;
-    \\      case 2u: pos = (row0 + 8u) * 16u + col0; break;
-    \\      case 3u: pos = (row0 + 9u) * 16u + col0; break;
-    \\      case 4u: pos = row0 * 16u + col0 + 8u; break;
-    \\      case 5u: pos = (row0 + 1u) * 16u + col0 + 8u; break;
-    \\      case 6u: pos = (row0 + 8u) * 16u + col0 + 8u; break;
-    \\      default: pos = (row0 + 9u) * 16u + col0 + 8u; break;
-    \\    }
-    \\    if ((pos % 16u) != local) continue;
-    \\    const float w = exl3_slot(cw, slot);
-    \\    acc += float(x[tk * TILE + (pos / 16u)]) * w;
-    \\  }
-    \\}
-    \\y[gid] = half(exl3_out(acc));
-;
-
 const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\threadgroup float partial[2 * 256];
     \\uint ot = uint(threadgroup_position_in_grid.x);
@@ -1026,8 +978,6 @@ var gemm_simdmat_force: ?bool = null;
 var gemm_simdmat_engaged: bool = false;
 var prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var gemv_kernel: KernelSlots = no_kernels;
-var gemv_engaged: bool = false;
 
 /// How the next dispatch decodes: the pack's codebook and codeword window.
 /// A weight kernel is built per (codebook, window), so the slots below are
@@ -1346,8 +1296,6 @@ fn codebookKernelWith(slots: *KernelSlots, comptime base: [:0]const u8, ins: []c
         },
     }
 }
-
-const GemvKey = struct { in_dim: c_int, out_dim: c_int, n: u32 };
 
 pub fn CfgCache(comptime Key: type, comptime CAP: usize) type {
     return struct {
@@ -2043,30 +1991,6 @@ pub fn finishIndexedAs(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_arr
         break :blk c;
     };
     return applyUnary(s, try getFinishKernel(), &.{ inner, svh, slots }, cfg);
-}
-
-fn getGemvKernel() !mlx.mlx_fast_metal_kernel {
-    const ins = [_][*:0]const u8{ "x", "trellis" };
-    const outs = [_][*:0]const u8{"y"};
-    return codebookKernel(&gemv_kernel, "sushi_exl3_k4_mcg_gemv", &ins, &outs, GEMV_SOURCE);
-}
-
-var inner_gemv_cfgs: CfgCache(GemvKey, 8) = .{};
-
-fn gemvConfig(in_dim: c_int, out_dim: c_int, rate: exl3.Rate) !mlx.mlx_fast_metal_kernel_config {
-    const key = GemvKey{ .in_dim = in_dim, .out_dim = out_dim, .n = rate.n };
-    if (inner_gemv_cfgs.get(key)) |c| return c;
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    const out_shape = [_]c_int{out_dim};
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 1, .float16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, out_dim, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IDIM", in_dim));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ODIM", out_dim));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", @intCast(rate.n)));
-    inner_gemv_cfgs.put(key, cfg);
-    return cfg;
 }
 
 const INDEXED_COOP_SOURCE: [:0]const u8 =
@@ -4053,95 +3977,6 @@ pub fn moeSwigluClampedWithShared(
     return downFinishReduce(s, original_order, down_svh, slots, scores, hidden, rows, topk, out_dtype);
 }
 
-pub fn prefillDecodeGatherMm(
-    s: mlx.mlx_stream,
-    x: mlx.mlx_array,
-    gate_pub: mlx.mlx_array,
-    up_pub: mlx.mlx_array,
-    down_pub: mlx.mlx_array,
-    slots: mlx.mlx_array,
-    scores: mlx.mlx_array,
-    rows: c_int,
-    hidden: c_int,
-    inter: c_int,
-    topk: c_int,
-) !mlx.mlx_array {
-    const no_idx = mlx.mlx_array{ .ctx = null };
-    var x4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x4);
-    try mlx.check(mlx.mlx_reshape(&x4, x, &[_]c_int{ rows, 1, 1, hidden }, 4, s));
-    var g4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g4);
-    try mlx.check(mlx.mlx_gather_mm(&g4, x4, gate_pub, no_idx, slots, false, s));
-    var up4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(up4);
-    try mlx.check(mlx.mlx_gather_mm(&up4, x4, up_pub, no_idx, slots, false, s));
-    var g = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g);
-    try mlx.check(mlx.mlx_squeeze(&g, g4, s));
-    var u = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(u);
-    try mlx.check(mlx.mlx_squeeze(&u, up4, s));
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
-    var silu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(silu);
-    try mlx.check(mlx.mlx_multiply(&silu, g, sig, s));
-    var h = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(h);
-    try mlx.check(mlx.mlx_multiply(&h, silu, u, s));
-    var h4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(h4);
-    try mlx.check(mlx.mlx_reshape(&h4, h, &[_]c_int{ rows, topk, 1, inter }, 4, s));
-    var d4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(d4);
-    try mlx.check(mlx.mlx_gather_mm(&d4, h4, down_pub, no_idx, slots, false, s));
-    var d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(d);
-    try mlx.check(mlx.mlx_squeeze(&d, d4, s));
-    var sc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sc);
-    try mlx.check(mlx.mlx_astype(&sc, scores, mlx.mlx_array_dtype(d), s));
-    var sc3 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sc3);
-    try mlx.check(mlx.mlx_reshape(&sc3, sc, &[_]c_int{ rows, topk, 1 }, 3, s));
-    var weighted = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(weighted);
-    try mlx.check(mlx.mlx_multiply(&weighted, d, sc3, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_sum_axis(&out, weighted, 1, false, s));
-    return out;
-}
-
-pub fn innerGemvF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array) !mlx.mlx_array {
-    const xsh = mlx.getShape(x);
-    const tsh = mlx.getShape(trellis);
-    if (xsh.len != 1 or tsh.len != 3) return error.BadExl3Shape;
-    const in_dim = xsh[0];
-    const out_dim = tsh[1] * 16;
-    const rate = try packedRate(tsh[2]);
-    if (tsh[0] * 16 != in_dim) return error.BadExl3Shape;
-    const cfg = try gemvConfig(in_dim, out_dim, rate);
-    const inputs_arr = [_]mlx.mlx_array{ x, trellis };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
-    const kernel = try getGemvKernel();
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
-    if (!gemv_engaged) {
-        gemv_engaged = true;
-        log.info("[expert-exl3] engaged in={d} out={d}\n", .{ in_dim, out_dim });
-    }
-    return out;
-}
-
 pub fn moeSwigluHost(
     alloc: std.mem.Allocator,
     x: []const f32,
@@ -4211,88 +4046,6 @@ test "exl3 packedRate reads n from the last dim and refuses outside K1..K8" {
     try t.expectError(error.BadExl3Shape, packedRate(130));
 }
 
-/// The fixture is `align(2)` so the u16 view below is a cast the caller has
-/// already paid for: a byte-aligned blob is a compile error, not a Debug panic.
-fn metalInnerGemvFixture(fixture: []align(2) const u8, rate: exl3.Rate, dec: exl3.Decode) !void {
-    setDecodeParams(dec);
-    defer setDecodeParams(.mul1);
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
-    const header = fixture[8 .. 8 + header_len];
-    const data = fixture[8 + header_len ..];
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
-    defer parsed.deinit();
-    const trellis_meta = parsed.value.object.get("trellis").?.object;
-    const t_off: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
-    const t_end: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
-    const trellis_bits: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, data[t_off..t_end]));
-    var x: [128]f32 = undefined;
-    var prng = std.Random.DefaultPrng.init(11);
-    const rnd = prng.random();
-    for (&x) |*v| v.* = rnd.float(f32) * 2 - 1;
-    const xf16 = try alloc.alloc(u16, 128);
-    for (x, xf16) |v, *b| b.* = exl3.f32ToF16Bits(v);
-    const xf = try alloc.alloc(f32, 128);
-    for (xf16, xf) |b, *v| v.* = exl3.f16BitsToF32(b);
-    const x_arr = mlx.mlx_array_new_data(xf16.ptr, &[_]c_int{128}, 1, .float16);
-    defer _ = mlx.mlx_array_free(x_arr);
-    const tr_arr = mlx.mlx_array_new_data(trellis_bits.ptr, &[_]c_int{ 8, 8, @intCast(rate.halfwords()) }, 3, .uint16);
-    defer _ = mlx.mlx_array_free(tr_arr);
-    const got = try innerGemvF16(s, x_arr, tr_arr);
-    defer _ = mlx.mlx_array_free(got);
-    var contig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(contig);
-    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
-    try mlx.check(mlx.mlx_array_eval(contig));
-    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
-    var host: [128]f32 = undefined;
-    exl3.innerGemv(trellis_bits, xf, 128, 128, rate, dec, &host);
-    // The GPU fuses multiply-add and may order the 128 products differently from the host, and the sums cancel
-    // (outputs ~1e-3 from terms ~1), so an output can land one f16 value away from the host's. The pair codec
-    // takes that slack, one value in at most a few outputs; its decode is pinned bit for bit by the exhaustive
-    // host == Metal decode tests, and every other codebook keeps the exact bytes.
-    var off: usize = 0;
-    for (0..128) |i| {
-        const bits: u16 = @bitCast(src[i]);
-        const want = exl3.f32ToF16Bits(host[i]);
-        if (bits == want) continue;
-        try t.expect(dec.codebook == .pair1);
-        try t.expectEqual(@as(u16, 1), @as(u16, @intCast(@abs(@as(i32, bits) - @as(i32, want)))));
-        off += 1;
-    }
-    try t.expect(off <= 4);
-}
-
-test "exl3 K3 Metal inner GEMV matches the host tile decode" {
-    try metalInnerGemvFixture(exl3.fixtures.k3, exl3.Rate.fromK(3), .mul1);
-}
-
-test "exl3 K2 Metal inner GEMV matches the host tile decode" {
-    try metalInnerGemvFixture(exl3.fixtures.k2, exl3.Rate.fromK(2), .mul1);
-}
-
-test "exl3 K2.5 MCG Metal inner GEMV matches the host tile decode" {
-    try metalInnerGemvFixture(exl3.fixtures.k2p5_mcg, .{ .n = 40 }, .mcg);
-}
-
-test "exl3 K3 MCG Metal inner GEMV matches the host tile decode" {
-    try metalInnerGemvFixture(exl3.fixtures.k3_mcg, .{ .n = 48 }, .mcg);
-}
-
-// A w16 bitstream is a valid w12 bitstream — only the value each window decodes
-// to changes — so the existing fixtures are the narrowed packs too, scored
-// against the host reference under the same width.
-test "exl3 Metal inner GEMV matches the host tile decode at a narrowed codeword window" {
-    try metalInnerGemvFixture(exl3.fixtures.k2p5_mcg, .{ .n = 40 }, .{ .codebook = .mcg, .window = .w12 });
-    try metalInnerGemvFixture(exl3.fixtures.k2p5_mcg, .{ .n = 40 }, .{ .codebook = .mcg, .window = .w14 });
-    try metalInnerGemvFixture(exl3.fixtures.k4, exl3.Rate.fromK(4), .{ .codebook = .mul1, .window = .w12 });
-}
-
 fn indexedParityStats(rate: exl3.Rate, in_dim: usize, out_dim: usize, e: usize, topk: usize, seed: u64, dec: exl3.Decode, mutate: Exl3Mutation) !Exl3GemmParityStats {
     setDecodeParams(dec);
     defer setDecodeParams(.mul1);
@@ -4343,98 +4096,12 @@ test "exl3 K2 cooperative indexed GEMV matches host MUL1 tile decode" {
     try indexedParity(exl3.Rate.fromK(2), 128, 128, 4, 10, 19, .mul1);
 }
 
-test "exl3 K3 Metal inner GEMV matches host on production shape" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    setDecodeParams(.mul1);
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const in_dim: usize = 2560;
-    const out_dim: usize = 640;
-    const k: u32 = 3;
-    const packed_n = exl3.packedHalfwords(k);
-    const in_tiles = in_dim / 16;
-    const out_tiles = out_dim / 16;
-    const trellis = try alloc.alloc(u16, in_tiles * out_tiles * packed_n);
-    var prng = std.Random.DefaultPrng.init(23);
-    const rnd = prng.random();
-    for (trellis) |*v| v.* = @truncate(rnd.int(u32));
-    const xf16 = try alloc.alloc(u16, in_dim);
-    for (xf16) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
-    const x_arr = mlx.mlx_array_new_data(xf16.ptr, &[_]c_int{@intCast(in_dim)}, 1, .float16);
-    defer _ = mlx.mlx_array_free(x_arr);
-    const tr_arr = mlx.mlx_array_new_data(trellis.ptr, &[_]c_int{ @intCast(in_tiles), @intCast(out_tiles), @intCast(packed_n) }, 3, .uint16);
-    defer _ = mlx.mlx_array_free(tr_arr);
-    const got = try innerGemvF16(s, x_arr, tr_arr);
-    defer _ = mlx.mlx_array_free(got);
-    var contig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(contig);
-    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
-    try mlx.check(mlx.mlx_array_eval(contig));
-    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
-    try expectInnerGemmParity(alloc, s, src[0..out_dim], xf16, &.{0}, trellis, in_dim, out_dim, exl3.Rate.fromK(k), .mul1);
-}
-
 test "exl3 K3 cooperative indexed GEMV matches host MUL1 on production shape" {
     try indexedParity(exl3.Rate.fromK(3), 2560, 640, 4, 10, 23, .mul1);
 }
 
 test "exl3 K2 cooperative indexed GEMV matches host MUL1 on production shape" {
     try indexedParity(exl3.Rate.fromK(2), 2560, 640, 4, 10, 29, .mul1);
-}
-
-test "exl3 K4 Metal inner GEMV matches the host tile decode" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    setDecodeParams(.mul1);
-    const fixture = exl3.fixtures.k4;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
-    const header = fixture[8 .. 8 + header_len];
-    const data = fixture[8 + header_len ..];
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
-    defer parsed.deinit();
-    const trellis_meta = parsed.value.object.get("trellis").?.object;
-    const inner_meta = parsed.value.object.get("inner").?.object;
-    const t_off: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[0].integer);
-    const t_end: usize = @intCast(trellis_meta.get("data_offsets").?.array.items[1].integer);
-    const i_off: usize = @intCast(inner_meta.get("data_offsets").?.array.items[0].integer);
-    const i_end: usize = @intCast(inner_meta.get("data_offsets").?.array.items[1].integer);
-    const trellis_bits = std.mem.bytesAsSlice(u16, data[t_off..t_end]);
-    const inner_bits = std.mem.bytesAsSlice(u16, data[i_off..i_end]);
-    var x: [128]f32 = undefined;
-    var prng = std.Random.DefaultPrng.init(11);
-    const rnd = prng.random();
-    for (&x) |*v| v.* = rnd.float(f32) * 2 - 1;
-    const xf16 = try alloc.alloc(u16, 128);
-    for (x, xf16) |v, *b| b.* = exl3.f32ToF16Bits(v);
-    const x_arr = mlx.mlx_array_new_data(xf16.ptr, &[_]c_int{128}, 1, .float16);
-    defer _ = mlx.mlx_array_free(x_arr);
-    const tr_arr = mlx.mlx_array_new_data(trellis_bits.ptr, &[_]c_int{ 8, 8, 64 }, 3, .uint16);
-    defer _ = mlx.mlx_array_free(tr_arr);
-    const got = try innerGemvF16(s, x_arr, tr_arr);
-    defer _ = mlx.mlx_array_free(got);
-    var contig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(contig);
-    try mlx.check(mlx.mlx_contiguous(&contig, got, false, s));
-    try mlx.check(mlx.mlx_array_eval(contig));
-    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
-    var host: [128]f32 = undefined;
-    @memset(&host, 0);
-    for (0..128) |o| {
-        var acc: f32 = 0;
-        for (0..128) |i| acc += exl3.f16BitsToF32(xf16[i]) * exl3.f16BitsToF32(inner_bits[i * 128 + o]);
-        host[o] = exl3.f16BitsToF32(exl3.f32ToF16Bits(acc));
-    }
-    for (0..128) |i| {
-        const bits: u16 = @bitCast(src[i]);
-        try t.expectEqual(exl3.f32ToF16Bits(host[i]), bits);
-    }
 }
 
 test "exl3 verify group union unique vs assignment count" {
@@ -11200,11 +10867,6 @@ test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and
         }
         for (SPEC1_WIDE_NS) |n| for (0..PARITY_SEEDS) |i| try indexedParity(.{ .n = n }, 128, 128, 4, 10, 4001 + 10 * n + i, dec);
     }
-}
-
-test "exl3 PAIR1's inner GEMV writes the host tile decode's bytes" {
-    try metalInnerGemvFixture(exl3.fixtures.k2p5_mcg, .{ .n = 40 }, PAIR1_W16);
-    try metalInnerGemvFixture(exl3.fixtures.k4, exl3.Rate.fromK(4), PAIR1_W16);
 }
 
 test "exl3 GLM lane, one-row and fused middle-down kernels keep the cooperative bytes under PAIR1" {
