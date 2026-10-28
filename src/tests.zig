@@ -47,6 +47,9 @@ test {
     _ = @import("responses.zig");
     _ = @import("ws.zig");
     _ = @import("mtp_lookup.zig");
+    _ = @import("token_history.zig");
+    _ = @import("history_publication.zig");
+    _ = @import("history.zig");
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");

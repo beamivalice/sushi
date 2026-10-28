@@ -32,6 +32,8 @@ pub fn driftStep(ema: f32) f32 {
     return 0.98 * ema + 0.02 * @as(f32, @floatFromInt(MAX_DRAFT));
 }
 
+pub const Source = enum { local, history };
+
 pub const Match = struct {
     /// Borrowed from the index.
     draft: []const u32,
@@ -40,6 +42,7 @@ pub const Match = struct {
     /// The agreement runs past the start of a line: the output copies lines, not the tail of
     /// one line whose next line it will not follow (a diff's `-`/`+`/` ` prefix, a quote).
     crosses_line: bool = true,
+    source: Source = .local,
 };
 
 pub const Index = struct {

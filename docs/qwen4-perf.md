@@ -812,3 +812,84 @@ llmprobe prints one median per context rung. Decode tok/s:
 - Streamed (`--ssd-budget-gb 32`, Sushi-2.6bpw, a 3.7k-token prompt, untimed, two requests each): DFlash2 27.9 and 30.4
   tok/s, MTP (`--mtp`) 22.8 and 29.0.
 
+## Standard warmed-history workload on M2 Max
+
+2026-10-28, base `1aececf3` plus focused history and suite repairs, ReleaseFast binary SHA-256
+`988a601f6f17e10d662cf130f64f083a20a1c30537e7baf3852002ac503151ba`.
+M2 Max / 64 GiB, macOS 27.0.1, AC, automatic fans, `taskpolicy -a`; official two-way GPU handoff per boot,
+servers reaped before release. Flash-Next STQ-2.75bpw, SSD budget 20 GiB, kv8/GDN16, context 32768,
+prefill 1024, prefix RAM 2 GiB/32 entries and disk off. Native adaptive MTP/local lookup remain enabled;
+external history is off in A and starts empty in B. These measurements predate the rebase onto `956fe27f`.
+
+All eight ABBA/BAAB boots completed the default-depth llmprobe 0.6.17 standard workload. The canonical
+client uses medium reasoning and warms history chronologically. Only its cache-bust initializer is fixed
+within each quartet; prompts, request ordering and sampling remain unchanged. The optional chat
+`ignore_eos` probe receives 400 and uses the client's own-stop fallback, so equal output work is not assumed.
+
+| metric | history off mean | history on mean | balanced change |
+|---|---:|---:|---:|
+| decode tok/s | 9.575 | 14.850 | +55.004% |
+| whole-client seconds | 1047.445 | 975.951 | -6.820% |
+| predictable decode tok/s | 14.600 | 15.450 | +5.767% |
+| novel-content decode tok/s | 10.125 | 12.625 | +24.332% |
+| batch-single tok/s | 7.000 | 7.725 | +10.523% |
+| four-stream aggregate tok/s | 12.400 | 11.925 | -3.826% |
+| 8K-context decode tok/s | 9.400 | 11.650 | +23.923% |
+| 16K-context decode tok/s | 9.975 | 11.250 | +12.719% |
+
+Changes are the geometric mean of the two within-quartet B/A ratios, not ratios of the displayed arm means.
+B boots select 285/288/294/292 history rounds and accept 1982/2005/2062/2054 drafts; all A boots select none.
+These whole-boot counters include warmups. Every boot fails the frozen busy-clock and swap-variation gates;
+slots 4–6 also record peer CPU build/test overlap. These are **unqualified observations, not a validated
+speedup**, output-quality comparison or release baseline. The four-stream regression remains included.
+This does not reproduce [mlx-serve PR #999](https://github.com/ddalcu/mlx-serve/pull/999)'s dense
+Qwen3.8-27B/M5 setting or establish its reported gain for Sushi.
+Sushi currently requires suffixes 8/32, a newline below 32, and caps drafts at 7/8; PR #999 uses 8/16,
+no newline gate and caps 7/14. The current verifier's row/state limits prevent treating that wider cap as a
+constant-only port. These source differences are not a measured attribution of the cross-engine gap.
+
+## Diverse-query history on M2 Max
+
+Same binary, hardware, launch configuration and per-boot GPU handoff as the standard workload above.
+A disables external history; B starts with an empty writable store. This is a separate workload,
+not pooled with the standard workload.
+
+Eight ABBA/BAAB boots each run 30 greedy, thinking-off SSE queries, seed47, max384 tokens, natural EOS.
+Six categories are interleaved through first-seen, exact-repeat, changed-fact/specification, unrelated,
+and delayed-repeat phases. First-seen means a new query, not necessarily globally empty history.
+All warming work remains included. Below, HTTP seconds are mean totals for each category's five requests:
+
+| category | history off s | history on s | balanced time change | rounded decode off/on tok/s |
+|---|---:|---:|---:|---:|
+| prose announcements | 91.468 | 83.687 | -8.50% | 9.795 / 11.615 |
+| incident/meeting summaries | 78.617 | 72.133 | -8.26% | 10.025 / 11.385 |
+| structured extraction | 44.147 | 42.203 | -4.40% | 12.400 / 13.575 |
+| Spanish/French translation | 39.330 | 38.349 | -2.49% | 11.400 / 12.040 |
+| arithmetic/planning | 32.654 | 34.069 | +4.32% | 12.440 / 11.965 |
+| small coding edits | 28.267 | 27.961 | -1.08% | 11.500 / 10.890 |
+| whole 30-request block | 314.482 | 298.401 | -5.11% | 11.260 / 11.912 |
+
+Time changes use the geometric mean of the two within-quartet B/A ratios. The whole-block quartet
+contrasts are -6.98% and -3.20%. Rounded decode columns are arithmetic means of request-log rates, not
+aggregate engine throughput; exact decode milliseconds were unavailable. Mean first-text TTFT is
+3.979→4.023s (+1.11% balanced), so this block does not show a TTFT improvement.
+
+| chronology phase, six requests | history off s | history on s | balanced time change |
+|---|---:|---:|---:|
+| first-seen | 70.773 | 74.795 | +5.66% |
+| exact repeat | 52.534 | 40.742 | -22.46% |
+| changed facts/specification | 68.693 | 68.250 | -0.64% |
+| unrelated | 69.020 | 73.279 | +6.20% |
+| delayed repeat | 53.461 | 41.335 | -22.74% |
+
+Enabled boots verify 432 history rounds and accept 3048 drafts in total; controls select none.
+Exact and delayed repeats account for 2760 accepted drafts. All 240 answers match bytes/counts/finishes
+by position across all eight boots, with 1943 output tokens per boot. Bounded automated checks pass 240/240;
+manual review nevertheless finds an invented no-compensation policy in 32 prose answers, 16 per arm.
+It is identical with history off/on. Natural-language validators check selected facts/format, not complete
+entailment; extraction/arithmetic and disclosed single-expression coding fixtures have exact checks.
+
+All eight boots fail the unchanged busy-clock and swap-variation gates; the first two also record CPU
+build/test overlap. These are **unqualified observations**, not a validated speedup or broad quality claim.
+The observed benefit is concentrated in repeated answers; first-seen/unrelated costs and the reasoning
+regression remain part of the result. No engine source or validator was tuned after seeing these outputs.

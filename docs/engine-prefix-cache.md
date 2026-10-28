@@ -158,6 +158,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   where the ceiling holds it beside the weights, the n-gram page cache (`page_cache_claim`) and a cold full-context
   prompt's bill (MiMo refuses rather than evicts); else that room, at most half the bill, so an outgrown session's
   trim copy fits beside it. A flag stands, `2GB` too; context sizing and the chunk pin still read the raw ask.
+- Opt-in history's retained CPU allocations (`token_history.retained_bytes`), including retired snapshots held by
+  requests, cache metadata/paths and proposal scratch, are hard-charged once in every RAM-first and SSD-first budget:
+  `(MLX active -| cache residency exclusion) +| retained history`; the n-gram page-cache claim stays separate.
+  Physical GPU-ceiling reads remain MLX-only. The inference thread refreshes budgets outside `queue_mu` at the normal
+  pre-admission tick when retained history changes, including decreases to zero; unchanged counts do not re-clamp.
+  Every refresh, including the post-unload timer, records the retained count it consumed.
 - A replacement over the budget sheds ring checkpoints (thinned as above) before the entry goes (`shedRingCheckpoints`).
 - Measured (b9dbbf53 plus this change, Sushi-3bpw, auto context 1M, kv8, MTP on; a ~200k-token three-turn session; `taskpolicy -a`,
   fans max, GPU lock per boot; 2026-09-27): unset, the budget is 11516 MB and turns 2-3 prefill in 0.35 s (199.7k

@@ -4369,15 +4369,15 @@ fn billedAutoContext(config: *const model_mod.ModelConfig) bool {
 }
 
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
-fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
+fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, budget_active: u64, chunk: u32) u32 {
     const ceiling = currentGpuMemoryCeiling(config, active_mem);
-    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk));
+    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, ceiling, budget_active, chunk));
     return resolvedContextForLoad(
         manualContext(config),
         config.pinned_context,
         ceiling,
-        active_mem,
-        ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)),
+        budget_active,
+        ctxCacheShare(ceiling, budget_active, ctxSizingCacheReserve(config)),
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
@@ -4452,11 +4452,24 @@ fn logOneSessionAsk(ask: u64, ctx_tokens: u64, one: OneSession) void {
 /// `revise` marks a post-load re-clamp (#364): the cache's own resident bytes come off the
 /// machine read so it never bills itself, and the budget lines stay quiet.
 pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle_out: *u64) u64 {
-    // RAM-first default: no idle allowance. Written first so every early return carries it.
-    idle_out.* = 0;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
-    active_mem -|= @as(usize, @intCast(@min(revise.exclude_bytes, std.math.maxInt(usize))));
+    return prefixCacheMemFrom(
+        config,
+        requested,
+        revise,
+        idle_out,
+        active_mem,
+        @import("token_history.zig").retained_bytes.load(.monotonic),
+        qwen4_mod.page_cache_claim.load(.acquire),
+    );
+}
+
+fn prefixCacheMemFrom(config: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle_out: *u64, raw_active: usize, history_retained: u64, page_claim: u64) u64 {
+    // RAM-first default: no idle allowance. Written first so every early return carries it.
+    idle_out.* = 0;
+    const active_mem = raw_active -| @as(usize, @intCast(@min(revise.exclude_bytes, std.math.maxInt(usize))));
+    const budget_active: u64 = @as(u64, active_mem) +| history_retained;
     const kv_bits: u64 = defaultKvBits(config);
     // Arch gate: the budget resolver changed three inputs at once (static ceiling, the
     // load-time context resolver, the floor-width reserve), all measured on qwen4_exp alone.
@@ -4469,12 +4482,12 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
             ctx_tokens +| slotRingBytes(config, kv_bits);
         // Context sizing and the chunk pin read the raw ask, so neither moves with this one.
-        const one = oneSessionFor(config, kv_bits, ceiling, active_mem, qwen4_mod.page_cache_claim.load(.acquire), ctx_tokens, chunk);
+        const one = oneSessionFor(config, kv_bits, ceiling, budget_active, page_claim, ctx_tokens, chunk);
         const ask = defaultPrefixCacheAskFor(config, requested, prefix_cache_mem_explicit, one.ask());
         const clamped = clampedPrefixCacheMem(
             ask,
             ceiling,
-            active_mem,
+            budget_active,
             ctx_kv,
             prefillTransientReserve(config, kv_bits, chunk),
         );
@@ -4491,24 +4504,24 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     // SSD-first takes the budget before the RAM-first plan: its resident entry IS the live KV.
     const ssd_chunk: u64 = pinPrefillChunk(config);
     // Not `getEffectiveContextLength`: on an auto boot it is still unpinned here.
-    const ssd_ctx_kv: u64 = ssdFirstSessionKvBytes(config, kv_bits, staticGpuMemoryCeiling(), active_mem, @intCast(ssd_chunk));
+    const ssd_ctx_kv: u64 = ssdFirstSessionKvBytes(config, kv_bits, staticGpuMemoryCeiling(), budget_active, @intCast(ssd_chunk));
     // Static ceiling on both arms (the budget is a property of the machine), and the clamp
     // reserve at the same width `planHotCache` reserves for: the ladder floor on an arch that
     // re-bills per request. The session is billed at the pinned width, the budget at the floor.
     const ssd_clamp_reserve: u64 = prefillTransientReserve(config, kv_bits, clampReserveWidth(config, @intCast(ssd_chunk)));
-    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out, revise.quiet)) |b| return b;
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), budget_active, ssd_ctx_kv, ssd_clamp_reserve, idle_out, revise.quiet)) |b| return b;
     // Pin first, then hand the pinned width in as the override.
     const pinned: u32 = pinPrefillChunk(config);
     // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
-    const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, pinned);
+    const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, budget_active, pinned);
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
-    const one = oneSessionFor(config, kv_bits, staticGpuMemoryCeiling(), active_mem, qwen4_mod.page_cache_claim.load(.acquire), ctx_tokens, clampReserveWidth(config, pinned));
+    const one = oneSessionFor(config, kv_bits, staticGpuMemoryCeiling(), budget_active, page_claim, ctx_tokens, clampReserveWidth(config, pinned));
     const ask = defaultPrefixCacheAskFor(config, requested, prefix_cache_mem_explicit, one.ask());
     const plan = planHotCache(
         config,
         kv_bits,
         staticGpuMemoryCeiling(),
-        active_mem,
+        budget_active,
         ctx_tokens,
         sizerCtxKvBytes(config, kv_bits),
         ask,
@@ -4529,6 +4542,102 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
     return plan.budget;
+}
+
+fn checkHistoryPrefixBudget(ssd_first: bool) !void {
+    const saved = .{
+        .ceiling = static_ceiling_override,
+        .ctx = server_config.max_context_size,
+        .capacity = prefix_cache_capacity,
+        .ram = prefix_cache_ram_enabled,
+        .disk = prefix_cache_disk_bytes,
+        .explicit = prefix_cache_mem_explicit,
+        .ssd = prefix_cache_mod.ssd_first_override,
+        .kv = configured_kv_quant,
+        .mtp = configured_mtp,
+        .resolved = hot_cache_mem_resolved.load(.monotonic),
+        .chunk_explicit = generate_mod.prefill_chunk_explicit,
+        .chunk = generate_mod.prefill_chunk_override,
+        .per_request = per_request_chunk_override,
+        .qsa_fused = transformer_mod.qsa_score_fused_override,
+    };
+    defer {
+        static_ceiling_override = saved.ceiling;
+        server_config.max_context_size = saved.ctx;
+        prefix_cache_capacity = saved.capacity;
+        prefix_cache_ram_enabled = saved.ram;
+        prefix_cache_disk_bytes = saved.disk;
+        prefix_cache_mem_explicit = saved.explicit;
+        prefix_cache_mod.ssd_first_override = saved.ssd;
+        configured_kv_quant = saved.kv;
+        configured_mtp = saved.mtp;
+        hot_cache_mem_resolved.store(saved.resolved, .monotonic);
+        generate_mod.prefill_chunk_explicit = saved.chunk_explicit;
+        generate_mod.prefill_chunk_override = saved.chunk;
+        per_request_chunk_override = saved.per_request;
+        transformer_mod.qsa_score_fused_override = saved.qsa_fused;
+    }
+    const gib: u64 = 1 << 30;
+    const ceiling: u64 = 64 * gib;
+    const active: usize = 16 * gib;
+    const retained: u64 = 4 * gib;
+    const requested: u64 = 64 * gib;
+    static_ceiling_override = ceiling;
+    server_config.max_context_size = 8192;
+    prefix_cache_capacity = 32;
+    prefix_cache_ram_enabled = true;
+    prefix_cache_disk_bytes = if (ssd_first) 20 * gib else 0;
+    prefix_cache_mem_explicit = true;
+    prefix_cache_mod.ssd_first_override = true;
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    configured_mtp = false;
+    generate_mod.prefill_chunk_explicit = false;
+    generate_mod.prefill_chunk_override = 8192;
+    per_request_chunk_override = true;
+    transformer_mod.qsa_score_fused_override = false;
+    var cfg = qwen4DeployedTestConfig();
+    cfg.mtp_override = false;
+    cfg.pinned_context = 8192;
+    cfg.pinned_prefill_chunk = 1024;
+
+    var idle: u64 = 123;
+    const before = prefixCacheMemFrom(&cfg, requested, .{ .quiet = true }, &idle, active, 0, 0);
+    const idle_before = idle;
+    try testing.expect(before > retained and before < requested);
+    try testing.expectEqual(if (ssd_first) idle_before else before, resolvedPrefixCacheMem());
+    const after = prefixCacheMemFrom(&cfg, requested, .{ .quiet = true }, &idle, active, retained, 0);
+    try testing.expectEqual(before - retained, after);
+    if (ssd_first) {
+        try testing.expectEqual(idle_before - retained, idle);
+        try testing.expectEqual(idle, resolvedPrefixCacheMem());
+    } else {
+        try testing.expectEqual(@as(u64, 0), idle);
+        try testing.expectEqual(after, resolvedPrefixCacheMem());
+    }
+
+    // Excluding the cache's own MLX residency must not exclude CPU history.
+    const excluded = prefixCacheMemFrom(&cfg, requested, .{ .exclude_bytes = ceiling, .quiet = true }, &idle, active + ceiling, retained, 0);
+    try testing.expectEqual(after, excluded);
+    const host_only = prefixCacheMemFrom(&cfg, requested, .{ .quiet = true }, &idle, 0, retained, 0);
+    const overexcluded = prefixCacheMemFrom(&cfg, requested, .{ .exclude_bytes = ceiling, .quiet = true }, &idle, 0, retained, 0);
+    try testing.expectEqual(host_only, overexcluded);
+    const exhausted = prefixCacheMemFrom(&cfg, requested, .{ .quiet = true }, &idle, active, ceiling, 0);
+    if (ssd_first) {
+        try testing.expectEqual(before - idle_before, exhausted);
+        try testing.expectEqual(@as(u64, 0), idle);
+        try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    } else {
+        try testing.expectEqual(@as(u64, 1), exhausted);
+        try testing.expectEqual(@as(u64, 1), resolvedPrefixCacheMem());
+    }
+}
+
+test "history retained memory clamps explicit RAM-first prefix cache budgets" {
+    try checkHistoryPrefixBudget(false);
+}
+
+test "history retained memory clamps explicit SSD-first prefix cache budgets" {
+    try checkHistoryPrefixBudget(true);
 }
 
 /// The SSD bytes one cached token costs this model at these settings, from the serialized geometry:
@@ -11747,6 +11856,8 @@ const StreamingTokenStream = struct {
     pending_buf: std.ArrayList(u32) = .empty,
     pending_idx: usize = 0,
     finished: bool = false,
+    history_ledger: @import("history_publication.zig").Ledger = .{},
+    history_failed: bool = false,
 
     /// Stats populated by `finalize()` after the stream ends. Consumers read
     /// these instead of touching the underlying gen/slot directly so the same
@@ -11779,6 +11890,7 @@ const StreamingTokenStream = struct {
     }
 
     fn deinit(self: *StreamingTokenStream, allocator: std.mem.Allocator) void {
+        self.finalize();
         self.pending_buf.deinit(allocator);
     }
 
@@ -11798,6 +11910,12 @@ const StreamingTokenStream = struct {
             self.prompt_tokens = g.prompt_tokens;
             self.completion_tokens = g.completion_tokens;
             self.finish_reason = g.finish_reason;
+            const outcome: @import("history_publication.zig").Outcome = if (self.history_failed) .failed else if (self.finished) .completed else .cancelled;
+            const output = self.history_ledger.finish(g.generated_ids.items, outcome) catch |err| {
+                log.warn("[history] stream publication refused: {s}\n", .{@errorName(err)});
+                return;
+            };
+            if (output) |ids| generate_mod.publishHistoryTurn(g.timer.io, g.xfm, g.tok, g.prompt_ids_owned, ids);
         }
     }
 
@@ -11827,6 +11945,17 @@ const StreamingTokenStream = struct {
     /// Yield the next decoded token id, or null if generation is complete.
     /// Mirrors the contract of `Generator.next` for the regular path.
     fn next(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
+        const token = self.nextUnpublished(allocator) catch |err| {
+            self.history_failed = true;
+            return err;
+        };
+        if (self.gen) |gen| {
+            if (token) |id| self.history_ledger.emitted(id, gen.generated_ids.items) else self.finished = true;
+        }
+        return token;
+    }
+
+    fn nextUnpublished(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
         // Scheduler path: drain the slot's output ring one token at a time.
         // The inference thread already handled regular/drafter/MTP dispatch
         // via runSingleDecodeTick; we just consume what it pushed.
@@ -11930,6 +12059,23 @@ const StreamingTokenStream = struct {
         }
     }
 };
+
+test "history legacy stream publishes drained tokens not its pending verified tail" {
+    var verified = [_]u32{ 41, 42, 43, 44 };
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    gen.generated_ids.items = &verified;
+    var stream = StreamingTokenStream{
+        .gen = &gen,
+        .mode = .mtp,
+        .eos_token_ids = &.{},
+        .pending_buf = .empty,
+    };
+    stream.pending_buf.items = &verified;
+    try testing.expectEqual(@as(?u32, 41), try stream.next(testing.allocator));
+    try testing.expectEqual(@as(?u32, 42), try stream.next(testing.allocator));
+    try testing.expectEqualSlices(u32, &.{ 41, 42 }, (try stream.history_ledger.finish(&verified, .cancelled)).?);
+}
 
 /// Choose the speculative-decoding mode for a streaming request based on
 /// the request flags and the model capabilities. Mirrors the dispatch in
@@ -28527,6 +28673,8 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
     slot.logprobs_buf = .empty;
     slot.out_idx = 0;
     slot.handover_token = null;
+    slot.legacy_gen = null;
+    slot.history_publication = .{};
     slot.cancelled = .init(false);
     slot.finished = false;
     slot.error_code = null;

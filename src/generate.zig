@@ -2034,6 +2034,8 @@ pub const Generator = struct {
     /// Prompt + committed output, indexed up to `mtp_lookup_gen` generated tokens.
     mtp_lookup_idx: ?mtp_lookup.Index = null,
     mtp_lookup_gen: usize = 0,
+    external_history: ?*@import("history.zig").Request = null,
+    external_history_failed: bool = false,
     /// Landed drafts per round, smoothed, for lookup and MTP rounds (`mtp_lookup.gate`).
     mtp_lookup_ema: f32 = @floatFromInt(mtp_lookup.MAX_DRAFT),
     mtp_round_ema: f32 = 0,
@@ -2678,6 +2680,7 @@ pub const Generator = struct {
     ) !Generator {
         // The logits forward starts at the prompt's last token; there is none to index.
         if (prompt_ids.len == 0) return error.EmptyPrompt;
+        xfm.configureHistory();
         // Reserved-token suppression rides the sampling params from HERE —
         // the one chokepoint every init site funnels through — so every
         // sampling path (serial, DFlash/MTP corrections, draft heads,
@@ -3902,6 +3905,13 @@ pub const Generator = struct {
             idx.deinit();
             self.mtp_lookup_idx = null;
         }
+        if (self.external_history) |history| {
+            const a = history.allocator;
+            history.deinit();
+            a.destroy(history);
+            @import("token_history.zig").releaseBytes(@sizeOf(@import("history.zig").Request));
+        }
+        self.external_history = null;
         // Publish the EV surface for the next request's seed.
         // Only healthy runs qualify — a runtime-disabled or barely-sampled
         // run would poison the next request's plans (inference thread only,
@@ -5527,6 +5537,7 @@ pub const Generator = struct {
         /// Drafts are a context continuation (`mtpLookupChain`): nothing to
         /// build, and no MTP statistics are fed.
         lookup: bool = false,
+        lookup_source: mtp_lookup.Source = .local,
 
         pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
             _ = mlx.mlx_array_free(self.t1_arr);
@@ -5679,24 +5690,55 @@ pub const Generator = struct {
         return &self.mtp_lookup_idx.?;
     }
 
-    /// A chain of the context's continuation after `t1`, or null when the gate
-    /// prefers the MTP head.
+    /// External tiers are queried only after native lookup admission. The
+    /// returned proposal borrows request scratch, never a verifier flight.
+    pub fn externalLookupMatch(self: *Generator, allocator: std.mem.Allocator, committed: []const u32, t1: u32, cap: u32) !?mtp_lookup.Match {
+        if (!self.xfm.history_config.enabled() or self.external_history_failed) return null;
+        if (self.external_history == null) {
+            if (self.xfm.token_history == null) self.xfm.token_history = @import("token_history.zig").HistoryCache.init(self.xfm.allocator);
+            const request = allocator.create(@import("history.zig").Request) catch |err| {
+                self.external_history_failed = true;
+                log.warn("[history] proposal tier refused: {s}\n", .{@errorName(err)});
+                return null;
+            };
+            request.* = @import("history.zig").Request.init(self.timer.io, allocator, &self.xfm.token_history.?, self.xfm.history_config, self.tok.content_sha256, @intCast(self.tok.definedVocabSize())) catch |err| {
+                self.external_history_failed = true;
+                allocator.destroy(request);
+                log.warn("[history] proposal tier refused: {s}\n", .{@errorName(err)});
+                return null;
+            };
+            @import("token_history.zig").retainBytes(@sizeOf(@import("history.zig").Request));
+            self.external_history = request;
+        }
+        return self.external_history.?.match(committed, t1, cap, LookupLines{ .tok = self.tok }) catch |err| {
+            self.external_history_failed = true;
+            log.warn("[history] proposal tier refused: {s}\n", .{@errorName(err)});
+            return null;
+        };
+    }
+
     fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
         if (!self.mtpLookupAllowed()) return null;
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
         const lookup_cap = depth_bounds.lookupCap(mtpLookupDraftCap(self.xfm.config.isMimo()), depth_bounds.active);
-        const got = idx.match(t1, lookup_cap);
+        var got = idx.match(t1, lookup_cap);
         const kv = self.mtpKvLen();
         const src = MtpCostSource.init(self.mtp_ev_costs, kv, if (mtpCostTableEnabled()) &self.xfm.round_cost else null);
-        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, mtpLookupCostsFor(src, mtpLookupPriceWidth(plan, self.mtp_round_drafted_ema)));
+        const costs = mtpLookupCostsFor(src, mtpLookupPriceWidth(plan, self.mtp_round_drafted_ema));
+        var k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, costs);
+        const floor = depth_bounds.floorFor(depth_bounds.active, lookup_cap);
+        if (k == 0 or k < floor) {
+            got = try self.externalLookupMatch(allocator, idx.toks.items, t1, lookup_cap);
+            k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, costs);
+        }
         if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
         const Once = struct {
             var logged = false;
         };
         if (!Once.logged) {
             Once.logged = true;
-            log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d}\n", .{ k, got.?.suffix });
+            log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d} source={s}\n", .{ k, got.?.suffix, @tagName(got.?.source) });
         }
         // No MTP chain consumes the stash this round; left pending, it would grow
         // across lookup rounds into one oversized head forward.
@@ -5732,6 +5774,7 @@ pub const Generator = struct {
             .h_chain = null,
             .m = k,
             .lookup = true,
+            .lookup_source = got.?.source,
         };
     }
 
@@ -7762,7 +7805,7 @@ pub const Generator = struct {
             self.mtp_trace.add(.eval, ph.read());
             ph.reset();
         }
-        log.debug("  [mtp-round] off0={d} t1={d} m={d}/{d} drafts={any} accepted={d}\n", .{ mtp_off0, t1, m, m_max, drafts[0..m], accepted });
+        log.debug("  [mtp-round] off0={d} t1={d} m={d}/{d} drafts={any} accepted={d} source={s}\n", .{ mtp_off0, t1, m, m_max, drafts[0..m], accepted, if (chain.lookup) @tagName(chain.lookup_source) else "mtp" });
 
         // ── Phase 5a: stash the committed history for a DEFERRED append ──
         // The old shape paid a second head forward (appendHistory) here every
@@ -11688,6 +11731,124 @@ fn seedKey(sampling: SamplingParams) mlx.mlx_array {
     return key;
 }
 
+/// A terminal caller-owned output boundary. Auxiliary storage failures are
+/// visible but never turn a successfully generated answer into a failed one.
+pub fn publishHistoryTurn(io: std.Io, xfm: *Transformer, tok: *const Tokenizer, prompt: []const u32, output: []const u32) void {
+    const config = xfm.history_config;
+    if (!config.lookup_store_write or output.len == 0) return;
+    const path = config.lookup_store orelse return;
+    const identity = tok.content_sha256 orelse {
+        log.warn("[history] publication refused: TokenizerRequired\n", .{});
+        return;
+    };
+    if (xfm.token_history == null) xfm.token_history = @import("token_history.zig").HistoryCache.init(xfm.allocator);
+    xfm.token_history.?.appendFinalTurn(io, path, identity, prompt, output) catch |err| {
+        log.warn("[history] publication failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    log.info("[history] published prompt_tokens={d} output_tokens={d}\n", .{ prompt.len, output.len });
+}
+
+test "history auxiliary allocation failures preserve native fallback without Metal" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const history = @import("token_history.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    const identity: [32]u8 = @splat(17);
+    try history.appendFinalTurn(io, a, path, identity, &.{ 1, 2, 3 }, &.{ 4, 5 });
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    tok.content_sha256 = identity;
+    try tok.id_to_token.put(99, "test");
+    for (0..2) |fail_index| {
+        const before = history.retained_bytes.load(.monotonic);
+        {
+            var failing = testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            const allocator = failing.allocator();
+            var xfm: Transformer = undefined;
+            xfm.allocator = a;
+            xfm.token_history = null;
+            xfm.history_config = .{ .lookup_store = path };
+            defer if (xfm.token_history) |*cache| cache.deinit() catch unreachable;
+            var gen: Generator = undefined;
+            gen.xfm = &xfm;
+            gen.tok = &tok;
+            gen.timer = io_util.Stopwatch.init(io);
+            gen.external_history = null;
+            gen.external_history_failed = false;
+            defer if (gen.external_history) |request| {
+                request.deinit();
+                allocator.destroy(request);
+                history.releaseBytes(@sizeOf(@import("history.zig").Request));
+            };
+            try testing.expect((try gen.externalLookupMatch(allocator, &.{ 1, 2 }, 3, 8)) == null);
+            try testing.expect(failing.has_induced_failure);
+            try testing.expect(gen.external_history_failed);
+            const attempts = failing.alloc_index;
+            try testing.expect((try gen.externalLookupMatch(allocator, &.{ 1, 2 }, 3, 8)) == null);
+            try testing.expectEqual(attempts, failing.alloc_index);
+        }
+        try testing.expectEqual(before, history.retained_bytes.load(.monotonic));
+    }
+}
+
+test "history publication is opt in and generator consumes leased proposals without Metal" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const history = @import("token_history.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const path = try std.fmt.allocPrint(a, "{s}/history", .{root});
+    defer a.free(path);
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    tok.content_sha256 = @splat(17);
+    var xfm: Transformer = undefined;
+    xfm.allocator = a;
+    xfm.token_history = null;
+    defer if (xfm.token_history) |*cache| cache.deinit() catch unreachable;
+    xfm.history_config = .{ .lookup_store = path };
+    publishHistoryTurn(io, &xfm, &tok, &.{ 1, 2, 3 }, &.{ 4, 5 });
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "history", .{}));
+    xfm.history_config.lookup_store_write = true;
+    publishHistoryTurn(io, &xfm, &tok, &.{ 1, 2, 3 }, &.{ 4, 5 });
+    xfm.history_config.lookup_store_write = false;
+    // Only externalLookupMatch's CPU fields are initialized: any target call
+    // here is a test failure, not an implicitly available Metal context.
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.tok = &tok;
+    gen.timer = io_util.Stopwatch.init(io);
+    gen.external_history = null;
+    gen.external_history_failed = false;
+    // The test tokenizer intentionally has no vocabulary entries.
+    try tok.id_to_token.put(99, "test");
+    defer if (gen.external_history) |request| {
+        request.deinit();
+        a.destroy(request);
+        history.releaseBytes(@sizeOf(@import("history.zig").Request));
+    };
+    const proposal = (try gen.externalLookupMatch(a, &.{ 1, 2 }, 3, 8)).?;
+    try std.testing.expectEqual(mtp_lookup.Source.history, proposal.source);
+    try std.testing.expectEqual(@as(u32, 3), proposal.suffix);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5 }, proposal.draft);
+    var ledger: @import("history_publication.zig").Ledger = .{};
+    ledger.emitted(4, &.{ 4, 5, 6 });
+    const emitted = (try ledger.finish(&.{ 4, 5, 6 }, .cancelled)).?;
+    xfm.history_config.lookup_store_write = true;
+    publishHistoryTurn(io, &xfm, &tok, &.{ 11, 12 }, emitted);
+    var snapshot = try xfm.token_history.?.acquirePersistent(io, path, tok.content_sha256.?);
+    defer snapshot.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, history.separator, 11, 12, 4, history.separator }, snapshot.index().tokens);
+    // A request that borrowed the old snapshot cannot see this new turn.
+    try std.testing.expect((try gen.externalLookupMatch(a, &.{11}, 12, 8)) == null);
+}
+
 /// Convenience: generate all tokens at once (non-streaming).
 pub fn generate(
     io: std.Io,
@@ -11758,6 +11919,8 @@ pub fn generate(
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
+    const result_logprobs = if (logprobs_n > 0) try logprob_results.toOwnedSlice(allocator) else null;
+    publishHistoryTurn(io, xfm, tok, gen.prompt_ids_owned, token_ids);
 
     return .{
         .text = text,
@@ -11767,7 +11930,7 @@ pub fn generate(
         .finish_reason = gen.finish_reason,
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
-        .logprobs = if (logprobs_n > 0) try logprob_results.toOwnedSlice(allocator) else null,
+        .logprobs = result_logprobs,
     };
 }
 

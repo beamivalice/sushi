@@ -124,11 +124,15 @@ pub const Override = struct {
     think_penalty: ?f32 = null,
     logit_bias_file: ?@import("logit_bias.zig").FilePath = null,
     vision: ?bool = null,
+    lookup_store: ?@import("logit_bias.zig").FilePath = null,
+    lookup_corpus: ?@import("logit_bias.zig").FilePath = null,
+    lookup_store_write: ?bool = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null and o.vision == null;
+            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and
+            o.lookup_store == null and o.lookup_corpus == null and o.lookup_store_write == null;
     }
 };
 
@@ -205,6 +209,18 @@ fn fromValue(v: std.json.Value) Override {
         .string => |path| o.logit_bias_file = @import("logit_bias.zig").FilePath.from(path),
         else => {},
     };
+    if (obj.get("lookup_store")) |value| switch (value) {
+        .string => |path| o.lookup_store = @import("logit_bias.zig").FilePath.from(path),
+        else => {},
+    };
+    if (obj.get("lookup_corpus")) |value| switch (value) {
+        .string => |path| o.lookup_corpus = @import("logit_bias.zig").FilePath.from(path),
+        else => {},
+    };
+    if (obj.get("lookup_store_write")) |value| switch (value) {
+        .bool => |write| o.lookup_store_write = write,
+        else => {},
+    };
     const lambda: ?f64 = if (obj.get("think_penalty")) |t| switch (t) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
@@ -256,6 +272,12 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         o.think_penalty orelse 0,
         if (o.vision) |v| (if (v) "on" else "off") else "default",
     });
+    if (o.lookup_store != null or o.lookup_corpus != null or o.lookup_store_write != null)
+        log.info("[history] model-settings.json: store={s} corpus={s} write={s}\n", .{
+            if (o.lookup_store) |*p| p.slice() else "off",
+            if (o.lookup_corpus) |*p| p.slice() else "off",
+            if (o.lookup_store_write orelse false) "on" else "off",
+        });
     return o;
 }
 
@@ -296,6 +318,30 @@ test "model_settings: the greedy tail (mtp_greedy_tail) is a bool, anything else
     try std.testing.expectEqual(@as(?bool, false), s.lookup("/m/b").mtp_greedy_tail);
     try std.testing.expect(!s.lookup("/m/b").isEmpty());
     try std.testing.expect(s.lookup("/m/c").isEmpty());
+}
+
+test "model_settings: explicit lookup history configuration is retained" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/read": {"lookup_store": "/private/history.bin"}, "/m/corpus": {"lookup_corpus": "/private/corpus"}, "/m/write": {"lookup_store_write": true}, "/m/bad": {"lookup_store": "", "lookup_corpus": 7, "lookup_store_write": "yes"}}
+    );
+    defer s.deinit();
+    try std.testing.expect(!s.lookup("/m/read").isEmpty());
+    try std.testing.expect(!s.lookup("/m/corpus").isEmpty());
+    try std.testing.expect(!s.lookup("/m/write").isEmpty());
+    try std.testing.expect(s.lookup("/m/bad").isEmpty());
+}
+
+test "model_settings: lookup paths outlive parsed settings and writing requires explicit opt-in" {
+    var settings = try parse(std.testing.allocator,
+        \\{"/m/read": {"lookup_store": "/private/history.bin", "lookup_corpus": "/private/corpus"}, "/m/write": {"lookup_store_write": true}}
+    );
+    const read = settings.lookup("/m/read");
+    const write = settings.lookup("/m/write");
+    settings.deinit();
+    try std.testing.expectEqualStrings("/private/history.bin", read.lookup_store.?.slice());
+    try std.testing.expectEqualStrings("/private/corpus", read.lookup_corpus.?.slice());
+    try std.testing.expect(!(read.lookup_store_write orelse false));
+    try std.testing.expect(write.lookup_store_write orelse false);
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {

@@ -1503,6 +1503,7 @@ pub fn main(init: std.process.Init) !void {
             const prefill_start = std.Io.Timestamp.now(io, .awake);
             var gen = try generate_mod.Generator.init(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice);
             defer gen.deinit(allocator);
+            var history_ledger: @import("history_publication.zig").Ledger = .{};
 
             const prefill_ns: u64 = @intCast(prefill_start.untilNow(io, .awake).nanoseconds);
             const prefill_tps: f64 = if (prefill_ns > 0)
@@ -1521,8 +1522,11 @@ pub fn main(init: std.process.Init) !void {
                     try stdout_w.writeAll(piece);
                     try stdout_w.flush();
                 }
+                history_ledger.emitted(token_id, gen.generated_ids.items);
                 completion_tokens += 1;
             }
+            if (try history_ledger.finish(gen.generated_ids.items, .completed)) |output|
+                generate_mod.publishHistoryTurn(io, &xfm, tok, gen.prompt_ids_owned, output);
             const decode_ns: u64 = @intCast(decode_start.untilNow(io, .awake).nanoseconds);
             const decode_tps: f64 = if (decode_ns > 0)
                 @as(f64, @floatFromInt(completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))

@@ -162,6 +162,78 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - Engagement: `[mtp] prompt-lookup drafts engaged: k=… suffix=…` once, `[spec-stats] … lookup=rounds/drafted/landed`
   and `lookup_table=`. A/B driver: `tests/bench_mtp_lookup.sh`.
 
+### Cross-request token history
+
+External history is disabled unless the model's `model-settings.json` entry supplies `lookup_store` or
+`lookup_corpus`. `lookup_store_write` defaults to `false`: a store path alone is read-only, never creates a
+directory or lock file, and never changes permissions. Setting it to `true` authorizes private store initialization
+and terminal append. There are no automatic paths, new flags or environment switches.
+
+Stored IDs are reversible sensitive prompt/output content. Use separate paths per trust boundary, not merely
+per tokenizer: matching identity is not access control. Writable stores use owner-only directories/files
+(`0700`/`0600` on POSIX), not encryption or secure deletion.
+
+- Native local lookup admission runs first; an admitted native continuation remains the incumbent. External
+  proposals use the same suffix/newline gate, depth floor, draft cap and exact MTP target verifier. Planner-owned,
+  batched-head and otherwise ineligible rounds stay ineligible; DFlash/GLM proposal routing is unchanged.
+- Existing debug `[mtp-round]` lines identify `source=local|history|mtp` alongside drafted tokens and accepted
+  drafts, so verified external engagement can be distinguished from configuration or local lookup.
+- Newline evidence excludes the pending anchor; only strong suffixes may exceed the ordinary draft cap.
+- Widen capped query-tail arithmetic before adding the pending token; the maximum 64-token request query must not wrap.
+- Tokenizer identity is SHA-256 of the exact JSON bytes parsed, including synthesized JSON for the slow loader;
+  missing or mismatched identities refuse the tier, never substitute a filename, size or modification time.
+- Model-owned caches lend immutable reference-counted snapshots to request-owned proposal scratch. Readers hold
+  no writer lock; cache replacement or teardown cannot invalidate leases. Terminal append reloads the current
+  durable log under a short stable lock, so B finishing before A cannot lose either turn.
+- The scheduler records successful output-queue appends after first-token echo suppression. Its terminal ledger
+  publishes only that emitted prefix, including cancellation during a verified block or after an early first token;
+  EOS and unseen speculative tails are absent. Engine emission is not a promise of network delivery.
+- Failed attempts publish nothing; retry teardown is not terminal. Terminal calls are once-only, even after a
+  failed append. Shutdown drains publication on the inference thread; legacy streaming and standalone generation
+  publish their emitted/caller-owned output, without publishing from generator teardown.
+- Read/import or proposal-allocation failures disable the auxiliary tier for that request; terminal lock, append, rollback and durability failures are
+  logged without failing native generation or implicitly retrying a turn. An uncertain rollback or post-rename
+  sync invalidates the current cached snapshot, not existing borrowers; the next reader validates storage afresh.
+- POSIX history opens are nonblocking and no-follow; descriptor checks reject non-regular or multiply linked files before locking or reading.
+- Writable initialization and append sync the store directory and ancestor chain, including retries after a
+  mkdir/ancestor-sync failure. A post-commit error can leave a visible complete turn with uncertain durability;
+  callers must not replay that turn automatically.
+
+Frozen corpora contain `meta.json` (`tokenizer_sha256`, `max_order` 1..64, `doc_sep` = `1 << 30`, optional counts
+and file SHA-256 digests), plus one-dimensional little-endian int32 `tokens.npy` and `sa.npy`. Suffix positions
+must be a sorted permutation; documents are nonempty and separator-terminated. Queries and continuations never
+cross separators, and imports are never modified.
+
+The writable `MLXLOOK1` log retains at most 262,144 token/separator words (1,048,616 bytes with its tokenizer
+header), evicting whole oldest documents. A full snapshot uses about 2 MiB of token/index arrays; imported arrays
+are bounded at 128 MiB. Retained arrays, metadata/paths and request/proposal allocations reduce the prefix-cache
+budget; validation and current-log transaction scratch are additional temporary peaks. No speedup is claimed.
+
+CPU regressions cover storage durability/refusals, overlapping leases, emitted-prefix publication, shutdown,
+tokenizer identity, 63/64-token request-query boundaries and line/cap gates. HTTP checks use a caller-owned
+loopback server and an initially empty private writable store; they never boot/stop the server or acquire a GPU lock.
+Publication/parity: `python3 tests/test_token_history.py --url <loopback URL> --model <id> --model-dir <pack>
+--store <private store> --output <run dir>`. Its default fixture uses Qwen thinking-off framing;
+`--prompt-file` supplies another checkpoint's rendered prompt. This mode does not establish proposal engagement.
+
+The permanent overlap regression ports the [focused history acceptance](https://github.com/jasontitus/mlx-serve/blob/8f2278b2/tests/test_token_history.py):
+add `--overlap --server-log <server log>` to the command above, without `--prompt-file`. Use a dedicated native-MTP
+Qwen server with `--mtp --no-drafter --max-concurrent 2 --ctx-size 4096 --prefix-cache-entries 0 --log-level debug`,
+no imported corpus, and `lookup_store_write: true` for that fresh store. On a 64-GB M2, the caller can use a fitting
+Flash-Next streamed pack with `--ssd-budget-gb 20`; this is a residency setting, not a test or speed claim.
+The script sends raw continuation prompts with caps seed96/A192/B24 and `ignore_eos: true`; stop/loop-guard
+termination still fails the length fixture explicitly. Only the seed's actual emitted output populates history.
+B starts after A emits at least eight text chunks and verifies a history proposal. The test requires overlapping
+request and emission intervals and B's durable publication while A remains active through terminal teardown.
+Neural attempts may be zero when verified lookup supplies A's continuations. Later history selection is reported,
+not required; if absent, post-publication verified-query coverage remains unexercised, unlike the CPU lease test.
+Unsupported scheduling, missing initial history engagement and early termination fail as `UNEXERCISED`.
+The final documents must be exactly seed/B/A, with submitted prompt IDs, complete emitted-token counts and text
+equal to each stream. `ignore_eos` wire text hides tokenizer `special: true` IDs; those IDs remain counted and
+stored, and only the detokenization comparison filters them. Artifacts contain timestamped SSE events, the scoped
+server log and a summary. Neither mode asserts semantic answers, universal variable-width serial equivalence or
+throughput; use a separate fresh store per invocation, and let the caller own the GPU reservation.
+
 ## Verify price by rows
 
 A verify row costs about 2.9 ms on Flash-Next STQ-2.75 at every width from 2 to 8, with no step at five or seven rows

@@ -3236,8 +3236,10 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     defer pack.close(io);
     try @import("glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
 
+    var cwd_dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer cwd_dir.close(io);
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);
+    const cwd_len = try cwd_dir.realPath(io, &cwd_buf);
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_len = try tmp.dir.realPath(io, &tmp_buf);
     const rel = try std.fs.path.relative(a, cwd_buf[0..cwd_len], null, cwd_buf[0..cwd_len], tmp_buf[0..tmp_len]);

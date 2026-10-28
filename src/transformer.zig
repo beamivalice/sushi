@@ -13916,6 +13916,8 @@ pub const Transformer = struct {
     /// two measured widths. Lives on the model, not the request — a request
     /// spans only its own max_tokens. Inference thread only.
     round_cost: round_cost_mod.Table = .{},
+    history_config: @import("token_history.zig").Config = .{},
+    token_history: ?@import("token_history.zig").HistoryCache = null,
     mtp_group_cost: group_cost_mod.Table = .{},
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
@@ -14649,7 +14651,18 @@ pub const Transformer = struct {
         c.deinit();
     }
 
+    /// Bind only after the Transformer reaches its final address.
+    pub fn configureHistory(self: *Transformer) void {
+        self.history_config = .{
+            .lookup_store = if (self.config.lookup_store_override) |*p| p.slice() else null,
+            .lookup_corpus = if (self.config.lookup_corpus_override) |*p| p.slice() else null,
+            .lookup_store_write = self.config.lookup_store_write_override,
+        };
+    }
+
     pub fn deinit(self: *Transformer) void {
+        if (self.token_history) |*history| history.deinit() catch unreachable;
+        self.token_history = null;
         self.flushImatrix(); // `/v1/unload-model` reaches here on the inference thread
         if (self.lm_head_coarse) |*rc| rc.deinit();
         self.lm_head_coarse = null;

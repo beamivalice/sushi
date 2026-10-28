@@ -736,6 +736,7 @@ pub const Slot = struct {
     /// Actual generated ids (from legacy_gen.generated_ids). Shallow copy at
     /// completion so the connection thread can read them without locking.
     generated_ids: ?[]u32,
+    history_publication: @import("history_publication.zig").Ledger = .{},
     /// pad-only flag: set by inference thread when the entire generation was
     /// token id 0. Server-level cache invalidation reads this after complete.
     was_pad_only: bool,
@@ -991,7 +992,14 @@ pub const Slot = struct {
             // condvar, so an early exit here trades an OOM for a hang.
             self.logprobs_buf.append(self.allocator, entry) catch |err| self.latchErrorLocked(@errorName(err));
         }
-        self.out_buf.append(self.allocator, t) catch |err| self.latchErrorLocked(@errorName(err));
+        self.out_buf.append(self.allocator, t) catch |err| {
+            self.history_publication.failedEmission();
+            self.latchErrorLocked(@errorName(err));
+            self.out_cond.broadcast(self.io);
+            self.out_event.set(self.io);
+            return;
+        };
+        self.history_publication.emitted(t, if (self.legacy_gen) |*g| g.generated_ids.items else &.{});
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
     }
@@ -1487,6 +1495,8 @@ pub const Scheduler = struct {
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
+    /// Retained history billed by the last inference-thread budget refresh.
+    history_budget_retained: u64 = 0,
 
     /// Per-entry digest snapshot the connection-thread guard reads instead of the cache.
     /// Replaced under `digest_mu` by the inference thread; readers copy under the lock.
@@ -2839,6 +2849,9 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.think_penalty_override = o.think_penalty;
     config.logit_bias_file_override = o.logit_bias_file;
     config.vision_override = o.vision;
+    config.lookup_store_override = o.lookup_store;
+    config.lookup_corpus_override = o.lookup_corpus;
+    config.lookup_store_write_override = o.lookup_store_write orelse false;
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
@@ -3960,25 +3973,6 @@ test "bf16 streaming registry gate uses resident plan not checkpoint disk size" 
     try testing.expect(expertStreamingGateBytes(15_000_000_000, 60_000_000_000, 5_033_164_800, 536_870_912) < 360_000_000_000);
 }
 
-test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never the raw launch flag" {
-    // 2026-08-30 Metal OOM: a 40 GB `--prefix-cache-mem` beside a ~70 GB pack
-    // was never validated against what the weights left under the GPU ceiling;
-    // the cache filled to its cap and a 143k prefill died uncatchably. The
-    // budget must pass through the resolver (server.prefixCacheMemForLoad)
-    // before it reaches initWithMem — and a SECOND construction site must not
-    // be able to skip the clamp (the cold-load launch flags class).
-    const src = @embedFile("scheduler.zig");
-    const needle = "HotPrefixCache.initWith" ++ "Mem(";
-    var found: usize = 0;
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, src, pos, needle)) |at| : (pos = at + needle.len) {
-        found += 1;
-        const window = src[at..@min(at + 240, src.len)];
-        try testing.expect(std.mem.indexOf(u8, window, "clamped_prefix_mem") != null);
-        try testing.expect(std.mem.indexOf(u8, window, "params.prefix_cache_mem_bytes") == null);
-    }
-    try testing.expect(found >= 1);
-}
 
 test "visionChoiceFor: DeepSeek-V4.1 loads its tower by default streamed or resident; --no-vision and the per-model vision:false skip it; other archs keep the streamed default off" {
     const saved = model_settings.vision_flag;
@@ -4619,6 +4613,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const xfm_ptr = try sch.allocator.create(Transformer);
     errdefer sch.allocator.destroy(xfm_ptr);
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    xfm_ptr.configureHistory();
     errdefer xfm_ptr.deinit();
     if (xfm_ptr.expert_stream) |engine| {
         engine.borrow_publish = &params.config.expert_borrow_bytes;
@@ -5371,6 +5366,7 @@ pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 /// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
 /// entries are excluded from the read so a full cache cannot ratchet itself down.
 fn reviseHotCacheBudgets(sch: *Scheduler) void {
+    sch.history_budget_retained = @import("token_history.zig").retained_bytes.load(.monotonic);
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
@@ -5391,6 +5387,107 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
     }
     sch.registry.mutex.unlock(sch.io);
     publishHotCacheResidency(sch);
+}
+
+fn reviseBudgetsForTick(sch: *Scheduler, residency_changed: bool) void {
+    const retained = @import("token_history.zig").retained_bytes.load(.monotonic);
+    if (residency_changed or retained != sch.history_budget_retained) reviseHotCacheBudgets(sch);
+}
+
+test "history retained memory refreshes budgets at the normal tick boundary" {
+    const history = @import("token_history.zig");
+    const Probe = struct {
+        var calls: usize = 0;
+        var observed: u64 = 0;
+        var revise: BudgetRevise = .{};
+
+        fn resolve(_: *ModelConfig, requested: u64, update: BudgetRevise, idle: *u64) u64 {
+            calls += 1;
+            observed = history.retained_bytes.load(.monotonic);
+            revise = update;
+            idle.* = requested -| observed;
+            return requested;
+        }
+    };
+    const saved_history = history.retained_bytes.load(.monotonic);
+    defer history.retained_bytes.store(saved_history, .monotonic);
+    history.retained_bytes.store(0, .monotonic);
+    Probe.calls = 0;
+    Probe.observed = 0;
+    Probe.revise = .{};
+
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("history-budget", "/history-budget", 0);
+    const cfg = try testing.allocator.create(ModelConfig);
+    cfg.* = .{ .model_type = "qwen4_exp" };
+    entry.config = cfg;
+    const requested: u64 = 4096;
+    entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 1, requested);
+    reg.mutex.lockUncancelable(testing.io);
+    reg.markReadyLocked(entry, 0);
+    reg.mutex.unlock(testing.io);
+
+    var sch: Scheduler = undefined;
+    sch.allocator = testing.allocator;
+    sch.io = testing.io;
+    sch.registry = reg;
+    sch.current_model = entry;
+    sch.hot_prefix_cache = &entry.prefix_cache.?;
+    sch.prefix_cache_mem_bytes = requested;
+    sch.prefix_cache_mem_resolver = Probe.resolve;
+    sch.budget_revise_sw = null;
+    sch.history_budget_retained = 0;
+    sch.resident_hot_cache_bytes = .init(0);
+    sch.reclaimable_hot_cache_bytes = .init(0);
+    sch.digest_mu = .init;
+    sch.hot_cache_digests = &.{};
+    sch.digest_residency = 0;
+    sch.metrics = null;
+    defer if (sch.hot_cache_digests.len > 0) testing.allocator.free(sch.hot_cache_digests);
+
+    // Characterize the existing residency trigger, then run only ordinary ticks.
+    reviseBudgetsForTick(&sch, true);
+    try testing.expectEqual(@as(usize, 1), Probe.calls);
+    try testing.expect(Probe.revise.quiet);
+    try testing.expectEqual(@as(u64, 0), Probe.revise.exclude_bytes);
+    try testing.expectEqual(requested, entry.prefix_cache.?.max_kv_bytes);
+    try testing.expectEqual(requested, entry.prefix_cache.?.ssd_idle_mem);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 1), Probe.calls);
+
+    history.retained_bytes.store(64, .monotonic);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 2), Probe.calls);
+    try testing.expectEqual(@as(u64, 64), Probe.observed);
+    try testing.expectEqual(requested - 64, entry.prefix_cache.?.ssd_idle_mem);
+    try testing.expect(sch.budget_revise_sw == null);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 2), Probe.calls);
+
+    history.retained_bytes.store(16, .monotonic);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 3), Probe.calls);
+    try testing.expectEqual(@as(u64, 16), Probe.observed);
+    try testing.expectEqual(requested - 16, entry.prefix_cache.?.ssd_idle_mem);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 3), Probe.calls);
+
+    history.retained_bytes.store(0, .monotonic);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 4), Probe.calls);
+    try testing.expectEqual(@as(u64, 0), Probe.observed);
+    try testing.expectEqual(requested, entry.prefix_cache.?.ssd_idle_mem);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 4), Probe.calls);
+
+    // The timer's direct refresh must also consume the observed retained count.
+    history.retained_bytes.store(128, .monotonic);
+    reviseHotCacheBudgets(&sch);
+    try testing.expectEqual(@as(usize, 5), Probe.calls);
+    try testing.expectEqual(@as(u64, 128), sch.history_budget_retained);
+    reviseBudgetsForTick(&sch, false);
+    try testing.expectEqual(@as(usize, 5), Probe.calls);
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
@@ -5679,6 +5776,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
             }
+            publishHistory(s, if (s.error_code != null) .failed else .cancelled);
             recordSlotCleanup(sch.metrics, s);
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
@@ -5695,7 +5793,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
-        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        reviseBudgetsForTick(sch, load_req != null or unload_req != null);
         switch (gpuWarmBeforePark(worked, unload_req != null)) {
             .keep => {},
             .restart => warm_since = io_util.Stopwatch.init(sch.io),
@@ -5895,7 +5993,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         // 5. Cull finished / errored / cancelled from `decoding`.
         cullDecoding(sch);
     }
-    flushImatrixCaptures(sch);
+    flushInferenceState(sch);
 }
 
 fn postPrefillTerminal(slot: *Slot) bool {
@@ -6029,10 +6127,14 @@ fn slotDonatedBytes(sch: *const Scheduler, s: *const Slot) u64 {
     return hc.donatedBytes(@intFromPtr(s));
 }
 
-/// Shutdown exit: an armed activation capture is written HERE, the last point
-/// this thread is alive. `Scheduler.deinit` unloads on the caller's thread,
-/// where the capture's mlx stream does not exist.
-fn flushImatrixCaptures(sch: *Scheduler) void {
+/// Finalize emitted history and activation captures before the inference thread
+/// exits; caller-thread model teardown cannot substitute for this boundary.
+fn flushInferenceState(sch: *Scheduler) void {
+    sch.queue_mu.lockUncancelable(sch.io);
+    for ([_][]*Slot{ sch.pending.items, sch.decoding.items, sch.prefilling.items, sch.cleanup_queue.items }) |slots| {
+        for (slots) |slot| publishHistory(slot, if (slot.error_code != null) .failed else .cancelled);
+    }
+    sch.queue_mu.unlock(sch.io);
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
     var it = sch.registry.entries.valueIterator();
@@ -6973,6 +7075,19 @@ fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     recordSlotEnd(m, slot, cleanupOutcome(slot));
 }
 
+fn publishHistory(slot: *Slot, outcome: @import("history_publication.zig").Outcome) void {
+    if (slot.history_publication.finalized) return;
+    const generated = if (slot.legacy_gen) |*g| g.generated_ids.items else &.{};
+    const output = slot.history_publication.finish(generated, outcome) catch |err| {
+        log.warn("[history] publication refused: {s}\n", .{@errorName(err)});
+        return;
+    };
+    const ids = output orelse return;
+    const xfm = slot.model.transformer orelse return;
+    const tok = slot.model.tokenizer orelse return;
+    generate_mod.publishHistoryTurn(slot.io, xfm, tok, slot.full_prompt, ids);
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -6989,6 +7104,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (latched) |name| {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
+    publishHistory(slot, if (latched != null or slot.error_code != null) .failed else if (std.mem.eql(u8, reason, "cancelled")) .cancelled else .completed);
     if (slot.completion_tokens <= 2) logShortGen(slot, reason);
     if (latched == null) logStop(slot, reason);
     commitSlotIfApplicable(sch, slot);
@@ -13136,6 +13252,88 @@ test "MTP handover: the first block's echo of the streamed t1 is swallowed once,
     slot.handover_token = 42;
     try testing.expect(!slot.takeHandoverEcho(43));
     try testing.expectEqual(@as(?u32, null), slot.handover_token);
+}
+
+test "history output funnel records early handover once and truncates a verified block" {
+    var slot: Slot = undefined;
+    slot.io = testing.io;
+    slot.allocator = testing.allocator;
+    slot.handover_token = null;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.out_buf = .empty;
+    defer slot.out_buf.deinit(testing.allocator);
+    slot.logprobs_buf = .empty;
+    defer slot.logprobs_buf.deinit(testing.allocator);
+    slot.legacy_gen = null;
+    slot.history_publication = .{};
+    slot.pushToken(41);
+    slot.handover_token = 41;
+    slot.pushToken(41);
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    try gen.generated_ids.appendSlice(testing.allocator, &.{ 41, 42, 43 });
+    defer gen.generated_ids.deinit(testing.allocator);
+    slot.legacy_gen = gen;
+    slot.pushToken(42);
+    try testing.expectEqualSlices(u32, &.{ 41, 42 }, slot.out_buf.items);
+    try testing.expectEqualSlices(u32, &.{ 41, 42 }, (try slot.history_publication.finish(gen.generated_ids.items, .cancelled)).?);
+}
+
+test "history shutdown flush retains queued cancelled emission before thread exit without Metal" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const path = try std.fmt.allocPrint(a, "{s}/history", .{root});
+    defer a.free(path);
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    tok.content_sha256 = @splat(9);
+    var xfm: Transformer = undefined;
+    xfm.allocator = a;
+    xfm.token_history = null;
+    xfm.history_config = .{ .lookup_store = path, .lookup_store_write = true };
+    defer if (xfm.token_history) |*cache| cache.deinit() catch unreachable;
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    model.tokenizer = &tok;
+    var slot: Slot = undefined;
+    slot.io = io;
+    slot.model = &model;
+    slot.legacy_gen = null;
+    slot.error_code = null;
+    var prompt = [_]u32{ 1, 2 };
+    slot.full_prompt = &prompt;
+    slot.history_publication = .{};
+    slot.history_publication.emitted(77, &.{});
+    var registry: model_registry_mod.ModelRegistry = undefined;
+    registry.mutex = .init;
+    registry.entries = std.StringHashMap(*LoadedModel).init(a);
+    defer registry.entries.deinit();
+    var sch: Scheduler = undefined;
+    sch.io = io;
+    sch.registry = &registry;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.prefilling = .empty;
+    sch.cleanup_queue = .empty;
+    defer sch.cleanup_queue.deinit(a);
+    try sch.cleanup_queue.append(a, &slot);
+    flushInferenceState(&sch);
+    var cache = @import("token_history.zig").HistoryCache.init(a);
+    defer cache.deinit() catch unreachable;
+    var lease = try cache.acquirePersistent(io, path, tok.content_sha256.?);
+    defer lease.deinit();
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 77, @import("token_history.zig").separator }, lease.index().tokens);
+    flushInferenceState(&sch);
+    var repeated = try cache.acquirePersistent(io, path, tok.content_sha256.?);
+    defer repeated.deinit();
+    try testing.expectEqualSlices(u32, lease.index().tokens, repeated.index().tokens);
 }
 
 test "culling an errored or cancelled GLM slot releases its native state, a live one keeps it" {

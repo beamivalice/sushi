@@ -137,6 +137,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
+- **Cross-request history is opt-in per model**: `lookup_store` and `lookup_corpus` are owned paths, and
+  `lookup_store_write` defaults to false; a store path alone never creates or modifies files. These settings
+  reach startup and cold loads through `applyModelSettings`; see [history](engine-mtp.md#cross-request-token-history).
 - **The prefix cache's tiers are launch flags only** (no `model-settings.json` key): RAM retention is off unless
   `--prefix-cache-mem` is given with a size (`off` or `0` keeps it off), and the SSD tier is on unless `--prefix-cache-disk 0`
   or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)).

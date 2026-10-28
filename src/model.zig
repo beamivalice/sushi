@@ -405,6 +405,9 @@ pub const ModelConfig = struct {
     think_penalty_override: ?f32 = null,
     logit_bias_file_override: ?@import("logit_bias.zig").FilePath = null,
     vision_override: ?bool = null,
+    lookup_store_override: ?@import("logit_bias.zig").FilePath = null,
+    lookup_corpus_override: ?@import("logit_bias.zig").FilePath = null,
+    lookup_store_write_override: bool = false,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the

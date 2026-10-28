@@ -22,6 +22,14 @@ mlx-serve src/assets/codex_model_instructions.md (https://github.com/ddalcu/mlx-
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; the tool list is
 adjusted to what codex-cli 0.154 declares.
 
+The immutable suffix-history storage and publication accounting in
+src/token_history.zig and src/history_publication.zig follow independently
+authored revisions 72419820 and e8449e14 of https://github.com/jasontitus/mlx-serve,
+Copyright (c) 2026 David Dalcu, MIT terms in LICENSE; port sources authored by
+Jason Titus. Multi-tier lookup concepts are credited to Khaled Bakeer and
+TandemLLM (https://github.com/0xBakeer/TandemLLM); no TandemLLM implementation
+is incorporated by this port.
+
 The DeepSeek-V4.1 image plan, letterbox box and aligner unfold in src/dsv41_vision.zig
 follow mlx-serve src/dsv41_vision.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; their numbers are

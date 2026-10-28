@@ -120,6 +120,8 @@ const SpecialScan = struct {
 };
 
 pub const Tokenizer = struct {
+    /// Identity of the exact JSON bytes consumed by the parser, never a path or stat.
+    content_sha256: ?[32]u8 = null,
     /// Token string -> id
     vocab: std.StringHashMap(u32),
     /// Id -> token string
@@ -1461,7 +1463,10 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         },
     });
 
+    var content_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &content_sha256, .{});
     var built: Tokenizer = .{
+        .content_sha256 = content_sha256,
         .vocab = vocab,
         .id_to_token = id_to_token,
         .merge_ranks = merge_ranks,
@@ -1481,6 +1486,19 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
     };
     if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
     return built;
+}
+
+test "tokenizer history identity hashes exact consumed bytes" {
+    const compact = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}";
+    const spaced = "{\"model\": {\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}";
+    var a = try parseTokenizerContent(std.testing.io, std.testing.allocator, compact);
+    defer a.deinit();
+    var b = try parseTokenizerContent(std.testing.io, std.testing.allocator, spaced);
+    defer b.deinit();
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(compact, &expected, .{});
+    try std.testing.expectEqual(expected, a.content_sha256.?);
+    try std.testing.expect(!std.mem.eql(u8, &a.content_sha256.?, &b.content_sha256.?));
 }
 
 /// Digits per pre-token from the tokenizer.json `pre_tokenizer` spec: a
