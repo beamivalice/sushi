@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A prompt that does not fit unloads idle resident models before it is refused**: with several models loaded, a long prompt used to get a 400 while an idle model held the memory; it now unloads the least recently used idle models (never its own or one serving a request) until it fits.
 - **DeepSeek-V4.1 reads its routers as stored**: the BF16 router weights are no longer widened to f32 at load, so the logits are bit-identical, each decode step reads half the router bytes, and 0.16 GB returns to the expert cache.
 - **Qwen and GLM agent turns no longer re-prefill the previous reply's thought**: a thinking request with tools now keeps a restore point right behind its generated `</think>` (on GLM the pool position at or below it), so the next turn restores through the thought, MTP and DFlash2 rounds cut to land on it with byte-identical output.
 - **A running stream keeps a quarter of the time while another request prefills**: `--prefill-decode-share` now defaults to 0.25 (was 0), so a concurrent decode no longer advances one token per prefill chunk; the share only adds decode ticks between chunks and never narrows a prefill chunk, on any model.

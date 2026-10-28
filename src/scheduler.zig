@@ -2279,6 +2279,27 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
     }
 
+    pub const UnloadedIdle = struct { id: []const u8, bytes: u64 };
+
+    /// Unloads the least recently used resident model nobody holds, other than `keep`, on the
+    /// inference thread. Null when none was idle or a request took it before the commit.
+    pub fn unloadLruIdleModel(self: *Scheduler, keep: []const u8) ?UnloadedIdle {
+        self.registry.mutex.lockUncancelable(self.io);
+        const entry = self.registry.pickLruEvictable(keep) orelse {
+            self.registry.mutex.unlock(self.io);
+            return null;
+        };
+        const bytes = entry.bytes_resident;
+        self.registry.mutex.unlock(self.io);
+
+        self.unloadModelIfIdle(entry.id, 0) catch return null;
+
+        self.registry.mutex.lockUncancelable(self.io);
+        defer self.registry.mutex.unlock(self.io);
+        if (entry.state == .ready) return null;
+        return .{ .id = entry.id, .bytes = bytes };
+    }
+
     /// Synchronously compute embeddings for `req.token_seqs` using the
     /// batched encoder forward pass on the inference thread. Same lifecycle
     /// as `encodeVision`: post + block + return results. Caller frees the

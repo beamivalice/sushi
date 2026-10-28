@@ -357,6 +357,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   and the scheduler's `admissionPassArmed` read that one predicate), crediting only
   provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
+- **A prompt that does not fit unloads idle resident models before it is refused** (`fitAfterUnloadingIdle`,
+  `Scheduler.unloadLruIdleModel`): least recently used first, re-billed after each, never the request's own model and
+  never one a request holds; the connection thread asks, the inference thread frees.
 - **DeepSeek STQ bills a request's state, not its prefill working set**: the working set comes out of decoder-layer
   expert pools each prefill forward releases when its need passes the live headroom, refused before anything is released
   where the pools cannot cover it; its transient cap (`Config.chunkCap`, the pool inside it) is that working set; admission bills that term only past the lendable bytes, plus a decode forward's

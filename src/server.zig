@@ -7486,6 +7486,44 @@ pub const AdmissionBill = struct {
     }
 };
 
+/// Unloads idle resident models, least recently used first, until `fits` holds; false when
+/// nothing idle is left. An idle model is memory its next request reloads.
+pub fn fitAfterUnloadingIdle(ctx: anytype, fits: fn (@TypeOf(ctx)) bool, unloadOne: fn (@TypeOf(ctx)) bool) bool {
+    while (!fits(ctx)) if (!unloadOne(ctx)) return false;
+    return true;
+}
+
+test "a prompt that does not fit unloads idle models, oldest first, until it fits" {
+    const t = std.testing;
+    const Fake = struct {
+        needed: u64,
+        available: u64,
+        idle: []const u64, // resident bytes, least recently used first
+        unloaded: usize = 0,
+        fn fits(f: *@This()) bool {
+            return f.needed <= f.available;
+        }
+        fn unloadOne(f: *@This()) bool {
+            if (f.unloaded == f.idle.len) return false;
+            f.available += f.idle[f.unloaded];
+            f.unloaded += 1;
+            return true;
+        }
+    };
+    // Already fits: nothing is unloaded.
+    var a = Fake{ .needed = 5, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(fitAfterUnloadingIdle(&a, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 0), a.unloaded);
+    // One idle model is enough: the second stays resident.
+    var b = Fake{ .needed = 10_558, .available = 9_466, .idle = &.{ 14_730, 8_000 } };
+    try t.expect(fitAfterUnloadingIdle(&b, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 1), b.unloaded);
+    // Every idle model goes and it still does not fit: refused.
+    var c = Fake{ .needed = 50, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(!fitAfterUnloadingIdle(&c, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 2), c.unloaded);
+}
+
 test "a refusal names the credit it COMPARED, never the residency it cannot take" {
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
@@ -8033,7 +8071,31 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
     return context;
 }
 
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
+/// `fitAfterUnloadingIdle`'s context for one request: each unload re-bills the same prompt.
+const IdleUnloadFit = struct {
+    sch: *scheduler_mod.Scheduler,
+    keep_id: []const u8,
+    bill: *AdmissionBill,
+    config: *const model_mod.ModelConfig,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    kv_override: ?transformer_mod.KVQuantConfig,
+    unchunked_prefill: bool,
+    enable_mtp: bool,
+
+    fn fits(self: *IdleUnloadFit) bool {
+        return self.bill.fitsAfterEviction();
+    }
+
+    fn unloadOne(self: *IdleUnloadFit) bool {
+        const gone = self.sch.unloadLruIdleModel(self.keep_id) orelse return false;
+        log.info("  prompt {d} tokens does not fit: unloaded idle model {s} ({d} MB)\n", .{ self.prompt_ids.len, gone.id, gone.bytes / (1024 * 1024) });
+        self.bill.* = prefillAdmissionBill(self.config, self.prompt_ids.len, self.max_tokens, self.kv_override, self.unchunked_prefill, self.prompt_ids, .{ .mtp_on = self.enable_mtp });
+        return true;
+    }
+};
+
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, keep_id: []const u8, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
     if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).glmLatentBits() == null) {
         const msg = "GLM native MLA cache supports kv_quant 8, 6 or off.";
         if (is_anthropic) {
@@ -8046,7 +8108,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     const prompt_len: usize = prompt_ids.len;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
+    var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
     logAdmissionDecision(bill);
     const needed = bill.needed;
     const available = bill.available;
@@ -8067,9 +8129,15 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         });
         return true;
     }
-    if (needed > available) {
-        const needed_mb = needed / (1024 * 1024);
-        const avail_mb = available / (1024 * 1024);
+    // Idle resident models are memory too: a connection thread asks the inference thread to unload
+    // them, least recently used first, before it refuses.
+    if (needed > available) if (global_scheduler) |sch| {
+        var unloading = IdleUnloadFit{ .sch = sch, .keep_id = keep_id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked_prefill = unchunked_prefill, .enable_mtp = enable_mtp };
+        if (fitAfterUnloadingIdle(&unloading, IdleUnloadFit.fits, IdleUnloadFit.unloadOne)) return true;
+    };
+    if (bill.needed > bill.available) {
+        const needed_mb = bill.needed / (1024 * 1024);
+        const avail_mb = bill.available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm). The cache
@@ -10442,7 +10510,7 @@ fn handleChatCompletions(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -10700,7 +10768,7 @@ fn handleCompletions(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty_c, .frequency_penalty = frequency_penalty_c }, logprobs_n);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, root);
     var sampling = generate_mod.SamplingParams{
@@ -17128,7 +17196,7 @@ fn handleAnthropicMessages(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -19119,7 +19187,7 @@ fn handleResponsesInner(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
