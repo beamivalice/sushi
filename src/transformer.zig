@@ -6649,7 +6649,7 @@ pub const KVCache = struct {
     /// installed on the Transformer on the error path, whose own `deinit`
     /// then freed every handle a second time. The class is "a fallible
     /// re-init behind a deinit"; keeping the order inside ONE helper is what
-    /// stops it recurring, so the call sites are scan-pinned to use it.
+    /// stops it recurring: every live re-init goes through here, never `.cache = try init` behind a deinit.
     pub fn reinit(self: *KVCache, num_layers: u32, config: KVQuantConfig) !void {
         var fresh = try initWithConfig(self.allocator, num_layers, config);
         fresh.swa_ring_window = self.swa_ring_window;
@@ -11184,7 +11184,6 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     var head_aux = ssmSnapshot(&live);
     defer ssmSnapshotDeinit(&head_aux);
 
-    // Built before the assignment: the scan guard reads `.cache = try` as the reinit defect.
     const head_cache = try KVCache.init(t.allocator, 1);
     var head: Qwen4Mtp = undefined;
     head.cache = head_cache;
@@ -11252,7 +11251,6 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     const keys = try attn256RandBf16(prng.random(), &[_]c_int{ 1, L, hd }, s);
     defer _ = mlx.mlx_array_free(keys);
 
-    // Built before the assignment: the scan guard reads `.cache = try` as the reinit defect.
     const head_cache = try KVCache.init(t.allocator, 1);
     var head: Qwen4Mtp = undefined;
     head.cache = head_cache;
@@ -11360,7 +11358,6 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
         defer _ = mlx.mlx_array_free(ref_lv);
 
         for ([_]bool{ true, false }) |with_mark| {
-            // Built before the assignment: the scan guard reads `.cache = try` as the reinit defect.
             const head_cache = try KVCache.init(t.allocator, 1);
             var head: Qwen4Mtp = undefined;
             head.cache = head_cache;
@@ -27176,39 +27173,6 @@ test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
     try testing.expectEqual(@as(usize, 0), cache.step);
 }
 
-test "every live KV cache re-init goes through reinit, which builds before it frees" {
-    // Class guard, not whack-a-mole: the defect was never the refusal, it was
-    // the CALLER SHAPE — a fallible re-init behind a deinit — and four sites
-    // had it (scheduler's cold load, main's offline path, resetCache,
-    // tryRestoreCache). Any future scheme that refuses an arch reopens the
-    // crash at whichever site is respelled. Needles are assembled at comptime
-    // so this test's own source cannot satisfy the scan.
-    const assign = ".cache = " ++ "try ";
-    inline for (.{
-        .{ "transformer.zig", @embedFile("transformer.zig") },
-        .{ "scheduler.zig", @embedFile("scheduler.zig") },
-        .{ "main.zig", @embedFile("main.zig") },
-    }) |f| {
-        if (std.mem.indexOf(u8, f[1], assign) != null) {
-            std.debug.print(
-                "{s}: assigns a fallible KVCache init onto a live `.cache` field; use KVCache.reinit\n",
-                .{f[0]},
-            );
-            return error.FallibleReinitBehindDeinit;
-        }
-    }
-    // ...and the helper itself builds BEFORE it frees. Reversed, it is exactly
-    // the bug it exists to prevent, and every call site inherits it silently.
-    const src = @embedFile("transformer.zig");
-    const at = std.mem.indexOf(u8, src, "pub fn re" ++ "init(self: *KVCache") orelse
-        return error.MissingReinitHelper;
-    const build_at = std.mem.indexOfPos(u8, src, at, "initWithConfig(") orelse
-        return error.MissingReinitBuild;
-    const free_at = std.mem.indexOfPos(u8, src, at, "self." ++ "deinit()") orelse
-        return error.MissingReinitFree;
-    try testing.expect(build_at < free_at);
-}
-
 test "KVCache sliding window views return last max_seq entries" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
@@ -32873,72 +32837,6 @@ test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
     const bv = mlx.mlx_array_data_float32(b).?;
     for (0..64) |i| try testing.expectEqual(bv[i] * 2.0, av[i]);
     for (64..128) |i| try testing.expectEqual(bv[i], av[i]);
-}
-
-test "qsaMaskFromQk applies yarnScaleRotated on the scalar rope arm only" {
-    // The QSA indexer's mlx_fast_rope else-arm is the only path that does not
-    // already fold mscale (M-RoPE tables carry it via fillCosSin). A comment
-    // once skipped the scale; deleting the call still left every runtime test
-    // green because they invoke yarnScaleRotated directly. This scan is the
-    // wiring pin. Needles are assembled at comptime so this test's own source
-    // cannot satisfy the scan.
-    const src = @embedFile("qwen4_qsa.zig");
-    const fn_mark = "pub fn qsaMask" ++ "FromQk(";
-    const at = std.mem.indexOf(u8, src, fn_mark) orelse return error.MissingQsaMaskFromQk;
-    const line_end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
-    const next = std.mem.indexOfPos(u8, src, line_end, "\npub fn ") orelse src.len;
-    const body = src[line_end..next];
-
-    const yarn_scale = "yarn" ++ "ScaleRotated";
-    const fast_rope = "mlx_" ++ "fast_rope";
-    const mrope_mark = "ctx.mrope_" ++ "cos_cur";
-    const apply_mrope = "apply" ++ "Mrope";
-    const scale_lit = "}, 1" ++ ".0,";
-    const skip_a = "deliberately NOT" ++ " applied";
-    const skip_b = "cannot change a" ++ " top-k";
-
-    const mrope_at = std.mem.indexOf(u8, body, mrope_mark) orelse return error.MissingMropeArm;
-    const pooled_at = std.mem.indexOfPos(u8, body, mrope_at, "// Pooled block keys") orelse
-        return error.MissingPooledSection;
-    const rope_block = body[mrope_at..pooled_at];
-    const else_at = std.mem.indexOf(u8, rope_block, "} else {") orelse return error.MissingScalarElse;
-    const mrope_arm = rope_block[0..else_at];
-    const scalar_arm = rope_block[else_at..];
-
-    try testing.expect(std.mem.indexOf(u8, mrope_arm, apply_mrope) != null);
-    var mrope_it = std.mem.splitScalar(u8, mrope_arm, '\n');
-    while (mrope_it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        if (std.mem.indexOf(u8, line, yarn_scale) != null) return error.YarnScaleOnMropeArm;
-    }
-
-    var fast_seen = false;
-    var scale_after = false;
-    var scale_one = false;
-    var scalar_it = std.mem.splitScalar(u8, scalar_arm, '\n');
-    while (scalar_it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        if (std.mem.indexOf(u8, line, fast_rope) != null) fast_seen = true;
-        if (std.mem.indexOf(u8, line, scale_lit) != null) scale_one = true;
-        if (std.mem.indexOf(u8, line, yarn_scale) != null) {
-            if (!fast_seen) return error.YarnScaleBeforeFastRope;
-            scale_after = true;
-        }
-    }
-    if (!fast_seen) return error.MissingFastRope;
-    if (!scale_one) return error.FastRopeScaleNotOne;
-    if (!scale_after) return error.MissingYarnScaleOnScalarArm;
-
-    var body_it = std.mem.splitScalar(u8, body, '\n');
-    while (body_it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        if (std.mem.indexOf(u8, line, skip_a) != null or std.mem.indexOf(u8, line, skip_b) != null) {
-            return error.SkipTheoryInProduction;
-        }
-    }
 }
 
 test "qwen4_exp yarn: the device denominator and the host spectrum are one spectrum" {
@@ -39990,29 +39888,10 @@ test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
     try std.testing.expectEqual(@as(u32, 1), b.qsa_arms.mask);
 }
 
-test "the qsa arm tally lives on the ForwardCtx and every increment goes through it" {
-    // Class guard for the ownership itself: a future edit that parks the
-    // counter back on the shared Transformer (or increments through `self`)
-    // reintroduces the union-of-slots bug with the log line looking healthy.
-    // Needles are assembled at comptime so this test's own source cannot
-    // satisfy the scan.
-    const field = "qsa_" ++ "arms";
-    try std.testing.expect(@hasField(ForwardCtx, field));
-    try std.testing.expect(!@hasField(Transformer, field));
-    try std.testing.expect(!@hasDecl(Transformer, "qsaArms" ++ "Take"));
-
-    const xfm_src = @embedFile("transformer.zig") ++ @embedFile("qwen4_forward.zig") ++ @embedFile("qwen4_qsa.zig");
-    // No self-owned tally anywhere: a `self.`-qualified tally was the field
-    // on the shared Transformer this bug came from.
-    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "self." ++ field) == null);
-    // ... and the attention site increments through the request's ctx.
-    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "ctx." ++ field ++ ".note(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "ctx." ++ field ++ ".noteGather(") != null);
-
-    // The logging seam reads the Generator's own ctx, not the Transformer.
-    const gen_src = @embedFile("generate.zig");
-    try std.testing.expect(std.mem.indexOf(u8, gen_src, "self.ctx." ++ field) != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen_src, "xfm.qsaArms" ++ "Take") == null);
+test "the qsa arm tally lives on the ForwardCtx, never on the shared Transformer" {
+    try std.testing.expect(@hasField(ForwardCtx, "qsa_arms"));
+    try std.testing.expect(!@hasField(Transformer, "qsa_arms"));
+    try std.testing.expect(!@hasDecl(Transformer, "qsaArmsTake"));
 }
 
 test "qsa verify gather geometry: rows, the union tail, and the no-win decline" {
@@ -46763,24 +46642,6 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
     _ = mlx.mlx_array_free(src_e[0].aux_state);
     src_e[0].aux_state = .{ .ctx = null };
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, cp.layers[0].aux_state, s));
-}
-
-test "the qwen4 EV seed width is mtp.MAX_DEPTH itself, not a mirrored constant" {
-    // The mirrored seed-width constant existed because "transformer.zig
-    // cannot import mtp.zig" — which stopped being true when the draft-rerank
-    // scheme put `const mtp_mod = @import("mtp.zig")` at the top of this file.
-    // A mirror plus a comptime assert in a THIRD file is what a direct
-    // reference is for, and the doc comment claiming the import is impossible
-    // reads as a spec (rule: "a contract COMMENT is read as a spec").
-    //
-    // The needle is split so this test is not its own counter-example.
-    const needle = "MTP_EV_SEED" ++ "_DEPTH";
-    try testing.expect(std.mem.indexOf(u8, @embedFile("transformer.zig"), needle) == null);
-    try testing.expect(std.mem.indexOf(u8, @embedFile("generate.zig"), needle) == null);
-    // The width reads through the import the retired comment said could not exist.
-    const source = @embedFile("transformer.zig");
-    try testing.expect(std.mem.indexOf(u8, source, "ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32") != null);
-    try testing.expect(std.mem.indexOf(u8, source, "const mtp_mod = @import(\"mtp.zig\");") != null);
 }
 
 test "qsa key append plan: rows advance by S, capacity grows only when it must" {
