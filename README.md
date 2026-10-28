@@ -71,7 +71,7 @@ the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
 less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-STQ-2.75bpw) at 64 GB.
 
-‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every under 128GB Mac. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `iogpu.wired_limit_mb=125000` and at `80` on a 96 GB Mac with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)).
+‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every under 128GB Mac. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `iogpu.wired_limit_mb=125000` and at `80` on a 96 GB Mac with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)). A budget above 108 (for example 114) also needs `sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000`: without it, prefill slows down with no error.
 
 ## Streaming
 
