@@ -652,9 +652,31 @@ fn failText(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytyp
     return .{ .fail = try std.fmt.allocPrint(allocator, fmt, args) };
 }
 
+/// Addresses a host name maps to, at most `out.len`; tests substitute fixed ones so none touches the network.
+const Resolver = *const fn (io: std.Io, name: std.Io.net.HostName, out: []std.Io.net.IpAddress) anyerror!usize;
+
+fn resolveHost(io: std.Io, name: std.Io.net.HostName, out: []std.Io.net.IpAddress) anyerror!usize {
+    var lookup_buf: [32]std.Io.net.HostName.LookupResult = undefined;
+    var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buf);
+    try name.lookup(io, &queue, .{ .port = 0 });
+    var n: usize = 0;
+    while (queue.getOne(io)) |r| switch (r) {
+        .address => |addr| if (n < out.len) {
+            out[n] = addr;
+            n += 1;
+        },
+        .canonical_name => {},
+    } else |_| {}
+    return n;
+}
+
 /// Why `url` may not be fetched, or null. Resolves the host: every address
 /// it maps to must be public.
 fn urlRefusal(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !?[]u8 {
+    return urlRefusalWith(allocator, io, url, resolveHost);
+}
+
+fn urlRefusalWith(allocator: std.mem.Allocator, io: std.Io, url: []const u8, resolve: Resolver) !?[]u8 {
     const uri = std.Uri.parse(url) catch return try allocator.dupe(u8, "refused: not a valid URL");
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
         return try allocator.dupe(u8, "refused: only http and https URLs can be fetched");
@@ -670,19 +692,13 @@ fn urlRefusal(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !?[]u8 
         return null;
     } else |_| {}
     const name = std.Io.net.HostName.init(host) catch return try std.fmt.allocPrint(allocator, "refused: {s} is not a valid host name", .{host});
-    var lookup_buf: [32]std.Io.net.HostName.LookupResult = undefined;
-    var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buf);
-    name.lookup(io, &queue, .{ .port = 0 }) catch |err| return try std.fmt.allocPrint(allocator, "error: could not resolve {s} ({t})", .{ host, err });
-    var any = false;
-    while (queue.getOne(io)) |r| switch (r) {
-        .address => |addr| {
-            any = true;
-            const class = classifyAddress(addr);
-            if (class != .public) return try std.fmt.allocPrint(allocator, "refused: {s} resolves to a {t} address", .{ host, class });
-        },
-        .canonical_name => {},
-    } else |_| {}
-    if (!any) return try std.fmt.allocPrint(allocator, "error: could not resolve {s}", .{host});
+    var addrs: [32]std.Io.net.IpAddress = undefined;
+    const n = resolve(io, name, &addrs) catch |err| return try std.fmt.allocPrint(allocator, "error: could not resolve {s} ({t})", .{ host, err });
+    if (n == 0) return try std.fmt.allocPrint(allocator, "error: could not resolve {s}", .{host});
+    for (addrs[0..n]) |addr| {
+        const class = classifyAddress(addr);
+        if (class != .public) return try std.fmt.allocPrint(allocator, "refused: {s} resolves to a {t} address", .{ host, class });
+    }
     return null;
 }
 
@@ -2240,6 +2256,43 @@ test "repl tools: web tools refuse local, private and non-http targets before co
     const img = try runForTest(ctx, "view_image", "{\"path_or_url\":\"http://192.168.1.10/cam.jpg\"}");
     defer allocator.free(img);
     try expectStartsWith("refused:", img);
+}
+
+var fixed_answer: ?[]const []const u8 = null;
+
+fn fixedResolver(_: std.Io, _: std.Io.net.HostName, out: []std.Io.net.IpAddress) anyerror!usize {
+    const answer = fixed_answer orelse return error.UnknownHostName;
+    for (answer, 0..) |text, i| out[i] = try std.Io.net.IpAddress.parse(text, 0);
+    return answer.len;
+}
+
+test "repl tools: a public-looking name is judged by the addresses it resolves to" {
+    const allocator = testing.allocator;
+    defer fixed_answer = null;
+    const Row = struct { answer: ?[]const []const u8, want: ?[]const u8 };
+    for ([_]Row{
+        .{ .answer = &.{ "93.184.216.34", "2606:2800:21f:cb07:6820:80da:af6b:8b2c" }, .want = null },
+        .{ .answer = &.{"10.0.0.5"}, .want = "refused: rebind.example resolves to a private address" },
+        .{ .answer = &.{ "93.184.216.34", "127.0.0.1" }, .want = "refused: rebind.example resolves to a loopback address" },
+        .{ .answer = &.{"fe80::1"}, .want = "refused: rebind.example resolves to a link_local address" },
+        .{ .answer = &.{}, .want = "error: could not resolve rebind.example" },
+        .{ .answer = null, .want = "error: could not resolve rebind.example (UnknownHostName)" },
+    }) |row| {
+        fixed_answer = row.answer;
+        const got = try urlRefusalWith(allocator, testing.io, "https://rebind.example/page", fixedResolver);
+        defer if (got) |g| allocator.free(g);
+        if (row.want) |want| try testing.expectEqualStrings(want, got.?) else try testing.expect(got == null);
+    }
+    // Literals, local names and bad schemes are decided without asking DNS.
+    for ([_][]const u8{ "http://10.0.0.1/", "http://[::1]/", "http://printer.local/", "ftp://rebind.example/", "http://u:p@rebind.example/" }) |url| {
+        const got = (try urlRefusalWith(allocator, testing.io, url, unreachableResolver)).?;
+        defer allocator.free(got);
+        try expectStartsWith("refused:", got);
+    }
+}
+
+fn unreachableResolver(_: std.Io, _: std.Io.net.HostName, _: []std.Io.net.IpAddress) anyerror!usize {
+    return error.ResolverMustNotRun;
 }
 
 test "repl tools: the tool list offers view_image only to a vision model, the write tools only when editing is on, and each call traces one line" {
