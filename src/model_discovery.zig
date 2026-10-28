@@ -46,7 +46,6 @@ const supported_model_types = [_][]const u8{
     "llama",     "mistral",
     "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
-    "bert",
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
@@ -312,10 +311,9 @@ pub fn isGgufModelPath(io: std.Io, path: []const u8) bool {
 
 /// Coarse classification of a model for UX surfaces — the `sushi list`
 /// TYPE column and the `run` chat-REPL preflight. Mirrors how serving
-/// actually routes the directory (encoder-only, drafter sidecars).
+/// actually routes the directory (drafter sidecars).
 pub const ModelKind = enum {
     chat,
-    embed,
     drafter,
     unsupported,
 
@@ -323,7 +321,6 @@ pub const ModelKind = enum {
     pub fn label(self: ModelKind) []const u8 {
         return switch (self) {
             .chat => "chat",
-            .embed => "embed",
             .drafter => "drafter",
             .unsupported => "unsupported",
         };
@@ -333,7 +330,6 @@ pub const ModelKind = enum {
     pub fn describe(self: ModelKind) []const u8 {
         return switch (self) {
             .chat => "a chat model",
-            .embed => "an embedding encoder (use /v1/embeddings)",
             .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
             .unsupported => "an architecture sushi does not support",
         };
@@ -343,7 +339,6 @@ pub const ModelKind = enum {
 
 /// Map a config.json `model_type` to its ModelKind.
 pub fn modelKindFromType(model_type: []const u8) ModelKind {
-    if (std.mem.eql(u8, model_type, "bert")) return .embed;
     if (std.mem.endsWith(u8, model_type, "_assistant")) return .drafter;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
@@ -387,7 +382,7 @@ pub const DiscoveredModel = struct {
     /// Approximate weight size on disk in bytes (sum of *.safetensors). Used
     /// later by eviction; null if scan failed.
     bytes_on_disk: ?u64,
-    /// `model_type` peeked from config.json (e.g. "bert"), so registry stubs
+    /// `model_type` peeked from config.json (e.g. "qwen4_exp"), so registry stubs
     /// can advertise arch-derived capabilities before a cold load. Empty
     /// when unknown.
     model_type: []const u8 = "",
@@ -656,9 +651,8 @@ pub const ProbeResult = struct {
 /// Validate an arbitrary absolute model directory the way discovery would
 /// (config.json present, supported model_type and quant mode) and report its
 /// weight bytes. Used by /v1/load-model's register-by-path branch for models
-/// OUTSIDE the --model-dir scan — e.g. the app's auto-downloaded embedding
-/// encoder, which lands wherever the download root is regardless of which
-/// org dir the chat model came from.
+/// OUTSIDE the --model-dir scan — e.g. a pack in the app's download root,
+/// whichever org dir the chat model came from.
 pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) !ProbeResult {
     const trimmed = trimTrailingSlash(abs_path);
     const base = std.fs.path.basename(trimmed);
@@ -728,15 +722,6 @@ pub const StubMeta = struct {
     /// (video piggybacks the vision tower — see src/qwen_vision.zig).
     has_video: bool = false,
     has_chat: bool = false,
-    /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
-    /// advertises "embeddings" and no chat capabilities.
-    is_encoder: bool = false,
-    /// Embedding capability (issue #116): every encoder, PLUS a decoder with a
-    /// declared pooling contract (config.json `pooling_mode`, or — added by
-    /// `readStubMeta` — a `1_Pooling/config.json` sidecar). The name-based
-    /// fallback for metadata-less checkpoints lives at the server's stub-cap
-    /// site via `model.poolingFromDirName` (one shared rule, no copy here).
-    has_embedding: bool = false,
     /// generation_config.json's thinking default (`ModelConfig.gen_enable_thinking`).
     enable_thinking: ?bool = null,
     model_type_buf: [64]u8 = @splat(0),
@@ -756,8 +741,7 @@ fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
 
 /// Pure: extract `StubMeta` from raw config.json bytes. `has_chat_template` is
 /// supplied by the caller (the template lives outside config.json), and
-/// determines chat/tool capabilities — gated off for encoder-only (`bert`)
-/// archs. Mirrors the loaded-path capability rules in `server.renderModelEntry`
+/// determines chat/tool capabilities. Mirrors the loaded-path capability rules in `server.renderModelEntry`
 /// (chat-template presence ⇒ chat/tool_use/streaming/json_schema). Returns
 /// `.found=false` on any parse failure.
 pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_chat_template: bool) StubMeta {
@@ -825,28 +809,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // MiMo serves images only; its video pads are not wired.
     meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0 and
         !std.mem.eql(u8, mt, "mimo_v2");
-    const bidirectional = blk: {
-        const cfgBool = struct {
-            fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
-                if (tc) |t| {
-                    if (t.get(key)) |v| {
-                        if (v == .bool) return v.bool;
-                    }
-                }
-                if (r.get(key)) |v| {
-                    if (v == .bool) return v.bool;
-                }
-                return false;
-            }
-        }.get;
-        break :blk cfgBool(root, text_cfg, "use_bidirectional_attention");
-    };
-    meta.is_encoder = std.mem.eql(u8, mt, "bert") or bidirectional;
-    meta.has_chat = has_chat_template and !meta.is_encoder;
-    meta.has_embedding = meta.is_encoder;
-    if (root.get("pooling_mode")) |v| {
-        if (v == .string) meta.has_embedding = true;
-    }
+    meta.has_chat = has_chat_template;
     return meta;
 }
 
@@ -899,14 +862,6 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
             meta.enable_thinking = @import("model.zig").parseGenerationDefaultsFromJson(gen_bytes).enable_thinking;
         } else |_| {}
     } else |_| {}
-    // A sentence-transformers pooling sidecar marks embedding capability even
-    // when config.json says nothing (the load path parses its mode; the stub
-    // only needs existence). Issue #116.
-    if (meta.found and !meta.has_embedding) {
-        if (dir.statFile(io, "1_Pooling/config.json", .{})) |st| {
-            if (st.kind == .file) meta.has_embedding = true;
-        } else |_| {}
-    }
     return meta;
 }
 
@@ -1225,10 +1180,9 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen3_5_moe"));
     try testing.expectEqual(ModelKind.chat, modelKindFromType("diffusion_gemma"));
     try testing.expect(isSupportedModelType("diffusion_gemma"));
-    // Encoders, drafter sidecars, and genuinely unsupported archs (media
+    // Drafter sidecars, and genuinely unsupported archs (media
     // generation included: it is no longer served).
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("flux2-klein-4b"));
-    try testing.expectEqual(ModelKind.embed, modelKindFromType("bert"));
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_assistant"));
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
     // DFlash sidecars ride the same `*_assistant` suffix rule — never listed
@@ -1488,46 +1442,6 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     {
         const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe_text\",\"vision_config\":{}}", true);
         try testing.expect(!m.has_vision);
-    }
-    // Encoder (bert): chat/tool caps suppressed even with a template present.
-    {
-        const m = parseStubMeta(a, "{\"model_type\":\"bert\",\"hidden_size\":384}", true);
-        try testing.expect(!m.has_chat);
-        try testing.expect(m.is_encoder);
-        try testing.expect(m.has_embedding);
-    }
-    // Decoder embedding checkpoint (issue #116): an explicit `pooling_mode`
-    // marks embeddings capability WITHOUT turning the stub into an encoder —
-    // Qwen3-Embedding keeps its causal arch (and its chat template).
-    {
-        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560,\"pooling_mode\":\"last_token\"}", true);
-        try testing.expect(m.has_embedding);
-        try testing.expect(!m.is_encoder);
-        try testing.expect(m.has_chat);
-    }
-    // A plain chat qwen3 advertises no embeddings capability.
-    {
-        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560}", true);
-        try testing.expect(!m.has_embedding);
-    }
-    // Bidirectional embedding model (EmbeddingGemma): a gemma3_text config
-    // with use_bidirectional_attention — the stub must advertise embeddings,
-    // never chat, WITHOUT cold-loading (issue #79).
-    {
-        const json =
-            \\{"model_type":"gemma3_text","use_bidirectional_attention":true,
-            \\"hidden_size":768,"num_hidden_layers":24,"max_position_embeddings":2048}
-        ;
-        const m = parseStubMeta(a, json, true);
-        try testing.expect(m.is_encoder);
-        try testing.expect(!m.has_chat);
-        try testing.expectEqual(@as(u32, 768), m.hidden_size);
-    }
-    // A chat gemma3_text WITHOUT the flag stays a chat model.
-    {
-        const m = parseStubMeta(a, "{\"model_type\":\"gemma3_text\",\"hidden_size\":768}", true);
-        try testing.expect(!m.is_encoder);
-        try testing.expect(m.has_chat);
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the

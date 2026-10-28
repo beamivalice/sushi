@@ -188,36 +188,6 @@ pub fn startupRefusal(err: anyerror, host: []const u8, port: u16, buf: []u8) ?[]
     }
 }
 
-test "textGenTargetOf: reads config unless the entry is mid-load" {
-    // Bar: a `.loading` entry's retained CPU state can be freed off-mutex, so
-    // the encoder-only flag must not come from `config` in that state.
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var reg = try model_registry_mod.ModelRegistry.init(std.testing.allocator, io, null, 3, 0, null);
-    defer reg.deinit();
-    const e = try reg.registerStubWithArch("m", "/path/to/m", 1024, "");
-
-    var cfg = std.mem.zeroes(model_mod.ModelConfig);
-    cfg.is_encoder_only = true;
-    e.config = &cfg;
-    defer {
-        e.config = null;
-        e.state = .unloaded;
-    }
-
-    // Resident, and retained across an unload: the pre-load 400 still fires.
-    e.state = .ready;
-    try std.testing.expect(textGenTargetOf(e).is_encoder_only);
-    e.state = .unloaded;
-    try std.testing.expect(textGenTargetOf(e).is_encoder_only);
-    try std.testing.expect(textGenRejectReason(textGenTargetOf(e)) != null);
-
-    // Mid-load: no config read at all, so the route falls through to
-    // `ensureLoaded` and the authoritative post-load check.
-    e.state = .loading;
-    try std.testing.expect(!textGenTargetOf(e).is_encoder_only);
-    try std.testing.expect(textGenRejectReason(textGenTargetOf(e)) == null);
-}
-
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
 const build_options = @import("build_options");
@@ -812,7 +782,6 @@ const ROUTE_PATHS = [_][]const u8{
     "/tokenize",
     "/v1/chat/completions",
     "/v1/completions",
-    "/v1/embeddings",
     "/v1/load-model",
     "/v1/messages",
     "/v1/messages/count_tokens",
@@ -1120,19 +1089,6 @@ pub fn parseOnOff(word: []const u8) ?bool {
 /// (handler refactor + per-connection threads), which the `serve()` startup
 /// guard checks before enabling.
 pub var max_concurrent: u32 = 1;
-
-/// Overflow 400 body text (an embedding input past the model's declared window;
-/// never a silent truncation, the Python-server `max_length=512` class): names the offending input INDEX and both counts,
-/// because the client can only fix what it can see (the contextOverflowMessage
-/// principle). bufPrint failure falls back to the bare sentence rather than
-/// sending no body (the media-gen fixed-buffer class).
-pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) []const u8 {
-    return std.fmt.bufPrint(
-        buf,
-        "Input at index {d} exceeds the maximum embedding input length: {d} tokens given, {d} allowed",
-        .{ index, tokens, limit },
-    ) catch "Input exceeds the maximum embedding input length";
-}
 
 // Plan 05: vision encoder and model id moved to `LoadedModel.vision_encoder`
 // and `LoadedModel.id`. Handlers read them off `lm`. `global_vision_encoder`
@@ -2040,7 +1996,6 @@ pub fn serve(
     log.info("  GET  /v1/models\n", .{});
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
-    log.info("  POST /v1/embeddings\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/messages/count_tokens (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
@@ -2597,8 +2552,7 @@ fn handleConnection(
 
     // ── Phase C: handlers take `lm` directly and extract their own
     //    locals. handleConnection only needs one decision for every
-    //    text-generation route: encoder-only AND media (image/audio/video/
-    //    3D) models get a clean 400 instead of reaching a prefill that has
+    //    text-generation route: media (image/audio/video/3D) models get a clean 400 instead of reaching a prefill that has
     //    no transformer to run (the SIGSEGV class documented on
     //    textGenRejectReason).
     const text_gen_reject: ?[]const u8 = textGenRejectReason(textGenTargetOf(lm));
@@ -2635,10 +2589,6 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleCompletions(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/embeddings")) {
-        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
-        const body = request[header_end + 4 .. total_read];
-        try handleEmbeddings(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages")) {
         if (text_gen_reject) |reason| {
             try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
@@ -5115,7 +5065,7 @@ test "a quantized pack is streaming capable and only the dense one is streaming 
 test "the streaming markers read the ONE arch gate: no other arch carries them" {
     const t = std.testing;
     var buf: [96]u8 = undefined;
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "gguf", "bert", "" }) |arch| {
+    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "gguf", "" }) |arch| {
         try t.expect(!streamingStubMarker(arch, true, true));
         try t.expect(!streamingRequiredMarker(arch, 0, false, true, true));
         try t.expectEqualStrings("", streamingRowPart(&buf, streamingStubMarker(arch, true, true), false, 60));
@@ -8211,15 +8161,7 @@ const ReadyCaps = struct {
     has_vision: bool = false,
     has_audio: bool = false,
     has_reasoning: bool = false,
-    /// Encoder-only (BERT/EmbeddingGemma) OR a decoder with a pooling contract
-    /// (Qwen3-Embedding) — `config.hasEmbeddingCapability()`. Issue #116.
-    has_embedding: bool = false,
 };
-
-/// Chat capability for a READY entry: a decoder with a chat template.
-fn readyHasChat(is_encoder_only: bool, chat_template_len: usize) bool {
-    return !is_encoder_only and chat_template_len > 0;
-}
 
 /// `capabilities` JSON array for a ready model. Caller deinits.
 fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) {
@@ -8243,7 +8185,6 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
     if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
-    if (c.has_embedding) try append_cap(allocator, &caps, &n_caps, "embeddings");
     try caps.append(allocator, ']');
     return caps;
 }
@@ -8254,7 +8195,6 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
 /// from a LoadedModel by `textGenTargetOf`; kept as plain facts so the
 /// decision is hermetically testable.
 const TextGenTarget = struct {
-    is_encoder_only: bool = false,
     /// A text-capable LM is resident (transformer) —
     /// or the entry isn't loaded yet, in which case stubs default to
     /// "assume text until the arch hint or a load says otherwise".
@@ -8326,18 +8266,12 @@ test "only a streamed load whose tower is off by default names --vision in its m
 /// when it can serve text: a request that reached prefill with no language
 /// model resident would dereference a null transformer.
 fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
-    if (t.is_encoder_only) return "Encoder-only models do not support text generation. Use /v1/embeddings instead.";
     if (!t.has_text_lm) return "This model cannot serve text generation (no language model resident).";
     return null;
 }
 
 fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
-    // `releaseRetainedCpuState`'s reader contract. Skipping the config costs
-    // the pre-load 400 for the duration of one reload; the post-load
-    // `text_gen_reject` is the authoritative barrier either way.
-    const cpu_state_stable = lm.state != .loading;
     return .{
-        .is_encoder_only = cpu_state_stable and lm.config != null and lm.config.?.is_encoder_only,
         .has_text_lm = lm.state != .ready or lm.transformer != null,
     };
 }
@@ -8404,13 +8338,12 @@ fn renderModelEntry(
             try std.fmt.allocPrint(allocator, "null", .{});
         defer allocator.free(ctx_str);
 
-        const has_chat = readyHasChat(config.is_encoder_only, chat_config.chat_template.len);
+        const has_chat = chat_config.chat_template.len > 0;
         const has_vision = entry.vision_encoder != null;
         var caps = try readyCapsJson(allocator, .{
             .has_chat = has_chat,
             .has_vision = has_vision,
             .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template),
-            .has_embedding = config.hasEmbeddingCapability(),
         });
         defer caps.deinit(allocator);
 
@@ -8448,15 +8381,6 @@ fn renderModelEntry(
         const gen_top_k_str = try optSamplingRecJson(allocator, u32, config.gen_top_k);
         defer allocator.free(gen_top_k_str);
 
-        // Effective embedding input ceiling (issue #117): surfaced so clients
-        // can discover the limit instead of learning it from a 400. null for
-        // models with no embedding capability; 0 = embedding-capable, unbounded.
-        const embed_limit_str = if (config.hasEmbeddingCapability())
-            try std.fmt.allocPrint(allocator, "{d}", .{config.max_position_embeddings})
-        else
-            try allocator.dupe(u8, "null");
-        defer allocator.free(embed_limit_str);
-
         var streaming_buf: [96]u8 = undefined;
         const streaming_part = streamingRowPart(
             &streaming_buf,
@@ -8466,7 +8390,7 @@ fn renderModelEntry(
         );
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{s}","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{s}","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -8491,7 +8415,6 @@ fn renderModelEntry(
             quantization,
             ctx_str,
             config.max_position_embeddings,
-            embed_limit_str,
             if (config.isMoe()) "true" else "false",
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
@@ -8556,22 +8479,12 @@ fn renderModelEntry(
         break :blk settings.lookup(entry.path).ssd_budget_gb orelse 0;
     } else 0);
 
-    // Capabilities. Encoder-only models advertise "embeddings"; chat models get
-    // chat/tool_use/streaming/json_schema (gated on chat-template presence, the
-    // same rule the loaded path uses) plus "vision" when a vision config is
-    // present. Reasoning/audio stay load-gated (they need the live template /
-    // encoder), so an unloaded stub may under-report those two.
-    const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert") or
-        (sm.found and sm.is_encoder);
-    // Decoder embedding stubs (issue #116): StubMeta's pooling signal
-    // (config key / sidecar), plus the known-family name rule for the
-    // metadata-less mlx-community conversions — the SAME `poolingFromDirName`
-    // the load path uses, so stub and loaded capability can't disagree.
-    const stub_has_embedding = (sm.found and sm.has_embedding) or
-        model_mod.poolingFromDirName(std.fs.path.basename(entry.path), entry.arch_hint) != null;
+    // Capabilities: chat/tool_use/streaming/json_schema (gated on chat-template
+    // presence, the same rule the loaded path uses) plus "vision" when a vision
+    // config is present. Reasoning/audio stay load-gated (they need the live
+    // template / encoder), so an unloaded stub may under-report those two.
     const caps_part: []const u8 = blk: {
-        if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
-        if (!sm.found or !(sm.has_chat or sm.has_vision or stub_has_embedding)) break :blk try allocator.dupe(u8, "");
+        if (!sm.found or !(sm.has_chat or sm.has_vision)) break :blk try allocator.dupe(u8, "");
         var b = std.ArrayList(u8).empty;
         errdefer b.deinit(allocator);
         try b.appendSlice(allocator, ",\"capabilities\":[");
@@ -8592,7 +8505,6 @@ fn renderModelEntry(
             try add(allocator, &b, &n, "json_schema");
         }
         if (sm.has_vision and !streaming_required) try add(allocator, &b, &n, "vision");
-        if (stub_has_embedding) try add(allocator, &b, &n, "embeddings");
         try b.append(allocator, ']');
         break :blk try b.toOwnedSlice(allocator);
     };
@@ -8766,7 +8678,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         requested_id = parseModelFromBody(request_body) orelse "";
     }
     // Register-by-path: an absolute path to a model directory OUTSIDE the
-    // --model-dir scan (e.g. the app's auto-downloaded embedding encoder).
+    // --model-dir scan (e.g. a pack in the app's download root).
     // The dir is validated exactly like discovery (config.json, supported
     // model_type + quant mode) before anything is registered; the load then
     // proceeds under the directory-basename id.
@@ -9279,276 +9191,6 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8
     log.info("[update] updating {s} -> {s} from the chat page; the server restarts\n", .{ update_mod.version, latest.? });
     update_mod.relaunch_requested.store(true, .release);
     shutdown_requested.store(true, .release);
-}
-
-/// `<bos> ids <eos>` for bidirectional embedding models. Either special is
-/// skipped when unknown; already-wrapped input is not double-wrapped.
-fn wrapEncoderIds(allocator: std.mem.Allocator, ids: []const u32, bos: ?u32, eos: ?u32) ![]u32 {
-    const need_bos = bos != null and (ids.len == 0 or ids[0] != bos.?);
-    const need_eos = eos != null and (ids.len == 0 or ids[ids.len - 1] != eos.?);
-    const out = try allocator.alloc(u32, ids.len + @intFromBool(need_bos) + @intFromBool(need_eos));
-    var i: usize = 0;
-    if (need_bos) {
-        out[i] = bos.?;
-        i += 1;
-    }
-    @memcpy(out[i .. i + ids.len], ids);
-    i += ids.len;
-    if (need_eos) out[i] = eos.?;
-    return out;
-}
-
-test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
-    const a = testing.allocator;
-    // EmbeddingGemma shape: bos 2, eos 1.
-    const wrapped = try wrapEncoderIds(a, &.{ 10, 11, 12 }, 2, 1);
-    defer a.free(wrapped);
-    try testing.expectEqualSlices(u32, &.{ 2, 10, 11, 12, 1 }, wrapped);
-    // Qwen3-Embedding shape (issue #116): eos-only append — the reference
-    // pools the appended <|endoftext|> position, so the id must be there.
-    const eos_only = try wrapEncoderIds(a, &.{ 10, 11 }, null, 151643);
-    defer a.free(eos_only);
-    try testing.expectEqualSlices(u32, &.{ 10, 11, 151643 }, eos_only);
-
-    // Missing specials are skipped, never invented.
-    const no_bos = try wrapEncoderIds(a, &.{ 10, 11 }, null, 1);
-    defer a.free(no_bos);
-    try testing.expectEqualSlices(u32, &.{ 10, 11, 1 }, no_bos);
-
-    // Already-wrapped input is left alone (idempotent).
-    const already = try wrapEncoderIds(a, &.{ 2, 10, 1 }, 2, 1);
-    defer a.free(already);
-    try testing.expectEqualSlices(u32, &.{ 2, 10, 1 }, already);
-
-    // Empty input still gets both specials.
-    const empty = try wrapEncoderIds(a, &.{}, 2, 1);
-    defer a.free(empty);
-    try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
-}
-
-fn handleEmbeddings(
-    allocator: std.mem.Allocator,
-    stream: *Conn,
-    body: []const u8,
-    lm: *LoadedModel,
-) !void {
-    // Both embed paths forward through the transformer: refuse by name when
-    // none is resident, before anything is queued.
-    const xfm = lm.transformer orelse {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "This model has no language model resident; embeddings are not supported.", null);
-        return;
-    };
-    const tok = lm.tokenizer.?;
-    const config = lm.config.?;
-    const gen_mod = @import("generate.zig");
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", null);
-        return;
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", null);
-        return;
-    }
-    const root = parsed.value.object;
-
-    // Parse input — can be a string or array of strings
-    const input_val = root.get("input") orelse {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing 'input' field", null);
-        return;
-    };
-
-    const model_name = if (root.get("model")) |m| (if (m == .string) m.string else config.model_type) else config.model_type;
-
-    // OpenAI `dimensions` (text-embedding-3 semantics): keep the first N
-    // components, L2-renormalize. Anything not a positive integer is a 400 —
-    // accepting the field and ignoring it would hand callers wrong-width
-    // vectors they only discover at retrieval time. Over-native is checked
-    // after the forward, when the model's width is known.
-    const req_dims: ?usize = if (root.get("dimensions")) |v| blk: {
-        if (v != .integer or v.integer < 1) {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'dimensions' must be a positive integer", null);
-            return;
-        }
-        break :blk @intCast(v.integer);
-    } else null;
-
-    // Collect input texts
-    var texts = std.ArrayList([]const u8).empty;
-    defer texts.deinit(allocator);
-
-    switch (input_val) {
-        .string => |s| try texts.append(allocator, s),
-        .array => |arr| {
-            for (arr.items) |item| {
-                if (item == .string) {
-                    try texts.append(allocator, item.string);
-                }
-            }
-        },
-        else => {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' must be a string or array of strings", null);
-            return;
-        },
-    }
-
-    if (texts.items.len == 0) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' must not be empty", null);
-        return;
-    }
-
-    log.info("POST /v1/embeddings ({d} inputs)\n", .{texts.items.len});
-
-    // Build response JSON
-    var resp_buf = std.ArrayList(u8).empty;
-    defer resp_buf.deinit(allocator);
-
-    try resp_buf.appendSlice(allocator, "{\"object\":\"list\",\"data\":[");
-
-    // Tokenize every input up front so the whole request rides ONE scheduler
-    // round-trip; the inference thread embeds the sequences in padded,
-    // key-masked GPU batches (generate.EMBED_MAX_BATCH per forward) instead
-    // of one forward per text.
-    var total_tokens: usize = 0;
-    var seqs = std.ArrayList([]const u32).empty;
-    defer {
-        for (seqs.items) |ids| allocator.free(ids);
-        seqs.deinit(allocator);
-    }
-    for (texts.items) |text| {
-        if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' entries must be non-empty strings", null);
-            return;
-        }
-        const raw_ids = try tok.encode(allocator, text);
-        const ids = if (config.effectivePooling() == .last_token) blk: {
-            // Last-token pooling models pool an APPENDED terminator: the
-            // Qwen3-Embedding tokenizer's TemplateProcessing post-processor
-            // adds <|endoftext|> (the config's eos_token_id) to every encode,
-            // and the reference pools THAT position — without it, we'd pool
-            // the final text token and quietly diverge from the model card.
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
-                allocator,
-                raw_ids,
-                null,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else raw_ids;
-        total_tokens += ids.len;
-        try seqs.append(allocator, ids);
-    }
-
-    // Issue #117: enforce the effective per-input token ceiling BEFORE the
-    // forward pass — the server owns the exact tokenizer, so the counts here
-    // are authoritative. Over-limit is an explicit 400, never truncation.
-    const embed_limit = config.max_position_embeddings;
-    if (embed_limit > 0) {
-        for (seqs.items, 0..) |ids, idx| {
-            if (ids.len > embed_limit) {
-                var msg_buf: [160]u8 = undefined;
-                const msg = embedOverflowMessage(&msg_buf, idx, ids.len, embed_limit);
-                log.warn("  embedding input {d} over limit: {d} > {d}\n", .{ idx, ids.len, embed_limit });
-                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
-                return;
-            }
-        }
-    }
-
-    // Phase A: route through scheduler when available so the encoder
-    // forward pass runs on the inference thread (mlx 0.31.2 thread-local
-    // streams). Falls back to a direct call only in the offline path
-    // where no scheduler exists. `computeEmbeddingsBatch` resets the KV
-    // cache before every sub-batch on both paths.
-    const embeddings = if (global_scheduler) |sch| blk: {
-        var req = scheduler_mod.EmbedRequest{
-            .model = lm,
-            .token_seqs = seqs.items,
-            .allocator = allocator,
-        };
-        break :blk sch.computeEmbeddings(&req) catch |err| {
-            if (req.error_name) |e| {
-                log.err("  embedding error: {s}\n", .{e});
-                allocator.free(e);
-            } else {
-                log.err("  embedding error: {}\n", .{err});
-            }
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
-            return;
-        };
-    } else fallback: {
-        break :fallback gen_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
-            log.err("  embedding error: {}\n", .{err});
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
-            return;
-        };
-    };
-    defer {
-        for (embeddings) |e| allocator.free(e);
-        allocator.free(embeddings);
-    }
-
-    if (req_dims) |d| {
-        const native = if (embeddings.len > 0) embeddings[0].len else 0;
-        if (d > native) {
-            const msg = try std.fmt.allocPrint(allocator, "'dimensions' must be between 1 and {d} for this model", .{native});
-            defer allocator.free(msg);
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
-            return;
-        }
-    }
-
-    for (embeddings, 0..) |full_embedding, idx| {
-        const embedding = if (req_dims) |d| truncateEmbeddingDims(full_embedding, d) else full_embedding;
-        if (idx > 0) try resp_buf.appendSlice(allocator, ",");
-
-        // Format: {"object":"embedding","embedding":[...floats...],"index":N}
-        const idx_str = try std.fmt.allocPrint(allocator, "{d}", .{idx});
-        defer allocator.free(idx_str);
-        try resp_buf.appendSlice(allocator, "{\"object\":\"embedding\",\"embedding\":[");
-
-        for (embedding, 0..) |val, i| {
-            if (i > 0) try resp_buf.appendSlice(allocator, ",");
-            var buf: [32]u8 = undefined;
-            const float_str = std.fmt.bufPrint(&buf, "{d:.8}", .{val}) catch "0";
-            try resp_buf.appendSlice(allocator, float_str);
-        }
-
-        try resp_buf.appendSlice(allocator, "],\"index\":");
-        try resp_buf.appendSlice(allocator, idx_str);
-        try resp_buf.appendSlice(allocator, "}");
-    }
-
-    const total_str = try std.fmt.allocPrint(allocator, "{d}", .{total_tokens});
-    defer allocator.free(total_str);
-    const model_escaped = try jsonEscape(allocator, model_name);
-    defer allocator.free(model_escaped);
-
-    try resp_buf.appendSlice(allocator, "],\"model\":");
-    try resp_buf.appendSlice(allocator, model_escaped);
-    try resp_buf.appendSlice(allocator, ",\"usage\":{\"prompt_tokens\":");
-    try resp_buf.appendSlice(allocator, total_str);
-    try resp_buf.appendSlice(allocator, ",\"total_tokens\":");
-    try resp_buf.appendSlice(allocator, total_str);
-    try resp_buf.appendSlice(allocator, "}}");
-
-    try sendResponse(stream, "200 OK", "application/json", resp_buf.items);
-    log.info("  <- {d} embeddings ({d} tokens)\n", .{ texts.items.len, total_tokens });
-}
-
-/// OpenAI `dimensions` semantics (text-embedding-3 class): keep the first
-/// `dims` components and L2-renormalize, in place. `dims >= len` returns the
-/// vector untouched so the default (no `dimensions`) path stays byte-identical.
-/// A zero prefix is returned unnormalized rather than divided by zero.
-fn truncateEmbeddingDims(embedding: []f32, dims: usize) []f32 {
-    if (dims == 0 or dims >= embedding.len) return embedding;
-    const out = embedding[0..dims];
-    var sumsq: f64 = 0;
-    for (out) |v| sumsq += @as(f64, v) * @as(f64, v);
-    if (sumsq <= 0) return out;
-    const inv = 1.0 / @sqrt(sumsq);
-    for (out) |*v| v.* = @floatCast(@as(f64, v.*) * inv);
-    return out;
 }
 
 fn handleTokenize(
@@ -14076,7 +13718,7 @@ test "routeExists answers endpoint existence without consulting the model" {
     // the server implements EVERYTHING (llmprobe: "server answers unknown paths
     // with HTTP 503" → every surface scored absent, live 2026-07-25).
     try std.testing.expect(routeExists("/v1/chat/completions"));
-    try std.testing.expect(routeExists("/v1/embeddings"));
+    try std.testing.expect(!routeExists("/v1/embeddings")); // not served: an unknown path
     try std.testing.expect(routeExists("/health"));
     // `/v1/responses/{id}` is served by prefix, not by an exact literal.
     try std.testing.expect(routeExists("/v1/responses/resp_abc123"));
@@ -23513,11 +23155,10 @@ test "optSamplingRecJson emits number when present, null when absent" {
     try std.testing.expectEqualStrings("null", none);
 }
 
-test "textGenRejectReason: encoder and LM-less entries rejected, chat models pass" {
+test "textGenRejectReason: LM-less entries rejected, chat models pass" {
     // Chat-capable targets pass — resident MLX LM, embedded engines, and
     // unloaded stubs (benefit of the doubt until load).
     try std.testing.expect(textGenRejectReason(.{}) == null);
-    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .is_encoder_only = true }).?, "/v1/embeddings") != null);
     // A READY entry with no LM resident rejects instead of crashing.
     try std.testing.expect(textGenRejectReason(.{ .has_text_lm = false }) != null);
 }
@@ -23527,8 +23168,6 @@ test "isTextGenRoute covers exactly the guarded surfaces" {
     try std.testing.expect(isTextGenRoute("POST", "/v1/messages"));
     try std.testing.expect(isTextGenRoute("POST", "/v1/responses"));
     try std.testing.expect(isTextGenRoute("GET", "/v1/responses")); // WS upgrade
-    // Embedding routes must NOT be gated — they serve encoders.
-    try std.testing.expect(!isTextGenRoute("POST", "/v1/embeddings"));
     try std.testing.expect(!isTextGenRoute("GET", "/v1/models"));
 }
 
@@ -23543,36 +23182,6 @@ test "isStatusRoute: only /props reaches the shared release" {
     try std.testing.expect(!isStatusRoute("POST", "/props"));
 }
 
-test "embedOverflowMessage: names the input index and both counts" {
-    var buf: [160]u8 = undefined;
-    const msg = embedOverflowMessage(&buf, 3, 1301, 1024);
-    try std.testing.expectEqualStrings(
-        "Input at index 3 exceeds the maximum embedding input length: 1301 tokens given, 1024 allowed",
-        msg,
-    );
-}
-
-test "readyCapsJson: embeddings capability — encoders alone, decoders beside chat" {
-    const a = std.testing.allocator;
-    // Encoder-only (BERT/EmbeddingGemma): embeddings, nothing else.
-    var enc = try readyCapsJson(a, .{ .has_embedding = true });
-    defer enc.deinit(a);
-    try std.testing.expectEqualStrings("[\"embeddings\"]", enc.items);
-    // A pooling-contracted decoder (Qwen3-Embedding, issue #116) keeps its
-    // chat set AND advertises embeddings — a READY model never advertises
-    // less capability than its stub.
-    var both = try readyCapsJson(a, .{ .has_chat = true, .has_embedding = true });
-    defer both.deinit(a);
-    try std.testing.expect(std.mem.indexOf(u8, both.items, "\"chat\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, both.items, "\"embeddings\"") != null);
-}
-
-test "readyHasChat: a decoder with a chat template chats, an encoder never" {
-    const t = std.testing;
-    try t.expect(readyHasChat(false, 1234));
-    try t.expect(!readyHasChat(true, 1234));
-    try t.expect(!readyHasChat(false, 0));
-}
 test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V widths" {
     const t = std.testing;
     // Uniform arch: every layer caches, K and V are both head_dim wide.
@@ -24344,35 +23953,6 @@ test "prefillFfnWidth: a declared MoE width beats the struct default, which is o
     bare.moe_intermediate_size = 0;
     bare.shared_expert_intermediate_size = 0;
     try t.expectEqual(@as(u64, 15360), prefillFfnWidth(&bare));
-}
-
-test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormalize)" {
-    const t = std.testing;
-
-    // Truncate to 2 of 4: keeps the first components, renormalizes to unit L2.
-    var v = [_]f32{ 3.0, 4.0, 100.0, 100.0 };
-    const out = truncateEmbeddingDims(&v, 2);
-    try t.expectEqual(@as(usize, 2), out.len);
-    try t.expectApproxEqAbs(@as(f32, 0.6), out[0], 1e-6); // 3/5
-    try t.expectApproxEqAbs(@as(f32, 0.8), out[1], 1e-6); // 4/5
-    var norm: f64 = 0;
-    for (out) |x| norm += @as(f64, x) * @as(f64, x);
-    try t.expectApproxEqAbs(@as(f64, 1.0), norm, 1e-6);
-
-    // dims == native width: byte-identical pass-through, no renorm — the
-    // default (no `dimensions`) path must never change.
-    var w = [_]f32{ 0.5, -0.25, 0.125 };
-    const same = truncateEmbeddingDims(&w, 3);
-    try t.expectEqual(@as(usize, 3), same.len);
-    try t.expectEqual(@as(f32, 0.5), same[0]);
-    try t.expectEqual(@as(f32, -0.25), same[1]);
-    try t.expectEqual(@as(f32, 0.125), same[2]);
-
-    // Zero prefix: truncation must not divide by zero or emit NaN.
-    var z = [_]f32{ 0.0, 0.0, 1.0 };
-    const zt = truncateEmbeddingDims(&z, 2);
-    try t.expectEqual(@as(usize, 2), zt.len);
-    for (zt) |x| try t.expect(!std.math.isNan(x));
 }
 
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {

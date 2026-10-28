@@ -72,77 +72,6 @@ pub const QuantMode = enum {
 
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
-/// Sentence-transformers pooling operation for embedding requests (issue
-/// #116): masked mean over real positions, the CLS token (position 0), or the
-/// last real (non-padding) token. Every mode is followed by L2 normalization.
-pub const PoolingMode = enum {
-    mean,
-    cls,
-    last_token,
-
-    pub fn fromString(s: []const u8) ?PoolingMode {
-        if (std.mem.eql(u8, s, "mean")) return .mean;
-        if (std.mem.eql(u8, s, "cls")) return .cls;
-        if (std.mem.eql(u8, s, "last_token")) return .last_token;
-        return null;
-    }
-};
-
-/// Parse a sentence-transformers `1_Pooling/config.json`. Returns the pooling
-/// mode when the file declares one we implement, null when the content isn't a
-/// pooling config at all (malformed JSON, unrelated object — best-effort, like
-/// generation_config.json), and `error.UnsupportedPoolingMode` when the file
-/// DOES declare pooling but only modes we don't implement (weighted-mean,
-/// max): serving those checkpoints mean-pooled would be silent corruption.
-pub fn parsePoolingSidecar(content: []const u8) !?PoolingMode {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), content, .{}) catch return null;
-    if (parsed != .object) return null;
-    const obj = parsed.object;
-
-    const getBool = struct {
-        fn get(o: std.json.ObjectMap, key: []const u8) bool {
-            if (o.get(key)) |v| {
-                if (v == .bool) return v.bool;
-            }
-            return false;
-        }
-    }.get;
-    // ST configs set exactly one mode true; check ours most-specific first.
-    if (getBool(obj, "pooling_mode_lasttoken")) return .last_token;
-    if (getBool(obj, "pooling_mode_cls_token")) return .cls;
-    if (getBool(obj, "pooling_mode_mean_tokens")) return .mean;
-    // Declares pooling, but none we support → refuse rather than mean-pool.
-    var it = obj.iterator();
-    while (it.next()) |e| {
-        if (std.mem.startsWith(u8, e.key_ptr.*, "pooling_mode_")) return error.UnsupportedPoolingMode;
-    }
-    return null;
-}
-
-/// Known-family pooling fallback for checkpoints that ship neither an explicit
-/// `pooling_mode` nor the ST sidecar (the mlx-community conversions strip it).
-/// Gated on the arch so a directory name can never flip an unrelated model:
-/// qwen3* named *embedding* → last-token (Qwen3-Embedding's contract), BERT
-/// bge-/mxbai-embed → CLS (their model cards' contract). Everything else null
-/// → the mean default.
-pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?PoolingMode {
-    var lower_buf: [256]u8 = undefined;
-    if (dir_basename.len > lower_buf.len) return null;
-    const lower = std.ascii.lowerString(&lower_buf, dir_basename);
-    if (std.mem.startsWith(u8, model_type, "qwen3")) {
-        if (std.mem.indexOf(u8, lower, "embedding") != null) return .last_token;
-        return null;
-    }
-    if (std.mem.eql(u8, model_type, "bert")) {
-        if (std.mem.indexOf(u8, lower, "bge-") != null) return .cls;
-        if (std.mem.indexOf(u8, lower, "mxbai-embed") != null) return .cls;
-        return null;
-    }
-    return null;
-}
-
 pub const isExpertStreamingArch = expert_quant.isExpertStreamingArch;
 
 /// DeepSeek-V4.1's MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
@@ -359,20 +288,7 @@ pub const ModelConfig = struct {
 
 
 
-    // BERT encoder-only
-    is_encoder_only: bool = false,
-
-    /// Sentence-transformers pooling for /v1/embeddings (issue #116). null =
-    /// no explicit signal → masked mean (the historical behavior, correct for
-    /// MiniLM-class BERTs and EmbeddingGemma). Set from config.json
-    /// `pooling_mode`, the ST `1_Pooling/config.json` sidecar, or the
-    /// known-family name fallback (`poolingFromDirName`). A non-null mode on a
-    /// decoder arch (Qwen3-Embedding) also advertises the `embeddings`
-    /// capability WITHOUT flipping `is_encoder_only` — the forward stays the
-    /// arch's own causal pass.
-    pooling_mode: ?PoolingMode = null,
-
-    // BOS id from config.json (embedding models wrap inputs <bos>…<eos>).
+    // BOS id from config.json.
     bos_token_id: ?u32 = null,
 
     // Context length from config.json (0 = unknown)
@@ -863,19 +779,6 @@ pub const ModelConfig = struct {
         return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
     }
 
-    /// The pooling op /v1/embeddings runs: the explicit signal, else masked
-    /// mean (the historical default — correct for MiniLM and EmbeddingGemma).
-    pub fn effectivePooling(self: *const ModelConfig) PoolingMode {
-        return self.pooling_mode orelse .mean;
-    }
-
-    /// Whether this model serves /v1/embeddings meaningfully: encoder-only
-    /// (BERT, EmbeddingGemma) or a decoder with a declared pooling contract
-    /// (Qwen3-Embedding). Drives capability advertising, never dispatch.
-    pub fn hasEmbeddingCapability(self: *const ModelConfig) bool {
-        return self.is_encoder_only or self.pooling_mode != null;
-    }
-
     /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
@@ -1302,32 +1205,6 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
         } else |_| {}
     } else |_| {}
-    // Pooling (issue #116), priority: explicit config.json `pooling_mode`
-    // (already parsed) > the ST `1_Pooling/config.json` sidecar > the
-    // known-family name fallback. A sidecar declaring only unsupported modes
-    // fails the load here — explicitly, never a silent mean-pool.
-    if (config.pooling_mode == null) {
-        const pool_path = try std.fmt.allocPrint(allocator, "{s}/1_Pooling/config.json", .{model_dir});
-        defer allocator.free(pool_path);
-        if (std.Io.Dir.openFileAbsolute(io, pool_path, .{})) |pool_file| {
-            defer pool_file.close(io);
-            var pool_buf: [4096]u8 = undefined;
-            var pool_reader = pool_file.reader(io, &pool_buf);
-            if (pool_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |pool_content| {
-                defer allocator.free(pool_content);
-                config.pooling_mode = try parsePoolingSidecar(pool_content);
-                if (config.pooling_mode) |m|
-                    log.info("[embed] pooling from 1_Pooling/config.json: {s}\n", .{@tagName(m)});
-            } else |_| {}
-        } else |_| {}
-    }
-    if (config.pooling_mode == null) {
-        if (poolingFromDirName(std.fs.path.basename(model_dir), config.model_type)) |m| {
-            config.pooling_mode = m;
-            log.info("[embed] pooling inferred from checkpoint name: {s}\n", .{@tagName(m)});
-        }
-    }
-
     // Community re-quants often ship NO generation_config.json; fill the
     // still-null truncation knobs with the family's documented defaults so
     // omitted-field resolution never bottoms out at untruncated sampling.
@@ -2042,16 +1919,6 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (v == .bool) config.attn_output_gate = v.bool;
     }
 
-    // Explicit pooling contract (issue #116): "mean" | "cls" | "last_token" in
-    // config.json marks a checkpoint as an embedding model and picks the pool
-    // op. An unknown value is a parse error, never a silent mean-pool —
-    // wrong-semantics vectors are harder to detect than a refused load.
-    if (root.get("pooling_mode")) |v| {
-        if (v == .string) {
-            config.pooling_mode = PoolingMode.fromString(v.string) orelse
-                return error.UnsupportedPoolingMode;
-        }
-    }
     if (cfg_obj.get("bos_token_id")) |v| {
         if (v == .integer and v.integer >= 0) config.bos_token_id = try cfgInt(u32, v);
     }
@@ -4223,14 +4090,6 @@ test "ModelConfig layerHeadDim" {
     try testing.expectEqual(@as(u32, 512), config.layerHeadDim(4));
 }
 
-test "ModelConfig BERT has no sliding window" {
-    var config = ModelConfig{};
-    config.is_encoder_only = true;
-    config.has_sliding_window = false;
-    try testing.expect(config.isGlobalLayer(0));
-    try testing.expect(config.isGlobalLayer(5));
-}
-
 test "shouldKeepWeightKey accepts orphan MTP head weights on Qwen3.5/3.6 checkpoints" {
     // Some Qwen3.5/3.6 checkpoints embed `*.mtp.*` tensors in the MAIN
     // shards (the sidecar-based MTP head in src/mtp.zig loads separately).
@@ -4536,86 +4395,6 @@ test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
     try testing.expectEqual(@as(?f32, 1.0), gd.temperature);
     try testing.expectEqual(@as(?f32, 0.95), gd.top_p);
     try testing.expectEqual(@as(?u32, 20), gd.top_k);
-}
-
-test "pooling: config.json pooling_mode key parses; unknown value rejected at parse" {
-    // Explicit converter/operator contract for checkpoints whose config alone
-    // can't reveal pooling (Qwen3-Embedding declares plain `qwen3`).
-    const base = "{{\"model_type\":\"qwen3\",\"hidden_size\":64,\"num_attention_heads\":8,\"num_hidden_layers\":2,\"pooling_mode\":\"{s}\"}}";
-    inline for (.{ .{ "last_token", PoolingMode.last_token }, .{ "cls", PoolingMode.cls }, .{ "mean", PoolingMode.mean } }) |case| {
-        const json = try std.fmt.allocPrint(testing.allocator, base, .{case[0]});
-        defer testing.allocator.free(json);
-        const config = try parseConfigFromJson(testing.allocator, json);
-        try testing.expectEqual(@as(?PoolingMode, case[1]), config.pooling_mode);
-        try testing.expect(config.hasEmbeddingCapability());
-        try testing.expect(!config.is_encoder_only); // pooling never flips the arch
-    }
-    // An unknown mode is a parse error, not a silent mean-pool: wrong-semantics
-    // vectors are harder to detect than a refused load.
-    const bad = try std.fmt.allocPrint(testing.allocator, base, .{"weighted_mean"});
-    defer testing.allocator.free(bad);
-    try expectError(error.UnsupportedPoolingMode, parseConfigFromJson(testing.allocator, bad));
-}
-
-test "pooling: sentence-transformers 1_Pooling sidecar parses all three modes" {
-    // Verbatim shape of ST `1_Pooling/config.json` (Qwen3-Embedding sets
-    // lasttoken, bge/mxbai set cls_token, MiniLM sets mean_tokens).
-    const last =
-        \\{"word_embedding_dimension": 2560, "pooling_mode_cls_token": false,
-        \\ "pooling_mode_mean_tokens": false, "pooling_mode_max_tokens": false,
-        \\ "pooling_mode_mean_sqrt_len_tokens": false, "pooling_mode_lasttoken": true}
-    ;
-    try testing.expectEqual(@as(?PoolingMode, .last_token), try parsePoolingSidecar(last));
-    const cls =
-        \\{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false, "pooling_mode_lasttoken": false}
-    ;
-    try testing.expectEqual(@as(?PoolingMode, .cls), try parsePoolingSidecar(cls));
-    const mean =
-        \\{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}
-    ;
-    try testing.expectEqual(@as(?PoolingMode, .mean), try parsePoolingSidecar(mean));
-}
-
-test "pooling: sidecar demanding an unsupported mode errors; non-pooling JSON is ignored" {
-    // A sidecar that DOES declare pooling but none we implement (weighted-mean,
-    // max) must refuse the load — mean-pooling it anyway is silent corruption.
-    const unsupported =
-        \\{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": false,
-        \\ "pooling_mode_max_tokens": true, "pooling_mode_lasttoken": false}
-    ;
-    try testing.expectError(error.UnsupportedPoolingMode, parsePoolingSidecar(unsupported));
-    // Malformed / unrelated JSON: best-effort null, like generation_config.json.
-    try testing.expectEqual(@as(?PoolingMode, null), try parsePoolingSidecar("not json"));
-    try testing.expectEqual(@as(?PoolingMode, null), try parsePoolingSidecar("{\"dimension\": 384}"));
-}
-
-test "pooling: known-family directory-name fallback" {
-    // The mlx-community conversions ship NO sidecar and a plain chat
-    // model_type, so a metadata-less checkpoint falls back to the family
-    // table — gated on the arch so a name can never flip an unrelated model.
-    try testing.expectEqual(@as(?PoolingMode, .last_token), poolingFromDirName("Qwen3-Embedding-4B-4bit-DWQ", "qwen3"));
-    try testing.expectEqual(@as(?PoolingMode, .last_token), poolingFromDirName("qwen3-embedding-0.6b", "qwen3"));
-    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("Qwen3-8B-4bit", "qwen3"));
-    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("Qwen3-Embedding-4B", "llama"));
-    // bge / mxbai are CLS-pooling BERTs (their cards say so); MiniLM stays mean.
-    try testing.expectEqual(@as(?PoolingMode, .cls), poolingFromDirName("bge-small-en-v1.5-8bit", "bert"));
-    try testing.expectEqual(@as(?PoolingMode, .cls), poolingFromDirName("mxbai-embed-large-v1", "bert"));
-    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("all-MiniLM-L6-v2", "bert"));
-    // EmbeddingGemma is mean-pooled via its own bidirectional path — the name
-    // fallback must not touch non-qwen3 archs on the "embedding" substring.
-    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("embeddinggemma-300m-8bit", "gemma3_text"));
-}
-
-test "pooling: effectivePooling defaults to mean; encoder capability unions" {
-    var config = ModelConfig{};
-    try testing.expectEqual(PoolingMode.mean, config.effectivePooling());
-    try testing.expect(!config.hasEmbeddingCapability());
-    config.is_encoder_only = true;
-    try testing.expect(config.hasEmbeddingCapability());
-    config.is_encoder_only = false;
-    config.pooling_mode = .last_token;
-    try testing.expectEqual(PoolingMode.last_token, config.effectivePooling());
-    try testing.expect(config.hasEmbeddingCapability());
 }
 
 test "parseGenerationDefaultsFromJson: missing keys and malformed input give nulls" {

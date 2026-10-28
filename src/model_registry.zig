@@ -181,8 +181,7 @@ pub const LoadedModel = struct {
     bytes_on_disk: ?u64,
     /// `model_type` peeked from config.json at discovery time (allocator-
     /// owned dupe; empty when unknown). Lets /v1/models advertise
-    /// arch-derived capabilities — e.g. "bert" → embeddings — while the
-    /// entry is still an `.unloaded` stub.
+    /// arch-derived capabilities while the entry is still an `.unloaded` stub.
     arch_hint: []const u8,
     streaming_index_complete: bool = false,
 
@@ -747,9 +746,9 @@ pub const ModelRegistry = struct {
     /// registry's world, and we never re-point a live entry's path. Returns
     /// the entry's stable id slice (owned by the registry).
     ///
-    /// Exists for models OUTSIDE the --model-dir scan: the app auto-downloads
-    /// a small embedding encoder and registers it here no matter which org
-    /// dir the chat model (and thus --model-dir) points at.
+    /// Exists for models OUTSIDE the --model-dir scan: the app registers a pack
+    /// from its download root here no matter which org dir the chat model (and
+    /// thus --model-dir) points at.
     pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8) ![]const u8 {
         var trimmed = abs_path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
@@ -1125,9 +1124,8 @@ pub const ModelRegistry = struct {
         // user loads a chat model via /v1/load-model — the live gen-first→
         // chat-later hole (2026-07-05). The LATEST chat-capable load is the
         // default, so a model-less request never swaps back to an older model;
-        // embedding encoders never qualify, and an explicit
-        // default (`--model`, `setDefault`) is never stolen.
-        if ((self.default_id.len == 0 or self.default_promoted) and chatCapable(entry) and
+        // an explicit default (`--model`, `setDefault`) is never stolen.
+        if ((self.default_id.len == 0 or self.default_promoted) and entry.config != null and
             !std.mem.eql(u8, self.default_id, entry.id))
         {
             self.default_id = entry.id;
@@ -1135,12 +1133,6 @@ pub const ModelRegistry = struct {
             log.info("[registry] default model -> {s} (latest chat-capable load on a headless server)\n", .{entry.id});
         }
         self.state_cond.broadcast(self.io);
-    }
-
-    /// Can this READY entry serve chat/completions? Embedding encoders cannot.
-    fn chatCapable(entry: *const LoadedModel) bool {
-        const cfg = entry.config orelse return false;
-        return !cfg.is_encoder_only;
     }
 
     /// Reserve `estimated` bytes against `reserved_bytes` for an entry that has
@@ -1435,8 +1427,8 @@ test "ModelRegistry: registerStub + setDefault" {
 test "ModelRegistry: registerStubWithArch keeps the discovery arch hint" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
-    const encoder = try reg.registerStubWithArch("bge", "/path/to/bge", 64, "bert");
-    try testing.expectEqualStrings("bert", encoder.arch_hint);
+    const hinted = try reg.registerStubWithArch("q4", "/path/to/q4", 64, "qwen4_exp");
+    try testing.expectEqualStrings("qwen4_exp", hinted.arch_hint);
     // Plain registerStub keeps an empty hint (no arch known).
     const plain = try reg.registerStub("foo", "/path/to/foo", 1024);
     try testing.expectEqualStrings("", plain.arch_hint);
@@ -1453,11 +1445,11 @@ test "ModelRegistry: registerByPath reuses an existing id without touching the f
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
-    const stub = try reg.registerStubWithArch("bge-x", "/models/bge-x", 64, "bert");
+    const stub = try reg.registerStubWithArch("q4-x", "/models/q4-x", 64, "qwen4_exp");
     // The path's parent doesn't exist — proves the fast path resolves by
     // basename before any probe.
-    const id = try reg.registerByPath(io, "/nonexistent/parent/bge-x/");
-    try testing.expectEqualStrings("bge-x", id);
+    const id = try reg.registerByPath(io, "/nonexistent/parent/q4-x/");
+    try testing.expectEqualStrings("q4-x", id);
     try testing.expectEqual(stub.id.ptr, id.ptr);
 }
 
@@ -2093,21 +2085,9 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // gen-first→chat-later hole (live 2026-07-05): a server started headless
     // (no --model) has no default, so requests addressing the "sushi"
     // alias 503 with no_model even after the user loads a chat model via
-    // /v1/load-model. The FIRST chat-capable load is promoted; embedding
-    // encoders never qualify; an existing default is never stolen.
+    // /v1/load-model. The FIRST chat-capable load is promoted; an existing default is never stolen.
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
     defer reg.deinit();
-
-    // A ready embedding ENCODER must not become the default.
-    const bge = try reg.registerStub("bge", "/m/bge", 64);
-    var bge_cfg = model_mod.ModelConfig{};
-    bge_cfg.model_type = "bert";
-    bge_cfg.is_encoder_only = true;
-    bge.config = &bge_cfg;
-    reg.mutex.lockUncancelable(reg.io);
-    reg.markReadyLocked(bge, 64);
-    reg.mutex.unlock(reg.io);
-    try testing.expectEqualStrings("", reg.default_id);
 
     // The first chat-capable load IS promoted...
     const chat = try reg.registerStub("gemma", "/m/gemma", 64);
@@ -2143,7 +2123,6 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
 
     // The configs are STACK-allocated test doubles — detach them before
     // registry deinit tries to free entry-owned configs.
-    bge.config = null;
     chat.config = null;
     chat2.config = null;
 }

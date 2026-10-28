@@ -12284,8 +12284,6 @@ pub fn sliceQsaHistoryOntoCheckpoint(dst: *SSMCheckpoint, src: *const SSMCheckpo
 
 // ── Standard model per-layer weights ──
 
-// ── BERT encoder-only layer weights ──
-
 // ── Standard decoder-only layer weights ──
 
 // ── MoE model per-layer weights ──
@@ -12621,10 +12619,6 @@ pub const ForwardCtx = struct {
     /// Scoped to the TRUNK: the qwen4 MTP head's forward builds its own ctx
     /// and its single QSA layer is not part of this tally.
     qsa_arms: QsaArmCounts = .{},
-    /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
-    /// by the BERT encoder forward so padded positions never attend. Null
-    /// (the default) keeps the unmasked single-sequence path.
-    key_pad_mask: ?mlx.mlx_array = null,
     /// DiffusionGemma encoder pass: multiply each layer's output by the
     /// ENCODER layer scalar instead of the decoder's. Set by the diffusion
     /// runner for prompt prefill and committed-canvas re-encode passes.
@@ -13550,7 +13544,6 @@ pub const Transformer = struct {
 
     owns_lm_head: bool,
     owns_norms: bool,
-    embedding_mode: bool = false,
 
     /// Layer stride for the decode async-eval ladder (0 = off). Resolved once
     /// at construction from `SUSHI_DECODE_ASYNC_LADDER` — a per-layer
@@ -15670,8 +15663,6 @@ pub const Transformer = struct {
         return self.forwardWith(ctx, token_ids);
     }
 
-    // ── BERT encoder-only forward pass ──
-
     // ── Standard forward pass (Gemma / Llama / Qwen3 / Gemma4) ──
 
     // ── Batched-decode forward pass ──
@@ -15683,7 +15674,7 @@ pub const Transformer = struct {
     // inner arrays (free each via mlx_array_free, then allocator.free the slice).
     //
     // Restrictions (enforced upstream by `Scheduler.batchable`):
-    //   - Standard arch only (no MoE, hybrid SSM, encoder-only).
+    //   - Standard arch only (no MoE, hybrid SSM).
     //   - Decode only (each slot contributes exactly one new token).
     //   - No grammar-constrained sampling, no in-flight speculative round.
     //
@@ -16929,23 +16920,6 @@ pub const Transformer = struct {
     // ── Hybrid attention (LFM2, Nemotron-H) ──
 
     // ── Simple (ungated) MLP with ReLU^2 (Nemotron-H) ──
-
-    /// Forward pass that returns hidden states (after final_norm, before lm_head).
-    /// Output shape: [1, seq_len, hidden_size]. Caller must free.
-    pub fn forwardEmbedding(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        return self.forwardEmbeddingMasked(token_ids, null);
-    }
-
-    /// Embedding forward for a padded [B, T] batch: `key_pad_mask` (additive,
-    /// [B, 1, 1, T]) keeps padded positions out of encoder attention. Null
-    /// mask == plain forwardEmbedding.
-    pub fn forwardEmbeddingMasked(self: *Transformer, token_ids: mlx.mlx_array, key_pad_mask: ?mlx.mlx_array) !mlx.mlx_array {
-        self.embedding_mode = true;
-        defer self.embedding_mode = false;
-        var ctx = self.defaultCtx();
-        ctx.key_pad_mask = key_pad_mask;
-        return self.forwardWith(&ctx, token_ids);
-    }
 
     // ── Full Attention for MoE models (with optional output gate) ──
 

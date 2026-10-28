@@ -835,7 +835,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         try capturePrefillHidden(self.s, target_all, final_normed, !ctx.verify_rows);
     }
 
-    if (self.embedding_mode) return final_normed;
     if (ctx.skip_lm_head) return final_normed;
     const logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
     _ = mlx.mlx_array_free(final_normed);

@@ -1258,29 +1258,6 @@ pub const VisionEncodeRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
-/// Phase: embedding work item for encoder-only models. Conn thread fills
-/// `token_seqs` and calls `Scheduler.computeEmbeddings`; the inference
-/// thread services the request via `generate.computeEmbeddingsBatch` — one
-/// padded, key-masked GPU forward per EMBED_MAX_BATCH chunk — and writes
-/// the float vectors into `results` (caller frees). Mirrors the
-/// VisionEncodeRequest pattern.
-pub const EmbedRequest = struct {
-    /// Plan 05 Phase D: target model whose `transformer` services this
-    /// request. The conn thread holds a refcount for the duration.
-    model: *model_registry_mod.LoadedModel,
-    /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
-    token_seqs: []const []const u32,
-    /// Output: one pooled L2-normalized embedding per input on success.
-    /// Rows + outer slice owned by `allocator`; caller frees.
-    results: ?[][]f32 = null,
-    /// Output: error name on failure. Owned by `allocator`; caller frees.
-    error_name: ?[]const u8 = null,
-    done: bool = false,
-    allocator: std.mem.Allocator,
-    done_mu: std.Io.Mutex = .init,
-    done_cond: std.Io.Condition = .init,
-};
-
 /// Plan 05 Phase D: cold-load work item. Posted by `Scheduler.ensureLoaded`
 /// when a request targets an `.unloaded` (or freshly-evicted) entry; the
 /// inference thread drains the queue between ticks. The conn thread parses
@@ -1512,9 +1489,6 @@ pub const Scheduler = struct {
     /// these in the gap before/after each prefill+decode tick. Posting
     /// broadcasts on `queue_cond` to wake an idle inference thread.
     vision_queue: std.ArrayList(*VisionEncodeRequest),
-    /// Pending embedding requests (encoder-only models). Same shape as
-    /// vision_queue; serviced inline between decode ticks.
-    embed_queue: std.ArrayList(*EmbedRequest),
     /// Phase D: pending cold-load requests. Conn threads post here via
     /// `scheduler.ensureLoaded`; the inference thread drains between ticks
     /// (load runs after cleanup + vision/embed, before prefill). Multiple
@@ -1652,7 +1626,6 @@ pub const Scheduler = struct {
             .pending = std.ArrayList(*Slot).empty,
             .decoding = std.ArrayList(*Slot).empty,
             .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
-            .embed_queue = std.ArrayList(*EmbedRequest).empty,
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
@@ -1728,9 +1701,8 @@ pub const Scheduler = struct {
         destroyAbandoned(self.abandoned);
         for (self.orphan_vision[0..self.orphan_vision_n]) |ve| freeVisionArray(ve);
         self.prefilling.deinit(self.allocator);
-        // Vision/embed queues should be empty (encodeVision/computeEmbedding
-        // block until done) but guard against shutdown-mid-encode by signaling
-        // done with an error.
+        // The vision queue should be empty (encodeVision blocks until done) but
+        // guard against shutdown-mid-encode by signaling done with an error.
         for (self.vision_queue.items) |req| {
             req.done_mu.lockUncancelable(self.io);
             req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
@@ -1739,14 +1711,6 @@ pub const Scheduler = struct {
             req.done_mu.unlock(self.io);
         }
         self.vision_queue.deinit(self.allocator);
-        for (self.embed_queue.items) |req| {
-            req.done_mu.lockUncancelable(self.io);
-            req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
-            req.done = true;
-            req.done_cond.broadcast(self.io);
-            req.done_mu.unlock(self.io);
-        }
-        self.embed_queue.deinit(self.allocator);
         // Phase D: signal any pending cold-load requesters that the
         // server is shutting down. They roll back their entry state and
         // free pre-loaded CPU resources.
@@ -2298,28 +2262,6 @@ pub const Scheduler = struct {
         defer self.registry.mutex.unlock(self.io);
         if (entry.state == .ready) return null;
         return .{ .id = entry.id, .bytes = bytes };
-    }
-
-    /// Synchronously compute embeddings for `req.token_seqs` using the
-    /// batched encoder forward pass on the inference thread. Same lifecycle
-    /// as `encodeVision`: post + block + return results. Caller frees the
-    /// returned rows + outer slice (allocated with `req.allocator`).
-    pub fn computeEmbeddings(self: *Scheduler, req: *EmbedRequest) ![][]f32 {
-        self.queue_mu.lockUncancelable(self.io);
-        self.embed_queue.append(self.allocator, req) catch |err| {
-            self.queue_mu.unlock(self.io);
-            return err;
-        };
-        self.queue_cond.broadcast(self.io);
-        self.queue_mu.unlock(self.io);
-
-        req.done_mu.lockUncancelable(self.io);
-        defer req.done_mu.unlock(self.io);
-        while (!req.done) {
-            req.done_cond.waitUncancelable(self.io, &req.done_mu);
-        }
-        if (req.error_name) |_| return error.EmbedFailed;
-        return req.results orelse error.EmbedFailed;
     }
 
     /// Phase A4: synchronously encode one or more images and return the
@@ -3348,7 +3290,6 @@ pub fn headlessStubCpuState(allocator: std.mem.Allocator) !CpuState {
         .num_attention_heads = 1,
         .num_key_value_heads = 1,
         .max_position_embeddings = 4096,
-        .is_encoder_only = false,
     });
 }
 
@@ -5511,7 +5452,6 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
         sch.decoding.items.len > 0 or
         sch.vision_queue.items.len > 0 or
-        sch.embed_queue.items.len > 0 or
         sch.cleanup_queue.items.len > 0 or
         sch.abandoned != null or
         sch.orphan_vision_n > 0 or
@@ -5622,14 +5562,12 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         var abandoned: ?*Slot = null;
         var orphan_vision: [orphan_vision_cap]mlx.mlx_array = undefined;
         var orphan_vision_n: usize = 0;
-        // 0b. Drain any pending vision/embed work. These run synchronously on
-        //     behalf of conn threads waiting in `encodeVision` /
-        //     `computeEmbedding`. Processed here (not concurrently with decode
-        //     ticks) so they share the inference thread's mlx stream cleanly.
+        // 0b. Drain any pending vision work. It runs synchronously on behalf of
+        //     conn threads waiting in `encodeVision`. Processed here (not
+        //     concurrently with decode ticks) so it shares the inference
+        //     thread's mlx stream cleanly.
         var vision_batch: [4]*VisionEncodeRequest = undefined;
         var vision_n: usize = 0;
-        var embed_batch: [4]*EmbedRequest = undefined;
-        var embed_n: usize = 0;
         // Phase D: cold-load drain. Process ONE load per tick — loading a
         // model is heavy (~seconds; weight read + JIT compile + warmup)
         // and we want the rest of the inference loop to stay responsive.
@@ -5648,10 +5586,6 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
                 vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
                 vision_n += 1;
-            }
-            while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
-                embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
-                embed_n += 1;
             }
             load_req = teardown.load;
             unload_req = teardown.unload;
@@ -5689,10 +5623,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
         destroyAbandoned(abandoned);
         for (orphan_vision[0..orphan_vision_n]) |ve| freeVisionArray(ve);
-        if (vision_n > 0 or embed_n > 0) {
-            for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
-            for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
-        }
+        for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
@@ -6273,31 +6204,6 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
 }
 
 fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []const u8) void {
-    req.done_mu.lockUncancelable(sch.io);
-    defer req.done_mu.unlock(sch.io);
-    if (req.error_name) |old| req.allocator.free(old);
-    req.error_name = req.allocator.dupe(u8, err_name) catch null;
-    req.done = true;
-    req.done_cond.broadcast(sch.io);
-}
-
-/// Service one embedding request on the inference thread. Runs the batched
-/// forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`, which resets
-/// the global xfm.cache before every sub-batch, and wakes the conn thread.
-fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
-    const xfm_ptr = req.model.transformer.?;
-    const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
-        finishEmbedRequest(sch, req, @errorName(err));
-        return;
-    };
-    req.done_mu.lockUncancelable(sch.io);
-    defer req.done_mu.unlock(sch.io);
-    req.results = results;
-    req.done = true;
-    req.done_cond.broadcast(sch.io);
-}
-
-fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8) void {
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
     if (req.error_name) |old| req.allocator.free(old);

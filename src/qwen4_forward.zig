@@ -1601,7 +1601,7 @@ pub fn forwardQwen4VerifyRows(
         }
     }
 
-    var join_lmhead = !self.embedding_mode;
+    var join_lmhead = true;
     var lmhead_widths: [MAX_BATCH_ROWS]c_int = undefined;
     if (join_lmhead) {
         var total: c_int = 0;
@@ -1640,7 +1640,7 @@ pub fn forwardQwen4VerifyRows(
         const logits: mlx.mlx_array = if (join_lmhead) blk: {
             lmhead_inputs[i] = mix.mixed;
             break :blk .{};
-        } else if (self.embedding_mode or row.ctx.skip_lm_head)
+        } else if (row.ctx.skip_lm_head)
             mix.mixed
         else blk: {
             defer _ = mlx.mlx_array_free(mix.mixed);
@@ -2130,7 +2130,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     h = .{ .ctx = null };
     if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
     const final = mix.mixed;
-    if (self.embedding_mode or ctx.skip_lm_head) {
+    if (ctx.skip_lm_head) {
         if (self.expert_stream) |engine| engine.finishForward(@intCast(batch * seq_len));
         return final;
     }
