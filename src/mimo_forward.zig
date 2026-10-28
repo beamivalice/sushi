@@ -681,12 +681,8 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         // A MiMo spec verify attends row by row with the decode arithmetic.
         const verify_rows = is_mimo and ctx.verify_rows;
         if (is_prefill and !verify_rows) {
-            // Skipped when the fused hd-256 kernel band-masks in-kernel
-            // (the mask itself is chunk x kv_len — GBs at long ctx).
             // Built at the TRIMMED length, which is what the attn fns hand SDPA.
-            if (!sliding.band_in_kernel) {
-                local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
-            }
+            local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
         }
         if ((!is_prefill or verify_rows) and total_kv > sw) {
             const local_kv_len: c_int = @min(total_kv, sw);

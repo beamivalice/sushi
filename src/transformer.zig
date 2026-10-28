@@ -2492,10 +2492,7 @@ pub fn prefillHeadDimFused(head_dim: u32) bool {
 }
 
 /// Shortest query block the fused hd-256 kernel accepts. Below it MLX's
-/// sdpa_vector wins (see the decline in fusedSdpaPrefill), which also means
-/// the kernel is NOT the thing band-masking a spec-verify block —
-/// `slidingViewFor` reads the same constant so the trim predicate and the
-/// decline can never drift.
+/// sdpa_vector wins (see the decline in fusedSdpaPrefill).
 pub const FUSED256_MIN_Q_LEN: c_int = 16;
 
 /// Try the fused flash prefill kernel (sushi_attn_pd, see `fusedPdDims`).
@@ -6525,11 +6522,8 @@ fn freeKVEntry(e: *KVCacheEntry) void {
     _ = mlx.mlx_array_free(e.value_biases_view);
 }
 
-/// "No width bound" for `slidingTailSpan`. A 32-wide cap used to keep prefill
-/// chunks out while the mask pairing was unproven; with `band_in_kernel` now
-/// gating the only consumer that reads ABSOLUTE positions and every other
-/// consumer deriving its query offset as `kv_len - q_len`, width needs no
-/// bound.
+/// "No width bound" for `slidingTailSpan`: every consumer derives its query offset as
+/// `kv_len - q_len`, so width needs no bound.
 pub const SLIDING_TRIM_UNBOUNDED: usize = std.math.maxInt(usize);
 
 /// How many TAIL KV entries a forward of `q_len` queries needs from a SLIDING
@@ -6550,8 +6544,7 @@ pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
 }
 
 /// What a sliding layer's K/V view looks like for THIS forward: the `max_kv`
-/// to hand `KVCache.update`, the length the view will actually have, and
-/// whether the fused hd-256 kernel is the thing doing the band masking.
+/// to hand `KVCache.update` and the length the view will actually have.
 ///
 /// ONE chokepoint for the policy — every arch path asks it rather than
 /// re-deriving the predicate, which is how the standard and MoE paths drifted
@@ -6564,11 +6557,6 @@ pub const SlidingView = struct {
     /// (`offset_val = kv_len - q_len`), so a trimmed view with the trimmed
     /// length is correct and a trimmed view with the full length is not.
     kv_len: c_int,
-    /// The fused hd-256 kernel masks the band in-kernel off ABSOLUTE positions
-    /// (`q_off = kL - qL`, `(row_pos - col) >= SW`), so a trimmed view would
-    /// shift its band. When true the trim is declined AND the explicit mask
-    /// build is skipped — the same predicate decides both.
-    band_in_kernel: bool,
 };
 
 var sliding_block_trim_logged: bool = false; // one-shot log guard
@@ -6581,16 +6569,8 @@ pub var deferred_ple_group_syncs: u64 = 0;
 pub const MAX_BATCH_ROWS = 32;
 var std_batched_logged: bool = false; // one-shot log guard
 pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) SlidingView {
-    // Keyed on the kernel's OWN floor: it declines everything below
-    // FUSED256_MIN_Q_LEN, so a spec-verify block (4-8 wide) is never
-    // band-masked in-kernel and is free to take the trim. The predicate used
-    // to say `seq_len >= 2`, which declined the trim for exactly those blocks
-    // and then fell through to the explicit-mask path anyway — gemma got
-    // nothing from the trim at all.
-    const band = fused256Enabled() and cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN;
-    const width: usize = if (band) 1 else SLIDING_TRIM_UNBOUNDED;
     const span: u32 = if (cfg.has_sliding_window)
-        slidingTailSpan(cfg.sliding_window, @intCast(seq_len), width)
+        slidingTailSpan(cfg.sliding_window, @intCast(seq_len), SLIDING_TRIM_UNBOUNDED)
     else
         0;
     const kv_len: c_int = if (span > 0) @min(total_kv, @as(c_int, @intCast(span))) else total_kv;
@@ -6600,7 +6580,7 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
         sliding_block_trim_logged = true;
         log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d}\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
     }
-    return .{ .span = span, .kv_len = kv_len, .band_in_kernel = band };
+    return .{ .span = span, .kv_len = kv_len };
 }
 
 pub const KVCache = struct {
@@ -27886,43 +27866,21 @@ test "slidingTailSpan covers the whole block, not just the last query" {
     try testing.expectEqual(@as(u32, 0), slidingTailSpan(4, 2, 1));
 }
 
-test "slidingViewFor declines the trim only where the fused kernel really bands" {
+test "slidingViewFor trims a sliding layer to the window tail and leaves a non-sliding one whole" {
     var cfg = ModelConfig{};
     cfg.has_sliding_window = true;
     cfg.sliding_window = 512;
 
-    // hd 256 with the fused kernel on. The kernel declines everything below
-    // FUSED256_MIN_Q_LEN, so a spec-verify block is NOT band-masked in-kernel
-    // and must take the trim — the predicate used to say `seq_len >= 2`, which
-    // handed gemma nothing at exactly the widths spec decode runs at.
-    cfg.head_dim = 256;
-    fused256_override = true;
-    defer fused256_override = null;
     {
         const decode = slidingViewFor(&cfg, 20000, 1);
-        try testing.expect(!decode.band_in_kernel);
         try testing.expectEqual(@as(u32, 512), decode.span);
         try testing.expectEqual(@as(c_int, 512), decode.kv_len);
 
         const verify = slidingViewFor(&cfg, 20000, 8);
-        try testing.expect(!verify.band_in_kernel);
         try testing.expectEqual(@as(u32, 519), verify.span);
         try testing.expectEqual(@as(c_int, 519), verify.kv_len);
 
-        // At the kernel's floor and above, the band IS in-kernel: it derives
-        // absolute positions from the K length, so the view stays WHOLE
-        // (span 0) and any mask built for it is built at total_kv.
-        const chunk = slidingViewFor(&cfg, 20000, FUSED256_MIN_Q_LEN);
-        try testing.expect(chunk.band_in_kernel);
-        try testing.expectEqual(@as(u32, 0), chunk.span);
-        try testing.expectEqual(@as(c_int, 20000), chunk.kv_len);
-    }
-
-    // hd 128: no fused kernel, so even a wide prefill chunk trims.
-    cfg.head_dim = 128;
-    {
         const chunk = slidingViewFor(&cfg, 32768, 2048);
-        try testing.expect(!chunk.band_in_kernel);
         try testing.expectEqual(@as(u32, 2559), chunk.span);
         try testing.expectEqual(@as(c_int, 2559), chunk.kv_len);
     }
@@ -27934,30 +27892,12 @@ test "slidingViewFor declines the trim only where the fused kernel really bands"
         try testing.expectEqual(@as(c_int, 300), short.kv_len);
     }
 
-    // Non-sliding config: no trim, kv_len is the whole cache.
     cfg.has_sliding_window = false;
     {
         const full = slidingViewFor(&cfg, 20000, 8);
         try testing.expectEqual(@as(u32, 0), full.span);
         try testing.expectEqual(@as(c_int, 20000), full.kv_len);
     }
-}
-
-test "FUSED256_MIN_Q_LEN is the single source for the decline and the band predicate" {
-    // These two drifted once already — the kernel declined below 16 while the
-    // trim predicate said 2 — and the cost was silent: gemma declined the trim
-    // at every spec-verify width and then fell through to the explicit-mask
-    // path anyway. Needles are assembled at comptime so this test's own source
-    // cannot satisfy the scan.
-    const src = @embedFile("transformer.zig");
-    const name = "FUSED256_" ++ "MIN_Q_LEN";
-    // The kernel's own decline reads the constant...
-    try testing.expect(std.mem.indexOf(u8, src, "if (qs[2] < " ++ name ++ ") return null;") != null);
-    // ...and so does the trim policy in slidingViewFor.
-    try testing.expect(std.mem.indexOf(u8, src, "cfg.head_dim == 256 and seq_len >= " ++ name) != null);
-    // Neither may respell the floor as a literal.
-    try testing.expect(std.mem.indexOf(u8, src, "if (qs[2] < 1" ++ "6)") == null);
-    try testing.expect(std.mem.indexOf(u8, src, "cfg.head_dim == 256 and seq_len >= " ++ "2") == null);
 }
 
 test "KVCache trims the tail view for a BLOCK-wide update, not just decode" {
