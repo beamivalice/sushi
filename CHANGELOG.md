@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash prefills in about 8 GB less memory**: sushi now owns the pack's weight memory and every forward runs under a hard per-phase cap, so a 2048-row prefill chunk reserves 6.6–7.1 GB instead of 15–16 GB and no longer borrows expert layers. Output and prefill speed are unchanged. A request that would pass its cap fails with a 503 and the server keeps serving.
+- **DeepSeek speculates under JSON schemas**: `response_format` and tool-call grammars keep DSpark on, with each draft row checked against the grammar.
+- **A queued request says so**: a streamed request waiting behind another gets an SSE comment naming the queue, and the log shows `[queue]` lines; a shutdown ends queued and running requests with a 503 instead of a truncated `length` finish.
 - **`sushi launch opencode` runs the newest opencode**: with an older opencode ahead of a newer one on PATH, the launcher started the older; it now picks the highest version installed.
 - **The server log names the token that ended each turn**: a reply that finishes `stop` logs `[stop]` with the EOS token id and text, the token before it, the completion count and the decode path, so a turn that ends mid-sentence can be traced to its token.
 - **`--model` and `sushi run` accept a relative path**: `sushi serve --model ./pack` used to fail with `ExpertLayoutUnsupported` (or lose expert streaming detection) unless the path was absolute; it is now resolved against the current directory at launch.
