@@ -17031,7 +17031,7 @@ pub const Transformer = struct {
         // at decode (S=1) and capturing verify widths (S 2..8); the chain below otherwise.
         if (batch == 1 and (projected == null or !self.spec_capture_ssm) and kernel == 4 and ssm.initialized and ssm.conv_state.ctx != null and
             ssm.ssm_state.ctx != null and (if (self.spec_capture_ssm) seq_len >= 2 else seq_len == 1) and
-            !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and !qwen4Standin().gdn_recur and
+            !cfg.kda_vector_gate and !qwen4Standin().gdn_recur and
             !diagEnvOnCached(&gdn_check_env, "QWEN4_GDN_CHECK") and gdnDecodeRecurEnabled())
         recur: {
             const geo = gdn_decode.Geometry{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv };
@@ -17121,7 +17121,7 @@ pub const Transformer = struct {
 
         // Wide prework is token-local; a cold chunk supplies the same zero history as conv1dWithCache.
         const prefill_fused = cfg.longCtxGated() and is_prefill and gdnPrefillFusedFor(seq_len, batch);
-        if (!cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and
+        if (!cfg.kda_vector_gate and
             (batch * seq_len <= GDN_FUSED_MAX_ROWS or prefill_fused) and
             kernel == 4 and (ssm.initialized or prefill_fused))
         blk: {
@@ -17272,19 +17272,8 @@ pub const Transformer = struct {
         // closure (mirrors mlx-lm's compute_g), raw chain as fallback.
         // [B, S, Hv]. KDA: one value per KEY CHANNEL — [B, S, Hv*Dk], which the
         // `_vec` kernel variant indexes.
-        //
-        // The two ARMS of fla's kernel are selected by the bound, exactly as
-        // `kda_gate_lower_bound`'s declaration says (0 = no bound): non-zero
-        // takes the bounded-sigmoid form, zero the softplus one. The softplus
-        // chain is elementwise and A_log arrives pre-expanded per key channel,
-        // so it serves a per-channel gate unchanged — where feeding `bound = 0`
-        // to `kdaGateChain` would silently yield exp(0) = 1, a gate that never
-        // forgets, on a checkpoint that simply omitted the key.
         const vector_gate = cfg.kda_vector_gate;
-        const g = g_fused orelse if (cfg.kdaUsesBoundedGate())
-            try kdaGateChain(la.A_log, a_proj, la.dt_bias, cfg.kda_gate_lower_bound, self.s)
-        else
-            try self.computeGdnGate(la.A_log, a_proj, la.dt_bias);
+        const g = g_fused orelse try self.computeGdnGate(la.A_log, a_proj, la.dt_bias);
         defer _ = mlx.mlx_array_free(g);
 
         // beta = sigmoid(b)
@@ -19674,55 +19663,6 @@ pub fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_arr
     var g = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(g);
     try mlx.check(mlx.mlx_astype(&g, g_f32, gate_dtype, s));
-    return g;
-}
-
-/// KDA forget gate (fla/ops/kda/fused_recurrent.py, the USE_LOWER_BOUND arm):
-///
-///   g = exp(bound * sigmoid(exp(A_log) * (a + dt_bias)))
-///
-/// The bound REPLACES the softplus form rather than clamping it — the decay
-/// lands in (exp(bound), 1) by construction, where `-exp(A_log)·softplus(·)`
-/// is unbounded below. Reading `kda_lower_bound` as a clamp on the softplus
-/// gate would be a plausible-looking, silently wrong recurrence.
-///
-/// Everything here is elementwise over the FLAT [B,S,Hv*Dk] gate: `A_log`
-/// arrives already expanded per key channel at load (see initMoeLayers), so
-/// the hot path needs no reshape and no per-head broadcast.
-fn kdaGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, bound: f32, s: mlx.mlx_stream) !mlx.mlx_array {
-    var A_log_f32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(A_log_f32);
-    try mlx.check(mlx.mlx_astype(&A_log_f32, A_log, .float32, s));
-    var exp_A = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(exp_A);
-    try mlx.check(mlx.mlx_exp(&exp_A, A_log_f32, s));
-
-    var a_plus_dt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a_plus_dt);
-    try mlx.check(mlx.mlx_add(&a_plus_dt, a, dt_bias, s));
-    var a_f32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a_f32);
-    try mlx.check(mlx.mlx_astype(&a_f32, a_plus_dt, .float32, s));
-
-    var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_multiply(&scaled, exp_A, a_f32, s));
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, scaled, s));
-
-    const bound_arr = mlx.mlx_array_new_float(bound);
-    defer _ = mlx.mlx_array_free(bound_arr);
-    var g_log = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_log);
-    try mlx.check(mlx.mlx_multiply(&g_log, sig, bound_arr, s));
-
-    var g_f32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_f32);
-    try mlx.check(mlx.mlx_exp(&g_f32, g_log, s));
-    var g = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(g);
-    try mlx.check(mlx.mlx_astype(&g, g_f32, .bfloat16, s));
     return g;
 }
 
@@ -33364,47 +33304,6 @@ test "GDN vectorized-gate kernel: a per-channel gate that is UNIFORM per head eq
     var seq_diff: f32 = 0;
     for (0..sn) |i| seq_diff = @max(seq_diff, @abs(cd[i] - dd[i]));
     try testing.expectEqual(@as(f32, 0), seq_diff);
-}
-
-test "kdaGateChain is the bounded-sigmoid gate, not a clamped softplus" {
-    // g = exp(bound * sigmoid(exp(A_log) * (a + dt_bias))). Two properties
-    // that a "clamp the softplus form at bound" misreading would break:
-    //   1. the decay is bounded BELOW by exp(bound) but never reaches it;
-    //   2. it is MONOTONICALLY DECREASING in `a` (large positive a ⇒ maximum
-    //      forgetting), where the softplus form's magnitude is unbounded.
-    const s = mlx.gpuStream();
-    const bound: f32 = -5.0;
-    const a_vals = [_]f32{ -8.0, 0.0, 4.0 };
-    const shape = [_]c_int{3};
-    const a_arr = mlx.mlx_array_new_data(&a_vals, &shape, 1, .float32);
-    defer _ = mlx.mlx_array_free(a_arr);
-    const zeros = [_]f32{ 0.0, 0.0, 0.0 };
-    const dt = mlx.mlx_array_new_data(&zeros, &shape, 1, .float32);
-    defer _ = mlx.mlx_array_free(dt);
-    const a_log_vals = [_]f32{ 0.0, 0.0, 0.0 }; // exp(A_log) = 1
-    const a_log = mlx.mlx_array_new_data(&a_log_vals, &shape, 1, .float32);
-    defer _ = mlx.mlx_array_free(a_log);
-
-    const g = try kdaGateChain(a_log, a_arr, dt, bound, s);
-    defer _ = mlx.mlx_array_free(g);
-    var g32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g32);
-    try mlx.check(mlx.mlx_astype(&g32, g, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(g32));
-    const gd = mlx.mlx_array_data_float32(g32) orelse return error.InvalidDtype;
-
-    const floor = @exp(bound); // ~0.0067
-    for (0..3) |i| {
-        try testing.expect(gd[i] > floor);
-        // The open upper bound closes in bf16: a very negative `a` gives a
-        // decay of 0.9983, whose nearest bf16 IS 1.0 (spacing 2^-8 near one).
-        // "No forgetting" is the correct limit, so assert the closed bound.
-        try testing.expect(gd[i] <= 1.0);
-    }
-    try testing.expect(gd[0] > gd[1]);
-    try testing.expect(gd[1] > gd[2]);
-    // a = 0 ⇒ sigmoid = 0.5 ⇒ g = exp(bound/2). bf16 round-trip tolerance.
-    try testing.expect(@abs(gd[1] - @exp(bound / 2.0)) < 5e-3);
 }
 
 // Like gdnTestRun(seq=true) but returns the state at an arbitrary position `pos`

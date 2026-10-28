@@ -757,15 +757,6 @@ pub const ModelConfig = struct {
     }
 
     /// Which of fla's two KDA gate arms this checkpoint declares. A non-zero
-    /// `kda_lower_bound` REPLACES the softplus form with the bounded sigmoid;
-    /// absent (0) means the softplus form, which the shared GatedDeltaNet chain
-    /// already computes elementwise and therefore serves a per-channel gate
-    /// unchanged. Feeding bound 0 to the bounded chain yields exp(0) = 1 — a
-    /// gate that never forgets — so the arm must be chosen, never defaulted.
-    pub fn kdaUsesBoundedGate(self: *const ModelConfig) bool {
-        return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
-    }
-
     /// Qwen3.8-Flash-Next (`qwen4_exp`): a GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
@@ -4033,26 +4024,6 @@ test "parseConfig prefers processor_config and fills missing Qwen bounds from pr
     try testing.expect(config.qwen_vision);
     try testing.expectEqual(@as(u32, 65536), config.qv_min_pixels);
     try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);
-}
-
-test "the KDA gate arm is SELECTED by the bound, never defaulted" {
-    // `kdaGateChain` with bound 0 computes exp(0) = 1: a decay that never
-    // forgets, on a checkpoint that merely omitted the key. The arms are fla's
-    // two, and the absent case belongs to the softplus chain (which is
-    // elementwise, so it serves a per-channel gate unchanged).
-    var bounded = ModelConfig{ .model_type = "glm5_next" };
-    bounded.kda_vector_gate = true;
-    bounded.kda_gate_lower_bound = -5;
-    try testing.expect(bounded.kdaUsesBoundedGate());
-
-    var unbounded = ModelConfig{ .model_type = "glm5_next" };
-    unbounded.kda_vector_gate = true; // per-channel gate, softplus form
-    try testing.expect(!unbounded.kdaUsesBoundedGate());
-
-    // A per-HEAD gate is never the bounded arm regardless of the field.
-    var per_head = ModelConfig{ .model_type = "glm5_next" };
-    per_head.kda_gate_lower_bound = -5;
-    try testing.expect(!per_head.kdaUsesBoundedGate());
 }
 
 test "parseConfigFromJson quantized checkpoint → quant_bits from key" {
