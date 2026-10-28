@@ -364,6 +364,8 @@ pub const FillPool = struct {
     accepted: u64 = 0,
     max_depth: usize = 0,
     stats_acc: FillStats = .{},
+    /// Test seam: runs on the worker after it takes job `index`, before it reads, so a test can hold a read open.
+    job_hook: ?*const fn (*FillPool, usize) void = null,
 
     pub fn create(allocator: std.mem.Allocator, opts: FillOptions) !*FillPool {
         if (opts.workers == 0 or opts.workers > 64) return error.InvalidFillPool;
@@ -696,6 +698,7 @@ pub const FillPool = struct {
             const files = self.files;
             const plan = self.plan.?;
             self.mu.unlock(io);
+            if (self.job_hook) |hook| hook(self, index);
             self.runJob(worker, files, plan, index);
         }
     }
@@ -1197,9 +1200,37 @@ const Canceller = struct {
     }
 };
 
+/// Holds job 0's read open until `done` is true, bounded at one second.
+fn holdFirstJobUntil(pool: *FillPool, index: usize, done: *const fn (*FillPool) bool) void {
+    if (index != 0) return;
+    for (0..1000) |_| {
+        if (done(pool)) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .real) catch {};
+    }
+}
+
+fn cancelRequested(pool: *FillPool) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    pool.mu.lockUncancelable(io);
+    defer pool.mu.unlock(io);
+    return pool.cancel;
+}
+
+fn queuedAhead(pool: *FillPool) bool {
+    return pool.maxQueueDepth() == 2;
+}
+
+fn holdUntilCancelled(pool: *FillPool, index: usize) void {
+    holdFirstJobUntil(pool, index, cancelRequested);
+}
+
+fn holdUntilQueuedAhead(pool: *FillPool, index: usize) void {
+    holdFirstJobUntil(pool, index, queuedAhead);
+}
+
 test "expert io fill cancel drains accepted work and reports" {
     const t = std.testing;
-    const chunk: usize = 16 * 1024 * 1024;
+    const chunk: usize = 1024 * 1024;
     var file = try TestFile.make(t.allocator, "big.bin", chunk * 4, 0x777);
     defer file.deinit(t.allocator);
     const fd = try file.open(t.allocator);
@@ -1216,18 +1247,19 @@ test "expert io fill cancel drains accepted work and reports" {
     try t.expectEqual(@as(usize, 4), plan.jobs.len);
     const pool = try FillPool.create(t.allocator, .{ .workers = 1, .queue_capacity = 1 });
     defer pool.destroy();
+    pool.job_hook = holdUntilCancelled;
     var canceller = Canceller{ .pool = pool };
     const thread = try std.Thread.spawn(.{}, Canceller.main, .{&canceller});
     const outcome = pool.run(&.{fd}, &plan);
     thread.join();
     try t.expectError(error.FillCancelled, outcome);
     try t.expectEqualSlices(u8, file.bytes[0..chunk], dst[0..chunk]);
-    try t.expect(pool.stats().bytes_read < @as(u64, chunk) * 4);
+    try t.expectEqual(@as(u64, chunk), pool.stats().bytes_read);
 }
 
 test "expert io fill keeps a worker fed while it is reading" {
     const t = std.testing;
-    const chunk: usize = 32 * 1024 * 1024;
+    const chunk: usize = 1024 * 1024;
     var file = try TestFile.make(t.allocator, "fed.bin", chunk * 2, 0x5eed);
     defer file.deinit(t.allocator);
     const fd = try file.open(t.allocator);
@@ -1244,17 +1276,11 @@ test "expert io fill keeps a worker fed while it is reading" {
     try t.expectEqual(@as(usize, 2), plan.jobs.len);
     const pool = try FillPool.create(t.allocator, .{ .workers = 1, .queue_capacity = 1 });
     defer pool.destroy();
-    // Whether the second job is queued before a cached 32 MiB read finishes depends on the scheduler, so
-    // the test asks for it within a few fills; a pool that never queues ahead fails them all.
-    var depth: usize = 0;
-    for (0..20) |_| {
-        @memset(dst, 0);
-        try pool.run(&.{fd}, &plan);
-        try t.expectEqualSlices(u8, file.bytes, dst[0 .. chunk * 2]);
-        depth = pool.maxQueueDepth();
-        if (depth == 2) break;
-    }
-    try t.expectEqual(@as(usize, 2), depth);
+    // The first read is held open until the second job is queued, so a pool that never queues ahead fails.
+    pool.job_hook = holdUntilQueuedAhead;
+    try pool.run(&.{fd}, &plan);
+    try t.expectEqualSlices(u8, file.bytes, dst[0 .. chunk * 2]);
+    try t.expectEqual(@as(usize, 2), pool.maxQueueDepth());
 }
 
 test "expert io file cache reopens a replaced shard and reuses a stable one" {
