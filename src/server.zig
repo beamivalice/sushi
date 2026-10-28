@@ -3365,7 +3365,7 @@ fn safeContextForBudget(
 ) u32 {
     if (per_tok == 0) return 1024;
     const max_seq: u64 = contextForBudget(working_set_limit, active_mem, hot_cache_reserve, per_tok);
-    if (max_seq == 0) return 1024;
+    if (max_seq < 1024) return 1024;
 
     var result: u32 = if (max_seq > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max_seq);
     // Cap at model's max position embeddings.
@@ -4296,7 +4296,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         config.pinned_context,
         ceiling,
         active_mem,
-        ctxSizingCacheReserve(config),
+        ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)),
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
@@ -4382,13 +4382,14 @@ fn billedAutoContext(config: *const model_mod.ModelConfig) bool {
 
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
 fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
-    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, chunk));
+    const ceiling = currentGpuMemoryCeiling(config, active_mem);
+    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk));
     return resolvedContextForLoad(
         manualContext(config),
         config.pinned_context,
-        currentGpuMemoryCeiling(config, active_mem),
+        ceiling,
         active_mem,
-        ctxSizingCacheReserve(config),
+        ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)),
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
@@ -6536,11 +6537,11 @@ fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceil
     // Flash-Next advertises the context its own request bill admits at the floor rung, from the
     // headroom admission reads (the writers' host bytes included), so the two cannot disagree.
     if (config.longCtxGated()) {
-        const budget = admissionAvailable(ceiling, active_mem) -| ctxSizingCacheReserve(config);
+        const budget = admissionAvailable(ceiling, active_mem) -| ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config));
         return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
     }
     // DeepSeek's request bill grows with the prompt (the indexer's scores), so its context is the longest that bill admits.
-    if (config.isDsv41()) return maxSushiContextAtWidth(config, kv_bits, admissionAvailable(ceiling, active_mem) -| ctxSizingCacheReserve(config), chunk, .{});
+    if (config.isDsv41()) return maxSushiContextAtWidth(config, kv_bits, admissionAvailable(ceiling, active_mem) -| ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)), chunk, .{});
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
     const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
     return safeContextForBudget(
@@ -6551,11 +6552,16 @@ fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceil
         // top of whatever context we report. `CTX_SIZING_CACHE_RESERVE`, not the resolved
         // budget and not the ask: the ask starved the context, the resolved budget was a
         // one-step loop. Gated: off the gate this is the raw ask, so `/v1/models` is unchanged.
-        ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk),
+        ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)) +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do not clamp to the checkpoint's max here; the caller applies it after the margin.
         0,
     );
+}
+
+/// The share of the room `reserve` may claim: the context is the primary claimant, so the cache never takes more than half.
+fn ctxCacheShare(ceiling: u64, active_mem: u64, reserve: u64) u64 {
+    return @min(reserve, admissionAvailable(ceiling, active_mem) / 2);
 }
 
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
@@ -23980,7 +23986,7 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
     // The sizer reserves the constant, not the ask or the resolved budget.
-    try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -29056,4 +29062,18 @@ test "the debug log redacts api_key and key query values and keeps the rest" {
     try std.testing.expectEqualStrings("/m?api_key=***&key=***", redactQueryKeys(&buf, "/m?api_key=x&key=y"));
     try std.testing.expectEqualStrings("/m?apikey=1&flag", redactQueryKeys(&buf, "/m?apikey=1&flag"));
     try std.testing.expectEqualStrings("/m?", redactQueryKeys(&buf, "/m?" ++ "a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&" ++ "key=zzzz"));
+}
+
+test "auto context on a room of about 1.8 GB neither advertises a few tokens nor lets the cache reserve eat it" {
+    const GiB: u64 = 1 << 30;
+    const per_tok: u64 = 278528;
+    const room: u64 = GiB * 18 / 10;
+    // The 2 GiB cache reserve alone exceeds the room: the context, not the cache, gets the half.
+    const share = ctxCacheShare(room + 5 * GiB, 5 * GiB, 2 * GiB);
+    try testing.expectEqual(room / 2, share);
+    try testing.expectEqual(@as(u64, GiB), ctxCacheShare(64 * GiB, 5 * GiB, GiB));
+    const auto = resolvedContextForLoad(0, 0, room + 5 * GiB, 5 * GiB, share, 0, per_tok, 0);
+    try testing.expectEqual(@as(u32, 2048), auto);
+    // A room that fits a few tokens past the reserve floors at 1024 instead of advertising them.
+    try testing.expectEqual(@as(u32, 1024), safeContextForBudget(2 * GiB + 100 * (1 << 20), 0, 2 * GiB, per_tok, 0));
 }

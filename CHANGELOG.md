@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **`/v1/responses` keeps the model's own reasoning in a tool loop**: a replayed plaintext `reasoning` item now reaches the prompt on its assistant turn (it was dropped), so a thinking model keeps its chain of thought between tool calls and the prefix cache hits; encrypted or malformed reasoning items are still ignored.
 - **Tool-call parsing handles five more malformed shapes**: stray DeepSeek `</｜DSML｜` closers no longer leak as the answer, a `<tool_call>` whose value holds an `<invoke>` stays that call, prose `<invoke>` openers no longer take the next call's arguments, a doubled GLM `<arg_key>` keeps a clean key, and a special token written in place of `<` before `function=` still parses.
+- **A small-memory Mac gets a usable default context**: the prefix cache's reserve no longer takes more than half of the free GPU memory when sizing the context, and a context that would fit under 1024 tokens is served as 1024.
+
 - **Image input accepts GIF (first frame) and BMP** beside JPEG, PNG and WebP.
 
 - **DeepSeek-V4.1-Flash no longer aborts on M1 and M2 Macs**: the indexer's top-k kernel probes the largest threadgroup the GPU runs (832 threads there, not 1024) at load, with identical picks.
