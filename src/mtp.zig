@@ -85,67 +85,13 @@ pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
 /// name. `generic` retains the conservative M1-M4 surface and auto cap.
 pub const MtpCostProfile = enum {
     generic,
-    g17_nax_q8_gs32,
-    g17_nax_q4_gs32,
-    g17_nax_q4_gs64,
-    g17_nax_q6_gs64,
-    g17_nax_q8_gs64,
-    g17_nax_oq4e_q4_gs64,
     g17_nax_qwen4_q4_gs64,
     g17_nax_qwen4_mixed_4_8_gs64,
     /// MiMo's three heads over the MCG K2.5 EXL3 pack: a verify row is ~45% of a forward.
     mimo_exl3,
 };
 
-/// Target-side tensors that contribute materially to a complete MTP round.
-/// This is deliberately a single classification rather than independent
-/// booleans: one bound target can match at most one measured cost surface.
-pub const MtpNaxTargetSurface = enum {
-    none,
-    uniform_quantized_embedding,
-    uniform_bf16_embedding,
-    uniform_q6_quantized_embedding,
-    uniform_q8_bf16_embedding,
-    oqe_quantized_embedding,
-};
-
-/// Pure first-stage classifier for a complete head/target fingerprint.
-/// Runtime tensor-shape validation must still pass before the returned
-/// calibrated profile is used.
-pub fn m5NaxCostProfileForFingerprint(
-    bits: u32,
-    group_size: u32,
-    target_surface: MtpNaxTargetSurface,
-) MtpCostProfile {
-    return switch (target_surface) {
-        .uniform_quantized_embedding => if (group_size == 32) switch (bits) {
-            8 => .g17_nax_q8_gs32,
-            4 => .g17_nax_q4_gs32,
-            else => .generic,
-        } else .generic,
-        .uniform_bf16_embedding => if (bits == 4 and group_size == 64)
-            .g17_nax_q4_gs64
-        else
-            .generic,
-        .uniform_q6_quantized_embedding => if (bits == 6 and group_size == 64)
-            .g17_nax_q6_gs64
-        else
-            .generic,
-        .uniform_q8_bf16_embedding => if (bits == 8 and group_size == 64)
-            .g17_nax_q8_gs64
-        else
-            .generic,
-        .oqe_quantized_embedding => if (bits == 4 and group_size == 64)
-            .g17_nax_oq4e_q4_gs64
-        else
-            .generic,
-        .none => .generic,
-    };
-}
-
-/// Pure first-stage classifier for the qwen4_exp in-checkpoint head. The
-/// trunk is MoE, so the fingerprint path above can never match it;
-/// this is its own measured surface, not a widening of the others.
+/// Pure first-stage classifier for the qwen4_exp in-checkpoint head.
 pub fn qwen4G17CostProfileForFingerprint(
     trunk_affine: bool,
     trunk_bits: u32,
@@ -2148,44 +2094,5 @@ test "mtp: row-axis coarse logits equal each solo readout" {
                 try testing.expect(equal);
             }
         }
-    }
-}
-
-test "format corpus: MTP cost profiles classify full target tensor surfaces" {
-    const Case = struct {
-        bits: u32,
-        group_size: u32,
-        target: MtpNaxTargetSurface,
-        want: MtpCostProfile,
-    };
-    const cases = [_]Case{
-        .{ .bits = 8, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q8_gs32 },
-        .{ .bits = 4, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q4_gs32 },
-        .{ .bits = 4, .group_size = 64, .target = .uniform_quantized_embedding, .want = .generic },
-        .{ .bits = 4, .group_size = 64, .target = .uniform_bf16_embedding, .want = .g17_nax_q4_gs64 },
-        .{ .bits = 6, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .g17_nax_q6_gs64 },
-        .{ .bits = 8, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .g17_nax_q8_gs64 },
-        .{ .bits = 8, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .generic },
-        .{ .bits = 6, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .generic },
-        .{ .bits = 4, .group_size = 64, .target = .oqe_quantized_embedding, .want = .g17_nax_oq4e_q4_gs64 },
-        .{ .bits = 4, .group_size = 64, .target = .none, .want = .generic },
-        .{ .bits = 4, .group_size = 32, .target = .uniform_bf16_embedding, .want = .generic },
-        .{ .bits = 8, .group_size = 32, .target = .oqe_quantized_embedding, .want = .generic },
-    };
-
-    for (cases) |case| {
-        try testing.expectEqual(
-            case.want,
-            m5NaxCostProfileForFingerprint(case.bits, case.group_size, case.target),
-        );
-    }
-
-    // A sidecar's quantization label never selects a calibrated target
-    // surface by itself. Unsupported sidecars remain generic for every target.
-    inline for (std.meta.tags(MtpNaxTargetSurface)) |target| {
-        try testing.expectEqual(
-            MtpCostProfile.generic,
-            m5NaxCostProfileForFingerprint(3, 32, target),
-        );
     }
 }

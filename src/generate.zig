@@ -2536,8 +2536,7 @@ pub const Generator = struct {
         /// The model's head before this request's opt-out (the qwen4 weights load with the trunk regardless).
         model_has_mtp: bool = false,
         /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-max-depth` not
-        /// passed): resolved by `resolveMtpDepthCap` — MTP_ADAPTIVE_NAX_CAP
-        /// for the measured M5 target+sidecar profile, otherwise
+        /// passed): resolved by `resolveMtpDepthCapForProfile` —
         /// MTP_ADAPTIVE_DEFAULT_CAP under the EV controller; DEFAULT_DEPTH in
         /// fixed mode. Explicit depths remain unchanged.
         mtp_depth: u32 = 0,
@@ -8218,13 +8217,10 @@ pub const Generator = struct {
 
     /// Default depth cap when `--mtp-max-depth` is not passed (0 = auto) and the
     /// EV controller is active. 6 keeps the verify forward at seq 1+6 = 7,
-    /// the split-K verify-qmm kernel's ceiling on M1-M4. Eligible M5/G17
-    /// targets use MTP_ADAPTIVE_NAX_CAP instead: their measured NAX round-cost
-    /// surface makes depths 7/8 profitable. Explicit depths always win.
+    /// the split-K verify-qmm kernel's ceiling on M1-M4. Explicit depths always win.
     /// This is the DEFAULT ROW only: `mtp.adaptiveDepthCapForMachine` lowers
     /// it on chips whose verify-width cliff was measured (M1 Pro: 4).
     pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
-    pub const MTP_ADAPTIVE_NAX_CAP: u32 = 8;
     /// Fraction by which a width's cost-per-position may exceed the running
     /// best before the measured ladder calls it past the cliff. 5% is well
     /// inside the gap the tile cliff opens (the M4 ladder turns up 12% at
@@ -8339,104 +8335,6 @@ pub const Generator = struct {
     /// Each position's own routed experts make a verify row ~.45 of a forward, flat to depth 3.
     pub const MTP_EV_MIMO_EXL3_COSTS: MtpEvCosts = .{ .draft = 0.04, .per_pos_lo = 0.44, .per_pos_hi = 0.44, .flat_max = 3, .sync = 0.02 };
     pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.26, .flat_max = 4, .sync = 0.01, .nax_from = 7, .per_pos_nax = 0.52 };
-    /// M5 Max/G17 refit (2026-07-17), same-session saturated fixed-depth
-    /// sweep after the NAX m16 verify lane landed: T(1..4) ~= 41.35 ms,
-    /// T(6)=62.15 ms, T(8)=68.39 ms. In floor units this identifies
-    /// draft+hi ~= .21 and draft+nax ~= .10; T(8)/T(6) is reproduced by
-    /// 2.19/1.99 = 1.1005 (measured 1.1004). The profile is selected only
-    /// for the calibrated dense Qwen3.6-27B homogeneous affine-4/gs-64
-    /// checkpoint with its native affine-8/gs-32 sidecar and successfully
-    /// built affine-3/gs-64 draft head, when the trunk lm_head routes both
-    /// M=8 and M=9 through NAX; every other combination retains DEFAULT.
-    pub const MTP_EV_G17_NAX_COSTS: MtpEvCosts = .{
-        .draft = 0.06,
-        .per_pos_lo = 0.06,
-        .per_pos_hi = 0.15,
-        .flat_max = 3,
-        .sync = 0.02,
-        .nax_from = 7,
-        .per_pos_nax = 0.04,
-    };
-    /// M5 Max/G17 affine-4/gs-32 sidecar refit (2026-07-18). A saturated
-    /// fixed-depth sweep gave T(1)=36.04, T(3)=43.01, T(6)=62.56, and
-    /// T(8)=66.06 ms. The fitted composite marginals (`draft + verify`) are
-    /// .107/.200/.054; depths 4 and 5 independently validate the rounded
-    /// .11/.20/.05 surface after matching-baseline correction. The split
-    /// between draft and verify is not separately identifiable.
-    pub const MTP_EV_G17_NAX_Q4_GS32_COSTS: MtpEvCosts = .{
-        .draft = 0.03,
-        .per_pos_lo = 0.08,
-        .per_pos_hi = 0.17,
-        .flat_max = 3,
-        .sync = 0.02,
-        .nax_from = 7,
-        .per_pos_nax = 0.02,
-    };
-    /// M5 Max/G17 uniform affine-4/gs-64 Qwen3.8-27B refit (2026-08-16).
-    /// Temperature-gated, reversed two-pass saturated echo gave T(1)=
-    /// 33.61-33.91, T(3)=38.455-38.465, T(6)=56.555-57.000, and NAX T(8)=
-    /// 61.890-61.925 ms/round. NAX-off T(8)=88.535-88.610 while depth-6
-    /// on/off stayed within 0.8%, isolating the M>=8 lane. A 31.4 ms fitted
-    /// floor gives rounded composite marginals .075/.195/.08. The profile
-    /// stays distinct because this trunk is uniform q4, not mixed q4/q5/q6.
-    pub const MTP_EV_G17_NAX_Q4_GS64_COSTS: MtpEvCosts = .{
-        .draft = 0.02,
-        .per_pos_lo = 0.055,
-        .per_pos_hi = 0.175,
-        .flat_max = 3,
-        .sync = 0.01,
-        .nax_from = 7,
-        .per_pos_nax = 0.06,
-    };
-    /// M5 Max/G17 uniform affine-6/gs-64 Qwen3.8-27B refit (2026-08-17).
-    /// Temperature-gated, six-pass counterbalanced calibration gave median
-    /// traced T(1)=44.98, T(3)=49.895, T(6)=64.495, and NAX T(8)=76.79
-    /// ms/round. A 42.52 ms fitted floor yields rounded composite marginals
-    /// .06/.115/.145 and reproduces T(8)/T(6): 1.815/1.525=1.1902 versus
-    /// 1.1907 measured. Depth 8 was 108.86 tok/s versus 102.93 at depth 7.
-    pub const MTP_EV_G17_NAX_Q6_GS64_COSTS: MtpEvCosts = .{
-        .draft = 0.02,
-        .per_pos_lo = 0.04,
-        .per_pos_hi = 0.095,
-        .flat_max = 3,
-        .sync = 0.01,
-        .nax_from = 7,
-        .per_pos_nax = 0.125,
-    };
-    /// M5 Max/G17 uniform affine-8/gs-64 Qwen3.8-27B refit (2026-08-17).
-    /// Five settled counterbalanced pairs found the q8-specific NAX takeover
-    /// at verify M=7: depth 6 rose from 73.42 to 77.89 tok/s (+6.09%), while
-    /// M=6 was -1.14%. Median traced NAX T(6)=85.94 ms and T(8)=90.68 ms over
-    /// the 53.0575 ms floor give normalized 1.62/1.71. The additive controller
-    /// cannot encode the one-time M7 kernel transition separately, so k=5..6
-    /// are a positive .19 bridge and the subsequent k=7..8 NAX marginal is
-    /// .045. This reproduces both measured endpoints without negative costs.
-    /// The profile is revoked when q8 NAX is off.
-    pub const MTP_EV_G17_NAX_Q8_GS64_COSTS: MtpEvCosts = .{
-        .draft = 0.005,
-        .per_pos_lo = 0.055,
-        .per_pos_hi = 0.185,
-        .flat_max = 4,
-        .sync = 0.01,
-        .nax_from = 7,
-        .per_pos_nax = 0.04,
-    };
-    /// M5 Max/G17 oQ4e mixed affine q4/q5/q6, gs64 refit (2026-07-23).
-    /// Saturated deterministic echo, same-session fixed widths:
-    /// T(1)=34.37, T(3)=40.31, T(6)=61.20, T(8)=62.79 ms/round.
-    /// Normalizing the inferred 31.40 ms floor gives composite marginals
-    /// .095/.220/.025. The split below is arbitrary but positive; only
-    /// `draft + per_pos_*` enters the controller. The profile is selected
-    /// solely for the exact resident oQ4e layer-role fingerprint.
-    pub const MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS: MtpEvCosts = .{
-        .draft = 0.02,
-        .per_pos_lo = 0.075,
-        .per_pos_hi = 0.20,
-        .flat_max = 3,
-        .sync = 0.01,
-        .nax_from = 7,
-        .per_pos_nax = 0.005,
-    };
     /// qwen4_exp (Qwen3.8-Flash-Next 125B-A6B) on G17, M5 Max 40-core refit
     /// (2026-08-27/28). Fitted at ~8.5k context like every prior surface
     /// (a short-context fit planned too shallow at 8.5k, measured -4% —
@@ -8609,9 +8507,8 @@ pub const Generator = struct {
     };
 
     /// Resolve the configured depth cap (`--mtp-max-depth`). 0 = auto (flag not passed):
-    /// MTP_ADAPTIVE_NAX_CAP only when the EV controller and a calibrated G17
-    /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
-    /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
+    /// MTP_ADAPTIVE_DEFAULT_CAP under the EV controller and DEFAULT_DEPTH in fixed mode.
+    /// Explicit values always win.
     pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
         const chip = chip_mod.chipBrand();
         const cap = mtpDepthCapResolved(configured, adaptive, profile, chip);
@@ -8668,11 +8565,9 @@ pub const Generator = struct {
             // The per-silicon row is the COLD-START cap: the measured
             // round-cost table may plan above it on trusted widths.
             .generic => mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP).cap,
-            .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => MTP_ADAPTIVE_NAX_CAP,
             // qwen4's measured surface has no NAX region to reach: depths 7-8
             // price at .345/pos against sub-60% tail acceptance even on
-            // saturated echo, so the calibrated cap keeps the default — the
-            // NAX cap exists for surfaces that flatten past position 6.
+            // saturated echo, so the calibrated cap keeps the default.
             .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 => MTP_ADAPTIVE_DEFAULT_CAP,
             // Three trained heads; the depth cap clamps to them at load.
             .mimo_exl3 => MTP_ADAPTIVE_DEFAULT_CAP,
@@ -8681,18 +8576,6 @@ pub const Generator = struct {
 
     pub fn resolveMtpDepthCapForProfile(configured: u32, profile: mtp_mod.MtpCostProfile) u32 {
         return mtpDepthCapForProfile(configured, mtpAdaptiveEnabled(), profile);
-    }
-
-    /// Legacy q8 boolean selector retained for source compatibility.
-    pub fn mtpDepthCapFor(configured: u32, adaptive: bool, nax_profile: bool) u32 {
-        const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
-        return mtpDepthCapForProfile(configured, adaptive, profile);
-    }
-
-    /// Legacy q8 boolean selector retained for source compatibility.
-    pub fn resolveMtpDepthCap(configured: u32, nax_profile: bool) u32 {
-        const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
-        return resolveMtpDepthCapForProfile(configured, profile);
     }
 
     /// Expected committed tokens for an m-deep round: the always-committed t1
@@ -9127,12 +9010,6 @@ pub const Generator = struct {
     pub fn mtpEvCostsForProfile(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
         return switch (profile) {
             .generic => MTP_EV_DEFAULT_COSTS,
-            .g17_nax_q8_gs32 => MTP_EV_G17_NAX_COSTS,
-            .g17_nax_q4_gs32 => MTP_EV_G17_NAX_Q4_GS32_COSTS,
-            .g17_nax_q4_gs64 => MTP_EV_G17_NAX_Q4_GS64_COSTS,
-            .g17_nax_q6_gs64 => MTP_EV_G17_NAX_Q6_GS64_COSTS,
-            .g17_nax_q8_gs64 => MTP_EV_G17_NAX_Q8_GS64_COSTS,
-            .g17_nax_oq4e_q4_gs64 => MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS,
             .g17_nax_qwen4_q4_gs64 => MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS,
             .g17_nax_qwen4_mixed_4_8_gs64 => MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS,
             .mimo_exl3 => MTP_EV_MIMO_EXL3_COSTS,
@@ -15392,28 +15269,22 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
     // An explicit depth still outranks the table on a measured chip.
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfileChip(8, true, .generic, "Apple M1 Pro"));
     try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfileChip(0, false, .generic, "Apple M1 Pro"));
-    for ([_]mtp_mod.MtpCostProfile{ .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 }) |profile| {
-        try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapForProfile(0, true, profile));
-        try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(0, true, profile));
-    }
     // qwen4's calibrated surface keeps the DEFAULT cap: no NAX region exists
     // to justify opening depths 7-8 on that arch.
     try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfile(0, true, .g17_nax_qwen4_q4_gs64));
     try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapForProfile(0, true, .g17_nax_qwen4_q4_gs64));
-    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64, .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 }) |profile| {
+    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 }) |profile| {
         try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfile(0, false, profile));
     }
     // Explicit values ignore both controller mode and profile, and remain
     // clamped to [1, MAX_DEPTH].
     try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, true, .generic));
-    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, false, .g17_nax_q8_gs32));
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, false, .g17_nax_qwen4_q4_gs64));
     try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapForProfile(7, true, .generic));
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(8, true, .generic));
-    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapForProfile(2, true, .g17_nax_q4_gs32));
+    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapForProfile(2, true, .g17_nax_qwen4_q4_gs64));
     try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapForProfile(12, true, .generic));
 
-    // The original boolean helpers remain source-compatible and map true to
-    // the pre-existing q8 profile.
     // The live resolver must NAME the row it applied, once. A silicon fence
     // nobody can see in the log is indistinguishable from the EV controller's
     // own choice at the same depth (dflash's ready line does the same).
@@ -15425,10 +15296,6 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
         try testing.expect(std.mem.indexOf(u8, body, "row.label") != null);
         try testing.expect(std.mem.indexOf(u8, body, "mtp_depth_cap_logged") != null);
     }
-
-    const live_generic = mtp_mod.adaptiveDepthCapForMachine(chip_mod.chipBrand(), Generator.MTP_ADAPTIVE_DEFAULT_CAP).cap;
-    try testing.expectEqual(live_generic, Generator.mtpDepthCapFor(0, true, false));
-    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
 }
 
 test "mtpFloorDisableObserve: extension misses do not poison depth one" {
@@ -15623,101 +15490,9 @@ test "mtpEvCostsForProfile: G17 profiles are explicit" {
     const generic = Generator.mtpEvCostsForProfile(.generic);
     try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, generic);
 
-    const q8 = Generator.mtpEvCostsForProfile(.g17_nax_q8_gs32);
-    try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, q8);
-    try testing.expectEqual(@as(u32, 7), q8.nax_from);
-
-    const q4 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs32);
-    try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, q4);
-    try testing.expectEqual(@as(u32, 7), q4.nax_from);
-
-    const q4_gs64 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs64);
-    try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, q4_gs64);
-    try testing.expectEqual(@as(u32, 7), q4_gs64.nax_from);
-
-    const oq4e = Generator.mtpEvCostsForProfile(.g17_nax_oq4e_q4_gs64);
-    try testing.expectEqual(Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS, oq4e);
-    try testing.expectEqual(@as(u32, 7), oq4e.nax_from);
-
     const qwen4 = Generator.mtpEvCostsForProfile(.g17_nax_qwen4_q4_gs64);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, qwen4);
     try testing.expect(!std.meta.eql(generic, qwen4));
-}
-
-test "MTP_EV_G17_NAX_COSTS reproduces the measured M5 depth-6/depth-8 ratio" {
-    const costs = Generator.MTP_EV_G17_NAX_COSTS;
-    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
-    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
-    try testing.expectApproxEqAbs(@as(f32, 1.99), t6, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 2.19), t8, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 68.39 / 62.15), t8 / t6, 2e-3);
-    try testing.expectApproxEqAbs(@as(f32, 0.21), Generator.mtpEvMarginalCost(costs, 6), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.10), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
-}
-
-test "MTP_EV_G17_NAX_Q4_GS32_COSTS encodes calibrated composite marginals" {
-    const costs = Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS;
-    try testing.expect(costs.draft > 0.0);
-    try testing.expect(costs.per_pos_lo > 0.0);
-    try testing.expect(costs.per_pos_hi > 0.0);
-    try testing.expect(costs.per_pos_nax > 0.0);
-    try testing.expectApproxEqAbs(@as(f32, 0.11), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.20), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.05), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 1.93), Generator.mtpEvRoundCost(costs, 6, false), 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 2.03), Generator.mtpEvRoundCost(costs, 8, false), 1e-5);
-}
-
-test "MTP_EV_G17_NAX_Q4_GS64_COSTS reproduces the calibrated M5 surface" {
-    const costs = Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS;
-    try testing.expectApproxEqAbs(@as(f32, 0.075), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.195), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.08), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
-    const t1 = Generator.mtpEvRoundCost(costs, 1, false);
-    const t3 = Generator.mtpEvRoundCost(costs, 3, false);
-    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
-    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
-    try testing.expectApproxEqAbs(@as(f32, 1.075), t1, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.225), t3, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.81), t6, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.97), t8, 1e-5);
-}
-
-test "MTP_EV_G17_NAX_Q6_GS64_COSTS reproduces the calibrated M5 surface" {
-    const costs = Generator.MTP_EV_G17_NAX_Q6_GS64_COSTS;
-    try testing.expectApproxEqAbs(@as(f32, 0.06), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.115), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.145), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
-    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
-    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
-    try testing.expectApproxEqAbs(@as(f32, 1.525), t6, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.815), t8, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 76.79 / 64.495), t8 / t6, 1e-3);
-}
-
-test "MTP_EV_G17_NAX_Q8_GS64_COSTS bridges the discontinuous NAX takeover" {
-    const costs = Generator.MTP_EV_G17_NAX_Q8_GS64_COSTS;
-    try testing.expectApproxEqAbs(@as(f32, 0.06), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.19), Generator.mtpEvMarginalCost(costs, 5), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.045), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
-    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
-    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
-    try testing.expectApproxEqAbs(@as(f32, 1.62), t6, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.71), t8, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 85.94 / 53.0575), t6, 2e-3);
-    try testing.expectApproxEqAbs(@as(f32, 90.68 / 53.0575), t8, 2e-3);
-}
-
-test "MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS reproduces the measured M5 surface" {
-    const costs = Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS;
-    try testing.expectApproxEqAbs(@as(f32, 0.095), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.22), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.025), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
-    const t6 = Generator.mtpEvRoundCost(costs, 6, false);
-    const t8 = Generator.mtpEvRoundCost(costs, 8, false);
-    try testing.expectApproxEqAbs(@as(f32, 1.945), t6, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.995), t8, 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 62.79 / 61.20), t8 / t6, 5e-4);
 }
 
 test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where generic costs over-draft prose" {
@@ -15742,7 +15517,7 @@ test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and 
     try testing.expectEqual(mtp_mod.MtpCostProfile.generic, head.costProfile(&xfm, kv.affine(6)));
 }
 
-test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
+test "mtpEvPlanFor: realistic warmup EMAs stop the generic surface early and never open qwen4 to depth 8" {
     const p = Generator.MTP_EV_PRIOR;
     const a = [_]f32{ 0.97, 0.89, p, p, p, p, p, p };
 
@@ -15750,15 +15525,6 @@ test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
     const generic = Generator.mtpEvPlanFor(&a, 8, Generator.MTP_EV_DEFAULT_COSTS, 3);
     try testing.expectEqual(@as(u32, 3), generic.m_lo);
     try testing.expect(generic.m_hi < 8);
-
-    // The M5 fit captures both its cheaper intermediate widths and the NAX
-    // takeover at draft position 7, so the same evidence reaches depth 8.
-    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, Generator.MTP_EV_G17_NAX_Q6_GS64_COSTS, Generator.MTP_EV_G17_NAX_Q8_GS64_COSTS, Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS }) |costs| {
-        const nax = Generator.mtpEvPlanFor(&a, 8, costs, 3);
-        try testing.expectEqual(@as(u32, 3), nax.m_lo);
-        try testing.expectEqual(@as(u32, 8), nax.m_hi);
-        try testing.expect(nax.tau_ln < 0.0);
-    }
 
     // qwen4_exp's measured surface has no NAX takeover — a verify row is
     // bytes at every width — so the same base depth stands but the same
@@ -15768,18 +15534,9 @@ test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
     try testing.expect(qwen4_plan.m_hi < 8);
 
     const cold = [_]f32{ 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 };
-    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS, Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS }) |costs| {
-        const cold_plan = Generator.mtpEvPlanFor(&cold, 8, costs, 8);
-        try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
-        try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
-    }
-    // Qwen3.8's measured depth-1 marginal is cheap enough that even this
-    // synthetic 20% first-draft case clears the exploration floor narrowly.
-    // The base stays at one and only one confidence-gated position is exposed.
-    const q38_cold = Generator.mtpEvPlanFor(&cold, 8, Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, 8);
-    try testing.expectEqual(@as(u32, 1), q38_cold.m_lo);
-    try testing.expectEqual(@as(u32, 2), q38_cold.m_hi);
-    try testing.expect(q38_cold.tau_ln < 0.0);
+    const cold_plan = Generator.mtpEvPlanFor(&cold, 8, Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 8);
+    try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
+    try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
 }
 
 test "mtpEvPlanFor: mid-decay acceptance picks a shallow base and a confidence-gated extension" {
