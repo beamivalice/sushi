@@ -142,13 +142,14 @@ pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8,
 /// Bytes the resident load holds once built: the stored tensors, the head widened to f32, and each
 /// fp8 weight's 32x32 scale grid spread over its rows.
 pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !u64 {
-    return sumBytes(io, allocator, dir_path, .trunk);
+    return sumBytes(io, allocator, dir_path, .trunk, false);
 }
 
 /// Bytes the vision tower adds once loaded: its block and aligner matrices as the affine 8-bit codes they are
 /// requantized to (`dsv41_vision.Dsv41Vision.init`), the rest as stored, bf16.
-pub fn visionBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !u64 {
-    return sumBytes(io, allocator, dir_path, .vision);
+/// `keep_bf16` (`--vision-bf16`) bills every matrix as stored.
+pub fn visionBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, keep_bf16: bool) !u64 {
+    return sumBytes(io, allocator, dir_path, .vision, keep_bf16);
 }
 
 /// Does the checkpoint ship the DSpark stages? Its weight index names `mtp.0.main_proj` (stored, or a trellis bank).
@@ -162,13 +163,13 @@ pub fn shipsDspark(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u
 
 /// Bytes the DSpark stages add once built: their tensors and experts, with the Markov head widened to f32.
 pub fn dsparkBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !u64 {
-    return sumBytes(io, allocator, dir_path, .stages);
+    return sumBytes(io, allocator, dir_path, .stages, false);
 }
 
 const Section = enum { trunk, stages, vision };
 
 /// `keeps`' bytes as built, over the trunk, only the DSpark stages, or only the vision tower.
-fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, section: Section) !u64 {
+fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, section: Section, keep_bf16: bool) !u64 {
     var shards = try shardNames(io, allocator, dir_path);
     defer freeShardNames(allocator, &shards);
     var total: u64 = 0;
@@ -190,7 +191,7 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
             const offs = (entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader).array.items;
             if (offs.len != 2 or offs[0] != .integer or offs[1] != .integer) return error.InvalidSafetensorsHeader;
             const bytes: u64 = @intCast(offs[1].integer - offs[0].integer);
-            if (section == .vision) if (requantizedShape(key, entry.value_ptr.object)) |shape| {
+            if (section == .vision and !keep_bf16) if (requantizedShape(key, entry.value_ptr.object)) |shape| {
                 total +|= vision.quantizedBytes(shape[0], shape[1]);
                 continue;
             };
@@ -344,7 +345,7 @@ test "dsv41 source: the tower's bytes are the vision section, the trunk's exclud
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    try testing.expectEqual(@as(u64, 40 + 300 + 500 + 20), try visionBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(@as(u64, 40 + 300 + 500 + 20), try visionBytes(testing.io, testing.allocator, root, false));
     try testing.expectEqual(@as(u64, 1040), try residentBytes(testing.io, testing.allocator, root));
     try testing.expectEqual(@as(u64, 7000), try dsparkBytes(testing.io, testing.allocator, root));
     var tower = try loadTower(testing.io, testing.allocator, root);
@@ -376,7 +377,23 @@ test "dsv41 source: the tower's bill counts the matrices the load requantizes as
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
     // Only the bf16 wqkv matrix of whole groups is requantized; its bias, an f32 matrix and the 588-wide patch embedding stay as stored.
     const expect = vision.quantizedBytes(384, 256) + 768 + 65536 + 301056;
-    try testing.expectEqual(expect, try visionBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(expect, try visionBytes(testing.io, testing.allocator, root, false));
+}
+
+test "dsv41 source: --vision-bf16 bills the tower's matrices as stored" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header =
+        \\{"vision.blocks.0.attn.wqkv.weight":{"dtype":"BF16","shape":[384,256],"data_offsets":[0,196608]}}
+    ;
+    var file: [8 + header.len + 196608]u8 = @splat(0);
+    std.mem.writeInt(u64, file[0..8], header.len, .little);
+    @memcpy(file[8..][0..header.len], header);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "model-a.safetensors", .data = &file });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    try testing.expectEqual(vision.quantizedBytes(384, 256), try visionBytes(testing.io, testing.allocator, root, false));
+    try testing.expectEqual(@as(u64, 196608), try visionBytes(testing.io, testing.allocator, root, true));
 }
 
 test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's trellis tensors as one region each" {

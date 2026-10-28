@@ -713,6 +713,9 @@ pub fn rmsRatio(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 
 pub const QUANT_BITS: u32 = 8;
 
+/// `--vision-bf16`: a tower stored bf16 stays bf16 at load instead of becoming affine 8-bit codes.
+pub var vision_bf16: bool = false;
+
 /// Bytes a requantized `[out, in]` weight holds: the codes and a bf16 scale and bias per `group`.
 pub fn quantizedBytes(out: u64, in: u64, group: u64) u64 {
     return out * in * QUANT_BITS / 8 + 2 * 2 * out * (in / group);

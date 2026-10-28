@@ -2646,7 +2646,7 @@ pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_di
         return .{
             .trunk = try source.residentBytes(io, allocator, model_dir),
             .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir) else 0,
-            .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir) else 0,
+            .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir, @import("vision_common.zig").vision_bf16) else 0,
         };
     }
     if (config.isGlm5())
@@ -2718,7 +2718,7 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
                 size += expert_quant.rateGroupMetaBytes(canonical, std.math.cast(u64, shape.array.items[0].integer) orelse 0);
             };
             // The Qwen tower's matrices are requantized at load (`qwen_vision.QwenVision.init`): billed as the codes.
-            if (is_vision) if (@import("vision_common.zig").headerMatrix(tensor.value_ptr.object)) |m| {
+            if (is_vision and !@import("vision_common.zig").vision_bf16) if (@import("vision_common.zig").headerMatrix(tensor.value_ptr.object)) |m| {
                 if (@import("qwen_vision.zig").quantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
                     size = @import("vision_common.zig").quantizedBytes(m.dims[0], m.dims[1], group);
             };
@@ -4901,6 +4901,32 @@ test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
     const split = try streamingResidentSplit(io, t.allocator, path_buf[0..path_len], &.{ .expert_layout = .bf16_fused });
     try t.expectEqual(@as(u64, 6), split.trunk);
     try t.expectEqual(@as(u64, 12), split.mtp);
+}
+
+test "qwen resident bill: the tower bills as affine 8-bit codes, and as stored under --vision-bf16" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const key = "model.visual.blocks.0.attn.qkv.weight";
+    const header = "{\"" ++ key ++ "\":{\"dtype\":\"BF16\",\"shape\":[384,128],\"data_offsets\":[0,98304]}}";
+    const bytes = try t.allocator.alloc(u8, 8 + header.len + 98304);
+    defer t.allocator.free(bytes);
+    std.mem.writeInt(u64, bytes[0..8], header.len, .little);
+    @memcpy(bytes[8 .. 8 + header.len], header);
+    @memset(bytes[8 + header.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "s.safetensors", .data = bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ key ++ "\":\"s.safetensors\"}}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const dir = path_buf[0..path_len];
+    const common = @import("vision_common.zig");
+    const quantized = try streamingResidentSplit(io, t.allocator, dir, &.{ .expert_layout = .bf16_fused });
+    try t.expectEqual(common.quantizedBytes(384, 128, 128), quantized.vision);
+    common.vision_bf16 = true;
+    defer common.vision_bf16 = false;
+    const kept = try streamingResidentSplit(io, t.allocator, dir, &.{ .expert_layout = .bf16_fused });
+    try t.expectEqual(@as(u64, 98304), kept.vision);
 }
 
 test "real qwen streaming resident estimate is trunk plus MTP only" {

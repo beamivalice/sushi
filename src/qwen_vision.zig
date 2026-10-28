@@ -101,6 +101,7 @@ const Load = struct {
     g64: u32 = 0,
     bf16_bytes: u64 = 0,
     quant_bytes: u64 = 0,
+    keep: bool = false,
 
     /// Requantizes the bf16 matrix `w` (pack key `key`) when the rule asks, frees its copy from `weights`.
     fn requantize(self: *Load, weights: *Weights, key: []const u8, w: *mlx.mlx_array, q: *?dflash.DflashLinear) !void {
@@ -108,6 +109,10 @@ const Load = struct {
         if (shape.len != 2 or mlx.mlx_array_dtype(w.*) != .bfloat16) return;
         const dims = [2]u64{ @intCast(shape[0]), @intCast(shape[1]) };
         const group = quantGroupAtLoad(key, true, &dims) orelse return;
+        if (self.keep) {
+            self.bf16_bytes += 2 * dims[0] * dims[1];
+            return;
+        }
         q.* = try common.requantize(w.*, group, self.s);
         _ = mlx.mlx_array_free(weights.take(key).?);
         w.* = .{ .ctx = null };
@@ -149,7 +154,7 @@ pub const QwenVision = struct {
 
     /// The serving tower: its big bf16 matrices are requantized to affine 8-bit and their copies leave `weights`.
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !QwenVision {
-        return initWith(allocator, config, weights, true);
+        return initWith(allocator, config, weights, !common.vision_bf16);
     }
 
     /// `quantize` false keeps every matrix bf16 (parity tests against the reference).
@@ -246,9 +251,9 @@ pub const QwenVision = struct {
             .merger_fc2_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight")),
             .merger_fc2_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.bias")),
         };
-        if (!quantize) return self;
+        if (!quantize and !common.vision_bf16) return self;
         errdefer self.release();
-        var ld: Load = .{ .s = s };
+        var ld: Load = .{ .s = s, .keep = !quantize };
         var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         for (self.blocks, 0..) |*blk, i| {
             try ld.requantize(weights, fmtLayer(&kbuf, prefix, i, "attn.qkv.weight"), &blk.qkv_w, &blk.qkv_q);
@@ -258,6 +263,7 @@ pub const QwenVision = struct {
         }
         try ld.requantize(weights, fmtKey(&kbuf, prefix, "merger.linear_fc1.weight"), &self.merger_fc1_w, &self.merger_fc1_q);
         try ld.requantize(weights, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight"), &self.merger_fc2_w, &self.merger_fc2_q);
+        if (ld.keep and ld.bf16_bytes > 0) log.info("[vision] tower kept bf16 (--vision-bf16): {d:.2} GB\n", .{@as(f64, @floatFromInt(ld.bf16_bytes)) / 1e9});
         if (ld.linears > 0) log.info("[vision] tower requantized at load: bf16 {d:.2} GB -> affine{d} {s} {d:.2} GB ({d} linears, {d} ms)\n", .{
             @as(f64, @floatFromInt(ld.bf16_bytes)) / 1e9,
             common.QUANT_BITS,
@@ -1525,6 +1531,38 @@ test "qwen vision: requantized tower holds affine 8-bit codes, frees the bf16 co
     const g = try common.gap(got, ref, qq.s);
     errdefer std.debug.print("[qwen-vision] tiny q8 vs bf16 cosine={d:.6}\n", .{g.cos});
     try std.testing.expect(g.cos > 0.999);
+}
+
+test "qwen vision: --vision-bf16 keeps bf16 matrices and matches the bf16 arm byte for byte" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var wk = try tinyTower();
+    defer wk.deinit();
+    var wb = try tinyTower();
+    defer wb.deinit();
+    const before = wk.count();
+    common.vision_bf16 = true;
+    defer common.vision_bf16 = false;
+    var qk = try QwenVision.init(a, tinyConfig(), &wk);
+    defer qk.deinit();
+    var qb = try QwenVision.initWith(a, tinyConfig(), &wb, false);
+    defer qb.deinit();
+
+    try std.testing.expectEqual(before, wk.count());
+    try std.testing.expect(qk.blocks[0].qkv_q == null and qk.merger_fc1_q == null);
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(qk.blocks[0].qkv_w));
+
+    var px: [16 * 96]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    for (&px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+    const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 16, 96 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+    const got = try qk.forward(patches, 4, 4);
+    defer _ = mlx.mlx_array_free(got);
+    const ref = try qb.forward(patches, 4, 4);
+    defer _ = mlx.mlx_array_free(ref);
+    const g = try common.gap(got, ref, qk.s);
+    try std.testing.expectEqual(@as(f64, 0), g.max_abs);
 }
 
 fn qwenTowerKey(key: []const u8, _: void) bool {

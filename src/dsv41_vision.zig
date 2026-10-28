@@ -266,7 +266,11 @@ fn lin(ld: *Load, comptime fmt: []const u8, args: anytype, out_dim: usize, in_di
     }
     var name_buf: [128]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, fmt ++ ".weight", args);
-    if (!ld.quantize or !quantizesAtLoad(name, true, &.{ out_dim, in_dim })) return l;
+    if (!quantizesAtLoad(name, true, &.{ out_dim, in_dim })) return l;
+    if (!ld.quantize) {
+        ld.bf16_bytes += 2 * out_dim * in_dim;
+        return l;
+    }
     // The bf16 copy goes as soon as its codes exist: the load holds one linear's worth of both.
     const q = try common.requantize(l.w, QUANT_GROUP, ld.s);
     _ = mlx.mlx_array_free(ld.weights.take(name).?);
@@ -296,7 +300,7 @@ pub const Dsv41Vision = struct {
     /// The serving tower: its block and aligner matrices are requantized to affine 8-bit and their bf16 copies leave
     /// `weights`. The tower's other handles are borrowed from `weights`, which outlives it.
     pub fn init(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights) !Dsv41Vision {
-        return initWith(allocator, config, weights, true);
+        return initWith(allocator, config, weights, !common.vision_bf16);
     }
 
     /// `quantize` false keeps every linear bf16 (the reference-parity tests).
@@ -345,6 +349,7 @@ pub const Dsv41Vision = struct {
         self.image_end = try tensor(weights, "image_end", .{});
         self.image_newline = try tensor(weights, "image_newline", .{});
         log.info("Vision encoder: DeepSeek-V4.1 ViT (depth={d}, hidden={d}, heads={d}, patch={d}, downsample={d})\n", .{ v.layers, d, v.heads, v.patch, v.downsample });
+        if (!quantize and common.vision_bf16) log.info("[vision] tower kept bf16 (--vision-bf16): {d:.2} GB\n", .{@as(f64, @floatFromInt(ld.bf16_bytes)) / 1e9});
         if (ld.linears > 0) log.info("[vision] tower requantized at load: bf16 {d:.2} GB -> affine{d} g{d} {d:.2} GB ({d} linears, {d} ms)\n", .{
             @as(f64, @floatFromInt(ld.bf16_bytes)) / 1e9,
             common.QUANT_BITS,
@@ -899,6 +904,39 @@ test "dsv41 vision: requantized tower holds affine 8-bit g128 codes, frees the b
     const cos = try common.cosineSim(got, want, dq.s);
     errdefer std.debug.print("[dsv41-vision] tiny q8 vs bf16 cosine={d:.6}\n", .{cos});
     try testing.expect(cos > 0.999);
+}
+
+test "dsv41 vision: --vision-bf16 keeps bf16 linears and matches the bf16 arm byte for byte" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var wk = try tinyTower();
+    defer wk.deinit();
+    var wb = try tinyTower();
+    defer wb.deinit();
+    const before = wk.count();
+    common.vision_bf16 = true;
+    defer common.vision_bf16 = false;
+    var dk = try Dsv41Vision.init(testing.allocator, tinyConfig(), &wk);
+    defer dk.deinit();
+    var db = try Dsv41Vision.initWith(testing.allocator, tinyConfig(), &wb, false);
+    defer db.deinit();
+
+    try testing.expectEqual(before, wk.count());
+    for ([_]*const Lin{ &dk.blocks[0].wqkv, &dk.blocks[1].w2, &dk.a_w1, &dk.patch }) |l| {
+        try testing.expect(l.q == null);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(l.w));
+    }
+
+    var px: [6 * 8 * 48]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    for (&px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+    const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 6 * 8, 48 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+    const got = try dk.forward(patches, 6, 8);
+    defer _ = mlx.mlx_array_free(got);
+    const want = try db.forward(patches, 6, 8);
+    defer _ = mlx.mlx_array_free(want);
+    const g = try common.gap(got, want, dk.s);
+    try testing.expectEqual(@as(f64, 0), g.max_abs);
 }
 
 // ── The requantized tower against the bf16 tower on a real image (the pack's tower, SUSHI_MODELS_DIR) ──

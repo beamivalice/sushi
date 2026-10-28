@@ -40,6 +40,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--idle-evict-secs` | off → unload a model idle this long (main.zig:959) | machine | help; 1 test | keep |
 | `--ctx-size` | model max → context length; also `ctx_size` in settings (main.zig:663) | machine | help, usage, README; 40 tests | keep |
 | `--config-overrides` | none → JSON deep-merged into every model's `config.json`, e.g. YaRN extension (main.zig:666) | user | help; 0 tests | keep: the context-extension lever; add a test |
+| `--vision-bf16` | off: a bf16 tower is requantized to affine 8-bit at load; set keeps it as stored, billed as stored (DeepSeek-V4.1 +0.47 GB, Qwen +0.30 GB) → users who want the stored tower's exact image quality; no effect with `--no-vision` or on a tower not stored bf16 (GLM); no settings key | machine | help; 4 tests | keep |
 | `--vision` / `--no-vision` | tower loads on a resident model and on DeepSeek-V4.1, not on any other streamed one → force it on or save its memory; also `vision` in settings (main.zig:693) | machine | help, README, topic docs; 17 tests | keep |
 | `--skip-mem-preflight` | off → bypass the free-RAM check before a load (main.zig:699) | machine | help, engine-memory-admission, qwen4-perf; 0 tests | keep: the refusal text names it; the M2 Max runs need it |
 | `--wired-margin-gib` | `1` → headroom under `iogpu.wired_limit_mb`, 1..32 (main.zig:898) | machine | help, README, engine-memory-admission; 0 tests | keep |

@@ -180,6 +180,8 @@ fn printUsage(io: std.Io) void {
         \\                      span (default 0 = off). Request think_penalty > this
         \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --vision-bf16       Keep a bf16 vision tower as stored instead of requantizing
+        \\                      it to affine 8-bit at load (more memory, exact tower)
         \\  --vision            Load the vision tower on an SSD-streamed load too (off by
         \\                      default there, except for DeepSeek-V4.1: its weights
         \\                      come out of the expert cache)
@@ -669,6 +671,8 @@ pub fn main(init: std.process.Init) !void {
             no_vision = true;
         } else if (std.mem.eql(u8, args[i], "--vision")) {
             vision = true;
+        } else if (std.mem.eql(u8, args[i], "--vision-bf16")) {
+            @import("vision_common.zig").vision_bf16 = true;
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {

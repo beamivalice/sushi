@@ -52,7 +52,7 @@ hidden 2560, expert intermediate 640.
   affine 8-bit and frees each bf16 copy. The group is 128 where the input width divides by 128 (every one of the 83: 1152
   and 4608 wide), else 64, else the matrix stays bf16: `mlp.linear_fc2` reads 4304 wide, so its 27 matrices (268 MB) stay.
   The patch embedding (Conv3d), position table, norms and biases stay. The tower holds 597,327,776 B, which is what
-  `indexedResidentSplit` bills, resident or streamed. One `[vision] tower requantized at load: ...` line reports it.
+  `indexedResidentSplit` bills, resident or streamed. One `[vision] tower requantized at load: ...` line reports it. `--vision-bf16` keeps the tower as stored (billed as stored, `[vision] tower kept bf16 (--vision-bf16): ...`).
   Against the bf16 tower on house.jpeg stretched to a 40 x 64 grid (640 tokens): merger output cosine 0.99950, max abs
   0.026, relative RMS 0.0317; load 32 ms; encode 211.5 ms against 209.7 ms (a tie; the transient peak is the same,
   0.918 GiB). M5 Max, base 2db0e8d5 plus this change, GPU lock held, QUIET, `taskpolicy -a`, median of 9 interleaved warm
