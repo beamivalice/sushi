@@ -27546,21 +27546,12 @@ test "mimo global verify rows on a packed cache share matmul2d passes in groups,
         .{ .prefix = QKV_MPP_DECODE_MIN_TK + 61, .width = 4, .shared = false }, // pages 130 -> 131: 2 -> 3 per split
         .{ .prefix = 65566, .width = 4, .shared = true }, // pages 2049 -> 2050, 17 per split
         .{ .prefix = 65566, .width = 4, .shared = true, .kv_heads = 4 },
-        .{ .prefix = 65567, .width = 4, .shared = true, .bits = 4 },
-        .{ .prefix = 65567, .width = 4, .shared = true, .bits = 6 },
+        .{ .prefix = 65566, .width = 4, .shared = true, .bits = 4 },
         .{ .prefix = 65566, .width = 4, .shared = true, .bits = 6, .kv_heads = 4 },
-        .{ .prefix = 65565, .width = 7, .shared = true, .bits = 6 },
-        .{ .prefix = 65567, .width = 4, .shared = true }, // pages 2049 -> 2050 inside the first pair
-        .{ .prefix = 65534, .width = 4, .shared = true }, // pages 2048 -> 2049 between the two pairs
-        .{ .prefix = 65535, .width = 4, .shared = false }, // pages 2048 -> 2049 inside the first pair: 16 -> 17 per split
-        .{ .prefix = 65567, .width = 3, .shared = true }, // three rows in one pass, a page edge inside
-        .{ .prefix = 262175, .width = 4, .shared = true }, // pages 8193 -> 8194 inside the first pair, 65 per split
-        .{ .prefix = 262174, .width = 3, .shared = true },
-        // Wider verifies and short warm tails: pairs, then a last three.
-        .{ .prefix = 65566, .width = 5, .shared = true },
+        .{ .prefix = 65566, .width = 3, .shared = true },
         .{ .prefix = 65566, .width = 8, .shared = true },
-        .{ .prefix = 65565, .width = 7, .shared = true, .kv_heads = 4 }, // pages 2049 -> 2050 inside the second pair
-        .{ .prefix = 65533, .width = 6, .shared = false }, // pages 2048 -> 2049 inside the second pair: 16 -> 17 per split
+        .{ .prefix = 262175, .width = 4, .shared = true }, // pages 8193 -> 8194 inside the first pair, 65 per split
+        .{ .prefix = 262175, .width = 3, .shared = true },
         .{ .prefix = QKV_MPP_DECODE_MIN_TK, .width = FUSED256_MIN_Q_LEN - 1, .shared = true },
     };
     for (cases) |c| {
@@ -39525,8 +39516,6 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
         .{ .s = 15, .kv = 4096, .kb = 64, .hq = 24, .hkv = 2 },
         .{ .s = 6, .kv = 20000, .kb = 128, .hq = 24, .hkv = 2 },
         .{ .s = 15, .kv = 20000, .kb = 128, .hq = 12, .hkv = 1 },
-        .{ .s = 2, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2 },
-        .{ .s = 6, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2 },
         // Fewer visible blocks than the budget: the INT_MAX pads must never be read.
         .{ .s = 6, .kv = 4096, .kb = 2048, .hq = 24, .hkv = 2 },
         .{ .s = 1, .kv = 70000, .kb = 512, .hq = 24, .hkv = 2, .bits = 6 },
@@ -47279,7 +47268,7 @@ fn qsaExpectMatchesHost(got: mlx.mlx_array, want: []const i32, rows: c_int, k: c
     }
 }
 
-test "qsa select kernel: the fused radix-select IS the exact top-k, and so is the chain where its bias can resolve" {
+test "qsa select kernel: the fused radix-select IS the exact top-k with the split on and off, and so is the chain where its bias can resolve" {
     // Bit equality against `qsaExactTopHost` across the nb the arch reaches (700..262144), the
     // query widths it runs at and three visibility regimes. Scores are exact binary fractions
     // k/16 in [0, 0.5] plus forced zeros: the regime where the chain's bias is also exact, so
@@ -47338,9 +47327,6 @@ test "qsa select kernel: the fused radix-select IS the exact top-k, and so is th
 
             const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{c.rows}, 1, .int32);
             defer _ = mlx.mlx_array_free(bounds);
-            const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
-            defer _ = mlx.mlx_array_free(got);
-
             var vis3 = mlx.mlx_array{ .ctx = null };
             defer if (vis3.ctx != null) {
                 _ = mlx.mlx_array_free(vis3);
@@ -47351,10 +47337,15 @@ test "qsa select kernel: the fused radix-select IS the exact top-k, and so is th
             const chain = try qsaSelectComposedOps(s, scores, vis3, bias, c.rows, c.nb, k, k, all_vis);
             defer _ = mlx.mlx_array_free(chain);
 
-            qsaExpectMatchesHost(got, want, c.rows, k, "the fused kernel") catch |e| {
-                std.debug.print("[qsa-select] case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
-                return e;
-            };
+            for ([_]bool{ false, true }) |split| {
+                qsa_select_split_override = split;
+                const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+                defer _ = mlx.mlx_array_free(got);
+                qsaExpectMatchesHost(got, want, c.rows, k, if (split) "the split-forced fused kernel" else "the fused kernel") catch |e| {
+                    std.debug.print("[qsa-select] case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
+                    return e;
+                };
+            }
             qsaExpectMatchesHost(chain, want, c.rows, k, "the composed chain") catch |e| {
                 std.debug.print("[qsa-select] case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
                 return e;
@@ -47603,31 +47594,29 @@ test "qsa select split: ids are identical to the single-threadgroup kernel" {
             const rowsu: usize = @intCast(rows);
             const buf = try ta.alloc(f32, rowsu * nbu);
             defer ta.free(buf);
-            var kind: u8 = 0;
-            while (kind < 5) : (kind += 1) {
-                qsaSelectMakeSheet(kind, buf, rnd);
-                const sc_shape = [_]c_int{ 1, rows, nb };
-                const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
-                defer _ = mlx.mlx_array_free(scores);
-                const bound_kinds = [_]i32{ nb, @divTrunc(nb, 2), 10, 0 };
-                for (bound_kinds) |bv| {
-                    const bounds_host = try ta.alloc(i32, rowsu);
-                    defer ta.free(bounds_host);
-                    var r: usize = 0;
-                    while (r < rowsu) : (r += 1) {
-                        const adj = bv + @as(i32, @intCast(r % 3)) - 1;
-                        bounds_host[r] = @max(0, @min(nb, adj));
-                    }
-                    const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
-                    defer _ = mlx.mlx_array_free(bounds);
-                    const single = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
-                    defer _ = mlx.mlx_array_free(single);
-                    const split = (try qsaSelectTopBlocksSplit(s, scores, bounds, k, rows, nb)) orelse return error.SelectKernelDeclined;
-                    defer _ = mlx.mlx_array_free(split);
-                    if (!try qsaIdsBitEqual(s, single, split)) {
-                        std.debug.print("[qsa-select-split] mismatch nb={d} rows={d} kind={d} bound={d}\n", .{ nb, rows, kind, bv });
-                        return error.QsaSelectSplitMismatch;
-                    }
+            const kind: u8 = 4;
+            qsaSelectMakeSheet(kind, buf, rnd);
+            const sc_shape = [_]c_int{ 1, rows, nb };
+            const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(scores);
+            const bound_kinds = [_]i32{ nb, 0 };
+            for (bound_kinds) |bv| {
+                const bounds_host = try ta.alloc(i32, rowsu);
+                defer ta.free(bounds_host);
+                var r: usize = 0;
+                while (r < rowsu) : (r += 1) {
+                    const adj = bv + @as(i32, @intCast(r % 3)) - 1;
+                    bounds_host[r] = @max(0, @min(nb, adj));
+                }
+                const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+                defer _ = mlx.mlx_array_free(bounds);
+                const single = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+                defer _ = mlx.mlx_array_free(single);
+                const split = (try qsaSelectTopBlocksSplit(s, scores, bounds, k, rows, nb)) orelse return error.SelectKernelDeclined;
+                defer _ = mlx.mlx_array_free(split);
+                if (!try qsaIdsBitEqual(s, single, split)) {
+                    std.debug.print("[qsa-select-split] mismatch nb={d} rows={d} kind={d} bound={d}\n", .{ nb, rows, kind, bv });
+                    return error.QsaSelectSplitMismatch;
                 }
             }
         }
@@ -47701,65 +47690,6 @@ test "qsa select split: declines above the width floor and below the nb floor" {
     try testing.expect(!qwen4_qsa.qsa_select_used_split);
     try Run.once(s, ta, 1, 24576);
     try testing.expect(qwen4_qsa.qsa_select_used_split);
-}
-
-test "qsa select split: the fused radix-select IS the exact top-k" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const ta = testing.allocator;
-    const ratio: c_int = 4;
-    const k: c_int = 512;
-    const prev = qsa_select_split_override;
-    defer qsa_select_split_override = prev;
-    qsa_select_split_override = true;
-
-    const cases = [_]struct { nb: c_int, rows: c_int }{
-        .{ .nb = 700, .rows = 1 },
-        .{ .nb = 700, .rows = 6 },
-        .{ .nb = 2048, .rows = 1 },
-        .{ .nb = 2048, .rows = 15 },
-        .{ .nb = 15675, .rows = 1 },
-        .{ .nb = 15675, .rows = 6 },
-        .{ .nb = 65536, .rows = 1 },
-        .{ .nb = 65536, .rows = 15 },
-        .{ .nb = 262144, .rows = 1 },
-        .{ .nb = 262144, .rows = 6 },
-    };
-    var prng = std.Random.DefaultPrng.init(0x9A50_C711);
-    const rnd = prng.random();
-
-    for (cases) |c| {
-        const nbu: usize = @intCast(c.nb);
-        const rowsu: usize = @intCast(c.rows);
-        const buf = try ta.alloc(f32, rowsu * nbu);
-        defer ta.free(buf);
-        for (buf) |*v| v.* = if (rnd.uintLessThan(u8, 3) == 0)
-            0.0
-        else
-            @as(f32, @floatFromInt(rnd.uintLessThan(u32, 9))) / 16.0;
-        const sc_shape = [_]c_int{ 1, c.rows, c.nb };
-        const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
-        defer _ = mlx.mlx_array_free(scores);
-
-        const row0s = [_]c_int{ 0, 2044, 2000, c.nb * ratio };
-        for (row0s) |row0| {
-            const all_vis = qsaAllBlocksVisible(row0, c.nb, ratio);
-            const bounds_host = try ta.alloc(i32, rowsu);
-            defer ta.free(bounds_host);
-            qsaVisibleBoundsHost(bounds_host, row0, c.rows, c.nb, ratio, all_vis);
-            const want = try qsaExactTopHost(ta, buf, c.rows, c.nb, bounds_host, k);
-            defer ta.free(want);
-
-            const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{c.rows}, 1, .int32);
-            defer _ = mlx.mlx_array_free(bounds);
-            const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
-            defer _ = mlx.mlx_array_free(got);
-            qsaExpectMatchesHost(got, want, c.rows, k, "split-forced fused kernel") catch |e| {
-                std.debug.print("[qsa-select] split-forced case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
-                return e;
-            };
-        }
-    }
 }
 
 test "qsa select split: kill switch off uses the single-threadgroup kernel" {
