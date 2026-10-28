@@ -190,6 +190,20 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   before tile k's MMA (+27%), 256- or 64-thread groups (+12% at 2048 rows); on the branch-free body: a threadgroup
   LUT decode of the w12 codebook (+32%), a per-k-step threadgroup barrier (+9%), unroll 4 (+20% over unroll 2),
   64-row windows again (+9-13% on gate/up). The kernel is register/occupancy bound: added live state loses.
+- **The Qwen prefill GEMM is MMA-bound, so a shared-decode tile cannot win.** A turboexl3 (MIT) port, its 64-row
+  shared-decode mixed kernel (fragment-order double-buffered stage, A pre-laid) and its 128-row-tile launch, ran against
+  the served body in one process at Flash-Next geometry (E 512, top-10, 2560/640, lognormal routing sigma 0.7, MCG w15,
+  one projection per launch, 2048/4096/8192 tokens, base 2db0e8d5, GPU lock, fans auto, arms interleaved A B B A). The
+  64-row kernel is within -3..+9% of ours at n32 to n50 and n64 (n64 4096 tokens: 1.02 gate, 0.99 down); the 128-row
+  tiles are +7-22% slower. With its decode skipped the 64-row kernel saves 6.5% (n64 gate, 4096 tokens), with its MMAs
+  skipped it keeps 28%: the MMA step is ~72% of the launch (~62 TFLOP/s), so the 2x decode saving the larger tile buys
+  is under 7%, which is why every shared-decode attempt above lost.
+- **Above n50 the decode, not the tile, was the gap.** n52 and n56 to n62 ran 15-25% above their neighbours (n64,
+  n54 aside) because a quad's 64-bit funnel is emulated; turbo's shared decode hid it, +6-20% over ours. `nax_win2`
+  builds the window as two 32-bit funnels below n64 (the weights lie within 32 bits of the last and 16 bits earlier),
+  same bytes (every reader byte test, every rate and codebook). Ours before -> after, 4096 tokens, one projection:
+  n56 -17% (turbo parity), n52 -6%, n58 -7%, n60 -5%, n62 -4%; n32, n42, n64 unchanged. n52, n58, n60, n62 stay
+  3-15% above turbo's flat curve (not the decode share; unroll 1 does not move them).
 - Dead for prefill routing: a counting sort (histogram, scan, stable scatter) in place of the argsort, exact with
   ties: -0.03 to -0.16 ms per MoE layer as a component, yet Qwen 2.6bpw prefill 5-10% slower in an A B B A (de867e94 era).
 - **The SwiGLU chain is f32**: gate, up, sigmoid, SiLU and their product stay in f32 registers through the multiply
