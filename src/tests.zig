@@ -139,6 +139,7 @@ test {
     _ = @import("repl_input.zig");
     _ = @import("launch.zig");
     _ = @import("opencode_persist.zig");
+    _ = @import("main.zig");
     _ = @import("mlx.zig");
     _ = @import("test_models.zig");
 }

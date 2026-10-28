@@ -473,9 +473,20 @@ pub fn noGpuBackend() bool {
     if (no_gpu_backend_cache == null) {
         var avail: bool = false;
         _ = mlx_metal_is_available(&avail);
-        no_gpu_backend_cache = !avail;
+        no_gpu_backend_cache = !avail or (builtin.is_test and testNoGpuEnv());
     }
     return no_gpu_backend_cache.?;
+}
+
+/// A test build reads `SUSHI_TEST_NO_GPU` (empty or a leading `0` is off) as a machine whose MLX has no Metal backend.
+fn testNoGpuEnv() bool {
+    const v = std.c.getenv("SUSHI_TEST_NO_GPU") orelse return false;
+    return v[0] != 0 and v[0] != '0';
+}
+
+/// The first line of a test that needs Metal kernels: it skips where MLX has no GPU backend.
+pub fn requireGpu() !void {
+    if (noGpuBackend()) return error.SkipZigTest;
 }
 
 var test_error_handler_installed = std.atomic.Value(bool).init(false);
@@ -1335,4 +1346,13 @@ test "an op after a refused allocation is correct once the stream is drained and
     try check(mlx_array_item_float32(&total, sum));
     try t.expectEqual(@as(f32, 2 * cap_test_mib / 4), total);
     try t.expect(!errorPending());
+}
+
+test "requireGpu skips a test when MLX has no GPU backend" {
+    const saved = no_gpu_backend_cache;
+    defer no_gpu_backend_cache = saved;
+    no_gpu_backend_cache = true;
+    try std.testing.expectError(error.SkipZigTest, requireGpu());
+    no_gpu_backend_cache = false;
+    try requireGpu();
 }

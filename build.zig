@@ -145,6 +145,8 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     const exl3_test_mod = addExl3Module(b, test_mod, target, optimize);
+    const encoder_mod = addEncoderModule(b, test_mod, exl3_test_mod, target, optimize);
+    test_mod.addImport("sushi_encoder", encoder_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     test_mod.linkSystemLibrary("webp", .{});
@@ -193,7 +195,6 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(exl3_test).step);
     }
 
-    const encoder_mod = addEncoderModule(b, test_mod, exl3_test_mod, target, optimize);
     const encoder_tests = b.addTest(.{
         .name = "encoder-test",
         .root_module = encoder_mod,
@@ -215,12 +216,24 @@ const test_buckets = [_][]const []const u8{
 fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
     const io = b.graph.io;
     var stems: std.ArrayList([]const u8) = .empty;
+    // A test inside a struct is named `<stem>.<Struct>.test.<name>`, which no stem filter selects.
+    var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     var src = buildRootHandle(b).openDir(io, "src", .{ .iterate = true }) catch |e| std.debug.panic("src/: {t}", .{e});
     defer src.close(io);
     var it = src.iterate();
     while (it.next(io) catch |e| std.debug.panic("src/: {t}", .{e})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        stems.append(b.allocator, b.fmt("{s}.", .{entry.name[0 .. entry.name.len - ".zig".len]})) catch @panic("OOM");
+        const stem = entry.name[0 .. entry.name.len - ".zig".len];
+        stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
+        const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| {
+            const indent = std.mem.indexOf(u8, line, "test \"") orelse continue;
+            if (indent == 0 or std.mem.trim(u8, line[0..indent], " ").len != 0) continue;
+            if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
+                std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
+            nested.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt(".test.{s}", .{line[indent + "test \"".len .. line.len - "\" {".len]}) }) catch @panic("OOM");
+        }
     }
     // Directory order varies; the filters key the compile step's cache.
     std.mem.sortUnstable([]const u8, stems.items, {}, struct {
@@ -229,7 +242,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
         }
     }.lt);
     const bucket = b.allocator.alloc(usize, stems.items.len) catch @panic("OOM");
-    for (stems.items, bucket) |stem, *k| k.* = namedBucket(stem[0 .. stem.len - 1]);
+    for (stems.items, bucket) |stem, *k| k.* = namedBucket(stem[0 .. stem.len - ".test.".len]);
     // A filter matches anywhere in a name, so "dflash." also selects glm5_dflash's tests: stems
     // that contain one another must share a bucket, or their tests would run twice.
     var moved = true;
@@ -250,6 +263,12 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
     for (0..test_buckets.len + 1) |i| {
         var filters: std.ArrayList([]const u8) = .empty;
         for (stems.items, bucket) |stem, k| if (k == i) filters.append(b.allocator, stem) catch @panic("OOM");
+        for (nested.items) |n| {
+            const owner = for (stems.items, bucket) |stem, k| {
+                if (std.mem.eql(u8, stem, n.stem)) break k;
+            } else unreachable;
+            if (owner == i) filters.append(b.allocator, n.filter) catch @panic("OOM");
+        }
         if (filters.items.len == 0) continue;
         const name = if (i < test_buckets.len) b.fmt("test-{s}", .{test_buckets[i][0]}) else "test-rest";
         out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items })) catch @panic("OOM");
