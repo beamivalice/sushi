@@ -8424,7 +8424,7 @@ fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
-/// through the model this tick; an MTP slot ramps back to speculating, any other spec mode
+/// through the model this tick; an MTP or DSpark slot goes back to speculating, any other spec mode
 /// decodes the answer regular (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
 fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
@@ -8446,21 +8446,33 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []const u32) !bool {
     const r = try gen.commitForcedTokens(slot.allocator, forced);
     defer slot.allocator.free(r.emitted);
-    for (r.emitted) |t| {
-        slot.pushToken(t);
-        slot.completion_tokens += 1;
-        if (t != 0) slot.was_pad_only = false;
-    }
+    for (r.emitted) |t| pushForcedToken(slot, t);
     std.debug.assert(slot.completion_tokens == gen.completion_tokens);
     if (r.stopped) {
         finishSlot(sch, slot, gen.finish_reason);
         return true;
     }
-    if (!try gen.mtpResumeAfterForced(slot.allocator)) {
-        gen.spec_disabled_runtime = true;
-        gen.spec_disable_reason = .think_bound;
-    }
+    if (gen.dspark) switch (try gen.dsparkResumeAfterForced(slot.allocator)) {
+        .resumed => |closer| {
+            pushForcedToken(slot, closer);
+            std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+            return false;
+        },
+        .stopped => {
+            finishSlot(sch, slot, gen.finish_reason);
+            return true;
+        },
+        .refused => {},
+    } else if (try gen.mtpResumeAfterForced(slot.allocator)) return false;
+    gen.spec_disabled_runtime = true;
+    gen.spec_disable_reason = .think_bound;
     return false;
+}
+
+fn pushForcedToken(slot: *Slot, t: u32) void {
+    slot.pushToken(t);
+    slot.completion_tokens += 1;
+    if (t != 0) slot.was_pad_only = false;
 }
 
 /// DeepSeek: a thinking request with tools is re-rendered with its thought, so the state right behind the generated
@@ -8564,9 +8576,9 @@ fn thinkBoundFired(gen: *const Generator) bool {
     return tb.fired;
 }
 
-/// A fired bound decodes plain unless an MTP head resumed behind it (DSpark and DFlash2 still do).
+/// A fired bound decodes plain unless an MTP head or DSpark resumed behind it (DFlash2 still decodes plain).
 fn thinkBoundForcesPlain(gen: *const Generator) bool {
-    return thinkBoundFired(gen) and (gen.mtp == null or gen.spec_disable_reason == .think_bound);
+    return thinkBoundFired(gen) and (gen.spec_disable_reason == .think_bound or (gen.mtp == null and !gen.dspark));
 }
 
 /// Drafts a thinking bound lets the slot's next MTP round carry, so it accepts no further than serial decode
@@ -11766,12 +11778,32 @@ test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP
     // A head that may not resume leaves `.think_bound`: plain, as before.
     gen.spec_disable_reason = .think_bound;
     try testing.expect(thinkBoundForcesPlain(&gen));
-    // DSpark and DFlash2 carry no MTP head: a fired bound still decodes them plain.
+    // DFlash2 carries no MTP head: a fired bound still decodes it plain.
     gen.mtp = null;
+    gen.dspark = false;
     gen.spec_disable_reason = .none;
     try testing.expect(thinkBoundForcesPlain(&gen));
     gen.think_closed_by_loop = true;
     tb.fired = false;
+    try testing.expect(thinkBoundForcesPlain(&gen));
+}
+
+test "a fired thinking bound keeps a DSpark slot in DSpark ticks, unless the close left it disabled" {
+    var forced = [_]u32{7};
+    var tb = generate_mod.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
+    var gen: Generator = undefined;
+    gen.sampling = .{ .think_bound = &tb };
+    gen.think_closed_by_loop = false;
+    gen.mtp = null;
+    gen.dspark = true;
+    // What commitThoughtClose leaves behind after `dsparkResumeAfterForced` drained the commit.
+    gen.spec_disabled_runtime = false;
+    gen.spec_disable_reason = .none;
+    try testing.expect(!thinkBoundForcesPlain(&gen));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, gen.mtp != null or gen.dspark, false, false));
+    // A refused resume (a grammar, `--max-mtp-ctx`) disables the slot at the close: plain.
+    gen.spec_disabled_runtime = true;
+    gen.spec_disable_reason = .think_bound;
     try testing.expect(thinkBoundForcesPlain(&gen));
 }
 

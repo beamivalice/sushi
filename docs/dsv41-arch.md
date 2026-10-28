@@ -324,8 +324,8 @@ experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in o
 (`generate.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A grammar or JSON schema drafts too
 ([below](#dspark-grammar)). A repeat or
 presence penalty and the think penalty shift the verify rows by the ids before them (`penaltyShiftRows`, `thinkShiftRows`). A thinking bound
-(Anthropic `budget_tokens`, `reasoning_budget_tokens`) is checked between rounds, so a round may pass the budget by up to the
-block; when it fires the closer is committed and the rest decodes serially.
+(Anthropic `budget_tokens`, `reasoning_budget_tokens`) is checked between rounds, and a round verifies at most the thought
+room left, so it fires at the token serial decode fires at; the closer is committed and DSpark rounds go on for the answer.
 A sampled request verifies the same block: the drafts are argmax tokens, a point mass, so each is kept with probability
 p of the temperature/top-k/top-p filtered row and the first reject draws from the residual (the bonus draw on a full
 accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MTP's `mtpBatchedAcceptGraph` and
@@ -386,9 +386,11 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   through the policy: 44.8 tok/s with it, 50.4 without; the gate ended 12-18 ticks of 3000 either way). Live (the shipped STQ pack, budget 110, `--ctx-size 65536`, one A then one B, die under 50 °C, commit c42b60a5): the 5.4k harbour prompt 45.1 -> 47.9 tok/s, a novel story 44.0 -> 47.6 (the old rule made 590 of 595 rounds plain there, the new one drafts a third). Greedy text is the same at every round-width mix (exact greedy, below): a row has the same bytes at every verify width. The stop switch is GLM's
   (`spec_cost_gate.zig`: 8-round windows against a probed plain step, 5% margin); the plain step is the 1-row round, so the state
   is the engine's and no other drafter runs. Sampled requests use the same choice and the acceptance rule above (a 1-row round draws
-  its token from the filtered row). `--mtp-max-depth n` caps R at n+1 and `--mtp-min-depth n` floors it at n+1 with no plain step or back-off below it (equal values pin R; a depth past the 5-draft block clamps to it, logged once at load; `--mtp-min-depth 1` is the default). `model-settings.json` has no depth keys. `SUSHI_DSV41_DSPARK_ROWS` forces or sweeps R. The adaptive R follows measured ms, so a seeded sampled
-  request repeats only at a forced R: under GPU load the round widths differ and the draws with them (the Generator test pins R=3
-  for its repeat check).
+  its token from the filtered row). `--mtp-max-depth n` caps R at n+1 and `--mtp-min-depth n` floors it at n+1 with no plain step or back-off below it (equal values pin R; a depth past the 5-draft block clamps to it, logged once at load; `--mtp-min-depth 1` is the default). `model-settings.json` has no depth keys. `SUSHI_DSV41_DSPARK_ROWS` forces or sweeps R. The adaptive R follows measured ms, and the
+  shipped pack's rows are not byte-exact at every width, so a seeded sampled request verifies at a fixed R=3 (clamped to the
+  depth flags) and draws each row with the key of the position it predicts: its text is the same on every repeat and streamed or
+  not (live, STQ 1.75bpw: three runs byte-identical with and without a reasoning budget; 52-60 tok/s against 52-63 adaptive,
+  which repeated nothing). Unseeded and greedy requests keep the adaptive R.
 - **Verify cost** (an STQ pack, M5 Max, `taskpolicy -a`, budget 88, one boot, attention arms interleaved, trimmed means, ms per
   verify): `v(R) = v(1) + step * (R-1)`, v(1) 37 / 42 / 53 and step 12.5 / 13 / 13.5 at 1k / 4k / 16k of context; the 6-row verify
   of today's fixed block is 106 / 106 / 110 ms against a 37-53 ms serial step. The routed experts are most of the step: a pick is its
@@ -632,7 +634,10 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   needs a prompt of the SSD floor (512 tokens) and checkpointing on. It is skipped for a thought under 512 tokens (the
   prompt-end snapshot's re-prefill is cheaper) and for one whose first or last token is `\n` or a space, which the
   server trims off the delivered `reasoning_content`. A client must send `reasoning_content` back verbatim, as the
-  server delivered it. Serial decode (no DSpark) leaves the state one
+  server delivered it. A reasoning budget (or loop-recovery close) keeps DSpark on for the answer: a round before the bound
+  verifies at most the thought room, and after the forced closer `Generator.dsparkResumeAfterForced` publishes the closer
+  and samples its successor (the stage windows already hold the forced rows, since every forward commits its main rows), so
+  the next round enters as after prefill; a thought point is not written behind a forced close. Serial decode (no DSpark) leaves the state one
   token ahead of the emitted ones and a RAM tier keeps points on the commit's list, so neither writes it.
   What a later prompt repeats of a generated turn (`dsv41 replay` test, the pack's `tokenizer.json`, the real template,
   `splitThinkBlock` and `parseToolCalls`):

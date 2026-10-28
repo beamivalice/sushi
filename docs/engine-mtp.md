@@ -51,9 +51,10 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - A reasoning budget (or loop-recovery close) keeps MTP on for the answer: the forced closer re-seeds the head
   (`mtpResumeAfterForced`: qwen4 head reset; MiMo's three heads take the hole like an adaptive serial block) and the slot
   ramps back through the serial exit. A round before the bound may emit at most the thought room (`ThinkBound.room`):
-  drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. DSpark and DFlash2
-  still decode the answer plain. Grouped rounds take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1
-  is a plain planner row), and a planner-owned slot rejoins the planner after the close instead of the serial ramp.
+  drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. Grouped rounds
+  take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1 is a plain planner row), and a
+  planner-owned slot rejoins the planner after the close instead of the serial ramp. DSpark takes the same cut
+  (`dsparkRowsForRoom`) and resumes by draining the commit (`dsparkResumeAfterForced`); DFlash2 still decodes the answer plain.
 - A think penalty shifts every verify block right after its forward (`thinkShiftRows`, solo, grouped and batched-head
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
 - Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active

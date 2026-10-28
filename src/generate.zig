@@ -939,6 +939,24 @@ fn cutMtpRound(drafts: []const u32, accepted: u32, pending: u32, keep: usize) st
     return .{ .accepted = @intCast(keep - 1), .pending = drafts[keep - 1] };
 }
 
+/// Rows a DSpark round may verify so it emits at most `room` tokens and the bound fires at the
+/// token serial decode fires at. A round always verifies its t1 row.
+pub fn dsparkRowsForRoom(rows: usize, room: ?u32) usize {
+    const r = room orelse return rows;
+    return @max(1, @min(rows, r));
+}
+
+/// Verify width of a seeded sampled DSpark request: the one most rounds chose on the shipped pack, the median of its
+/// adaptive widths (2 to 3 rows at ~70% per-draft acceptance), where the round-cost model also puts the best tokens per ms.
+const dspark_seeded_rows: u32 = 3;
+
+/// The fixed width a request's DSpark rounds verify at, or null for the adaptive policy. A seeded sampled request
+/// must not take its width from measured ms, so a repeat or a stream gets the same rounds.
+pub fn dsparkSeededRows(sampling: SamplingParams, range: dspark_rows.Range) ?usize {
+    if (sampling.seed == null or isGreedyTemperature(sampling.temperature)) return null;
+    return std.math.clamp(dspark_seeded_rows, range.min_rows, range.max_rows);
+}
+
 /// A forced tool call (`tool_choice` required or named) enforced while
 /// decoding: the thought runs free, and the position after its closer (or
 /// token 0 when the prompt already closed it) is `forced` instead of a sample.
@@ -4595,11 +4613,16 @@ pub const Generator = struct {
             self.spec_disabled_runtime = true;
             self.spec_disable_reason = .max_ctx;
         }
-        const forced: ?usize = if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) 1 else switch (diag) {
-            .off, .log => if (policy.next() == .plain) 1 else null,
+        const think_room: ?u32 = if (self.sampling.think_bound) |tb| room: {
+            tb.observe(self.generated_ids.items);
+            break :room tb.room();
+        } else null;
+        const policy_rows: ?usize = if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) 1 else switch (diag) {
+            .off, .log => dsparkSeededRows(self.sampling, policy.range) orelse if (policy.next() == .plain) 1 else null,
             .rows => |n| n,
             .sweep => dspark_sweep_rows[self.dspark_stats.rounds % dspark_sweep_rows.len],
         };
+        const forced: ?usize = if (think_room != null and think_room.? <= 1) 1 else policy_rows;
         var ids_buf: [dsv41_max_drafts + 1]u32 = undefined;
         var conf_buf: [dsv41_max_drafts]f32 = @splat(0);
         var block: ?@import("dsv41_model.zig").Draft = null;
@@ -4618,7 +4641,7 @@ pub const Generator = struct {
         };
         // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
         const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
-        var rows: usize = rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at);
+        var rows: usize = dsparkRowsForRoom(rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at), think_room);
         // The draft heads score the whole vocabulary, but only a prompt may carry the image id (the model refuses it
         // without rows), and the trunk never picks it: a draft that holds it ends the chunk before it.
         if (xfm.dsv41) |m| if (m.cfg.image_token_id != 0) {
@@ -4842,41 +4865,45 @@ pub const Generator = struct {
         return token;
     }
 
-    /// The longest accepted prefix of point-mass `drafts` against the verify rows' filtered densities (keep a
-    /// draft with probability p), and the token pending after it: the residual sample at the first reject, or the
-    /// bonus draw from the last row on a full accept. The output distribution is the serial sampler's.
+    /// The longest prefix of point-mass `drafts` that the verify rows' own draws reproduce, and the draw after it. Row
+    /// j draws with the key of the generated position it predicts, so the tokens are the serial sampler's whatever the
+    /// round mix. A point-mass draft survives a draw of the row's density with probability p(draft): the exact rule.
     fn dsparkSampledVerdict(self: *Generator, logits: mlx.mlx_array, drafts: []const u32) !struct { accepted: u32, pending: u32 } {
         const s = self.xfm.s;
-        const m: u32 = @intCast(drafts.len);
+        const rows = drafts.len + 1;
         const probs = try probsAllPositions(logits, self.sampling, s);
         defer _ = mlx.mlx_array_free(probs);
-        if (m == 0) {
-            const drawn = try sampleFromProbsLazy(probs, self.mtpSamplingDraw(self.sampling), s);
-            defer _ = mlx.mlx_array_free(drawn);
-            try mlx.check(mlx.mlx_array_eval(drawn));
-            var id: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&id, drawn));
-            return .{ .accepted = 0, .pending = @intCast(id) };
-        }
-        var arrs: [dsv41_max_drafts]mlx.mlx_array = undefined;
-        if (m > arrs.len) return error.SpecDecodeUnsupported;
+        const rows2d = try verifyRows2d(probs, @intCast(drafts.len), s);
+        defer _ = mlx.mlx_array_free(rows2d);
+        const vocab = mlx.getShape(rows2d)[1];
+        var draws: [dsv41_max_drafts + 1]mlx.mlx_array = undefined;
         var built: usize = 0;
-        defer for (arrs[0..built]) |a| {
-            _ = mlx.mlx_array_free(a);
+        defer for (draws[0..built]) |d| {
+            _ = mlx.mlx_array_free(d);
         };
-        for (drafts) |d| {
-            const id: i32 = @intCast(d);
-            arrs[built] = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
+        if (rows > draws.len) return error.SpecDecodeUnsupported;
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (0..rows) |j| {
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            const at: c_int = @intCast(j);
+            try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
+            var keyed = self.sampling;
+            keyed.draw +%= j;
+            draws[built] = try sampleFromProbsLazy(row, keyed, s);
             built += 1;
+            _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
         }
-        var graph = try mtpBatchedAcceptGraph(probs, arrs[0..m], null, m, self.mtpSamplingDraw(self.sampling), s);
-        defer graph.deinit();
-        try mlx.check(mlx.mlx_array_eval(graph.accept_p));
-        try mlx.check(mlx.mlx_array_eval(graph.corr_samples));
-        const p = mlx.mlx_array_data_float32(graph.accept_p) orelse return error.MlxArrayDataNull;
-        const corr = mlx.mlx_array_data_int32(graph.corr_samples) orelse return error.MlxArrayDataNull;
-        const accepted = mtp_acceptance.exactPrefix(p[0..m], null, null, &self.prng);
-        return .{ .accepted = accepted, .pending = @intCast(corr[accepted]) };
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
+        try mlx.check(mlx.mlx_array_eval(flat));
+        const drawn = mlx.mlx_array_data_int32(flat) orelse return error.MlxArrayDataNull;
+        var accepted: u32 = 0;
+        while (accepted < drafts.len and @as(u32, @intCast(drawn[accepted])) == drafts[accepted]) accepted += 1;
+        self.sampling.draw +%= accepted + 1;
+        return .{ .accepted = accepted, .pending = @intCast(drawn[accepted]) };
     }
 
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
@@ -6704,6 +6731,30 @@ pub const Generator = struct {
     /// the commit's pending logits and primes a fresh hidden; a serial ramp would keep its whole group plain.
     fn mtpSerialExitAfterForced(planner_owned: bool) MtpSerialExit {
         return if (planner_owned) .none else .drain;
+    }
+
+    pub const DsparkResume = union(enum) {
+        /// The slot decodes plain: not a DSpark slot, DSpark already off, or a grammar owns the ticks.
+        refused,
+        stopped,
+        /// The closer `commitForcedTokens` left pending, published now: DSpark rounds follow.
+        resumed: u32,
+    };
+
+    /// A forced commit left the shim-seeded state; drain it to DSpark's round entry (the closer published, its
+    /// successor sampled and not in the cache). The stage windows already hold the forced rows, since every
+    /// forward commits its main rows. The thought is closed, so its restore-point cut is disarmed.
+    pub fn dsparkResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !DsparkResume {
+        if (!self.dspark or self.spec_disabled_runtime or self.sampling.constraint != null) return .refused;
+        switch (try self.drainPipelineForSpec(allocator)) {
+            .drained => |closer| {
+                self.dspark_round_ends_at = null;
+                log.info("  [dspark] resumed after the forced thought close at {d} generated tokens\n", .{self.generated_ids.items.len});
+                return .{ .resumed = closer };
+            },
+            .stopped => return .stopped,
+            .already_clean, .stay_disabled => return .refused,
+        }
     }
 
     /// A forced commit (`commitForcedTokens`) ran plain through the trunk, so the head's history has a
@@ -20669,8 +20720,8 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     try testing.expect(!logprob_req.dspark);
     try testing.expectError(error.SpecDecodeUnsupported, logprob_req.nextDspark(a));
 
-    // A sampled request drafts too: the verify rows take the exact rule for a point-mass draft. A seeded stream
-    // repeats only at a fixed verify width: the adaptive width follows measured ms, so it differs under GPU load.
+    // A sampled request drafts too: the verify rows take the exact rule for a point-mass draft, and a seeded one
+    // verifies at its fixed width, so it repeats.
     const sampled_params = SamplingParams{ .temperature = 0.8, .seed = 7 };
     var runs: [2]std.ArrayList(u32) = .{ .empty, .empty };
     defer for (&runs) |*r| r.deinit(a);
@@ -20782,6 +20833,84 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
         n += r.tokens.len;
     }
     try testing.expectEqual(@as(usize, want), n);
+}
+
+test "dsv41 generator: a seeded sampled request verifies at one width whatever the cost model says (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const prompt = ids[0..30];
+    const want: u32 = 60;
+    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+
+    const Perturb = enum { none, dear, cheap, owed };
+    var base_hist: [dsv41_max_drafts + 2]u32 = undefined;
+    var base_tokens: std.ArrayList(u32) = .empty;
+    defer base_tokens.deinit(a);
+    for ([_]Perturb{ .none, .dear, .cheap, .owed }) |perturb| {
+        for ([_]SamplingParams{ .{ .temperature = 0.8, .seed = 7 }, .{ .temperature = 0.8, .seed = 7, .top_k = 20 } }, 0..) |params, which| {
+            try xfm.resetCache();
+            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, params, &.{}, .{ .dspark_enabled = true });
+            defer gen.deinit(a);
+            try testing.expect(gen.dspark);
+            switch (perturb) {
+                .none => {},
+                .dear => gen.dspark_policy.cost = .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 },
+                .cheap => gen.dspark_policy.cost = .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 },
+                .owed => {
+                    gen.dspark_policy.owed = 6;
+                    gen.dspark_policy.period = 8;
+                },
+            }
+            var got: std.ArrayList(u32) = .empty;
+            defer got.deinit(a);
+            while (try gen.nextDspark(a)) |r| {
+                defer a.free(r.tokens);
+                try got.appendSlice(a, r.tokens);
+            }
+            try testing.expectEqual(@as(usize, want), got.items.len);
+            if (which == 1) continue;
+            if (perturb == .none) {
+                base_hist = gen.dspark_stats.rows_hist;
+                try base_tokens.appendSlice(a, got.items);
+                continue;
+            }
+            try testing.expectEqualSlices(u32, &base_hist, &gen.dspark_stats.rows_hist);
+            try testing.expectEqualSlices(u32, base_tokens.items, got.items);
+        }
+    }
+
+    // An unseeded request keeps the adaptive policy: the cost model still moves its width.
+    var widths: [2][dsv41_max_drafts + 2]u32 = undefined;
+    for ([_]Perturb{ .dear, .cheap }, 0..) |perturb, i| {
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8 }, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_policy.cost = if (perturb == .dear) .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 } else .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        widths[i] = gen.dspark_stats.rows_hist;
+    }
+    try testing.expect(!std.mem.eql(u32, &widths[0], &widths[1]));
 }
 
 test "dsv41 generator: a DSpark round ends right behind the id it is told to, at any verify width, with the state standing there (DSV41_TINY)" {
@@ -21163,6 +21292,198 @@ test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its
     try testing.expectEqual(forced[forced.len - 1], out.items[at + forced.len - 1]);
     try testing.expect(at >= bound.budget);
     try testing.expectEqual(@as(usize, want), out.items.len);
+}
+
+test "a DSpark round never verifies past the position serial decode closes the thought at" {
+    // Serial decode fires when the thought holds `budget` tokens; a round emits t1 plus its accepted drafts.
+    for ([_]u32{ 1, 2, 3, 9, 48 }) |budget| {
+        for ([_]usize{ 1, 2, 3, 6 }) |width| {
+            for ([_]u32{ 0, 1, 2, 5 }) |accept_every| {
+                var tb = ThinkBound{ .budget = budget, .opener_id = null, .closer_id = 99, .forced = &.{99}, .in_think = true };
+                var emitted: u32 = 0;
+                while (!tb.due()) {
+                    const rows = dsparkRowsForRoom(width, tb.room());
+                    try testing.expect(rows >= 1);
+                    emitted += 1 + @min(@as(u32, @intCast(rows - 1)), accept_every);
+                    tb.count = emitted;
+                    try testing.expect(emitted <= budget);
+                }
+                try testing.expectEqual(budget, emitted);
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 5), dsparkRowsForRoom(5, null));
+    try testing.expectEqual(@as(usize, 1), dsparkRowsForRoom(5, 0));
+    try testing.expectEqual(@as(usize, 2), dsparkRowsForRoom(5, 2));
+}
+
+/// `tail`: DSpark rounds up to the bound, then the old behavior (the forced commit, serial ticks after it).
+const ThinkBoundMode = union(enum) { serial, tail, spark: DsparkDiag };
+
+const ThinkBoundOutcome = struct {
+    tokens: std.ArrayList(u32) = .empty,
+    /// Tokens published when the bound fired.
+    fired_at: ?usize = null,
+    rounds_after: u64 = 0,
+    drafted_after: u64 = 0,
+    /// Rounds by verify width before the bound fired.
+    rows_before: [dsv41_max_drafts + 2]u32 = @splat(0),
+    resumed: bool = false,
+
+    fn deinit(self: *ThinkBoundOutcome, a: std.mem.Allocator) void {
+        self.tokens.deinit(a);
+    }
+};
+
+/// The scheduler's order for one request: the bound is checked before every tick, `commitThoughtClose` commits the
+/// forced ids and (DSpark) drains them back to a round entry.
+fn thinkBoundRun(
+    a: std.mem.Allocator,
+    io: std.Io,
+    xfm: *Transformer,
+    tok: *Tokenizer,
+    prompt: []const u32,
+    want: u32,
+    budget: u32,
+    forced: []const u32,
+    mode: ThinkBoundMode,
+    params: SamplingParams,
+) !ThinkBoundOutcome {
+    var bound = ThinkBound{ .budget = budget, .opener_id = null, .closer_id = forced[forced.len - 2], .forced = forced, .in_think = true };
+    try xfm.resetCache();
+    var sampling = params;
+    sampling.think_bound = &bound;
+    var gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, want, sampling, &.{}, switch (mode) {
+        .serial => .{ .skip_lazy_preforward = true },
+        .tail, .spark => .{ .dspark_enabled = true },
+    });
+    defer gen.deinit(a);
+    if (mode != .serial) {
+        try testing.expect(gen.dspark);
+        gen.dspark_diag = if (mode == .spark) mode.spark else .{ .rows = 1 };
+    }
+    var out = ThinkBoundOutcome{};
+    errdefer out.deinit(a);
+    var at_fire = gen.dspark_stats;
+    while (true) {
+        bound.observe(gen.generated_ids.items);
+        if (bound.due()) {
+            bound.fired = true;
+            out.fired_at = gen.generated_ids.items.len;
+            at_fire = gen.dspark_stats;
+            out.rows_before = at_fire.rows_hist;
+            const r = try gen.commitForcedTokens(a, forced);
+            defer a.free(r.emitted);
+            try out.tokens.appendSlice(a, r.emitted);
+            if (r.stopped) break;
+            if (mode == .spark) switch (try gen.dsparkResumeAfterForced(a)) {
+                .resumed => |closer| {
+                    try out.tokens.append(a, closer);
+                    out.resumed = true;
+                    try testing.expect(!gen.spec_disabled_runtime);
+                    try testing.expectEqual(SpecDisableReason.none, gen.spec_disable_reason);
+                },
+                .stopped => break,
+                .refused => {},
+            };
+            continue;
+        }
+        if (mode != .serial and (!bound.fired or out.resumed)) {
+            const r = (try gen.nextDspark(a)) orelse break;
+            defer a.free(r.tokens);
+            try out.tokens.appendSlice(a, r.tokens);
+        } else {
+            const t = (try gen.next(a)) orelse break;
+            try out.tokens.append(a, t);
+        }
+    }
+    out.rounds_after = gen.dspark_stats.rounds - at_fire.rounds;
+    out.drafted_after = gen.dspark_stats.drafted - at_fire.drafted;
+    return out;
+}
+
+fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv(env) orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = if (stq) 64 << 20 else 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const prompt = ids[0..30];
+    const want: u32 = 30;
+    const forced = [_]u32{ 3, 4, 10 };
+
+    for ([_]u32{ 2, 4, 7 }) |budget| {
+        // One-row rounds that do not sum by width are the serial step. The forced commit is one forward whose width
+        // depends on the exit state (a spec exit re-feeds t1), so serial decode agrees through the forced ids only;
+        // the answer is compared with the same commit followed by serial ticks.
+        dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+        var serial = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .serial, .{ .temperature = 0.0 });
+        defer serial.deinit(a);
+        var tail = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .tail, .{ .temperature = 0.0 });
+        defer tail.deinit(a);
+        var one = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = .{ .rows = 1 } }, .{ .temperature = 0.0 });
+        defer one.deinit(a);
+        try testing.expectEqual(@as(?usize, budget), serial.fired_at);
+        try testing.expectEqual(serial.fired_at, one.fired_at);
+        try testing.expect(one.resumed and one.rounds_after > 0);
+        try testing.expectEqualSlices(u32, serial.tokens.items[0 .. budget + forced.len + 1], one.tokens.items[0 .. budget + forced.len + 1]);
+        try testing.expectEqualSlices(u32, tail.tokens.items, one.tokens.items);
+
+        // Exact rounds (the STQ trunk) give a row the same bytes at every width: any mix, cut by the budget, equals the
+        // one-row stream.
+        if (!stq) continue;
+        dsv41_model.setDsparkExact(xfm.dsv41.?, true);
+        var base = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = .{ .rows = 1 } }, .{ .temperature = 0.0 });
+        defer base.deinit(a);
+        try testing.expectEqual(@as(?usize, budget), base.fired_at);
+        for ([_]DsparkDiag{ .{ .rows = 3 }, .{ .rows = 6 }, .sweep, .off }) |diag| {
+            var got = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = diag }, .{ .temperature = 0.0 });
+            defer got.deinit(a);
+            try testing.expectEqual(base.fired_at, got.fired_at);
+            for (got.rows_before, 0..) |n, rows| if (rows > budget) try testing.expectEqual(@as(u32, 0), n);
+            try testing.expect(got.resumed and got.rounds_after > 0);
+            try testing.expectEqualSlices(u32, base.tokens.items, got.tokens.items);
+            if (diag == .rows and diag.rows > 1) try testing.expect(got.drafted_after > 0);
+        }
+
+        // A seeded sampled request draws per generated position, so the round mix (the adaptive width follows
+        // measured ms) changes neither the thought nor the answer behind the forced close.
+        const sampled = SamplingParams{ .temperature = 0.8, .seed = 7 };
+        var seeded = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = .{ .rows = 1 } }, sampled);
+        defer seeded.deinit(a);
+        for ([_]DsparkDiag{ .{ .rows = 3 }, .{ .rows = 6 }, .sweep, .off }) |diag| {
+            var got = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = diag }, sampled);
+            defer got.deinit(a);
+            try testing.expect(got.resumed and got.rounds_after > 0);
+            try testing.expectEqualSlices(u32, seeded.tokens.items, got.tokens.items);
+        }
+    }
+}
+
+test "dsv41 generator: a thinking bound that fires mid-round cuts it at the serial token, and DSpark decodes the answer (DSV41_TINY)" {
+    try thinkBoundSparkProof("DSV41_TINY", false);
+}
+
+test "dsv41 generator: a thinking bound that fires mid-round cuts it at the serial token, and DSpark decodes the answer (DSV41_STQ_TINY)" {
+    try thinkBoundSparkProof("DSV41_STQ_TINY", true);
 }
 
 test "dspark eligibility: sampled, penalized and thinking-bound requests draft, logprobs do not" {
