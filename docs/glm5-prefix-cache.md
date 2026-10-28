@@ -28,6 +28,10 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   - A request stepped down to narrower tail chunks near 1M matches only a cold run that steps down the same way.
   - Guards: the generator fixture tests (including a mid-request step-down), the hot-cache fixture tests, and
     `tests/test_glm_prefix_reuse.sh`.
+- **A thinking request with tools takes one more point mid-decode, at the pool position at or below its `</think>`**
+  ([engine-prefix-cache](engine-prefix-cache.md#thought-points)): the DFlash2 round carrying the closer commits only up to
+  that multiple of 4 (no file-format change), the KDA state there is the newest checkpoint and the commit's rows run
+  through it. The assistant window stays the prefill's, so a restore past it takes the trunk alone.
 - **A restore takes the nearest checkpoint at or below the match** (owner decision), usually the previous prompt's
   end. Off the grid, only the chunk around the checkpoint runs in a different shape, and the suffix rejoins the cold
   grid at the next boundary.

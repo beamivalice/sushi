@@ -15120,3 +15120,137 @@ test "dsv41 replay: what the next prompt shares with a generated turn (DeepSeek 
         if (c.thinking and c.tools != null and c.reuse != .thought_less_trim) try testing.expect(r.reused > r.think_close_at.?);
     }
 }
+
+/// One turn of a hybrid-state arch replayed the way a client does (the pack's own template and tokenizer): the
+/// generated tokens for `raw`, the server's split and parse of its text, and the next request's prompt.
+const Replay = struct {
+    gen: []u32,
+    /// Generated tokens the next prompt repeats, from the first one.
+    reused: usize,
+    /// The next prompt starts with the first prompt.
+    prefix_kept: bool,
+    think_close_at: ?usize,
+
+    fn deinit(self: *Replay, a: std.mem.Allocator) void {
+        a.free(self.gen);
+    }
+};
+
+fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatConfig, tools: ?[]const u8, thinking: bool, raw: []const u8) !Replay {
+    const first = [_]Message{.{ .role = "user", .content = "q" }};
+    const p1_text = try renderChatTemplate(a, &first, cfg, tools, null, thinking, null, false);
+    defer a.free(p1_text);
+    const p1 = try tok.encodeMarked(a, p1_text);
+    defer a.free(p1);
+    const gen = try tok.encodeMarked(a, raw);
+    errdefer a.free(gen);
+
+    const split = splitThinkBlock(raw, true, thinking);
+    const parsed = if (tools != null) try parseToolCalls(a, raw) else null;
+    defer if (parsed) |calls| {
+        for (calls) |c| {
+            a.free(c.name);
+            a.free(c.arguments);
+        }
+        a.free(calls);
+    };
+    var calls: [4]ToolCall = undefined;
+    if (parsed) |pc| for (pc, 0..) |c, i| {
+        calls[i] = .{ .id = "call_1", .name = c.name, .arguments = c.arguments };
+    };
+    const assistant: Message = .{
+        .role = "assistant",
+        .content = split.content,
+        .reasoning_content = split.reasoning_content,
+        .tool_calls = if (parsed) |pc| calls[0..pc.len] else null,
+    };
+    const tail: Message = if (parsed != null) .{ .role = "tool", .content = "ok", .tool_call_id = "call_1" } else .{ .role = "user", .content = "next" };
+    const second = [_]Message{ first[0], assistant, tail };
+    const p2_text = try renderChatTemplate(a, &second, cfg, tools, null, thinking, null, false);
+    defer a.free(p2_text);
+    const p2 = try tok.encodeMarked(a, p2_text);
+    defer a.free(p2);
+
+    const keep = p1.len <= p2.len and std.mem.eql(u32, p1, p2[0..p1.len]);
+    var reused: usize = 0;
+    if (keep) {
+        const tail_ids = p2[p1.len..];
+        while (reused < gen.len and reused < tail_ids.len and gen[reused] == tail_ids[reused]) reused += 1;
+    }
+    const close_id = tok.specialTokenId("</think>");
+    return .{
+        .gen = gen,
+        .reused = reused,
+        .prefix_kept = keep,
+        .think_close_at = if (close_id) |id| std.mem.indexOfScalar(u32, gen, id) else null,
+    };
+}
+
+const NextReuse = enum {
+    /// Every generated token comes back.
+    whole,
+    /// Through the thought, short of the closer: the template re-renders the thought's edges.
+    thought_short,
+    /// The turn is not re-rendered as it was generated.
+    none,
+};
+
+const replay_tools =
+    \\[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"tags":{"type":"array"}}}}}]
+;
+
+const ReplayCase = struct { name: []const u8, tools: ?[]const u8, thinking: bool, raw: []const u8, reuse: NextReuse };
+
+fn expectReplays(pack: []const u8, cases: []const ReplayCase) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try @import("test_models.zig").packPath(&buf, pack);
+    const a = testing.allocator;
+    var tok = tokenizer_mod.loadTokenizer(testing.io, a, dir) catch return error.SkipZigTest;
+    defer tok.deinit();
+    var cfg = loadChatConfig(testing.io, a, dir) catch return error.SkipZigTest;
+    defer cfg.deinit();
+    for (cases) |c| {
+        var r = try replayTurn(a, &tok, &cfg, c.tools, c.thinking, c.raw);
+        defer r.deinit(a);
+        errdefer std.debug.print("{s}: {d} tokens, prefix kept {}, reused {d}, </think> at {?d}\n", .{ c.name, r.gen.len, r.prefix_kept, r.reused, r.think_close_at });
+        switch (c.reuse) {
+            .whole => try testing.expectEqual(r.gen.len, r.reused),
+            .thought_short => try testing.expect(r.reused <= r.think_close_at.?),
+            .none => try testing.expect(!r.prefix_kept or r.reused == 0),
+        }
+        // The state behind the closer is a restore point the next prompt reaches only when it repeats the closer.
+        if (c.thinking and c.reuse != .thought_short and c.reuse != .none) try testing.expect(r.reused > r.think_close_at.?);
+    }
+}
+
+test "qwen4 replay: what the next prompt shares with a generated turn (Flash-Next tokenizer.json, real template)" {
+    const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
+    const call = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n</function>\n</tool_call>";
+    const call_json = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n<parameter=tags>\n[\"a\",\"b\"]\n</parameter>\n<parameter=limit>\n40\n</parameter>\n</function>\n</tool_call>";
+    const call_code = "<tool_call>\n<function=write_file>\n<parameter=content>\nconst s = \"a\\nb\"; // <x> & 'y' \\ \xe2\x80\x94 \n\tfn f() void {}\n</parameter>\n</function>\n</tool_call>";
+    try expectReplays("Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", &.{
+        .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nI will read the file.\n\n" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with code in a string", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_code, .reuse = .whole },
+        .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, no tools", .tools = null, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, tools, no newline before the closer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>\n\n" ++ call, .reuse = .thought_short },
+        .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file.\n\n" ++ call, .reuse = .whole },
+        .{ .name = "chat, no tools", .tools = null, .thinking = false, .raw = "The entry point is `src/main.zig`.", .reuse = .whole },
+    });
+}
+
+test "glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 tokenizer.json, real template)" {
+    const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
+    const call = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value></tool_call>";
+    const call_json = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value><arg_key>tags</arg_key><arg_value>[\"a\",\"b\"]</arg_value><arg_key>limit</arg_key><arg_value>40</arg_value></tool_call>";
+    try expectReplays("GLM-5.3-Flash-Sushi-2.4bpw", &.{
+        .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>I will read the file." ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>The entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, tools, the thought ends in a newline", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>" ++ call, .reuse = .thought_short },
+        .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file." ++ call, .reuse = .whole },
+    });
+}

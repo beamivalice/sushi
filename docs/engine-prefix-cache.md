@@ -249,6 +249,26 @@ chain, so a text -> image -> text conversation restores past its images after a 
 
 Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
 
+<a id="thought-points"></a>
+### Thought points: a restore point behind a generated `</think>`
+
+Prefill saves only the grid and the prompt end, so a tool loop on Qwen (MTP) or GLM (DFlash2) re-prefilled the previous
+reply every turn. A thinking request with tools now takes one more point mid-decode, DeepSeek's
+([dsv41-arch](dsv41-arch.md#prefix-cache)) on a recurrent state.
+
+- **The closer is what every turn shares** (`replay` tests in `chat.zig`, pack tokenizer and real template): Qwen re-renders
+  `<think>\n` + trimmed thought + `\n</think>\n\n`, GLM `<think>` + thought + `</think>`, and both repeat the whole reply. A thought
+  starting in whitespace or ending in any the template does not write is re-rendered (`generate.thoughtEdgesSurvive`) and
+  its point dropped; a client must send `reasoning_content` back as delivered.
+- **Armed** by `scheduler.armThoughtPoint` for thinking + tools, a prompt of 512 tokens or more ending in `<think>`, and a
+  speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either.
+- **The round carrying the closer ends on it** (`generate.thoughtRound`): Qwen's verified round accepts only through the
+  closer and the next accepted draft is pending (`cutMtpRound`), so the stream is the whole round's byte for byte; GLM's
+  budget is cut to the pool position at or below the closer, and a closer in the round's first rows can leave none.
+- **The state is the newest checkpoint, held from the closer to the commit and billed to a request that takes one** (`WarmPrefix.thought`, `server.qwenThoughtPointBytes`,
+  `glmThoughtPointBytes`: 58.8 or 110 MB, 147.6 MB). Both tiers treat it as any checkpoint under the cap of 160; an
+  over-budget conversation drops its oldest points first, so the newest stays.
+
 <a id="checkpoints-on-ssd"></a>
 ### Qwen's GDN checkpoints live on the SSD
 

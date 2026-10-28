@@ -15156,3 +15156,44 @@ test "restoreLogLine: one shape for every arch, the tag aside" {
         try restoreLogLine(&buf, "[prefix]", 8161, 16384, "SSD", 42),
     );
 }
+
+test "HotPrefixCache: a checkpoint taken inside the generated reply is where a prompt that repeats the thought restores" {
+    const s = mlx.gpuStream();
+    const vision_key: u64 = 0xcafe;
+    // 12 prompt tokens, then the reply: its thought, the closer (99) and the first answer token. The prompt-end checkpoint
+    // sits at 10; the thought's, taken behind the closer, at 19.
+    const entry = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 21, 22, 23, 24, 25, 26, 99, 27 };
+    // The next turn re-renders the thought and the closer, then carries the tool result.
+    const repeats = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 21, 22, 23, 24, 25, 26, 99, 70, 71, 72, 73 };
+    // A client that did not send the thought back diverges at the reply's first token.
+    const drops = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 80, 81, 82, 83, 84, 85, 86, 87, 88 };
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, entry.len);
+    var prompt_end = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&prompt_end);
+    var thought = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&thought);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &prompt_end, 10, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &thought, 19, s);
+    _ = try hc.commitWithMediaState(&cache, &entry, true, vision_key, 0, null, cps, null, null, 12);
+
+    for ([_]struct { prompt: []const u32, at: usize, conv: f32 }{
+        .{ .prompt = &repeats, .at = 19, .conv = 300.0 },
+        .{ .prompt = &drops, .at = 10, .conv = 100.0 },
+    }) |c| {
+        var target = try KVCache.init(testing.allocator, 3);
+        defer target.deinit();
+        var ssm = pcEmptySsm();
+        defer pcFreeHybrid(&ssm);
+        var moe_off: usize = 0;
+        const result = try hc.lookupAndRestore(&target, &moe_off, &ssm, s, c.prompt, true, vision_key, null, null);
+        try testing.expectEqual(c.at, result.matched);
+        try testing.expectEqual(c.at, moe_off);
+        try testing.expectEqual(c.conv, pcSsmVal(ssm[0].conv_state, 0, s));
+    }
+}

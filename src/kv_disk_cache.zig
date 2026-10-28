@@ -10589,3 +10589,44 @@ test "DiskTier: a commit holding no KV rows persists nothing, even with checkpoi
     try std.testing.expectEqual(@as(usize, 0), tier.entryCount());
     try std.testing.expectEqual(@as(u64, 0), tier.total_bytes);
 }
+
+test "DiskTier: a thought point past the prompt end is the newest point and survives a budget squeeze with the grid point" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    const len = 3 * POINT_GRID + 144;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, len, 8, 0.0, .float32);
+    var tokens: [len]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src = buildHybridEntries(s, 1000, 2000);
+    defer freeHybridEntries(&src);
+    // The grid, the prompt end 24 past the last grid point, the thought's closer 100 tokens into the reply.
+    const prompt_end = 3 * POINT_GRID + 24;
+    const thought = prompt_end + 100;
+    const positions = [_]usize{ POINT_GRID, 2 * POINT_GRID, 3 * POINT_GRID, prompt_end, thought };
+    var cps: [positions.len]transformer_mod.SSMCheckpoint = undefined;
+    for (&cps, positions) |*cp, p| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, p, s);
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    // Room for the rows and three points, then two: the oldest go first, the newest point and the grid point stay.
+    for ([_]struct { room: u64, want: []const u32 }{
+        .{ .room = 3, .want = &.{ 3 * POINT_GRID, prompt_end, thought } },
+        .{ .room = 2, .want = &.{ 3 * POINT_GRID, thought } },
+    }, 0..) |c, i| {
+        var name: [16]u8 = undefined;
+        var tier = try DiskTier.init(testing.allocator, io, base, try std.fmt.bufPrint(&name, "fp-thought{d}", .{i}), 0, 128);
+        defer tier.deinit();
+        tier.cp_thin = .min_span_recency;
+        tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+        const point = tier.pointFileBytes(&cps[0]);
+        tier.max_bytes = tier.entryBytesAt(cache.entries, len, null, &.{}, 0) + c.room * point + point / 2;
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        try testing.expectEqualSlices(u32, c.want, tier.entries.items[0].ssm_positions);
+    }
+}

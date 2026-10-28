@@ -1052,3 +1052,57 @@ test "GLM default verification schedule selects only three NAX rows" {
         }
     }
 }
+
+test "GLM a round cut to a shorter budget commits the uncut path's prefix, ends on the serial state of those tokens, and leaves the uncut path's next token pending" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = @import("model.zig").Weights.init(a);
+    defer weights.deinit();
+    const cfg = try randomizedFixture(&weights, s);
+    var target = try forward.Model.load(a, cfg, &weights, s);
+    defer target.deinit();
+    var request = try forward.Request.initServing(a, target.layers.len);
+    defer request.deinit();
+    const prompt = [_]u32{ 3, 1, 2, 1, 0 };
+    const ids = mlx.mlx_array_new_data(&prompt, &.{ 1, prompt.len }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const prefill = try target.forwardLast(&request, ids, true);
+    defer _ = mlx.mlx_array_free(prefill);
+    try mlx.check(mlx.mlx_array_eval(prefill));
+
+    // A chain whose drafts are the target's own tokens, so the whole path is accepted.
+    const parents = [_]i32{ -1, 0, 1 };
+    var probe = try verify(&target, &request, &.{ 2, 0, 0 }, &parents, &.{}, .serial_rows);
+    defer probe.deinit();
+    const tokens = [_]u32{ 2, probe.targets[0], probe.targets[1] };
+    var computed = try verify(&target, &request, &tokens, &parents, &.{}, .serial_rows);
+    defer computed.deinit();
+    const full = try tree.accept(&tokens, &parents, computed.targets[0..3], 3, &.{});
+    try std.testing.expectEqual(@as(usize, 3), full.count);
+
+    for ([_]usize{ 1, 2, 3 }) |budget| {
+        const cut = try tree.accept(&tokens, &parents, computed.targets[0..3], budget, &.{});
+        try std.testing.expectEqual(budget, cut.count);
+        try std.testing.expectEqualSlices(u32, full.rows[0..budget], cut.rows[0..budget]);
+        try std.testing.expectEqual(@as(?u32, computed.targets[budget - 1]), cut.pending);
+
+        var committed = try computed.prepareCommit(&request, budget, &.{}, s);
+        defer committed.deinit();
+        const state = committed.states[cut.rows[budget - 1]].?;
+        var serial = try adapter.cloneRequest(&request);
+        defer serial.deinit();
+        for (tokens[0..budget]) |token| {
+            const one = mlx.mlx_array_new_data(&token, &.{ 1, 1 }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(one);
+            const logits = try target.forwardLast(&serial, one, true);
+            defer _ = mlx.mlx_array_free(logits);
+            try mlx.check(mlx.mlx_array_eval(logits));
+        }
+        try std.testing.expectEqual(serial.offset, state.offset);
+        try std.testing.expectEqual(request.offset + budget, state.offset);
+        for (serial.layers, state.layers) |x, y| {
+            try expectArrayBits(x.recurrent.conv_state, y.recurrent.conv_state, s);
+            try expectArrayBits(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
+        }
+    }
+}

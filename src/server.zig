@@ -6702,6 +6702,8 @@ pub const WarmPrefix = struct {
     /// The prefill moves each checkpoint to SSD as it is produced and frees the RAM copy, so at most
     /// `glm5_prefix.checkpoint_ram_held` states are in RAM at once.
     released: bool = false,
+    /// The request takes a thought point mid-decode: one more checkpoint state, held to its commit.
+    thought: bool = false,
 
     /// Rows of KV this request will not allocate: the rows the restored buffer already holds.
     /// Capacity is a ceiling on the credit, never a switch: a growing chain outruns its capacity
@@ -6962,6 +6964,19 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     return n * per_cp;
 }
 
+/// The checkpoint state a thinking request holds past its prefill's: the restore point behind its thought's closer, taken
+/// mid-decode and held to the commit (`generate.ThoughtPoint`).
+fn qwenThoughtPointBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix) u64 {
+    if (!warm.thought or !config.isQwen4() or ssm_checkpoint_stride == 0) return 0;
+    return config.ssmCheckpointBytes();
+}
+
+/// GLM's twin: held from the closer to the commit beside the checkpoints the commit lists, only for a request that keeps any.
+fn glmThoughtPointBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix) u64 {
+    if (!warm.thought or effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config)) == 0 or warm.checkpoints == 0) return 0;
+    return config.ssmCheckpointBytes();
+}
+
 /// The most checkpoint states a Qwen request holds at once when its model runs an SSD tier: the write-through
 /// frees each one once its file is written, and a request it cannot serve is thinned to the same number
 /// (`scheduler.qwenCheckpointCap`). Null = every checkpoint stays in RAM.
@@ -7218,7 +7233,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .state_bytes = reserved * (statePerTokenBilled(config) +| head_state_per_tok) +|
             (if (mtp_on) mimo_mtp.State.billedBytes(config) else 0),
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
-        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
+        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk) +| qwenThoughtPointBytes(config, warm),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
@@ -7521,7 +7536,7 @@ pub fn prefillNeededAtChunk(
     if (config.isGlm5()) {
         return (glmCacheBytes(config, seq, max_tokens, kv_bits) +| @max(
             glm5TransientBytes(config, seq, chunk, kv_bits) +| glmPrefixStateBytes(config, seq, warm),
-            glmCommitStateBytes(config, seq, warm, kv_bits),
+            glmCommitStateBytes(config, seq, warm, kv_bits) +| glmThoughtPointBytes(config, warm),
         )) *| 5 / 4 +|
             (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +|
             cadenceInflightBytes(mlx_mb_per_buffer);
@@ -7966,6 +7981,7 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
         .mtp_on = enable_mtp,
         .checkpoints = checkpoints.keep,
         .released = checkpoints.released,
+        .thought = checkpoints.thought,
     }).fits();
 }
 
@@ -7994,6 +8010,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         .mtp_on = enable_mtp,
         .checkpoints = checkpoints.keep,
         .released = checkpoints.released,
+        .thought = checkpoints.thought,
     };
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, warm);
     const mb = 1024 * 1024;
@@ -29083,4 +29100,49 @@ test "auto context on a room of about 1.8 GB neither advertises a few tokens nor
     try testing.expectEqual(@as(u32, 2048), auto);
     // A room that fits a few tokens past the reserve floors at 1024 instead of advertising them.
     try testing.expectEqual(@as(u32, 1024), safeContextForBudget(2 * GiB + 100 * (1 << 20), 0, 2 * GiB, per_tok, 0));
+}
+
+test "a thought point is one more checkpoint state in the bill: every Qwen request, a GLM request that keeps checkpoints" {
+    const t = std.testing;
+    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max, prefix_cache_disk_bytes, prefix_cache_ram_enabled };
+    defer {
+        prefix_cache_capacity = saved[0];
+        ssm_checkpoint_stride = saved[1];
+        ssm_checkpoint_max = saved[2];
+        prefix_cache_disk_bytes = saved[3];
+        prefix_cache_ram_enabled = saved[4];
+    }
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    prefix_cache_capacity = 32;
+    prefix_cache_disk_bytes = 12 << 30;
+    prefix_cache_ram_enabled = false;
+
+    var qwen = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer qwen.deinit(t.allocator);
+    qwen.expert_layout = .exl3_k4;
+    const q_per = qwen.ssmCheckpointBytes();
+    try t.expect(q_per > 0);
+    try t.expectEqual(q_per, qwenThoughtPointBytes(&qwen, .{ .thought = true }));
+    try t.expectEqual(@as(u64, 0), qwenThoughtPointBytes(&qwen, .{}));
+    const q_terms = prefillRequestTerms(&qwen, 4096, 1024, 8, 512, .{ .thought = true });
+    try t.expectEqual(retainedSsmCheckpointBytes(&qwen, 4096, 0, 512) + q_per, q_terms.checkpoint_bytes);
+    try t.expectEqual(retainedSsmCheckpointBytes(&qwen, 4096, 0, 512), prefillRequestTerms(&qwen, 4096, 1024, 8, 512, .{}).checkpoint_bytes);
+    ssm_checkpoint_stride = 0;
+    try t.expectEqual(@as(u64, 0), qwenThoughtPointBytes(&qwen, .{ .thought = true }));
+    ssm_checkpoint_stride = 256;
+
+    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
+    defer glm.deinit(t.allocator);
+    glm.dflash_loaded = true;
+    const g_per = glm.ssmCheckpointBytes();
+    try t.expectEqual(@as(u64, 147_619_840), g_per);
+    try t.expectEqual(g_per, glmThoughtPointBytes(&glm, .{ .checkpoints = 8, .thought = true }));
+    try t.expectEqual(g_per, glmThoughtPointBytes(&glm, .{ .checkpoints = 1, .released = true, .thought = true }));
+    // A request that takes no thought point, keeps no checkpoints, or has no tier to take one bills nothing.
+    try t.expectEqual(@as(u64, 0), glmThoughtPointBytes(&glm, .{ .checkpoints = 8 }));
+    try t.expectEqual(@as(u64, 0), glmThoughtPointBytes(&glm, .{ .thought = true }));
+    prefix_cache_capacity = 0;
+    prefix_cache_disk_bytes = 0;
+    try t.expectEqual(@as(u64, 0), glmThoughtPointBytes(&glm, .{ .checkpoints = 8, .thought = true }));
 }

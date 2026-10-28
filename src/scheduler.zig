@@ -50,6 +50,7 @@ const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
+const glm5_prefix = @import("glm5_prefix.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -262,6 +263,8 @@ pub const SubmitParams = struct {
 pub const CheckpointPlan = struct {
     keep: u32 = 0,
     released: bool = false,
+    /// The request will take a thought point mid-decode (`thoughtPointWanted`): one more state held to its commit.
+    thought: bool = false,
 };
 
 /// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory
@@ -6507,6 +6510,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // attn models this returns an empty slice (no allocator hit). Ownership
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
+    settleThoughtPoint(slot, gen_ptr);
     const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
@@ -6605,7 +6609,6 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
 /// Ownership of `cps` passes to the cache.
 fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request: *const glm5_forward_mod.Request, tokens: []const u32, cps_opt: ?[]transformer_mod.SSMCheckpoint, dflash: ?prefix_cache_mod.DflashCommit, prompt_len: usize) void {
     const cps_all = cps_opt orelse return;
-    const glm5_prefix = @import("glm5_prefix.zig");
     const s = slot.model.transformer.?.s;
     // The rows are chosen before the copy: only what the RAM tier keeps, never a full copy followed by a trim.
     const window: u64 = if (dflash) |d| prefix_cache_mod.HotPrefixCache.liveCacheBytes(d.cache) else 0;
@@ -7732,6 +7735,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .checkpoints = .{
                     .keep = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
                     .released = glmCheckpointsRelease(slot, slot.full_prompt.len - hot_matched),
+                    .thought = thoughtPointWanted(slot, cp_stride > 0),
                 },
                 .fits = fits_fn,
             };
@@ -7930,6 +7934,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
 
     slot.legacy_gen = gen;
     armDsv41ThoughtPoint(slot, &slot.legacy_gen.?, write_through_on and cp_stride > 0);
+    armThoughtPoint(slot, &slot.legacy_gen.?, cp_stride > 0);
     publishHandoverToken(slot, &slot.legacy_gen.?);
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
@@ -8446,6 +8451,51 @@ fn armDsv41ThoughtPoint(slot: *Slot, gen: *Generator, tier_takes_points: bool) v
     const close = tok.specialTokenId("</think>") orelse return;
     if (slot.full_prompt[slot.full_prompt.len - 1] != open) return;
     gen.dspark_round_ends_at = close;
+}
+
+/// The request shape that takes a thought point: admission bills the state from this answer, the arming acts on it.
+fn thoughtPointWanted(slot: *const Slot, checkpoints_on: bool) bool {
+    const cfg = slot.model.config orelse return false;
+    if (!checkpoints_on or !slot.has_tools or !slot.enable_thinking) return false;
+    if (slot.full_prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return false;
+    return cfg.isGlm5() or (cfg.isQwen4() and slot.enable_mtp);
+}
+
+/// Qwen over MTP and GLM over DFlash2 keep a recurrent state that restores only at a saved point, and a thinking request
+/// with tools is re-rendered with its thought: the state right behind the generated `</think>` (on GLM the pool position
+/// at or below it) is a restore point the next prompt shares (docs/engine-prefix-cache.md#thought-points).
+fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
+    if (!thoughtPointWanted(slot, checkpoints_on)) return;
+    const grid: u32 = if (gen.glm_dflash_native)
+        @intCast(glm5_prefix.pool_size)
+    else if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null)
+        1
+    else
+        return;
+    const tok = slot.model.tokenizer orelse return;
+    const open = tok.specialTokenId("<think>") orelse return;
+    const close = tok.specialTokenId("</think>") orelse return;
+    if (std.mem.indexOfScalar(u32, slot.full_prompt[slot.full_prompt.len - 2 ..], open) == null) return;
+    gen.thought_point = .{ .closer = close, .grid = grid, .min_tokens = generate_mod.thought_point_min_tokens, .base = slot.full_prompt.len };
+}
+
+/// A thought the next prompt would re-render differently is no restore point: its state is dropped before the commit.
+fn settleThoughtPoint(slot: *Slot, gen: *Generator) void {
+    const tp = gen.thought_point orelse return;
+    if (tp.state != .taken) return;
+    const tok = slot.model.tokenizer orelse return gen.dropThoughtPoint();
+    const generated = gen.generated_ids.items;
+    const end = std.mem.indexOfScalar(u32, generated, tp.closer) orelse return gen.dropThoughtPoint();
+    if (end < 2) return gen.dropThoughtPoint();
+    const first = tok.decode(slot.allocator, generated[0..1], false) catch return gen.dropThoughtPoint();
+    defer slot.allocator.free(first);
+    const tail = tok.decode(slot.allocator, generated[end - 2 .. end], false) catch return gen.dropThoughtPoint();
+    defer slot.allocator.free(tail);
+    const style: generate_mod.CloserStyle = if (gen.glm_dflash_native) .bare_closer else .newline_before_closer;
+    if (!generate_mod.thoughtEdgesSurvive(style, first, tail)) {
+        log.info("[prefix] no thought restore point: the template re-renders the thought's edges\n", .{});
+        gen.dropThoughtPoint();
+    }
 }
 
 /// The round that committed `</think>` ended right behind it: its state goes to the SSD tier as one restore point.
