@@ -24,6 +24,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 ZIG=${ZIG:-./.zig-toolchain/zig}
 FILTER=${1:-}
+STEP=${TEST_STEP:-test}
 
 if [ ! -x "$ZIG" ]; then
   echo "SKIP: no $ZIG (run ./scripts/fetch-zig.sh)"
@@ -36,11 +37,11 @@ fi
 LC_ALL=C grep -l -a -E 'o/[0-9a-f]+/(exl3-)?test' .zig-cache/h/* 2>/dev/null | xargs rm -f 2>/dev/null
 
 if [ -n "$FILTER" ]; then
-  WHAT="zig build test -Dtest-filter=$FILTER"
-  OUT=$("$ZIG" build test -Doptimize=ReleaseFast -Dtest-filter="$FILTER" 2>&1)
+  WHAT="zig build $STEP -Dtest-filter=$FILTER"
+  OUT=$("$ZIG" build "$STEP" -Doptimize=ReleaseFast -Dtest-filter="$FILTER" 2>&1)
 else
-  WHAT="zig build test"
-  OUT=$("$ZIG" build test -Doptimize=ReleaseFast 2>&1)
+  WHAT="zig build $STEP"
+  OUT=$("$ZIG" build "$STEP" -Doptimize=ReleaseFast 2>&1)
 fi
 RC=$?
 

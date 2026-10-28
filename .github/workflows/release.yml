@@ -35,45 +35,8 @@ jobs:
       - name: No local paths in tracked files
         run: bash tests/test_no_local_paths.sh
 
-      - name: Select Xcode (Metal toolchain for the MLX kernels)
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - name: Install Zig
-        run: |
-          bash scripts/fetch-zig.sh
-          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
-
-      - name: Install dependencies
-        run: brew bundle install --file=Brewfile
-
-      # mlx + mlx-c are pinned submodules built from source with deployment
-      # target 26.2 so MLX's NAX (M5 neural-accelerator) kernels are compiled
-      # in — the Homebrew bottle is built at 26.0 and ships with them silently
-      # disabled (MLX_METAL_NO_NAX). scripts/build-mlx.sh asserts the built
-      # metallib actually contains *_nax kernels. Compiling needs no M5: the
-      # runtime probe (GPU gen >= 17) gates dispatch on user machines.
-      - name: Compute mlx pin cache key
-        id: mlxpin
-        run: |
-          echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-          echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-          echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
-
-      - name: Cache self-built mlx + mlx-c
-        uses: actions/cache@v4
-        with:
-          path: lib/mlx
-          key: mlx-stage-${{ steps.mlxpin.outputs.mlx }}-${{ steps.mlxpin.outputs.mlxc }}-${{ steps.mlxpin.outputs.xcode }}
-
-      - name: Build mlx + mlx-c (NAX-enabled)
-        run: |
-          # Xcode 26 ships the Metal compiler as a separate component; fetch it
-          # if the image doesn't have it (build-mlx.sh hard-fails without it).
-          xcrun -sdk macosx metal --version >/dev/null 2>&1 \
-            || sudo xcodebuild -downloadComponent MetalToolchain
-          bash scripts/build-mlx.sh
+      - name: Set up the build
+        uses: ./.github/actions/setup-build
 
       # Without a Developer ID in the repo secrets the binary ships ad-hoc signed and not notarized.
       - name: Detect signing identity
@@ -155,8 +118,8 @@ jobs:
       - name: Verify staged mlx (NAX kernels + minos)
         run: bash tests/test_mlx_staged_nax.sh
 
-      - name: Run Zig tests
-        run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Test tier
+        uses: ./.github/actions/test-host
 
       # Tagged only once the suite is green, so a failed test leaves no tag behind.
       - name: Create tag (manual dispatch)

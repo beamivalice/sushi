@@ -1,0 +1,51 @@
+name: Host test tier
+description: Compile every unit test, run the tests that link no MLX, and run the hermetic repository guards. Needs the build from setup-build.
+
+inputs:
+  tier:
+    description: "host: the tests that link no MLX. all: the whole suite, which needs a GPU."
+    default: host
+  test_filter:
+    description: "';'-separated substrings: only the tests whose name contains one of them (empty: every test of the tier)"
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # The workflow gate parses YAML, and Homebrew's python3 has no PyYAML.
+    - name: Set up Python for the hermetic guards
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+
+    - name: Hermetic guards
+      shell: bash
+      run: |
+        python3 -m pip install --quiet pyyaml
+        fail=0
+        for t in test_release test_release_workflow_gates test_brewfile_covers_build_tools test_build_mlx_pins \
+                 test_private_cache test_gpu_lock; do
+          echo "::group::$t"
+          bash "tests/$t.sh" || { echo "::error::tests/$t.sh failed"; fail=1; }
+          echo "::endgroup::"
+        done
+        TEST_STEP=test-host bash tests/test_test_runner_quiet.sh || { echo "::error::tests/test_test_runner_quiet.sh failed"; fail=1; }
+        exit $fail
+
+    # Compiling is the whole check for the tests this tier does not run: a test that no longer builds fails here.
+    - name: Compile every unit test
+      shell: bash
+      run: zig build test-build -Doptimize=ReleaseFast
+
+    - name: Run Zig tests
+      shell: bash
+      env:
+        TIER: ${{ inputs.tier }}
+        TEST_FILTER: ${{ inputs.test_filter }}
+      run: |
+        args=()
+        IFS=';' read -ra parts <<< "${TEST_FILTER:-}"
+        for p in ${parts[@]+"${parts[@]}"}; do [ -n "$p" ] && args+=("-Dtest-filter=$p"); done
+        step=test-host
+        [ "$TIER" = all ] && step=test
+        zig build "$step" -Doptimize=ReleaseFast --summary all ${args[@]+"${args[@]}"}
