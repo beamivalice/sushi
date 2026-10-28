@@ -19663,24 +19663,6 @@ fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return w_t;
 }
 
-/// A depthwise conv weight is `[C, K, 1]` in MLX and `[C, 1, K]` in torch, and
-/// which one a checkpoint ships is a CONVERTER choice, not an arch property:
-/// mlx_lm's LFM2 conversion writes the MLX layout, while LiquidAI's own bf16
-/// repos (LFM2.5-1.2B-Instruct, LFM2.5-2.6B) ship the torch one straight out of
-/// the training code. This is the `patchProjLayout` class, with one mercy —
-/// reading it wrong is not a plausible-but-wrong number, it is a hard abort:
-/// mlx_conv1d solves in_channels off the LAST axis, so a [2048, 1, 3] weight at
-/// groups=2048 demands 6144 input channels and kills the load at warmup.
-///
-/// `K == 1` is the one shape the layouts share, and it is its own transpose.
-pub fn depthwiseConvNeedsTranspose(shape: []const c_int) bool {
-    if (shape.len != 3) return false;
-    return shape[1] == 1 and shape[2] > 1;
-}
-
-/// One-shot so a mixed-converter library says which layout it found, once.
-var depthwise_conv_layout_logged: bool = false;
-
 /// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
 /// Replace `*w` with its pre-transposed `[in, out]` form and record the new
 /// array in `owned` so we can free it on Transformer.deinit.
@@ -20334,52 +20316,6 @@ test "floatDtypeTable: float tables are dense, packed/quantized ones are not" {
     try std.testing.expect(!floatDtypeTable(.uint32)); // packed affine quant
     try std.testing.expect(!floatDtypeTable(.uint8)); // fp8-encoded scales/modes
     try std.testing.expect(!floatDtypeTable(.int32));
-}
-
-/// Additive symmetric band mask for bidirectional sliding-window layers:
-/// [1, 1, L, L] bf16, 0 where |i-j| < window, -inf outside — the causal
-/// sliding semantic (lookback window-1 + self) mirrored in both directions.
-/// Broadcasts additively against a [B, 1, 1, L] key-pad mask.
-pub fn encoderBandMask(allocator: std.mem.Allocator, seq_len: usize, window: u32, s: mlx.mlx_stream) !mlx.mlx_array {
-    const buf = try allocator.alloc(f32, seq_len * seq_len);
-    defer allocator.free(buf);
-    for (0..seq_len) |i| {
-        for (0..seq_len) |j| {
-            const d = if (i > j) i - j else j - i;
-            buf[i * seq_len + j] = if (d < window) 0 else -std.math.inf(f32);
-        }
-    }
-    const shape = [_]c_int{ 1, 1, @intCast(seq_len), @intCast(seq_len) };
-    const f32_mask = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
-    defer _ = mlx.mlx_array_free(f32_mask);
-    var mask = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&mask, f32_mask, .bfloat16, s));
-    return mask;
-}
-
-test "encoderBandMask: symmetric |i-j| < window band, -inf outside" {
-    const s = mlx.gpuStream();
-    const mask = try encoderBandMask(testing.allocator, 4, 2, s);
-    defer _ = mlx.mlx_array_free(mask);
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, mask, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(f));
-    const vals = mlx.mlx_array_data_float32(f).?;
-    // Row 0: [0, 0, -inf, -inf]; row 2: [-inf, 0, 0, 0].
-    try testing.expectEqual(@as(f32, 0), vals[0]);
-    try testing.expectEqual(@as(f32, 0), vals[1]);
-    try testing.expect(std.math.isNegativeInf(vals[2]));
-    try testing.expect(std.math.isNegativeInf(vals[3]));
-    try testing.expect(std.math.isNegativeInf(vals[2 * 4 + 0]));
-    try testing.expectEqual(@as(f32, 0), vals[2 * 4 + 1]);
-    try testing.expectEqual(@as(f32, 0), vals[2 * 4 + 2]);
-    try testing.expectEqual(@as(f32, 0), vals[2 * 4 + 3]);
-    const shape = mlx.getShape(mask);
-    try testing.expectEqual(@as(c_int, 1), shape[0]);
-    try testing.expectEqual(@as(c_int, 1), shape[1]);
-    try testing.expectEqual(@as(c_int, 4), shape[2]);
-    try testing.expectEqual(@as(c_int, 4), shape[3]);
 }
 
 pub fn affineParamsFromGeometry(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) ?QuantParams {
@@ -45305,19 +45241,6 @@ test "ropeAngleRows hands back every array it builds, success path included" {
             try testing.expectEqual(base, after);
         }
     }
-}
-
-test "depthwiseConvNeedsTranspose reads the LAYOUT, not the arch" {
-    const t = std.testing;
-    // MLX layout [C, K, 1] — what mlx_lm's LFM2 conversion writes. Leave it.
-    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 3, 1 }));
-    // Torch layout [C, 1, K] — what LiquidAI's own bf16 repos ship.
-    try t.expect(depthwiseConvNeedsTranspose(&.{ 2048, 1, 3 }));
-    try t.expect(depthwiseConvNeedsTranspose(&.{ 8, 1, 4 }));
-    // K == 1 is the one ambiguous shape, and it is its own transpose.
-    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 1, 1 }));
-    // Not a depthwise conv weight at all.
-    try t.expect(!depthwiseConvNeedsTranspose(&.{ 2048, 3 }));
 }
 
 // ── Chunked vision splice (issue #197) ───────────────────────────────────────
