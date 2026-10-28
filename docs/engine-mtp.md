@@ -48,6 +48,11 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   correction from ORIGINAL `verify_logits[accepted]`.
 - A block decoder checks its ENTRY token before drafting (`generate.tokenStops`); the token budget is a PRE-COMMIT
   invariant; a committed argmax is a `CommittedArgmax` (only `verifyArgmax` builds one, masking reserved ids).
+- A reasoning budget (or loop-recovery close) keeps MTP on for the answer: the forced closer re-seeds the head
+  (`mtpResumeAfterForced`: qwen4 head reset; MiMo's three heads take the hole like an adaptive serial block) and the slot
+  ramps back through the serial exit. A round before the bound may emit at most the thought room (`ThinkBound.room`):
+  drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. DSpark and DFlash2
+  still decode the answer plain.
 - A think penalty shifts every verify block right after its forward (`thinkShiftRows`, solo, grouped and batched-head
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
 - Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active

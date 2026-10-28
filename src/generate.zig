@@ -851,7 +851,19 @@ pub const ThinkBound = struct {
     pub fn due(self: *const ThinkBound) bool {
         return !self.fired and self.in_think and self.count >= self.budget;
     }
+
+    /// Thought tokens left before the bound is due; null once it cannot fire. `observe` first.
+    pub fn room(self: *const ThinkBound) ?u32 {
+        if (self.fired or !self.in_think) return null;
+        return self.budget -| self.count;
+    }
 };
+
+/// Drafts an MTP round may carry so it emits at most `room` tokens (t1 plus accepted drafts) and the
+/// bound fires at the token serial decode fires at. Null = no draft fits: the round runs serial.
+pub fn mtpDraftCapForRoom(room: u32) ?u32 {
+    return if (room > 1) room - 1 else null;
+}
 
 /// A forced tool call (`tool_choice` required or named) enforced while
 /// decoding: the thought runs free, and the position after its closer (or
@@ -6524,6 +6536,27 @@ pub const Generator = struct {
         if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
         if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
         if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
+    }
+
+    /// A forced commit (`commitForcedTokens`) ran plain through the trunk, so the head's history has a
+    /// hole. Re-seed a qwen4 head (its positions refuse a gap) and take the serial exit ramp back to
+    /// MTP. False = not an MTP slot that may resume: the caller disables speculation.
+    pub fn mtpResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !bool {
+        if (self.mtp == null or self.mtp_cache == null or !self.mtpAdaptiveHeadMayResume()) return false;
+        try self.mtpDetachHead(allocator, false);
+        switch (self.mtp_cache.?) {
+            .qwen4 => |r| {
+                if (self.mtp_hist_stash) |*st| st.deinit();
+                self.mtp_hist_stash = null;
+                r.t.qwen4MtpActivate(r.st);
+                try r.t.qwen4MtpReset();
+            },
+            .mimo => {},
+        }
+        self.spec_disabled_runtime = false;
+        self.spec_disable_reason = .none;
+        self.mtp_serial_exit = .drain;
+        return true;
     }
 
     fn mtpSerialOneToken(allocator: std.mem.Allocator, tok: u32) !DrafterStepResult {

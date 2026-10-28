@@ -8411,8 +8411,8 @@ fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
-/// through the model this tick, and decode the answer regular from here on
-/// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
+/// through the model this tick; an MTP slot ramps back to speculating, any other spec mode
+/// decodes the answer regular (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
 fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
     tb.observe(gen.generated_ids.items);
@@ -8443,8 +8443,10 @@ fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []c
         finishSlot(sch, slot, gen.finish_reason);
         return true;
     }
-    gen.spec_disabled_runtime = true;
-    gen.spec_disable_reason = .think_bound;
+    if (!try gen.mtpResumeAfterForced(slot.allocator)) {
+        gen.spec_disabled_runtime = true;
+        gen.spec_disable_reason = .think_bound;
+    }
     return false;
 }
 
@@ -8504,6 +8506,20 @@ fn thinkBoundFired(gen: *const Generator) bool {
     return tb.fired;
 }
 
+/// A fired bound decodes plain unless an MTP head resumed behind it (DSpark and DFlash2 still do).
+fn thinkBoundForcesPlain(gen: *const Generator) bool {
+    return thinkBoundFired(gen) and (gen.mtp == null or gen.spec_disable_reason == .think_bound);
+}
+
+/// An MTP round must not accept past the position serial decode closes the thought at: cap its
+/// drafts to the thought room, or run the last room token serial.
+fn capMtpRoundToThinkBound(gen: *Generator) void {
+    const room = (gen.sampling.think_bound orelse return).room() orelse return;
+    if (generate_mod.mtpDraftCapForRoom(room)) |cap| {
+        gen.mtp_group_cap = cap;
+    } else gen.mtp_serial_left = 1;
+}
+
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     var inner_err: ?anyerror = null;
     runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
@@ -8537,7 +8553,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally.
-    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
+    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundForcesPlain(gen)) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null or gen.dspark,
         slot.enable_drafter,
@@ -8556,6 +8572,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     }
     if (tick_mode == .mtp) {
         gen.mtp_group_cap = 0;
+        capMtpRoundToThinkBound(gen);
         const result = try gen.nextMtp(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -11654,6 +11671,80 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
+}
+
+test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP ticks" {
+    var t: transformer_mod.Transformer = undefined;
+    var forced = [_]u32{7};
+    var tb = generate_mod.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
+    var gen: Generator = undefined;
+    gen.sampling = .{ .think_bound = &tb };
+    gen.think_closed_by_loop = false;
+    gen.mtp = .{ .qwen4 = &t };
+    // What commitThoughtClose leaves behind after a head resumed.
+    gen.spec_disabled_runtime = false;
+    gen.spec_disable_reason = .none;
+    try testing.expect(!thinkBoundForcesPlain(&gen));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, gen.mtp != null, false, false));
+    // A head that may not resume leaves `.think_bound`: plain, as before.
+    gen.spec_disable_reason = .think_bound;
+    try testing.expect(thinkBoundForcesPlain(&gen));
+    // DSpark and DFlash2 carry no MTP head: a fired bound still decodes them plain.
+    gen.mtp = null;
+    gen.spec_disable_reason = .none;
+    try testing.expect(thinkBoundForcesPlain(&gen));
+    gen.think_closed_by_loop = true;
+    tb.fired = false;
+    try testing.expect(thinkBoundForcesPlain(&gen));
+}
+
+test "an MTP round never accepts past the position serial decode closes the thought at" {
+    // Serial decode fires when the thought holds `budget` tokens; a round emits t1 plus its accepted drafts.
+    for ([_]u32{ 1, 2, 3, 9, 48 }) |budget| {
+        for ([_]u32{ 0, 1, 2, 3, 5, 8 }) |accept_every| {
+            var tb = generate_mod.ThinkBound{ .budget = budget, .opener_id = null, .closer_id = 99, .forced = &.{99}, .in_think = true };
+            var emitted: u32 = 0;
+            var rounds: u32 = 0;
+            while (!tb.due()) : (rounds += 1) {
+                const room = tb.room().?;
+                const drafts: u32 = generate_mod.mtpDraftCapForRoom(room) orelse 0;
+                const accepted = @min(drafts, accept_every);
+                emitted += 1 + accepted;
+                tb.count = emitted;
+                try testing.expect(emitted <= budget);
+            }
+            try testing.expectEqual(budget, emitted);
+        }
+    }
+    var tb = generate_mod.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
+    try testing.expectEqual(@as(?u32, 1), tb.room());
+    try testing.expectEqual(@as(?u32, null), generate_mod.mtpDraftCapForRoom(1));
+    try testing.expectEqual(@as(?u32, 3), generate_mod.mtpDraftCapForRoom(4));
+    tb.fired = true;
+    try testing.expectEqual(@as(?u32, null), tb.room());
+    tb.fired = false;
+    tb.in_think = false;
+    try testing.expectEqual(@as(?u32, null), tb.room());
+}
+
+test "the last thought token before the bound runs serial, wider rooms cap the drafts" {
+    var tb = generate_mod.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
+    var gen: Generator = undefined;
+    gen.sampling = .{ .think_bound = &tb };
+    gen.mtp_group_cap = 0;
+    gen.mtp_serial_left = 0;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 1), gen.mtp_serial_left);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_group_cap);
+    gen.mtp_serial_left = 0;
+    tb.count = 1;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 3), gen.mtp_group_cap);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_serial_left);
+    gen.sampling = .{};
+    gen.mtp_group_cap = 0;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_group_cap);
 }
 
 test "a plain batched tick checks the thinking budget before its rows forward" {
