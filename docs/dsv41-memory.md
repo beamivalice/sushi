@@ -119,6 +119,12 @@ the rest being the measured per-row rate against the old formula. At wired 12400
 `with its decoder pools lendable` test), budget 117 and no decoder pool to lend, the advertised context is 390,144
 tokens where it was under 262,144.
 
+**Gates** (09977e23 vs main b66f36a8, budget 108, DSpark): greedy code, prose and image answers and their SSD-restore
+follow-ups are byte-identical; a 225,674-token cold prefill runs 764.7 tok/s against 753.1 (AC, fans max, both started
+under 50 °C, one run each); no `TransientCapExceeded` over that prefill, an image, or 445 chunks at `--prefill-chunk
+512`. The peak diagnostic slows a cold prefill by itself (a diag run read 414 tok/s on the same prompt): never time
+with it on.
+
 <a id="owned-weights"></a>
 ## Weight memory sushi owns
 
