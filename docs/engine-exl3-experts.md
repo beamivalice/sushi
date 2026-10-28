@@ -371,7 +371,7 @@ trunk SPEC1 (`spec1-w15`) n64, head n96, DSpark stage experts PAIR1 n32 resident
 | tensor (per layer) | codec, n | in -> out | 1 row | verify 2-8 | prefill |
 |---|---|---|---|---|---|
 | routed gate, up / down | PAIR1 n24, n26, n32, n40 (+ mixed class) | 5120 -> 2304 / 2304 -> 5120, 384 experts, top-6 | grouped pair GEMV, fused-mid down, reduce (`moeDecodeClamped`) | same chain, up to 16 rows | per-group NAX GEMM (`moePrefillClamped`, <= 512 experts) |
-| shared expert w1, w3 / w2 | SPEC1 n64 | 5120 -> 2304 / 2304 -> 5120 | one-expert fused chain (`moeClamped`, 4 dispatches) | same | w1, w3, SwiGLU ops, w2 (rows kernel to 8, GEMM past) |
+| shared expert w1, w3 / w2 | SPEC1 n64 | 5120 -> 2304 / 2304 -> 5120 | one-expert fused chain (`moeClamped`, 5 launches), or inside the routed chain's launches ([below](#dsv41-shared-fused)) | same | w1, w3, SwiGLU ops, w2 (rows kernel to 8, GEMM past) |
 | `wq_a`, `wkv`, compressor `wkv`/`wgate` | SPEC1 n64 | 5120 -> 1280 / 512 / 512 / 512 | rows kernel | rows kernel | sorted GEMM |
 | `wq_b` | SPEC1 n64 | 1280 -> 32768 | rows kernel | rows kernel | sorted GEMM |
 | `wo_a` (8 groups) | SPEC1 n64 | 4096 -> 1024 each | rows kernel, grouped | same | sorted GEMM, grouped |
@@ -416,6 +416,45 @@ ratios and orderings are usable, absolute microseconds are not; commit and setti
 [perf-baselines](perf-baselines.md#dsv41-stq)): `SUSHI_DSV41_STQ_UBENCH=<shape filter|1>` (trunk linears against the
 GEMM, the indexed GEMV, mxfp8 and affine-4) and `SUSHI_DSV41_EXPERT_UBENCH=1` (the grouped chain at the plan's layers 2,
 5, 23 and the stage), both on the exl3 test binary; `SUSHI_UBENCH_STEPS` / `SUSHI_UBENCH_ROUNDS` size the chains.
+
+<a id="dsv41-shared-fused"></a>
+**The shared expert rides the routed chain's launches** (`rate_groups.moeDecodeClampedSharedFused`, 1 to 16 rows, the
+prepared chain at 5120/2304). The shared expert is a SPEC1 n64 one-expert chain of five launches (lane prepare, one-row
+or lane pair, mid, one-row or lane down, finish); the routed chain over PAIR1 groups is five more. Each of the first four
+routed launches (`pairPrepare`, pair GEMV, mid, down GEMV) now carries the matching shared kernel's threadgroups after
+its own (`fuse.zig`: A's and B's threadgroups laid end to end on one grid; B's inputs, outputs, template ints and codec
+helpers renamed `s_`, `S_`, `sx_exl3_`, so SPEC1's decoder lives beside PAIR1's), and the finish reduce takes one more
+simdgroup per threadgroup for the shared down finish and adds its bf16 result, rounded as the shared chain's own reduce
+rounded it. Every part runs its own statements and its own K split, so the output is the bytes of the shared chain folded
+into `moeDecodeClamped`'s reduce.
+- **Proof** (`exl3 rate groups: the shared expert riding ...`): bytes equal to `moeClamped` plus the folded reduce at 1
+  to 16 rows (512/256 over four rate groups with a mixed class), a DSpark stage's one group at top-3, and the real
+  5120/2304 geometry at 1, 2, 4 and 6 rows, with either part's threadgroups first, and five launches per layer.
+- **Launches**: 10 a layer become 5, so 200 fewer per serial token (40 layers) and per verify round, and 15 fewer on a
+  drafting round (three DSpark stage layers). A launch costs ~1.76 us of gap; the saving is larger because the shared
+  chain's tails fill with routed work.
+- **Chain per layer** (`SUSHI_DSV41_SHARED_UBENCH=1`, exl3 test binary, base `2db0e8d5`, ReleaseFast, GPU lock, QUIET,
+  `taskpolicy -a`, fans auto, M5 Max, median of 21 interleaved rounds of 16 dependent steps, layer 2 plan, us):
+
+  | rows | shared separate | fused (routed first) | fused (shared first) | routed only | fused / separate |
+  |---|---|---|---|---|---|
+  | 1 | 174.2 | 153.5 | 155.4 | 130.1 | 0.881 |
+  | 2 | 326.5 | 288.2 | 283.8 | 240.8 | 0.869 |
+  | 3 | 443.9 | 418.7 | 413.9 | 348.6 | 0.932 |
+  | 4 | 581.0 | 543.2 | 534.7 | 451.1 | 0.920 |
+  | 6 | 834.9 | 794.7 | 799.5 | 660.9 | 0.952 |
+  | 8 | 1096.8 | 1045.6 | 1036.1 | 871.0 | 0.945 |
+
+  Layer 23's five-group plan gives the same ratios (rows 1: 180.7 / 159.7; rows 6: 857.5 / 808.8). The shared chain alone
+  is 42 us at one row and the fused launches take 20 of them back; the rest is the ALU-bound SPEC1 decode, which a launch
+  cannot hide behind the ALU-bound PAIR1 decode. Which part's threadgroups lead moves the chain by 1% and is not a lever.
+- **Live** (661d485e, DeepSeek STQ-1.75bpw, budget 108, 512 tokens on a 14k-char code prompt, AC, fans max, one A then
+  one B, GPU lock): `--no-mtp` 46.5 -> 47.4 tok/s, DSpark 50.2 -> 52.4, both arms byte-identical.
+- **Where it applies**: the route-spec queue (`Experts.Spec.queue`, serial decode and every verify round) and the DSpark
+  stage layers pass the shared expert to `stqRouted` as a layer (`SharedOp.layer`), so a pack that does not fit (not
+  SPEC1 n64 lane shapes, a hidden width off the prepared geometry) builds it as before. A settle that rebuilds a layer
+  builds the shared expert then from the kept input. The waiting schedule and the host-fed apply keep it as a chain of its
+  own, queued behind the picks so the GPU runs it while the host fills misses.
 
 **The trunk GEMM is not a prefill lever.** At 512 rows the sorted trellis GEMM matches MLX's mxfp8 GEMM and comes
 within ~15% of affine-4. Times in µs, trellis GEMM / mxfp8 / affine-4, interleaved:

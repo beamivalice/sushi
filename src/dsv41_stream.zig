@@ -136,7 +136,7 @@ pub const StqStream = struct {
     }
 
     /// The chain over the slots the layer's GPU map holds for the picks, which the host checks in `settle`.
-    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) anyerror!model.Experts.Queued {
+    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp) anyerror!model.Experts.Queued {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const spec = try self.engine.specGrouped(@intCast(layer)) orelse return error.Dsv41StqLayerNotGrouped;
         const idx32 = try sc.astype(idx, .int32);
@@ -151,7 +151,7 @@ pub const StqStream = struct {
 
     /// Reads the picks and resolves them in the cache: null when each sat in the slot `map` gave the queued chain, else
     /// the chain over the slots they now hold. The cache is touched here only, so a discarded successor never moves it.
-    fn settleOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A, map: []const i32) anyerror!?A {
+    fn settleOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, map: []const i32) anyerror!?A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
@@ -215,7 +215,7 @@ pub const StqStream = struct {
         // A resident layer maps the picks to slots on the GPU: no host read, so the forward is never stalled on one.
         if (self.engine.residentRoute(@intCast(layer))) |rr| {
             const local = try sc.take(rr.map, try sc.astype(idx, .int32), 0);
-            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, shared);
+            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, .{ .array = shared });
         }
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
@@ -250,7 +250,7 @@ pub const StqStream = struct {
         const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
         // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
-        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared);
+        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, .{ .array = shared });
         self.engine.noteExpertCompute(@intCast(layer), clock.lap());
         return out;
     }

@@ -470,6 +470,9 @@ and its embedding through the affine row gather. The FP4 fused kernels do not en
 trellis bank); the FFN is the routed sum plus the shared expert, which at decode width (<= 16 rows) is one expert of the fused
 trellis chain (`sharedFused`: pair GEMV, fused mid and down, reduce; the clamped SwiGLU stays in f32) and over more rows the
 three linears and the SwiGLU ops; the routed decode reduce adds it in f32 (`stqRouted`), the byte-equal of a separate add.
+On the route-spec queue and in the DSpark stage layers the shared expert rides the routed chain's own launches (5 fewer
+launches a layer, byte-identical; [engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)); the waiting schedule keeps
+it a chain of its own.
 Trunk linears take the multi-row kernel up to 8 rows. Up to 8 rows, `wq_a` and `wkv` (and a ratio-1 KV source's compressor
 `wkv`) run as one stacked launch, as do a pooling compressor's `wkv` and `wgate` (`Layer.in_shared`, `CompW.shared`,
 stacked at load; each linear keeps a view of the stack for wider chunks). `dsv41 real` holds both stacks of layer 2's own

@@ -188,9 +188,9 @@ pub const Experts = union(enum) {
         can: *const fn (ctx: *anyopaque, layer: usize) bool,
         /// The routed sum plus `shared` (as `Hook.apply`) over the slots the map holds for the picks `idx`, with no host
         /// read; `map` is the host copy of that map, kept until the layer is settled.
-        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) anyerror!Queued,
+        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp) anyerror!Queued,
         /// The host's side of a queued layer: null when every pick sat in the slot the GPU read, else the exact sum.
-        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A, map: []const i32) anyerror!?A,
+        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, map: []const i32) anyerror!?A,
     };
 
     pub const Queued = struct {
@@ -2003,10 +2003,31 @@ fn moeWide(sc: *Scope, m: *const Model, li: usize, h: A, r: kernels.Routes, sy: 
     return out;
 }
 
+/// The shared expert's `[L, dim]` output, or the layer to run it from: at decode width the routed chain takes the
+/// expert into its own launches, so it is built only where that chain does not apply.
+pub const SharedOp = union(enum) {
+    array: A,
+    layer: struct { m: *const Model, li: usize },
+
+    fn value(self: SharedOp, sc: *Scope, x: A) !A {
+        return switch (self) {
+            .array => |a| a,
+            .layer => |l| sharedExpert(sc, l.m, &l.m.layers[l.li], x),
+        };
+    }
+};
+
+fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+    const q = [3]Stq{ ly.shared[0].stq orelse return null, ly.shared[1].stq orelse return null, ly.shared[2].stq orelse return null };
+    const se: exl3.rate_groups.SharedExpert = .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
+    const y = try exl3.rate_groups.moeDecodeClampedSharedFused(sc.s, x, rb, flat, scores, k, .float32, se, limit) orelse return null;
+    return try sc.keep(y);
+}
+
 /// `x` `[L, dim]` through the trellis banks `rb` at the picks `slots` (`[L, k]` ids of `rb`) weighted `wts`: the clamped
-/// SwiGLU of each, summed, plus the shared expert's `shared` (`[L, dim]`, f32). Decode-width chunks ride the
-/// one-dispatch-per-stage decode chain, whose reduce adds `shared`, wider ones the grouped GEMM.
-pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: A) !A {
+/// SwiGLU of each, summed, plus the shared expert's output (`[L, dim]`, f32). Decode-width chunks ride the
+/// one-dispatch-per-stage decode chain, whose reduce adds the shared expert, wider ones the grouped GEMM.
+pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp) !A {
     const L = dim(x, 0);
     const k: c_int = @intCast(dim(slots, 1));
     const flat = try sc.reshape(try sc.astype(slots, .uint32), &.{ci(L) * k});
@@ -2014,9 +2035,19 @@ pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const e
     try dec.requireTable();
     exl3.kernels.setDecodeParams(dec);
     // The decode reduce returns one row as `[dim]`.
-    if (L <= exl3.kernels.DECODE_ROWS_MAX) return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, shared, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
+    if (L <= exl3.kernels.DECODE_ROWS_MAX) {
+        if (shared == .layer) {
+            if (try routedWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k)) |y| return sc.reshape(y, &.{ ci(L), ci(dim(x, 1)) });
+        }
+        const sy = try shared.value(sc, x);
+        // The shared chain left its own codec active.
+        exl3.kernels.setDecodeParams(dec);
+        return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, sy, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
+    }
+    const sy = try shared.value(sc, x);
+    exl3.kernels.setDecodeParams(dec);
     const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillClamped(sc.s, x, rb, flat, scores, k, limit)), .float32);
-    return sc.add(y, try sc.astype(shared, .float32));
+    return sc.add(y, try sc.astype(sy, .float32));
 }
 
 /// Queues `x` on the GPU without waiting for it.
@@ -2065,22 +2096,20 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
     if (pf) |p| try p.mark(.router, &.{ r.idx, r.wts });
     if (c.expert_dec) |dec| {
         if (li >= c.layers) {
-            const sy = try sharedExpert(sc, m, ly, h);
-            return sc.astype(try stqRouted(sc, dec, @intFromFloat(c.swiglu_limit), &m.dspark.?.stq[li - c.layers], h, r.idx, r.wts, sy), m.act);
+            return sc.astype(try stqRouted(sc, dec, @intFromFloat(c.swiglu_limit), &m.dspark.?.stq[li - c.layers], h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } }), m.act);
         }
         const hk = switch (m.experts) {
             .resident => return error.Dsv41StqExpertsStream,
             .hook => |hk| hk,
         };
         if (sh.spec_on) {
-            const sy = try sharedExpert(sc, m, ly, h);
             const target = prefetchTarget(m, li, dim(h, 0));
             // Submitted ahead of the chain, so the host's read of it waits for nothing but the router.
             const pred = if (target) |j| try predictLogits(sc, m, h, j) else none;
             if (pred.ctx != null) try submit(pred);
-            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, sy);
+            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } });
             const out = try sc.astype(q.out, m.act);
-            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts), .sy = sc.out(sy) };
+            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts) };
             if (pred.ctx != null) {
                 sh.spec.?.pred = sc.out(pred);
                 sh.spec.?.pred_layer = target.?;
@@ -2694,7 +2723,6 @@ const Unresolved = struct {
     h: A,
     idx: A,
     wts: A,
-    sy: A,
     x1: A = none,
     post: A = none,
     comb: A = none,
@@ -2704,7 +2732,7 @@ const Unresolved = struct {
     pred_layer: usize = 0,
 
     fn deinit(self: *Unresolved) void {
-        for ([_]A{ self.h, self.idx, self.wts, self.sy, self.x1, self.post, self.comb, self.pre, self.pred }) |a| if (a.ctx != null) {
+        for ([_]A{ self.h, self.idx, self.wts, self.x1, self.post, self.comb, self.pre, self.pred }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
     }
@@ -2849,7 +2877,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const t0 = readStart();
-    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, u.sy, u.map);
+    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, .{ .layer = .{ .m = m, .li = u.li } }, u.map);
     readDone(settle_site, t0);
     if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
     if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });

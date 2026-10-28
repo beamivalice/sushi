@@ -53,6 +53,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - Decode on this box is dispatch-gap bound: ~860 kernels per Flash-Next token, kernel time ~9.8 of ~18 ms, ~7 us
   per boundary. `MLX_MAX_OPS_PER_BUFFER` and `MLX_METAL_FAST_SYNCH` gave nothing; decode wins come from fewer,
   denser kernels ([perf-baselines](qwen4-perf.md#exl3)).
+- **Two kernels in one launch** (`exl3/fuse.zig`): part A's threadgroups, then part B's, each running its own statements on
+  its own inputs, outputs, template ints and (renamed) codec helpers, so every output has the bytes of its kernel run alone.
+  DeepSeek's shared expert rides the routed decode chain this way, 5 launches a layer fewer
+  ([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)). Idea from turboexl3's shared expert in its decode
+  launches (MIT); no code is ported. A chained ubench shows the saving only if the two chains do not already overlap there.
 - At one decode row the shared-expert gate's dot runs on the router kernel's idle simdgroups in MLX's own
   `dot_product` order (bit-equal to the matmul; declines at 32 or fewer experts, K % 8 != 0 or K > 16384).
 - A split-K grid too small to fill the GPU (QSA at one decode row: 32 threadgroups) waits on its tile loads. Extra

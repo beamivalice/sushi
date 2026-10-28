@@ -659,6 +659,14 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
 - The llmprobe cells swing 5-10% within an arm, as tokens per round varies. The server's own round log, summed over
   every request in the boot, puts the branch 0.9% faster: no regression.
 - `tests/test_mtp_equivalence.sh` on the branch binary: 18 passed, 0 failed.
+- **The shared expert inside the routed launches is priced, not built.** Flash-Next's shared expert is gate qmv, up qmv,
+  geglu, down qmv: 4 launches x 48 layers = 192 per serial token and per MTP verify round (the rows kernels at 2 to 8
+  rows, same count). The stand-in above puts the whole shared expert at 0.62 of the 17.99 ms forward (3.4% at most), and
+  the launches alone at 0.6-1.5 us each (the tail fold: 144 launches, 0.09 ms) are 0.1-0.3 ms, 0.7-1.6%. A fused launch
+  would also have to reproduce MLX's affine-8 qmv reduction tree bit for bit beside the EXL3 decode, and each down
+  threadgroup needs the whole geglu product of gate and up, so it recomputes it. DeepSeek's shared expert is a trellis
+  bank of the routed chain's own family, where the same fusion landed
+  ([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)).
 
 <a id="verify-rows8"></a>
 ## Flash-Next: verify at 2 to 8 rows costs the same per row (4d7f575c to 8044906b)

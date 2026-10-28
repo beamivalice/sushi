@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 183 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 72, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
+**Summary.** 185 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 74, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -76,7 +76,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
 | `SUSHI_VISION_CHUNKED` | `generate.zig:1533` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
-## Microbenches (72)
+## Microbenches (74)
 
 In-process meters. Load-time meters run on the served binary; the rest are tests that skip when unset.
 
@@ -89,7 +89,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS`, `SUSHI_DECODE_FWD_UBENCH_PROFILE`, `SUSHI_DECODE_FWD_UBENCH_ROW_ARMS` | `scheduler.zig` | GDN chain vs fused step, one extra profiled pass per width, MiMo verify width run prefill-shaped then as rows | load | yes: engine-kernels |
 | `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:89, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
 | `SUSHI_EXL3_CODEBOOK_AB`, `SUSHI_EXL3_GEMM_ARMS`, `SUSHI_EXL3_LOWK_UBENCH`, `SUSHI_EXL3_CHAIN_UBENCH`, `SUSHI_EXL3_GEMM_COUNTS` | `exl3/expert_exl3_kernels.zig` | EXL3 codebook A/B, served-vs-reference GEMM arms, low-rate decode chain, every-rate decode chain (lane funnel vs 64-bit merge); `_COUNTS=<file>` replays per-layer expert counts into the arms meter | test | yes: engine-exl3-experts, mimo2-perf |
-| `SUSHI_DSV41_STQ_UBENCH`, `SUSHI_DSV41_EXPERT_UBENCH`, `SUSHI_UBENCH_STEPS`, `SUSHI_UBENCH_ROUNDS` | `exl3/linear.zig`, `exl3/dsv41_ubench.zig`, `exl3/bench_util.zig` | DeepSeek-V4.1 STQ trunk linears (`=<shape filter>` or `1`) and the 384-expert grouped chain at the plan's layers, as chains of dependent calls; steps per chain and rounds | test | yes: engine-exl3-experts, perf-baselines |
+| `SUSHI_DSV41_STQ_UBENCH`, `SUSHI_DSV41_EXPERT_UBENCH`, `SUSHI_DSV41_SHARED_UBENCH`, `SUSHI_DSV41_SHARED_LAYOUT`, `SUSHI_UBENCH_STEPS`, `SUSHI_UBENCH_ROUNDS` | `exl3/linear.zig`, `exl3/dsv41_ubench.zig`, `exl3/bench_util.zig` | DeepSeek-V4.1 STQ trunk linears (`=<shape filter>` or `1`) the 384-expert grouped chain at the plan's layers and the shared expert beside it (separate, fused, routed only; `_LAYOUT` picks the layer), as chains of dependent calls; steps per chain and rounds | test | yes: engine-exl3-experts, perf-baselines |
 | `SUSHI_EXL3_ROWS_SWEEP` | `exl3/expert_exl3_kernels.zig` | the multi-row kernel's launch geometries per trunk shape, chained and independent (`qwen4`, `glm5`, `dsv41`) | test | yes: engine-exl3-experts |
 | `SUSHI_DSV41_TRUNK_UBENCH`, `SUSHI_DSV41_TRUNK_UBENCH_ROWS` | `exl3/expert_exl3_kernels.zig` | DeepSeek trunk linears at the real shapes by width under the served geometry, with a streaming memory floor (`=<shape filter>` or `1`; `_ROWS=1,2,..`) | test | yes: engine-exl3-experts |
 | `SUSHI_DSV41_INDEX_UBENCH`, `SUSHI_DSV41_ATTN_UBENCH` | `dsv41_model.zig` | DeepSeek decode indexer stages (scores, mask, top-k, candidate gather) and index-stream peak bytes by context; decode attention core vs fused error by case | test | yes: dsv41-arch |

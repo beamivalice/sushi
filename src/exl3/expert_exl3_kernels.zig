@@ -10272,7 +10272,7 @@ pub fn downPreparedGroupedText(group: c_int) ![:0]const u8 {
 
 /// A slot's Hadamard-prepared input for both projections, `[slot][gate|up][IDIM]` f16: the values
 /// `PAIR_GEMV_SOURCE` otherwise re-derives in every threadgroup of the slot, in lane order.
-const PAIR_PREP_SOURCE: [:0]const u8 = metalReplaceFound(PAIR_PREP_BODY, "LANE_SLOT", LANE_ORDER_SLOT);
+pub const PAIR_PREP_SOURCE: [:0]const u8 = metalReplaceFound(PAIR_PREP_BODY, "LANE_SLOT", LANE_ORDER_SLOT);
 const PAIR_PREP_BODY: [:0]const u8 =
     \\const uint block = uint(threadgroup_position_in_grid.x);
     \\const uint slot = uint(threadgroup_position_in_grid.y);
@@ -13183,11 +13183,12 @@ test "exl3 GLM lane half4 pair exact bytes" {
     for ([_]u32{ 36, 40 }) |n| try lanePairCase(4096, 2048, 1, n);
 }
 
-const LANE_PREP_SOURCE: [:0]const u8 = blk: {
+pub const LANE_PREP_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(1000000);
     break :blk metalReplaceAll(TOKEN_PAIR_PREPARE_SOURCE, "[yb + lane", "[yb + " ++ LANE_ORDER_SLOT);
 };
-const LANE_PAIR_SOURCE: [:0]const u8 = blk: {
+pub const LANE_PREP_UNSORTED_SOURCE = metalReplaceFound(LANE_PREP_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;");
+pub const LANE_PAIR_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(1000000);
     var body = INDEXED_PAIR_COOP_SOURCE;
     body = metalReplaceAll(body, "const float in0 = float(x[xb + tk * TILE + row0]);", "const float4 in4 = float4(*((const device half4 *)(x + xb + tk * TILE + (lane & 3u) * 4u)));\nconst float in0 = in4.x;");
@@ -13328,7 +13329,7 @@ pub const PrefillGridSupport = struct {
 
 var lane_decode_dispatches: usize = 0;
 /// The GLM lane kernels read through `exl3_lane`, whose words and shifts follow from n.
-fn laneServesRate(n: c_int) bool {
+pub fn laneServesRate(n: c_int) bool {
     return n >= 0 and exl3.kFromPackedDim(@intCast(n)) != null;
 }
 fn laneClampedPair(s: mlx.mlx_stream, x: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, sg: mlx.mlx_array, su: mlx.mlx_array, slots: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int) !?[2]mlx.mlx_array {
@@ -13353,8 +13354,8 @@ fn downLaneReads(comptime source: [:0]const u8, comptime space: []const u8) [:0]
     body = metalReplaceAll(body, "const float in3 = float(x[xb + tk * TILE + row3]);", "const float in3 = in4.w;");
     return body;
 }
-const DOWN_LANE_MID_SOURCE = metalReplaceAll(MID_SOURCE, "yd[xb + lane", "yd[xb + " ++ LANE_ORDER_SLOT);
-const DOWN_LANE_COOP_SOURCE = downLaneReads(INDEXED_COOP_SOURCE, "device");
+pub const DOWN_LANE_MID_SOURCE = metalReplaceAll(MID_SOURCE, "yd[xb + lane", "yd[xb + " ++ LANE_ORDER_SLOT);
+pub const DOWN_LANE_COOP_SOURCE = downLaneReads(INDEXED_COOP_SOURCE, "device");
 var down_lane_mid_cfgs: CfgCache(MidKey, 8) = .{};
 var down_lane_mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var down_lane_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
@@ -13391,7 +13392,7 @@ fn downLanePrepare(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg
 /// iteration, so four tile reads are in flight and each input quad serves both tiles. Every output cell
 /// keeps its k order (tile sg, sg+4, ...) and the epilogue its r-then-simdgroup sum, so the bytes are the
 /// lane kernels'. Three or more tiles per group or k-tiles per iteration spill.
-const ONE_ROW_COOP_SOURCE: [:0]const u8 =
+pub const ONE_ROW_COOP_SOURCE: [:0]const u8 =
     \\threadgroup float partial[2u * 4u * 256u];
     \\const uint ot = uint(threadgroup_position_in_grid.x) * 2u;
     \\const uint slot = uint(threadgroup_position_in_grid.y);
@@ -13460,7 +13461,7 @@ const ONE_ROW_COOP_SOURCE: [:0]const u8 =
     \\  y[(size_t)slot * (size_t)(ODIM) + (ot + o) * TILE + c] = half(exl3_out(sum));
     \\}
 ;
-const ONE_ROW_PAIR_SOURCE: [:0]const u8 =
+pub const ONE_ROW_PAIR_SOURCE: [:0]const u8 =
     \\const bool upper = threadgroup_position_in_grid.z != 0u;
     \\const device half* x = upper ? xu : xg;
     \\const device ushort* trellis = upper ? tu : tg;
@@ -13482,7 +13483,7 @@ fn countOneRow(n: u32) void {
     log.info("[exl3-decode] one-row coop GEMV engaged n{d}\n", .{n});
 }
 /// Whole H128 blocks give 8k-tile iterations; an even tile count gives the tile pairs.
-fn oneRowCoopServes(in_tiles: c_int, out_tiles: c_int) bool {
+pub fn oneRowCoopServes(in_tiles: c_int, out_tiles: c_int) bool {
     return !one_row_coop_off and in_tiles > 0 and out_tiles > 0 and @mod(in_tiles, 8) == 0 and @mod(out_tiles, 2) == 0;
 }
 fn downLaneCoop(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
