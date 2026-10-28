@@ -20291,19 +20291,21 @@ fn expectCloseWaitsForPeer(close_delimited: bool, stop_server: bool) !void {
     // reset a lagging reader.
     var waited: u32 = 0;
     while (!closed.load(.acquire) and waited < 50) : (waited += 1) {
-        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+        std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch {};
     }
     try testing.expectEqual(!close_delimited, closed.load(.acquire));
 
     if (stop_server) {
         shutdown_requested.store(true, .release);
+        // A stray byte wakes the close's poll so it re-reads the flag now, not at the end of its 500 ms slice.
+        _ = std.c.send(sv[1], "x", 1, 0);
     } else {
         _ = std.c.close(sv[1]);
         client_open = false;
     }
     waited = 0;
-    while (!closed.load(.acquire) and waited < 300) : (waited += 1) {
-        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+    while (!closed.load(.acquire) and waited < 3000) : (waited += 1) {
+        std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch {};
     }
     try testing.expect(closed.load(.acquire));
 }
@@ -27361,7 +27363,7 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
     slot.decode_ns = 0;
     slot.in_pass = .init(1);
 
-    var player = TickPlayer{ .slot = &slot, .n = published, .gap_ms = 20 };
+    var player = TickPlayer{ .slot = &slot, .n = published, .gap_ms = 2 };
     const t = try std.Thread.spawn(.{}, TickPlayer.run, .{&player});
     const stops = [_][]const u8{"S"};
     var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null };
@@ -27514,9 +27516,9 @@ fn readerGivesUp(sent: []const u8, limit_ms: i64, drip_ms: u64) !bool {
 
 test "readRequest: a client that stalls its head or body, or drips its head, is dropped" {
     const head = "POST /v1/chat/completions HTTP/1.1\r\n";
-    try std.testing.expect(try readerGivesUp(head, 200, 0));
-    try std.testing.expect(try readerGivesUp(head, 300, 50));
-    try std.testing.expect(try readerGivesUp(head ++ "Content-Length: 100\r\n\r\n{}", 200, 0));
+    try std.testing.expect(try readerGivesUp(head, 40, 0));
+    try std.testing.expect(try readerGivesUp(head, 60, 10));
+    try std.testing.expect(try readerGivesUp(head ++ "Content-Length: 100\r\n\r\n{}", 40, 0));
 }
 
 test "readRequest: a Content-Length that wraps the size sum is a 413" {

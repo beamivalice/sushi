@@ -1482,60 +1482,69 @@ test "opencode script: optional --standalone follows the subcommand, the model r
     try t.expect(std.mem.indexOf(u8, flag, "\n\"$sushi_opencode_bin\" \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
 }
 
-/// Runs the opencode launch script under `zsh -f` with fake `opencode`s, each spec `dir|--version output|--help
-/// output`, on PATH in the order given. Returns what the chosen fake logged.
-fn runOpencodeFakes(extras: []const []const u8, specs: []const []const u8, exit_code: u8) ![]u8 {
-    const script = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", FALLBACK_BUDGET, "{}", extras);
-    defer t.allocator.free(script);
-    const setup =
-        \\d=$(mktemp -d); trap 'rm -rf $d' EXIT
-        \\pdirs=()
-        \\for spec in "$@"; do
-        \\  f=("${(@s:|:)spec}")
-        \\  mkdir $d/$f[1]; pdirs+=($d/$f[1])
-        \\  print -r -- "#!/bin/sh
-        \\case \$1 in --version) echo '$f[2]';; --help) echo '$f[3]';; *) echo \"picked $f[1] \$*\" >> $d/log;; esac" > $d/$f[1]/opencode
-        \\  chmod +x $d/$f[1]/opencode
-        \\done
-        \\PATH="${(j.:.)pdirs}:/usr/bin:/bin"
+const OpencodeCase = struct {
+    extras: []const []const u8 = &.{},
+    specs: []const []const u8,
+    exit_code: u8 = 0,
+    logged: []const u8 = "",
+};
+
+/// Runs every case's opencode launch script in ONE `zsh -f`, each in a subshell with fake `opencode`s on PATH in
+/// the order of its specs (`dir|--version output|--help output`), and checks what the chosen fake logged and the exit code.
+fn expectOpencodeFakes(cases: []const OpencodeCase) !void {
+    var full = std.ArrayList(u8).empty;
+    defer full.deinit(t.allocator);
+    var expected = std.ArrayList(u8).empty;
+    defer expected.deinit(t.allocator);
+    // macOS scans each new executable on its first run; hard links to one fake share that scan.
+    try full.appendSlice(t.allocator,
+        \\d0=$(mktemp -d); trap 'rm -rf $d0' EXIT
+        \\print -r -- '#!/bin/sh
+        \\d=${0%/*}
+        \\case $1 in --version) cat $d/ver;; --help) cat $d/help;; *) echo "picked ${d##*/} $*" >> ${d%/*}/log;; esac' > $d0/fake
+        \\chmod +x $d0/fake
         \\
-    ;
-    const full = try std.mem.concat(t.allocator, u8, &.{ setup, script, "\ncat $d/log\n" });
-    defer t.allocator.free(full);
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(t.allocator);
-    try argv.appendSlice(t.allocator, &.{ "/bin/zsh", "-f", "-c", full, "sushi-test" });
-    try argv.appendSlice(t.allocator, specs);
-    const r = try std.process.run(t.allocator, t.io, .{ .argv = argv.items });
+    );
+    for (cases, 0..) |c, i| {
+        const script = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", FALLBACK_BUDGET, "{}", c.extras);
+        defer t.allocator.free(script);
+        try full.print(t.allocator, "(d=$d0/{d}; mkdir $d; set --", .{i});
+        for (c.specs) |spec| try full.print(t.allocator, " '{s}'", .{spec});
+        try full.appendSlice(t.allocator,
+            \\
+            \\pdirs=()
+            \\for spec in "$@"; do
+            \\  f=("${(@s:|:)spec}")
+            \\  mkdir $d/$f[1]; pdirs+=($d/$f[1])
+            \\  ln $d0/fake $d/$f[1]/opencode
+            \\  print -r -- $f[2] > $d/$f[1]/ver; print -r -- $f[3] > $d/$f[1]/help
+            \\done
+            \\PATH="${(j.:.)pdirs}:/usr/bin:/bin"
+            \\
+        );
+        try full.appendSlice(t.allocator, script);
+        try full.appendSlice(t.allocator, "\ncat $d/log\n)\nprint -r -- \"=== $?\"\n");
+        try expected.print(t.allocator, "{s}=== {d}\n", .{ c.logged, c.exit_code });
+    }
+    const r = try std.process.run(t.allocator, t.io, .{ .argv = &.{ "/bin/zsh", "-f", "-c", full.items } });
     defer t.allocator.free(r.stderr);
-    errdefer t.allocator.free(r.stdout);
-    try t.expectEqual(exit_code, r.term.exited);
-    return r.stdout;
+    defer t.allocator.free(r.stdout);
+    try t.expectEqualStrings(expected.items, r.stdout);
 }
 
-test "opencode script: the newest opencode on PATH launches, whichever comes first" {
+test "opencode script: the newest opencode on PATH launches whichever comes first, and none exits 127" {
     const old = "old|1.4.2|usage: opencode [options]";
     const new = "new|opencode v2.0.18|usage: opencode --standalone";
-    for ([_][2][]const u8{ .{ old, new }, .{ new, old } }) |order| {
-        const out = try runOpencodeFakes(&.{ "run", "hi" }, &order, 0);
-        defer t.allocator.free(out);
-        try t.expectEqualStrings("picked new run --standalone hi\n", out);
-    }
-    // Versions compare by number, not by text: 10.0.0 outranks 9.9.9.
-    const out = try runOpencodeFakes(&.{}, &.{ "nine|9.9.9|", "ten|10.0.0|" }, 0);
-    defer t.allocator.free(out);
-    try t.expectEqualStrings("picked ten \n", out);
-}
-
-test "opencode script: an unreadable version still launches when it is the only opencode, and none exits 127" {
-    const only = try runOpencodeFakes(&.{}, &.{"odd|not a version|"}, 0);
-    defer t.allocator.free(only);
-    try t.expectEqualStrings("picked odd \n", only);
-    const ranked = try runOpencodeFakes(&.{}, &.{ "odd|not a version|", "old|1.4.2|" }, 0);
-    defer t.allocator.free(ranked);
-    try t.expectEqualStrings("picked old \n", ranked);
-    const none = try runOpencodeFakes(&.{}, &.{}, 127);
-    defer t.allocator.free(none);
+    try expectOpencodeFakes(&.{
+        .{ .extras = &.{ "run", "hi" }, .specs = &.{ old, new }, .logged = "picked new run --standalone hi\n" },
+        .{ .extras = &.{ "run", "hi" }, .specs = &.{ new, old }, .logged = "picked new run --standalone hi\n" },
+        // Versions compare by number, not by text: 10.0.0 outranks 9.9.9.
+        .{ .specs = &.{ "nine|9.9.9|", "ten|10.0.0|" }, .logged = "picked ten \n" },
+        // An unreadable version still launches when it is the only opencode, and loses to a readable one.
+        .{ .specs = &.{"odd|not a version|"}, .logged = "picked odd \n" },
+        .{ .specs = &.{ "odd|not a version|", "old|1.4.2|" }, .logged = "picked old \n" },
+        .{ .specs = &.{}, .exit_code = 127 },
+    });
 }
 
 test "grok names" {
