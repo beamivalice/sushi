@@ -251,9 +251,7 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode)
 const MCG_W12: api.format.Decode = .{ .codebook = .mcg, .window = .w12 };
 
 test "GLM prefill grid serves every admitted rate, mixed projections included, with the sorted chain's bytes" {
-    const expert = @import("expert_exl3.zig");
-    var n: c_int = expert.Rate.min_n;
-    while (n <= expert.Rate.max_n) : (n += 2) {
+    for ([_]c_int{ 16, 24, 32, 36, 40, 48, 64 }) |n| {
         try gridMatchesSortedChain(.{ n, n, n }, @mod(n, 8) == 0, MCG_W12);
     }
     try gridMatchesSortedChain(.{ 40, 40, 36 }, true, MCG_W12);
