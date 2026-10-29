@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # test_logprobs.sh — the logprobs wire contract, on every surface that serves it.
 #
 # Three defects fixed 2026-08-05 (temperature-scaled logits, float-equality id
@@ -16,35 +16,19 @@
 # this server 100% on `Logprob consistency` while streaming returned nothing),
 # and invisible to any output-equality test, since the deltas are unchanged.
 #
-#   LOGPROBS_TEST_MODEL=<dir> ./tests/test_logprobs.sh [port]
-#
-# Any chat model works; defaults to the Flash-Next EXL3 pack. SKIPs without one.
+# Any chat model works.
 set -uo pipefail
 
-MODEL="${LOGPROBS_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${1:-11293}"
-BIN="${BINARY:-./zig-out/bin/sushi}"
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+BASE=$SUSHI_URL
 
-[ -d "$MODEL" ] || { echo "SKIP: no model at $MODEL"; exit 0; }
-[ -x "$BIN" ]   || { echo "fail: build sushi first"; exit 1; }
-
-ID="$(basename "$MODEL")"
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-LOG="$(mktemp)"
-"$BIN" --serve --model "$MODEL" --port "$PORT" >"$LOG" 2>&1 &
-SRV=$!
-trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
-
-for _ in $(seq 1 180); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
+ID=$(curl -sf "$BASE/v1/models" | python3 -I -c 'import sys, json; print(json.load(sys.stdin)["data"][0]["id"])') \
+    || { echo "fail: /v1/models"; exit 1; }
 
 python3 - "$BASE" "$ID" <<'PY'
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 BASE, MODEL = sys.argv[1], sys.argv[2]
+N = os.environ["SUSHI_NONCE"] + " "
 fails, checks = [], 0
 
 def ck(name, cond, detail=""):
@@ -73,7 +57,7 @@ def post(path, body, stream=False):
         utf8_bad.append((path, e.start, bytes(raw[e.start:e.start + 2])))
         return json.loads(raw.decode("utf-8", "replace"))
 
-MSG = [{"role": "user", "content": "Count from one to eight in words."}]
+MSG = [{"role": "user", "content": N + "Count from one to eight in words."}]
 REQ = {"model": MODEL, "messages": MSG, "max_tokens": 48, "temperature": 0,
        "logprobs": True, "top_logprobs": 5}
 
@@ -131,7 +115,7 @@ ck("distribution not saturated to 0.0 at temp 0",
    f"{[round(t['logprob'],6) for t in a['top_logprobs']]}")
 
 print("── [3/7] /v1/completions: integer logprobs, four parallel arrays ──")
-r = post("/v1/completions", {"model": MODEL, "prompt": "Count from one to five:",
+r = post("/v1/completions", {"model": MODEL, "prompt": N + "Count from one to five:",
                              "max_tokens": 24, "temperature": 0, "logprobs": 5})
 lp = r["choices"][0].get("logprobs")
 if r["usage"]["completion_tokens"] == 0:
@@ -179,7 +163,7 @@ if st:
     ck("[stream] logprob VALUES match non-streaming", not lp_mismatch, f"{lp_mismatch[:5]}")
 
 print("── [5/7] STREAMING /v1/completions carries the legacy shape ──")
-CREQ = {"model": MODEL, "prompt": "Count from one to five:", "max_tokens": 24,
+CREQ = {"model": MODEL, "prompt": N + "Count from one to five:", "max_tokens": 24,
         "temperature": 0, "logprobs": 5}
 ns = post("/v1/completions", {**CREQ, "stream": False})["choices"][0]
 resp = post("/v1/completions", {**CREQ, "stream": True, "stream_options": {"include_usage": True}}, stream=True)
@@ -238,7 +222,7 @@ print("── [6/7] logprobs describe message.content, not the reasoning we stri
 # was the first token of the thought. Measured on Qwen3.6-27B (3 builds),
 # Qwen3.6-35B-A3B, gemma-4-31b, gemma-4-e4b, Qwen3-4B and LFM2.5: 37-186
 # entries against 8 characters of content.
-TMSG = [{"role": "user", "content": "The capital of Australia is which city? Reply with just the city."}]
+TMSG = [{"role": "user", "content": N + "The capital of Australia is which city? Reply with just the city."}]
 TREQ = {"model": MODEL, "messages": TMSG, "max_tokens": 300, "temperature": 0,
         "logprobs": True, "top_logprobs": 5, "enable_thinking": True}
 r = post("/v1/chat/completions", {**TREQ, "stream": False})
@@ -287,7 +271,7 @@ for response_format in (
       "schema": {"type": "object", "properties": {"answer": {"type": "boolean"}},
                  "required": ["answer"], "additionalProperties": False}}},
 ):
-    req = {**REQ, "messages": [{"role": "user", "content": "Return JSON with answer true."}],
+    req = {**REQ, "messages": [{"role": "user", "content": N + "Return JSON with answer true."}],
            "max_tokens": 64, "enable_thinking": False, "response_format": response_format,
            "enable_mtp": False}
     choice = post("/v1/chat/completions", {**req, "stream": False})["choices"][0]
