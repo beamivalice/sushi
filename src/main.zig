@@ -36,6 +36,7 @@ const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const parent_watch = @import("parent_watch.zig");
 const update_mod = @import("update.zig");
+const sampler = @import("sampler.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -1447,7 +1448,7 @@ pub fn main(init: std.process.Init) !void {
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.
-        generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
+        sampler.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
         generate_mod.installThinkMarkers(&xfm, tok);
         try generate_mod.installLogitBias(io, &xfm, tok);
 
@@ -1491,7 +1492,7 @@ pub fn main(init: std.process.Init) !void {
         _ = mlx.mlx_reset_peak_memory();
 
         const eos_slice = config.eosTokenSlice();
-        const sampling = generate_mod.SamplingParams{ .temperature = temperature };
+        const sampling = sampler.SamplingParams{ .temperature = temperature };
 
         var stdout_buf: [16 * 1024]u8 = undefined;
         var stdout_w_state = std.Io.File.stdout().writer(io, &stdout_buf);

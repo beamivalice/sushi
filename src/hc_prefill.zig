@@ -4,6 +4,7 @@ const log = @import("log.zig");
 const trf = @import("transformer.zig");
 const testing = std.testing;
 const test_support = @import("test_support.zig");
+const prefill_plan = @import("prefill_plan.zig");
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
 const KVCache = trf.KVCache;
@@ -15,7 +16,7 @@ var sigmoid_table: ?mlx.mlx_array = null;
 var announced = false;
 
 // Include the final remainder that the chunker may merge into an 8192-token chunk.
-pub const max_seq: c_int = 8192 + @as(c_int, @intCast(@import("generate.zig").TAIL_MERGE_MAX)) - 1;
+pub const max_seq: c_int = 8192 + @as(c_int, @intCast(prefill_plan.TAIL_MERGE_MAX)) - 1;
 
 pub fn eligible(batch: c_int, seq: c_int, hc: u32, hidden: u32, inject: mlx.mlx_array, dtype: mlx.mlx_dtype) bool {
     return inject.ctx != null and dtype == .bfloat16 and mlx.mlx_array_dtype(inject) == .bfloat16 and geometry(batch, seq) and hc >= 1 and hc <= 8 and hidden >= 128 and hidden <= 4096 and hidden % 128 == 0;
@@ -235,5 +236,5 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
     for ([_][4]u32{ .{ 0, 17, 4, 2560 }, .{ 3, 17, 4, 2560 }, .{ 1, 16, 4, 2560 }, .{ 1, 8704, 4, 2560 }, .{ 1, 17, 0, 2560 }, .{ 1, 17, 9, 2560 }, .{ 1, 17, 4, 64 }, .{ 1, 17, 4, 4097 }, .{ 1, 17, 4, 129 } }) |shape| {
         try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3], inject, .bfloat16));
     }
-    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true));
+    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), prefill_plan.nextChunkEnd(0, 8703, 8192, false, 0, 0, true));
 }

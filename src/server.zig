@@ -191,6 +191,11 @@ pub fn startupRefusal(err: anyerror, host: []const u8, port: u16, buf: []u8) ?[]
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
 const build_options = @import("build_options");
+const glm5_generate = @import("glm5/glm5_generate.zig");
+const mtp_plan = @import("mtp_plan.zig");
+const prefill_plan = @import("prefill_plan.zig");
+const sampler = @import("sampler.zig");
+const think_penalty = @import("think_penalty.zig");
 const nowSecs = io_util.nowSecs;
 const nowMs = io_util.nowMs;
 const nowMsMonotonic = io_util.nowMsMonotonic;
@@ -1146,18 +1151,18 @@ const THINK_BOUND_EARLY_STOP = "\n\nConsidering the limited time by the user, I 
 /// Arm a decode-time thinking bound for this request, or null when nothing
 /// bounds it (no budget, thinking off, markers not atomic). `forced` is
 /// allocated; the caller frees it after generation.
-fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?generate_mod.ThinkBound {
+fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?mtp_plan.ThinkBound {
     if (budget < 0) return null;
     return thinkBoundWithBudget(allocator, lm, tok, prompt_ids, enable_thinking, @intCast(budget), true);
 }
 
 /// The bound a loop convicted inside a thought closes it with, built when the loop is
 /// convicted: a request carrying a `think_bound` from the start is refused DFlash2.
-pub fn loopCloseBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool) ?generate_mod.ThinkBound {
+pub fn loopCloseBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool) ?mtp_plan.ThinkBound {
     return thinkBoundWithBudget(allocator, lm, tok, prompt_ids, enable_thinking, std.math.maxInt(u32), false);
 }
 
-fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: u32, announce: bool) ?generate_mod.ThinkBound {
+fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: u32, announce: bool) ?mtp_plan.ThinkBound {
     if (!enable_thinking or lm.transformer == null) return null;
     const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
         if (announce) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
@@ -1188,14 +1193,14 @@ fn resolveThinkPenalty(root: std.json.ObjectMap, flag: ?f32, setting: ?f32) f32 
 
 /// The penalty for one request: off unless it thinks, lambda > 0 and its span is trackable
 /// (a single-token closer, and an opener when the prompt leaves the thought to the model).
-fn thinkPenaltyFor(lambda: f32, enable_thinking: bool, opener: ?u32, closer: ?u32, prompt_opened: bool) generate_mod.ThinkPenalty {
+fn thinkPenaltyFor(lambda: f32, enable_thinking: bool, opener: ?u32, closer: ?u32, prompt_opened: bool) think_penalty.ThinkPenalty {
     if (lambda <= 0 or !enable_thinking) return .{};
     const close = closer orelse return .{};
     if (opener == null and !prompt_opened) return .{};
     return .{ .lambda = lambda, .opener_id = opener, .closer_id = close, .phase = if (prompt_opened) .inside else .before };
 }
 
-fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, lambda: f32) generate_mod.ThinkPenalty {
+fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, lambda: f32) think_penalty.ThinkPenalty {
     if (!enable_thinking or lm.transformer == null) return .{};
     if (!@import("think_penalty.zig").needsSpan(lambda, lm.transformer.?.logit_bias)) return .{};
     const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
@@ -4754,7 +4759,7 @@ test "DeepSeek's streamed request bill brackets the prefill peaks measured on th
     config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
     // No decoder pool to lend: the bill is the working set's, as measured.
     config.expert_borrow_bytes = 0;
-    try std.testing.expectEqual(generate_mod.TAIL_MERGE_MAX - 1, dsv41_config.tail_merge_rows);
+    try std.testing.expectEqual(prefill_plan.TAIL_MERGE_MAX - 1, dsv41_config.tail_merge_rows);
     // Live per-chunk `peak_bytes - active_bytes` (`SUSHI_PREFILL_CHUNK_PEAK`), CED prefill, `--ssd-budget-gb 94`, the STQ d4
     // pack, DSpark on: `chunk` is the configured width, `seq` where the chunk ended (a last chunk absorbs its tail).
     const measured = [_]struct { seq: u64, chunk: u64, peak_mb: u64 }{
@@ -4887,10 +4892,10 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     // The widest rung is then always affordable, and a chunk boundary never steps down for the working set.
     const MB: u64 = 1 << 20;
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode + config.expertPoolBytes(), 512, 0, .{}));
-    var st: generate_mod.AdaptiveWidthState = .{};
+    var st: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st));
     config.expert_borrow_bytes = 0;
-    var st0: generate_mod.AdaptiveWidthState = .{};
+    var st0: mtp_plan.AdaptiveWidthState = .{};
     try t.expect(adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st0) < 2048);
 }
 
@@ -5352,7 +5357,7 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
     try t.expectEqual(@as(u32, 4096), billed);
 
     // The other reader agrees.
-    try t.expectEqual(@as(usize, 4096), generate_mod.effectivePrefillChunk(
+    try t.expectEqual(@as(usize, 4096), prefill_plan.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
         cfg.num_attention_heads,
         40_000,
@@ -5683,7 +5688,7 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     generate_mod.prefill_chunk_explicit = false;
 
     // The pure chunk resolver: `pinPrefillChunk` reads live memory.
-    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+    const chunk: u32 = @intCast(prefill_plan.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
         cfg.num_attention_heads,
         0,
@@ -5789,7 +5794,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     server_config.max_context_size = 0;
     cfg.pinned_context = 0;
 
-    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+    const chunk: u32 = @intCast(prefill_plan.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
         cfg.num_attention_heads,
         0,
@@ -6256,7 +6261,7 @@ test "an explicit --prefill-chunk is the widest width a request may run, not a p
     // The bill and the forward run the one width the pick names.
     const pick = requestPrefillPick(&cfg, seq, 2048, kv_bits, at_2048, false, .{});
     try t.expectEqual(@as(u32, 2048), pick);
-    try t.expectEqual(@as(usize, pick), generate_mod.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pick));
+    try t.expectEqual(@as(usize, pick), prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pick));
 
     // A narrower N is the cap for every rung; one below the floor is the floor.
     generate_mod.prefill_chunk_override = 3000;
@@ -6270,7 +6275,7 @@ test "an explicit --prefill-chunk is the widest width a request may run, not a p
     defer per_request_chunk_override = null;
     const off = requestPrefillPick(&cfg, seq, 2048, kv_bits, 0, false, .{});
     try t.expectEqual(@as(u32, 4096), off);
-    try t.expectEqual(@as(usize, 4096), generate_mod.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), off));
+    try t.expectEqual(@as(usize, 4096), prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), off));
 }
 
 test "admission tries the ladder DOWN before refusing: a prompt that fits only at 512" {
@@ -6405,7 +6410,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// `computeMemoryContext` at one reading of the ceiling and MLX's active memory.
 fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64) u32 {
     // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
-    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
+    const chunk: u64 = @intCast(prefill_plan.effectivePrefillChunk(
         config.prefillScoreHeadDim(),
         config.num_attention_heads,
         0,
@@ -6817,13 +6822,13 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     const per_cp = config.ssmCheckpointBytes();
     if (per_cp == 0 or ssm_checkpoint_stride == 0) return 0;
     if (config.isGlm5()) return glmPrefillSchedule(seq, matched, glm5_prefix.checkpointMax(ssm_checkpoint_max)).peak * per_cp;
-    const stride: u64 = generate_mod.effectiveSsmCheckpointStride(ssm_checkpoint_stride, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
+    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(ssm_checkpoint_stride, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
     if (stride == 0) return 0;
     // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
     // snapshot, the only capture a warm append shorter than one stride makes.
     const span: u64 = seq -| @min(matched, seq);
     var n: u64 = seq / stride -| @min(matched, seq) / stride;
-    if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
+    if (span > prefill_plan.SSM_SNAPSHOT_BACKOFF) n += 1;
     if (ssm_checkpoint_max > 0) n = @min(n, ssm_checkpoint_max);
     if (ssmResidentCap(config)) |cap| n = @min(n, cap);
     return n * per_cp;
@@ -6851,9 +6856,9 @@ fn ssmResidentCap(config: *const model_mod.ModelConfig) ?u64 {
 }
 
 /// The checkpoints a GLM prefill of `seq` tokens takes after restoring `matched`: the one schedule the generator runs.
-fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureSchedule {
+fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) glm5_generate.GlmCaptureSchedule {
     const offset: usize = @intCast(@min(matched, seq));
-    return generate_mod.glmCaptureSchedule(generate_mod.glm_capture_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
+    return glm5_generate.glmCaptureSchedule(generate_mod.glm_capture_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
 }
 
 /// The restore points a DeepSeek prefill holds in RAM while it runs: with a RAM tier the capped list plus the copy
@@ -6862,7 +6867,7 @@ fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureS
 fn dsv41CheckpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
     const c = config.dsv41 orelse return 0;
     const base = effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config));
-    const stride = generate_mod.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
+    const stride = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
     if (stride == 0) return 0;
     const one = c.stateFixedBytes(config.dsparkOn()) +| seq *| c.stateBytesPerToken();
     // SSD-first, a point the tier takes shares the request's rows and leaves RAM as the writer copies it: what is in
@@ -7525,7 +7530,7 @@ fn ladderTop(config: *const model_mod.ModelConfig, chunk_override: u32) u32 {
 fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long_ctx_gated: bool) u64 {
     // `--prefill-chunk` is unbounded at its source; clamp before narrowing.
     return @min(
-        @as(u64, generate_mod.requestPrefillChunk(
+        @as(u64, prefill_plan.requestPrefillChunk(
             config.prefillScoreHeadDim(),
             config.num_attention_heads,
             @intCast(seq),
@@ -7638,10 +7643,10 @@ pub fn adaptivePrefillWidth(
     headroom: u64,
     current: u32,
     cap: u32,
-    st: *generate_mod.AdaptiveWidthState,
+    st: *mtp_plan.AdaptiveWidthState,
 ) u32 {
     if (cap == 0 or current == 0) return current;
-    const floor: u32 = @min(cap, @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+    const floor: u32 = @min(cap, @as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)));
 
     if (prefillChunkCost(config, kv_bits, current, kv_len) > headroom) {
         st.supporting = 0;
@@ -7725,7 +7730,7 @@ pub fn adaptivePrefillWidthNow(
     pos: usize,
     current: u32,
     cap: u32,
-    st: *generate_mod.AdaptiveWidthState,
+    st: *mtp_plan.AdaptiveWidthState,
     staged_host: u64,
 ) u32 {
     if (!adaptivePrefillChunkEnabled(config)) return current;
@@ -7778,7 +7783,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     const chunk: u64 = if (unchunked_prefill)
         @max(seq, 1)
     else
-        @intCast(generate_mod.requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
+        @intCast(prefill_plan.requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
     // RAM hot-cache restores rebind MLX array handles by refcount; they do not
     // allocate another copy of the cached buffers. `active_mem` above already
     // includes the resident entry, while `prefillMemoryNeeded` bills the full
@@ -8946,7 +8951,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv_cache = kvCacheFor(config);
     const kv = kv_cache.config;
-    const acceptance = generate_mod.mtpAcceptanceFor(config.mtp_acceptance_override);
+    const acceptance = mtp_plan.mtpAcceptanceFor(config.mtp_acceptance_override);
     // This model's own tier, the four numbers from one publish.
     const disk = lm.disk_stats.snapshot();
     return .{
@@ -8960,7 +8965,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_choice = mtpChoiceFor(config),
         .mtp_acceptance = acceptance.value,
         .mtp_acceptance_source = model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
-        .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
+        .mtp_greedy_tail = mtp_plan.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
@@ -10069,7 +10074,7 @@ fn handleChatCompletions(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -10078,7 +10083,7 @@ fn handleChatCompletions(
     // but different vision embeddings, so prefix matching would reuse stale features.
     const eos_slice = config.eosTokenSlice();
 
-    var sampling = generate_mod.SamplingParams{
+    var sampling = sampler.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -10329,7 +10334,7 @@ fn handleCompletions(
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, root);
-    var sampling = generate_mod.SamplingParams{
+    var sampling = sampler.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -10366,7 +10371,7 @@ fn handleNonStreamingCompletion(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     skip_special: bool,
     stop_sequences: []const []const u8,
@@ -10464,7 +10469,7 @@ fn handleStreamingCompletion(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     skip_special: bool,
     stop_sequences: []const []const u8,
@@ -10773,7 +10778,7 @@ fn nonStreamingViaScheduler(
     prompt_ids: []const u32,
     full_prompt: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     cached_tokens: u32,
     has_tools: bool,
@@ -10877,7 +10882,7 @@ fn nonStreamingViaScheduler(
     // Phase A5: take ownership of the slot's accumulated logprobs. After
     // `toOwnedSlice` the slot's list is empty, so `Slot.deinit` doesn't try
     // to free what we just transferred to the caller.
-    const logprobs_slice: ?[]generate_mod.LogprobResult = slot.takeLogprobs(if (end == .stopped) token_ids.len else std.math.maxInt(usize));
+    const logprobs_slice: ?[]sampler.LogprobResult = slot.takeLogprobs(if (end == .stopped) token_ids.len else std.math.maxInt(usize));
 
     return .{
         .text = text,
@@ -10964,7 +10969,7 @@ fn emitConstrainedResponses(a: std.mem.Allocator, stream: *Conn, seq: *u64, reas
     }
 }
 
-fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: generate_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
+fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: sampler.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
     if (sampling.constraint) |c| {
         if (c.proto) |p| {
             routed.* = rp_mod.Delivery.init(p);
@@ -10986,7 +10991,7 @@ fn handleNonStreamingGeneration(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
@@ -11500,11 +11505,11 @@ pub fn requestSpecModes(
     enable_mtp: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     logprobs_n: u32,
 ) RequestSpec {
-    const spec_ok = !generate_mod.mtpUnsupported(sampling, logprobs_n);
-    const sidecar = spec_ok and !generate_mod.penaltyActive(sampling) and enable_drafter and dflash_loaded;
+    const spec_ok = !mtp_plan.mtpUnsupported(sampling, logprobs_n);
+    const sidecar = spec_ok and !sampler.penaltyActive(sampling) and enable_drafter and dflash_loaded;
     const use_dflash = sidecar and dflash_loaded;
     const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
     const use_drafter = use_dflash or (!use_mtp and sidecar);
@@ -11521,16 +11526,16 @@ pub fn requestBillsMtpHead(
     enable_mtp: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     logprobs_n: u32,
 ) bool {
     return requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n).use_mtp;
 }
 
 /// A request that asked for MTP and runs without it says why; the boot line says MTP is on.
-fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: generate_mod.SamplingParams, logprobs_n: u32) void {
+fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: sampler.SamplingParams, logprobs_n: u32) void {
     if (!enable_mtp or !mtp_loaded) return;
-    if (generate_mod.mtpRefusal(sampling, logprobs_n)) |why| log.info("  mtp=disabled ({s})\n", .{why});
+    if (mtp_plan.mtpRefusal(sampling, logprobs_n)) |why| log.info("  mtp=disabled ({s})\n", .{why});
 }
 
 fn pickStreamMode(
@@ -11538,7 +11543,7 @@ fn pickStreamMode(
     enable_mtp: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     logprobs_n: u32,
 ) StreamMode {
     const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n);
@@ -11548,7 +11553,7 @@ fn pickStreamMode(
 }
 
 test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head" {
-    const plain = generate_mod.SamplingParams{};
+    const plain = sampler.SamplingParams{};
     // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
     var r = requestSpecModes(true, true, true, true, plain, 0);
     try std.testing.expect(r.use_drafter and !r.use_mtp);
@@ -11577,7 +11582,7 @@ test "the bill prices the MTP head only for a request that runs it: a DFlash2 re
     const saved_force = server_config.default_force_mtp;
     defer server_config.default_force_mtp = saved_force;
     server_config.default_force_mtp = false;
-    const plain = generate_mod.SamplingParams{};
+    const plain = sampler.SamplingParams{};
     // A loaded drafter outranks the head; `enable_drafter:false` hands the request back to it.
     try t.expect(!requestBillsMtpHead(true, true, true, true, plain, 0));
     try t.expect(requestBillsMtpHead(false, true, true, true, plain, 0));
@@ -11598,10 +11603,10 @@ test "the bill prices the MTP head only for a request that runs it: a DFlash2 re
 }
 
 test "requestSpecModes: a repeat, presence or frequency penalty keeps the sidecar off but MTP on" {
-    const presence = generate_mod.SamplingParams{ .presence_penalty = 1.5 };
-    const repeat = generate_mod.SamplingParams{ .repeat_penalty = 1.1 };
-    const frequency = generate_mod.SamplingParams{ .frequency_penalty = 0.5 };
-    for ([_]generate_mod.SamplingParams{ presence, repeat, frequency }) |sampling| {
+    const presence = sampler.SamplingParams{ .presence_penalty = 1.5 };
+    const repeat = sampler.SamplingParams{ .repeat_penalty = 1.1 };
+    const frequency = sampler.SamplingParams{ .frequency_penalty = 0.5 };
+    for ([_]sampler.SamplingParams{ presence, repeat, frequency }) |sampling| {
         // A loaded sidecar cannot take the request, so the round falls to MTP.
         var r = requestSpecModes(true, true, true, true, sampling, 0);
         try std.testing.expect(r.use_mtp and !r.use_drafter);
@@ -11624,7 +11629,7 @@ fn handleStreamingGeneration(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
@@ -12380,7 +12385,7 @@ const StreamLogprobs = struct {
     lens: std.ArrayList(usize) = .empty,
     /// Total decoded bytes noted so far — the generation's length.
     bytes_noted: usize = 0,
-    entries: std.ArrayList(generate_mod.LogprobResult) = .empty,
+    entries: std.ArrayList(sampler.LogprobResult) = .empty,
     /// The last rendered JSON, owned here and freed on the next drain — the
     /// caller passes it straight into a chunk and never sees the lifetime.
     rendered: ?[]const u8 = null,
@@ -14025,7 +14030,7 @@ fn formatTokenLogprob(
     tok: *const Tokenizer,
     token_id: u32,
     logprob: f32,
-    top_logprobs: []const generate_mod.TokenLogprob,
+    top_logprobs: []const sampler.TokenLogprob,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
@@ -14099,7 +14104,7 @@ fn formatCompletionsLogprobs(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
     token_ids: []const u32,
-    logprobs: []const generate_mod.LogprobResult,
+    logprobs: []const sampler.LogprobResult,
     offset_base: *usize,
 ) ![]const u8 {
     var toks = std.ArrayList(u8).empty;
@@ -14211,7 +14216,7 @@ fn formatLogprobsObject(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
     token_ids: []const u32,
-    logprobs: []const generate_mod.LogprobResult,
+    logprobs: []const sampler.LogprobResult,
 ) ![]const u8 {
     var content_buf = std.ArrayList(u8).empty;
     defer content_buf.deinit(allocator);
@@ -16575,12 +16580,12 @@ fn handleAnthropicMessages(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, true, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     const eos_slice = config.eosTokenSlice();
-    var sampling = generate_mod.SamplingParams{
+    var sampling = sampler.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -16945,7 +16950,7 @@ fn handleAnthropicNonStreaming(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
@@ -17202,7 +17207,7 @@ fn handleAnthropicStreaming(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
@@ -18470,10 +18475,10 @@ fn handleResponsesInner(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     // ── sampling ──
-    var sampling = generate_mod.SamplingParams{
+    var sampling = sampler.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -22878,7 +22883,7 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
     var prev: u32 = std.math.maxInt(u32);
     for (PREFILL_CHUNK_LADDER) |c| {
         try t.expect(c < prev);
-        try t.expect(c >= generate_mod.PREFILL_CHUNK_FLOOR);
+        try t.expect(c >= prefill_plan.PREFILL_CHUNK_FLOOR);
         prev = c;
     }
 }
@@ -22960,7 +22965,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
     try t.expect(narrow * 2 < wide);
 
     cfg.pinned_prefill_chunk = 512;
-    try t.expectEqual(@as(usize, 512), generate_mod.effectivePrefillChunk(
+    try t.expectEqual(@as(usize, 512), prefill_plan.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
         cfg.num_attention_heads,
         40_000,
@@ -22972,7 +22977,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
     // Unpinned keeps the launch width — a model the sizer never ran on must
     // not silently get a narrower forward than the guard bills.
     const unpinned_prefill_chunk: usize = 0;
-    try t.expectEqual(@as(usize, 8192), generate_mod.effectivePrefillChunk(
+    try t.expectEqual(@as(usize, 8192), prefill_plan.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
         cfg.num_attention_heads,
         40_000,
@@ -22988,7 +22993,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         generate_mod.prefill_chunk_override = 8192;
         generate_mod.prefill_chunk_explicit = false;
     }
-    try t.expectEqual(@as(usize, 2048), generate_mod.effectivePrefillChunk(
+    try t.expectEqual(@as(usize, 2048), prefill_plan.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
         cfg.num_attention_heads,
         40_000,
@@ -23695,13 +23700,13 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     try tok.id_to_token.put(4, "a\x01\"b");
 
     const token_ids = [_]u32{ 1, 2, 3 };
-    var t0 = [_]generate_mod.TokenLogprob{
+    var t0 = [_]sampler.TokenLogprob{
         .{ .token_id = 1, .logprob = -0.25 },
         .{ .token_id = 4, .logprob = -3.5 },
     };
-    var t1 = [_]generate_mod.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
-    var t2 = [_]generate_mod.TokenLogprob{.{ .token_id = 3, .logprob = -1.0 }};
-    const lps = [_]generate_mod.LogprobResult{
+    var t1 = [_]sampler.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
+    var t2 = [_]sampler.TokenLogprob{.{ .token_id = 3, .logprob = -1.0 }};
+    const lps = [_]sampler.LogprobResult{
         .{ .token_logprob = -0.25, .top_logprobs = &t0 },
         .{ .token_logprob = -0.5, .top_logprobs = &t1 },
         .{ .token_logprob = -1.0, .top_logprobs = &t2 },
@@ -23770,7 +23775,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     try tok.id_to_token.put(3, "B");
     try tok.id_to_token.put(4, "CD");
 
-    var t0 = [_]generate_mod.TokenLogprob{
+    var t0 = [_]sampler.TokenLogprob{
         .{ .token_id = 1, .logprob = -0.1 },
         .{ .token_id = 2, .logprob = -9.0 },
         .{ .token_id = 3, .logprob = -9.5 },
@@ -23798,11 +23803,11 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     // candidate here: two would both render as U+FFFD and collide into a single
     // key. That collision is OpenAI's own shape reproduced faithfully, not a
     // defect this test should pin away.
-    var comp_top = [_]generate_mod.TokenLogprob{
+    var comp_top = [_]sampler.TokenLogprob{
         .{ .token_id = 1, .logprob = -0.1 },
         .{ .token_id = 2, .logprob = -9.0 },
     };
-    const comp_lps = [_]generate_mod.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
+    const comp_lps = [_]sampler.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
     var tbase: usize = 0;
     const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, &tbase);
     defer allocator.free(comp_json);
@@ -23815,7 +23820,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
 
     // Valid UTF-8 is untouched, including multi-byte that arrives whole.
     try tok.id_to_token.put(5, "é€");
-    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]generate_mod.TokenLogprob{});
+    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]sampler.TokenLogprob{});
     defer allocator.free(clean);
     const clean_parsed = try std.json.parseFromSlice(std.json.Value, allocator, clean, .{});
     defer clean_parsed.deinit();
@@ -24163,7 +24168,7 @@ test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it tak
     const cap = adaptCapFor(&cfg, seq);
 
     {
-        var st: generate_mod.AdaptiveWidthState = .{};
+        var st: mtp_plan.AdaptiveWidthState = .{};
         const h = prefillChunkCost(&cfg, kv_bits, 2048, kv);
         try t.expect(h < prefillChunkCost(&cfg, kv_bits, cap, kv));
         try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
@@ -24171,20 +24176,20 @@ test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it tak
     }
     // Several rungs in one call.
     {
-        var st: generate_mod.AdaptiveWidthState = .{};
+        var st: mtp_plan.AdaptiveWidthState = .{};
         const h = prefillChunkCost(&cfg, kv_bits, 512, kv);
         try t.expectEqual(@as(u32, 512), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
     }
     // No headroom at all: the ladder floor, never 0 (the loop reads 0 as "no change").
     {
-        var st: generate_mod.AdaptiveWidthState = .{};
+        var st: mtp_plan.AdaptiveWidthState = .{};
         const got = adaptivePrefillWidth(&cfg, kv_bits, kv, 0, cap, cap, &st);
-        try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), got);
+        try t.expectEqual(@as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)), got);
         try t.expect(got != 0);
     }
     {
-        var st: generate_mod.AdaptiveWidthState = .{};
-        const floor: u32 = @intCast(generate_mod.PREFILL_CHUNK_FLOOR);
+        var st: mtp_plan.AdaptiveWidthState = .{};
+        const floor: u32 = @intCast(prefill_plan.PREFILL_CHUNK_FLOOR);
         try t.expectEqual(floor, adaptivePrefillWidth(&cfg, kv_bits, kv, 0, floor, cap, &st));
     }
 }
@@ -24201,13 +24206,13 @@ test "adaptivePrefillWidth: HOLD is margin 1.0 — the admitted width is not sec
     const cap = adaptCapFor(&cfg, 786_432);
     const cost_2k = prefillChunkCost(&cfg, kv_bits, 2048, kv);
 
-    var st: generate_mod.AdaptiveWidthState = .{};
+    var st: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k, 2048, cap, &st));
     try t.expect(!st.ratcheted);
     try t.expect(cost_2k * 5 / 4 > cost_2k);
-    var st2: generate_mod.AdaptiveWidthState = .{};
+    var st2: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k * 5 / 4 - 1, 2048, cap, &st2));
-    var st3: generate_mod.AdaptiveWidthState = .{};
+    var st3: mtp_plan.AdaptiveWidthState = .{};
     try t.expect(adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k - 1, 2048, cap, &st3) < 2048);
 }
 
@@ -24224,14 +24229,14 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     const from: u32 = cap / 2;
     const cost_up = prefillChunkCost(&cfg, kv_bits, cap, kv);
 
-    var st: generate_mod.AdaptiveWidthState = .{};
+    var st: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st));
     try t.expectEqual(@as(u8, 1), st.supporting);
     try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st));
     try t.expectEqual(@as(u8, 0), st.supporting); // and the count restarts at the new width
 
     // Room for the wider chunk's bill but not its margin: never.
-    var st2: generate_mod.AdaptiveWidthState = .{};
+    var st2: mtp_plan.AdaptiveWidthState = .{};
     const between = cost_up * 5 / 4 - 1;
     try t.expect(between >= cost_up);
     var i: usize = 0;
@@ -24240,7 +24245,7 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     }
 
     // A single unsupporting probe resets the run.
-    var st3: generate_mod.AdaptiveWidthState = .{};
+    var st3: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st3));
     try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, between, from, cap, &st3));
     try t.expectEqual(@as(u8, 0), st3.supporting);
@@ -24271,9 +24276,9 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     try t.expect(hook_installed != adaptive);
 
     // A slot without the adaptive hook keeps the flat bound.
-    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptive));
-    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
-    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive));
+    try t.expectEqual(prefill_plan.TAIL_MERGE_MAX, prefill_plan.tailMergeMaxFor(512, adaptive));
+    try t.expectEqual(@as(usize, 812), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
+    try t.expectEqual(@as(usize, 1), prefill_plan.prefillChunkCount(812, 512, false, 0, 0, adaptive));
 
     const cfg = qwen4RequestTestConfig();
     per_request_chunk_override = true;
@@ -24283,8 +24288,8 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
     if (unpinned) {
-        try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
-        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 64), prefill_plan.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 512), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
     }
     try t.expect(!scheduler_mod.adaptiveChunkWidthFor(null));
     scheduler_mod.prefill_chunk_adaptive_enabled = null;
@@ -24303,9 +24308,9 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     try t.expect(!other.perRequestPrefillChunk());
     try t.expect(!adaptivePrefillChunkEnabled(&other));
     const off = adaptivePrefillChunkEnabled(&other);
-    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, off));
-    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(2048, off));
-    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off));
+    try t.expectEqual(prefill_plan.TAIL_MERGE_MAX, prefill_plan.tailMergeMaxFor(512, off));
+    try t.expectEqual(prefill_plan.TAIL_MERGE_MAX, prefill_plan.tailMergeMaxFor(2048, off));
+    try t.expectEqual(@as(usize, 812), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, off));
 
     const cfg = qwen4RequestTestConfig();
     try t.expect(cfg.perRequestPrefillChunk());
@@ -24315,12 +24320,12 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     defer adaptive_chunk_override = null;
     const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
-    try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
-    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 64), prefill_plan.tailMergeMaxFor(512, true));
+    try t.expectEqual(@as(usize, 512), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, true));
     // An operator pin turns the scaling back off.
     adaptive_chunk_override = false;
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
-    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptivePrefillChunkEnabled(&cfg)));
+    try t.expectEqual(prefill_plan.TAIL_MERGE_MAX, prefill_plan.tailMergeMaxFor(512, adaptivePrefillChunkEnabled(&cfg)));
 }
 
 test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
@@ -24333,7 +24338,7 @@ test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
     const cap = adaptCapFor(&cfg, 1_048_576);
 
     // Step down once, then hand it the whole machine: it stays (a re-widen would be a metronome).
-    var st: generate_mod.AdaptiveWidthState = .{};
+    var st: mtp_plan.AdaptiveWidthState = .{};
     const narrowed = adaptivePrefillWidth(&cfg, kv_bits, kv, prefillChunkCost(&cfg, kv_bits, 1024, kv), cap, cap, &st);
     try t.expect(narrowed < cap);
     try t.expect(st.ratcheted);
@@ -24343,13 +24348,13 @@ test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
     }
 
     // Nothing above the arch cap, ever.
-    var st2: generate_mod.AdaptiveWidthState = .{};
+    var st2: mtp_plan.AdaptiveWidthState = .{};
     i = 0;
     while (i < 8) : (i += 1) {
         try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, std.math.maxInt(u64) / 2, cap, cap, &st2));
     }
     // A cap of 0 (the unchunked vision arm) is "do not touch the width".
-    var st3: generate_mod.AdaptiveWidthState = .{};
+    var st3: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, 0, 2048, 0, &st3));
 }
 
@@ -24364,7 +24369,7 @@ test "adaptivePrefillWidth: a 1M prompt walks DOWN as the box fills, and a small
     const kv: u64 = 1_048_576;
     const cap = adaptCapFor(&cfg, 1_048_576);
 
-    var st: generate_mod.AdaptiveWidthState = .{};
+    var st: mtp_plan.AdaptiveWidthState = .{};
     var width: u32 = cap;
     var seen_narrower: usize = 0;
     var headroom: u64 = 50 * 1024 * MiB; // the wired-limit box, quiet
@@ -24372,19 +24377,19 @@ test "adaptivePrefillWidth: a 1M prompt walks DOWN as the box fills, and a small
     while (step < 64) : (step += 1) {
         const next = adaptivePrefillWidth(&cfg, kv_bits, kv, headroom, width, cap, &st);
         try t.expect(next <= width); // never widens after the first step-down
-        try t.expect(next >= @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+        try t.expect(next >= @as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)));
         try t.expect(next <= cap);
         try t.expect(prefillChunkCost(&cfg, kv_bits, next, kv) <= headroom or
-            next == @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+            next == @as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)));
         if (next < width) seen_narrower += 1;
         width = next;
         headroom -|= 1024 * MiB; // a co-tenant, or the accreting state
     }
     try t.expect(seen_narrower >= 2);
-    try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), width);
+    try t.expectEqual(@as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)), width);
 
     // A 32k prompt on the same box: the width never moves.
-    var st2: generate_mod.AdaptiveWidthState = .{};
+    var st2: mtp_plan.AdaptiveWidthState = .{};
     const cap32 = adaptCapFor(&cfg, 32_768);
     var w32: u32 = cap32;
     step = 0;
@@ -24435,11 +24440,11 @@ test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not a
 
     // Starts at half the cap so one widen step lands exactly on the cap.
     const from: u32 = cap / 2;
-    var st_short: generate_mod.AdaptiveWidthState = .{};
+    var st_short: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, from, cap, &st_short));
     try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, from, cap, &st_short));
 
-    var st_long: generate_mod.AdaptiveWidthState = .{};
+    var st_long: mtp_plan.AdaptiveWidthState = .{};
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, long_kv, headroom, from, cap, &st_long));
@@ -24448,9 +24453,9 @@ test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not a
 
     // The hold keeps its margin-1.0 semantics at the live KV.
     const hold = prefillChunkCost(&cfg, kv_bits, 2048, long_kv);
-    var st_hold: generate_mod.AdaptiveWidthState = .{};
+    var st_hold: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, hold, 2048, cap, &st_hold));
-    var st_down: generate_mod.AdaptiveWidthState = .{};
+    var st_down: mtp_plan.AdaptiveWidthState = .{};
     try t.expect(adaptivePrefillWidth(&cfg, kv_bits, long_kv, hold - 1, 2048, cap, &st_down) < 2048);
 }
 
@@ -25238,7 +25243,7 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     defer generate_mod.prefill_chunk_override = saved_override;
     generate_mod.prefill_chunk_override = 8192;
     const stride: u64 = 8192;
-    try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(ssm_checkpoint_stride, 8192));
+    try t.expectEqual(stride, prefill_plan.effectiveSsmCheckpointStride(ssm_checkpoint_stride, 8192));
 
     // Cold: `seq / stride` saturates at --ssm-checkpoint-max as before.
     try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
@@ -25531,8 +25536,8 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
 
     // The allocator side: the prefill loop asks for the whole request's capacity
     // before the first chunk writes, so no buffer grows mid-prefill.
-    try t.expect(generate_mod.reservedPrefillTokens(&cfg, seq, 2048, chunk) > seq);
-    try t.expectEqual(@as(u64, 0), generate_mod.reservedPrefillTokens(&cfg, 1024, 2048, chunk));
+    try t.expect(prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk) > seq);
+    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&cfg, 1024, 2048, chunk));
 
     // The bill side: headroom and the per-slot ring, nothing else acquired.
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
@@ -25564,7 +25569,7 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
     plain.model_type = "not_a_served_arch";
     try t.expect(!plain.reservesKvCapacity());
     try t.expectEqual(PrefillRequestTerms{}, prefillRequestTerms(&plain, seq, 2048, 8, chunk, .{}));
-    try t.expectEqual(@as(u64, 0), generate_mod.reservedPrefillTokens(&plain, seq, 2048, chunk));
+    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&plain, seq, 2048, chunk));
 }
 
 test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sheets" {
@@ -25672,7 +25677,7 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
     try t.expectEqual(@as(u32, 1024), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, need - 1, pin, 0, .{}));
 
     // The forward starts at 2048 and steps down per chunk only where a chunk stops fitting.
-    try t.expectEqual(@as(usize, 2048), generate_mod.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 0));
+    try t.expectEqual(@as(usize, 2048), prefill_plan.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 0));
     try t.expectEqual(explicitPrefillChunk() == 0, adaptivePrefillChunkEnabled(&cfg));
 
     // 2048 is a default: an explicit `--prefill-chunk 4096` raises the ladder's top rung, billed at that width.
@@ -25706,7 +25711,7 @@ test "mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has roo
     const terms = prefillRequestTerms(&cfg, seq, 2048, kv_bits, 2048, .{});
     const held = seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) + terms.reserved_kv_bytes + terms.state_bytes + terms.qsa_ring_bytes;
     const headroom = ceiling - resident - held;
-    var st: generate_mod.AdaptiveWidthState = .{};
+    var st: mtp_plan.AdaptiveWidthState = .{};
     var pos: u64 = 0;
     while (pos < seq) : (pos += 2048) try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, pos, headroom, 2048, 2048, &st));
 }
@@ -26278,9 +26283,9 @@ test "think penalty: arms a thinking request whose think markers are single toke
     const close: u32 = 8;
     const prompt_opened = thinkPenaltyFor(1.5, true, open, close, true);
     try t.expectEqual(@as(f32, 1.5), prompt_opened.lambda);
-    try t.expectEqual(generate_mod.ThinkPenalty.Phase.inside, prompt_opened.phase);
+    try t.expectEqual(think_penalty.ThinkPenalty.Phase.inside, prompt_opened.phase);
     try t.expectEqual(close, prompt_opened.closer_id);
-    try t.expectEqual(generate_mod.ThinkPenalty.Phase.before, thinkPenaltyFor(1.5, true, open, close, false).phase);
+    try t.expectEqual(think_penalty.ThinkPenalty.Phase.before, thinkPenaltyFor(1.5, true, open, close, false).phase);
     try t.expect(!thinkPenaltyFor(0, true, open, close, true).armed());
     try t.expect(!thinkPenaltyFor(1.5, false, open, close, true).armed());
     try t.expect(!thinkPenaltyFor(1.5, true, open, null, true).armed());
@@ -26890,7 +26895,7 @@ test "GLM requests prefill at 2048 and step down a rung only where a chunk stops
     const available: u64 = 115_904 * 1024 * 1024 - 104_350_000_000;
     const top: u64 = 1_048_576 - 256;
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, available, 2048, 0, .{}));
-    var st: generate_mod.AdaptiveWidthState = .{};
+    var st: mtp_plan.AdaptiveWidthState = .{};
     const kv_top = sessionBytesPerToken(&cfg, kv_bits) * top;
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, top, available - kv_top, 2048, 2048, &st));
 
@@ -27123,7 +27128,7 @@ test "GLM billed checkpoint peak equals the checkpoints its prefill captures, wh
         ssm_checkpoint_stride = stride;
         for (cases) |c| for (0..9) |cap_usize| {
             const cap: u32 = @intCast(cap_usize);
-            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, c.matched, c.seq - c.matched, 2048);
+            const oracle = glm5_generate.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, c.matched, c.seq - c.matched, 2048);
             const billed = glmPrefixStateBytes(&cfg, c.seq, .{ .matched_tokens = c.matched, .checkpoints = cap });
             const want: u64 = if (cap == 0) 0 else @as(u64, oracle.peak) * per_cp;
             std.testing.expectEqual(want, billed) catch |e| {
@@ -27163,7 +27168,7 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
         const staged: u64 = 0;
         for ([_]u64{ 64, 131_072, 900_000, 1_040_000 }) |seq| {
             const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
-            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, 0, seq, 2048);
+            const oracle = glm5_generate.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, 0, seq, 2048);
             // Eight spread checkpoints below the newest, each at its real size.
             var positions: [8]usize = undefined;
             const bytes: [8]u64 = @splat(per_cp);

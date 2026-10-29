@@ -26,6 +26,7 @@ const glm5_forward = @import("glm5/glm5_forward.zig");
 const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const dsv41_model = @import("dsv41/dsv41_model.zig");
 const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
+const prefill_plan = @import("prefill_plan.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -13165,7 +13166,6 @@ test "GLM SSD-only: a restore at an 8192 grid point reads SSD like a cold prefil
 test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD, holding two states, and a grid point restores its state" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
-    const generate_mod = @import("generate.zig");
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -13198,12 +13198,12 @@ test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD
         for (cps.items) |*cp| cp.deinit(testing.allocator);
         cps.deinit(testing.allocator);
     }
-    const stride = generate_mod.effectiveSsmCheckpointStride(256, 8192);
-    const loop_end = len - 1 - generate_mod.SSM_SNAPSHOT_BACKOFF;
+    const stride = prefill_plan.effectiveSsmCheckpointStride(256, 8192);
+    const loop_end = len - 1 - prefill_plan.SSM_SNAPSHOT_BACKOFF;
     var peak: usize = 0;
     var pos: usize = 0;
     while (pos < loop_end) {
-        pos = generate_mod.nextChunkEnd(pos, loop_end, 8192, true, stride, 0, true);
+        pos = prefill_plan.nextChunkEnd(pos, loop_end, 8192, true, stride, 0, true);
         if (pos % stride == 0) {
             try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[cps.items.len], pos, s));
             peak = @max(peak, pcHeld(cps.items));

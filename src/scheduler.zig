@@ -70,7 +70,7 @@ const ForwardCtx = transformer_mod.ForwardCtx;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
-const SamplingParams = generate_mod.SamplingParams;
+const SamplingParams = sampler.SamplingParams;
 const dflash_mod = @import("dflash.zig");
 const glm5_forward_mod = @import("glm5/glm5_forward.zig");
 const round_cost_mod = @import("round_cost.zig");
@@ -329,7 +329,7 @@ pub var prefill_chunk_adapt: ?*const fn (
     usize,
     u32,
     u32,
-    *generate_mod.AdaptiveWidthState,
+    *mtp_plan.AdaptiveWidthState,
     u64,
 ) u32 = null;
 
@@ -741,7 +741,7 @@ pub const Slot = struct {
     /// `logprobs_n > 0`. The conn thread takes ownership via
     /// `nonStreamingViaScheduler` (or equivalent) at completion; if the
     /// caller doesn't consume, `Slot.deinit` frees the contents.
-    logprobs_buf: std.ArrayList(generate_mod.LogprobResult),
+    logprobs_buf: std.ArrayList(sampler.LogprobResult),
 
     /// Initialize but do NOT take ownership of caches — those are allocated
     /// inside `init` from the slot's allocator.
@@ -976,7 +976,7 @@ pub const Slot = struct {
     /// buffer at completion and is blind to both, which is why the streaming
     /// gap survived: it is invisible to output-equality tests AND to llmprobe,
     /// which probes logprobs non-streaming only.
-    pub fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
+    pub fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?sampler.LogprobResult) void {
         if (self.takeHandoverEcho(t)) return;
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -1004,7 +1004,7 @@ pub const Slot = struct {
         self: *Slot,
         allocator: std.mem.Allocator,
         cursor: usize,
-        out: *std.ArrayList(generate_mod.LogprobResult),
+        out: *std.ArrayList(sampler.LogprobResult),
     ) !usize {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -1016,7 +1016,7 @@ pub const Slot = struct {
 
     /// Connection thread: take ownership of the first `limit` logprob entries. A slot cancelled
     /// mid-decode may hold entries for tokens the caller never read; those are freed here.
-    pub fn takeLogprobs(self: *Slot, limit: usize) ?[]generate_mod.LogprobResult {
+    pub fn takeLogprobs(self: *Slot, limit: usize) ?[]sampler.LogprobResult {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         while (self.logprobs_buf.items.len > limit) self.allocator.free(self.logprobs_buf.pop().?.top_logprobs);
@@ -2339,7 +2339,7 @@ pub const Scheduler = struct {
             if (cf.pending()) return .forced_call;
         }
         if (slot.logprobs_n > 0) return .logprobs;
-        if (generate_mod.penaltyActive(slot.sampling)) return .penalty;
+        if (sampler.penaltyActive(slot.sampling)) return .penalty;
         // Ask the transformer, never name the arch here — same rule as `modelExclusiveDecode`.
         const t = slot.model.transformer orelse return .arch;
         return if (t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode() or t.supportsBatchedGlmRows()) .ok else .arch;
@@ -2735,7 +2735,7 @@ fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         const s = sch.pending.items[idx];
         const cfg = s.model.config orelse continue;
         if (s.model.transformer == null) continue;
-        bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, generate_mod.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp);
+        bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, prefill_plan.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp);
     }
     const admitted = admitsWithinMemory(bills[0..n], live, outstanding);
     for (admit_idx[0..admitted], bills[0..admitted]) |idx, bill| sch.pending.items[idx].growth_commit = if (bill) |b| b.commit else 0;
@@ -2903,8 +2903,8 @@ const LaunchPicks = struct {
     fn of(mtp_flag: ?bool, kv_flag: ?transformer_mod.KVQuantConfig, config: *const ModelConfig) LaunchPicks {
         return .{
             .mtp = mtpChoiceFor(mtp_flag orelse true, mtp_flag != null, config),
-            .acceptance = generate_mod.mtpAcceptanceFor(config.mtp_acceptance_override),
-            .greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
+            .acceptance = mtp_plan.mtpAcceptanceFor(config.mtp_acceptance_override),
+            .greedy_tail = mtp_plan.mtpGreedyTailFor(config.mtp_greedy_tail_override),
             .kv = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_flag orelse transformer_mod.KVQuantConfig.engine_default, kv_flag != null),
         };
     }
@@ -4526,7 +4526,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
-    generate_mod.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
+    sampler.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
     generate_mod.installThinkMarkers(xfm_ptr, params.tok);
     try generate_mod.installLogitBias(sch.io, xfm_ptr, params.tok);
 
@@ -4545,8 +4545,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const kv_quant_config = kv_cache.config;
     const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
     const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
-    const acceptance = generate_mod.mtpAcceptanceFor(params.config.mtp_acceptance_override);
-    const greedy_tail = generate_mod.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
+    const acceptance = mtp_plan.mtpAcceptanceFor(params.config.mtp_acceptance_override);
+    const greedy_tail = mtp_plan.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
     // GLM has no MTP head; the server's `MTP: off` line already says so.
     if (!params.config.isGlm5() and !params.config.isDsv41()) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
         if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
@@ -6597,14 +6597,14 @@ pub const LoopStop = struct {
     /// client's decision ("this turn is unusable, don't feed it back") is the
     /// same whichever tier convicted, and the tier is in the log.
     finish_details: []const u8 = "repetition_loop",
-    tier: generate_mod.DegenerateTail.Tier,
+    tier: degenerate.DegenerateTail.Tier,
     trim_start: usize,
 };
 
 /// Pure decision + trim point. The three tiers live in generate.zig
 /// (`degenerateTail`); this is where their verdict becomes server behaviour.
 pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
-    const d = generate_mod.degenerateTail(generated_ids) orelse return null;
+    const d = degenerate.degenerateTail(generated_ids) orelse return null;
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
@@ -7161,7 +7161,7 @@ fn chunkWidthCb(
     pos: usize,
     cur: u32,
     cap: u32,
-    st: *generate_mod.AdaptiveWidthState,
+    st: *mtp_plan.AdaptiveWidthState,
 ) u32 {
     const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
     const cfg = wc.cfg orelse return cur;
@@ -7499,7 +7499,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Placeholder rows the restored prefix already holds: their embeddings are never read, so the
     // media is encoded only now that the restore is known.
     const vision_consumed: usize = if (hot_matched > 0)
-        generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.video_token_id)
+        prefill_plan.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.video_token_id)
     else
         0;
     var vision_skipped: usize = 0;
@@ -7568,7 +7568,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .seq = slot.full_prompt.len,
                 .max_tokens = slot.max_tokens,
                 .kv_cfg = slot.cache.config,
-                .unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+                .unchunked = prefill_plan.visionPrefillUnchunked(slot.vision_embeddings != null),
                 .warm_matched = hot_matched,
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
@@ -7636,7 +7636,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             slot.full_prompt.len,
             slot.max_tokens,
             slot.cache.config,
-            generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+            prefill_plan.visionPrefillUnchunked(slot.vision_embeddings != null),
             hot_matched,
             slot.cache.residentCapacityTokens(),
             hot_checked_out,
@@ -7710,8 +7710,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Use the resolved thinking mode and normalize the M5/block-16
             // calibration to this machine's effective assistant width.
             .mtp_enabled = use_head_mtp,
-            .mtp_acceptance = generate_mod.mtpAcceptanceFor(slot.model.config.?.mtp_acceptance_override).value,
-            .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override).value,
+            .mtp_acceptance = mtp_plan.mtpAcceptanceFor(slot.model.config.?.mtp_acceptance_override).value,
+            .mtp_greedy_tail = mtp_plan.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override).value,
             .mtp = if (use_head_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,
@@ -8182,7 +8182,7 @@ const LoopAction = enum { cut, close_thought };
 /// A loop convicted INSIDE an open think block is recoverable once per request: the
 /// bound's early-stop line and closer are committed and the model answers. Anything else
 /// (answer-side loop, a second loop, no room before `max_tokens`) keeps the ordinary cut.
-fn loopRecoveryAction(tb: *generate_mod.ThinkBound, ids: []const u32, completion_tokens: u32, max_tokens: u32, recovered: bool) LoopAction {
+fn loopRecoveryAction(tb: *mtp_plan.ThinkBound, ids: []const u32, completion_tokens: u32, max_tokens: u32, recovered: bool) LoopAction {
     tb.observe(ids);
     if (recovered or tb.fired or !tb.in_think) return .cut;
     if (!generate_mod.forcedBoundaryCanContinue(completion_tokens, max_tokens, tb.forced.len + 1)) return .cut;
@@ -8193,9 +8193,9 @@ fn loopRecoveryAction(tb: *generate_mod.ThinkBound, ids: []const u32, completion
 /// is built here, not at request start: a request carrying a `think_bound` is refused DFlash2.
 /// True = the slot's tick is spent.
 fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
-    var lazy: ?generate_mod.ThinkBound = null;
+    var lazy: ?mtp_plan.ThinkBound = null;
     defer if (lazy) |b| slot.allocator.free(b.forced);
-    const tb: *generate_mod.ThinkBound = gen.sampling.think_bound orelse blk: {
+    const tb: *mtp_plan.ThinkBound = gen.sampling.think_bound orelse blk: {
         const tok = slot.model.tokenizer orelse return false;
         lazy = @import("server.zig").loopCloseBound(slot.allocator, slot.model, tok, slot.full_prompt, slot.enable_thinking) orelse return false;
         break :blk &lazy.?;
@@ -8296,7 +8296,7 @@ fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     const open = tok.specialTokenId("<think>") orelse return;
     const close = tok.specialTokenId("</think>") orelse return;
     if (std.mem.indexOfScalar(u32, slot.full_prompt[slot.full_prompt.len - 2 ..], open) == null) return;
-    gen.thought_point = .{ .closer = close, .grid = grid, .min_tokens = generate_mod.thought_point_min_tokens, .base = slot.full_prompt.len };
+    gen.thought_point = .{ .closer = close, .grid = grid, .min_tokens = mtp_plan.thought_point_min_tokens, .base = slot.full_prompt.len };
 }
 
 /// A thought the next prompt would re-render differently is no restore point: its state is dropped before the commit.
@@ -8311,8 +8311,8 @@ fn settleThoughtPoint(slot: *Slot, gen: *Generator) void {
     defer slot.allocator.free(first);
     const tail = tok.decode(slot.allocator, generated[end - 2 .. end]) catch return gen.dropThoughtPoint();
     defer slot.allocator.free(tail);
-    const style: generate_mod.CloserStyle = if (gen.glm_dflash_native) .bare_closer else .newline_before_closer;
-    if (!generate_mod.thoughtEdgesSurvive(style, first, tail)) {
+    const style: mtp_plan.CloserStyle = if (gen.glm_dflash_native) .bare_closer else .newline_before_closer;
+    if (!mtp_plan.thoughtEdgesSurvive(style, first, tail)) {
         log.info("[prefix] no thought restore point: the template re-renders the thought's edges\n", .{});
         gen.dropThoughtPoint();
     }
@@ -8370,7 +8370,7 @@ fn thinkBoundForcesPlain(gen: *const Generator) bool {
 /// closes the thought: null = unbounded, 0 = the room's last token runs plain. `observe` first.
 fn thinkBoundDraftLimit(gen: *const Generator) ?u32 {
     const room = (gen.sampling.think_bound orelse return null).room() orelse return null;
-    return generate_mod.mtpDraftCapForRoom(room) orelse 0;
+    return mtp_plan.mtpDraftCapForRoom(room) orelse 0;
 }
 
 /// A solo or grouped MTP round keeps the tighter of its own cap and the thought room, or runs the
@@ -8477,7 +8477,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // Published in the SAME critical section as the token so a streaming
     // reader that has been handed token i can read entry i — see
     // `pushTokenWithLogprob`.
-    var lp_take: ?generate_mod.LogprobResult = null;
+    var lp_take: ?sampler.LogprobResult = null;
     if (slot.logprobs_n > 0) {
         if (gen.last_logprob) |lp| {
             lp_take = lp;
@@ -8708,7 +8708,7 @@ fn slotMimoMtpCrowdable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or generate_mod.penaltyActive(slot.sampling)) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedMimoDecode()) return false;
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
@@ -8757,7 +8757,7 @@ fn glmRowsInCompany(slot: *const Slot, drafting: []const *Slot, plain: []const *
 fn slotGlmRowable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!gen.glm_dflash_native or gen.dflash_ctx == null or gen.done) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or generate_mod.penaltyActive(slot.sampling)) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
     const t = slot.model.transformer orelse return false;
     return t.supportsBatchedGlmRows();
 }
@@ -8775,6 +8775,10 @@ fn slotMtpGroupable(slot: *const Slot) bool {
 }
 
 const Planner = @import("mtp_group_planner.zig");
+const degenerate = @import("degenerate.zig");
+const mtp_plan = @import("mtp_plan.zig");
+const prefill_plan = @import("prefill_plan.zig");
+const sampler = @import("sampler.zig");
 
 fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.GroupShape {
     const xfm = slots[0].model.transformer.?;
@@ -8783,7 +8787,7 @@ fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.GroupSh
         const gen = &slot.legacy_gen.?;
         const kv: u8 = @intCast(xfm.round_cost.bucketOf(@intCast(slot.moe_seq_offset)));
         if (width == 0) {
-            shape.rows[i] = group_cost_mod.GroupShape.row(0, 0, 0, kv, 0, 0, group_cost_mod.GroupShape.samplingMode(false, false, false, !generate_mod.isGreedyTemperature(gen.sampling.temperature)));
+            shape.rows[i] = group_cost_mod.GroupShape.row(0, 0, 0, kv, 0, 0, group_cost_mod.GroupShape.samplingMode(false, false, false, !sampler.isGreedyTemperature(gen.sampling.temperature)));
         } else {
             const off = Generator.mtpRoundOff0(gen.mtp_hist_stash, gen.mtp_cache.?.step());
             const history = 1 + if (gen.mtp_hist_stash) |stash| stash.n else @as(usize, 0);
@@ -9039,7 +9043,7 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     var pending_draft = false;
     for (active, 0..) |slot, i| {
         if (slot.model != active[0].model or !slot.allow_batch_mtp) return false;
-        if (generate_mod.penaltyActive(slot.sampling)) return false;
+        if (sampler.penaltyActive(slot.sampling)) return false;
         const gen = if (slot.legacy_gen) |*g| g else return false;
         if (gen.ctx.mrope_pos != null) return false;
         pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
@@ -9183,7 +9187,7 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
 /// A plain batched tick samples no repeat or presence penalty, so a penalised slot keeps its MTP round.
 fn anyPenalised(slots: []const *Slot) bool {
     for (slots) |slot| {
-        if (generate_mod.penaltyActive(slot.sampling)) return true;
+        if (sampler.penaltyActive(slot.sampling)) return true;
     }
     return false;
 }
@@ -9585,7 +9589,7 @@ fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, exp
     for (live, states, 0..) |slot, st, i| {
         const chain = st.chain;
         if (chain.m > round_cost_mod.MAX_WIDTH or chain.n_drafted > round_cost_mod.MAX_WIDTH or chain.head_input_rows > round_cost_mod.MAX_WIDTH + 2) return;
-        const mode = group_cost_mod.GroupShape.samplingMode(slot.legacy_gen.?.mtp.?.canRerankDrafts(), chain.conf_arrs != null, chain.q_probs != null, !generate_mod.isGreedyTemperature(slot.legacy_gen.?.sampling.temperature));
+        const mode = group_cost_mod.GroupShape.samplingMode(slot.legacy_gen.?.mtp.?.canRerankDrafts(), chain.conf_arrs != null, chain.q_probs != null, !sampler.isGreedyTemperature(slot.legacy_gen.?.sampling.temperature));
         key.rows[i] = group_cost_mod.GroupShape.row(@intCast(chain.m), @intCast(chain.n_drafted), @intCast(@min(chain.plan.m_lo, chain.n_drafted)), @intCast(xfm.round_cost.bucketOf(@intCast(st.moe_seq_offset_snap))), @intCast(xfm.round_cost.bucketOf(@intCast(chain.off0))), @intCast(chain.head_input_rows), mode);
         key.padding += @intCast(st.verify_len - (1 + chain.m));
     }
@@ -9949,7 +9953,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // the initWithOptions chokepoint and carries the model's
     // reserved-token suppression mask; the slot's copy is the raw
     // request params.
-    var sample_params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
+    var sample_params: [MAX_BATCH_GROUP]sampler.SamplingParams = undefined;
     var sample_rows: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
     var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
     std.debug.assert(batch.len == logits_arr.len);
@@ -9965,7 +9969,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         sample_params[i] = gen.sampling;
     }
     if (batch.len > 0) {
-        try generate_mod.sampleRows(sample_ids[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], xfm_ptr.s);
+        try sampler.sampleRows(sample_ids[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], xfm_ptr.s);
         for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
     }
 
@@ -10839,7 +10843,7 @@ test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not 
 
     // Collapse into a short cycle (the php.html shape: "server-side scripting
     // language, " ≈ a 6-token cycle) past the guard's span threshold.
-    for (0..generate_mod.degenerate_loop_min_span / 6 + 1) |_| {
+    for (0..degenerate.degenerate_loop_min_span / 6 + 1) |_| {
         for ([_]u32{ 101, 202, 303, 404, 505, 606 }) |t| {
             try ids.append(testing.allocator, t);
         }
@@ -10862,7 +10866,7 @@ test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
     // 58-token cycle, one rep short of the tier's span bar: NOT cut.
     var cycle: [58]u32 = undefined;
     for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(1000 + i));
-    for (0..generate_mod.degenerate_loop_long_min_span / cycle.len) |_| try ids.appendSlice(testing.allocator, &cycle);
+    for (0..degenerate.degenerate_loop_long_min_span / cycle.len) |_| try ids.appendSlice(testing.allocator, &cycle);
     try testing.expect(loopStopReason(ids.items) == null);
 
     // The next repetition crosses it — cut as an intentional stop.
@@ -10875,14 +10879,14 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(testing.allocator);
     try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6, 7 });
-    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
+    for (0..degenerate.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
     }
 
     const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("stop", stop.finish_reason);
     try testing.expectEqualStrings("repetition_loop", stop.finish_details);
-    try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
+    try testing.expectEqual(degenerate.DegenerateTail.Tier.exact_cycle, stop.tier);
     // Trimmed to the honest prefix plus one copy of the cycle.
     try testing.expectEqual(@as(usize, 6), stop.trim_start);
 
@@ -10894,7 +10898,7 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
 
     // A new loop wholly inside the constrained answer retains the existing
     // stop/repetition result, with an absolute trim point for response code.
-    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
+    for (0..degenerate.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
     }
     const answer_loop = loopStopDecision(ids.items[answer_start..]) orelse return error.TestExpectedLoopCut;
@@ -10934,7 +10938,7 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
         &[_]u32{ 40, 41, 42, 43, 44, 45, 50, 46 },
     };
     var i: usize = 0;
-    while (ids.items.len < generate_mod.near_repeat_min_span + 32) : (i += 1) {
+    while (ids.items.len < degenerate.near_repeat_min_span + 32) : (i += 1) {
         try ids.appendSlice(testing.allocator, phrasings[i % phrasings.len]);
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
@@ -10945,7 +10949,7 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
     var healthy = std.ArrayList(u32).empty;
     defer healthy.deinit(testing.allocator);
     var line: u32 = 0;
-    while (healthy.items.len < generate_mod.near_repeat_window + 32) : (line += 1) {
+    while (healthy.items.len < degenerate.near_repeat_window + 32) : (line += 1) {
         try healthy.appendSlice(testing.allocator, &[_]u32{ 10, 11, 12 });
         try healthy.append(testing.allocator, 1000 + line);
         try healthy.appendSlice(testing.allocator, &[_]u32{ 13, 14 });
@@ -11049,7 +11053,7 @@ test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained
     try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .constraint = &constraint }, 0));
     try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .presence_penalty = 1 }, 0));
     try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 1));
-    var think_bound: generate_mod.ThinkBound = undefined;
+    var think_bound: mtp_plan.ThinkBound = undefined;
     try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_bound = &think_bound }, 0));
 }
 
@@ -11373,7 +11377,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
 test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP ticks" {
     var t: transformer_mod.Transformer = undefined;
     var forced = [_]u32{7};
-    var tb = generate_mod.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
+    var tb = mtp_plan.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
     var gen: Generator = undefined;
     gen.sampling = .{ .think_bound = &tb };
     gen.think_closed_by_loop = false;
@@ -11398,7 +11402,7 @@ test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP
 
 test "a fired thinking bound keeps a DSpark slot in DSpark ticks, unless the close left it disabled" {
     var forced = [_]u32{7};
-    var tb = generate_mod.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
+    var tb = mtp_plan.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
     var gen: Generator = undefined;
     gen.sampling = .{ .think_bound = &tb };
     gen.think_closed_by_loop = false;
@@ -11419,12 +11423,12 @@ test "an MTP round never accepts past the position serial decode closes the thou
     // Serial decode fires when the thought holds `budget` tokens; a round emits t1 plus its accepted drafts.
     for ([_]u32{ 1, 2, 3, 9, 48 }) |budget| {
         for ([_]u32{ 0, 1, 2, 3, 5, 8 }) |accept_every| {
-            var tb = generate_mod.ThinkBound{ .budget = budget, .opener_id = null, .closer_id = 99, .forced = &.{99}, .in_think = true };
+            var tb = mtp_plan.ThinkBound{ .budget = budget, .opener_id = null, .closer_id = 99, .forced = &.{99}, .in_think = true };
             var emitted: u32 = 0;
             var rounds: u32 = 0;
             while (!tb.due()) : (rounds += 1) {
                 const room = tb.room().?;
-                const drafts: u32 = generate_mod.mtpDraftCapForRoom(room) orelse 0;
+                const drafts: u32 = mtp_plan.mtpDraftCapForRoom(room) orelse 0;
                 const accepted = @min(drafts, accept_every);
                 emitted += 1 + accepted;
                 tb.count = emitted;
@@ -11433,10 +11437,10 @@ test "an MTP round never accepts past the position serial decode closes the thou
             try testing.expectEqual(budget, emitted);
         }
     }
-    var tb = generate_mod.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
+    var tb = mtp_plan.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
     try testing.expectEqual(@as(?u32, 1), tb.room());
-    try testing.expectEqual(@as(?u32, null), generate_mod.mtpDraftCapForRoom(1));
-    try testing.expectEqual(@as(?u32, 3), generate_mod.mtpDraftCapForRoom(4));
+    try testing.expectEqual(@as(?u32, null), mtp_plan.mtpDraftCapForRoom(1));
+    try testing.expectEqual(@as(?u32, 3), mtp_plan.mtpDraftCapForRoom(4));
     tb.fired = true;
     try testing.expectEqual(@as(?u32, null), tb.room());
     tb.fired = false;
@@ -11445,7 +11449,7 @@ test "an MTP round never accepts past the position serial decode closes the thou
 }
 
 test "the last thought token before the bound runs serial, wider rooms cap the drafts" {
-    var tb = generate_mod.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
+    var tb = mtp_plan.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
     var gen: Generator = undefined;
     gen.sampling = .{ .think_bound = &tb };
     gen.mtp_group_cap = 0;
@@ -11465,7 +11469,7 @@ test "the last thought token before the bound runs serial, wider rooms cap the d
 }
 
 test "a group's row cap and the thought room both bound a round's drafts" {
-    var tb = generate_mod.ThinkBound{ .budget = 12, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 1 };
+    var tb = mtp_plan.ThinkBound{ .budget = 12, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 1 };
     var gen: Generator = undefined;
     gen.sampling = .{ .think_bound = &tb };
     // Room 11 leaves the group's row cap of 3 in force.
@@ -11482,7 +11486,7 @@ test "a group's row cap and the thought room both bound a round's drafts" {
 }
 
 test "a planner row never gets more drafts than its thought room" {
-    var tb = generate_mod.ThinkBound{ .budget = 20, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 0 };
+    var tb = mtp_plan.ThinkBound{ .budget = 20, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 0 };
     var gen: Generator = undefined;
     gen.mtp_depth = 4;
     gen.mtp_depth_current = 4;
@@ -11505,7 +11509,7 @@ test "a planner row never gets more drafts than its thought room" {
 test "a plain batched tick checks the thinking budget before its rows forward" {
     // A thought past its budget with no room left to close it: the bound fires, the slot decodes on.
     const forced = [_]u32{ 9, 7 };
-    var tb = generate_mod.ThinkBound{ .budget = 2, .opener_id = 5, .closer_id = 7, .forced = &forced, .in_think = false };
+    var tb = mtp_plan.ThinkBound{ .budget = 2, .opener_id = 5, .closer_id = 7, .forced = &forced, .in_think = false };
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(testing.allocator);
     try ids.appendSlice(testing.allocator, &.{ 5, 11, 12, 13 });
@@ -13430,11 +13434,11 @@ test "loop recovery: a loop inside an open think block closes the thought once" 
     const OPEN: u32 = 10;
     const CLOSE: u32 = 11;
     const forced = [_]u32{ 30, 31, CLOSE, 32 };
-    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    var tb = mtp_plan.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(testing.allocator);
     try ids.appendSlice(testing.allocator, &.{ 5, 6 });
-    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| try ids.appendSlice(testing.allocator, &.{ 101, 102, 103 });
+    for (0..degenerate.degenerate_loop_min_span / 3 + 1) |_| try ids.appendSlice(testing.allocator, &.{ 101, 102, 103 });
 
     try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&tb, ids.items, 400, 4096, false));
     // No room to close the thought: the ordinary cut.
@@ -13447,11 +13451,11 @@ test "loop recovery: an answer-side loop is still cut, a thought the prompt open
     const OPEN: u32 = 10;
     const CLOSE: u32 = 11;
     const forced = [_]u32{ 30, CLOSE, 32 };
-    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    var tb = mtp_plan.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
     const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096, false));
 
-    var reopened = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = false };
+    var reopened = mtp_plan.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = false };
     const inside = [_]u32{ 7, OPEN, 5, 6 };
     try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&reopened, &inside, 4, 4096, false));
 }

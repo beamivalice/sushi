@@ -5,6 +5,7 @@ const model = @import("../model.zig");
 const base = @import("glm5_model.zig");
 const primitive = @import("glm5_next.zig");
 const exl3 = @import("sushi_exl3");
+const sampler = @import("../sampler.zig");
 const Arr = mlx.mlx_array;
 const Ops = base.Ops;
 const Linear = base.Linear;
@@ -623,7 +624,7 @@ pub const Model = struct {
     pub fn samplingLogits(self: *const Model, ops: *Ops, logits: Arr) !Arr {
         const mask = self.suppress_mask orelse return logits;
         const out = try ops.slot();
-        try @import("../generate.zig").applySuppressMask(out, logits, mask, self.s);
+        try sampler.applySuppressMask(out, logits, mask, self.s);
         return out.*;
     }
 

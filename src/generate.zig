@@ -45,100 +45,11 @@ const dspark_rows = @import("dsv41/dspark_rows.zig");
 const row_grammar = @import("row_grammar.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
-pub const ThinkPenalty = think_penalty.ThinkPenalty;
 const glm5_generate = @import("glm5/glm5_generate.zig");
-pub const glmChunkEnd = glm5_generate.glmChunkEnd;
-pub const GlmCaptureSchedule = glm5_generate.GlmCaptureSchedule;
-pub const glmCaptureSchedule = glm5_generate.glmCaptureSchedule;
-const restorableCheckpoint = glm5_generate.restorableCheckpoint;
-pub const glmCaptureOracle = glm5_generate.glmCaptureOracle;
 const sampler = @import("sampler.zig");
-pub const TokenLogprob = sampler.TokenLogprob;
-pub const LogprobResult = sampler.LogprobResult;
-pub const isGreedyTemperature = sampler.isGreedyTemperature;
-pub const SamplingParams = sampler.SamplingParams;
-pub const argmaxOnlyRequest = sampler.argmaxOnlyRequest;
-pub const installSuppressMask = sampler.installSuppressMask;
-pub const applySuppressMask = sampler.applySuppressMask;
-pub const penaltyActive = sampler.penaltyActive;
-const penaltiesOf = sampler.penaltiesOf;
-const probsAllPositions = sampler.probsAllPositions;
-const groupProbsBlock = sampler.groupProbsBlock;
-const groupProbsRow = sampler.groupProbsRow;
-const probsAtLastPos = sampler.probsAtLastPos;
-const probAt = sampler.probAt;
-const sampleFromProbs = sampler.sampleFromProbs;
-const pldOneHotRow = sampler.pldOneHotRow;
-const selectorQRow = sampler.selectorQRow;
-const shortlistProposal = sampler.shortlistProposal;
-const argmaxStepProposal = sampler.argmaxStepProposal;
-const shortlistStepProposal = sampler.shortlistStepProposal;
-const logitsStepProposal = sampler.logitsStepProposal;
-const shortlistProposalRows = sampler.shortlistProposalRows;
-const sampleResidual = sampler.sampleResidual;
-const sampleFromProbsLazy = sampler.sampleFromProbsLazy;
-const penalizedSampleLazy = sampler.penalizedSampleLazy;
-const firstTokenSample = sampler.firstTokenSample;
-pub const sampleTokenLazy = sampler.sampleTokenLazy;
-pub const sampleRows = sampler.sampleRows;
-const sampleRowsHomogeneous = sampler.sampleRowsHomogeneous;
-const sampleRowsAnySeed = sampler.sampleRowsAnySeed;
-const seedKey = sampler.seedKey;
-const SampleResult = sampler.SampleResult;
-const MarkerShift = sampler.MarkerShift;
-const sampleToken = sampler.sampleToken;
-const firstTokenLogprobs = sampler.firstTokenLogprobs;
-const computeLogprobs = sampler.computeLogprobs;
-const applyGrammarMask = sampler.applyGrammarMask;
-const applyRowMasks = sampler.applyRowMasks;
 const prefill_plan = @import("prefill_plan.zig");
-pub const PREFILL_CHUNK_FLOOR = prefill_plan.PREFILL_CHUNK_FLOOR;
-pub const boundedPrefillChunk = prefill_plan.boundedPrefillChunk;
-pub const effectivePrefillChunk = prefill_plan.effectivePrefillChunk;
-pub const requestPrefillChunk = prefill_plan.requestPrefillChunk;
-const thinHeldCheckpoints = prefill_plan.thinHeldCheckpoints;
-pub const TAIL_MERGE_MAX = prefill_plan.TAIL_MERGE_MAX;
-pub const tailMergeMaxFor = prefill_plan.tailMergeMaxFor;
-pub const nextChunkEnd = prefill_plan.nextChunkEnd;
-pub const SSM_SNAPSHOT_BACKOFF = prefill_plan.SSM_SNAPSHOT_BACKOFF;
-pub const ssmSnapshotBackoff = prefill_plan.ssmSnapshotBackoff;
-pub const effectiveSsmCheckpointStride = prefill_plan.effectiveSsmCheckpointStride;
-pub const reservedPrefillTokens = prefill_plan.reservedPrefillTokens;
-pub const shouldCheckpointSsmPrefill = prefill_plan.shouldCheckpointSsmPrefill;
-pub const visionChunkedPrefillEnabled = prefill_plan.visionChunkedPrefillEnabled;
-pub const visionPrefillUnchunked = prefill_plan.visionPrefillUnchunked;
-pub const countSpliceRows = prefill_plan.countSpliceRows;
-pub const prefillChunkCount = prefill_plan.prefillChunkCount;
-pub const CACHE_CLEAR_INTERVAL = prefill_plan.CACHE_CLEAR_INTERVAL;
-pub const shouldClearAllocatorCache = prefill_plan.shouldClearAllocatorCache;
-pub const clearsPoolAtPrefillEnd = prefill_plan.clearsPoolAtPrefillEnd;
 const mtp_plan = @import("mtp_plan.zig");
-pub const mtpAcceptanceFor = mtp_plan.mtpAcceptanceFor;
-pub const mtpGreedyTailFor = mtp_plan.mtpGreedyTailFor;
-pub const commitAdaptiveWidth = mtp_plan.commitAdaptiveWidth;
-pub const AdaptiveWidthState = mtp_plan.AdaptiveWidthState;
-pub const SpecDisableReason = mtp_plan.SpecDisableReason;
-pub const ThinkBound = mtp_plan.ThinkBound;
-pub const mtpDraftCapForRoom = mtp_plan.mtpDraftCapForRoom;
-pub const ThoughtPoint = mtp_plan.ThoughtPoint;
-pub const thoughtRound = mtp_plan.thoughtRound;
-pub const thought_point_min_tokens = mtp_plan.thought_point_min_tokens;
-pub const CloserStyle = mtp_plan.CloserStyle;
-pub const thoughtEdgesSurvive = mtp_plan.thoughtEdgesSurvive;
-const cutMtpRound = mtp_plan.cutMtpRound;
-const specDecodeUnsupported = mtp_plan.specDecodeUnsupported;
-pub const mtpUnsupported = mtp_plan.mtpUnsupported;
-pub const mtpRefusal = mtp_plan.mtpRefusal;
-const rowsThroughId = mtp_plan.rowsThroughId;
-pub const capAcceptedForTokenBudget = mtp_plan.capAcceptedForTokenBudget;
 const degenerate = @import("degenerate.zig");
-pub const degenerate_loop_min_span = degenerate.degenerate_loop_min_span;
-pub const degenerate_loop_long_min_span = degenerate.degenerate_loop_long_min_span;
-pub const near_repeat_window = degenerate.near_repeat_window;
-pub const near_repeat_min_span = degenerate.near_repeat_min_span;
-pub const DegenerateTail = degenerate.DegenerateTail;
-pub const degenerateTail = degenerate.degenerateTail;
-pub const StallClock = degenerate.StallClock;
 
 /// Module-level overrides for prefill behavior. Defaults match the original
 /// hardcoded values; main.zig may overwrite these from CLI flags before
@@ -739,8 +650,8 @@ const dspark_seeded_rows: u32 = 3;
 
 /// The fixed width a request's DSpark rounds verify at, or null for the adaptive policy. A seeded sampled request
 /// must not take its width from measured ms, so a repeat or a stream gets the same rounds.
-pub fn dsparkSeededRows(sampling: SamplingParams, range: dspark_rows.Range) ?usize {
-    if (sampling.seed == null or isGreedyTemperature(sampling.temperature)) return null;
+pub fn dsparkSeededRows(sampling: sampler.SamplingParams, range: dspark_rows.Range) ?usize {
+    if (sampling.seed == null or sampler.isGreedyTemperature(sampling.temperature)) return null;
     return std.math.clamp(dspark_seeded_rows, range.min_rows, range.max_rows);
 }
 
@@ -914,8 +825,8 @@ pub fn verifyArgmax(logits: mlx.mlx_array, mask: ?mlx.mlx_array, s: mlx.mlx_stre
 }
 
 /// Logit biases and the think penalty ride the verifier (`Generator.glmPenalty`).
-pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
-    return !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null;
+pub fn glmDflashEligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
+    return !mtp_plan.specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null;
 }
 
 /// Drafts a sampled DSpark round can verify; the checkpoint's block is 5.
@@ -947,8 +858,8 @@ fn dsparkDiag() DsparkDiag {
 /// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
 /// rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`), after which the request
 /// decodes serially.
-pub fn dsparkEligible(sampling: SamplingParams, logprobs_n: u32) bool {
-    return !mtpUnsupported(sampling, logprobs_n);
+pub fn dsparkEligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
+    return !mtp_plan.mtpUnsupported(sampling, logprobs_n);
 }
 
 /// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
@@ -998,7 +909,7 @@ pub const GenerationResult = struct {
     /// is what was actually run through the model this turn, so `prefill_tps`
     /// reflects real compute rather than an inflated full-prompt rate.
     cached_tokens: u32 = 0,
-    logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
+    logprobs: ?[]sampler.LogprobResult = null, // per-token logprobs (caller must free)
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`
     /// ("stop" for loop cuts — see `scheduler.loopStopReason`).
@@ -1054,7 +965,7 @@ fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Transformer, ctx
 /// Reserve this request's cache capacity, and grow the restored layers to it, before the
 /// prefill's first chunk writes (`KVCache.growToReservation`). Returns the reserved tokens.
 pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelConfig, total_ctx: u64, max_tokens: u64, chunk: u64, s: mlx.mlx_stream) !u64 {
-    const reserved = reservedPrefillTokens(config, total_ctx, max_tokens, chunk);
+    const reserved = prefill_plan.reservedPrefillTokens(config, total_ctx, max_tokens, chunk);
     cache.reserve(@intCast(reserved));
     try cache.growToReservation(s);
     return reserved;
@@ -1065,7 +976,7 @@ pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelCon
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
 pub const Generator = struct {
-    const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
+    const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, sampler.SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
     xfm: *Transformer,
     /// Forward-pass context. Stores per-request KVCache pointer, moe_seq_offset
     /// pointer, ssm_entries slice, vision_embeddings handle, and capture_hidden
@@ -1083,7 +994,7 @@ pub const Generator = struct {
     /// which is the ONE place `step` may move.
     last_cache_clear_step: u32 = 0,
     max_tokens: u32,
-    sampling: SamplingParams,
+    sampling: sampler.SamplingParams,
     prompt_tokens: u32,
     completion_tokens: u32,
     finish_reason: []const u8,
@@ -1099,10 +1010,10 @@ pub const Generator = struct {
     loop_guard_start: usize = 0,
     consecutive_pad: u32 = 0, // count of consecutive token-0 (pad) generations
     timeout_ns: u64, // 0 = no timeout; measures SILENCE, not total time (see StallClock)
-    stall: StallClock = .{},
+    stall: degenerate.StallClock = .{},
     timer: io_util.Stopwatch,
     logprobs_n: u32 = 0, // 0 = disabled, >0 = number of top_logprobs to return
-    last_logprob: ?LogprobResult = null, // logprob result for the most recently returned token
+    last_logprob: ?sampler.LogprobResult = null, // logprob result for the most recently returned token
     /// Logprobs for the token the NEXT `next()` call will return.
     ///
     /// The decode loop returns `next_token_id` and, in the same call, forwards
@@ -1114,7 +1025,7 @@ pub const Generator = struct {
     /// back with `<|role_end|>` at rank 1). Seeded at init with t1's own
     /// distribution — t1 is sampled from the prefill's final forward, which
     /// this loop never sees.
-    pending_logprob: ?LogprobResult = null,
+    pending_logprob: ?sampler.LogprobResult = null,
     // Async pipeline state: pre-computed forward pass logits for next decode step
     pending_logits: mlx.mlx_array = .{},
     has_pending_logits: bool = false,
@@ -1192,7 +1103,7 @@ pub const Generator = struct {
     dspark_round_ends_at: ?u32 = null,
     /// Armed by the scheduler for a hybrid thinking request with tools; the restore point it takes is the last
     /// of `ssm_checkpoints` while `state` is `.taken`.
-    thought_point: ?ThoughtPoint = null,
+    thought_point: ?mtp_plan.ThoughtPoint = null,
     /// A constrained DSpark request: `next_token_id` is sampled under the grammar but not yet emitted or in the cache,
     /// and `has_pending_logits` is false. Serial decode (`next`) emits it first.
     dspark_pending: bool = false,
@@ -1399,7 +1310,7 @@ pub const Generator = struct {
     // generation; we never re-enable speculation within a single request.
     spec_disabled_runtime: bool = false,
     /// Why `spec_disabled_runtime` was set, for `[spec-stats]`.
-    spec_disable_reason: SpecDisableReason = .none,
+    spec_disable_reason: mtp_plan.SpecDisableReason = .none,
     /// A loop convicted inside the thought already closed it: one recovery per request.
     think_closed_by_loop: bool = false,
     /// Adaptive serial controller: which arm this request is on and the KV bucket it was decided in.
@@ -1624,7 +1535,7 @@ pub const Generator = struct {
         tok: *const Tokenizer,
         prompt_ids: []const u32,
         max_tokens: u32,
-        sampling: SamplingParams,
+        sampling: sampler.SamplingParams,
         eos_token_ids: []const u32,
     ) !Generator {
         return initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{});
@@ -1829,7 +1740,7 @@ pub const Generator = struct {
     /// Returns the width the next chunk should run at (`cur` unchanged = no change).
     pub const ChunkWidthHook = struct {
         ctx: *anyopaque,
-        call: *const fn (ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *AdaptiveWidthState) u32,
+        call: *const fn (ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *mtp_plan.AdaptiveWidthState) u32,
         /// Re-price a widen after the interleave tick has allocated for co-tenant slots. A
         /// step-down needs no confirmation: it is the safe direction.
         confirm: *const fn (ctx: *anyopaque, pos: usize, want: u32) bool,
@@ -1850,7 +1761,7 @@ pub const Generator = struct {
         tok: *const Tokenizer,
         prompt_ids: []const u32,
         max_tokens: u32,
-        sampling_in: SamplingParams,
+        sampling_in: sampler.SamplingParams,
         eos_token_ids: []const u32,
         options_in: InitOptions,
     ) !Generator {
@@ -1884,7 +1795,7 @@ pub const Generator = struct {
         // lm_head gate: the certified prune and MiMo's coarse shortlist serve
         // the ARGMAX, not the tail distribution, so they engage only when this
         // request consumes nothing else (`argmaxOnlyRequest`).
-        ctx.argmax_only = argmaxOnlyRequest(sampling, options.logprobs_n);
+        ctx.argmax_only = sampler.argmaxOnlyRequest(sampling, options.logprobs_n);
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -1927,7 +1838,7 @@ pub const Generator = struct {
         // start at ssm_checkpoint_pos_offset, so the final KV length is that
         // offset plus everything we're about to forward.
         const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-        const PREFILL_CHUNK: usize = requestPrefillChunk(
+        const PREFILL_CHUNK: usize = prefill_plan.requestPrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -1960,7 +1871,7 @@ pub const Generator = struct {
         }
         const has_vision = ctx.vision_embeddings != null;
         const glm_request = ctx.glm5_request;
-        const want_ssm_cp = shouldCheckpointSsmPrefill(
+        const want_ssm_cp = prefill_plan.shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
             (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null or xfm.dsv41 != null,
             has_vision,
@@ -1984,7 +1895,7 @@ pub const Generator = struct {
         else if (glm_request != null)
             glm_checkpoint_stride
         else
-            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override));
+            prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override));
         // Where a checkpoint is captured: GLM chunks on its chunk grid but keeps points only on the wider
         // restore-point grid.
         const cp_grid: usize = if (glm_request != null and want_ssm_cp) glm_capture_stride else ssm_cp_stride;
@@ -2070,9 +1981,9 @@ pub const Generator = struct {
         // completed chunks, fed to ctx.vision_splice_offset per forward
         // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
         // so that path is byte-identical to the old whole-prompt behavior.
-        const vision_chunked = has_vision and visionChunkedPrefillEnabled();
+        const vision_chunked = has_vision and prefill_plan.visionChunkedPrefillEnabled();
         var vision_rows_consumed: usize = options.vision_rows_before;
-        var adapt_state: AdaptiveWidthState = .{
+        var adapt_state: mtp_plan.AdaptiveWidthState = .{
             .width_min = @intCast(PREFILL_CHUNK),
             .width_max = @intCast(PREFILL_CHUNK),
         };
@@ -2080,9 +1991,9 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = if (glm_request != null and want_state_cp)
-                glmCaptureSchedule(glm_capture_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
+                glm5_generate.glmCaptureSchedule(glm_capture_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
             else
-                ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
+                prefill_plan.ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
@@ -2096,7 +2007,7 @@ pub const Generator = struct {
             // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
             // (installed process-wide).
             const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
-            const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(@min(effectivePrefillChunk(
+            const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(@min(prefill_plan.effectivePrefillChunk(
                 xfm.config.prefillScoreHeadDim(),
                 xfm.config.num_attention_heads,
                 total_ctx_for_chunk,
@@ -2134,7 +2045,7 @@ pub const Generator = struct {
                 adapt_state.width_max = @intCast(start_chunk);
                 if (options.chunk_width_hook) |hk| {
                     const w = hk.call(hk.ctx, ssm_cp_offset, @intCast(cur_chunk), cap_adapt, &adapt_state);
-                    if (w != 0 and w < cur_chunk) commitAdaptiveWidth(&cur_chunk, &adapt_state, w);
+                    if (w != 0 and w < cur_chunk) mtp_plan.commitAdaptiveWidth(&cur_chunk, &adapt_state, w);
                 }
             }
 
@@ -2184,14 +2095,14 @@ pub const Generator = struct {
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
                 const end = if (glm_request != null)
-                    glmChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                    glm5_generate.glmChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                 else
-                    nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                    prefill_plan.nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 // The model reads the next forward's Engram rows while this chunk runs: the next chunk, or the final span.
                 if (xfm.dsv41 != null) {
                     const ahead_end = if (end < loop_end)
-                        nextChunkEnd(end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                        prefill_plan.nextChunkEnd(end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                     else
                         prompt_ids.len;
                     ctx.ahead_ids = ids_i32[end..ahead_end];
@@ -2329,7 +2240,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and cp_grid > 0 and abs_end_for_cp2 % cp_grid == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) {
+                if (want_ssm_cp and cp_grid > 0 and abs_end_for_cp2 % cp_grid == 0 and glm5_generate.restorableCheckpoint(glm_request, abs_end_for_cp2)) {
                     const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2, options.write_through_hook != null);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -2347,11 +2258,11 @@ pub const Generator = struct {
                     };
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
                     // the last `max * stride` tokens and left no affordable trim point.
-                    thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
+                    prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
                 }
 
                 if (vision_chunked) {
-                    vision_rows_consumed += countSpliceRows(
+                    vision_rows_consumed += prefill_plan.countSpliceRows(
                         ids_i32[pos..end],
                         xfm.config.image_token_id,
                         xfm.config.video_token_id,
@@ -2377,7 +2288,7 @@ pub const Generator = struct {
                         const next_w = hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk), cap_adapt, &adapt_state);
                         if (next_w != 0 and next_w != cur_chunk) {
                             if (next_w < cur_chunk) {
-                                commitAdaptiveWidth(&cur_chunk, &adapt_state, next_w);
+                                mtp_plan.commitAdaptiveWidth(&cur_chunk, &adapt_state, next_w);
                             } else {
                                 pending_widen = next_w;
                                 widen_confirm = hk.confirm;
@@ -2395,7 +2306,7 @@ pub const Generator = struct {
                 if (pending_widen != 0) {
                     if (widen_confirm) |cf| {
                         if (cf(widen_ctx.?, ssm_cp_offset + pos, pending_widen)) {
-                            commitAdaptiveWidth(&cur_chunk, &adapt_state, pending_widen);
+                            mtp_plan.commitAdaptiveWidth(&cur_chunk, &adapt_state, pending_widen);
                         } else {
                             adapt_state.supporting = 0;
                         }
@@ -2436,7 +2347,7 @@ pub const Generator = struct {
                 // to be a stride multiple).
                 const already_have = ssm_checkpoints.items.len > 0 and
                     ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
-                if (!already_have and restorableCheckpoint(glm_request, final_abs)) {
+                if (!already_have and glm5_generate.restorableCheckpoint(glm_request, final_abs)) {
                     // SSM state is already materialized — the chunked loop
                     // evaluated it at every chunk boundary. The final chunk
                     // may have been a stride-aligned one (already evaluated)
@@ -2459,7 +2370,7 @@ pub const Generator = struct {
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
-                    thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
+                    prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
                 }
             }
         }
@@ -2667,7 +2578,7 @@ pub const Generator = struct {
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
         if (sampling.call_force == null and (mtp_active or dflash_active)) {
-            const sample_lazy = try firstTokenSample(xfm, logits, sampling, s);
+            const sample_lazy = try sampler.firstTokenSample(xfm, logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
@@ -2751,7 +2662,7 @@ pub const Generator = struct {
         // the drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
         if (options.skip_lazy_preforward or options.dspark_enabled) {
-            const sample_lazy = try firstTokenSample(xfm, logits, sampling, s);
+            const sample_lazy = try sampler.firstTokenSample(xfm, logits, sampling, s);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
@@ -2759,7 +2670,7 @@ pub const Generator = struct {
             // t1's own distribution comes from the prefill's final forward and
             // is invisible to the decode loop — read it here or the first
             // returned token has no logprobs and the array shifts by one.
-            const first_lp = try firstTokenLogprobs(allocator, logits, @intCast(first_val), options.logprobs_n, s);
+            const first_lp = try sampler.firstTokenLogprobs(allocator, logits, @intCast(first_val), options.logprobs_n, s);
             _ = mlx.mlx_array_free(logits);
 
             var gen = Generator{
@@ -2798,7 +2709,7 @@ pub const Generator = struct {
         }
 
         // Regular path: sample first token lazily, then build the next forward pass
-        const lazy_token = try firstTokenSample(xfm, logits, sampling, s);
+        const lazy_token = try sampler.firstTokenSample(xfm, logits, sampling, s);
 
         const next_logits = try lazyForward(xfm, &ctx, lazy_token);
 
@@ -2819,7 +2730,7 @@ pub const Generator = struct {
         // See the skip_lazy_preforward branch: t1's distribution lives only in
         // the prefill's own output, so it is read here, against the id that was
         // actually drawn.
-        const first_lp = try firstTokenLogprobs(allocator, logits, @intCast(val), options.logprobs_n, s);
+        const first_lp = try sampler.firstTokenLogprobs(allocator, logits, @intCast(val), options.logprobs_n, s);
         _ = mlx.mlx_array_free(logits);
 
         var gen = Generator{
@@ -2862,7 +2773,7 @@ pub const Generator = struct {
     /// Shares `advanceStep`'s clock: a clear here is a clear, so the decode
     /// cadence measures its next interval from this point.
     pub fn clearPoolBeforeDecode(self: *Generator) void {
-        if (!clearsPoolAtPrefillEnd(&self.xfm.config)) return;
+        if (!prefill_plan.clearsPoolAtPrefillEnd(&self.xfm.config)) return;
         _ = mlx.mlx_clear_cache();
         self.last_cache_clear_step = self.step;
     }
@@ -2881,7 +2792,7 @@ pub const Generator = struct {
     pub fn advanceStep(self: *Generator, n: u32) void {
         self.completion_tokens += n;
         self.step += n;
-        if (shouldClearAllocatorCache(self.step, self.last_cache_clear_step, CACHE_CLEAR_INTERVAL)) {
+        if (prefill_plan.shouldClearAllocatorCache(self.step, self.last_cache_clear_step, prefill_plan.CACHE_CLEAR_INTERVAL)) {
             _ = mlx.mlx_clear_cache();
             self.last_cache_clear_step = self.step;
         }
@@ -3187,12 +3098,12 @@ pub const Generator = struct {
         defer self.sampling.draw +%= 1;
         // A penalised slot reaches here only from the constrained steps and a forced call's
         // name choice, whose logits follow `generated_ids` (`samplesSync`, `draftsRefused`).
-        return penalizedSampleLazy(std.heap.page_allocator, shifted, self.sampling, self.generated_ids.items, self.xfm.s);
+        return sampler.penalizedSampleLazy(std.heap.page_allocator, shifted, self.sampling, self.generated_ids.items, self.xfm.s);
     }
 
     /// This slot samples on the synchronous serial path (`sampleToken`), never the lazy pipeline.
     pub fn samplesSync(self: *const Generator) bool {
-        return self.logprobs_n > 0 or penaltyActive(self.sampling);
+        return self.logprobs_n > 0 or sampler.penaltyActive(self.sampling);
     }
 
     /// What precedes a sampled position beyond the committed `generated_ids`.
@@ -3250,20 +3161,20 @@ pub const Generator = struct {
     /// Row j of a verify block under the request's repeat, presence and frequency penalties, over the committed
     /// ids and `ids[0..j]` (inclusive): the logits its serial tick would sample. Drafts stay raw.
     pub fn penaltyShiftRows(self: *Generator, logits: *mlx.mlx_array, ids: mlx.mlx_array) !bool {
-        if (!penaltyActive(self.sampling)) return false;
+        if (!sampler.penaltyActive(self.sampling)) return false;
         const shape = mlx.getShape(logits.*);
         const committed = try seen_penalty.buildCounts(std.heap.page_allocator, self.generated_ids.items, @intCast(shape[shape.len - 1]));
         defer _ = mlx.mlx_array_free(committed);
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
-        try seen_penalty.shiftRows(&out, logits.*, ids, committed, penaltiesOf(self.sampling), self.xfm.s);
+        try seen_penalty.shiftRows(&out, logits.*, ids, committed, sampler.penaltiesOf(self.sampling), self.xfm.s);
         _ = mlx.mlx_array_free(logits.*);
         logits.* = out;
         return true;
     }
 
     /// The host-decided penalty for a sample after the committed ids, for `sampleToken`.
-    fn markerShiftCommitted(self: *Generator) ?MarkerShift {
+    fn markerShiftCommitted(self: *Generator) ?sampler.MarkerShift {
         const tp = &self.sampling.think_penalty;
         if (!tp.active()) return null;
         tp.observe(self.generated_ids.items);
@@ -3288,7 +3199,7 @@ pub const Generator = struct {
         }
         var masked = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked);
-        try applyGrammarMask(allocator, &masked, logits, mask, self.xfm.s);
+        try sampler.applyGrammarMask(allocator, &masked, logits, mask, self.xfm.s);
         return self.sampleLazy(masked, .committed);
     }
 
@@ -3447,7 +3358,7 @@ pub const Generator = struct {
     pub fn thoughtRoundCut(self: *Generator, path: []const u32, anchor: usize) ?usize {
         const tp = &(self.thought_point orelse return null);
         if (tp.state != .armed or self.thoughtStateInGroup()) return null;
-        switch (thoughtRound(tp.*, path, anchor)) {
+        switch (mtp_plan.thoughtRound(tp.*, path, anchor)) {
             .whole => return null,
             .skip => {
                 tp.state = .passed;
@@ -3543,7 +3454,7 @@ pub const Generator = struct {
         var ops = @import("glm5/glm5_model.zig").Ops{ .s = gen.xfm.s };
         defer ops.deinit();
         const logits = try ops.slice(context.logits, 1, @intCast(row), @intCast(row + 1));
-        const sampled = sampleTokenLazy(logits, gen.sampling, gen.xfm.s);
+        const sampled = sampler.sampleTokenLazy(logits, gen.sampling, gen.xfm.s);
         defer _ = mlx.mlx_array_free(sampled);
         try mlx.check(mlx.mlx_array_eval(sampled));
         var token: i32 = 0;
@@ -3675,7 +3586,7 @@ pub const Generator = struct {
     /// round, alone or as one group of a grouped tick.
     pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *const @import("glm5/glm5_dflash.zig").Proposal, layerwise: *@import("glm5/glm5_dflash_model.zig").Verified, draft_ns: u64, verify_ns: u64, lookup: bool) !DrafterStepResult {
         const budget = self.max_tokens - self.completion_tokens;
-        const sampled = !isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
+        const sampled = !sampler.isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
         if (sampled) try sampledGlmDecisions(self, layerwise, budget, self.eos_token_ids);
         const request = self.ctx.glm5_request.?;
         // A round that carries the thought's closer ends on the pool position at or below it; the verified targets
@@ -3801,7 +3712,7 @@ pub const Generator = struct {
         };
         // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
         const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
-        var rows: usize = dsparkRowsForRoom(rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at), think_room);
+        var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at), think_room);
         // The draft heads score the whole vocabulary, but only a prompt may carry the image id (the model refuses it
         // without rows), and the trunk never picks it: a draft that holds it ends the chunk before it.
         if (xfm.dsv41) |m| if (m.cfg.image_token_id != 0) {
@@ -3820,7 +3731,7 @@ pub const Generator = struct {
         const ctx_before = self.ctx.cache.step;
         var logits = try xfm.dsv41Verify(&self.ctx, ids_buf[0..rows]);
         defer _ = mlx.mlx_array_free(logits);
-        if (self.sampling.think_penalty.active() or penaltyActive(self.sampling)) {
+        if (self.sampling.think_penalty.active() or sampler.penaltyActive(self.sampling)) {
             var row_ids: [dsv41_max_drafts + 1]i32 = undefined;
             if (rows > row_ids.len) return error.SpecDecodeUnsupported;
             for (ids_buf[0..rows], row_ids[0..rows]) |id, *o| o.* = @intCast(id);
@@ -3831,11 +3742,11 @@ pub const Generator = struct {
         }
         var masked_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked_logits);
-        if (rows_masked) try applyRowMasks(&masked_logits, logits, self.dspark_masks.items[0 .. rows * vocab], rows, vocab, s);
+        if (rows_masked) try sampler.applyRowMasks(&masked_logits, logits, self.dspark_masks.items[0 .. rows * vocab], rows, vocab, s);
         const verdict_logits = if (rows_masked) masked_logits else logits;
         var accepted: u32 = 0;
         var pending: u32 = 0;
-        if (isGreedyTemperature(self.sampling.temperature)) {
+        if (sampler.isGreedyTemperature(self.sampling.temperature)) {
             var verified = try verifyArgmax(verdict_logits, self.sampling.suppress_mask, s);
             defer verified.deinit();
             try mlx.check(mlx.mlx_array_eval(verified.lazy()));
@@ -3939,7 +3850,7 @@ pub const Generator = struct {
         var masked = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked);
         const kind = try row_grammar.maskFor(self.rowView(c), c.mask_buf);
-        if (kind == .masked) try applyGrammarMask(allocator, &masked, logits, c.mask_buf, self.xfm.s);
+        if (kind == .masked) try sampler.applyGrammarMask(allocator, &masked, logits, c.mask_buf, self.xfm.s);
         const lazy = try self.sampleLazy(if (kind == .masked) masked else logits, .committed);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
@@ -4031,7 +3942,7 @@ pub const Generator = struct {
     fn dsparkSampledVerdict(self: *Generator, logits: mlx.mlx_array, drafts: []const u32) !struct { accepted: u32, pending: u32 } {
         const s = self.xfm.s;
         const rows = drafts.len + 1;
-        const probs = try probsAllPositions(logits, self.sampling, s);
+        const probs = try sampler.probsAllPositions(logits, self.sampling, s);
         defer _ = mlx.mlx_array_free(probs);
         const rows2d = try verifyRows2d(probs, @intCast(drafts.len), s);
         defer _ = mlx.mlx_array_free(rows2d);
@@ -4051,7 +3962,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
             var keyed = self.sampling;
             keyed.draw +%= j;
-            draws[built] = try sampleFromProbsLazy(row, keyed, s);
+            draws[built] = try sampler.sampleFromProbsLazy(row, keyed, s);
             built += 1;
             _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
         }
@@ -4090,7 +4001,7 @@ pub const Generator = struct {
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
         std.debug.assert(self.dflash_ctx != null or self.spec_disabled_runtime);
-        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        if (mtp_plan.specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
@@ -4176,7 +4087,7 @@ pub const Generator = struct {
         // track p and keeps acceptance flat across temperature. Greedy
         // requests keep the argmax path untouched, so the byte-equality
         // guard is unaffected.
-        const stochastic = !isGreedyTemperature(self.sampling.temperature);
+        const stochastic = !sampler.isGreedyTemperature(self.sampling.temperature);
         // DFlash2 path selector: when the sidecar ships one, drafts come from
         // the pairwise-scored path trace instead of per-position argmax /
         // block sampling. Greedy requests keep the byte-equality bar (a
@@ -4328,9 +4239,9 @@ pub const Generator = struct {
         if (stochastic) {
             var k: u32 = 0;
             while (k < m) : (k += 1) {
-                const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
+                const target_p = try sampler.probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
                 defer _ = mlx.mlx_array_free(target_p);
-                const p_draft = try probAt(target_p, drafts[k], s);
+                const p_draft = try sampler.probAt(target_p, drafts[k], s);
                 const accept_prob: f32 = if (sel_path) |*sp| blk: {
                     // Selector-sampled draft: q is the traced step's own
                     // candidate softmax — exact, no GPU read.
@@ -4358,7 +4269,7 @@ pub const Generator = struct {
         // and assistant-context commit so every representation of the turn —
         // returned tokens, generated_ids, usage, KV and DFlash context — ends
         // at exactly max_tokens.
-        accepted = capAcceptedForTokenBudget(
+        accepted = mtp_plan.capAcceptedForTokenBudget(
             accepted,
             self.completion_tokens,
             self.max_tokens,
@@ -4367,20 +4278,20 @@ pub const Generator = struct {
         const next_pending: u32 = blk: {
             if (stochastic) {
                 const correction_logits = per_pos_logits.?[accepted];
-                const probs = try probsAtLastPos(correction_logits, self.sampling, s);
+                const probs = try sampler.probsAtLastPos(correction_logits, self.sampling, s);
                 defer _ = mlx.mlx_array_free(probs);
                 if (accepted < m) {
                     // norm(max(0, p − q)) against the q the draft was drawn
                     // from — a one-hot here is the WRONG residual for a
                     // sampled draft, and wrong silently.
                     const q_row = if (sel_path) |*sp|
-                        try selectorQRow(sp, accepted, m_full, vl_shape[2], s)
+                        try sampler.selectorQRow(sp, accepted, m_full, vl_shape[2], s)
                     else
-                        try pldOneHotRow(drafts[accepted], vl_shape[2], s);
+                        try sampler.pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
-                    break :blk try sampleResidual(probs, q_row, s);
+                    break :blk try sampler.sampleResidual(probs, q_row, s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampler.sampleFromProbs(probs, s);
                 }
             } else {
                 const argmax_data = try verify_argmax.ids(1 + m);
@@ -4583,8 +4494,8 @@ pub const Generator = struct {
     /// graph is built. The same counter covers draft and correction samples,
     /// including cross-round pre-drafts, so no two keyed draws reuse a key.
     /// An argmax depth draws nothing.
-    fn mtpSamplingDraw(self: *Generator, params: SamplingParams) SamplingParams {
-        if (isGreedyTemperature(params.temperature)) return params;
+    fn mtpSamplingDraw(self: *Generator, params: sampler.SamplingParams) sampler.SamplingParams {
+        if (sampler.isGreedyTemperature(params.temperature)) return params;
         var draw = params;
         draw.draw = self.sampling.draw;
         self.sampling.draw +%= 1;
@@ -4647,7 +4558,7 @@ pub const Generator = struct {
     /// Allocate an empty draft chain for `plan` (nothing built yet).
     fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
         const consider_ext = plan.m_hi > plan.m_lo;
-        const sharp_drafts = !isGreedyTemperature(self.mtpDraftSampling(0).temperature);
+        const sharp_drafts = !sampler.isGreedyTemperature(self.mtpDraftSampling(0).temperature);
         const drafts = try allocator.alloc(u32, plan.m_hi);
         errdefer allocator.free(drafts);
         const draft_arrs = try allocator.alloc(mlx.mlx_array, plan.m_hi);
@@ -4858,7 +4769,7 @@ pub const Generator = struct {
             // greedily (argmax) or sampled from a q over those 32 rows.
             const path = mtpDraftStepPath(
                 rerank_drafts,
-                !isGreedyTemperature(draft_sampling.temperature),
+                !sampler.isGreedyTemperature(draft_sampling.temperature),
                 chain.conf_arrs != null and i < chain.plan.m_lo,
             );
             const use_rerank = path != .full_logits;
@@ -4919,14 +4830,14 @@ pub const Generator = struct {
                 if (try head.draftShortlist(xfm, rerank_x, draft_sampling.suppress_mask)) |shortlist| {
                     var sl = shortlist;
                     defer sl.deinit();
-                    const prop = try shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
+                    const prop = try sampler.shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
                     chain.draft_arrs[i] = prop.id;
                     slots[i] = prop.q;
                 } else {
                     // The coarse head just retired: propose greedily and hand
                     // the verify the one-hot q that proposal really has.
                     const id = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
-                    const prop = try argmaxStepProposal(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
+                    const prop = try sampler.argmaxStepProposal(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
                     chain.draft_arrs[i] = prop.id;
                     slots[i] = prop.q;
                 }
@@ -4935,12 +4846,12 @@ pub const Generator = struct {
                 const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
                 chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
             } else if (chain.q_probs) |slots| {
-                const prop = try logitsStepProposal(step_out.logits, self.mtpSamplingDraw(draft_sampling), s);
+                const prop = try sampler.logitsStepProposal(step_out.logits, self.mtpSamplingDraw(draft_sampling), s);
                 slots[i] = prop.q;
                 chain.n_qp = i + 1;
                 chain.draft_arrs[i] = prop.id;
             } else {
-                chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
+                chain.draft_arrs[i] = sampler.sampleTokenLazy(step_out.logits, draft_sampling, s);
             }
             chain.n_drafted = i + 1;
             if (chain.conf_arrs != null and i < chain.plan.m_lo) {
@@ -5101,7 +5012,7 @@ pub const Generator = struct {
                 try mlx.check(mlx.mlx_slice(&xk, stacked_x, &[_]c_int{ k_c, 0, 0 }, 3, &[_]c_int{ k_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
                 const id = try g.mtp.?.draftSelect(xfm, xk, g.sampling.suppress_mask);
                 if (c.q_probs) |slots| {
-                    const prop = try argmaxStepProposal(id, vocab, s);
+                    const prop = try sampler.argmaxStepProposal(id, vocab, s);
                     c.draft_arrs[step] = prop.id;
                     slots[step] = prop.q;
                     c.n_qp = step + 1;
@@ -5114,25 +5025,25 @@ pub const Generator = struct {
 
         // Which rows sample, and whether one batched draw can serve them all.
         var sampled: [32]usize = undefined;
-        var params: [32]SamplingParams = undefined;
+        var params: [32]sampler.SamplingParams = undefined;
         var samples: [32]bool = @splat(false);
         var k_sampled: usize = 0;
         for (gens, chains, 0..) |g, *c, row| {
             const row_params = g.mtpDraftSampling(step);
-            if (c.q_probs == null or isGreedyTemperature(row_params.temperature)) continue;
+            if (c.q_probs == null or sampler.isGreedyTemperature(row_params.temperature)) continue;
             samples[row] = true;
             sampled[k_sampled] = row;
             params[k_sampled] = row_params;
             k_sampled += 1;
         }
         const batched = k_sampled > 1 and
-            sampleRowsHomogeneous(params[0..k_sampled]) and
-            !sampleRowsAnySeed(params[0..k_sampled]);
+            sampler.sampleRowsHomogeneous(params[0..k_sampled]) and
+            !sampler.sampleRowsAnySeed(params[0..k_sampled]);
 
         for (gens, chains, 0..) |g, *c, row| {
             if (samples[row]) continue;
             if (c.q_probs) |slots| {
-                const prop = try shortlistStepProposal(shortlists[row], g.mtpDraftSampling(step), s);
+                const prop = try sampler.shortlistStepProposal(shortlists[row], g.mtpDraftSampling(step), s);
                 c.draft_arrs[step] = prop.id;
                 slots[step] = prop.q;
                 c.n_qp = step + 1;
@@ -5141,7 +5052,7 @@ pub const Generator = struct {
         }
         if (!batched) {
             for (sampled[0..k_sampled], params[0..k_sampled]) |row, row_params| {
-                const prop = try shortlistProposal(shortlists[row], gens[row].mtpSamplingDraw(row_params), s);
+                const prop = try sampler.shortlistProposal(shortlists[row], gens[row].mtpSamplingDraw(row_params), s);
                 chains[row].draft_arrs[step] = prop.id;
                 chains[row].n_drafted = step + 1;
                 chains[row].q_probs.?[step] = prop.q;
@@ -5149,7 +5060,7 @@ pub const Generator = struct {
             }
             return;
         }
-        const group = try shortlistProposalRows(shortlists[0..n], sampled[0..k_sampled], params[0], s);
+        const group = try sampler.shortlistProposalRows(shortlists[0..n], sampled[0..k_sampled], params[0], s);
         for (sampled[0..k_sampled], 0..) |row, j| {
             chains[row].draft_arrs[step] = group.ids[j];
             chains[row].n_drafted = step + 1;
@@ -5281,12 +5192,12 @@ pub const Generator = struct {
                 for (gens, chains, 0..) |g, *c, k| {
                     const draft_sampling = g.mtpDraftSampling(i);
                     if (c.q_probs) |slots| {
-                        const prop = try logitsStepProposal(outs[k].logits, g.mtpSamplingDraw(draft_sampling), xfm.s);
+                        const prop = try sampler.logitsStepProposal(outs[k].logits, g.mtpSamplingDraw(draft_sampling), xfm.s);
                         slots[i] = prop.q;
                         c.n_qp = i + 1;
                         c.draft_arrs[i] = prop.id;
                     } else {
-                        c.draft_arrs[i] = sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
+                        c.draft_arrs[i] = sampler.sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
                     }
                     c.n_drafted = i + 1;
                     if (c.conf_arrs != null and i < c.plan.m_lo) {
@@ -5338,7 +5249,7 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         _: f32,
-        sampling: SamplingParams,
+        sampling: sampler.SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         return mtpBatchedAcceptGraph(probs_all, draft_arrs, q_probs, m, sampling, s);
@@ -5349,7 +5260,7 @@ pub const Generator = struct {
         draft_arrs: []const mlx.mlx_array,
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
-        sampling: SamplingParams,
+        sampling: sampler.SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         const shape = mlx.getShape(probs_all); // [1, 1+m, V]
@@ -5432,7 +5343,7 @@ pub const Generator = struct {
             var log_stack = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(log_stack);
             try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-            const key = seedKey(sampling);
+            const key = sampler.seedKey(sampling);
             defer _ = mlx.mlx_array_free(key);
             var sampled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sampled);
@@ -5478,7 +5389,7 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         delta: f32,
-        sampling: SamplingParams,
+        sampling: sampler.SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         return mtpBatchedLossyGraph(.typical, probs_all, draft_arrs, q_probs, m, delta, sampling, s);
@@ -5490,7 +5401,7 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         alpha: f32,
-        sampling: SamplingParams,
+        sampling: sampler.SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         return mtpBatchedLossyGraph(.tokenv3, probs_all, draft_arrs, q_probs, m, alpha, sampling, s);
@@ -5505,7 +5416,7 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         param: f32,
-        sampling: SamplingParams,
+        sampling: sampler.SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         const shape = mlx.getShape(probs_all); // [1, 1+m, V]
@@ -5635,7 +5546,7 @@ pub const Generator = struct {
             var log_stack = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(log_stack);
             try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-            const key = seedKey(sampling);
+            const key = sampler.seedKey(sampling);
             defer _ = mlx.mlx_array_free(key);
             var sampled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sampled);
@@ -6086,7 +5997,7 @@ pub const Generator = struct {
     pub fn mtpGreedyVerdict(am: []const i32, drafts: []const u32, completion: u32, max_tokens: u32) MtpRowVerdict {
         var accepted: u32 = 0;
         while (accepted < drafts.len and @as(u32, @intCast(am[accepted])) == drafts[accepted]) accepted += 1;
-        accepted = capAcceptedForTokenBudget(accepted, completion, max_tokens);
+        accepted = mtp_plan.capAcceptedForTokenBudget(accepted, completion, max_tokens);
         return .{ .accepted = accepted, .next_pending = @intCast(am[accepted]) };
     }
 
@@ -6133,7 +6044,7 @@ pub const Generator = struct {
         if (group_planner.enabled() and self.mtp_planner_owned and self.mtp_hidden_stale) return error.MtpHiddenStale;
         // Release-enforced guard (issue #97): the MTP path cannot honor a
         // grammar constraint or logprobs (compiled-out asserts before).
-        if (mtpUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        if (mtp_plan.mtpUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         // `--max-mtp-ctx`, checked at the top of the round against prompt + generated. Sticky
         // (context only grows), routed through the same `spec_disabled_runtime` fallback.
@@ -6553,7 +6464,7 @@ pub const Generator = struct {
             for (st.chain.draft_arrs[0..st.chain.m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             _ = mlx.mlx_vector_array_append_value(eval_vec, st.new_hidden);
             _ = mlx.mlx_vector_array_append_value(eval_vec, st.verify_hidden_all);
-            if (!isGreedyTemperature(gen.sampling.temperature)) continue;
+            if (!sampler.isGreedyTemperature(gen.sampling.temperature)) continue;
             st.verify_argmax = try verifyArgmax(st.verify_logits, gen.sampling.suppress_mask, s);
             _ = mlx.mlx_vector_array_append_value(eval_vec, st.verify_argmax.lazy());
         }
@@ -6563,9 +6474,9 @@ pub const Generator = struct {
 
     /// Whether ONE filtered block can serve every sampled row of a group: the
     /// filter is per REQUEST, and one categorical cannot carry a per-row key.
-    pub fn mtpGroupAcceptBatchable(params: []const SamplingParams) bool {
+    pub fn mtpGroupAcceptBatchable(params: []const sampler.SamplingParams) bool {
         if (params.len == 0) return false;
-        return sampleRowsHomogeneous(params) and !sampleRowsAnySeed(params);
+        return sampler.sampleRowsHomogeneous(params) and !sampler.sampleRowsAnySeed(params);
     }
 
     /// Phase 4 for the sampled rows of a group, built together: ONE
@@ -6582,10 +6493,10 @@ pub const Generator = struct {
         s: mlx.mlx_stream,
     ) !void {
         var rows: [MTP_GROUP_ROWS_MAX]usize = undefined;
-        var params: [MTP_GROUP_ROWS_MAX]SamplingParams = undefined;
+        var params: [MTP_GROUP_ROWS_MAX]sampler.SamplingParams = undefined;
         var k: usize = 0;
         for (gens, states, 0..) |gen, st, i| {
-            if (isGreedyTemperature(gen.sampling.temperature)) continue;
+            if (sampler.isGreedyTemperature(gen.sampling.temperature)) continue;
             if (st.chain.m == 0 or st.verify_len != 1 + st.chain.m) return;
             rows[k] = i;
             params[k] = gen.sampling;
@@ -6618,11 +6529,11 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_concatenate_axis(&block, vec, 1, s));
         }
 
-        const probs = try groupProbsBlock(block, params[0], s);
+        const probs = try sampler.groupProbsBlock(block, params[0], s);
         defer _ = mlx.mlx_array_free(probs);
         for (rows[0..k], 0..) |i, j| {
             const st = states[i];
-            const row_probs = try groupProbsRow(probs, offs[j], st.verify_len, s);
+            const row_probs = try sampler.groupProbsRow(probs, offs[j], st.verify_len, s);
             defer _ = mlx.mlx_array_free(row_probs);
             // The row's OWN acceptance mode, threshold and draw index: only the
             // filter is shared, so a seeded row keeps its own key.
@@ -6716,7 +6627,7 @@ pub const Generator = struct {
         // realizes the whole round. The old per-draft probAt()/sampleResidual()
         // calls cost one GPU round-trip sync EACH — 3-5 syncs per round that
         // stalled the pipeline for milliseconds while the GPU sat idle.
-        const stochastic = !isGreedyTemperature(self.sampling.temperature);
+        const stochastic = !sampler.isGreedyTemperature(self.sampling.temperature);
         const vl_shape = mlx.getShape(verify_logits);
 
         var accept_p_vec = mlx.mlx_array_new();
@@ -6753,7 +6664,7 @@ pub const Generator = struct {
             var live_logits = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(live_logits);
             try mlx.check(mlx.mlx_slice(&live_logits, verify_logits, &.{ 0, 0, 0 }, 3, &.{ vl_shape[0], @intCast(1 + m), vl_shape[2] }, 3, &.{ 1, 1, 1 }, 3, s));
-            const probs_all = try probsAllPositions(live_logits, self.sampling, s);
+            const probs_all = try sampler.probsAllPositions(live_logits, self.sampling, s);
             defer _ = mlx.mlx_array_free(probs_all);
             const bg = try self.acceptGraphFor(chain.lookup)(
                 probs_all,
@@ -6844,7 +6755,7 @@ pub const Generator = struct {
                 defer_data = defer_ptr[0..m];
             }
             accepted = self.acceptPrefixFor(chain.lookup)(p_data[0..m], q_data, defer_data, &self.prng);
-            accepted = capAcceptedForTokenBudget(
+            accepted = mtp_plan.capAcceptedForTokenBudget(
                 accepted,
                 self.completion_tokens,
                 self.max_tokens,
@@ -6876,7 +6787,7 @@ pub const Generator = struct {
             path[0] = t1;
             @memcpy(path[1 .. 1 + accepted], drafts[0..accepted]);
             if (self.thoughtRoundCut(path[0 .. 1 + accepted], moe_seq_offset_snap)) |keep| {
-                const cut = cutMtpRound(drafts, accepted, next_pending, keep);
+                const cut = mtp_plan.cutMtpRound(drafts, accepted, next_pending, keep);
                 accepted = cut.accepted;
                 next_pending = cut.pending;
             }
@@ -7140,7 +7051,7 @@ pub const Generator = struct {
     /// whose filtered p is one-hot, so its argmax proposal is already optimal.
     /// A greedy target keeps the argmax proposal (the temp-0 identity contract); a sampled
     /// target proposes from the draft sampler, where `min(1, p[argmax])` collapses on a flat row.
-    pub fn mtpDraftGreedyFor(target: SamplingParams) bool {
+    pub fn mtpDraftGreedyFor(target: sampler.SamplingParams) bool {
         return target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1;
     }
 
@@ -7172,9 +7083,9 @@ pub const Generator = struct {
     /// tunable: swept 2026-08-04 on the oQ4e head (prose@0.6, forced depth 3,
     /// sampled drafts) at draft temp 0.6/0.7/0.85/1.0 and per-draft
     /// acceptance was flat at 49.7-56.9% — no arm beat 0.6.
-    pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool, draft_temp: f32) SamplingParams {
+    pub fn mtpDraftSamplingFor(target: sampler.SamplingParams, force_greedy: bool, draft_temp: f32) sampler.SamplingParams {
         var d = target;
-        if (force_greedy or isGreedyTemperature(target.temperature)) {
+        if (force_greedy or sampler.isGreedyTemperature(target.temperature)) {
             d.temperature = 0.0;
             return d;
         }
@@ -7186,7 +7097,7 @@ pub const Generator = struct {
 
     /// Greedy drafts at chain depth `step` (0 = the round's first draft). The
     /// greedy tail samples depth 0 of a sampled request and takes the argmax after it.
-    pub fn mtpDraftGreedyAt(target: SamplingParams, greedy_tail: bool, step: u32) bool {
+    pub fn mtpDraftGreedyAt(target: sampler.SamplingParams, greedy_tail: bool, step: u32) bool {
         return mtpDraftGreedyFor(target) or (greedy_tail and step > 0);
     }
 
@@ -7194,7 +7105,7 @@ pub const Generator = struct {
     /// proposal mode, the greedy tail and the loaded family's draft temperature,
     /// resolved in ONE place so no call site can read a different proposal than
     /// the one the verify's q came from.
-    pub fn mtpDraftSampling(self: *const Generator, step: u32) SamplingParams {
+    pub fn mtpDraftSampling(self: *const Generator, step: u32) sampler.SamplingParams {
         return mtpDraftSamplingFor(
             self.sampling,
             mtpDraftGreedyAt(self.sampling, self.mtp_greedy_tail, step),
@@ -8799,8 +8710,8 @@ pub const Generator = struct {
     /// One debug line per planned round with every input the planner read.
     pub fn mtpPlannerMode(self: *const Generator) u8 {
         const head = self.mtp orelse return 0;
-        const sharp = !isGreedyTemperature(self.mtpDraftSampling(0).temperature);
-        return group_cost.GroupShape.samplingMode(head.canRerankDrafts(), false, sharp, !isGreedyTemperature(self.sampling.temperature));
+        const sharp = !sampler.isGreedyTemperature(self.mtpDraftSampling(0).temperature);
+        return group_cost.GroupShape.samplingMode(head.canRerankDrafts(), false, sharp, !sampler.isGreedyTemperature(self.sampling.temperature));
     }
 
     fn mtpPlannerObserve(self: *Generator, observed: u32, accepted: u32) void {
@@ -9252,9 +9163,9 @@ pub const Generator = struct {
         if (self.samplesSync()) {
             defer _ = mlx.mlx_array_free(step_logits);
             const t_sample = tick_prof.mark();
-            const result: SampleResult = switch (self.forcedNext()) {
-                .sample => try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.markerShiftCommitted(), self.xfm.s),
-                .force => |id| .{ .token_id = id, .logprob_result = try firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.s) },
+            const result: sampler.SampleResult = switch (self.forcedNext()) {
+                .sample => try sampler.sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.markerShiftCommitted(), self.xfm.s),
+                .force => |id| .{ .token_id = id, .logprob_result = try sampler.firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.s) },
                 .choose => |ids| blk: {
                     const lazy = try self.sampleAmong(allocator, step_logits, ids);
                     defer _ = mlx.mlx_array_free(lazy);
@@ -9262,7 +9173,7 @@ pub const Generator = struct {
                     var v: i32 = 0;
                     try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
                     const id: u32 = @intCast(v);
-                    break :blk .{ .token_id = id, .logprob_result = try firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.s) };
+                    break :blk .{ .token_id = id, .logprob_result = try sampler.firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.s) };
                 },
             };
             tick_prof.add(.sample, t_sample);
@@ -9357,7 +9268,7 @@ pub const Generator = struct {
             if (invalid_crossers == 0) break :blk try self.sampleLazy(step_logits, .committed);
             var masked_logits = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(masked_logits);
-            try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, self.xfm.s);
+            try sampler.applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, self.xfm.s);
             break :blk try self.sampleLazy(masked_logits, .committed);
         };
         defer _ = mlx.mlx_array_free(lazy);
@@ -9480,7 +9391,7 @@ pub const Generator = struct {
 
         var masked_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked_logits);
-        try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
+        try sampler.applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
 
         const lazy = try self.sampleLazy(masked_logits, .committed);
         defer _ = mlx.mlx_array_free(lazy);
@@ -9580,7 +9491,7 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(logits);
         try mlx.check(mlx.mlx_array_set(&logits, self.pending_logits));
         const token = (try self.nextConstrainedToken(allocator)) orelse return null;
-        const lp = try computeLogprobs(allocator, logits, token, self.logprobs_n, self.xfm.s);
+        const lp = try sampler.computeLogprobs(allocator, logits, token, self.logprobs_n, self.xfm.s);
         if (self.last_logprob) |old| allocator.free(old.top_logprobs);
         self.pending_logprob = lp;
         self.last_logprob = self.pending_logprob;
@@ -9638,7 +9549,7 @@ pub const Generator = struct {
 
         var masked_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(masked_logits);
-        try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
+        try sampler.applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
 
         // The next forward is built on the still-lazy sample so the CPU graph
         // build overlaps this step's GPU work; the token is realized after
@@ -9883,7 +9794,7 @@ pub fn generate(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: SamplingParams,
+    sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     timeout_ns: u64,
     logprobs_n: u32,
@@ -9911,7 +9822,7 @@ pub fn generate(
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
 
-    var logprob_results = std.ArrayList(LogprobResult).empty;
+    var logprob_results = std.ArrayList(sampler.LogprobResult).empty;
     defer {
         if (logprobs_n == 0) {
             for (logprob_results.items) |*lp| allocator.free(lp.top_logprobs);

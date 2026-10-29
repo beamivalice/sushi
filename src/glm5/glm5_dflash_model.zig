@@ -9,6 +9,7 @@ const kda = @import("glm5_dflash_kda.zig");
 const tree = @import("glm5_dflash_tree.zig");
 const adapter = @import("glm5_dflash.zig");
 const think_penalty = @import("../think_penalty.zig");
+const sampler = @import("../sampler.zig");
 const Arr = mlx.mlx_array;
 const Ops = base.Ops;
 // Layers per asynchronous evaluation group; zero settles every layer synchronously.
@@ -1034,7 +1035,7 @@ test "GLM verify decides biased tree rows as serial decode under the same bias, 
                 state.phase = p.phaseAfter(ids[0..rows_on_path.len]);
                 const shifted = try ops.slot();
                 try think_penalty.shiftScoped(shifted, raw, markers, state, null, s);
-                const decided = try ops.own(@import("../generate.zig").sampleTokenLazy(shifted.*, .{ .temperature = 0, .suppress_mask = reserved }, s));
+                const decided = try ops.own(sampler.sampleTokenLazy(shifted.*, .{ .temperature = 0, .suppress_mask = reserved }, s));
                 try mlx.check(mlx.mlx_array_eval(decided));
                 var want: i32 = 0;
                 try mlx.check(mlx.mlx_array_item_int32(&want, decided));
