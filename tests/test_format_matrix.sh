@@ -19,6 +19,7 @@
 #   8. /v1/messages stream + tools + thinking: tool_use block, no leak
 #   9-11. Truncated thinking on /v1/messages, /v1/responses and the chat stream
 #   12-14. Thinking streams: split in live chunks, with tools, and after a tool result
+#   15-17. Thinking x tools x stream grid, and stream == non-stream split
 #
 # A thought the token cap cuts open is a legal turn on every row: the rows then assert the split (reasoning kept,
 # nothing in content), never the answer. Thinking rows ask `reasoning_effort: low`, since the split is the subject.
@@ -113,9 +114,10 @@ elif mode == "chat" and not stream:
                calls=[{"name": t["function"]["name"], "args": t["function"]["arguments"]} for t in m.get("tool_calls") or []],
                usage=d.get("usage") or {})
 elif mode == "chat":
-    calls, c, r, fin, cn, rn = {}, "", "", None, 0, 0
+    calls, c, r, fin, cn, rn, done = {}, "", "", None, 0, 0, False
     for o in sse(resp):
         if o is None:
+            done = True
             break
         ch = (o.get("choices") or [{}])[0]
         fin = ch.get("finish_reason") or fin
@@ -130,7 +132,7 @@ elif mode == "chat":
             if f.get("name"):
                 e["name"] = f["name"]
             e["args"] += f.get("arguments") or ""
-    out.update(finish=fin, content=c, reasoning=r, content_chunks=cn, reasoning_chunks=rn, calls=[calls[k] for k in sorted(calls)])
+    out.update(finish=fin, content=c, reasoning=r, content_chunks=cn, reasoning_chunks=rn, done=done, calls=[calls[k] for k in sorted(calls)])
 elif not stream:
     d = json.load(resp)
     blocks = d.get("content", [])
@@ -291,6 +293,7 @@ if [ "$THINKS" = 1 ]; then
         chk "12. stream no-think turn: answer arrives as CONTENT, reasoning stays empty" "r['content'] and r['reasoning_chunks']==0"
     fi
     chk "12. stream thinking: no leaked think tags in reasoning" "not any(t in r['reasoning'] for t in ('<think','</think'))"
+    chk "12. stream thinking: content deltas follow the thought (or the cap cut it)" "r['content_chunks']>0 or r['finish']=='length'"
     chk_clean "12. stream thinking: no leaked tags in content" content
 
     # ── 13. Stream + thinking + tools ──
@@ -308,6 +311,50 @@ if [ "$THINKS" = 1 ]; then
     chk "14. round-trip stream: content populated (>5), a further call, or a cut thought" "len(r['content'])>5 or r['calls'] or (r['finish']=='length' and r['reasoning'])"
     chk_clean "14. round-trip stream: no tag leak in content" content
     chk "14. round-trip stream: no tag leak in reasoning" "not any(t in r['reasoning'] for t in ('<think','</think'))"
+fi
+
+# ── 15. The thinking x tools x stream grid. The no-thinking half: a plain answer carries no reasoning, a
+#      tool turn carries a call and no reasoning. GLM has no thinking-off mode, so it skips the half. ──
+CMD_PROMPT=$(user 'Run the command: echo hello')
+if [ "$GLM" = 1 ]; then
+    echo -e "  ${YELLOW}SKIP${NC} 15. no-thinking permutations: GLM has no thinking-off mode"
+else
+    R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$(user 'What is 2+2? Answer in one word.')],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
+    chk "15. no thinking, no tools, non-stream: content, no reasoning_content" "r['content'] and not r['reasoning']"
+    R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$CMD_PROMPT],\"tools\":[$SHELL_TOOL],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
+    chk "15. no thinking, tools, non-stream: finish tool_calls, call shell, no reasoning_content" "r['finish']=='tool_calls' and r['calls'] and r['calls'][0]['name']=='shell' and not r['reasoning']"
+    R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$(user 'What is 2+2? One word.')],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
+    chk "15. no thinking, no tools, stream: content deltas, no reasoning deltas, [DONE]" "r['content_chunks']>0 and r['reasoning_chunks']==0 and r['done']"
+    R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$CMD_PROMPT],\"tools\":[$SHELL_TOOL],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
+    chk "15. no thinking, tools, stream: tool_calls delta, finish tool_calls, no reasoning deltas" "r['calls'] and r['finish']=='tool_calls' and r['reasoning_chunks']==0"
+    chk_clean "15. no thinking, tools, stream: no tag leak in content" content
+fi
+
+if [ "$THINKS" = 1 ]; then
+    # ── 16. The thinking half. What a model does with its thought is its choice: the split holds either way ──
+    R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$CMD_PROMPT],\"tools\":[$SHELL_TOOL],\"max_tokens\":2000,\"temperature\":0,$THINK}")
+    chk "16. thinking, tools, non-stream: a call (or the thought was cut)" "r['calls'] or (r['finish']=='length' and r['reasoning'])"
+    chk "16. thinking, tools, non-stream: with no thought, nothing leaked to content" "r['reasoning'] or not r['content']"
+    chk_clean "16. thinking, tools, non-stream: no tag leak in content" content
+
+    R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$(user 'What is 15 times 17? Think step by step then use shell to verify with: echo $((15*17))')],\"tools\":[$SHELL_TOOL],\"max_tokens\":2000,\"temperature\":0,$THINK}")
+    chk "16. thinking, tools, stream: reasoning deltas, or the call survived" "r['reasoning'] or r['calls']"
+    chk "16. thinking, tools, stream: a call, an answer, or a thought the cap cut (reasoning kept)" "r['calls'] or r['content'] or (r['finish']=='length' and r['reasoning'])"
+    chk_clean "16. thinking, tools, stream: no tag leak in content" content
+    chk "16. thinking, tools, stream: no raw think tag in reasoning" "not any(t in r['reasoning'] for t in ('<think','</think'))"
+
+    R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$(user 'Say hello in French. Do not use any tools.')],\"tools\":[$SHELL_TOOL],\"max_tokens\":2000,\"temperature\":0,$THINK}")
+    chk "16. thinking, tools declared, stream: the stream carries data" "r['content'] or r['reasoning'] or r['calls']"
+    chk_clean "16. thinking, tools declared, stream: no tag leak in content" content
+
+    # ── 17. The same request streamed and not splits the SAME at temperature 0, byte for byte ──
+    SPLIT_BODY="\"model\":\"x\",\"messages\":[$(user 'What is 15 times 17?')],\"max_tokens\":3000,\"temperature\":0,$THINK"
+    R=$(ask chat 0 "{$SPLIT_BODY}")
+    NS=$(jget "$R" "json.dumps([r['reasoning'].strip(), r['content'].strip()])")
+    R=$(ask chat 1 "{$SPLIT_BODY}")
+    ST=$(jget "$R" "json.dumps([r['reasoning'].strip(), r['content'].strip()])")
+    check "17. stream and non-stream split identically" "$([ -n "$NS" ] && [ "$NS" = "$ST" ] && echo 1 || echo 0)"
+    chk "17. the answer is content, not reasoning (or the cap cut the thought)" "r['content'] or r['finish']=='length'"
 fi
 
 echo
