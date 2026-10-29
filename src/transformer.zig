@@ -24389,7 +24389,7 @@ fn mimoExl3DistinctRouting(rows: usize) !void {
     }
     if (rows > 1) try t.expect(@popCount(seen) > 2);
     const relative = @sqrt(err2 / @max(ref2, 1e-20));
-    if (diagEnvOn("SUSHI_EXL3_LAYER_UBENCH"))
+    if (diagEnvOn("SUSHI_EXL3_PARITY_TRACE"))
         std.debug.print("mimo distinct routed MoE rows={d} relative RMS={d:.8}\n", .{ rows, relative });
     if (!(relative < 0.01)) {
         std.debug.print("mimo distinct routed MoE rows={d} relative RMS={d:.8}\n", .{ rows, relative });

@@ -112,7 +112,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   (`layout.tileMajor`, [engine-exl3-experts](engine-exl3-experts.md#rate-groups)), filled through the bounce buffers and
   read by the decode GEMVs and the three prefill GEMM bodies with a new first tile and k stride; the pack on disk and every
   plane's bytes are unchanged. The chain is 1.6-3.3% faster than pack order, not the ~25% the no-trellis-loads ablation
-  allowed: the scatter of the 96-192 B chunks was not the limit (`SUSHI_DSV41_REPACK_UBENCH=1`, exl3 test binary, pack order
+  allowed: the scatter of the 96-192 B chunks was not the limit (`SUSHI_DSV41_REPACK_UBENCH=1`, a since-removed exl3 test meter, pack order
   against tile-major interleaved per round: 1 row 130.2 to 128.1 us at L2, 134.0 to 130.6 at L23, 4 rows 464 to 449 us at
   L23; GPU lock, QUIET, fans max, die 49 C, `taskpolicy -a`, e4c87be5). Live, ba4abafc, serial `--no-mtp` at 4.7k, the same
   600 greedy tokens: 48.3 tok/s against 47.9 (d57f8ea8, one boot each); the first request's first prefill chunk and

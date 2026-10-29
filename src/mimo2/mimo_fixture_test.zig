@@ -184,7 +184,7 @@ test "mimo_v2 EXL3 real shard routed fork matches CPU dump oracle" {
             }
         }
         const rel = @sqrt(ss / @max(ref, 1e-20));
-        if (diagEnvOn("SUSHI_EXL3_LAYER_UBENCH"))
+        if (diagEnvOn("SUSHI_EXL3_PARITY_TRACE"))
             std.debug.print("mimo real routed layer={d} rows={d} relative RMS={d:.8}\n", .{ layer, rows, rel });
         if (!(rel < 0.01)) {
             std.debug.print("mimo real routed layer={d} rows={d} relative RMS={d:.8}\n", .{ layer, rows, rel });
@@ -251,7 +251,7 @@ test "mimo_v2 EXL3 sliced real scales and outliers match the f32 oracle" {
             }
             maximum = @max(maximum, @sqrt(ss / @max(ref, 1e-30)));
         }
-        if (diagEnvOn("SUSHI_EXL3_LAYER_UBENCH") or maximum >= 0.01)
+        if (diagEnvOn("SUSHI_EXL3_PARITY_TRACE") or maximum >= 0.01)
             std.debug.print("mimo sliced real rows={d} max row relative RMS={d:.8}\n", .{ rows, maximum });
         try t.expect(maximum < 0.01);
     }

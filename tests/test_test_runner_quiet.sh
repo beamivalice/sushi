@@ -14,7 +14,7 @@
 #
 # and no Build Summary, while exiting 0. That is indistinguishable from a real
 # failure at a glance and has been read as one. So: benchmark and diagnostic
-# lines in a test ride an env switch (SUSHI_EXL3_LAYER_UBENCH for the EXL3
+# lines in a test ride an env switch (SUSHI_EXL3_PARITY_TRACE for the EXL3
 # ones); only a test that is about to FAIL may print.
 #
 # Usage: ./tests/test_test_runner_quiet.sh [test-filter]   (default: the whole suite)

@@ -604,7 +604,7 @@ pay through order: the fold with the shared chain LAST was +0.55 to +0.7 ms slow
 
 On `ad562c40` plus this landing, Sushi-2.4bpw, kv8, `--no-drafter`, `taskpolicy -a`, GPU lock, QUIET, AC power, fans max.
 
-Component (`SUSHI_GLM_T1_UBENCH=1`, synthetic E288 banks, 4096/2048, top-8 over 24 rotating routes, MCG w14, 24 dependent
+Component (`SUSHI_GLM_T1_UBENCH=1`, now `sushi-ubench run glm5.routed_t1`; synthetic E288 banks, 4096/2048, top-8 over 24 rotating routes, MCG w14, 24 dependent
 layers per eval, medians of 9, arms interleaved in one process; each phase is the difference of prefix chains):
 
 | µs per layer | pair prepare | gate/up | mid prepare | down | finish | chain |

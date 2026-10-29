@@ -305,7 +305,7 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
 - Metal System Trace over a 2.5k prefill on f42cd8e (`--instrument 'Metal GPU Counters'`): the scalar sorted EXL3
   GEMM took 90.7% of sampled GPU time (gate/up 59.5%, down 31.2%), MLX's bf16 GEMM 5.1%, everything else 4%.
 - The simdgroup-matrix body against the scalar body, one process (f22a383 + the body), A B B A, paired per-block ratio,
-  window table built outside the timed calls (`SUSHI_EXL3_LAYER_UBENCH=1`, MCG w15, 512 experts, top-10):
+  window table built outside the timed calls (a since-removed `SUSHI_EXL3_LAYER_UBENCH=1` meter, MCG w15, 512 experts, top-10):
 
 | prompt chunk | n48 2560->640 | n48 640->2560 | n64 2560->640 | n64 640->2560 |
 |---|---|---|---|---|

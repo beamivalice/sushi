@@ -198,7 +198,7 @@ Setup: M5 Max 128 GB, 2026-10-15, fans at max, `taskpolicy -a`, GPU lock `lane3-
 running), on battery at 100%. Base = main `2df81de2`; new = `2eedbef9`; the live binary was built from
 `3da27606`, the same served code before a test limit moved. All ReleaseFast.
 
-`SUSHI_EXL3_CHAIN_UBENCH=1` (exl3 test binary): 48 dependent pair GEMV + fused-mid down steps, E=16, 2560 -> 640,
+`SUSHI_EXL3_CHAIN_UBENCH=1` (exl3 test binary; now `sushi-ubench run shared.exl3_decode_chain`): 48 dependent pair GEMV + fused-mid down steps, E=16, 2560 -> 640,
 top-10, MCG, one row; the 64-bit merge and the funnel interleaved in one process; us per step. Re-timed on main
 `5feaacf1` (n64 on the lane funnel): 2026-10-16, fans at max, `taskpolicy -a`, GPU lock `lowk-rungs`, quiet window,
 on battery at 95%, median of 15. The arms are `5feaacf1`'s reader, built into a later exl3 test binary (e4951a82)
@@ -316,7 +316,7 @@ so the experts are cold), us per call over the picked experts' bytes:
 
 The multi-row kernel's SIMD arm is what an M1 to M4 runs for every verify width, and what `gemmNaxOn() == false` runs on
 any machine. Measured on the M5 Max with the SIMD arm forced (`SUSHI_FORCE_GPU_FAMILY_FALLBACK=1
-SUSHI_EXL3_ROWS_SIMD_UBENCH=1`, exl3 test binary, `-Dtest-filter="exl3 SIMD multi-row timing"`), main d810c50c plus the
+SUSHI_EXL3_ROWS_SIMD_UBENCH=1`, a since-removed exl3 test meter, `-Dtest-filter="exl3 SIMD multi-row timing"`), main d810c50c plus the
 split row loops and `tgrp 2`, GPU lock, QUIET, `taskpolicy -a`. Each call is fed by the previous call's output, before and after
 are interleaved in one process, best of 7 chains of up to 48 cold banks; SPEC1 n64 (head and Qwen head n96), f16 rows.
 Cells are us per projection, fans on auto; no M1 to M4 timing exists yet. Output bytes are identical before and after.

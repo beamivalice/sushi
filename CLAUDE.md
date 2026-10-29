@@ -156,7 +156,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
   one stray line hangs the runner while the standalone binary passes.
 - **A PASSING test prints NOTHING, on either stream**: Zig 0.17 renders any test stderr through its failure
   renderer (`failed command: … --listen=-`, exit 0), which reads as a failed suite. Diagnostics ride an env switch
-  (`SUSHI_EXL3_LAYER_UBENCH`). Guard: `tests/test_test_runner_quiet.sh`.
+  (`SUSHI_EXL3_PARITY_TRACE`). Guard: `tests/test_test_runner_quiet.sh`.
 - **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour.
   Test the behaviour or state the rule in a comment.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
