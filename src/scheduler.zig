@@ -4144,7 +4144,6 @@ test "Sushi quant memory production pack CPU header audit" {
     try testing.expect(all > vision);
     try testing.expect(vision > text);
     try testing.expectEqual(loadRequirementBytes(&cfg, all, true, 0), try residentColdLoadBillBytes(io, a, &cfg, path, true, true, true, ""));
-    std.debug.print("Sushi memory audit {s}: text={d}, vision={d}, mtp={d}, all={d} bytes\n", .{ path, text, vision - text, all - vision, all });
 }
 
 const LoadBillFixtures = struct {

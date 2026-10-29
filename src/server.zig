@@ -3633,7 +3633,6 @@ test "Sushi quant memory production context CPU audit" {
     try std.testing.expectEqual(@as(u64, 8), bill.kv_bits);
     try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context, 8).bytes <= budget);
     if (bill.max_context < cfg.contextCap()) try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context + 1, 8).bytes > budget);
-    std.debug.print("Sushi context audit {s}: 500000 tokens={d} bytes, max_context={d} for 16 GiB, chunk={d}, KV{d}\n", .{ path, bill.needed, bill.max_context, bill.chunk, bill.kv_bits });
 }
 
 test "Sushi quant memory request refusal carries the actual KV width MTP and maximum to the wire" {

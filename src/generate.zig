@@ -17513,7 +17513,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
                 }
                 for (0..n) |i| {
                     const bs = batch_ptrs[i];
-                    std.debug.print("[mtp compare] N={d} depth={d} round={d} row={d}\n", .{ n, depth, round, i });
+                    errdefer std.debug.print("[mtp compare] N={d} depth={d} round={d} row={d}\n", .{ n, depth, round, i });
                     try testing.expectEqual(depth, bs.chain.m);
                     for (ss[i].?.chain.draft_arrs[0..depth], bs.chain.draft_arrs[0..depth]) |x, y| try MtpChainTestSlot.equal(x, y, xfm.s, "x");
                     try MtpChainTestSlot.equal(ss[i].?.verify_logits, bs.verify_logits, xfm.s, "ss[i].?.verify_logits");
@@ -17546,7 +17546,6 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
                         try testing.expectEqual(se.ple_prev_valid, be.ple_prev_valid);
                         if (se.ple_prev_valid) try testing.expectEqualSlices(u32, &se.ple_prev, &be.ple_prev);
                     }
-                    std.debug.print("[mtp round] N={d} depth={d} round={d} row={d} accepted={d} stash={d}\n", .{ n, depth, round, i, bs.retained - 1, mlx.mlx_array_size(bh.ids) });
                 }
             }
         }
@@ -17555,12 +17554,10 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
         try testing.expect(transformer_mod.mtp_coarse_pair_dispatches > coarse_before);
         {
             try testing.expect(qwen4_forward.mtp_verify_hc_prepared_calls > hc_prepared_before);
-            std.debug.print("[prepared HC] calls={d}\n", .{qwen4_forward.mtp_verify_hc_prepared_calls - hc_prepared_before});
         }
-        inline for (.{ .dense_tiles, .hc_rows, .route_pack }, 0..) |lever, i| {
+        inline for (0..3) |i| {
             {
                 try testing.expect(transformer_mod.mtp_verify_kernel_calls[i] > verify_kernel_before[i]);
-                std.debug.print("[verify kernel] {s} calls={d}\n", .{ @tagName(lever), transformer_mod.mtp_verify_kernel_calls[i] - verify_kernel_before[i] });
             }
         }
     }

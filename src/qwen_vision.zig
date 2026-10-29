@@ -1007,7 +1007,7 @@ test "qwen preprocessing parity vs reference pixel_values (QWEN_PREPROCESS_FIXTU
     const mean_abs = sum_abs / @as(f64, @floatFromInt(actual.len));
     const fraction_over_point_one =
         @as(f64, @floatFromInt(over_point_one)) / @as(f64, @floatFromInt(actual.len));
-    std.debug.print(
+    errdefer std.debug.print(
         "qwen preprocessing parity: max_abs={d:.6} mean_abs={d:.6} over_0.10={d:.4}%\n",
         .{ max_abs, mean_abs, fraction_over_point_one * 100.0 },
     );
@@ -1099,9 +1099,9 @@ test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
         tok_sum += d;
     }
     const mean_abs = sum_abs / @as(f64, @floatFromInt(ref.len));
-    std.debug.print("\nqwen vision parity: max_abs={d:.5} mean_abs={d:.6} (N_merged={d}, dim={d})\n", .{ max_abs, mean_abs, n / 4, dim });
-    std.debug.print("  max@ token={d} chan={d} ours={d:.4} ref={d:.4}\n", .{ max_idx / dim, max_idx % dim, od[max_idx], ref[max_idx] });
-    std.debug.print("  diffs>0.10: {d}/{d}  diffs>0.30: {d}  worst-token meanrow-diff token={d} sum={d:.3}\n", .{ gt_010, ref.len, gt_030, worst_tok, worst_tok_diff / @as(f64, @floatFromInt(dim)) });
+    errdefer std.debug.print("\nqwen vision parity: max_abs={d:.5} mean_abs={d:.6} (N_merged={d}, dim={d})\n", .{ max_abs, mean_abs, n / 4, dim });
+    errdefer std.debug.print("  max@ token={d} chan={d} ours={d:.4} ref={d:.4}\n", .{ max_idx / dim, max_idx % dim, od[max_idx], ref[max_idx] });
+    errdefer std.debug.print("  diffs>0.10: {d}/{d}  diffs>0.30: {d}  worst-token meanrow-diff token={d} sum={d:.3}\n", .{ gt_010, ref.len, gt_030, worst_tok, worst_tok_diff / @as(f64, @floatFromInt(dim)) });
     // bf16 ViT through 12 blocks with different reduction orders than the
     // reference: tolerate accumulated rounding + a handful of outliers, catch
     // real bugs (a structural bug blows up mean_abs by 10-100x).

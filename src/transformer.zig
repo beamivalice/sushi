@@ -11040,7 +11040,6 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
                         try mlx.check(mlx.mlx_array_set(&hb2[k], bout[k].stream));
                     }
                 }
-                std.debug.print("[mtp matched draft steps] stash={} N={d} depth={d} solo={any} batched={any}\n", .{ with_stash, N, depth, steps_s[0..n_use], steps_b[0..n_use] });
             }
         }
     }
@@ -43325,7 +43324,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
     const hid: usize = @intCast(config.qv_out_hidden);
     const n_img: usize = ref_emb.len / hid;
     const re = qwen4CompareRows(our_emb, ref_emb, n_img, hid);
-    std.debug.print("[qwen4 fixture vision] tower {d}x{d}x{d} -> {d} rows: min row cos {d:.5}\n", .{ gt, gh, gw, n_img, re.min_cos });
+    errdefer std.debug.print("[qwen4 fixture vision] tower {d}x{d}x{d} -> {d} rows: min row cos {d:.5}\n", .{ gt, gh, gw, n_img, re.min_cos });
     try testing.expect(re.min_cos > 0.99);
 
     // [b] 3-D positions: our get_rope_index == the reference table + delta.
@@ -43402,7 +43401,6 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
             }
             const w: usize = ref_h.len / T;
             const rc = qwen4CompareRows(our_h, ref_h, T, w);
-            std.debug.print("[qwen4 fixture vision] after layer {d}: min row cos {d:.5}\n", .{ i, rc.min_cos });
             if (rc.min_cos < 0.999 and i == 3) {
                 for (0..T) |row| {
                     const rr = qwen4CompareRows(our_h[row * w ..][0..w], ref_h[row * w ..][0..w], 1, w);
@@ -43459,7 +43457,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
                 if (ref_mask[row * T + c] != our_mask[row * T + c]) mask_bad += 1;
             }
         }
-        std.debug.print("[qwen4 fixture vision] layer-3 QSA mask: {d} mismatched over {d} decisive rows ({d} acquitted)\n", .{ mask_bad, T - mask_tied_rows, mask_tied_rows });
+        errdefer std.debug.print("[qwen4 fixture vision] layer-3 QSA mask: {d} mismatched over {d} decisive rows ({d} acquitted)\n", .{ mask_bad, T - mask_tied_rows, mask_tied_rows });
         try testing.expect(mask_tied_rows < T / 2);
         try testing.expectEqual(@as(usize, 0), mask_bad);
         if (fx.get("stream_pre_mixer")) |ref_pm| {
@@ -43482,7 +43480,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
         try testing.expectEqual(T * v, ours.len);
         @memcpy(ours_full, ours);
         const r = qwen4CompareTied("logits", ours, ref_full, T, v, 0, ties);
-        std.debug.print("[qwen4 fixture vision] full prefill T={d}: min cos {d:.5} ({d} rows acquitted) argmax {d}/{d} decisive rows\n", .{ T, r.min_cos, r.tied, r.agree, r.decisive });
+        errdefer std.debug.print("[qwen4 fixture vision] full prefill T={d}: min cos {d:.5} ({d} rows acquitted) argmax {d}/{d} decisive rows\n", .{ T, r.min_cos, r.tied, r.agree, r.decisive });
         try testing.expect(r.min_cos > 0.995);
         // A k < E fixture (`build --topk`) ties in most trunk rows across
         // every MoE layer; its selection coverage is the MTP head's ONE
@@ -43531,7 +43529,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
         const last = pours[(t_pre - t1 - 1) * v ..][0..v];
         const rself = qwen4CompareRows(last, ours_full[(t_pre - 1) * v ..][0..v], 1, v);
         const rp = qwen4CompareTied("prefill-last", last, ref_last, 1, v, t_pre - 1, ties);
-        std.debug.print("[qwen4 fixture vision] chunked prefill {d}+{d}: last-row cos vs our full forward {d:.5}, vs reference {d:.5}\n", .{ t1, t_pre - t1, rself.min_cos, rp.min_cos });
+        errdefer std.debug.print("[qwen4 fixture vision] chunked prefill {d}+{d}: last-row cos vs our full forward {d:.5}, vs reference {d:.5}\n", .{ t1, t_pre - t1, rself.min_cos, rp.min_cos });
         try testing.expect(rself.min_cos > 0.999);
         try testing.expect(rp.min_cos > 0.995);
 
@@ -43550,7 +43548,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
             dec.decisive += rd.decisive;
             dec.tied += rd.tied;
         }
-        std.debug.print("[qwen4 fixture vision] decode x{d}: min cos {d:.5} ({d} acquitted) argmax {d}/{d} decisive rows\n", .{ t_dec, dec.min_cos, dec.tied, dec.agree, dec.decisive });
+        errdefer std.debug.print("[qwen4 fixture vision] decode x{d}: min cos {d:.5} ({d} acquitted) argmax {d}/{d} decisive rows\n", .{ t_dec, dec.min_cos, dec.tied, dec.agree, dec.decisive });
         try testing.expect(dec.min_cos > 0.995);
         try testing.expect(dec.decisive >= (if (ties.route_gap != null) @as(usize, 0) else 2) and dec.agree == dec.decisive);
     }
@@ -43615,7 +43613,7 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
         defer allocator.free(our_h);
         if (our_h.len != ref_h.len) continue;
         const rc = qwen4CompareRows(our_h, ref_h, T, ref_h.len / T);
-        std.debug.print("[qwen4 fixture bf16] after layer {d}: min row cos {d:.5}\n", .{ i - 1, rc.min_cos });
+        errdefer std.debug.print("[qwen4 fixture bf16] after layer {d}: min row cos {d:.5}\n", .{ i - 1, rc.min_cos });
         try testing.expect(rc.min_cos > 0.999);
         checked += 1;
     }
@@ -44051,7 +44049,6 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     _ = mlx.mlx_array_free(try b_s.forward(&xfm, b_ids[0..pb]));
     _ = mlx.mlx_array_free(try a_b.forward(&xfm, a_ids[0..pa]));
     _ = mlx.mlx_array_free(try b_b.forward(&xfm, b_ids[0..pb]));
-    std.debug.print("[qwen4 batched] prefill A {d} B {d}: cache.step A {d}, offset A {d}\n", .{ pa, pb, a_s.cache.step, a_s.off });
 
     var min_cos: f64 = 1.0;
     var checked: usize = 0;
@@ -44112,7 +44109,7 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
             }
         }
     }
-    std.debug.print("[qwen4 batched] {d} ticks x 2 slots: min cos {d:.5}, argmax {d}/{d} decisive rows\n", .{ K, min_cos, agreed, checked });
+    errdefer std.debug.print("[qwen4 batched] {d} ticks x 2 slots: min cos {d:.5}, argmax {d}/{d} decisive rows\n", .{ K, min_cos, agreed, checked });
     try testing.expect(min_cos > 0.995);
     try testing.expect(checked >= 2 and agreed == checked);
     // Both slots crossed the budget: the batched QSA mask path ran.
@@ -45015,11 +45012,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             defer allocator.free(our_h);
             if (our_h.len != ref_h.len) {
                 std.debug.print("[qwen4 fixture] stream_{d}: size {d} vs ref {d}\n", .{ i, our_h.len, ref_h.len });
-                continue;
             }
-            const w: usize = ref_h.len / T;
-            const rc = qwen4CompareRows(our_h, ref_h, T, w);
-            std.debug.print("[qwen4 fixture] after layer {d}: min row cos {d:.5}\n", .{ i - 1, rc.min_cos });
         }
         if (fx.get("stream_pre_mixer")) |ref_pm| {
             const ref_h = try qwen4ReadF32(allocator, ref_pm, s);
@@ -45040,7 +45033,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         defer allocator.free(ours);
         try testing.expectEqual(T * v, ours.len);
         const r = qwen4CompareTied("logits", ours, ref_full, T, v, 0, ties);
-        std.debug.print("[qwen4 fixture] full prefill T={d}: min cos {d:.5} ({d} rows acquitted) argmax {d}/{d} decisive rows\n", .{ T, r.min_cos, r.tied, r.agree, r.decisive });
+        errdefer std.debug.print("[qwen4 fixture] full prefill T={d}: min cos {d:.5} ({d} rows acquitted) argmax {d}/{d} decisive rows\n", .{ T, r.min_cos, r.tied, r.agree, r.decisive });
         try testing.expect(r.min_cos > 0.995);
         // A k < E fixture (`build --topk`) ties in most trunk rows across
         // every MoE layer; its selection coverage is the MTP head's ONE
@@ -45072,7 +45065,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         const pours = try qwen4ReadF32(allocator, plog, s);
         defer allocator.free(pours);
         const rp = qwen4CompareTied("prefill-last", pours[(t_pre - 1) * v ..], ref_last, 1, v, t_pre - 1, ties);
-        std.debug.print("[qwen4 fixture] prefill {d}: last-row cos {d:.5}\n", .{ t_pre, rp.min_cos });
+        errdefer std.debug.print("[qwen4 fixture] prefill {d}: last-row cos {d:.5}\n", .{ t_pre, rp.min_cos });
         try testing.expect(rp.min_cos > 0.995);
 
         var dec: Qwen4TiedCmp = .{ .min_cos = 1.0, .agree = 0, .decisive = 0, .tied = 0 };
@@ -45090,7 +45083,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             dec.decisive += rd.decisive;
             dec.tied += rd.tied;
         }
-        std.debug.print("[qwen4 fixture] decode x{d}: min cos {d:.5} ({d} acquitted) argmax {d}/{d} decisive rows\n", .{ t_dec, dec.min_cos, dec.tied, dec.agree, dec.decisive });
+        errdefer std.debug.print("[qwen4 fixture] decode x{d}: min cos {d:.5} ({d} acquitted) argmax {d}/{d} decisive rows\n", .{ t_dec, dec.min_cos, dec.tied, dec.agree, dec.decisive });
         try testing.expect(dec.min_cos > 0.995);
         try testing.expect(dec.decisive >= (if (ties.route_gap != null) @as(usize, 0) else 2) and dec.agree == dec.decisive);
     }
@@ -45157,7 +45150,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         const fresh = try qwen4ReadF32(allocator, flog, s);
         defer allocator.free(fresh);
         const rr = qwen4CompareRows(ours_c, fresh[kept * v ..], cont, v);
-        std.debug.print("[qwen4 fixture] rollback (P={d}, verify {d}, accept {d}, +{d}): min cos {d:.5} argmax {d}/{d}\n", .{ P, VL, ACC, cont, rr.min_cos, rr.argmax_agree, rr.rows });
+        errdefer std.debug.print("[qwen4 fixture] rollback (P={d}, verify {d}, accept {d}, +{d}): min cos {d:.5} argmax {d}/{d}\n", .{ P, VL, ACC, cont, rr.min_cos, rr.argmax_agree, rr.rows });
         try testing.expect(rr.min_cos > 0.999);
         try testing.expect(rr.argmax_agree == rr.rows);
     }
@@ -45369,7 +45362,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         defer allocator.free(fresh_x);
         const n_rows = fresh_ids.items.len;
         const rx = qwen4CompareRows(ours_x, fresh_x[(n_rows - n_merged) * v ..], n_merged, v);
-        std.debug.print("[qwen4 fixture] MTP cross-round (P={d}, rounds {d}, acc {d}/{d}, merged {d} rows of {d}): min cos {d:.5} argmax {d}/{d}\n", .{ P, accs.len, accs[0], accs[1], n_merged, n_rows, rx.min_cos, rx.argmax_agree, rx.rows });
+        errdefer std.debug.print("[qwen4 fixture] MTP cross-round (P={d}, rounds {d}, acc {d}/{d}, merged {d} rows of {d}): min cos {d:.5} argmax {d}/{d}\n", .{ P, accs.len, accs[0], accs[1], n_merged, n_rows, rx.min_cos, rx.argmax_agree, rx.rows });
         try testing.expect(rx.min_cos > 0.999);
         try testing.expect(rx.argmax_agree == rx.rows);
     }
@@ -45975,7 +45968,7 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
             try xfm.qwen4MtpReset();
             try testing.expectEqual(base, mlxSettledActiveBytes(s));
         }
-        std.debug.print("[qwen4] MTP fault sweep {s}: {d} checked ops, {d} error paths, live bytes back at baseline on all\n", .{ @tagName(proj), n_ops, errs });
+        errdefer std.debug.print("[qwen4] MTP fault sweep {s}: {d} checked ops, {d} error paths, live bytes back at baseline on all\n", .{ @tagName(proj), n_ops, errs });
         try testing.expect(errs >= 1);
     }
     try xfm.qwen4MtpReset();
@@ -49344,7 +49337,7 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
     try testing.expectError(error.MlxError, r);
 
     for (ctxs, 0..) |c, row| {
-        std.debug.print("[mtp failure state] row={d} before={d} after={d}\n", .{ row, offsets_before[row], c.moe_seq_offset.* });
+        errdefer std.debug.print("[mtp failure state] row={d} before={d} after={d}\n", .{ row, offsets_before[row], c.moe_seq_offset.* });
         try testing.expectEqual(offsets_before[row], c.moe_seq_offset.*);
         try testing.expectEqual(cache_steps_before[row], c.cache.step);
         for (c.cache.entries, 0..) |entry, layer| try testing.expectEqual(kv_offsets_before[row][layer], entry.offset);
@@ -49404,7 +49397,6 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         try testing.expect(try qsaArraysAllEqual(ref_logits[0], logits[i], s));
         try testing.expect(try qsaArraysAllEqual(ref_all[0], all[i], s));
     }
-    std.debug.print("[mtp verify] deferred PLE: row 1 failure cleared both claims and preserved history; recovered logits and hidden equal solo\n", .{});
 }
 
 test "deferred PLE at N rows: every row's capacity is checked against its OWN width" {

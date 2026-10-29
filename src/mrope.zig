@@ -855,7 +855,4 @@ test "qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)" {
         }
     }
     try std.testing.expect(rows_seen >= 12);
-    std.debug.print("[qwen4-yarn] {d} freqs + {d} position rows (through {d}) match HF/vLLM\n", .{
-        got.len, rows_seen, fx.get("extended_max_position_embeddings").?.integer,
-    });
 }

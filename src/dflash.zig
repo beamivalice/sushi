@@ -3304,7 +3304,7 @@ test "dflash fixture parity: encoder + two draft rounds vs transformers referenc
         const enc = try encodeContext(&m, caps1);
         defer _ = mlx.mlx_array_free(enc);
         const p = try parityVs(enc, encoder_out, allocator, s);
-        std.debug.print("[dflash-fixture] encoder cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
+        errdefer std.debug.print("[dflash-fixture] encoder cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
         try testing.expect(p.cos > 0.99);
         try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
     }
@@ -3319,7 +3319,7 @@ test "dflash fixture parity: encoder + two draft rounds vs transformers referenc
         const hidden = try forwardBlock(&m, &dctx, noise, n_ctx);
         defer _ = mlx.mlx_array_free(hidden);
         const p = try parityVs(hidden, round1_hidden, allocator, s);
-        std.debug.print("[dflash-fixture] round1 cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
+        errdefer std.debug.print("[dflash-fixture] round1 cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
         try testing.expect(p.cos > 0.99);
         try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
     }
@@ -3338,7 +3338,7 @@ test "dflash fixture parity: encoder + two draft rounds vs transformers referenc
         const hidden = try forwardBlock(&m, &dctx, noise, n_ctx + n_delta);
         defer _ = mlx.mlx_array_free(hidden);
         const p = try parityVs(hidden, round2_hidden, allocator, s);
-        std.debug.print("[dflash-fixture] round2 cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
+        errdefer std.debug.print("[dflash-fixture] round2 cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
         try testing.expect(p.cos > 0.99);
         try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
     }
@@ -3408,7 +3408,7 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     defer _ = mlx.mlx_array_free(hidden);
     {
         const p = try parityVs(hidden, round1_hidden, allocator, s);
-        std.debug.print("[dflash2-fixture] block hidden cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
+        errdefer std.debug.print("[dflash2-fixture] block hidden cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
         try testing.expect(p.cos > 0.99);
         try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
     }
@@ -3438,7 +3438,7 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     var path = try selectPath(allocator, &model.selector.?, model.config.selector_top_k, ref_hidden, logits, anchor_id, 0.0, prng.random(), s);
     defer path.deinit(allocator);
     const want_path = root.get("path_ids").?.array;
-    std.debug.print("[dflash2-fixture] path got={any}\n", .{path.ids});
+    errdefer std.debug.print("[dflash2-fixture] path got={any}\n", .{path.ids});
     try testing.expectEqual(@as(usize, m), want_path.items.len);
     for (path.ids, want_path.items) |got, want| {
         try testing.expectEqual(@as(u32, @intCast(want.integer)), got);
