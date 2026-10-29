@@ -462,6 +462,7 @@ test {
     _ = kernels;
     _ = @import("kernel_source.zig");
     _ = project_rows;
+    _ = @import("sorted_windows.zig");
     _ = codebook_tables;
 }
 

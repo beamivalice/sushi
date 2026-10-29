@@ -9,6 +9,7 @@ const exl3 = @import("expert_exl3.zig");
 const codebook_tables = @import("codebook_tables.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const kernel_src = @import("kernel_source.zig");
+const sorted_windows = @import("sorted_windows.zig");
 const group_layout = @import("layout.zig");
 const root = @import("root.zig");
 const fuse = @import("fuse.zig");
@@ -1628,7 +1629,7 @@ pub fn moePrefillClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged,
     defer _ = mlx.mlx_array_free(mid);
     const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win);
     defer _ = mlx.mlx_array_free(d);
-    return kernels.finishMimoSorted(s, d, w.inverse, rb.svh[2], slots, scores, rb.hidden, rows, topk, mlx.mlx_array_dtype(x));
+    return sorted_windows.finishSortedInverse(s, d, w.inverse, rb.svh[2], slots, scores, rb.hidden, rows, topk, mlx.mlx_array_dtype(x));
 }
 
 // ---- Tests ----
