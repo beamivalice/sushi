@@ -39,6 +39,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - `zig build test-host` builds `src/tests_host.zig`, a root that links no MLX: a file in it that reaches MLX fails the
   link. The build reads that root's imports as the host list, and no MLX bucket may also select a host file's tests.
 - `zig build test` runs the host tier, the MLX buckets, the exl3 binaries and the encoder binary.
+- build.zig names a bucket's files at configure time, so every folder or file it scans is declared with
+  `b.dependOnDirectoryContents`/`dependOnFileContents`; without that a new test file never runs until the cache goes.
 - `SUSHI_TEST_NO_GPU=1` makes a test build see no Metal backend, so `requireGpu` skips (diagnostic, test builds only).
 - The pack tier's envs: `DSV41_TINY`, `DSV41_STQ_TINY` (tiny DeepSeek fixtures), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`. A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green

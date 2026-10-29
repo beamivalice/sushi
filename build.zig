@@ -303,6 +303,8 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
     var top: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     for (test_dirs) |dir_path| {
         const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
+        // The scan runs at configure time, whose cache would otherwise miss a new or edited test file.
+        b.dependOnDirectoryContents(b.path(dir_path));
         var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e });
         defer src.close(io);
         var it = src.iterate();
@@ -316,6 +318,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
                 continue;
             }
             stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
+            b.dependOnFileContents(b.path(b.fmt("{s}/{s}", .{ dir_path, entry.name })));
             const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
             var lines = std.mem.splitScalar(u8, source, '\n');
             while (lines.next()) |line| {
@@ -386,6 +389,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
 
 /// The host tier's files are the imports of src/tests_host.zig, the one list.
 fn hostStems(b: *std.Build) []const []const u8 {
+    b.dependOnFileContents(b.path("src/tests_host.zig"));
     const source = buildRootHandle(b).readFileAlloc(b.graph.io, "src/tests_host.zig", b.allocator, .limited(1 << 20)) catch |e| std.debug.panic("src/tests_host.zig: {t}", .{e});
     var stems: std.ArrayList([]const u8) = .empty;
     var lines = std.mem.splitScalar(u8, source, '\n');
