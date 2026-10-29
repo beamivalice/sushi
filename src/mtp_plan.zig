@@ -11,6 +11,7 @@ const testing = std.testing;
 const generate = @import("generate.zig");
 const dsv41_dspark = @import("dsv41/dsv41_dspark.zig");
 const sampler = @import("sampler.zig");
+const mtp_policy = @import("mtp_policy.zig");
 const CallForce = generate.CallForce;
 const Constraint = generate.Constraint;
 const Generator = generate.Generator;
@@ -310,17 +311,17 @@ test "commitAdaptiveWidth: the summary follows the running width from both commi
 
 fn mtpEvTestGenerator() Generator {
     var g: Generator = undefined;
-    g.mtp_depth = Generator.MTP_ADAPTIVE_DEFAULT_CAP;
+    g.mtp_depth = mtp_policy.MTP_ADAPTIVE_DEFAULT_CAP;
     g.mtp_depth_current = 1;
     g.mtp_window_drafted = @splat(0);
     g.mtp_window_accepted = @splat(0);
     g.mtp_window_idx = 0;
     g.mtp_rounds_since_switch = 0;
     g.mtp_promote_cooldown = 0;
-    g.mtp_ev_accept = @splat(Generator.MTP_EV_PRIOR);
-    g.mtp_ev_rounds = Generator.MTP_EV_WARMUP_ROUNDS;
+    g.mtp_ev_accept = @splat(mtp_policy.MTP_EV_PRIOR);
+    g.mtp_ev_rounds = mtp_policy.MTP_EV_WARMUP_ROUNDS;
     g.mtp_ev_m_lo_prev = 1;
-    g.mtp_ev_costs = Generator.MTP_EV_DEFAULT_COSTS;
+    g.mtp_ev_costs = mtp_policy.MTP_EV_DEFAULT_COSTS;
     g.spec_disabled_runtime = false;
     return g;
 }
@@ -339,13 +340,13 @@ test "mtpGreedyTailFor: the greedy tail flag outranks the per-model mtp_greedy_t
 
 test "updateMtpEvRound: sticky disable uses the first draft at base depth one" {
     var good = mtpEvTestGenerator();
-    for (0..Generator.MTP_DEPTH_WINDOW * 2) |_| good.updateMtpEvRound(8, 1);
+    for (0..mtp_policy.MTP_DEPTH_WINDOW * 2) |_| good.updateMtpEvRound(8, 1);
     try testing.expect(!good.spec_disabled_runtime);
     for (good.mtp_window_drafted) |sample| try testing.expectEqual(@as(u8, 1), sample);
     for (good.mtp_window_accepted) |sample| try testing.expectEqual(@as(u8, 1), sample);
 
     var bad = mtpEvTestGenerator();
-    for (0..Generator.MTP_DEPTH_WINDOW - 1) |_| {
+    for (0..mtp_policy.MTP_DEPTH_WINDOW - 1) |_| {
         bad.updateMtpEvRound(8, 0);
         try testing.expect(!bad.spec_disabled_runtime);
     }
@@ -355,15 +356,15 @@ test "updateMtpEvRound: sticky disable uses the first draft at base depth one" {
 
 test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
     var g = mtpEvTestGenerator();
-    g.mtp_ev_rounds = Generator.MTP_EV_WARMUP_ROUNDS - 1;
+    g.mtp_ev_rounds = mtp_policy.MTP_EV_WARMUP_ROUNDS - 1;
     g.mtp_window_idx = 7;
     g.updateMtpEvRound(4, 0);
-    try testing.expectEqual(Generator.MTP_EV_WARMUP_ROUNDS, g.mtp_ev_rounds);
+    try testing.expectEqual(mtp_policy.MTP_EV_WARMUP_ROUNDS, g.mtp_ev_rounds);
     try testing.expectEqual(@as(u32, 0), g.mtp_window_idx);
 
-    for (0..Generator.MTP_DEPTH_WINDOW - 1) |_| g.updateMtpEvRound(1, 0);
+    for (0..mtp_policy.MTP_DEPTH_WINDOW - 1) |_| g.updateMtpEvRound(1, 0);
     try testing.expect(!g.spec_disabled_runtime);
-    try testing.expectEqual(Generator.MTP_DEPTH_WINDOW - 1, g.mtp_window_idx);
+    try testing.expectEqual(mtp_policy.MTP_DEPTH_WINDOW - 1, g.mtp_window_idx);
 
     g.mtp_ev_m_lo_prev = 2;
     g.updateMtpEvRound(4, 0);

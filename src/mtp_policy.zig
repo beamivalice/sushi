@@ -12,7 +12,7 @@ const sampler = @import("sampler.zig");
 const transformer_mod = @import("transformer.zig");
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
-const MtpWidthTrial = Generator.MtpWidthTrial;
+const MtpWidthTrial = round_cost.TrialSchedule;
 const mtpRoundOff0 = Generator.mtpRoundOff0;
 const readEnvBool = generate_mod.readEnvBool;
 const testing = std.testing;
@@ -2394,7 +2394,7 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
 }
 
 test "mtpWidthTrial: blocks per period, idempotent per round, period grows with the measured gap" {
-    var wt = Generator.MtpWidthTrial{};
+    var wt = round_cost.TrialSchedule{};
     var forced: u32 = 0;
     var i: u32 = 10;
     while (i < 210) : (i += 1) {
@@ -2442,7 +2442,7 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     };
     const a = [_]f32{ 0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95 };
     var t = round_cost.Table{};
-    var wt = Generator.MtpWidthTrial{};
+    var wt = round_cost.TrialSchedule{};
     var prev: ?u32 = null;
     var prev2: ?u32 = null;
     var prev_two = false;
@@ -2963,7 +2963,7 @@ test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its perio
 
     const run = struct {
         fn f(reread: bool) ?u32 {
-            var wt = G.MtpWidthTrial{};
+            var wt = round_cost.TrialSchedule{};
             var i: u32 = 12;
             while (i < 200) : (i += 1) {
                 const period: u32 = if (i < 18) 124 else round_cost.EXPLORE_PERIOD_COLD;

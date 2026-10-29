@@ -15,6 +15,7 @@ const testing = std.testing;
 const sampler = @import("../sampler.zig");
 const SamplingParams = sampler.SamplingParams;
 const generate = @import("../generate.zig");
+const mtp_policy = @import("../mtp_policy.zig");
 const Generator = generate.Generator;
 const MtpHeadRef = generate.MtpHeadRef;
 
@@ -39,7 +40,7 @@ test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where 
     const mimo = Generator.mtpEvCostsForProfile(.mimo_exl3);
     try testing.expectEqual(@as(u32, 1), Generator.mtpEvPlanFor(&prose, 3, mimo, 3).m_lo);
     try testing.expectEqual(@as(u32, 3), Generator.mtpEvPlanFor(&code, 3, mimo, 3).m_lo);
-    try testing.expect(Generator.mtpEvPlanFor(&prose, 3, Generator.MTP_EV_DEFAULT_COSTS, 3).m_lo > 1);
+    try testing.expect(Generator.mtpEvPlanFor(&prose, 3, mtp_policy.MTP_EV_DEFAULT_COSTS, 3).m_lo > 1);
 }
 
 test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and other layouts stay generic" {
@@ -261,7 +262,7 @@ test "mtpLookupDraftCap: a MiMo lookup drafts no wider than its verify keeps dec
     for (&text, 0..) |*t, i| t.* = @intCast(1 + i % 40);
     try idx.extend(&text, Lines{});
     const got = idx.match(1, Generator.mtpLookupDraftCap(true)) orelse return error.NoMatch;
-    var free = Generator.mtpLookupCostsFor(Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, null), 3);
+    var free = Generator.mtpLookupCostsFor(mtp_policy.MtpCostSource.init(mtp_policy.MTP_EV_DEFAULT_COSTS, 1000, null), 3);
     for (&free.lookup) |*c| c.* = 0.01;
     try testing.expectEqual(Generator.mtpVerifyDraftsMax(true), mtp_lookup.gate(got, 1000, 8, 0, true, free));
 }

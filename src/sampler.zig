@@ -19,6 +19,8 @@ const testing = std.testing;
 const mtp_plan = @import("mtp_plan.zig");
 const ThinkBound = mtp_plan.ThinkBound;
 const generate = @import("generate.zig");
+const mtp_round = @import("mtp_round.zig");
+const mtp_policy = @import("mtp_policy.zig");
 const CallForce = generate.CallForce;
 const Constraint = generate.Constraint;
 const Generator = generate.Generator;
@@ -2247,7 +2249,7 @@ test "shortlistProposal: q is zero off the shortlist, sums to 1, and peaks on th
     var sl = mtp_mod.Shortlist{ .cands = cands, .exact = exact, .rows = V };
     defer sl.deinit();
 
-    const sampling = Generator.mtpDraftSamplingFor(.{ .temperature = 1.0 }, false, Generator.MTP_DRAFT_TEMP);
+    const sampling = Generator.mtpDraftSamplingFor(.{ .temperature = 1.0 }, false, mtp_round.MTP_DRAFT_TEMP);
     const prop = try shortlistProposal(sl, sampling, s);
     defer _ = mlx.mlx_array_free(prop.id);
     defer _ = mlx.mlx_array_free(prop.q);
@@ -2313,7 +2315,7 @@ test "shortlistProposalRows: every row's q belongs to that row's own shortlist" 
     }
     defer for (&sl) |*x| x.deinit();
 
-    const sampling = Generator.mtpDraftSamplingFor(.{ .temperature = 1.0 }, false, Generator.MTP_DRAFT_TEMP);
+    const sampling = Generator.mtpDraftSamplingFor(.{ .temperature = 1.0 }, false, mtp_round.MTP_DRAFT_TEMP);
     const rows = [_]usize{ 0, 1, 2 };
     const out = try shortlistProposalRows(&sl, &rows, sampling, s);
     defer for (0..N) |j| {
@@ -2342,7 +2344,7 @@ test "shortlistProposalRows: every row's q belongs to that row's own shortlist" 
 test "mtpDraftStepPath: a sampled proposal keeps the rerank shortlist" {
     // Bar: a sampled proposal reads the rerank shortlist; only the chunk-A
     // confidence gate needs the full lm_head.
-    const P = Generator.DraftStepPath;
+    const P = mtp_round.DraftStepPath;
     try testing.expectEqual(P.rerank_sampled, Generator.mtpDraftStepPath(true, true, false));
     try testing.expectEqual(P.rerank_greedy, Generator.mtpDraftStepPath(true, false, false));
     // The extension gate wants ln p_head over the whole vocabulary.
@@ -2358,7 +2360,7 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
     // (temp 0.6 / top_p 0.95 / top_k 20 — oMLX Lightning's _DRAFT_SAMPLER_*
     // constants; matched-temp drafting collapses on high-entropy content).
     const target = SamplingParams{ .temperature = 1.0, .top_p = 1.0, .top_k = 0, .repeat_penalty = 1.1 };
-    const d = Generator.mtpDraftSamplingFor(target, false, Generator.MTP_DRAFT_TEMP);
+    const d = Generator.mtpDraftSamplingFor(target, false, mtp_round.MTP_DRAFT_TEMP);
     try testing.expectEqual(@as(f32, 0.6), d.temperature);
     try testing.expectEqual(@as(f32, 0.95), d.top_p);
     try testing.expectEqual(@as(u32, 20), d.top_k);
@@ -2367,12 +2369,12 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
 
     // Greedy target keeps greedy drafts (the temp-0 identity contract).
     const greedy = SamplingParams{ .temperature = 0.0 };
-    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(greedy, false, Generator.MTP_DRAFT_TEMP).temperature);
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(greedy, false, mtp_round.MTP_DRAFT_TEMP).temperature);
     const near_greedy = SamplingParams{ .temperature = 0.005 };
-    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(near_greedy, false, Generator.MTP_DRAFT_TEMP).temperature);
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(near_greedy, false, mtp_round.MTP_DRAFT_TEMP).temperature);
 
     // An explicit greedy request wins.
-    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true, Generator.MTP_DRAFT_TEMP).temperature);
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true, mtp_round.MTP_DRAFT_TEMP).temperature);
 
     // The draft temperature is the FAMILY's, passed in, never a global.
     try testing.expectEqual(@as(f32, 1.0), Generator.mtpDraftSamplingFor(target, false, 1.0).temperature);
@@ -2414,8 +2416,8 @@ test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request d
         const target = SamplingParams{ .temperature = t, .top_p = 0.95, .top_k = 20, .seed = 7 };
         for (0..mtp_mod.MAX_DEPTH) |d| {
             const step: u32 = @intCast(d);
-            const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, step), Generator.MTP_DRAFT_TEMP_QWEN4);
-            const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, false, step), Generator.MTP_DRAFT_TEMP_QWEN4);
+            const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, step), mtp_round.MTP_DRAFT_TEMP_QWEN4);
+            const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, false, step), mtp_round.MTP_DRAFT_TEMP_QWEN4);
             try testing.expect(std.meta.eql(on, off));
             try testing.expect(isGreedyTemperature(on.temperature));
         }
@@ -2508,7 +2510,7 @@ test "spec sampling exactness: a greedy tail (depth 0 sampled, argmax after it, 
 }
 
 test "mtpRegimeObserve: averages the first 1/beta samples, then moves by the cost beta, reseeds on a new base depth" {
-    var r = Generator.MtpRegime{};
+    var r = mtp_policy.MtpRegime{};
     Generator.mtpRegimeObserve(&r, true, 3, 45.0, 4.0); // first round counts
     try testing.expect(r.two_tok > 0.0);
     Generator.mtpRegimeObserve(&r, false, 3, 45.0, 4.0); // transition: dropped
@@ -2522,7 +2524,7 @@ test "mtpRegimeObserve: averages the first 1/beta samples, then moves by the cos
     for (0..8) |_| Generator.mtpRegimeObserve(&r, false, 3, 60.0, 5.0);
     try testing.expectApproxEqAbs(@as(f32, 59.0), r.one_ms, 1e-3);
     Generator.mtpRegimeObserve(&r, false, 3, 70.0, 5.0);
-    try testing.expectApproxEqAbs(59.0 + Generator.MTP_EV_COST_BETA * 11.0, r.one_ms, 1e-3);
+    try testing.expectApproxEqAbs(59.0 + mtp_policy.MTP_EV_COST_BETA * 11.0, r.one_ms, 1e-3);
     // The climb moved m_lo: the depth-3 rounds are not the depth-4 regime.
     Generator.mtpRegimeObserve(&r, false, 4, 70.0, 5.0);
     try testing.expectApproxEqAbs(@as(f32, 70.0), r.one_ms, 1e-6);
@@ -2538,7 +2540,7 @@ test "mtpEmaMs: seeds on the first sample then folds nanoseconds into a ms EMA" 
     try testing.expectApproxEqAbs(@as(f32, 45.0), D.mtpEmaMs(0.0, 45_000_000), 1e-3);
     // A subsequent sample folds at MTP_EV_COST_BETA toward the new value.
     const folded = D.mtpEmaMs(45.0, 40_000_000); // 40 ms sample
-    try testing.expectApproxEqAbs(45.0 + D.MTP_EV_COST_BETA * (40.0 - 45.0), folded, 1e-3);
+    try testing.expectApproxEqAbs(45.0 + mtp_policy.MTP_EV_COST_BETA * (40.0 - 45.0), folded, 1e-3);
     // Env parse: default on, "0" off, "" on.
     try testing.expect(D.mtpCostTableEnabledFromEnv(null));
     try testing.expect(!D.mtpCostTableEnabledFromEnv("0"));
@@ -2716,7 +2718,7 @@ test "greedy tail: each depth's verify q is the density its draft came from" {
     };
     for (&props, 0..) |*p, d| {
         const greedy = Generator.mtpDraftGreedyAt(target, true, @intCast(d));
-        p.* = try shortlistStepProposal(sl, Generator.mtpDraftSamplingFor(target, greedy, Generator.MTP_DRAFT_TEMP), s);
+        p.* = try shortlistStepProposal(sl, Generator.mtpDraftSamplingFor(target, greedy, mtp_round.MTP_DRAFT_TEMP), s);
         built += 1;
         // Every depth drafts the same `[1]` id shape: the verify concatenates them.
         try testing.expectEqualSlices(c_int, &.{1}, mlx.getShape(p.id));

@@ -30,6 +30,7 @@ const walkChunkEnds = prefill_plan.walkChunkEnds;
 const generate = @import("../generate.zig");
 const Generator = generate.Generator;
 const mtp_round = @import("../mtp_round.zig");
+const mtp_policy = @import("../mtp_policy.zig");
 const MtpHeadRef = generate.MtpHeadRef;
 
 test "a 40k Qwen prefill checkpoints every 8192 tokens at any chunk width the ladder takes" {
@@ -107,23 +108,23 @@ test "Qwen4 mixed MTP cost prior prices the measured width-seven fallback" {
 }
 
 test "mtpEvPlanFor: realistic warmup EMAs stop the generic surface early and never open qwen4 to depth 8" {
-    const p = Generator.MTP_EV_PRIOR;
+    const p = mtp_policy.MTP_EV_PRIOR;
     const a = [_]f32{ 0.97, 0.89, p, p, p, p, p, p };
 
     // The M1-M4 surface stops at the first expensive ramp position.
-    const generic = Generator.mtpEvPlanFor(&a, 8, Generator.MTP_EV_DEFAULT_COSTS, 3);
+    const generic = Generator.mtpEvPlanFor(&a, 8, mtp_policy.MTP_EV_DEFAULT_COSTS, 3);
     try testing.expectEqual(@as(u32, 3), generic.m_lo);
     try testing.expect(generic.m_hi < 8);
 
     // qwen4_exp's measured surface has no NAX takeover — a verify row is
     // bytes at every width — so the same base depth stands but the same
     // evidence must NOT extend to depth 8.
-    const qwen4_plan = Generator.mtpEvPlanFor(&a, 8, Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 3);
+    const qwen4_plan = Generator.mtpEvPlanFor(&a, 8, mtp_policy.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 3);
     try testing.expectEqual(@as(u32, 3), qwen4_plan.m_lo);
     try testing.expect(qwen4_plan.m_hi < 8);
 
     const cold = [_]f32{ 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 };
-    const cold_plan = Generator.mtpEvPlanFor(&cold, 8, Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 8);
+    const cold_plan = Generator.mtpEvPlanFor(&cold, 8, mtp_policy.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 8);
     try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
     try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
 }
@@ -223,7 +224,7 @@ test "mtpAdaptiveVoteFor: four real switch events of the qwen4 A/B" {
     // Four switches the v1 controller made on a 62.7k prose prompt where MTP was the faster
     // arm (56.8 vs 51.6 tok/s): the modeled token count ran 12-31% under the cell's own `tok`.
     const G = Generator;
-    const margin = G.MTP_ADAPTIVE_MARGIN;
+    const margin = mtp_policy.MTP_ADAPTIVE_MARGIN;
     const Event = struct {
         name: []const u8,
         table_ms_tok: f32, // Table.msPerTok(m_lo, bucket), from `table=` in [spec-stats]
@@ -240,7 +241,7 @@ test "mtpAdaptiveVoteFor: four real switch events of the qwen4 A/B" {
     };
     for (events) |e| {
         try testing.expectEqual(
-            G.MtpAdaptiveVote.mtp,
+            mtp_policy.MtpAdaptiveVote.mtp,
             G.mtpAdaptiveVoteFor(e.table_ms_tok, e.table_ms_tok, e.serial_ms_tok, margin),
         );
         // Must not vote serial on any row; an unfilled window is `.undecided`.
@@ -248,14 +249,14 @@ test "mtpAdaptiveVoteFor: four real switch events of the qwen4 A/B" {
         const got = G.mtpAdaptiveVoteFor(e.table_ms_tok, win, e.serial_ms_tok, margin);
         try testing.expect(got != .serial);
         try testing.expectEqual(
-            if (e.window_full) G.MtpAdaptiveVote.mtp else G.MtpAdaptiveVote.undecided,
+            if (e.window_full) mtp_policy.MtpAdaptiveVote.mtp else mtp_policy.MtpAdaptiveVote.undecided,
             got,
         );
     }
     // Rule B ungated reproduces the b1-long2 mistake.
     const b1l2 = events[1];
     try testing.expectEqual(
-        G.MtpAdaptiveVote.serial,
+        mtp_policy.MtpAdaptiveVote.serial,
         G.mtpAdaptiveVoteFor(30.0, b1l2.window_ms_tok, b1l2.serial_ms_tok, margin),
     );
 }
@@ -334,7 +335,7 @@ const MtpChainTestSlot = struct {
         a.destroy(slot);
     }
 
-    fn begin(g: *Generator, a: std.mem.Allocator, depth: u32, confidence: bool) !Generator.MtpRoundOpen {
+    fn begin(g: *Generator, a: std.mem.Allocator, depth: u32, confidence: bool) !mtp_round.MtpRoundOpen {
         g.mtp_depth_current = depth;
         g.spec_cost_solo = false;
         g.mtp_batch_head = true;
@@ -430,7 +431,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
                 batch[i] = try MtpChainTestSlot.init(a, io, &xfm, &tok, ids, depth);
             }
             for (0..3) |round| {
-                var ss: [4]?Generator.MtpRoundState = @splat(null);
+                var ss: [4]?mtp_round.MtpRoundState = @splat(null);
                 var results: [4]?Generator.DrafterStepResult = @splat(null);
                 defer for (&ss, results) |*state, result| {
                     if (state.*) |*v| v.deinit(a);
@@ -442,8 +443,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
                     ss[i] = try g.mtpRoundContinue(a, open);
                     try g.mtpRoundVerify(&ss[i].?);
                 }
-                var opens: [4]Generator.MtpRoundOpen = undefined;
-                var chains: [4]Generator.MtpPreDraft = undefined;
+                var opens: [4]mtp_round.MtpRoundOpen = undefined;
+                var chains: [4]mtp_round.MtpPreDraft = undefined;
                 var owns: [4]bool = @splat(false);
                 var gens: [4]*Generator = undefined;
                 defer for (&chains, owns) |*chain, owned| {
@@ -456,11 +457,11 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
                     owns[i] = true;
                 }
                 try Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth);
-                var batch_states: [4]?Generator.MtpRoundState = @splat(null);
+                var batch_states: [4]?mtp_round.MtpRoundState = @splat(null);
                 defer for (&batch_states) |*state| {
                     if (state.*) |*p| p.deinit(a);
                 };
-                var batch_ptrs: [4]*Generator.MtpRoundState = undefined;
+                var batch_ptrs: [4]*mtp_round.MtpRoundState = undefined;
                 for (0..n) |i| {
                     opens[i].chain = chains[i];
                     owns[i] = false;
@@ -559,7 +560,7 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
 
     const Check = struct {
-        fn chain(c: *const Generator.MtpPreDraft, s: mlx.mlx_stream) !void {
+        fn chain(c: *const mtp_round.MtpPreDraft, s: mlx.mlx_stream) !void {
             const qs = c.q_probs orelse return error.ExpectedProposalRows;
             try testing.expectEqual(c.m, c.n_qp);
             for (0..c.m) |i| {
@@ -604,8 +605,8 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
     }
     for (0..3) |_| {
         var gens: [2]*Generator = undefined;
-        var opens: [2]Generator.MtpRoundOpen = undefined;
-        var chains: [2]Generator.MtpPreDraft = undefined;
+        var opens: [2]mtp_round.MtpRoundOpen = undefined;
+        var chains: [2]mtp_round.MtpPreDraft = undefined;
         var owns: [2]bool = @splat(false);
         defer for (&chains, owns) |*c, owned| {
             if (owned) c.deinit(a);
@@ -617,7 +618,7 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
             owns[i] = true;
         }
         try Generator.mtpChainBuildBatched(&gens, &chains, 0, depth);
-        var states: [2]?Generator.MtpRoundState = @splat(null);
+        var states: [2]?mtp_round.MtpRoundState = @splat(null);
         defer for (&states) |*st| {
             if (st.*) |*v| v.deinit(a);
         };
@@ -658,12 +659,12 @@ test "acceptance failure restores every unfinished row after verify returns" {
     defer for (slots) |slot| {
         if (slot) |p| p.deinit(a);
     };
-    var states: [2]?Generator.MtpRoundState = @splat(null);
+    var states: [2]?mtp_round.MtpRoundState = @splat(null);
     defer for (&states) |*state| {
         if (state.*) |*p| p.deinit(a);
     };
     var gens: [2]*Generator = undefined;
-    var ptrs: [2]*Generator.MtpRoundState = undefined;
+    var ptrs: [2]*mtp_round.MtpRoundState = undefined;
     var before: [2]usize = undefined;
     var old_keys: [2]mlx.mlx_array = @splat(.{ .ctx = null });
     var layers: [2]usize = undefined;
@@ -952,8 +953,8 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
             a.free(result.tokens);
         }
         var gens: [2]*Generator = undefined;
-        var opens: [2]Generator.MtpRoundOpen = undefined;
-        var chains: [2]Generator.MtpPreDraft = undefined;
+        var opens: [2]mtp_round.MtpRoundOpen = undefined;
+        var chains: [2]mtp_round.MtpPreDraft = undefined;
         var owns: [2]bool = @splat(false);
         defer for (&chains, owns) |*chain, owned| {
             if (owned) chain.deinit(a);
@@ -966,11 +967,11 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
             owns[row] = true;
         }
         try Generator.mtpChainBuildBatched(&gens, &chains, 0, 1);
-        var states: [2]?Generator.MtpRoundState = @splat(null);
+        var states: [2]?mtp_round.MtpRoundState = @splat(null);
         defer for (&states) |*state| {
             if (state.*) |*value| value.deinit(a);
         };
-        var pointers: [2]*Generator.MtpRoundState = undefined;
+        var pointers: [2]*mtp_round.MtpRoundState = undefined;
         for (0..2) |row| {
             opens[row].chain = chains[row];
             owns[row] = false;

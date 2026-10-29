@@ -874,16 +874,6 @@ pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelCon
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
 pub const Generator = struct {
-    pub const DraftStepPath = mtp_round.DraftStepPath;
-    pub const MTP_DRAFT_TEMP = mtp_round.MTP_DRAFT_TEMP;
-    pub const MTP_DRAFT_TEMP_QWEN4 = mtp_round.MTP_DRAFT_TEMP_QWEN4;
-    pub const MtpGraphFn = mtp_round.MtpGraphFn;
-    pub const MtpHistStash = mtp_round.MtpHistStash;
-    pub const MtpPreDraft = mtp_round.MtpPreDraft;
-    pub const MtpRoundOpen = mtp_round.MtpRoundOpen;
-    pub const MtpRoundState = mtp_round.MtpRoundState;
-    pub const MtpRowVerdict = mtp_round.MtpRowVerdict;
-    pub const MtpSerialExit = mtp_round.MtpSerialExit;
 
     xfm: *Transformer,
     /// Forward-pass context. Stores per-request KVCache pointer, moe_seq_offset
@@ -991,7 +981,7 @@ pub const Generator = struct {
     dflash_block_size: u32 = 0,
     /// Wall ms of this request's DFlash rounds, for the cost gate.
     dflash_wall_ms: f64 = 0,
-    dflash_gate_window: DflashGateWindow = .{},
+    dflash_gate_window: glm5_generate.DflashGateWindow = .{},
     /// Drafts the verifies of this request carried, and the selector-confidence calibration that picks rows.
     dflash_drafts_verified: u64 = 0,
     dflash_calib: dflash_policy.Calibration = .{},
@@ -1037,7 +1027,7 @@ pub const Generator = struct {
     // `deinit`).
     mtp: ?MtpHeadRef = null,
     /// Installed verifier route; selected once at init, not checked per token.
-    mtp_accept_graph: MtpGraphFn = mtpBatchedExactGraph,
+    mtp_accept_graph: mtp_round.MtpGraphFn = mtpBatchedExactGraph,
     mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
     mtp_accept_param: f32 = 0,
     /// A sampled request drafts only depth 0 from the draft sampler, every later depth by argmax.
@@ -1065,8 +1055,8 @@ pub const Generator = struct {
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     mtp_accepted_tokens: u64 = 0,
     /// Adaptive-depth moving window: per-round drafted/accepted counts.
-    mtp_window_drafted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
-    mtp_window_accepted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
+    mtp_window_drafted: [mtp_policy.MTP_DEPTH_WINDOW]u8 = @splat(0),
+    mtp_window_accepted: [mtp_policy.MTP_DEPTH_WINDOW]u8 = @splat(0),
     mtp_window_idx: u32 = 0,
     mtp_rounds_since_switch: u32 = 0,
     /// Rounds remaining during which promotion is blocked (set after a
@@ -1107,7 +1097,7 @@ pub const Generator = struct {
     /// EV controller: conditional acceptance EMA per draft index,
     /// a[i] = P(draft i accepted | drafts 0..i-1 accepted). Optimistic prior;
     /// warmup rounds pull the low indices to reality before it can matter.
-    mtp_ev_accept: [mtp_mod.MAX_DEPTH]f32 = @splat(MTP_EV_PRIOR),
+    mtp_ev_accept: [mtp_mod.MAX_DEPTH]f32 = @splat(mtp_policy.MTP_EV_PRIOR),
     /// Rounds seen by the EV controller (drives the legacy-behavior warmup).
     mtp_ev_rounds: u32 = 0,
     /// Last round's planned m_lo (base-depth climb damping: +1/round max).
@@ -1115,7 +1105,7 @@ pub const Generator = struct {
     /// Round-cost surface selected once for this target+MTP head. The M5/G17
     /// NAX surface requires the measured trunk, native sidecar, and 3-bit
     /// draft-only head; every other combination keeps the M1-M4 surface.
-    mtp_ev_costs: MtpEvCosts = MTP_EV_DEFAULT_COSTS,
+    mtp_ev_costs: mtp_policy.MtpEvCosts = mtp_policy.MTP_EV_DEFAULT_COSTS,
     /// Live-cost EMAs (ms), 0 = unseeded. `mtp_ev_sync_ms` is the measured
     /// chunk-A confidence-read sync — updated ONLY on extension-considered
     /// rounds, so it holds the true cost of a sync when one happens (not the
@@ -1125,11 +1115,11 @@ pub const Generator = struct {
     /// fraction of the round. Always-on; the trace is not required.
     mtp_ev_sync_ms: f32 = 0,
     mtp_ev_round_ms: f32 = 0,
-    mtp_regime: MtpRegime = .{},
+    mtp_regime: mtp_policy.MtpRegime = .{},
     mtp_regime_verdict: ?bool = null,
     /// Width-trial schedule for the round-cost table (one 2-round block per
     /// period at m_lo+1, so the table learns the next cliff once).
-    mtp_width_trial: MtpWidthTrial = .{},
+    mtp_width_trial: round_cost.TrialSchedule = .{},
     /// Consecutive plans with the same m_lo (the base has stopped climbing).
     mtp_m_lo_streak: u32 = 0,
     /// Drafts of the previous TWO rounds (0 = serial), every round: a round
@@ -1172,7 +1162,7 @@ pub const Generator = struct {
     /// scheduler can run the head step for the group in one graph.
     mtp_batch_head: bool = false,
     /// Per-phase wall-time trace (SUSHI_MTP_TRACE=1; else untouched).
-    mtp_trace: MtpTrace = .{},
+    mtp_trace: mtp_policy.MtpTrace = .{},
     /// Trace-only: stopwatch running across the scheduler gap (round return
     /// → next round entry); bills the `.gap` phase. Null when not tracing.
     mtp_gap_watch: ?io_util.Stopwatch = null,
@@ -1181,13 +1171,13 @@ pub const Generator = struct {
     /// multi-row head forward instead of a separate appendHistory forward.
     /// Rounds with no successor (EOS/length/runtime disable) never pay for
     /// the append; the stash is freed unconsumed in `deinit`.
-    mtp_hist_stash: ?MtpHistStash = null,
+    mtp_hist_stash: ?mtp_round.MtpHistStash = null,
     /// Cross-round pre-draft (round pipelining): the NEXT round's chunk-A
     /// draft chain, built and async-dispatched at the CURRENT round's tail
     /// so the head chain runs on the GPU while the CPU emits tokens. The
     /// build consumes `mtp_hist_stash`, so the two are mutually exclusive
     /// (asserted at consume). Freed unconsumed in `deinit`.
-    mtp_pre_draft: ?MtpPreDraft = null,
+    mtp_pre_draft: ?mtp_round.MtpPreDraft = null,
 
     // ── Phase 1: SSM checkpoints captured during prefill ──
     /// Owned SSM-state snapshots taken at stride-aligned positions during
@@ -1222,26 +1212,23 @@ pub const Generator = struct {
     /// A loop convicted inside the thought already closed it: one recovery per request.
     think_closed_by_loop: bool = false,
     /// Adaptive serial controller: which arm this request is on and the KV bucket it was decided in.
-    mtp_adaptive: MtpAdaptive = .{},
+    mtp_adaptive: mtp_policy.MtpAdaptive = .{},
     /// This request has released the module-owned MTP head (sticky serial arm reached a serial
     /// block boundary). Per request: one slow request must not turn MTP off process-wide.
     mtp_head_released: bool = false,
     /// This request's realized MTP price (ms per emitted token) over a trailing window.
-    mtp_price: MtpPriceWindow = .{},
+    mtp_price: mtp_policy.MtpPriceWindow = .{},
     /// Ticks left in a bounded serial block (the serial probe); the slot stays an MTP slot.
     mtp_serial_left: u32 = 0,
     /// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.
-    mtp_serial_exit: MtpSerialExit = .none,
+    mtp_serial_exit: mtp_round.MtpSerialExit = .none,
     /// Ticks of the current serial block spent warming (the previous round's tail).
     mtp_serial_warm: u32 = 0,
     mtp_serial_giveup_logged: bool = false,
     /// Inter-tick wall clock feeding the table's serial cell. Null = the next read seeds.
     mtp_serial_clock: ?io_util.Stopwatch = null,
-    pub const DFLASH_GATE_WARMUP = glm5_generate.DFLASH_GATE_WARMUP;
-    pub const DFLASH_GATE_MARGIN = glm5_generate.DFLASH_GATE_MARGIN;
     pub const dflashBreakEvenAccepted = glm5_generate.dflashBreakEvenAccepted;
     pub const dflashGateShouldDisable = glm5_generate.dflashGateShouldDisable;
-    pub const DflashGateWindow = glm5_generate.DflashGateWindow;
 
     /// Verifier rows a round of this request carried on average: the block's until a round has run.
     fn dflashMeanRows(self: *const Generator) f32 {
@@ -1821,7 +1808,7 @@ pub const Generator = struct {
         // history is self-consistent (sliding-window history semantics).
         const mtp_active = options.mtp_enabled and options.mtp != null;
         const AcceptRoute = struct {
-            graph: MtpGraphFn,
+            graph: mtp_round.MtpGraphFn,
             prefix: mtp_acceptance.PrefixFn,
             param: f32,
         };
@@ -3348,9 +3335,6 @@ pub const Generator = struct {
     pub const sampleGlmNode = glm5_generate.sampleGlmNode;
     pub const sampledGlmDecisions = glm5_generate.sampledGlmDecisions;
 
-    pub const ConstrainedEntry = dsv41_dspark.ConstrainedEntry;
-    pub const DsparkResume = dsv41_dspark.DsparkResume;
-    pub const Pending = dsv41_dspark.Pending;
     pub const dsparkConstrainedEntry = dsv41_dspark.dsparkConstrainedEntry;
     pub const dsparkEmitPending = dsv41_dspark.dsparkEmitPending;
     pub const dsparkJudgePending = dsv41_dspark.dsparkJudgePending;
@@ -3378,7 +3362,7 @@ pub const Generator = struct {
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
             const emitted = self.generated_ids.items.len - dflash_gen_before;
-            const post_warmup = dflash_rounds_before >= DFLASH_GATE_WARMUP;
+            const post_warmup = dflash_rounds_before >= glm5_generate.DFLASH_GATE_WARMUP;
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
             self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
             if (self.dflash_round_width > 0) self.dflash_wall_ms += wall;
@@ -3968,26 +3952,6 @@ pub const Generator = struct {
     pub const updateMtpDepth = mtp_policy.updateMtpDepth;
     pub const updateMtpEvRound = mtp_policy.updateMtpEvRound;
 
-    pub const MTP_ADAPTIVE_CONFIRM = mtp_policy.MTP_ADAPTIVE_CONFIRM;
-    pub const MTP_ADAPTIVE_DEFAULT_CAP = mtp_policy.MTP_ADAPTIVE_DEFAULT_CAP;
-    pub const MTP_ADAPTIVE_MARGIN = mtp_policy.MTP_ADAPTIVE_MARGIN;
-    pub const MTP_DEPTH_WINDOW = mtp_policy.MTP_DEPTH_WINDOW;
-    pub const MTP_EV_COST_BETA = mtp_policy.MTP_EV_COST_BETA;
-    pub const MTP_EV_DEFAULT_COSTS = mtp_policy.MTP_EV_DEFAULT_COSTS;
-    pub const MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS = mtp_policy.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS;
-    pub const MTP_EV_PRIOR = mtp_policy.MTP_EV_PRIOR;
-    pub const MTP_EV_WARMUP_ROUNDS = mtp_policy.MTP_EV_WARMUP_ROUNDS;
-    pub const MTP_PRICE_WINDOW = mtp_policy.MTP_PRICE_WINDOW;
-    pub const MtpAdaptive = mtp_policy.MtpAdaptive;
-    pub const MtpAdaptiveAction = mtp_policy.MtpAdaptiveAction;
-    pub const MtpAdaptiveArm = mtp_policy.MtpAdaptiveArm;
-    pub const MtpAdaptiveVote = mtp_policy.MtpAdaptiveVote;
-    pub const MtpCostSource = mtp_policy.MtpCostSource;
-    pub const MtpEvCosts = mtp_policy.MtpEvCosts;
-    pub const MtpPriceWindow = mtp_policy.MtpPriceWindow;
-    pub const MtpRegime = mtp_policy.MtpRegime;
-    pub const MtpTrace = mtp_policy.MtpTrace;
-    pub const SubLap = mtp_policy.SubLap;
 
     // ── MTP EV (expected-value) adaptive controller ──
     // Fixed-depth drafting is the warm-decode ceiling: at ~77% per-draft the
@@ -4087,7 +4051,6 @@ pub const Generator = struct {
     /// Width-trial schedule: same shape as the regime's (explicit
     /// trial_end/next_trial, a 2-round block — transition then measurement),
     /// idempotent per round because `mtpRoundPlan` has two call sites.
-    pub const MtpWidthTrial = round_cost.TrialSchedule;
 
     /// Returns the next token ID, or null when generation is finished.
     ///
@@ -5033,7 +4996,7 @@ test "CallForce: a required call names one of the declared functions, the model 
 }
 
 test "MtpTrace: per-phase accumulation, round averaging, log cadence, reset" {
-    var t = Generator.MtpTrace{};
+    var t = mtp_policy.MtpTrace{};
     // 2 rounds: draft 2ms+4ms, eval 10ms+30ms.
     t.add(.draft, 2_000_000);
     t.add(.eval, 10_000_000);
@@ -5050,7 +5013,7 @@ test "MtpTrace: per-phase accumulation, round averaging, log cadence, reset" {
     try testing.expectEqual(@as(u32, 1), t.extended);
     // Log line falls due exactly at LOG_EVERY rounds.
     var i: u32 = 2;
-    while (i < Generator.MtpTrace.LOG_EVERY - 1) : (i += 1) {
+    while (i < mtp_policy.MtpTrace.LOG_EVERY - 1) : (i += 1) {
         try testing.expect(!t.endRound(1, 1, false));
     }
     try testing.expect(t.endRound(1, 1, false));
@@ -5060,7 +5023,7 @@ test "MtpTrace: per-phase accumulation, round averaging, log cadence, reset" {
 }
 
 test "the [mtp-trace] phase summary stays contiguous for its log consumers" {
-    const line = try std.fmt.allocPrint(testing.allocator, Generator.MtpTrace.LINE_FMT, .{
+    const line = try std.fmt.allocPrint(testing.allocator, mtp_policy.MtpTrace.LINE_FMT, .{
         @as(u32, 32), 0.45, 0.0, 0.0,         4.09, 56.86, 0.0,  0.0,   0.03, 0.0,  0.07, 61.57,
         2.0,          1.4,  0.0, "0.91/0.80", 4.09, 7.13,  6.40, 52.28, 0.94, 0.44,
     });
@@ -5072,7 +5035,7 @@ test "the [mtp-trace] phase summary stays contiguous for its log consumers" {
 }
 
 test "MtpTrace sub-laps attribute inside a phase without changing the round total" {
-    var t = Generator.MtpTrace{};
+    var t = mtp_policy.MtpTrace{};
     t.add(.verify, 20_000_000);
     t.addSub(.build, 15_000_000);
     t.addSub(.ple, 3_000_000);
@@ -5111,7 +5074,7 @@ test "Tokenizer.definedVocabSize: highest defined id + 1, 0 when nothing is defi
 }
 
 test "MtpTrace per-index acceptance: index i counts only rounds that drafted it" {
-    var t: Generator.MtpTrace = .{};
+    var t: mtp_policy.MtpTrace = .{};
     _ = t.endRound(3, 3, false); // all three accepted
     _ = t.endRound(3, 1, false); // a0 accepted, a1 rejected, a2 never judged
     _ = t.endRound(1, 0, false); // depth-1 round: only index 0 drafted
@@ -5122,9 +5085,8 @@ test "MtpTrace per-index acceptance: index i counts only rounds that drafted it"
 }
 
 test "MtpPriceWindow: reads nothing until FULL, skips width trials, prices per TOKEN" {
-    const G = Generator;
-    const N = G.MTP_PRICE_WINDOW;
-    var w = G.MtpPriceWindow{};
+    const N = mtp_policy.MTP_PRICE_WINDOW;
+    var w = mtp_policy.MtpPriceWindow{};
     try testing.expect(w.msPerTok() == null);
 
     var i: u32 = 0;
@@ -5135,20 +5097,20 @@ test "MtpPriceWindow: reads nothing until FULL, skips width trials, prices per T
     w.observe(20.0, 2.0, false);
     try testing.expectApproxEqAbs(@as(f32, 10.0), w.msPerTok().?, 1e-4);
 
-    var t = G.MtpPriceWindow{};
+    var t = mtp_policy.MtpPriceWindow{};
     i = 0;
     while (i < N * 2) : (i += 1) t.observe(999.0, 1.0, true);
     try testing.expect(t.msPerTok() == null);
     try testing.expectEqual(@as(u32, 0), t.filled);
 
-    var d = G.MtpPriceWindow{};
+    var d = mtp_policy.MtpPriceWindow{};
     d.observe(std.math.nan(f32), 2.0, false);
     d.observe(20.0, 0.0, false);
     d.observe(-1.0, 2.0, false);
     try testing.expectEqual(@as(u32, 0), d.filled);
 
     // Summed over the window: 8 rounds at 1 tok/30 ms + 8 at 4 tok/60 ms = 18.0 ms/tok, not 22.5.
-    var m = G.MtpPriceWindow{};
+    var m = mtp_policy.MtpPriceWindow{};
     i = 0;
     while (i < N / 2) : (i += 1) m.observe(30.0, 1.0, false);
     while (i < N) : (i += 1) m.observe(60.0, 4.0, false);
@@ -5162,63 +5124,61 @@ test "MtpPriceWindow: reads nothing until FULL, skips width trials, prices per T
 }
 
 test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per round" {
-    const G = Generator;
-    const need = G.MTP_ADAPTIVE_CONFIRM;
-    var a = G.MtpAdaptive{};
+    const need = mtp_policy.MTP_ADAPTIVE_CONFIRM;
+    var a = mtp_policy.MtpAdaptive{};
     var r: u32 = 0;
     while (r < need - 1) : (r += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(r, 3, .serial, need));
+        try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, a.round(r, 3, .serial, need));
     }
-    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, a.round(need - 1, 3, .serial, need));
-    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.to_serial, a.round(need - 1, 3, .serial, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveArm.serial, a.arm);
     try testing.expectEqual(@as(u32, 1), a.switches);
 
     // `mtpRoundPlan` has two call sites per round: the second call at the same index must not advance the streak.
-    var b = G.MtpAdaptive{};
+    var b = mtp_policy.MtpAdaptive{};
     var i: u32 = 0;
     while (i < need - 1) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, b.round(i, 3, .serial, need));
-        try testing.expectEqual(G.MtpAdaptiveAction.none, b.round(i, 3, .serial, need));
+        try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, b.round(i, 3, .serial, need));
+        try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, b.round(i, 3, .serial, need));
     }
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, b.round(need - 1, 3, .serial, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveArm.undecided, b.arm);
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.to_serial, b.round(need - 1, 3, .serial, need));
 
-    var c = G.MtpAdaptive{};
+    var c = mtp_policy.MtpAdaptive{};
     _ = c.round(0, 3, .serial, need);
     _ = c.round(1, 3, .serial, need);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, c.round(2, 3, .mtp, need));
-    try testing.expectEqual(G.MtpAdaptiveArm.mtp, c.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, c.round(3, 3, .serial, need));
-    try testing.expectEqual(G.MtpAdaptiveAction.none, c.round(4, 3, .serial, need));
-    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, c.round(5, 3, .serial, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, c.round(2, 3, .mtp, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveArm.mtp, c.arm);
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, c.round(3, 3, .serial, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, c.round(4, 3, .serial, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.to_serial, c.round(5, 3, .serial, need));
 
-    var d = G.MtpAdaptive{};
+    var d = mtp_policy.MtpAdaptive{};
     _ = d.round(0, 3, .serial, need);
     _ = d.round(1, 3, .serial, need);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, d.round(2, 3, .undecided, need));
-    try testing.expectEqual(G.MtpAdaptiveAction.none, d.round(3, 3, .serial, need));
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, d.arm);
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, d.round(2, 3, .undecided, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, d.round(3, 3, .serial, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveArm.undecided, d.arm);
 
-    var e = G.MtpAdaptive{};
+    var e = mtp_policy.MtpAdaptive{};
     _ = e.round(0, 3, .serial, need);
     _ = e.round(1, 3, .serial, need);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, e.round(2, 4, .serial, need));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, e.round(2, 4, .serial, need));
     try testing.expectEqual(@as(u32, 1), e.confirm);
 
-    var f = G.MtpAdaptive{};
-    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
+    var f = mtp_policy.MtpAdaptive{};
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
 }
 
 test "MtpAdaptive: only a bucket crossing re-opens the serial decision" {
-    const G = Generator;
-    var off = G.MtpAdaptive{};
+    var off = mtp_policy.MtpAdaptive{};
     _ = off.round(0, 3, .serial, 1);
     var i: u32 = 0;
     while (i < 1024) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3));
+        try testing.expectEqual(mtp_policy.MtpAdaptiveAction.none, off.serialTick(3));
     }
-    try testing.expectEqual(G.MtpAdaptiveArm.serial, off.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4));
+    try testing.expectEqual(mtp_policy.MtpAdaptiveArm.serial, off.arm);
+    try testing.expectEqual(mtp_policy.MtpAdaptiveAction.to_mtp, off.serialTick(4));
 }
 
 test "MTP head persistence kill switch: only a literal 0 turns it off" {

@@ -22,6 +22,7 @@ const qwen4BatchedPleForward = qwen4_test_support.qwen4BatchedPleForward;
 const qwen4ExpectMoeBitsEqual = qwen4_test_support.qwen4ExpectMoeBitsEqual;
 const rollbackRowToAccepted = qwen4_test_support.rollbackRowToAccepted;
 const test_support = @import("../test_support.zig");
+const mtp_round = @import("../mtp_round.zig");
 const attn256RandBf16 = test_support.attn256RandBf16;
 const mlxSettledActiveBytes = test_support.mlxSettledActiveBytes;
 const qkvExpectBitsEqual = test_support.qkvExpectBitsEqual;
@@ -369,7 +370,7 @@ fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_a
     gen.ctx = slot.ctx;
     gen.sampling = .{};
     defer slot.ctx = gen.ctx;
-    var state: Gen.MtpRoundState = undefined;
+    var state: mtp_round.MtpRoundState = undefined;
     state.tracing = false;
     state.verify_input = row;
     try gen.mtpRoundVerify(&state);
@@ -3243,7 +3244,7 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     for (0..2) |i| try testing.expectEqualSlices(i32, solo_am[i], grp_am[i]);
 
     const accept = gen_mod.Generator.mtpGreedyVerdict;
-    var base: [2]gen_mod.Generator.MtpRowVerdict = undefined;
+    var base: [2]mtp_round.MtpRowVerdict = undefined;
     for (0..2) |i| {
         const solo_v = accept(solo_am[i], drafts[i][0 .. S_row[i] - 1], 0, 400);
         const grp_v = accept(grp_am[i], drafts[i][0 .. S_row[i] - 1], 0, 400);

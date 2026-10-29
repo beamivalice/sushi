@@ -30,6 +30,8 @@ const sampler = @import("sampler.zig");
 const testing = std.testing;
 const scheduler_mod = @import("scheduler.zig");
 const slot_outcome = @import("slot_outcome.zig");
+const mtp_round = @import("mtp_round.zig");
+const mtp_policy = @import("mtp_policy.zig");
 const LoopAction = scheduler_mod.LoopAction;
 const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
@@ -476,8 +478,8 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     };
     var tick_sw = io_util.Stopwatch.init(group[0].io);
     var gens: [MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
-    var chains: [MAX_BATCH_GROUP]generate_mod.Generator.MtpPreDraft = undefined;
-    var opens: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundOpen = undefined;
+    var chains: [MAX_BATCH_GROUP]mtp_round.MtpPreDraft = undefined;
+    var opens: [MAX_BATCH_GROUP]mtp_round.MtpRoundOpen = undefined;
     var live: [MAX_BATCH_GROUP]*Slot = undefined;
     var n: usize = 0;
     var n_chain: usize = 0;
@@ -540,7 +542,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
         n_chain = i + 1;
     }
 
-    const chain_lap = generate_mod.Generator.SubLap.start(generate_mod.Generator.mtpTraceOn(), live[0].io);
+    const chain_lap = mtp_policy.SubLap.start(generate_mod.Generator.mtpTraceOn(), live[0].io);
     generate_mod.Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth) catch |e| {
         for (live[0..n]) |slot| slot.markError(@errorName(e));
         return;
@@ -557,7 +559,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     const taken = n;
     n = 0;
     n_chain = 0;
-    var states: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundState = undefined;
+    var states: [MAX_BATCH_GROUP]mtp_round.MtpRoundState = undefined;
     var vgens: [MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
     var vlive: [MAX_BATCH_GROUP]*Slot = undefined;
     var vn: usize = 0;
@@ -576,7 +578,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     }
     if (vn == 0) return;
 
-    var sts: [MAX_BATCH_GROUP]*generate_mod.Generator.MtpRoundState = undefined;
+    var sts: [MAX_BATCH_GROUP]*mtp_round.MtpRoundState = undefined;
     for (states[0..vn], 0..) |*st, i| sts[i] = st;
     if (generate_mod.Generator.mtpGroupVerify(vgens[0..vn], sts[0..vn])) |_| {
         generate_mod.Generator.mtpGroupAccept(vgens[0..vn], sts[0..vn]) catch |e| {
@@ -699,7 +701,7 @@ fn runBatchedMtpTick(sch: *Scheduler, group: []*Slot) !void {
 /// every slot accepts and rolls back on its own row.
 fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     const allocator = sch.allocator;
-    var states: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundState = undefined;
+    var states: [MAX_BATCH_GROUP]mtp_round.MtpRoundState = undefined;
     var live: [MAX_BATCH_GROUP]*Slot = undefined;
     var n: usize = 0;
     defer for (states[0..n], live[0..n]) |*st, slot| {
@@ -828,7 +830,7 @@ fn cacheCostFormat(config: transformer_mod.KVQuantConfig) u64 {
 
 /// One wall for the group grid: from the tick's first round-begin to its last publish.
 /// Both group sites hand their tick stopwatch here rather than starting one of their own.
-fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, expected: usize, tick_sw: *io_util.Stopwatch, head_calls_before: u64) void {
+fn observeGroupRound(live: []*Slot, states: []const mtp_round.MtpRoundState, expected: usize, tick_sw: *io_util.Stopwatch, head_calls_before: u64) void {
     const xfm = live[0].model.transformer orelse return;
     if (live.len > group_cost_mod.MAX_GROUP_ROWS) return;
     var price_transition = false;
@@ -868,7 +870,7 @@ fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, exp
 /// One verify forward for a whole group: ragged rows ride the row-axis form, equal-lane
 /// trunks the merged padded forward, one row a solo round.
 /// Finish one row's round and publish it; a failed finish errors the slot instead.
-fn mtpFinishPublish(sch: *Scheduler, slot: *Slot, gen: *Generator, st: *Generator.MtpRoundState) void {
+fn mtpFinishPublish(sch: *Scheduler, slot: *Slot, gen: *Generator, st: *mtp_round.MtpRoundState) void {
     const r = gen.mtpRoundFinish(slot.allocator, st) catch |e| {
         slot.markError(@errorName(e));
         return;

@@ -455,7 +455,7 @@ test "a penalty keeps DFlash and the drafter off but not MTP" {
 
 test "Generator.dflashGateShouldDisable: a serial price decides by ms per token, the ladder break-even decides without one" {
     const G = Generator;
-    const w = G.DFLASH_GATE_WARMUP;
+    const w = DFLASH_GATE_WARMUP;
     const round_ms: f64 = 30.6; // a 4-row round, Sushi-2.6bpw M5 Max
     // Never decided before the warmup rounds.
     try testing.expect(!G.dflashGateShouldDisable(w - 1, 0, round_ms * @as(f64, @floatFromInt(w - 1)), 4.0, 13.3));
@@ -485,10 +485,10 @@ test "Generator.dflashGateShouldDisable: a serial price decides by ms per token,
 
 test "Generator.DflashGateWindow: one-time costs in the warmup rounds do not decide the request, a steady loser is still dropped" {
     const G = Generator;
-    const w: u64 = G.DFLASH_GATE_WARMUP;
+    const w: u64 = DFLASH_GATE_WARMUP;
     const serial: f32 = 14.5;
     // Warmup rounds of 80 ms (graph builds), then 30 ms rounds that emit 3.4 tokens: 8.8 ms per token.
-    var win = G.DflashGateWindow{};
+    var win = DflashGateWindow{};
     var wall: f64 = 80.0 * @as(f64, @floatFromInt(w));
     try testing.expect(!win.shouldDisable(w, 2 * w, wall, 5.0, serial));
     var n: u64 = w;
@@ -499,7 +499,7 @@ test "Generator.DflashGateWindow: one-time costs in the warmup rounds do not dec
     // The cumulative price over the same rounds is above the serial token, so the unwindowed test dropped it.
     try testing.expect(G.dflashGateShouldDisable(w, 2 * w, 80.0 * @as(f64, @floatFromInt(w)), 5.0, serial));
     // Rounds of 60 ms emitting 2 tokens (30 ms per token) lose once a warmup's worth of them has run.
-    var loser = G.DflashGateWindow{};
+    var loser = DflashGateWindow{};
     var lw: f64 = 30.0 * @as(f64, @floatFromInt(w));
     try testing.expect(!loser.shouldDisable(w, w, lw, 5.0, serial));
     var dropped_at: u64 = 0;
