@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 179 vars. By kind: tradeoff levers 14, diagnostics 48, microbenches 64, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 169 vars. By kind: tradeoff levers 14, diagnostics 48, microbenches 54, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -77,7 +77,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
 | `SUSHI_VISION_CHUNKED` | `generate.zig:1533` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
-## Microbenches (64)
+## Microbenches (54)
 
 In-process meters. Load-time meters run on the served binary; the rest are tests that skip when unset.
 
@@ -97,8 +97,6 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_GLM_T1_UBENCH` | `exl3/expert_exl3_kernels.zig` | GLM one-row routed chain meter at E288 4096/2048 n36 and n40 w14: per-phase µs per layer, lane vs one-row GEMVs interleaved | test | yes: glm5-clamped-experts |
 | `SUSHI_EXL3_LAYER_UBENCH` | `exl3/expert_exl3_kernels.zig:82` | prints per-stage EXL3 expert timings (adds syncs) | once | yes: engine-exl3-experts, qwen4-perf |
 | `SUSHI_FP8_UBENCH`, `SUSHI_FP8_UBENCH_SHAPE`, `SUSHI_FP8_UBENCH_SWEEP` | `fp8_block.zig` | FP8 trunk GEMV meter (`<reps>`, shape filter, `direct` sweep) | test | yes: mimo2-perf |
-| `SUSHI_GLM_A6_SHAPES_UBENCH`, `SUSHI_GLM_ARMS_UBENCH`, `SUSHI_GLM_ATTN_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH_CTX`, `SUSHI_GLM_LONGCTX_UBENCH_REPS`, `SUSHI_GLM_QMM_UBENCH` | `glm5_a6_dense_once.zig`, `glm5_model.zig`, `glm5_attention.zig`, `glm5_dflash_qmm.zig` | GLM NAX-arm, sparse-attention, long-context and qmm meters (+ ctx/reps lists) | test | yes: glm5-perf, glm5-kernels |
-| `SUSHI_GLM_DECODE_UBENCH`, `SUSHI_GLM_DECODE_UBENCH_CTX`, `SUSHI_GLM_KDA_PREFILL_UBENCH` | `glm5_attention.zig`, `glm5_model.zig` | GLM serial-decode MLA attention stages per context list; KDA prefill layer components | test | yes: glm5-kernels |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `scheduler.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
 | `SUSHI_QWEN_FOLD_UBENCH` | `qwen4_shared.zig` (test) | `1` times a Flash-Next MoE layer with the shared expert separate, folded (either grid order) and absent, one-bank and rate-grouped, as a dependent chain | test | yes: qwen4-perf |
 | `SUSHI_GLM_FOLD_UBENCH` | `glm5_shared.zig` (test) | `1` times a routed GLM layer with the shared expert separate, folded (either grid order) and absent, as a dependent chain | test | yes: glm5-kernels |

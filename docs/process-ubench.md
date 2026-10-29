@@ -73,3 +73,10 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `dsv41.rows_growth` | dsv41 | a full row store growing by one chunk: time, held MB and the peak beyond them (min and max) |
 | `dsv41.attn_span` | dsv41 | one attention span at the release geometry: composed core, f16 wide arm, fused kernel; peak MB (min and max) |
 | `dsv41.topk` | dsv41 | the decode top-k over index scores, one threadgroup a row against the served split, per row of work in one eval of one or eight |
+| `glm5.verify_qmm` | glm5 | verify-row projections per stored width (A6, A5) at the trunk shapes: serial qmv rows, the row-streaming kernel, row tiles |
+| `glm5.a6_trunk` | glm5 | A6 g128 trunk projections at 2048 rows: qmm against dequantize + dense NAX GEMM, with the count of differing bf16 values |
+| `glm5.nax_arms` | glm5 | NAX-shaped arms on this GPU's MLX (A6 dense-once, MLA head batches, three-row verify batch, KDA cluster) against the staged arms, with how far outputs differ |
+| `glm5.kda_prefill` | glm5 | one synthetic T2048 KDA layer, stage by stage, plus the whole reference layer |
+| `glm5.mla_decode_attn` | glm5 | one decode row's MLA attention as a 16-layer dependent chain, cumulative stages, by context |
+| `glm5.mla_chunk_attn` | glm5 | whole sparse attention of a short chunk on a kv8 state: scalar, packed FP32 composite, packed NAX, served |
+| `glm5.mla_chunk_stages` | glm5 | a 2048-row chunk's index scores, top-512 selection and whole attention, by context |

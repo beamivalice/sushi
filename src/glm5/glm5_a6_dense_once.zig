@@ -48,8 +48,8 @@ pub fn transientBudget(chunk: usize, pending_layers: usize) !usize {
     return if (chunk == 2048 and @import("glm5_model.zig").naxArms()) bill(pending_layers) else 0;
 }
 
-const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
-fn fixture(ops: *Ops, k: c_int, n: c_int, seed: u64) !Input {
+pub const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
+pub fn fixture(ops: *Ops, k: c_int, n: c_int, seed: u64) !Input {
     const key = try ops.slot();
     try mlx.check(mlx.mlx_random_key(key, seed));
     const x = try ops.slot();
@@ -125,78 +125,4 @@ test "GLM A6 dense once Linear keeps native bits and declines decode rows" {
         try std.testing.expectEqual(@as(usize, 1), dispatchCount());
     }
     resetDispatchCount();
-}
-
-test "GLM A6 dense once trunk shapes: bytes and time against qmm (SUSHI_GLM_A6_SHAPES_UBENCH)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_GLM_A6_SHAPES_UBENCH") or !@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const candidates = [_][2]c_int{ .{ 4096, 8192 }, .{ 8192, 4096 }, .{ 4096, 2048 }, .{ 2048, 4096 }, .{ 4096, 12288 }, .{ 12288, 4096 }, .{ 4096, 1536 }, .{ 1536, 16384 }, .{ 4096, 512 }, .{ 1536, 4096 } };
-    const repeats = 6;
-    for (candidates, 0..) |shape, index| {
-        const k = shape[0];
-        const n = shape[1];
-        var fx = Ops{ .s = mlx.gpuStream() };
-        defer fx.deinit();
-        const input = try fixture(&fx, k, n, @intCast(7000 + index));
-        var times: [2][9]f64 = undefined;
-        var differ: usize = 0;
-        for (0..11) |rep| for (0..2) |arm| {
-            var ops = Ops{ .s = mlx.gpuStream() };
-            defer ops.deinit();
-            const sw = @import("../io_util.zig").Stopwatch.init(io);
-            var outs: [repeats]Arr = undefined;
-            for (&outs) |*out| out.* = if (arm == 0) try ops.qmm(input.x, input.w, input.scales, input.biases, true) else try ops.binary(.mm, input.x, try ops.transpose(try ops.dequant(input.w, input.scales, input.biases), &.{ 1, 0 }));
-            for (outs) |out| try mlx.check(mlx.mlx_array_eval(out));
-            if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6 / repeats;
-            if (rep == 0 and arm == 1) {
-                const reference = try ops.qmm(input.x, input.w, input.scales, input.biases, true);
-                try mlx.check(mlx.mlx_array_eval(reference));
-                const count = mlx.mlx_array_size(reference);
-                const want = mlx.mlx_array_data_bfloat16(reference).?[0..count];
-                const got = mlx.mlx_array_data_bfloat16(outs[0]).?[0..count];
-                differ = 0;
-                for (want, got) |a, b| differ += @intFromBool(a != b);
-            }
-        };
-        for (&times) |*t| std.mem.sort(f64, t, {}, std.sort.asc(f64));
-        std.debug.print("[a6-shapes] {d}->{d}: qmm {d:.3} ms, dequant+gemm {d:.3} ms ({d:.1}%), {d} values differ\n", .{ k, n, times[0][4], times[1][4], (times[1][4] / times[0][4] - 1) * 100, differ });
-    }
-    var fx = Ops{ .s = mlx.gpuStream() };
-    defer fx.deinit();
-    const gate = try fixture(&fx, 4096, 2048, 7100);
-    const up = try fixture(&fx, 4096, 2048, 7101);
-    var times: [2][9]f64 = undefined;
-    var differ: usize = 0;
-    for (0..11) |rep| for (0..2) |arm| {
-        var ops = Ops{ .s = mlx.gpuStream() };
-        defer ops.deinit();
-        const sw = @import("../io_util.zig").Stopwatch.init(io);
-        var outs: [repeats][2]Arr = undefined;
-        for (&outs) |*out| {
-            if (arm == 0) {
-                out.* = .{ try ops.binary(.mm, gate.x, try ops.transpose(try ops.dequant(gate.w, gate.scales, gate.biases), &.{ 1, 0 })), try ops.binary(.mm, gate.x, try ops.transpose(try ops.dequant(up.w, up.scales, up.biases), &.{ 1, 0 })) };
-            } else {
-                const w = try ops.concat(&.{ gate.w, up.w }, 0);
-                const sc = try ops.concat(&.{ gate.scales, up.scales }, 0);
-                const bi = try ops.concat(&.{ gate.biases, up.biases }, 0);
-                const both = try ops.binary(.mm, gate.x, try ops.transpose(try ops.dequant(w, sc, bi), &.{ 1, 0 }));
-                out.* = .{ try ops.slice(both, 2, 0, 2048), try ops.slice(both, 2, 2048, 4096) };
-            }
-        }
-        for (outs) |out| for (out) |o| try mlx.check(mlx.mlx_array_eval(o));
-        if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6 / repeats;
-        if (rep == 0 and arm == 1) {
-            const reference = [2]Arr{ try ops.qmm(gate.x, gate.w, gate.scales, gate.biases, true), try ops.qmm(gate.x, up.w, up.scales, up.biases, true) };
-            differ = 0;
-            for (reference, outs[0]) |r, o| {
-                const flat = try ops.contiguous(o);
-                try mlx.check(mlx.mlx_array_eval(r));
-                try mlx.check(mlx.mlx_array_eval(flat));
-                const count = mlx.mlx_array_size(r);
-                for (mlx.mlx_array_data_bfloat16(r).?[0..count], mlx.mlx_array_data_bfloat16(flat).?[0..count]) |a, b| differ += @intFromBool(a != b);
-            }
-        }
-    };
-    for (&times) |*t| std.mem.sort(f64, t, {}, std.sort.asc(f64));
-    std.debug.print("[a6-shapes] shared gate+up: two banks {d:.3} ms, one 4096-wide bank {d:.3} ms ({d:.1}%), {d} values differ\n", .{ times[0][4], times[1][4], (times[1][4] / times[0][4] - 1) * 100, differ });
 }

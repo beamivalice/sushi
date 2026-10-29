@@ -5,7 +5,7 @@ const mlx = @import("../mlx.zig");
 const latent_store = @import("glm5_latent.zig");
 pub const Latent = latent_store.Latent;
 const partials = @import("glm5_attention_prefill.zig");
-const packed_nax = @import("glm5_attention_nax_packed.zig");
+pub const packed_nax = @import("glm5_attention_nax_packed.zig");
 const latent_overlay = @import("glm5_attention_overlay.zig");
 const Arr = mlx.mlx_array;
 const Ops = @import("glm5_model.zig").Ops;
@@ -28,20 +28,20 @@ pub fn packedCadenceTransientBudget(chunk: usize, pending_layers: usize) !usize 
     return std.math.mul(usize, packed_nax.scratch_limit, pending_layers);
 }
 
-const Scope = struct {
+pub const Scope = struct {
     s: mlx.mlx_stream,
     values: [96]Arr = undefined,
     count: usize = 0,
-    fn deinit(self: *Scope) void {
+    pub fn deinit(self: *Scope) void {
         for (self.values[0..self.count]) |a| _ = mlx.mlx_array_free(a);
     }
-    fn slot(self: *Scope) !*Arr {
+    pub fn slot(self: *Scope) !*Arr {
         if (self.count == self.values.len) return error.AttentionGraphTooLarge;
         self.values[self.count] = mlx.mlx_array_new();
         self.count += 1;
         return &self.values[self.count - 1];
     }
-    fn own(self: *Scope, a: Arr) !Arr {
+    pub fn own(self: *Scope, a: Arr) !Arr {
         const out = self.slot() catch |e| {
             _ = mlx.mlx_array_free(a);
             return e;
@@ -50,7 +50,7 @@ const Scope = struct {
         out.* = a;
         return a;
     }
-    fn result(_: *Scope, a: Arr) !Arr {
+    pub fn result(_: *Scope, a: Arr) !Arr {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_set(&out, a));
@@ -67,7 +67,7 @@ const Scope = struct {
         try mlx.check(mlx.mlx_reshape(out, a, dims.ptr, dims.len, self.s));
         return out.*;
     }
-    fn cut(self: *Scope, a: Arr, start: c_int, end: c_int) !Arr {
+    pub fn cut(self: *Scope, a: Arr, start: c_int, end: c_int) !Arr {
         const sh = mlx.getShape(a);
         var lo: [4]c_int = @splat(0);
         var hi: [4]c_int = @splat(0);
@@ -89,7 +89,7 @@ const Scope = struct {
         try mlx.check(mlx.mlx_concatenate_axis(out, vec, 0, self.s));
         return out.*;
     }
-    fn zeros(self: *Scope, dims: []const c_int, dtype: mlx.mlx_dtype) !Arr {
+    pub fn zeros(self: *Scope, dims: []const c_int, dtype: mlx.mlx_dtype) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_zeros(out, dims.ptr, dims.len, dtype, self.s));
         return out.*;
@@ -397,7 +397,7 @@ const MERGE: [:0]const u8 =
 
 var tree_score_calls: usize = 0;
 
-fn indexScores(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
+pub fn indexScores(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
     const pools: c_int = @intCast(state.processed / 4);
     if (state.pool_tail.ctx != null) {
         const base: c_int = pools - @as(c_int, @intCast(state.poolTailRows()));
@@ -575,7 +575,7 @@ fn selectPools(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
         try partitionTop(scope, scores, rows);
 }
 
-fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
+pub fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
     const rows = mlx.getShape(index_q)[0];
     const pools: c_int = @intCast(state.processed / 4);
     const off = try scope.own(mlx.mlx_array_new_int(@intCast(offset)));
@@ -732,7 +732,7 @@ fn treeScoresRows(scope: *Scope, pooled: Arr, tail: Arr, tail_rows: c_int, index
     return kernelOutput(scope, ov, 0);
 }
 
-fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, headpack: bool, overlay: ?latent_overlay.View) !Arr {
+pub fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, headpack: bool, overlay: ?latent_overlay.View) !Arr {
     if (headpack) {
         var ops = @import("glm5_model.zig").Ops{ .s = scope.s };
         defer ops.deinit();
@@ -1591,7 +1591,7 @@ test "GLM packed cadence bills a second tile only beyond one wide tile" {
     try std.testing.expectEqual(@as(usize, 0), try packedCadenceTransientBudget(2048, 2));
 }
 
-fn normal(scope: *Scope, shape: []const c_int, seed: u64, deviation: f32) !Arr {
+pub fn normal(scope: *Scope, shape: []const c_int, seed: u64, deviation: f32) !Arr {
     const key = try scope.slot();
     try mlx.check(mlx.mlx_random_key(key, seed));
     const out = try scope.slot();
@@ -1925,307 +1925,4 @@ test "GLM sparse prefill without NAX takes the FP32 composite, no worse than the
         try std.testing.expect(@abs(c - o) <= @abs(r - o) + @abs(o) / 128 + slack);
     }
     for (got[(rows - 1) * 64 * 512 ..]) |c| try std.testing.expectEqual(@as(f32, 0), c);
-}
-
-test "GLM sparse attention arms per chunk (SUSHI_GLM_ATTN_UBENCH)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_GLM_ATTN_UBENCH")) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const s = mlx.gpuStream();
-    const history: usize = 16384;
-    var scope = Scope{ .s = s };
-    defer scope.deinit();
-    var state = State{ .processed = history };
-    defer state.deinit();
-    state.latent = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&state.latent, try normal(&scope, &.{ @intCast(history), 512 }, 71, 1)));
-    try mlx.check(mlx.mlx_array_eval(state.latent));
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const transformer = @import("../transformer.zig");
-    const saved = transformer.vqmm_nax_probe_override;
-    defer transformer.vqmm_nax_probe_override = saved;
-    const nax = @import("glm5_model.zig").naxArms();
-    for ([_]c_int{ 1, 8 }) |rows| {
-        const offset = history - @as(usize, @intCast(rows));
-        const ids = try a.alloc(i32, @as(usize, @intCast(rows)) * 2051);
-        defer a.free(ids);
-        for (0..@intCast(rows)) |r| for (0..2051) |k| {
-            ids[r * 2051 + k] = if (k % 37 == 5) -1 else @intCast(offset + r - 2050 + k);
-        };
-        const selected = try scope.own(mlx.mlx_array_new_data(ids.ptr, &.{ rows, 2051 }, 2, .int32));
-        const q = try normal(&scope, &.{ rows, 64, 512 }, 72 + @as(u64, @intCast(rows)), 2);
-        try mlx.check(mlx.mlx_array_eval(q));
-        var outs: [3]Arr = .{ nil, nil, nil };
-        var times: [3][12]f64 = undefined;
-        for (0..14) |rep| for (0..3) |arm| {
-            if (arm == 2 and !nax) continue;
-            var arm_scope = Scope{ .s = s };
-            defer arm_scope.deinit();
-            var ops = Ops{ .s = s };
-            defer ops.deinit();
-            transformer.vqmm_nax_probe_override = if (arm == 1) false else saved;
-            const sw = @import("../io_util.zig").Stopwatch.init(io);
-            const out = if (arm == 0)
-                try attentionChunk(&arm_scope, &state, q, selected, offset, 1.0 / 16.0, if (rows == 1) 8 else 1, false, null)
-            else
-                (try packed_nax.run(&ops, q, state.latentView(), selected, offset, history, 1.0 / 16.0)).?;
-            try mlx.check(mlx.mlx_array_eval(out));
-            if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6;
-            if (rep == 0) outs[arm] = try scope.own(try arm_scope.result(out));
-        };
-        const n: usize = @intCast(64 * 512);
-        const want = blk: {
-            const lat = try a.alloc(f32, history * 512);
-            defer a.free(lat);
-            try bf16Values(state.latent, lat);
-            const qv = try a.alloc(f32, n);
-            defer a.free(qv);
-            try bf16Values(try scope.cut(q, 0, 1), qv);
-            break :blk try attentionOracle(a, lat, qv, ids[0..2051], 1, 1.0 / 16.0);
-        };
-        defer a.free(want);
-        const got = try a.alloc(f32, n);
-        defer a.free(got);
-        for (0..3) |arm| {
-            if (arm == 2 and !nax) continue;
-            try bf16Values(try scope.cut(outs[arm], 0, 1), got);
-            var worst: f64 = 0;
-            var peak: f64 = 0;
-            var sq: f64 = 0;
-            for (got, want) |g, w| {
-                worst = @max(worst, @abs(g - w));
-                peak = @max(peak, @abs(w));
-                sq += (g - w) * (g - w);
-            }
-            std.mem.sort(f64, &times[arm], {}, std.sort.asc(f64));
-            std.debug.print("[glm-attn-ubench] rows={d} arm={s} median {d:.3} ms min {d:.3} ms | row0 vs f64: max abs {e:.3} rms {e:.3} peak {d:.3}\n", .{ rows, ([_][]const u8{ "scalar", "composite", "nax" })[arm], times[arm][6], times[arm][0], worst, @sqrt(sq / @as(f64, @floatFromInt(n))), peak });
-        }
-    }
-}
-
-const UbenchStage = enum { scores, select, attend };
-
-fn ubenchRun(stage: UbenchStage, state: *const State, q: Arr, iq: Arr, w: Arr, offset: usize, s: mlx.mlx_stream) !void {
-    const rows: usize = @intCast(mlx.getShape(q)[0]);
-    if (stage == .attend) {
-        const out = try attend(state, q, iq, w, offset, 1.0 / 16.0, s);
-        defer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_array_eval(out));
-        return;
-    }
-    var start: usize = 0;
-    while (start < rows) {
-        var scope = Scope{ .s = s };
-        defer scope.deinit();
-        const outputs = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(outputs);
-        for (0..2) |_| {
-            if (start == rows) break;
-            const end = @min(rows, start + packed_nax.max_rows);
-            var node = state.*;
-            if (rows == 1) node.processed = offset + 1;
-            const iqc = try scope.cut(iq, @intCast(start), @intCast(end));
-            const wc = try scope.cut(w, @intCast(start), @intCast(end));
-            const out = if (stage == .scores) try indexScores(&scope, &node, iqc, wc, offset + start) else try selectChunk(&scope, &node, iqc, wc, offset + start);
-            try mlx.check(mlx.mlx_vector_array_append_value(outputs, out));
-            start = end;
-        }
-        try mlx.check(mlx.mlx_eval(outputs));
-    }
-}
-
-fn ubenchMedianMs(io: std.Io, reps: usize, stage: UbenchStage, state: *const State, q: Arr, iq: Arr, w: Arr, offset: usize, s: mlx.mlx_stream) !f64 {
-    var samples: [16]f64 = undefined;
-    const n = @min(reps, samples.len);
-    try ubenchRun(stage, state, q, iq, w, offset, s);
-    for (samples[0..n]) |*sample| {
-        const sw = @import("../io_util.zig").Stopwatch.init(io);
-        try ubenchRun(stage, state, q, iq, w, offset, s);
-        sample.* = @as(f64, @floatFromInt(sw.read())) / 1e6;
-    }
-    std.mem.sort(f64, samples[0..n], {}, std.sort.asc(f64));
-    return samples[n / 2];
-}
-
-// DIAGNOSTIC (SUSHI_GLM_LONGCTX_UBENCH=1): one MLA layer's long-context attention on a synthetic kv8
-// state of `_CTX` rows (default 2048,8192,32768,131072): decode (one row) and a 2048-row prefill
-// chunk, split into index scores, top-512 selection and the whole attention. Synchronizing stages
-// rank costs; multiply by 11 MLA layers for a token or a chunk.
-test "GLM long-context attention components (SUSHI_GLM_LONGCTX_UBENCH=1)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_GLM_LONGCTX_UBENCH")) return error.SkipZigTest;
-    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const raw = if (std.c.getenv("SUSHI_GLM_LONGCTX_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "2048,8192,32768,131072";
-    const reps: usize = if (std.c.getenv("SUSHI_GLM_LONGCTX_UBENCH_REPS")) |r| try std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) else 5;
-    var it = std.mem.tokenizeScalar(u8, raw, ',');
-    while (it.next()) |token| {
-        const n = try std.fmt.parseInt(c_int, token, 10);
-        var scope = Scope{ .s = s };
-        defer scope.deinit();
-        var state = State{ .latent_bits = latent_store.kv8_bits };
-        defer state.deinit();
-        const ape = try scope.zeros(&.{ 4, 128 }, .bfloat16);
-        var filled: c_int = 0;
-        while (filled < n) {
-            const rows = @min(n - filled, 16384);
-            var part = Scope{ .s = s };
-            defer part.deinit();
-            const seed: u64 = @intCast(filled);
-            _ = try state.append(try normal(&part, &.{ rows, 512 }, seed + 1, 1), try normal(&part, &.{ rows, 128 }, seed + 2, 1), try normal(&part, &.{ rows, 128 }, seed + 3, 1), ape, s);
-            try state.evaluate();
-            filled += rows;
-        }
-        const total: usize = @intCast(n);
-        const decode_q = try normal(&scope, &.{ 1, 64, 512 }, 21, 0.05);
-        const decode_iq = try normal(&scope, &.{ 1, 32, 128 }, 22, 1);
-        const decode_w = try normal(&scope, &.{ 1, 32 }, 23, 0.2);
-        var ms: [3]f64 = undefined;
-        for (std.enums.values(UbenchStage), &ms) |stage, *m| m.* = try ubenchMedianMs(io, reps, stage, &state, decode_q, decode_iq, decode_w, total - 1, s);
-        std.debug.print("[glm-attn-ubench] ctx={d} decode: scores {d:.3} ms, select {d:.3} ms, attend {d:.3} ms\n", .{ n, ms[0], ms[1], ms[2] });
-        {
-            // One decode row appended to the state it owns, then to a shared copy (no donation).
-            const row_latent = try normal(&scope, &.{ 1, 512 }, 24, 1);
-            const row_key = try normal(&scope, &.{ 1, 128 }, 25, 1);
-            for (0..2) |shared| {
-                var line: [8]f64 = undefined;
-                for (&line) |*m| {
-                    var other = if (shared == 1) try state.share() else State{};
-                    defer other.deinit();
-                    const sw = @import("../io_util.zig").Stopwatch.init(io);
-                    _ = try state.append(row_latent, row_key, row_key, ape, s);
-                    try state.evaluate();
-                    m.* = @as(f64, @floatFromInt(sw.read())) / 1e6;
-                }
-                std.debug.print("[glm-attn-ubench] ctx={d} decode append {s} ms:", .{ n, if (shared == 1) "shared" else "owned" });
-                for (line) |m| std.debug.print(" {d:.3}", .{m});
-                std.debug.print("\n", .{});
-            }
-        }
-        if (n < 2051 + 2048) continue;
-        {
-            // A prefill chunk appended to the owned state: each one regrows capacity.
-            var part = Scope{ .s = s };
-            defer part.deinit();
-            const chunk_latent = try normal(&part, &.{ 2048, 512 }, 26, 1);
-            const chunk_key = try normal(&part, &.{ 2048, 128 }, 27, 1);
-            try mlx.check(mlx.mlx_array_eval(chunk_latent));
-            try mlx.check(mlx.mlx_array_eval(chunk_key));
-            std.debug.print("[glm-attn-ubench] ctx={d} chunk append ms:", .{n});
-            for (0..4) |_| {
-                const sw = @import("../io_util.zig").Stopwatch.init(io);
-                _ = try state.append(chunk_latent, chunk_key, chunk_key, ape, s);
-                try state.evaluate();
-                std.debug.print(" {d:.3}", .{@as(f64, @floatFromInt(sw.read())) / 1e6});
-            }
-            std.debug.print("\n", .{});
-        }
-        const prefill_q = try normal(&scope, &.{ 2048, 64, 512 }, 31, 0.05);
-        const prefill_iq = try normal(&scope, &.{ 2048, 32, 128 }, 32, 1);
-        const prefill_w = try normal(&scope, &.{ 2048, 32 }, 33, 0.2);
-        for (std.enums.values(UbenchStage), &ms) |stage, *m| m.* = try ubenchMedianMs(io, @min(reps, 3), stage, &state, prefill_q, prefill_iq, prefill_w, total - 2048, s);
-        std.debug.print("[glm-attn-ubench] ctx={d} prefill chunk 2048: scores {d:.1} ms, select {d:.1} ms, attend {d:.1} ms\n", .{ n, ms[0], ms[1], ms[2] });
-    }
-}
-
-const DecodeStage = enum { null_chain, scores, select, composite_cast, composite_qk, composite_softmax, composite, full };
-
-fn decodeComposite(ops: *Ops, q: Arr, kv_bank: Arr, mask: Arr, scale: f32, stage: DecodeStage) !Arr {
-    const kv = try ops.cast(kv_bank, .float32);
-    if (stage == .composite_cast) return kv;
-    const queries = try ops.binary(.mul, try ops.cast(q, .float32), try ops.scalar(scale, .float32));
-    const kt = try ops.transpose(kv, &.{ 0, 2, 1 });
-    const blocks = try ops.ones(&.{ 1, 2, 65 }, .bool_);
-    const qk = try ops.slot();
-    try mlx.check(mlx.mlx_block_masked_mm(qk, queries, kt, 32, blocks, .{ .ctx = null }, .{ .ctx = null }, ops.s));
-    const masked = try ops.slot();
-    try mlx.check(mlx.mlx_where(masked, try ops.reshape(mask, &.{ 1, 1, 2051 }), qk.*, try ops.scalar(-std.math.inf(f32), .float32), ops.s));
-    if (stage == .composite_qk) return masked.*;
-    const probs = try ops.softmax(masked.*, -1);
-    if (stage == .composite_softmax) return probs;
-    const blocks2 = try ops.ones(&.{ 1, 2, 16 }, .bool_);
-    const pv = try ops.slot();
-    try mlx.check(mlx.mlx_block_masked_mm(pv, probs, kv, 32, blocks2, .{ .ctx = null }, .{ .ctx = null }, ops.s));
-    return ops.cast(pv.*, .bfloat16);
-}
-
-// DIAGNOSTIC (SUSHI_GLM_DECODE_UBENCH=1, `_CTX`): one serial decode row's MLA attention as a dependent chain of
-// 16 layers (each layer's query and index inputs come from the previous output), cumulative stages; the
-// per-layer figure includes the chain's token plumbing, which `null_chain` measures.
-test "GLM decode row attention stages (SUSHI_GLM_DECODE_UBENCH=1)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_GLM_DECODE_UBENCH")) return error.SkipZigTest;
-    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const raw = if (std.c.getenv("SUSHI_GLM_DECODE_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "1024,8192,32768,131072";
-    var it = std.mem.tokenizeScalar(u8, raw, ',');
-    while (it.next()) |token| {
-        const n = try std.fmt.parseInt(c_int, token, 10);
-        var scope = Scope{ .s = s };
-        defer scope.deinit();
-        var state = State{ .latent_bits = latent_store.kv8_bits };
-        defer state.deinit();
-        const ape = try scope.zeros(&.{ 4, 128 }, .bfloat16);
-        var filled: c_int = 0;
-        while (filled < n) {
-            const rows = @min(n - filled, 16384);
-            var part = Scope{ .s = s };
-            defer part.deinit();
-            const seed: u64 = @intCast(filled);
-            _ = try state.append(try normal(&part, &.{ rows, 512 }, seed + 1, 1), try normal(&part, &.{ rows, 128 }, seed + 2, 1), try normal(&part, &.{ rows, 128 }, seed + 3, 1), ape, s);
-            try state.evaluate();
-            filled += rows;
-        }
-        const pos: usize = @intCast(n - 1);
-        const q0 = try normal(&scope, &.{ 1, 64, 512 }, 21, 0.05);
-        const bank = try normal(&scope, &.{ 1, 2051, 512 }, 22, 1);
-        const mask = try scope.slot();
-        try mlx.check(mlx.mlx_ones(mask, &.{ 1, 2051 }, 2, .bool_, s));
-        try mlx.check(mlx.mlx_array_eval(q0));
-        try mlx.check(mlx.mlx_array_eval(bank));
-        try mlx.check(mlx.mlx_array_eval(mask.*));
-        var line: [8]f64 = undefined;
-        for (std.enums.values(DecodeStage), &line) |stage, *out| {
-            var samples: [9]f64 = undefined;
-            for (&samples, 0..) |*sample, rep| {
-                _ = rep;
-                var opses: [16]Ops = undefined;
-                var scopes: [16]Scope = undefined;
-                for (&opses, &scopes) |*o, *sc| {
-                    o.* = Ops{ .s = s };
-                    sc.* = Scope{ .s = s };
-                }
-                defer for (&opses, &scopes) |*o, *sc| {
-                    o.deinit();
-                    sc.deinit();
-                };
-                var q = q0;
-                const sw = @import("../io_util.zig").Stopwatch.init(io);
-                for (&opses, &scopes) |*ops, *sc| {
-                    const flat = try ops.reshape(q, &.{32768});
-                    const iq = try ops.reshape(try ops.slice(flat, 0, 0, 4096), &.{ 1, 32, 128 });
-                    const w = try ops.reshape(try ops.slice(flat, 0, 4096, 4128), &.{ 1, 32 });
-                    var node = state;
-                    node.processed = pos + 1;
-                    const product: Arr = switch (stage) {
-                        .null_chain => q,
-                        .scores => try indexScores(sc, &node, iq, w, pos),
-                        .select => try ops.own(try decodeSelected(&state, iq, w, pos, s)),
-                        .composite_cast, .composite_qk, .composite_softmax => try decodeComposite(ops, q, bank, mask.*, 1.0 / 16.0, stage),
-                        .composite => try packed_nax.compositeWith(ops, q, bank, mask.*, 1.0 / 16.0, .block_masked),
-                        .full => try ops.own(try attend(&state, q, iq, w, pos, 1.0 / 16.0, s)),
-                    };
-                    const first = try ops.cast(try ops.reshape(try ops.slice(try ops.reshape(product, &.{-1}), 0, 0, 1), &.{1}), .float32);
-                    const token_value = try ops.cast(try ops.binary(.mul, first, try ops.scalar(0, .float32)), .bfloat16);
-                    q = try ops.binary(.add, q, token_value);
-                }
-                try mlx.check(mlx.mlx_array_eval(q));
-                sample.* = @as(f64, @floatFromInt(sw.read())) / 1e3 / 16.0;
-            }
-            std.mem.sort(f64, &samples, {}, std.sort.asc(f64));
-            out.* = samples[4];
-        }
-        std.debug.print("[glm-decode-ubench] ctx={d} us/layer:", .{n});
-        for (std.enums.values(DecodeStage), line) |stage, v| std.debug.print(" {s}={d:.0}", .{ @tagName(stage), v });
-        std.debug.print("\n", .{});
-    }
 }

@@ -13,6 +13,7 @@ pub const report = @import("ubench_report.zig");
 const box = @import("bench_box.zig");
 const exl3 = @import("sushi_exl3");
 const dsv41 = @import("ubench_dsv41.zig");
+const glm5 = @import("ubench_glm5.zig");
 
 const registry = [_]report.Bench{
     exl3.ubench.dsv41_experts,
@@ -22,7 +23,7 @@ const registry = [_]report.Bench{
     dsv41.rows_growth,
     dsv41.attn_span,
     dsv41.topk,
-};
+} ++ glm5.benches;
 
 const exit_bad_args = 2;
 const exit_refused = 3;

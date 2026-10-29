@@ -129,7 +129,7 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     return tiles(stream, x, linear);
 }
 
-fn tiles(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
+pub fn tiles(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     if (!mlx.streamIsGpu(stream) or x.ctx == null or linear.w.ctx == null or linear.scales.ctx == null or linear.biases.ctx == null) return null;
     const sh = mlx.getShape(x);
     const ws = mlx.getShape(linear.w);
@@ -267,55 +267,4 @@ test "GLM DFlash affine row tiles decline incompatible grids and layouts" {
     try std.testing.expect((try project(s, try ops.ones(&.{ 1, 17, 256 }, .bfloat16), linear)) == null);
     try std.testing.expect((try project(s, try ops.cast(x, .float32), linear)) == null);
     try std.testing.expectEqual(before, dispatchCount());
-}
-
-test "GLM verify row projections per stored width (SUSHI_GLM_QMM_UBENCH)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_GLM_QMM_UBENCH")) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const Shape = struct { n: c_int, k: c_int };
-    const banks = 12;
-    for ([_]c_int{ 6, 5 }) |bits| for ([_]Shape{ .{ .n = 8192, .k = 4096 }, .{ .n = 4096, .k = 8192 }, .{ .n = 4096, .k = 16384 }, .{ .n = 16384, .k = 1536 }, .{ .n = 2048, .k = 4096 }, .{ .n = 4096, .k = 2048 }, .{ .n = 1536, .k = 4096 } }) |shape| {
-        var fx = Ops{ .s = s };
-        defer fx.deinit();
-        var linears: [banks]Linear = undefined;
-        for (&linears, 0..) |*linear, i| {
-            const key = try fx.slot();
-            try mlx.check(mlx.mlx_random_key(key, @intCast(i * 7919 + @as(usize, @intCast(shape.n)))));
-            const codes = try fx.slot();
-            try mlx.check(mlx.mlx_random_bits(codes, &[_]c_int{ shape.n, @divExact(shape.k * bits, 32) }, 2, 4, key.*, s));
-            const scales = try fx.slot();
-            try mlx.check(mlx.mlx_random_uniform(scales, try fx.scalar(0.001, .bfloat16), try fx.scalar(0.02, .bfloat16), &[_]c_int{ shape.n, @divExact(shape.k, 128) }, 2, .bfloat16, key.*, s));
-            const biases = try fx.binary(.mul, scales.*, try fx.scalar(if (bits == 5) -15.5 else -31.5, .bfloat16));
-            linear.* = .{ .w = codes.*, .scales = scales.*, .biases = biases, .input = shape.k, .output = shape.n };
-            for ([_]Arr{ linear.w, linear.scales, linear.biases }) |a| try mlx.check(mlx.mlx_array_eval(a));
-        }
-        const key = try fx.slot();
-        try mlx.check(mlx.mlx_random_key(key, 31));
-        const x = try fx.slot();
-        try mlx.check(mlx.mlx_random_normal(x, &[_]c_int{ 1, 3, shape.k }, 3, .bfloat16, 0, 1, key.*, s));
-        try mlx.check(mlx.mlx_array_eval(x.*));
-        var times: [3][10]f64 = undefined;
-        for (0..12) |rep| for (0..3) |arm| {
-            var ops = Ops{ .s = s };
-            defer ops.deinit();
-            var outs: [banks]Arr = undefined;
-            const sw = @import("../io_util.zig").Stopwatch.init(io);
-            for (linears, &outs) |linear, *out| out.* = switch (arm) {
-                0 => blk: {
-                    var parts: [3]Arr = undefined;
-                    for (0..3) |r| parts[r] = try linear.apply(&ops, try ops.slice(x.*, 1, @intCast(r), @intCast(r + 1)));
-                    break :blk try ops.concat(&parts, 1);
-                },
-                1 => try ops.own((try project(s, x.*, linear)).?),
-                else => try ops.own((try tiles(s, x.*, linear)).?),
-            };
-            const group = mlx.mlx_vector_array_new_data(&outs, banks);
-            defer _ = mlx.mlx_vector_array_free(group);
-            try mlx.check(mlx.mlx_eval(group));
-            if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6 / banks;
-        };
-        for (&times) |*t| std.mem.sort(f64, t, {}, std.sort.asc(f64));
-        std.debug.print("[glm-qmm-ubench] A{d} {d}x{d} T3 per projection: serial {d:.4} ms, rows {d:.4} ms, tiles {d:.4} ms\n", .{ bits, shape.n, shape.k, times[0][5], times[1][5], times[2][5] });
-    };
 }

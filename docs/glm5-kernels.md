@@ -78,8 +78,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   every larger key plus the lowest-pool ties at it, each candidate's rank), equal to ArgPartition's stable order
   (higher score first, ties by pool, NaN last). Decode and verify rows keep ArgPartition. A 32-row tile scores, ranks
   and expands its 32 rows in one pass, bit-equal to the two 16-row halves it used to join.
-- **Meter**: `SUSHI_GLM_LONGCTX_UBENCH=1` (`_CTX`, `_REPS`) runs one MLA layer on a synthetic kv8 state: a decode row
-  and a 2048-row chunk split into scores, selection and whole attention, plus decode and chunk append costs.
+- **Meter**: `sushi-ubench run glm5.mla_chunk_stages` runs one MLA layer on a synthetic kv8 state: a 2048-row chunk
+  split into scores, selection and whole attention (`--rungs ctx=..`). `glm5.mla_chunk_attn` times a short chunk across
+  the scalar, packed and served arms, and `glm5.mla_decode_attn` a decode row.
 - **Sparse attention**: per real query, gather its 512 pools plus raw tail (2051 latent rows) into one BF16 bank used
   as K and V, native SDPA at scale 1/16 for at most 16 queries per graph (16K: 0.69 vs 5.22 ms scalar). Two such graphs
   stay in flight (−18.6% at 8K, −6.9% at 16K) and the older settles only after its successor is queued, so the GPU
@@ -98,7 +99,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   −34% at 2048 tokens). The output epilogue fuses FP32 RMS, norm weight and sigmoid gate. The conv history keeps raw
   BF16 bits (integer copies of the last three QKV rows: a float round trip flushes subnormals and signed zeros).
   From 128 rows the prework reads the three projections in place, with no concatenated copy (exact, −0.4 ms of a
-  14.7 ms T2048 layer). `SUSHI_GLM_KDA_PREFILL_UBENCH=1` times each stage of one synthetic T2048 layer.
+  14.7 ms T2048 layer). `sushi-ubench run glm5.kda_prefill` times each stage of one synthetic T2048 layer.
 - **HC**: at 128+ BF16 rows one kernel fuses widening, RMS (MLX's 1024-logical-thread reduction on 128 threads) and
   the 24-output projection with shared accumulators (exact, −51% at 512 rows).
   The RMS mix serves two rows per threadgroup (each weight load feeds both, each row keeps its own lane order and
@@ -187,7 +188,7 @@ four rows; down: sixteen rows, a simdgroup per four), so every output element ha
   A request's serial row (one row, no overlay, NAX) takes `runRow`, B1's bytes in fewer dispatches: the gather writes
   the FP32 bank, the scaled FP32 query and, past the dense window, expands the 512 pools itself; the current row
   comes from the cache (not a dequantized tail copy); the block masks are built once; no all-invalid zeroing.
-  `SUSHI_GLM_DECODE_UBENCH=1` (`_CTX`) splits one row into a dependent 16-layer chain per stage.
+  `sushi-ubench run glm5.mla_decode_attn` splits one row into a dependent 16-layer chain per stage.
   Multi-row gathers write FP32 directly after the BF16/kv8 read, retaining its rounding boundary and the 32 MiB
   scratch cap. Every cell sits within one BF16 ulp of an FP64 oracle;
   the fused D512 NAX SDPA it replaced missed that on ~70% of cells (rel L2 1.2e-2 against 1.6e-3). Gate (`cc56be2b`
@@ -210,7 +211,7 @@ four rows; down: sixteen rows, a simdgroup per four), so every output element ha
   ([A5 trunk](glm5-perf.md#glm-a5-verify)). One-shot load lines name each path a pack reaches: `[glm] copy-free QKV
   engaged (A5g128)`, `[glm-dflash] coefficient hoist rows engaged`, `[glm-dflash] affine row tiles engaged`.
   A6 dense-once and the MLA prefill head batches stay A6-only: the head batch changes numerics, so an A5 arm needs
-  its own KLD gate. `SUSHI_GLM_QMM_UBENCH=1` times serial rows, the row-streaming kernel and row tiles per width at the trunk shapes.
+  its own KLD gate. `sushi-ubench run glm5.verify_qmm` times serial rows, the row-streaming kernel and row tiles per width at the trunk shapes.
 - **Prepared three-row inputs**: large A5/A6 projections reuse the input's original BF16 group sums and exact
   power-of-two coefficients across output tiles. HC expansion emits both the rounded residual and its FP32
   normalized view for the next collapse. The default NAX three-row path uses two-layer asynchronous groups;

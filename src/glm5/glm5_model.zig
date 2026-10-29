@@ -561,7 +561,7 @@ pub const KdaLayer = struct {
         return ops.concat(&try self.projectQkvParts(ops, x), -1);
     }
 
-    fn projectQkvParts(self: KdaLayer, ops: *Ops, x: Arr) ![3]Arr {
+    pub fn projectQkvParts(self: KdaLayer, ops: *Ops, x: Arr) ![3]Arr {
         return if (try @import("glm5_decode.zig").qkv(ops.s, x, .{
             .{ .weight = self.q.w, .scales = self.q.scales, .biases = self.q.biases },
             .{ .weight = self.k.w, .scales = self.k.scales, .biases = self.k.biases },
@@ -1099,7 +1099,7 @@ test "GLM KDA prefill chunk reads the projections in place with the staged path'
     defer fx.deinit();
     const dense = struct {
         fn linear(o: *Ops, n: c_int, k: c_int, seed: u64) !Linear {
-            return .{ .w = try ubenchArray(o, &.{ n, k }, .bfloat16, seed, -0.2, 0.2), .input = k, .output = n };
+            return .{ .w = try syntheticArray(o, &.{ n, k }, .bfloat16, seed, -0.2, 0.2), .input = k, .output = n };
         }
     };
     var layer = KdaLayer{
@@ -1112,12 +1112,12 @@ test "GLM KDA prefill chunk reads the projections in place with the staged path'
         .gb = try dense.linear(&fx, 256, 128, 70),
         .beta = try dense.linear(&fx, 2, 256, 80),
         .out = try dense.linear(&fx, 256, 256, 90),
-        .conv_q = try ubenchArray(&fx, &.{ 256, 1, 4 }, .bfloat16, 100, -0.5, 0.5),
-        .conv_k = try ubenchArray(&fx, &.{ 256, 1, 4 }, .bfloat16, 101, -0.5, 0.5),
-        .conv_v = try ubenchArray(&fx, &.{ 256, 1, 4 }, .bfloat16, 102, -0.5, 0.5),
-        .a_log = try ubenchArray(&fx, &.{2}, .float32, 103, -1, 1),
-        .dt_bias = try ubenchArray(&fx, &.{256}, .float32, 104, -1, 1),
-        .out_norm = try ubenchArray(&fx, &.{128}, .bfloat16, 105, 0.5, 1.5),
+        .conv_q = try syntheticArray(&fx, &.{ 256, 1, 4 }, .bfloat16, 100, -0.5, 0.5),
+        .conv_k = try syntheticArray(&fx, &.{ 256, 1, 4 }, .bfloat16, 101, -0.5, 0.5),
+        .conv_v = try syntheticArray(&fx, &.{ 256, 1, 4 }, .bfloat16, 102, -0.5, 0.5),
+        .a_log = try syntheticArray(&fx, &.{2}, .float32, 103, -1, 1),
+        .dt_bias = try syntheticArray(&fx, &.{256}, .float32, 104, -1, 1),
+        .out_norm = try syntheticArray(&fx, &.{128}, .bfloat16, 105, 0.5, 1.5),
     };
     defer layer.deinit();
     try layer.prepare(s);
@@ -1125,13 +1125,13 @@ test "GLM KDA prefill chunk reads the projections in place with the staged path'
     for ([_]c_int{ 127, 128, 130, 515 }) |rows| for ([_]bool{ false, true }) |hot| {
         var ops = Ops{ .s = s };
         defer ops.deinit();
-        const x = try ubenchArray(&ops, &.{ 1, rows, 256 }, .bfloat16, 7, -1, 1);
+        const x = try syntheticArray(&ops, &.{ 1, rows, 256 }, .bfloat16, 7, -1, 1);
         var states: [2]@import("../transformer.zig").SSMCacheEntry = undefined;
         for (&states) |*state| {
             state.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
             if (hot) {
-                try mlx.check(mlx.mlx_array_set(&state.conv_state, try ubenchArray(&ops, &.{ 1, 3, 768 }, .bfloat16, 11, -1, 1)));
-                try mlx.check(mlx.mlx_array_set(&state.ssm_state, try ubenchArray(&ops, &.{ 1, 2, 128, 128 }, .float32, 12, -0.1, 0.1)));
+                try mlx.check(mlx.mlx_array_set(&state.conv_state, try syntheticArray(&ops, &.{ 1, 3, 768 }, .bfloat16, 11, -1, 1)));
+                try mlx.check(mlx.mlx_array_set(&state.ssm_state, try syntheticArray(&ops, &.{ 1, 2, 128, 128 }, .float32, 12, -0.1, 0.1)));
             }
         }
         defer for (states) |state| {
@@ -1325,7 +1325,7 @@ test "GLM NAX arms and their bills follow the one NAX gate" {
     }
 }
 
-fn ubenchArray(ops: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype, seed: u64, low: f32, high: f32) !Arr {
+pub fn syntheticArray(ops: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype, seed: u64, low: f32, high: f32) !Arr {
     const key = try ops.slot();
     try mlx.check(mlx.mlx_random_key(key, seed));
     const out = try ops.slot();
@@ -1335,236 +1335,4 @@ fn ubenchArray(ops: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype, seed: u64,
         try mlx.check(mlx.mlx_random_uniform(out, try ops.scalar(low, dtype), try ops.scalar(high, dtype), shape.ptr, shape.len, dtype, key.*, ops.s));
     try mlx.check(mlx.mlx_array_eval(out.*));
     return out.*;
-}
-
-test "GLM NAX-shaped arms on this GPU's MLX kernels (SUSHI_GLM_ARMS_UBENCH)" {
-    const transformer = @import("../transformer.zig");
-    if (!transformer.diagEnvOn("SUSHI_GLM_ARMS_UBENCH")) return error.SkipZigTest;
-    const saved = transformer.vqmm_nax_probe_override;
-    defer transformer.vqmm_nax_probe_override = saved;
-    const s = mlx.gpuStream();
-    var fx = Ops{ .s = s };
-    defer fx.deinit();
-    const x = try ubenchArray(&fx, &.{ 1, 2048, 4096 }, .bfloat16, 1, -2, 2);
-    const a6 = [_]Arr{ try ubenchArray(&fx, &.{ 8192, 768 }, .uint32, 2, 0, 0), try ubenchArray(&fx, &.{ 8192, 32 }, .bfloat16, 3, 0.001, 0.01), try ubenchArray(&fx, &.{ 8192, 32 }, .bfloat16, 4, -0.3, 0.1) };
-    const head = [_]Arr{ try ubenchArray(&fx, &.{ 64, 256, 96 }, .uint32, 5, 0, 0), try ubenchArray(&fx, &.{ 64, 256, 4 }, .bfloat16, 6, 0.001, 0.01), try ubenchArray(&fx, &.{ 64, 256, 4 }, .bfloat16, 7, -0.3, 0.1) };
-    const q = try ubenchArray(&fx, &.{ 2048, 64, 1, 256 }, .bfloat16, 8, -1, 1);
-    const v = try ubenchArray(&fx, &.{ 2048, 64, 1, 512 }, .bfloat16, 9, -1, 1);
-    const cluster_w = try ubenchArray(&fx, &.{ 320, 4096 }, .bfloat16, 10, -0.05, 0.05);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const names = [_][]const u8{ "a6-dense-once T2048 4096->8192", "mla-query head batch T2048", "mla-value head batch T2048", "mla-query verify batch T3", "kda-cluster T2048" };
-    for (names, 0..) |name, case| {
-        var times: [2][10]f64 = undefined;
-        var outs: [2]Arr = .{ .{ .ctx = null }, .{ .ctx = null } };
-        defer for (outs) |o| if (o.ctx != null) {
-            _ = mlx.mlx_array_free(o);
-        };
-        for (0..12) |rep| for (0..2) |arm| {
-            transformer.vqmm_nax_probe_override = arm == 1;
-            var ops = Ops{ .s = s };
-            defer ops.deinit();
-            const sw = @import("../io_util.zig").Stopwatch.init(io);
-            const out = switch (case) {
-                0 => if (arm == 1) (try @import("glm5_a6_dense_once.zig").tryPrefill(&ops, x, a6[0], a6[1], a6[2])).? else try ops.qmm(x, a6[0], a6[1], a6[2], true),
-                1 => if (arm == 1) (try @import("glm5_mla_prefill_batch.zig").run(&ops, .{ .x = q, .w = head[0], .scales = head[1], .biases = head[2] }, .query)).? else try ops.qmm(q, head[0], head[1], head[2], false),
-                2 => if (arm == 1) (try @import("glm5_mla_prefill_batch.zig").run(&ops, .{ .x = v, .w = head[0], .scales = head[1], .biases = head[2] }, .value)).? else try ops.qmm(v, head[0], head[1], head[2], true),
-                3 => blk: {
-                    const rows = try ops.slice(q, 0, 0, 3);
-                    if (arm == 1) break :blk (try @import("glm5_mla_verify_batch.zig").run(&ops, .{ .x = rows, .w = head[0], .scales = head[1], .biases = head[2] }, .query)).?;
-                    var parts: [3]Arr = undefined;
-                    for (0..3) |r| parts[r] = try ops.qmm(try ops.slice(rows, 0, @intCast(r), @intCast(r + 1)), head[0], head[1], head[2], false);
-                    break :blk try ops.concat(&parts, 0);
-                },
-                else => blk: {
-                    if (arm == 1) {
-                        const banks = try @import("glm5_kda_prefill_cluster.zig").project(&ops, cluster_w, x);
-                        break :blk try ops.concat(&banks, -1);
-                    }
-                    var parts: [3]Arr = undefined;
-                    var at: c_int = 0;
-                    for (@import("glm5_kda_prefill_cluster.zig").widths, 0..) |n, i| {
-                        parts[i] = try ops.binary(.mm, x, try ops.transpose(try ops.slice(cluster_w, 0, at, at + n), &.{ 1, 0 }));
-                        at += n;
-                    }
-                    break :blk try ops.concat(&parts, -1);
-                },
-            };
-            try mlx.check(mlx.mlx_array_eval(out));
-            if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6;
-            if (rep == 0) outs[arm] = try ops.result(try ops.contiguous(try ops.cast(out, .float32)));
-        };
-        for (outs) |o| try mlx.check(mlx.mlx_array_eval(o));
-        const n = mlx.mlx_array_size(outs[0]);
-        const ref = mlx.mlx_array_data_float32(outs[0]).?[0..n];
-        const got = mlx.mlx_array_data_float32(outs[1]).?[0..n];
-        var differ: usize = 0;
-        var num: f64 = 0;
-        var den: f64 = 0;
-        for (ref, got) |r, g| {
-            if (@as(u32, @bitCast(r)) != @as(u32, @bitCast(g))) differ += 1;
-            num += (g - r) * (g - r);
-            den += r * r;
-        }
-        for (&times) |*t| std.mem.sort(f64, t, {}, std.sort.asc(f64));
-        std.debug.print("[glm-arms-ubench] {s}: staged median {d:.3} ms, arm median {d:.3} ms; {d}/{d} values differ, rel L2 {e:.3}\n", .{ name, times[0][5], times[1][5], differ, n, @sqrt(num / den) });
-    }
-}
-
-const KdaPrefillMeter = struct {
-    layer: KdaLayer,
-    x: Arr,
-    dq: [3]Arr,
-    parts: [3]Arr,
-    joined: Arr,
-    dout: Arr,
-    gated: Arr,
-    cluster_banks: [3]Arr,
-    raw_a: Arr,
-    gate: Arr,
-    prework: @import("glm5_kda_prework.zig").Result,
-    state: Arr,
-    y: Arr,
-    cfg: model.ModelConfig,
-    wide: Arr,
-    big: Arr,
-
-    const stage_names = [_][]const u8{ "dequant q,k,v", "q,k,v GEMMs", "concat", "dequant o", "o GEMM", "cluster GEMM+slices", "f_b,g_b GEMMs", "prework", "recurrence", "post epilogue", "projectQkvParts served", "whole applyReference", "single N=24576 GEMM", "8192^3 GEMM (peak)", "prework + concat (joined)" };
-
-    fn evalAll(arrays: []const Arr) !void {
-        for (arrays) |a| try mlx.check(mlx.mlx_array_eval(a));
-    }
-
-    fn run(self: *KdaPrefillMeter, ops: *Ops, id: usize) !void {
-        const prework_mod = @import("glm5_kda_prework.zig");
-        switch (id) {
-            0 => try evalAll(&.{
-                try ops.dequant(self.layer.q.w, self.layer.q.scales, self.layer.q.biases),
-                try ops.dequant(self.layer.k.w, self.layer.k.scales, self.layer.k.biases),
-                try ops.dequant(self.layer.v.w, self.layer.v.scales, self.layer.v.biases),
-            }),
-            1 => {
-                var out: [3]Arr = undefined;
-                for (self.dq, 0..) |w, i| out[i] = try ops.binary(.mm, self.x, try ops.transpose(w, &.{ 1, 0 }));
-                try evalAll(&out);
-            },
-            2 => try evalAll(&.{try ops.concat(&self.parts, -1)}),
-            3 => try evalAll(&.{try ops.dequant(self.layer.out.w, self.layer.out.scales, self.layer.out.biases)}),
-            4 => try evalAll(&.{try ops.binary(.mm, self.gated, try ops.transpose(self.dout, &.{ 1, 0 }))}),
-            5 => {
-                const banks = (try self.layer.prefillCluster(ops, self.x)).?;
-                try evalAll(&banks);
-            },
-            6 => try evalAll(&.{ try self.layer.fb.apply(ops, self.cluster_banks[0]), try self.layer.gb.apply(ops, self.cluster_banks[1]) }),
-            7, 14 => {
-                const split = id == 7;
-                const r = (try prework_mod.apply(ops.s, .{ .qkv = if (split) .{ .ctx = null } else try ops.concat(&self.parts, -1), .parts = if (split) self.parts else null, .a = self.raw_a, .beta = self.cluster_banks[2], .conv_weight = self.layer.prepared_conv, .exp_a = self.layer.prepared_decay, .dt_bias = self.layer.dt_bias, .conv_state = null, .heads = 64, .lower = self.cfg.kda_gate_lower_bound })).?;
-                defer r.deinit();
-                try evalAll(&r.arrays());
-            },
-            8 => {
-                const r = (try @import("glm5_kda_value_rows.zig").run(.{ .q = self.prework.q, .k = self.prework.k, .v = self.prework.v, .decay = self.prework.decay, .beta = self.prework.beta, .state = self.state }, 4, ops.s)).?;
-                defer r.deinit();
-                try evalAll(&.{ r.y, r.state });
-            },
-            9 => try evalAll(&.{(try @import("glm5_kda_fused.zig").post(ops.s, self.y, self.gate, self.layer.out_norm, self.cfg.rms_norm_eps)).?}),
-            10 => try evalAll(&(try self.layer.projectQkvParts(ops, self.x))),
-            12 => try evalAll(&.{try ops.binary(.mm, self.x, try ops.transpose(self.wide, &.{ 1, 0 }))}),
-            13 => try evalAll(&.{try ops.binary(.mm, self.big, try ops.transpose(self.big, &.{ 1, 0 }))}),
-            else => {
-                var cache = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-                defer _ = mlx.mlx_array_free(cache.conv_state);
-                defer _ = mlx.mlx_array_free(cache.ssm_state);
-                const out = try self.layer.applyReference(ops, self.x, &self.cfg, &cache);
-                try evalAll(&.{ out, cache.conv_state, cache.ssm_state });
-            },
-        }
-    }
-};
-
-test "GLM KDA prefill component meter (SUSHI_GLM_KDA_PREFILL_UBENCH)" {
-    const transformer = @import("../transformer.zig");
-    if (!transformer.diagEnvOn("SUSHI_GLM_KDA_PREFILL_UBENCH")) return error.SkipZigTest;
-    if (!naxArms()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    var fx = Ops{ .s = s };
-    defer fx.deinit();
-    const a6 = struct {
-        fn bank(o: *Ops, n: c_int, k: c_int, seed: u64) !Linear {
-            return .{
-                .w = try ubenchArray(o, &.{ n, @divExact(k * 3, 16) }, .uint32, seed, 0, 0),
-                .scales = try ubenchArray(o, &.{ n, @divExact(k, 128) }, .bfloat16, seed + 1, 0.0005, 0.004),
-                .biases = try ubenchArray(o, &.{ n, @divExact(k, 128) }, .bfloat16, seed + 2, -0.12, 0.04),
-                .input = k,
-                .output = n,
-            };
-        }
-        fn dense(o: *Ops, n: c_int, k: c_int, seed: u64) !Linear {
-            return .{ .w = try ubenchArray(o, &.{ n, k }, .bfloat16, seed, -0.05, 0.05), .input = k, .output = n };
-        }
-    };
-    var layer = KdaLayer{
-        .q = try a6.bank(&fx, 8192, 4096, 10),
-        .k = try a6.bank(&fx, 8192, 4096, 20),
-        .v = try a6.bank(&fx, 8192, 4096, 30),
-        .fa = try a6.dense(&fx, 128, 4096, 40),
-        .fb = try a6.dense(&fx, 8192, 128, 50),
-        .ga = try a6.dense(&fx, 128, 4096, 60),
-        .gb = try a6.dense(&fx, 8192, 128, 70),
-        .beta = try a6.dense(&fx, 64, 4096, 80),
-        .out = try a6.bank(&fx, 4096, 8192, 90),
-        .conv_q = try ubenchArray(&fx, &.{ 8192, 1, 4 }, .bfloat16, 100, -0.5, 0.5),
-        .conv_k = try ubenchArray(&fx, &.{ 8192, 1, 4 }, .bfloat16, 101, -0.5, 0.5),
-        .conv_v = try ubenchArray(&fx, &.{ 8192, 1, 4 }, .bfloat16, 102, -0.5, 0.5),
-        .a_log = try ubenchArray(&fx, &.{64}, .float32, 103, -1, 1),
-        .dt_bias = try ubenchArray(&fx, &.{8192}, .float32, 104, -1, 1),
-        .out_norm = try ubenchArray(&fx, &.{128}, .bfloat16, 105, 0.5, 1.5),
-    };
-    defer layer.deinit();
-    try layer.prepare(s);
-    try layer.preparePrefillCluster(s);
-    const cfg = model.ModelConfig{ .hidden_size = 4096, .linear_key_head_dim = 128, .linear_num_value_heads = 64, .linear_conv_kernel_dim = 4, .kda_gate_lower_bound = -5, .rms_norm_eps = 1e-5 };
-    const x = try ubenchArray(&fx, &.{ 1, 2048, 4096 }, .bfloat16, 1, -1, 1);
-    var m: KdaPrefillMeter = undefined;
-    m.layer = layer;
-    m.x = x;
-    m.cfg = cfg;
-    for ([_]*const Linear{ &layer.q, &layer.k, &layer.v }, 0..) |l, i| {
-        m.dq[i] = try fx.dequant(l.w, l.scales, l.biases);
-        m.parts[i] = try fx.binary(.mm, x, try fx.transpose(m.dq[i], &.{ 1, 0 }));
-    }
-    m.joined = try fx.concat(&m.parts, -1);
-    m.wide = try fx.concat(&m.dq, 0);
-    m.big = try ubenchArray(&fx, &.{ 8192, 8192 }, .bfloat16, 7, -1, 1);
-    try mlx.check(mlx.mlx_array_eval(m.wide));
-    m.dout = try fx.dequant(layer.out.w, layer.out.scales, layer.out.biases);
-    m.cluster_banks = (try layer.prefillCluster(&fx, x)).?;
-    m.raw_a = try layer.fb.apply(&fx, m.cluster_banks[0]);
-    m.gate = try fx.reshape(try layer.gb.apply(&fx, m.cluster_banks[1]), &.{ 1, 2048, 64, 128 });
-    m.state = try fx.zeros(&.{ 1, 64, 128, 128 }, .float32);
-    m.prework = (try @import("glm5_kda_prework.zig").apply(s, .{ .qkv = m.joined, .a = m.raw_a, .beta = m.cluster_banks[2], .conv_weight = layer.prepared_conv, .exp_a = layer.prepared_decay, .dt_bias = layer.dt_bias, .heads = 64 })).?;
-    defer m.prework.deinit();
-    const rec = (try @import("glm5_kda_value_rows.zig").run(.{ .q = m.prework.q, .k = m.prework.k, .v = m.prework.v, .decay = m.prework.decay, .beta = m.prework.beta, .state = m.state }, 4, s)).?;
-    defer rec.deinit();
-    m.y = rec.y;
-    m.gated = try fx.reshape((try @import("glm5_kda_fused.zig").post(s, m.y, m.gate, layer.out_norm, cfg.rms_norm_eps)).?, &.{ 1, 2048, 8192 });
-    try KdaPrefillMeter.evalAll(&.{ m.joined, m.dout, m.raw_a, m.gate, m.state, m.y, m.gated, m.cluster_banks[0], m.cluster_banks[1], m.cluster_banks[2], m.prework.q, m.prework.k, m.prework.v, m.prework.decay, m.prework.beta });
-
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const reps = 14;
-    const stages = KdaPrefillMeter.stage_names.len;
-    var times: [stages][reps]f64 = undefined;
-    for (0..reps + 2) |rep| for (0..stages) |id| {
-        var ops = Ops{ .s = s };
-        defer ops.deinit();
-        const sw = @import("../io_util.zig").Stopwatch.init(io);
-        try m.run(&ops, id);
-        if (rep >= 2) times[id][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6;
-    };
-    var sum: f64 = 0;
-    for (&times, KdaPrefillMeter.stage_names, 0..) |*t, name, id| {
-        std.mem.sort(f64, t, {}, std.sort.asc(f64));
-        std.debug.print("[glm-kda-prefill-ubench] {s}: median {d:.3} ms (min {d:.3})\n", .{ name, t[reps / 2], t[0] });
-        if (id < 10) sum += t[reps / 2];
-    }
-    std.debug.print("[glm-kda-prefill-ubench] sum of stages 0-9: {d:.3} ms\n", .{sum});
 }
