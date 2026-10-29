@@ -2,7 +2,7 @@
 
 # SUSHI
 
-A local AI server for low-bit, very high quality Sushi quants, using custom EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ and macOS 26.2 or later are required.
+A local AI server for low-bit, very high quality Sushi quants, using custom Sushi Trellis Quant (STQ) or EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ and macOS 26.2 or later are required.
 
 ## Model support list
 
