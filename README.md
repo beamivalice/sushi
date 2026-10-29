@@ -127,3 +127,7 @@ as `Authorization: Bearer <key>`. If `SUSHI_KEY` is unset or empty, the server r
 MIT, for sushi and the mlx-serve code it forks ([LICENSE](LICENSE)); ported kernels and vendored code are listed in
 [NOTICE](NOTICE). The Qwen packs follow the Qwen Community License and the MiMo pack Xiaomi's MIT license, stated on
 each Hugging Face page.
+
+## macOS control app
+
+[Sushi Control](apps/SushiControl/README.md) provides native menu bar controls, model management and a live dashboard. Build it with `apps/SushiControl/macos/build.sh`; it connects to a standard Sushi server or starts its own local instance.
