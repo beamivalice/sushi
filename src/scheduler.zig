@@ -53,6 +53,7 @@ const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const disk_placement = @import("disk_placement.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
@@ -1034,7 +1035,7 @@ pub const LoadRequest = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget = null,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1130,7 +1131,7 @@ pub const Scheduler = struct {
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
     ssm_checkpoint_stride: u32,

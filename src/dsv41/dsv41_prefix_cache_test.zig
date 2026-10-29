@@ -5,6 +5,7 @@ const dsv41_model = @import("dsv41_model.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const glm5_forward = @import("../glm5/glm5_forward.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
+const disk_placement = @import("../disk_placement.zig");
 const kv_quant = @import("../kv_quant.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
@@ -992,9 +993,9 @@ test "DeepSeek SSD tier: the namespace names the layout, and another layout's en
     const tag = cfg.cacheLayoutNamespace() orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings(dsv41_prefix.namespaceTag(cfg.dsparkOn()), tag);
     try testing.expect(!std.mem.eql(u8, dsv41_prefix.namespaceTag(true), dsv41_prefix.namespaceTag(false)));
-    const a = try kv_disk_cache.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(true));
+    const a = try disk_placement.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(true));
     defer testing.allocator.free(a);
-    const b = try kv_disk_cache.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(false));
+    const b = try disk_placement.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(false));
     defer testing.allocator.free(b);
     try testing.expect(!std.mem.eql(u8, a, b));
 

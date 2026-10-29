@@ -112,6 +112,7 @@ test {
     _ = @import("parent_watch.zig");
     _ = @import("update.zig");
     _ = @import("kv_disk_cache.zig");
+    _ = @import("disk_placement.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("model_discovery.zig");
     _ = @import("mimo2/mimo_source.zig");

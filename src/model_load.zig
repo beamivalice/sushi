@@ -15,6 +15,7 @@ const prefix_cache_mod = @import("prefix_cache.zig");
 const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const disk_placement = @import("disk_placement.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
@@ -128,7 +129,7 @@ pub const LoadParams = struct {
     prefix_cache_disk_bytes: u64 = 0,
     /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget = null,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -2194,15 +2195,15 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             break :attach;
         };
         defer if (layout) |l| sch.allocator.free(l);
-        const fp = kv_disk_cache.modelFingerprintWithLayout(sch.allocator, sch.io, entry.path, layout) catch |err| {
+        const fp = disk_placement.modelFingerprintWithLayout(sch.allocator, sch.io, entry.path, layout) catch |err| {
             log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
         defer sch.allocator.free(fp);
-        const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
+        const base = disk_placement.defaultBaseDir(sch.allocator) catch break :attach;
         defer sch.allocator.free(base);
-        const plan: kv_disk_cache.DefaultDiskBudget = if (params.prefix_cache_disk_resolver) |resolve|
-            resolve(params.config, base, kv_disk_cache.tierBytes(sch.io, base, fp)) orelse break :attach
+        const plan: disk_placement.DefaultDiskBudget = if (params.prefix_cache_disk_resolver) |resolve|
+            resolve(params.config, base, disk_placement.tierBytes(sch.io, base, fp)) orelse break :attach
         else
             .{ .bytes = params.prefix_cache_disk_bytes, .bound = .flag, .cap = params.prefix_cache_disk_bytes };
         disk_tier = kv_disk_cache.DiskTier.init(

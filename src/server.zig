@@ -32,6 +32,7 @@ const responses_mod = @import("responses.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const kv_disk_writer = @import("kv_disk_writer.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const disk_placement = @import("disk_placement.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -721,7 +722,7 @@ pub fn clearResolvedPrefixCacheMem() void {
 /// safetensors under `~/.sushi/kv-cache/<model-fingerprint>` and are restored across restarts instead
 /// of recomputed, LRU-evicted to the budget. Unnamed, the ask is the 20 GB ceiling and the tier is on;
 /// `prefixCacheDiskForLoad` sizes the real budget per model (the Swift app's Settings toggle passes the flag).
-pub var prefix_cache_disk_bytes: u64 = kv_disk_cache.DEFAULT_DISK_CAP;
+pub var prefix_cache_disk_bytes: u64 = disk_placement.DEFAULT_DISK_CAP;
 /// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
 pub var prefix_cache_disk_explicit = false;
 
@@ -3635,18 +3636,18 @@ fn diskContextForLoad(config: *model_mod.ModelConfig) u64 {
 /// there is none. Runs on the inference thread beside `prefixCacheMemForLoad`.
 /// `held` is what this model's tier already occupies under `dir`: it counts as available, or a restart on a
 /// nearly full volume would evict what the last boot stored.
-pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64) ?kv_disk_cache.DefaultDiskBudget {
+pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64) ?disk_placement.DefaultDiskBudget {
     const kv_bits = defaultKvBits(config);
     const bpt = diskBytesPerToken(config, kv_bits);
     const ctx = if (prefix_cache_disk_explicit) 0 else diskContextForLoad(config);
     // An unreadable volume is no reason to refuse: the tier re-checks before every store.
-    const free: u64 = if (kv_disk_cache.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
+    const free: u64 = if (disk_placement.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
     var buf: [384]u8 = undefined;
-    const plan = kv_disk_cache.resolveDiskBudget(prefix_cache_disk_explicit, prefix_cache_disk_bytes, prefix_cache_capacity, ctx, bpt, free, held) orelse {
-        log.info("{s}\n", .{kv_disk_cache.diskOffLine(&buf, free, dir)});
+    const plan = disk_placement.resolveDiskBudget(prefix_cache_disk_explicit, prefix_cache_disk_bytes, prefix_cache_capacity, ctx, bpt, free, held) orelse {
+        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir)});
         return null;
     };
-    log.info("{s}\n", .{kv_disk_cache.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir)});
+    log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir)});
     return plan;
 }
 
@@ -9816,7 +9817,7 @@ test "prefix cache defaults: no RAM retention, an unnamed SSD tier on" {
     try testing.expect(!prefix_cache_ram_enabled);
     try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     try testing.expect(!prefix_cache_mem_explicit and !prefix_cache_disk_explicit);
-    try testing.expectEqual(kv_disk_cache.DEFAULT_DISK_CAP, prefix_cache_disk_bytes);
+    try testing.expectEqual(disk_placement.DEFAULT_DISK_CAP, prefix_cache_disk_bytes);
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {

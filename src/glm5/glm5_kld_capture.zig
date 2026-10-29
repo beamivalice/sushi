@@ -556,7 +556,7 @@ const Ledger = struct {
         for (b.inputs[next..]) |ids| remaining += ids.len;
         // A full disk would stop the run mid-batch; refuse before the first batch instead, with a 16 GiB margin.
         const needed = layerMajorDiskBytes(remaining, b.prompts.len - next, if (b.hidden != null) self.run.hidden_boundaries else 0, self.run.hidden_width, b.row.len);
-        if (@import("../kv_disk_cache.zig").volumeSpace(if (b.hidden != null) self.run.hidden_out else self.staging)) |space| if (space.free < needed + (16 << 30)) {
+        if (@import("../disk_placement.zig").volumeSpace(if (b.hidden != null) self.run.hidden_out else self.staging)) |space| if (space.free < needed + (16 << 30)) {
             @import("../log.zig").err("[kld] layer-major: {d} GB still to write, {d} GB free (16 GiB margin)\n", .{ needed / 1_000_000_000, space.free / 1_000_000_000 });
             return error.GlmLayerMajorDiskTooSmall;
         };

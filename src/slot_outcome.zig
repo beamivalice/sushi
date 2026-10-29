@@ -4,6 +4,7 @@ const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
 const Generator = generate_mod.Generator;
@@ -303,7 +304,7 @@ fn logDiskUsage(model: *const LoadedModel) void {
     const snap = model.disk_stats.snapshot();
     if (snap.budget == 0) return;
     var buf: [128]u8 = undefined;
-    log.info("{s}\n", .{kv_disk_cache.diskUsageLine(&buf, snap.used, snap.budget, snap.entries)});
+    log.info("{s}\n", .{disk_placement.diskUsageLine(&buf, snap.used, snap.budget, snap.entries)});
 }
 
 test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
