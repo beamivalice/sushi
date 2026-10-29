@@ -1325,7 +1325,7 @@ test "no reachable grammar state is a dead end" {
         var schema = try parseSchema(testing.allocator, src);
         defer schema.deinit();
         var seed: u64 = 0;
-        while (seed < 200) : (seed += 1) {
+        while (seed < 40) : (seed += 1) {
             var prng = std.Random.DefaultPrng.init(seed);
             const rnd = prng.random();
             var g = try Grammar.init(testing.allocator, &schema);

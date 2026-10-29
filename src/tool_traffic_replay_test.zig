@@ -78,24 +78,40 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
     var unresolved: usize = 0; // calls left non-conforming (genuinely-broken model output)
     var soft_wrapper_leaks: usize = 0; // unparseable <tool_call> wrappers shown as text
 
+    // A `{"tools_id", "tools"}` line defines a tools array once; it precedes every record that names it.
+    var table_arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer table_arena_state.deinit();
+    const table_arena = table_arena_state.allocator();
+    var tools_by_id = std.StringHashMap([]const u8).init(table_arena);
+
     while (line_it.next()) |line| {
         if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-        idx += 1;
 
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
         var rec = std.json.parseFromSlice(std.json.Value, arena, line, .{}) catch |e| {
-            std.debug.print("\n[replay record {d}] fixture line is not valid JSON: {}\n", .{ idx, e });
+            std.debug.print("\n[replay record {d}] fixture line is not valid JSON: {}\n", .{ idx + 1, e });
             return error.ToolTrafficReplayFailed;
         };
         defer rec.deinit();
         if (rec.value != .object) continue;
 
-        const raw = (rec.value.object.get("raw") orelse continue).string;
-        const tools_val = rec.value.object.get("tools") orelse continue;
-        const tools_json = try std.json.Stringify.valueAlloc(arena, tools_val, .{});
+        const obj = rec.value.object;
+        if (obj.get("raw") == null) {
+            const id = obj.get("tools_id") orelse continue;
+            const tools_val = obj.get("tools") orelse continue;
+            try tools_by_id.put(try table_arena.dupe(u8, id.string), try std.json.Stringify.valueAlloc(table_arena, tools_val, .{}));
+            continue;
+        }
+        idx += 1;
+
+        const raw = obj.get("raw").?.string;
+        const tools_json = if (obj.get("tools_id")) |id| tools_by_id.get(id.string) orelse {
+            std.debug.print("\n[replay record {d}] names tools_id {s} that no line defines\n", .{ idx, id.string });
+            return error.ToolTrafficReplayFailed;
+        } else try std.json.Stringify.valueAlloc(arena, obj.get("tools") orelse continue, .{});
         records += 1;
 
         // Mirror the server exactly: normalize → parse → (bare-JSON inference is

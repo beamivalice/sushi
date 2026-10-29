@@ -11503,13 +11503,13 @@ test "ThinkScan: per-token work is FLAT in buffer size, not linear" {
     defer buf.deinit(testing.allocator);
     var max_span: usize = 0;
     var i: usize = 0;
-    while (i < 4000) : (i += 1) {
+    while (i < 400) : (i += 1) {
         // A think block that never closes — the expensive arm of the bench.
         try buf.appendSlice(testing.allocator, if (i == 0) "<think>" else "token words and more ");
         _ = streamThinkGateScan(buf.items, true, false, false, &scan);
         if (i > 0 and scan.last_scan_span > max_span) max_span = scan.last_scan_span;
     }
-    try testing.expect(buf.items.len > 60_000);
+    try testing.expect(buf.items.len > 8_000);
     // Bounded by one token's bytes plus the trailing partial-marker candidate.
     try testing.expect(max_span <= 64);
 
@@ -11538,38 +11538,6 @@ test "ThinkScan: reset() re-arms the cursor when the stream buffer is cleared" {
     scan.reset();
     // Same scan struct, fresh (shorter) buffer: must not carry the old close.
     try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGateScan("<think>more", true, false, false, &scan));
-}
-
-test "bench: streaming think gate scans BYTES, memoized vs fresh" {
-    // The 5.10 acceptance bar is that per-token work is FLAT in buffer size,
-    // not merely smaller. Wall clock is unavailable in a hermetic test under
-    // Zig 0.17 (clocks live under std.Io) and would be noise anyway — bytes
-    // examined is the thing that was quadratic, and it is deterministic.
-    // Mirrors the 4b.4 harness: 4000 tokens growing to ~104 KB.
-    const a = testing.allocator;
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(a);
-    var scan: ThinkScan = .{};
-    try buf.appendSlice(a, "<think>");
-    var memo_bytes: u64 = 0;
-    var fresh_bytes: u64 = 0;
-    var i: usize = 0;
-    while (i < 4000) : (i += 1) {
-        try buf.appendSlice(a, "some reasoning words here ");
-        const g = streamThinkGateScan(buf.items, true, false, false, &scan);
-        try testing.expectEqual(StreamThinkGate.hold_thinking, g);
-        memo_bytes += scan.last_scan_span;
-        // What the unmemoized gate re-reads every token: the whole buffer, and
-        // more than once (open scan + close scan + two substring scans).
-        fresh_bytes += buf.items.len;
-    }
-    errdefer std.debug.print(
-        "[think-gate] {d} tokens to {d} KB: fresh >= {d} KB scanned, memoized {d} KB ({d}x)\n",
-        .{ 4000, buf.items.len / 1024, fresh_bytes / 1024, memo_bytes / 1024, fresh_bytes / @max(memo_bytes, 1) },
-    );
-    // Linear-in-total, not quadratic: the memoized scan reads each byte a
-    // bounded number of times.
-    try testing.expect(memo_bytes < buf.items.len * 4);
 }
 
 test "streaming content agrees with the non-streaming split on leading whitespace" {

@@ -74,6 +74,42 @@ def records(dump_path):
         yield {"tools": _trim_tools(tools, raw), "raw": raw}
 
 
+def tools_id(tools):
+    key = json.dumps(tools, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def read_fixture(path):
+    """Records with their tools arrays inlined. A line carrying `tools_id` and `tools` defines an array
+    once; a record names it by `tools_id`. A record with inline `tools` is read as it is."""
+    table, out = {}, []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if "raw" not in r:
+            table[r["tools_id"]] = r["tools"]
+            continue
+        if "tools_id" in r:
+            r = {"tools": table[r.pop("tools_id")], **r}
+        out.append(r)
+    return out
+
+
+def write_fixture(path, recs):
+    """Each distinct tools array once, ahead of the records that name it."""
+    ids = [tools_id(r["tools"]) for r in recs]
+    table = {}
+    for i, r in zip(ids, recs):
+        table.setdefault(i, r["tools"])
+    with path.open("w") as fh:
+        for i, tools in table.items():
+            fh.write(json.dumps({"tools_id": i, "tools": tools}, ensure_ascii=False) + "\n")
+        for i, r in zip(ids, recs):
+            rec = {"tools_id": i, **{k: v for k, v in r.items() if k != "tools"}}
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def key_of(r):
     names = ",".join(sorted(
         (t.get("function") or {}).get("name") or "" for t in r["tools"]))
@@ -92,9 +128,7 @@ def main():
 
     out = pathlib.Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    existing = []
-    if out.exists():
-        existing = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
+    existing = read_fixture(out) if out.exists() else []
     seen = {key_of(r) for r in existing}
 
     added, scanned = [], 0
@@ -113,9 +147,7 @@ def main():
                 r["model"] = a.model
             added.append(r)
 
-    with out.open("w") as fh:
-        for r in existing + added:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    write_fixture(out, existing + added)
     print(f"scanned {scanned} records; {len(added)} new; "
           f"fixture now {len(existing) + len(added)} -> {out}")
 

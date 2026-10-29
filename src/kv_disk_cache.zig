@@ -6575,8 +6575,6 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links qsa.safetensors"
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
 
-    chunk_share_override = true;
-    defer chunk_share_override = null;
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-share", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
@@ -6642,8 +6640,6 @@ test "DiskTier: an inherited QSA history is dropped on extend past the common pr
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
 
-    chunk_share_override = true;
-    defer chunk_share_override = null;
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-ext", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
@@ -9347,8 +9343,6 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
 
-    chunk_share_override = true;
-    defer chunk_share_override = null;
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-share", 0, 128);
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
@@ -9401,8 +9395,6 @@ test "DiskTier chunk share: total_bytes is bytes on disk whichever holder dies f
     // The filesystem is the refcount: donor-then-heir and heir-then-donor both land back on the pre-commit number.
     const io = std.testing.io;
     const s = mlx.gpuStream();
-    chunk_share_override = true;
-    defer chunk_share_override = null;
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
     try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
@@ -9460,8 +9452,6 @@ test "DiskTier chunk share: a writer-armed tier beside a RAM tier links like SSD
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
-    chunk_share_override = true;
-    defer chunk_share_override = null;
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-share-ram", 0, 128);
     defer tier.deinit();
     tier.enableBackgroundWriter();
@@ -9518,8 +9508,6 @@ test "DiskTier chunk share: meta v6 carries inherited_chunks; a v5 manifest load
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
-    chunk_share_override = true;
-    defer chunk_share_override = null;
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
     try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
@@ -9578,8 +9566,6 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
-    chunk_share_override = true;
-    defer chunk_share_override = null;
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-landed", 0, 128);
     tier.ssd_first = true;
