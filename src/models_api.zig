@@ -5,6 +5,7 @@ const generate_mod = @import("generate.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
+const expert_quant = @import("expert_quant.zig");
 const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -45,7 +46,7 @@ const sendErrorResponse = server.sendErrorResponse;
 const sendResponse = server.sendResponse;
 
 pub fn streamingStubMarker(architecture: []const u8, geometry_ok: bool, index_complete: bool) bool {
-    return model_mod.isExpertStreamingArch(architecture) and geometry_ok and index_complete;
+    return expert_quant.isExpertStreamingArch(architecture) and geometry_ok and index_complete;
 }
 
 /// A dense qwen4_exp checkpoint has no resident arm at all; a quantized pack
@@ -422,7 +423,7 @@ pub fn renderModelEntry(
     const sm = model_discovery.readStubMeta(io, allocator, entry.path);
     const streaming_geometry = sm.found and sm.hidden_size > 0 and sm.num_hidden_layers > 0 and
         sm.num_experts > 0 and sm.num_experts_per_tok > 0 and sm.moe_intermediate_size > 0;
-    const streaming_precheck = model_mod.isExpertStreamingArch(entry.arch_hint) and streaming_geometry;
+    const streaming_precheck = expert_quant.isExpertStreamingArch(entry.arch_hint) and streaming_geometry;
     const streaming_candidate = streamingStubMarker(
         entry.arch_hint,
         streaming_geometry,

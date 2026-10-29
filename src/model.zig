@@ -71,7 +71,6 @@ pub const QuantMode = enum {
     }
 };
 
-pub const isExpertStreamingArch = expert_quant.isExpertStreamingArch;
 
 /// DeepSeek-V4.1's MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
 pub const dsv41_pool_bytes: u64 = 1 << 30;
@@ -789,7 +788,7 @@ pub const ModelConfig = struct {
     /// its precision: both the dense HF layout and an MLX pack's per-projection
     /// banks stream. The disk-side half of the answer is the discovery layout probe.
     pub fn supportsExpertStreaming(self: *const ModelConfig) bool {
-        return isExpertStreamingArch(self.model_type) and self.expertLayerCount() > 0 and self.num_experts > 0 and
+        return expert_quant.isExpertStreamingArch(self.model_type) and self.expertLayerCount() > 0 and self.num_experts > 0 and
             self.num_experts_per_tok > 0 and self.hidden_size > 0 and self.moe_intermediate_size > 0;
     }
 
@@ -3647,10 +3646,10 @@ pub const QWEN4_GOOD_FIELDS =
 
 test "isExpertStreamingArch admits only implemented streaming families" {
     const t = std.testing;
-    try t.expect(isExpertStreamingArch("qwen4_exp"));
-    try t.expect(isExpertStreamingArch("mimo_v2"));
+    try t.expect(expert_quant.isExpertStreamingArch("qwen4_exp"));
+    try t.expect(expert_quant.isExpertStreamingArch("mimo_v2"));
     for ([_][]const u8{ "qwen4_exp_text", "mimo_v2_text", "not_a_served_arch", "gguf", "" }) |mt| {
-        try t.expect(!isExpertStreamingArch(mt));
+        try t.expect(!expert_quant.isExpertStreamingArch(mt));
         var c = ModelConfig{
             .model_type = mt,
             .num_hidden_layers = 48,

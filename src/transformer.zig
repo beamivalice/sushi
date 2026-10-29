@@ -8211,7 +8211,7 @@ fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []const u
 }
 
 fn shouldStreamExpertBank(config: *const ModelConfig, prefix: []const u8) bool {
-    return config.expert_streaming and model_mod.isExpertStreamingArch(config.model_type) and
+    return config.expert_streaming and expert_quant_mod.isExpertStreamingArch(config.model_type) and
         std.mem.eql(u8, prefix, config.weight_prefix);
 }
 
