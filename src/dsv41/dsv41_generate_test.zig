@@ -21,14 +21,15 @@ const mtp_plan = @import("../mtp_plan.zig");
 const SpecDisableReason = mtp_plan.SpecDisableReason;
 const ThinkBound = mtp_plan.ThinkBound;
 const generate = @import("../generate.zig");
-const DsparkDiag = generate.DsparkDiag;
+const dsv41_dspark = @import("dsv41_dspark.zig");
+const DsparkDiag = dsv41_dspark.DsparkDiag;
 const Generator = generate.Generator;
 const SchemaConstraint = generate.SchemaConstraint;
-const dsparkEligible = generate.dsparkEligible;
-const dsparkRowsForRoom = generate.dsparkRowsForRoom;
-const dsv41_max_drafts = generate.dsv41_max_drafts;
-const dsv41_max_verify_rows = generate.dsv41_max_verify_rows;
-const parseDsparkDiag = generate.parseDsparkDiag;
+const dsparkEligible = dsv41_dspark.dsparkEligible;
+const dsparkRowsForRoom = dsv41_dspark.dsparkRowsForRoom;
+const dsv41_max_drafts = dsv41_dspark.dsv41_max_drafts;
+const dsv41_max_verify_rows = dsv41_dspark.dsv41_max_verify_rows;
+const parseDsparkDiag = dsv41_dspark.parseDsparkDiag;
 
 test "SUSHI_DSV41_DSPARK_ROWS never forces a verify wider than dsv41Verify accepts" {
     const limit = dsv41_max_verify_rows;

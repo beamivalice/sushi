@@ -9,12 +9,13 @@ const depth_bounds = @import("mtp_depth_bounds.zig");
 const Transformer = transformer_mod.Transformer;
 const testing = std.testing;
 const generate = @import("generate.zig");
+const dsv41_dspark = @import("dsv41/dsv41_dspark.zig");
 const sampler = @import("sampler.zig");
 const CallForce = generate.CallForce;
 const Constraint = generate.Constraint;
 const Generator = generate.Generator;
 const SamplingParams = sampler.SamplingParams;
-const dsparkEligible = generate.dsparkEligible;
+const dsparkEligible = dsv41_dspark.dsparkEligible;
 const penaltyActive = sampler.penaltyActive;
 
 /// THIS model's acceptance mode: the launch flag > its `mtp_acceptance` > exact.
