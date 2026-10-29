@@ -39,7 +39,7 @@ item).
 | `sushi launch <agent>` | works by construction | rows come from `/v1/models`; the efforts list is the arch's four words |
 | `model-settings.json` | works | `ssd_budget_gb`, `mtp`, `ctx_size`; `kv_quant` is ignored |
 | `sushi kld` | works | capture and compare through the generic path; `--drop-expert` scores a pruned student ([quality-kld](quality-kld.md)) |
-| Smoke and format matrices | works | `tests/test_smoke_matrix.sh`, `tests/test_format_matrix.sh` carry a `deepseek_v41` row |
+| Smoke and format matrices | works | `tests/test_smoke_matrix.sh` carries a `deepseek_v41` row; `tests/test_format_matrix.sh` attaches to every model pass |
 | Engram read-ahead | works | every pass reads its rows on a thread from `beginPass` ([dsv41-arch](dsv41-arch.md#what-loads)) |
 
 ## Larger gaps
@@ -67,7 +67,7 @@ number), under the GPU lock.
 
 1. `tests/run.sh --tier live --model dsv41 --only test_smoke_matrix.sh` (cells `default` and `nospec`; the pass SKIPs the
    KV cells): every check ok, and `dspark: a sampled request drafts`.
-2. `tests/test_format_matrix.sh` with `FORMAT_MODELS=deepseek_v41`: tool-call fidelity, stream and non-stream.
+2. `tests/run.sh --tier live --model dsv41 --only test_format_matrix.sh`: tool-call fidelity, stream and non-stream.
 3. Sampled speculation: one request at `temperature 1, top_p 0.95`, 14k to 28k context, thinking off. Expect
    `[spec-stats] mode=dspark` with `per_draft_pct` between the greedy and zero, and decode above the serial figure.
 4. Thinking bound: Anthropic `/v1/messages` with `thinking: {type: enabled, budget_tokens: 256}`. Expect
