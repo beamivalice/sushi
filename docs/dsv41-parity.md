@@ -65,8 +65,8 @@ Ranked by what an agent client feels.
 All with `--ssd-budget-gb` sized to the box, a binary built from the head under test (stamp commit and mtime beside every
 number), under the GPU lock.
 
-1. `tests/test_smoke_matrix.sh` with `SMOKE_ARCHES=deepseek_v41 SMOKE_CONFIGS=default,nospec`: every check ok, and
-   `dspark: a sampled request drafts`. One boot per cell.
+1. `tests/run.sh --tier live --model dsv41 --only test_smoke_matrix.sh` (cells `default` and `nospec`; the pass SKIPs the
+   KV cells): every check ok, and `dspark: a sampled request drafts`.
 2. `tests/test_format_matrix.sh` with `FORMAT_MODELS=deepseek_v41`: tool-call fidelity, stream and non-stream.
 3. Sampled speculation: one request at `temperature 1, top_p 0.95`, 14k to 28k context, thinking off. Expect
    `[spec-stats] mode=dspark` with `per_draft_pct` between the greedy and zero, and decode above the serial figure.
