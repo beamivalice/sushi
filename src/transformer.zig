@@ -43264,6 +43264,23 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         var stream_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(stream_all);
         ctx.capture_stream_all = &stream_all;
+        if (fx.get("l1_ngram_ids")) |ref_ids_arr| {
+            const st = xfm.qwen4.?;
+            var f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f);
+            try mlx.check(mlx.mlx_astype(&f, ref_ids_arr, .int32, s));
+            try mlx.check(mlx.mlx_array_eval(f));
+            const ref_ids = mlx.mlx_array_data_int32(f) orelse return error.Unreadable;
+            const nh: usize = st.hash.n_heads;
+            const host_ids = try allocator.alloc(u32, T);
+            defer allocator.free(host_ids);
+            for (0..T) |i| host_ids[i] = @intCast(ids_src[i]);
+            const rows = try allocator.alloc(i64, T * nh);
+            defer allocator.free(rows);
+            var prev: [8]u32 = @splat(st.hash.eos);
+            st.hash.rowIds(prev[0 .. st.hash.ngram_size - 1], host_ids, rows);
+            for (0..T * nh) |i| try testing.expectEqual(@as(i64, ref_ids[i]), rows[i]);
+        }
         const logits = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
         // MTP head: stream rows 0..T-2 + tokens 1..T-1 at positions 1.. → logits for 2..T.
