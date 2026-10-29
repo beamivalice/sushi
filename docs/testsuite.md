@@ -125,7 +125,13 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41>`, plus `tests/run.sh --tier live --model <arch>` for the scripts it touches (`--only <glob>` narrows) |
 | `src/exl3` or `src/encoder` only | `zig build test -Dmodel=exl3` or `-Dmodel=enc` |
 | a shared file, `build.zig` or `mlx.zig` | `zig build test` |
-| a landing on main | `zig build test` with the tiny-fixture envs set, plus the touched area's scripts |
+| docs only, or test scripts only | nothing in Zig; `tests/run.sh --check` and the scripts it touched |
+| a landing on main, a release, a bisect of an unexplained failure | `zig build test` with the tiny-fixture envs set, plus the touched area's scripts |
+
+The full suite is the only run that sees every test in its real binary and order: a test that leaks or fails alone can
+pass after its neighbours warm a cache. Run it where the table says, never as a habit while iterating (filter instead).
+A landing compares its test total (`Build Summary` plus `test-host`) with the previous landing's: an unexplained drop
+means tests were not built, and blocks the push.
 
 CI runs `test-build` (every test compiles), `test-host` and the hermetic guards on every PR; the GPU tier is a
 `workflow_dispatch` choice (`tier: all`), because a hosted runner's GPU flips rounding ties the M5 holds.

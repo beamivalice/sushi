@@ -140,14 +140,14 @@ Flags: `sushi --help` lists them all.
 
 ## Testing — TDD is mandatory
 
-Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) full suite (`zig build test
--Doptimize=ReleaseFast` 0 fail + relevant `tests/*.sh`); (4) refactor. A live curl is a sanity check, NOT a test.
+Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) the subset or full suite that
+[testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
 corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the matching doc.
 
-Tests follow [testsuite](docs/testsuite.md); `zig build test-host` runs the MLX-free tier beside a live server.
+`zig build test-host` runs the MLX-free tier beside a live server.
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live:
 `tests/qwen4/test_qwen4_exp.sh`, `tests/qwen4/test_bf16_streaming.sh`, `tests/test_mtp_equivalence.sh`,
 `tests/test_prefix_cache_*.sh`, `tests/test_smoke_matrix.sh`. Matrix: `tests/CLAUDE.md`.
