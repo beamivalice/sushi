@@ -12,7 +12,6 @@ DeepSeek's image-encode bill, which is also its transient cap, covers a quarter 
 DeepSeek's live headroom and its load fit each count the decode pool the ledger parks once
 DeepSeek's request bill takes its prefill working set out of the decoder pools a prefill may release
 DeepSeek's streamed request bill brackets the prefill peaks measured on the M5 Max
-DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less sidecar declines the head only
 GLM BF16 individual index recognizes separate gate up down experts
 GLM BF16 individual source preserves shard bytes and leaves dense prefix and MTP unopened
 GLM BF16 individual source rejects incomplete quantized or malformed banks
@@ -74,8 +73,6 @@ MiMo EXL3 streaming imported slabs warm and reuse different layer rates
 MiMo MTP state bill is constant and follows retained storage
 MiMo honors the declared wired limit streamed or resident, without enabling long-context paths
 ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only
-Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD, holding two states, and a grid point restores its state
-Qwen SSD-only: a prefill holds at most two checkpoint states, lists every position, and any of them restores from SSD exactly
 Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and the checkpoint's own word
 Qwen4 mixed MTP profile requires its measured geometry and packs
 Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)
@@ -196,7 +193,6 @@ mimo_v2 template renders a tools request as the reference does
 mimo_v2 warm bill credits only the restored global rows, never the ring
 mimo_v2 with an SSD tier bills a restored global layer beside its first grow
 mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has room
-modelFingerprint: the f32 and the --qwen-gdn 16 GDN layouts each get their own SSD namespace
 mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, DSpark does not
 mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k
 mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never a batched head or a planner-owned round
@@ -234,7 +230,6 @@ qwen smart_resize honors checkpoint processor pixel bounds
 qwen smart_resize matches reference table
 qwen xml: the live <function=…>/<parameter=…> capture (package.json class)
 qwen xml: truncated mid-parameter ships NAME + the completed params only
-qwen4 MTP head persist: the head's row count IS its cache step, so a committed history adopts
 qwen4 expert streaming targets only the trunk bank
 qwen4 replay: what the next prompt shares with a generated turn (Flash-Next tokenizer.json, real template)
 qwen4 streaming index completeness requires every target bank and PLE shard
@@ -258,8 +253,6 @@ selectEffortPick: only Qwen high and max carry a re-route; MiMo's on-fold stays 
 serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto low|high|max
 slice (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1, SUSHI_MODELS_DIR and ENCODER_SLICE_OUT): writes a layers-by-experts slice for conversion runs
 source: SafetensorsSource streams per-expert public weights for Qwen, GLM and MiMo and refuses GGUF
-spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected
-spec snap bytes: the qwen4 head's QSA half is billed into the entry
 spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)
 stock Qwen adapter engages only on the byte-pinned revisions
 stock Qwen adapter leaves prompts without late notes byte-identical, tools, thinking and media included
