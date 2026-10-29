@@ -182,6 +182,82 @@ fn runExperts(run: *report.Run) anyerror!void {
     }
 }
 
+pub const dsv41_tail_routed: report.Bench = .{
+    .name = "dsv41.tail_routed",
+    .scope = .dsv41,
+    .what = "the CED decoder tail's routed experts at the plan's layers: the prefill sorted GEMM against the multi-row decode chain, by rows",
+    .unit = .us,
+    .axes = &.{
+        .{ .name = "layout", .values = &.{ "L2", "L5", "L23" }, .numeric = false },
+        .{ .name = "rows", .values = &.{ "8", "16", "32", "64", "128", "256" } },
+    },
+    .arms = &.{ "gemm", "chain" },
+    .ref = "gemm",
+    .run = runTailRouted,
+};
+
+const TailRung = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: Ctx, steps: usize };
+
+fn tailStep(c: Ctx, chain: bool, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const slots = c.routes[i % ROUTE_SETS];
+    return if (chain)
+        rate_groups.moeDecodeClamped(s, x, c.rb, slots, c.scores, c.topk, .float32, null, null, LIMIT)
+    else
+        rate_groups.moePrefillClamped(s, x, c.rb, slots, c.scores, c.topk, LIMIT);
+}
+
+const TailStep = struct { c: Ctx, chain: bool };
+
+fn tailLink(t: TailStep, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    return tailStep(t.c, t.chain, s, i, x);
+}
+
+fn sampleTail(smp: TailRung, arm: usize) anyerror!f64 {
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, TailStep{ .c = smp.c, .chain = arm == 1 }, tailLink);
+    const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
+}
+
+fn runTailRouted(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0xd54f);
+    const rnd = prng.random();
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    for (LAYOUTS[0..3]) |lay| {
+        if (!listed(run.axis("layout"), lay.key)) continue;
+        var banks: [8]root.Bank = undefined;
+        for (lay.groups, 0..) |g, i| banks[i] = try bench.makeBank(rnd, HIDDEN, INTER, g.n, g.experts, 0.02, 0.9);
+        var rb = try rate_groups.Ragged.init(s, banks[0..lay.groups.len]);
+        defer rb.deinit();
+        const st = rb.storage();
+        const vec = mlx.mlx_vector_array_new_data(&st, st.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
+        for (run.axis("rows")) |rows_text| {
+            const rows = try std.fmt.parseInt(usize, rows_text, 10);
+            var routes: [ROUTE_SETS]mlx.mlx_array = undefined;
+            _ = makeRoutes(rnd, &rb, rows, lay.topk, .uniform, &routes);
+            defer for (routes) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            const xh = try std.heap.page_allocator.alloc(u16, rows * HIDDEN);
+            defer std.heap.page_allocator.free(xh);
+            for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
+            const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(HIDDEN) }, 2, .bfloat16);
+            defer _ = mlx.mlx_array_free(x0);
+            var scv: [256 * 6]f32 = undefined;
+            for (&scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+            const scores = mlx.mlx_array_new_data(&scv, &[_]c_int{@intCast(rows * lay.topk)}, 1, .float32);
+            defer _ = mlx.mlx_array_free(scores);
+            const c: Ctx = .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = true };
+            const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ lay.key, rows });
+            try run.interleave(label, TailRung{ .s = s, .x0 = x0, .c = c, .steps = run.steps(4) }, sampleTail);
+        }
+    }
+}
+
 fn listed(values: []const []const u8, v: []const u8) bool {
     for (values) |x| if (std.mem.eql(u8, x, v)) return true;
     return false;

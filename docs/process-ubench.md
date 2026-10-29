@@ -67,6 +67,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 | bench | scope | what it times |
 |---|---|---|
 | `dsv41.experts` | dsv41 | the 384-expert PAIR1 grouped chain at the plan's layers 2, 5, 23 and the DSpark stage bank, by rows and routing mode |
+| `dsv41.tail_routed` | dsv41 | the CED decoder tail's routed experts at the plan's layers 2, 5, 23: the prefill sorted GEMM against the multi-row decode chain, 8 to 256 rows |
 | `shared.exl3_decode_chain` | shared | the EXL3 decode chain at Flash-Next geometry for any rate (n24 to n128, MCG and SPEC1, 1 to 4 rows) against n32, n48 and n64 |
 | `shared.exl3_grouped_decode` | shared | the decode chain at 1 to 8 rows with verify rows sharing expert reads: ungrouped, prepared, pairs, sized member capacity, on Flash-Next and DeepSeek geometry |
 | `shared.exl3_moe_layer` | shared | a Flash-Next MoE layer (E512, K4, top-10) on MUL1, MCG, STD1, SPEC1 and PAIR1 against MLX's affine-4 `gather_qmm` x3, from 1 to 2048 rows |
