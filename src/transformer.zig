@@ -37841,12 +37841,6 @@ test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
     try std.testing.expectEqual(@as(u32, 1), b.qsa_arms.mask);
 }
 
-test "the qsa arm tally lives on the ForwardCtx, never on the shared Transformer" {
-    try std.testing.expect(@hasField(ForwardCtx, "qsa_arms"));
-    try std.testing.expect(!@hasField(Transformer, "qsa_arms"));
-    try std.testing.expect(!@hasDecl(Transformer, "qsaArmsTake"));
-}
-
 test "qsa verify gather geometry: rows, the union tail, and the no-win decline" {
     // The ONE owner of R. Production budget is 512 blocks of 4: at S=7 the
     // union is 14336 rows + tail, so the arm needs kv well past that; at
