@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=exact
 # Concurrent MTP users on one model: every stream's greedy output at a FIXED draft depth
 # must be byte-identical to its solo run (the byte bar for spec decode), whether the
 # rounds ride one batched verify (qwen3_5 dense/MoE) or interleave with their own head
 # state (qwen4_exp). A crowd of 4 must still complete on the plain batched tick.
-# Usage: MTP_BATCHED_MODEL=<dir with an MTP head> ./tests/test_mtp_batched.sh [port]
 set -u
-MODEL="${MTP_BATCHED_MODEL:?set MTP_BATCHED_MODEL}"
-PORT=${1:-18850}; BASE="http://127.0.0.1:$PORT"
-BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+sushi_require mtp
+sushi_require batching
+BASE="$SUSHI_URL"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 LOG=$(mktemp); OUT=$(mktemp -d)
-SUSHI_ROUND_COST_PERSIST=0 "$BINARY" --mtp-min-depth 2 --mtp-max-depth 2 --model "$MODEL" --serve --port "$PORT" --mtp --max-concurrent 8 --prefix-cache-entries 0 > "$LOG" 2>&1 &
-PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$LOG" "$OUT"' EXIT
-for i in $(seq 1 240); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC} server did not start"; tail -20 "$LOG"; exit 1; }
-IS_QWEN4=$(python3 -c "import json,sys; print(1 if json.load(open(sys.argv[1]+'/config.json')).get('model_type')=='qwen4_exp' else 0)" "$MODEL")
+trap 'rm -rf "$LOG" "$OUT"' EXIT
+IS_QWEN4=$([ "$SUSHI_ARCH" = qwen4_exp ] && echo 1 || echo 0)
 
-P=("Write a short essay about the history of quantum computing." "Explain how a compiler turns source code into machine code." "Describe the water cycle for a graduate seminar." "Summarize the causes of the French revolution.")
+P=("$SUSHI_NONCE Write a short essay about the history of quantum computing." "$SUSHI_NONCE Explain how a compiler turns source code into machine code." "$SUSHI_NONCE Describe the water cycle for a graduate seminar." "$SUSHI_NONCE Summarize the causes of the French revolution.")
 req() { python3 -c "import json,sys; print(json.dumps({'model':'sushi','messages':[{'role':'user','content':sys.argv[1]}],'max_tokens':150,'temperature':0}))" "$1" |
     curl -s -m 900 -X POST -H 'Content-Type: application/json' -d @- "$BASE/v1/chat/completions" |
     python3 -c "import sys,json; j=json.load(sys.stdin); print(j['choices'][0]['message']['content'])"; }
@@ -60,7 +58,8 @@ PYEOF
         echo -e "${RED}FAIL${NC} stream $i at N=$N diverged at token $idx with a serial top-2 gap of $g nats"; diff "$OUT/solo$i" "$OUT/conc$i" | head -6; fail=1
     fi
 done
-[ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} $N concurrent MTP streams match solo (fixed depth 2; near-ties acquitted on the batched verify)"
+[ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} $N concurrent MTP streams match solo (fixed depth; near-ties acquitted on the batched verify)"
+sushi_log_since > "$LOG"
 if [ "$IS_QWEN4" = 1 ]; then
     grep -q "gdn batched verify engaged" "$LOG" && { echo -e "${RED}FAIL${NC} qwen4 rounds must stay solo (no batched verify yet)"; fail=1; }
     [ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} qwen4 MTP users interleave on their own head state"
@@ -70,6 +69,7 @@ else
 fi
 
 pids=(); for i in 0 1 2 3; do req "${P[$i]}" > "$OUT/crowd$i" & pids+=($!); done; wait "${pids[@]}"
+sushi_log_since > "$LOG"
 for i in 0 1 2 3; do [ -s "$OUT/crowd$i" ] || { echo -e "${RED}FAIL${NC} crowd stream $i returned nothing"; fail=1; }; done
 if [ "$IS_QWEN4" = 0 ]; then
     grep -q "gdn batched decode engaged (slots=4)" "$LOG" || { echo -e "${YELLOW}NOT RUN${NC} the four MTP streams never overlapped into one plain batched tick"; }

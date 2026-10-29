@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=exact
 # repeat_penalty / presence_penalty reach the default decode path (one boot, MTP on by default).
 #
 #   1. APPLIED: a penalised request answers the same bytes as with `logprobs` on, whose synchronous
@@ -11,41 +11,18 @@
 #   3. STREAM == NON-STREAM for the penalised request, and for a json_schema + penalty request,
 #      whose content must still parse against its schema.
 #   4. A penalised request beside a concurrent unpenalised neighbour: both keep their solo bytes.
-#
-# Usage: PENALTY_TEST_MODEL=<pack> ./tests/test_penalty_paths.sh [port]
-# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw. SUSHI_TEST_EXTRA_ARGS adds server flags
-# (a streamed pack: `--ssd-budget-gb 18`).
 set -u
-MODEL="${PENALTY_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${1:-11319}"
-BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"
-if [ ! -d "$MODEL" ]; then
-    echo "SKIP: model not found at $MODEL"
-    exit 0
-fi
-if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/health"; then
-    echo "FAIL: port $PORT is already serving; pass a free port"
-    exit 1
-fi
-ARTIFACTS="${PENALTY_TEST_OUTPUT_DIR:-$(mktemp -d)}"
-mkdir -p "$ARTIFACTS"
-LOG="$ARTIFACTS/server.log"
-# shellcheck disable=SC2086
-"$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter --prefix-cache-entries 0 \
-    --ctx-size 8192 --max-concurrent 4 --log-level info $EXTRA_ARGS >"$LOG" 2>&1 &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT
-for _ in $(seq 1 400); do
-    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
-    kill -0 "$SERVER_PID" 2>/dev/null || { echo "FAIL: server exited"; tail -20 "$LOG"; exit 1; }
-    sleep 3
-done
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+sushi_require mtp
+LOG=$(mktemp)
+trap 'rm -f "$LOG"' EXIT
 
-ENGAGE_PRE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
-curl -s --max-time 600 -o /dev/null -H 'Content-Type: application/json' "http://127.0.0.1:$PORT/v1/chat/completions" \
-    -d '{"model":"default","temperature":0,"max_tokens":160,"enable_thinking":false,"presence_penalty":2.0,"messages":[{"role":"user","content":"Count from 1 to 40 separated by commas, then write the word apple ten times."}]}'
+ENGAGE_PRE=$(sushi_log_since | grep -c "\[spec-stats\] mode=mtp")
+curl -s --max-time 600 -o /dev/null -H 'Content-Type: application/json' "$SUSHI_URL/v1/chat/completions" \
+    -d '{"model":"default","temperature":0,"max_tokens":160,"enable_thinking":false,"presence_penalty":2.0,"messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Count from 1 to 40 separated by commas, then write the word apple ten times."}]}'
 sleep 1
+sushi_log_since > "$LOG"
 if [ "$(grep -c "\[spec-stats\] mode=mtp" "$LOG")" -le "$ENGAGE_PRE" ]; then
     echo "FAIL: a penalised request logged no '[spec-stats] mode=mtp' line (it ran without MTP)"
     exit 1
@@ -56,18 +33,18 @@ if [ "${ATTEMPTS:-0}" -le 0 ]; then
     exit 1
 fi
 
-python3 - "$PORT" <<'PY'
+python3 - "$SUSHI_URL" "$SUSHI_NONCE" <<'PY'
 import json, sys, threading, urllib.request
 
-port = sys.argv[1]
+url, nonce = sys.argv[1], sys.argv[2]
 BASE = {"model": "default", "temperature": 0, "max_tokens": 160, "enable_thinking": False,
-        "messages": [{"role": "user", "content": "Count from 1 to 40 separated by commas, then write the word apple ten times."}]}
-OTHER = dict(BASE, max_tokens=200, messages=[{"role": "user", "content": "Explain in a paragraph why the sky is blue."}])
+        "messages": [{"role": "user", "content": nonce + " Count from 1 to 40 separated by commas, then write the word apple ten times."}]}
+OTHER = dict(BASE, max_tokens=200, messages=[{"role": "user", "content": nonce + " Explain in a paragraph why the sky is blue."}])
 SCHEMA = {"type": "json_schema", "json_schema": {"name": "fruits", "schema": {
     "type": "object", "properties": {"fruits": {"type": "array", "items": {"type": "string"}}}, "required": ["fruits"]}}}
 
 def post(body):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(),
+    req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         return r.read().decode()

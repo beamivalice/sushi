@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
-"""Live EOS/cancellation parity against a running server.
-
-Start it with native MTP and
-`--mtp-min-depth 4 --mtp-max-depth 4` so both arms use the same verify width.
-The caller owns model loading and GPU/thermal controls.
-"""
+# sushi-test: tier=live boot=exact
+"""Live EOS/cancellation parity on the exact boot: native MTP at a fixed draft depth, so the grouped arm and its
+solo reference share one verify width."""
 import argparse
 import concurrent.futures
 import http.client
 import json
+import os
 import re
 from pathlib import Path
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
-import urllib.request
+from urllib.parse import urlparse
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
+import sushi_test as st
+
+nonce = st.attach()
+st.require('mtp')
+st.require('batching')
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('port', type=int)
-parser.add_argument('--server-log', type=Path, required=True)
 parser.add_argument('--out', type=Path)
 args = parser.parse_args()
-port = args.port
+port = urlparse(st.url()).port
 out = args.out or Path(tempfile.mkdtemp(prefix='mtp-batch-stops-'))
 out.mkdir(parents=True, exist_ok=True)
-logfile = args.server_log
-base = f'http://127.0.0.1:{port}'
+logfile = Path(os.environ['SUSHI_LOG'])
 shorts = [
     'Count from one to twenty in English, separated by commas, and stop after twenty.',
     'List the twelve months from January through December, one per line, with no introduction.',
@@ -41,7 +43,7 @@ def request(prompt, limit=160, barrier=None, cancel_after=None, grouped=False):
     if barrier is not None:
         barrier.wait()
     conn = http.client.HTTPConnection('127.0.0.1', port, timeout=120)
-    body = dict(model='default', messages=[dict(role='user', content=prompt)], temperature=0,
+    body = dict(model='default', messages=[dict(role='user', content=f'{nonce} {prompt}')], temperature=0,
                 max_tokens=limit, enable_mtp=True, enable_batch_mtp=grouped, enable_thinking=False, stream=True,
                 stream_options=dict(include_usage=True))
     conn.request('POST', '/v1/chat/completions', json.dumps(body), {'Content-Type': 'application/json'})
@@ -93,9 +95,7 @@ def equal(label, expected, actual):
     if expected['usage']['completion_tokens'] != actual['usage']['completion_tokens']:
         raise AssertionError(label + ': completion count differs from solo')
 
-# A prompt's first run computes its prefix; every later run restores it from the
-# prefix cache, which is not bit-exact. References are taken from the second run
-# so they share the restore path with the grouped runs they are compared to.
+# The first run warms the kernels; references come from the second.
 for prompt, limit in [(p, 160) for p in shorts] + [(survivor, 200), (victim, 512)]:
     request(prompt, limit)
 references = [request(prompt) for prompt in shorts]
@@ -149,6 +149,6 @@ for attempt in range(8):
         break
 if not reached_cancel:
     raise AssertionError('No mid-round cancellation publication was observed; gate did not run')
-if '[batched] row-axis mtp verify engaged (slots=2' not in logfile.read_text(errors='replace'):
+if '[batched] row-axis mtp verify engaged (slots=2' not in st.log_since():
     raise AssertionError('Grouped verify did not engage')
 print('RESULT: 2 passed, 0 failed; artifacts=' + str(out), flush=True)
