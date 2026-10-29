@@ -128,7 +128,8 @@ words = set()
 for m in p["models"]:
     accepted = rows.get(m["id"], {}).get("reasoning_efforts")
     for lvl, w in m["thinkingLevelMap"].items():
-        if accepted is not None and w not in accepted: bad.append(f"{m['id']}:{lvl}->{w}")
+        # A null word is a level the model does not offer (GLM has no off).
+        if w and accepted is not None and w not in accepted: bad.append(f"{m['id']}:{lvl}->{w}")
         if w: words.add(w)
 print("BAD " + " ".join(bad) if bad else " ".join(sorted(words)))
 PY
