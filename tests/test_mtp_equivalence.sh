@@ -54,9 +54,9 @@ MODEL=$(sushi_pack "${SUSHI_PASS_MODEL:-qwen4}") || exit $?
 EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"
 MAX_TOKENS=120
 ARCH=$(sushi_arch "$MODEL")
-# MiMo answers inside a think block by default: compare the reasoning too.
-REASONING=0
-[ "$ARCH" = mimo_v2 ] && REASONING=1
+# Both served archs think by default, so a short budget can end inside the think block: the compared answer is
+# reasoning + content.
+REASONING=1
 export REASONING
 PROMPT="Write a short story about a robot learning to paint."
 EXPECT_AUTO_PROFILE="${MTP_EXPECT_AUTO_PROFILE:-}"

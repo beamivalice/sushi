@@ -22,8 +22,8 @@ MODEL=$(sushi_pack qwen4) || exit $?
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-SHORT_PAYLOAD='{"model":"sushi","messages":[{"role":"user","content":"What is 2+2? Answer with just the number, no explanation."}],"max_tokens":32,"temperature":0.0,"stream":false}'
-LONG_PAYLOAD='{"model":"sushi","messages":[{"role":"user","content":"Recite the first paragraph of \"A Tale of Two Cities\" by Charles Dickens."}],"max_tokens":200,"temperature":0.0,"stream":false}'
+SHORT_PAYLOAD='{"model":"sushi","messages":[{"role":"user","content":"What is 2+2? Answer with just the number, no explanation."}],"max_tokens":32,"temperature":0.0,"stream":false,"enable_thinking":false}'
+LONG_PAYLOAD='{"model":"sushi","messages":[{"role":"user","content":"Recite the first paragraph of \"A Tale of Two Cities\" by Charles Dickens."}],"max_tokens":200,"temperature":0.0,"stream":false,"enable_thinking":false}'
 
 post() { curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$SUSHI_URL/v1/chat/completions"; }
 text_of() { python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"; }
