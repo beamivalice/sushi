@@ -1,169 +1,123 @@
 #!/usr/bin/env python3
-"""Serial live Sushi billing, KV override, and context refusal validation.
+# sushi-test: tier=live boot=own pack=qwen4 boots=4
+"""Live Sushi memory billing, KV override and context refusal, on the default Qwen pack and, when present, MiMo.
 
-Requires the box GPU lock and real Qwen/MiMo packs. Runs no workload until
-invoked explicitly; compilation and --help do not start a server.
+Per pack, two resident boots at a 1248-token context (MTP + vision on, and `--no-mtp --no-vision`):
+  - the enabled boot holds more resident bytes than the disabled one, advertises images, and reports the MTP head
+    in /v1/models and /props; KV8 is the default and a per-request KV4 override is honoured and logged;
+  - the load bills `[preflight] weights ~W GB, needs ~N GB`: N is at least W plus the 1 GiB net plus the measured
+    warmup, `/props` peak memory fits N and sits within 3 GB of it, and a short chat completes.
+Then, without loading weights: a startup refusal at an absurd context names the maximum context before any shard
+loads, and a headless `--model-dir` server answers `/v1/load-model` with a 503 `out_of_memory` naming it, twice.
+`--refusals-only` runs just the last two.
 """
-
 import argparse
 import json
 import os
 from pathlib import Path
 import re
-import socket
-import subprocess
+import sys
 import time
-import urllib.error
-import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import sushi_boot as b  # noqa: E402
 
-PACKS = {
-    "Qwen3.8-Flash-Next-Sushi-2.6bpw": (47_463_796_730, 45_355_923_482),
-    "MiMo-V2.6-Flash-Sushi-2.3bpw": (96_265_841_408, 93_619_252_096),
-}
+CTX = 1248
+ABSURD_CTX = 4_000_000_000
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", type=Path, default=Path(os.environ.get("SUSHI_MODELS_DIR", str(Path.home() / "llm" / "models"))))
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--pack", choices=list(PACKS), action="append")
     parser.add_argument("--refusals-only", action="store_true")
     args = parser.parse_args()
-    root = Path(__file__).resolve().parent.parent
-    binary = args.binary.resolve()
-    assert binary.is_file(), binary
-    args.output.mkdir(parents=True, exist_ok=True)
-    packs = args.pack or list(PACKS)
-    for name in packs:
-        assert (args.models / name / "config.json").is_file(), name
-    env = dict(os.environ)
-    env.pop("SUSHI_MTP_DRAFT_HEAD_BITS", None)  # Native defaults: Qwen 3 bits, MiMo 2 bits.
-    owner = f"sushi-memory-live-{os.getpid()}"
-    lock = root / "scripts/gpu-lock.sh"
+    models = Path(os.environ.get("SUSHI_MODELS_DIR", str(Path.home() / ".sushi/models")))
+    packs = [p for p in (b.pack("qwen4"), b.pack("mimo2", required=False)) if p is not None]
+    out = b.run_dir()
+    common = ["--prefill-chunk", "512", "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-drafter"]
 
-    def port():
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            return probe.getsockname()[1]
+    def settle():
+        time.sleep(2)  # Metal unwires buffers asynchronously after a process exits
 
-    def request(base, route, body=None):
-        data = None if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(base + route, data=data, headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=180) as response:
-                return response.status, json.load(response)
-        except urllib.error.HTTPError as response:
-            return response.code, json.load(response)
-
-    def run_server(label, context, model=None, flags=(), exercise=None, refuses=False):
-        run_port = port()
-        base = f"http://127.0.0.1:{run_port}"
-        log_path = args.output / f"{label}.log"
-        command = [str(binary), "serve", "--host", "127.0.0.1", "--port", str(run_port),
-                   "--ctx-size", str(context), "--prefill-chunk", "512" if context < 1_000_000 else "2048",
-                   "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-drafter"]
-        command += ["--model", str(model)] if model else ["--model-dir", str(args.models)]
-        command += list(flags)
-        subprocess.run([str(lock), "acquire", owner], check=True)
-        child = None
-        try:
-            with log_path.open("w") as log:
-                child = subprocess.Popen(["taskpolicy", "-a", *command], stdout=log,
-                                         stderr=subprocess.STDOUT, env=env)
-                if refuses:
-                    exit_code = child.wait(timeout=120)
-                    assert exit_code > 0, f"expected clean refusal, got exit {exit_code}: {label}"
-                else:
-                    deadline = time.monotonic() + 300
-                    while time.monotonic() < deadline:
-                        assert child.poll() is None, f"server exited; see {log_path}"
-                        try:
-                            if request(base, "/health")[0] == 200:
-                                break
-                        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-                            time.sleep(0.5)
-                    else:
-                        raise AssertionError(f"startup timeout; see {log_path}")
-                    exercise(base, log_path)
-        finally:
-            if child is not None and child.poll() is None:
-                child.terminate()
-                try:
-                    child.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
-            subprocess.run([str(lock), "release", owner], check=True)
-            # Metal unwires buffers asynchronously after a process exits.
-            time.sleep(2)
-        text = log_path.read_text()
-        if refuses:
-            maximum = re.search(r"Maximum context with this memory budget: (\d+) tokens", text)
-            assert maximum, f"numeric startup refusal missing; see {log_path}"
-            assert "Loading model-" not in text, "refusal happened after shard loading"
-            print(f"PASS {label}: maximum context {maximum.group(1)}", flush=True)
-        return text
+    def exercise(server, name, enabled, base_bytes):
+        base = server.base
+        status, listing = b.request(base, "/v1/models")
+        assert status == 200, listing
+        loaded = next(m for m in listing["data"] if m.get("loaded"))
+        assert loaded["meta"]["mtp_loaded"] == enabled, loaded["meta"]
+        assert ("image" in loaded["input_modalities"]) == enabled, loaded["input_modalities"]
+        if enabled:
+            assert loaded["bytes_resident"] > base_bytes, (loaded["bytes_resident"], base_bytes)
+        status, props = b.request(base, "/props")
+        assert status == 200, props
+        assert props["default_generation_settings"]["n_ctx"] == CTX, props["default_generation_settings"]
+        assert props["settings"]["kv_cache"]["scheme"] == "kv8", props["settings"]
+        assert props["settings"]["kv_quant"] == "8", props["settings"]
+        assert props["settings"]["mtp"]["loaded"] == enabled, props["settings"]["mtp"]
+        assert props["settings"]["mtp"]["default_on"] == enabled, props["settings"]["mtp"]
+        found = re.findall(r"\[preflight\] weights ~([0-9.]+) GB, needs ~([0-9.]+) GB", server.log_text())
+        assert len(found) == 1, found
+        weights, needed = map(float, found[0])
+        # The billed weights plus the larger of the measured warmup plus the 1 GiB net and the context bill.
+        warmup = 0.25 if name.startswith("MiMo") else (1.25 if enabled else 0.125)
+        assert needed - weights >= 1.0 + warmup - 0.01, (weights, needed, warmup)
+        assert 0 < props["memory"]["active_bytes"] <= props["memory"]["peak_bytes"], props["memory"]
+        peak = props["memory"]["peak_bytes"] / 2**30
+        assert peak <= needed + 0.005, props["memory"]
+        assert needed - peak <= 3.0, (needed, peak)
+        (out / f"{server.label}.props.json").write_text(json.dumps(props, indent=2))
+        status, reply = b.request(base, "/v1/chat/completions", {
+            "model": loaded["id"], "messages": [{"role": "user", "content": "Reply with one greeting."}],
+            "kv_quant": 4, "max_tokens": 8, "temperature": 0, "stream": False, "enable_thinking": False,
+        })
+        assert status == 200 and reply.get("choices"), reply
+        assert reply["usage"]["completion_tokens"] > 0, reply
+        assert "kv-quant override: affine 4-bit (per-request)" in server.log_text()
+        print(f"PASS {server.label}: {loaded['bytes_resident']} bytes, KV8 default, KV4 request, weights {weights} GB, "
+              f"needs {needed} GB, peak {peak:.2f} GB", flush=True)
+        return loaded["bytes_resident"]
 
     if not args.refusals_only:
-        for name in packs:
-            for enabled in (True, False):
-                label = f"{name}-{'enabled' if enabled else 'disabled'}"
-                wanted = PACKS[name][0 if enabled else 1]
+        for pack in packs:
+            disabled_bytes = 0
+            for enabled in (False, True):
+                label = f"billing-{pack.name}-{'enabled' if enabled else 'disabled'}"
+                flags = common + ["--ctx-size", str(CTX), "--kv-quant", "8"] + (["--mtp"] if enabled else ["--no-mtp", "--no-vision"])
+                with b.Server(label, model=pack, flags=flags) as server:
+                    server.wait_ready()
+                    got = exercise(server, pack.name, enabled, disabled_bytes)
+                    if not enabled:
+                        disabled_bytes = got
+                settle()
 
-                def exercise(base, log_path, name=name, enabled=enabled, wanted=wanted, label=label):
-                    status, models = request(base, "/v1/models")
-                    assert status == 200, models
-                    loaded = next(m for m in models["data"] if m.get("loaded"))
-                    assert loaded["bytes_resident"] == wanted, (loaded["bytes_resident"], wanted)
-                    assert loaded["meta"]["mtp_loaded"] == enabled, loaded["meta"]
-                    assert ("image" in loaded["input_modalities"]) == enabled, loaded["input_modalities"]
-                    status, props = request(base, "/props")
-                    assert status == 200, props
-                    assert props["settings"]["kv_cache"]["scheme"] == "kv8", props["settings"]
-                    assert props["settings"]["kv_quant"] == "8", props["settings"]
-                    assert props["settings"]["mtp"]["loaded"] == enabled, props["settings"]["mtp"]
-                    assert props["settings"]["mtp"]["default_on"] == enabled, props["settings"]["mtp"]
-                    preflight = re.search(r"\[preflight\] weights ~([0-9.]+) GB, needs ~([0-9.]+) GB", log_path.read_text())
-                    assert preflight, log_path
-                    weights, needed = map(float, preflight.groups())
-                    warmup = 0.25 if name.startswith("MiMo") else (1.25 if enabled else 0.125)
-                    assert needed - weights >= 1.0 + warmup - 0.01, (weights, needed, warmup)
-                    assert props["memory"]["peak_bytes"] <= (needed + 0.005) * 2**30, props["memory"]
-                    (args.output / f"{label}.props.json").write_text(json.dumps(props, indent=2))
-                    status, reply = request(base, "/v1/chat/completions", {
-                        "model": loaded["id"], "messages": [{"role": "user", "content": "Reply with one greeting."}],
-                        "kv_quant": 4, "max_tokens": 8, "temperature": 0, "stream": False,
-                        "enable_thinking": False,
-                    })
-                    assert status == 200 and reply.get("choices"), reply
-                    assert reply["usage"]["completion_tokens"] > 0, reply
-                    assert "kv-quant override: affine 4-bit (per-request)" in log_path.read_text()
-                    (args.output / f"{label}.reply.json").write_text(json.dumps(reply, indent=2))
-                    print(f"PASS {label}: {wanted} bytes, KV8 default, KV4 request", flush=True)
+    for pack in packs:
+        label = f"billing-{pack.name}-startup-refusal"
+        server = b.Server(label, model=pack, flags=common + ["--ctx-size", str(ABSURD_CTX), "--mtp"]).start()
+        try:
+            code = server.wait_exit(120)
+        finally:
+            server.stop(gone_ok=True)
+        text = server.log.read_text()
+        assert code > 0, f"expected a clean refusal, got exit {code}: {label}"
+        maximum = re.search(r"Maximum context with this memory budget: (\d+) tokens", text)
+        assert maximum, f"numeric startup refusal missing; see {server.log}"
+        assert "Loading model-" not in text, "refusal happened after shard loading"
+        print(f"PASS {label}: maximum context {maximum.group(1)}", flush=True)
+        settle()
 
-                run_server(label, 4096, args.models / name,
-                           ("--mtp",) if enabled else ("--no-mtp", "--no-vision"), exercise)
-
-    for name in packs:
-        run_server(f"{name}-startup-refusal", 4_000_000_000, args.models / name, ("--mtp",), refuses=True)
-
-    def cold(base, log_path):
-        for name in packs:
+    with b.Server("billing-cold-refusal", model_dir=models, flags=common + ["--ctx-size", str(ABSURD_CTX), "--mtp"]) as server:
+        server.wait_ready()
+        for pack in packs:
             for attempt in range(2):
-                status, body = request(base, "/v1/load-model", {"model": name})
+                status, body = b.request(server.base, "/v1/load-model", {"model": pack.name})
                 assert status == 503 and body["error"]["type"] == "out_of_memory", (status, body)
                 maximum = re.search(r"Maximum context: (\d+) tokens", body["error"]["message"])
                 assert maximum, body
-                (args.output / f"{name}-cold-refusal-{attempt}.json").write_text(json.dumps(body, indent=2))
-                print(f"PASS {name} cold refusal {attempt}: maximum context {maximum.group(1)}", flush=True)
-        _, props = request(base, "/props")
+                print(f"PASS {pack.name} cold refusal {attempt}: maximum context {maximum.group(1)}", flush=True)
+        _, props = b.request(server.base, "/props")
         assert props["memory"]["active_bytes"] < 512 * 1024 * 1024, props["memory"]
-        assert "Loading model-" not in log_path.read_text()
-
-    run_server("cold-refusal", 4_000_000_000, flags=("--mtp",), exercise=cold)
+        assert "Loading model-" not in server.log_text()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

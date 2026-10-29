@@ -24,11 +24,13 @@ def skip(reason):
     sys.exit(EXIT_SKIP)
 
 
-def pack(key):
-    """The pack dir for a model key, alias or path (boot.sh's table), or SKIP when it is missing."""
+def pack(key, required=True):
+    """The pack dir for a model key, alias or path (boot.sh's table); SKIP when it is missing, or None if not required."""
     r = subprocess.run(["/bin/bash", "-c", f'. "{ROOT}/tests/lib/boot.sh"; sushi_pack "$1"', "_", key],
                        capture_output=True, text=True)
     if r.returncode == EXIT_SKIP:
+        if not required:
+            return None
         skip(r.stderr.strip().removeprefix("SKIP: "))
     r.check_returncode()
     return Path(r.stdout.strip())
@@ -131,8 +133,9 @@ class Server:
         """The exit status of a server that is expected to refuse and leave."""
         return self.proc.wait(timeout=timeout)
 
-    def stop(self, status=0):
-        """TERM, then KILL after the wait; releases the lock and writes <label>.END. A server already gone is a crash."""
+    def stop(self, status=0, gone_ok=False):
+        """TERM, then KILL after the wait; releases the lock and writes <label>.END. A server already gone is a crash
+        unless the script expected it to leave (a refusal)."""
         if self.proc is None:
             return
         state = "clean"
@@ -144,6 +147,8 @@ class Server:
                 self.proc.kill()
                 self.proc.wait()
                 state = "killed"
+        elif gone_ok:
+            state = "gone"
         elif self.proc.returncode != 0:
             state = "crash"
             print(f"[boot] CRASH: server '{self.label}' was already gone, exit status {self.proc.returncode}; log: {self.log}",
