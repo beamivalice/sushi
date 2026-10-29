@@ -38,7 +38,6 @@ const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const glm5_forward = @import("glm5/glm5_forward.zig");
 const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
-const kv_disk_cache_mod = @import("kv_disk_cache.zig");
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
 const dspark_rows = @import("dsv41/dspark_rows.zig");
@@ -806,40 +805,6 @@ pub fn verifyArgmax(logits: mlx.mlx_array, mask: ?mlx.mlx_array, s: mlx.mlx_stre
     return .{ .arr = out };
 }
 
-/// Logit biases and the think penalty ride the verifier (`Generator.glmPenalty`).
-pub fn glmDflashEligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
-    return !mtp_plan.specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null;
-}
-
-/// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
-/// agrees back `mtp_lookup.STRONG_SUFFIX` tokens and the budget holds the whole chain.
-pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@import("glm5/glm5_dflash.zig").Proposal {
-    const drafts = Generator.glm_lookup_drafts;
-    const m = got orelse return null;
-    if (m.suffix < mtp_lookup.STRONG_SUFFIX or m.draft.len < drafts or budget <= drafts) return null;
-    var chain = @import("glm5/glm5_dflash.zig").Proposal{ .count = drafts + 1 };
-    chain.tokens[0] = pending;
-    chain.parents[0] = -1;
-    for (m.draft[0..drafts], 1..) |token, row| {
-        chain.tokens[row] = token;
-        chain.parents[row] = @intCast(row - 1);
-    }
-    return chain;
-}
-
-/// Takes the verifier's MLA capacity right after prefill, inside the request's admission bill: no
-/// round grows a buffer, and a later admission already sees the capacity as live memory.
-pub const GlmSpecWindow = struct { snapshot: transformer_mod.KVCacheSnapshot, base_pos: usize };
-
-fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assistant: *const dflash_mod.DflashCtx, max_tokens: u32, s: mlx.mlx_stream) !void {
-    const request = ctx.glm5_request orelse return error.GlmRequestMissing;
-    const kv = ctx.cache.config;
-    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
-    const held = request.residentBytes() +| assistant.cache.residentBytes();
-    const budget = @import("server.zig").glmDflashReserveBudget(config, request.offset, max_tokens, kv_bits, held);
-    _ = try @import("glm5/glm5_dflash_reserve.zig").reserve(request, request.offset + max_tokens + 3, budget, s);
-}
-
 /// Generation result (for non-streaming use).
 pub const GenerationResult = struct {
     text: []u8,
@@ -890,15 +855,6 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
     const uncached: u32 = if (prompt_tokens > cached_tokens) prompt_tokens - cached_tokens else 0;
     return tokensPerSec(uncached, prefill_ns);
 }
-
-/// GLM's chunk grid: absolute multiples of its widest prefill chunk. A narrower chunk divides
-/// it and `nextChunkEnd` ends a chunk on every grid point, so a grid point is a chunk boundary in
-/// every request whatever widths it runs. A test seam; serving never changes it.
-pub var glm_checkpoint_stride: usize = glm5_forward.prefill_chunk;
-
-/// GLM's restore-point grid: the chunk grid points a checkpoint is captured at (a multiple of it), the
-/// same 8192 grid every arch keeps on SSD. A test seam; serving never changes it.
-pub var glm_capture_stride: usize = kv_disk_cache_mod.POINT_GRID;
 
 /// A prefill checkpoint at absolute `pos`: the slot's SSM entries, the GLM request's KDA state, or DeepSeek's whole request state.
 /// `to_ssd`: a write-through takes the point to the SSD tier before the next forward, so DeepSeek's shares its rows.
@@ -1021,7 +977,7 @@ pub const Generator = struct {
     glm_lookup: struct { rounds: u64 = 0, landed: u64 = 0 } = .{},
     /// The GLM assistant window as prefill left it, committed with the prefix: every GLM restore
     /// point lies at or below the prompt end, which a window cropped at the reply's end can miss.
-    glm_prefill_window: ?GlmSpecWindow = null,
+    glm_prefill_window: ?glm5_generate.GlmSpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Whether a DFlash2 round pays against a plain one-row tick for this request, and the plain ticks it ran.
@@ -1728,7 +1684,7 @@ pub const Generator = struct {
         try sampling.think_penalty.prepare(allocator, bias_vocab, xfm.think_marker_mask, xfm.s);
         errdefer sampling.think_penalty.deinitPrepared();
         var options = options_in;
-        const glm_dflash_native = xfm.glm5 != null and options.dflash_enabled and options.dflash != null and glmDflashEligible(sampling, options.logprobs_n);
+        const glm_dflash_native = xfm.glm5 != null and options.dflash_enabled and options.dflash != null and glm5_generate.glmDflashEligible(sampling, options.logprobs_n);
         if (xfm.glm5 != null) {
             options.mtp_enabled = false;
             options.dflash_enabled = glm_dflash_native;
@@ -1842,12 +1798,12 @@ pub const Generator = struct {
         const ssm_cp_stride: usize = if (!want_ssm_cp)
             0
         else if (glm_request != null)
-            glm_checkpoint_stride
+            glm5_generate.glm_checkpoint_stride
         else
             prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override));
         // Where a checkpoint is captured: GLM chunks on its chunk grid but keeps points only on the wider
         // restore-point grid.
-        const cp_grid: usize = if (glm_request != null and want_ssm_cp) glm_capture_stride else ssm_cp_stride;
+        const cp_grid: usize = if (glm_request != null and want_ssm_cp) glm5_generate.glm_capture_stride else ssm_cp_stride;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
         // scheduler after restoring a checkpoint) pass the matched prefix
         // length so the snapshots stamp positions valid in the full original
@@ -1940,7 +1896,7 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = if (glm_request != null and want_state_cp)
-                glm5_generate.glmCaptureSchedule(glm_capture_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
+                glm5_generate.glmCaptureSchedule(glm5_generate.glm_capture_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
             else
                 prefill_plan.ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
@@ -2534,8 +2490,8 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
 
-            if (glm_dflash_native) try reserveGlmDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
-            var glm_window: ?GlmSpecWindow = if (glm_dflash_native and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
+            if (glm_dflash_native) try glm5_generate.reserveGlmDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
+            var glm_window: ?glm5_generate.GlmSpecWindow = if (glm_dflash_native and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
             errdefer if (glm_window) |*w| w.snapshot.deinit();
             const mtp_cost_profile: mtp_mod.MtpCostProfile = if (mtp_active)
                 options.mtp.?.costProfile(xfm, ctx.cache.config)
@@ -3376,230 +3332,18 @@ pub const Generator = struct {
         accepted_tokens: u32,
     };
 
-    /// DFlash block-drafter step. ONE assistant forward proposes
-    /// `block_size - 1` drafts, conditioned on the trunk's cached
-    /// target_layer_ids hiddens (the per-request `dflash_ctx`); the trunk
-    /// verify over `[t1, drafts...]` follows the standard spec invariant
-    /// (`cache.step = prompt_len + emitted`, t1 NOT in cache on entry,
-    /// correction from ORIGINAL `verify_logits[accepted]`).
-    ///
-    /// Rollback is an offset-only `cache.truncate` — legal because
-    /// `DflashModel.bind` restricts targets to the pure-KVCache standard
-    /// path (no SSM, no module-owned state), where a position's K/V depend
-    /// only on earlier positions (causal) and are identical whether computed
-    /// in a width-16 verify or any re-forward. No re-forward runs at all:
-    /// the next round's context comes from slicing THIS round's verify
-    /// captures to the committed prefix — exactly the reference's
-    /// `hidden_states[i+1][:, :n_accepted]`.
-    ///
-    /// Drafts are greedy (argmax over the trunk lm_head on assistant
-    /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
-    /// use the same one-hot Leviathan acceptance.
-    const GlmSampleContext = struct { generator: *Generator, logits: mlx.mlx_array };
-
-    fn sampleGlmNode(raw: *anyopaque, row: usize) !u32 {
-        const context: *GlmSampleContext = @ptrCast(@alignCast(raw));
-        const gen = context.generator;
-        var ops = @import("glm5/glm5_model.zig").Ops{ .s = gen.xfm.s };
-        defer ops.deinit();
-        const logits = try ops.slice(context.logits, 1, @intCast(row), @intCast(row + 1));
-        const sampled = sampler.sampleTokenLazy(logits, gen.sampling, gen.xfm.s);
-        defer _ = mlx.mlx_array_free(sampled);
-        try mlx.check(mlx.mlx_array_eval(sampled));
-        var token: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&token, sampled));
-        gen.sampling.draw +%= 1;
-        return @intCast(token);
-    }
-
-    fn sampledGlmDecisions(raw: *anyopaque, verified: *@import("glm5/glm5_dflash_model.zig").Verified, budget: usize, eos: []const u32) !void {
-        const gen: *Generator = @ptrCast(@alignCast(raw));
-        var context = GlmSampleContext{ .generator = gen, .logits = verified.logits };
-        _ = try @import("glm5/glm5_dflash_tree.zig").sampledTargets(verified.tokens[0..verified.count], verified.parents[0..verified.count], verified.targets[0..verified.count], budget, eos, &context, sampleGlmNode);
-    }
-
-    /// Commits this request's row of a grouped GLM tick (`verifyGroups`, one pending token) and
-    /// returns the row's logits. A DFlash2 request also appends the row's captures to its
-    /// assistant context, so its rounds resume when it decodes alone again.
-    pub fn glmRowCommit(self: *Generator, verified: *const @import("glm5/glm5_dflash_model.zig").Verified) !mlx.mlx_array {
-        const request = self.ctx.glm5_request orelse return error.GlmRequestMissing;
-        const s = self.xfm.s;
-        if (self.glm_dflash_native) {
-            var verification = try verified.prepareCommitConsuming(request, 1, self.eos_token_ids, s);
-            defer verification.deinit();
-            _ = @import("glm5/glm5_dflash.zig").commitVerified(self.dflash.?, &self.dflash_ctx.?, request, &verification, 1, self.eos_token_ids) catch |err| {
-                request.failed = true;
-                return err;
-            };
-        } else try @import("glm5/glm5_dflash_model.zig").commitPlainRow(verified, request, s);
-        self.ctx.cache.step = request.offset;
-        var logits = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(logits);
-        try mlx.check(mlx.mlx_array_set(&logits, verified.logits));
-        return logits;
-    }
-
-    fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        if (!try self.glmRoundReady()) return null;
-        const schedule = @import("glm5/glm5_dflash_model.zig").bindDefaultSchedule();
-        defer schedule.restore();
-        var timer = io_util.Stopwatch.init(self.timer.io);
-        const tick = io_util.Stopwatch.init(self.timer.io);
-        const action = self.glm_gate.next();
-        const lookup = if (self.glm_gate.probing()) null else try self.glmLookupChain(allocator);
-        const proposal = lookup orelse switch (action) {
-            .round => try self.glmProposeRound(),
-            .plain => self.glmPlainProposal(),
-        };
-        const draft_ns = timer.read();
-        timer.reset();
-        const request = self.ctx.glm5_request.?;
-        // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
-        const group = @import("glm5/glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = self.glmPenalty() };
-        var verified: [1]@import("glm5/glm5_dflash_model.zig").Verified = undefined;
-        try @import("glm5/glm5_dflash_model.zig").verifyGroups(self.xfm.glm5.?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
-        const layerwise = &verified[0];
-        defer layerwise.deinit();
-        const verify_ns = timer.read();
-        const result = try self.glmRoundEnd(allocator, &proposal, layerwise, draft_ns, verify_ns, lookup != null);
-        const wall_ms = @as(f64, @floatFromInt(tick.read())) / @as(f64, std.time.ns_per_ms);
-        const emitted: u32 = @intCast(result.tokens.len);
-        if (lookup != null) {
-            self.glm_lookup.rounds += 1;
-            self.glm_lookup.landed += result.accepted_tokens;
-            self.glm_gate.observeLookup(emitted);
-        } else if (proposal.count == 1) {
-            self.glm_gate.observePlain(wall_ms);
-        } else self.glm_gate.observeRound(wall_ms, emitted);
-        return result;
-    }
-
-    /// The pending token alone: a plain one-row tick that still commits the assistant's taps, so
-    /// DFlash2 rounds resume on the next tick.
-    fn glmPlainProposal(self: *const Generator) @import("glm5/glm5_dflash.zig").Proposal {
-        var one = @import("glm5/glm5_dflash.zig").Proposal{ .count = 1 };
-        one.tokens[0] = self.next_token_id;
-        one.parents[0] = -1;
-        return one;
-    }
-
-    /// Drafts a verbatim-copy round takes from the context instead of the assistant: four rows,
-    /// the widest the native verify overlay reads.
-    pub const glm_lookup_drafts = 3;
-
-    /// The context's continuation after the pending token when the output is copying a long
-    /// span (`mtp_lookup.STRONG_SUFFIX` tokens of agreement), as a chain in place of the
-    /// assistant's tree.
-    pub fn glmLookupChain(self: *Generator, allocator: std.mem.Allocator) !?@import("glm5/glm5_dflash.zig").Proposal {
-        if (mtp_lookup_disabled or isEosId(self.next_token_id, self.eos_token_ids)) return null;
-        const got = (try self.mtpLookupIndex(allocator)).match(self.next_token_id, glm_lookup_drafts);
-        const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
-        if (self.glm_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
-        return chain;
-    }
-
-    /// The logit policy this request's DFlash2 tree rows take in the verifier; null = none.
-    pub fn glmPenalty(self: *Generator) ?@import("glm5/glm5_dflash_model.zig").Penalty {
-        const tp = &self.sampling.think_penalty;
-        if (!tp.active()) return null;
-        tp.observe(self.generated_ids.items);
-        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase == .after)) return null;
-        return .{ .state = tp.*, .markers = self.xfm.think_marker_mask };
-    }
-
-    /// A DFlash2 GLM round may run: not done, no stop due.
-    pub fn glmRoundReady(self: *Generator) !bool {
-        if (self.done or try self.checkStop()) return false;
-        if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
-        if (self.ctx.glm5_request == null) return error.GlmRequestMissing;
-        const target = self.xfm.glm5.?;
-        target.s = self.xfm.s;
-        target.suppress_mask = self.xfm.suppress_mask;
-        self.dflash.?.s = self.xfm.s;
-        return true;
-    }
-
-    /// This request's round draft: as many rows as the policy finds worth their verify, within the flags' bounds.
-    fn glmProposeRound(self: *Generator) !@import("glm5/glm5_dflash.zig").Proposal {
-        const costs = dflash_policy.glmLadder();
-        const min = dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS;
-        return @import("glm5/glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
-    }
-
-    /// This request's round draft of at most `max_nodes` nodes.
-    pub fn glmPropose(self: *Generator, max_nodes: usize) !@import("glm5/glm5_dflash.zig").Proposal {
-        return @import("glm5/glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
-    }
-
-    /// Decides (sampled requests draw along the visited path), commits and books a verified
-    /// round, alone or as one group of a grouped tick.
-    pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *const @import("glm5/glm5_dflash.zig").Proposal, layerwise: *@import("glm5/glm5_dflash_model.zig").Verified, draft_ns: u64, verify_ns: u64, lookup: bool) !DrafterStepResult {
-        const budget = self.max_tokens - self.completion_tokens;
-        const sampled = !sampler.isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
-        if (sampled) try sampledGlmDecisions(self, layerwise, budget, self.eos_token_ids);
-        const request = self.ctx.glm5_request.?;
-        // A round that carries the thought's closer ends on the pool position at or below it; the verified targets
-        // already fix the path, so the cut commits a prefix of it with the same pending token.
-        var round_budget = budget;
-        if (self.thought_point != null) {
-            const full = try @import("glm5/glm5_dflash_tree.zig").accept(layerwise.tokens[0..layerwise.count], layerwise.parents[0..layerwise.count], layerwise.targets[0..layerwise.count], budget, self.eos_token_ids);
-            var path: [16]u32 = undefined;
-            for (full.rows[0..full.count], path[0..full.count]) |row, *t| t.* = layerwise.tokens[row];
-            if (self.thoughtRoundCut(path[0..full.count], request.offset)) |keep| round_budget = @min(budget, keep);
-        }
-        var round = try @import("glm5/glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, round_budget, self.eos_token_ids);
-        round.draft_ns = draft_ns;
-        round.verify_ns = verify_ns;
-        if (!lookup and proposal.count > 1) self.dflash_calib.observeTree(&proposal.conf, &proposal.parents, proposal.count, round.rows[0..round.count]);
-        // Accepted share of the tree's depth: a fork can land one draft, a chain two.
-        var depth: [16]u32 = @splat(0);
-        var deepest: u32 = 0;
-        for (proposal.parents[1..proposal.count], 1..) |parent, row| {
-            depth[row] = depth[@intCast(parent)] + 1;
-            deepest = @max(deepest, depth[row]);
-        }
-        if (deepest > 0 and !lookup) {
-            const rate: f32 = @as(f32, @floatFromInt(round.accepted_drafts)) / @as(f32, @floatFromInt(deepest));
-            self.glm_draft_rate = 0.7 * self.glm_draft_rate + 0.3 * rate;
-        }
-        var emitted = round.count;
-        for (round.tokens[1..round.count], 1..) |token, i| {
-            if (tokenStops(token, self.eos_token_ids, &self.consecutive_pad)) {
-                if (!isEosId(token, self.eos_token_ids)) emitted = i;
-                self.done = true;
-                self.finish_reason = "stop";
-                self.stop_token = token;
-                break;
-            }
-        }
-        const tokens = try allocator.dupe(u32, round.tokens[0..emitted]);
-        errdefer allocator.free(tokens);
-        try self.generated_ids.appendSlice(allocator, tokens);
-        self.advanceStep(@intCast(tokens.len));
-        self.ctx.cache.step = request.offset;
-        self.next_token_id = round.pending orelse tokens[tokens.len - 1];
-        if (round.verified_rows > 1) {
-            self.dflash_attempted += 1;
-            self.dflash_accepted_tokens += round.accepted_drafts;
-            self.dflash_round_width = @intCast(round.verified_rows - 1);
-            self.glm_round.drafted += round.verified_rows - 1;
-            self.glm_round.draft_ns += round.draft_ns;
-            self.glm_round.verify_ns += round.verify_ns;
-            self.glm_round.replay_ns += round.replay_ns;
-            self.glm_round.commit_ns += round.commit_ns;
-        } else if (!lookup) {
-            self.glm_plain.ticks += 1;
-            self.glm_plain.verify_ns += round.verify_ns;
-            self.glm_plain.replay_ns += round.replay_ns;
-            self.glm_plain.commit_ns += round.commit_ns;
-        }
-        if (round.stopped) {
-            self.done = true;
-            self.finish_reason = "stop";
-        }
-        self.thoughtPointTake();
-        return .{ .tokens = tokens, .accepted_tokens = @intCast(round.accepted_drafts) };
-    }
+    pub const glmLookupChain = glm5_generate.glmLookupChain;
+    pub const glmPenalty = glm5_generate.glmPenalty;
+    pub const glmPlainProposal = glm5_generate.glmPlainProposal;
+    pub const glmPropose = glm5_generate.glmPropose;
+    pub const glmProposeRound = glm5_generate.glmProposeRound;
+    pub const glmRoundEnd = glm5_generate.glmRoundEnd;
+    pub const glmRoundReady = glm5_generate.glmRoundReady;
+    pub const glmRowCommit = glm5_generate.glmRowCommit;
+    pub const glm_lookup_drafts = glm5_generate.glm_lookup_drafts;
+    pub const nextGlmDflash = glm5_generate.nextGlmDflash;
+    pub const sampleGlmNode = glm5_generate.sampleGlmNode;
+    pub const sampledGlmDecisions = glm5_generate.sampledGlmDecisions;
 
     pub const ConstrainedEntry = dsv41_dspark.ConstrainedEntry;
     pub const DsparkResume = dsv41_dspark.DsparkResume;
@@ -4312,7 +4056,7 @@ pub const Generator = struct {
     };
 
     /// The committed-token index, synced to `generated_ids`.
-    fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_lookup.Index {
+    pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_lookup.Index {
         const lines = LookupLines{ .tok = self.tok };
         if (self.mtp_lookup_idx == null) {
             var idx = mtp_lookup.Index.init(allocator);

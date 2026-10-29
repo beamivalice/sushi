@@ -5875,7 +5875,7 @@ fn ssmResidentCap(config: *const model_mod.ModelConfig) ?u64 {
 /// The checkpoints a GLM prefill of `seq` tokens takes after restoring `matched`: the one schedule the generator runs.
 fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) glm5_generate.GlmCaptureSchedule {
     const offset: usize = @intCast(@min(matched, seq));
-    return glm5_generate.glmCaptureSchedule(generate_mod.glm_capture_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
+    return glm5_generate.glmCaptureSchedule(glm5_generate.glm_capture_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
 }
 
 /// The restore points a DeepSeek prefill holds in RAM while it runs: with a RAM tier the capped list plus the copy
@@ -13652,7 +13652,7 @@ test "GLM billed checkpoint peak equals the checkpoints its prefill captures, wh
         ssm_checkpoint_stride = stride;
         for (cases) |c| for (0..9) |cap_usize| {
             const cap: u32 = @intCast(cap_usize);
-            const oracle = glm5_generate.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, c.matched, c.seq - c.matched, 2048);
+            const oracle = glm5_generate.glmCaptureOracle(glm5_generate.glm_checkpoint_stride, glm5_generate.glm_capture_stride, cap, c.matched, c.seq - c.matched, 2048);
             const billed = glmPrefixStateBytes(&cfg, c.seq, .{ .matched_tokens = c.matched, .checkpoints = cap });
             const want: u64 = if (cap == 0) 0 else @as(u64, oracle.peak) * per_cp;
             std.testing.expectEqual(want, billed) catch |e| {
@@ -13692,7 +13692,7 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
         const staged: u64 = 0;
         for ([_]u64{ 64, 131_072, 900_000, 1_040_000 }) |seq| {
             const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
-            const oracle = glm5_generate.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, 0, seq, 2048);
+            const oracle = glm5_generate.glmCaptureOracle(glm5_generate.glm_checkpoint_stride, glm5_generate.glm_capture_stride, cap, 0, seq, 2048);
             // Eight spread checkpoints below the newest, each at its real size.
             var positions: [8]usize = undefined;
             const bytes: [8]u64 = @splat(per_cp);

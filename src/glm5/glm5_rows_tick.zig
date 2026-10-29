@@ -3,6 +3,7 @@ const mlx = @import("../mlx.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const generate_mod = @import("../generate.zig");
+const glm5_generate = @import("glm5_generate.zig");
 const model_mod = @import("../model.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
@@ -138,7 +139,7 @@ pub fn glmNativeDflashArmed(
     sampling: SamplingParams,
     logprobs_n: u32,
 ) bool {
-    return is_glm5 and enable_drafter and has_dflash and generate_mod.glmDflashEligible(sampling, logprobs_n);
+    return is_glm5 and enable_drafter and has_dflash and glm5_generate.glmDflashEligible(sampling, logprobs_n);
 }
 
 /// Step costs of a grouped GLM forward in ms (rows ubench, glm5-arch#concurrency): fixed, per
