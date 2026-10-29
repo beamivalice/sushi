@@ -58,8 +58,15 @@ def post(path, body, stream=False):
         return json.loads(raw.decode("utf-8", "replace"))
 
 MSG = [{"role": "user", "content": N + "Count from one to eight in words."}]
-REQ = {"model": MODEL, "messages": MSG, "max_tokens": 48, "temperature": 0,
-       "logprobs": True, "top_logprobs": 5}
+# Thinking is on by default and would spend a short cap before any content; GLM cannot turn it off.
+GLM = os.environ.get("SUSHI_ARCH") == "glm5_next"
+NO_THINK = {"reasoning_effort": "low"} if GLM else {"enable_thinking": False}
+
+def cap(n):
+    return max(n, 2048) if GLM else n
+
+REQ = {"model": MODEL, "messages": MSG, "max_tokens": cap(48), "temperature": 0,
+       "logprobs": True, "top_logprobs": 5, **NO_THINK}
 
 def entries_ok(label, content):
     bad_rank1 = [(i, e["token"], e["top_logprobs"][0]["token"])
@@ -105,8 +112,8 @@ def first_content_entry(req):
         print("  \033[0;31mFAIL\033[0m  no content logprob entries to compare"); sys.exit(1)
     return ents[0]
 
-a = first_content_entry({**REQ, "max_tokens": 8, "stream": False})
-b = first_content_entry({**REQ, "max_tokens": 8, "temperature": 2.0, "top_k": 1, "stream": False})
+a = first_content_entry({**REQ, "max_tokens": cap(8), "stream": False})
+b = first_content_entry({**REQ, "max_tokens": cap(8), "temperature": 2.0, "top_k": 1, "stream": False})
 ck("same token drawn", a["token"] == b["token"], f"{a['token']!r} vs {b['token']!r}")
 ck("its logprob is temperature-INDEPENDENT", abs(a["logprob"] - b["logprob"]) < 1e-3,
    f"temp0={a['logprob']} temp2={b['logprob']}")
@@ -272,7 +279,7 @@ for response_format in (
                  "required": ["answer"], "additionalProperties": False}}},
 ):
     req = {**REQ, "messages": [{"role": "user", "content": N + "Return JSON with answer true."}],
-           "max_tokens": 64, "enable_thinking": False, "response_format": response_format,
+           "max_tokens": cap(64), **NO_THINK, "response_format": response_format,
            "enable_mtp": False}
     choice = post("/v1/chat/completions", {**req, "stream": False})["choices"][0]
     text = choice["message"].get("content") or ""
