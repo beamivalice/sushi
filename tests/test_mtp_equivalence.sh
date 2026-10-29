@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=own pack=each boots=3
 # MTP (native multi-token-prediction head) correctness + engagement test, for both served
 # archs: Qwen's head and MiMo-V2.6's three heads (`model_type` from config.json picks the
 # markers, the engagement lines and whether reasoning is part of the compared answer).
@@ -24,16 +24,15 @@
 #      Every divergence fails, with the serial top-two gap reported.
 #   3. PROMPT LOOKUP — a copy task (return a file with one rename) runs
 #      lookup rounds (`lookup=R/..` with R > 0) and still matches the
-#      --no-mtp bytes, stream and non-stream; `--no-mtp-lookup` runs none
+#      serial bytes (the same boot with `enable_mtp:false` on the request), stream and non-stream; `--no-mtp-lookup` runs none
 #      and matches too; a seeded sampled copy is the same bytes streamed.
 #
-# Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
-# Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw. A standalone
+# The pack is the pass model's default (SUSHI_PASS_MODEL, qwen4 when run alone; SUSHI_TEST_PACK_<MODEL> overrides). A standalone
 # sidecar (every mtp.sidecar_rel_paths location) or a sharded/monolithic
 # checkpoint carrying one of mtp_marker_keys works.
 # Calibrated auto-depth surfaces can additionally pin their live dispatch arm:
 #   MTP_EXPECT_AUTO_PROFILE=g17_nax_qwen4_q4_gs64 MTP_EXPECT_AUTO_DEPTH=6 \
-#     MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh
+#     ./tests/test_mtp_equivalence.sh
 #
 # MoE trunks (35B-A3B, qwen4_exp) keep MTP default-OFF per request; set
 # MTP_FORCE_ENABLE=1 to inject "enable_mtp":true into every request body so
@@ -45,13 +44,16 @@
 # depth cap instead of the chunk-B extension, and adds a pinned `--mtp-min-depth 3 --mtp-max-depth 3` boot that
 # must be byte-identical to --no-mtp. Its copy task runs prompt-lookup rounds as Qwen's does.
 
+# A pass whose pack has no MTP head (GLM, DeepSeek) SKIPs (3). The serial reference is a request with enable_mtp:false on
+# the MTP boot, so the baseline needs no boot of its own: three boots (default, --no-mtp-lookup, the seeded sampled
+# copy), plus a fourth on MiMo.
+
 set -u
-MODEL="${MTP_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${1:-11313}"
-BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
+. "$(dirname "$0")/lib/boot.sh"
+MODEL=$(sushi_pack "${SUSHI_PASS_MODEL:-qwen4}") || exit $?
 EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"
 MAX_TOKENS=120
-ARCH=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("model_type", ""))' "$MODEL/config.json" 2>/dev/null)
+ARCH=$(sushi_arch "$MODEL")
 # MiMo answers inside a think block by default: compare the reasoning too.
 REASONING=0
 [ "$ARCH" = mimo_v2 ] && REASONING=1
@@ -110,70 +112,35 @@ except (OSError, ValueError, AttributeError):
 PY
 }
 
-if [ ! -d "$MODEL" ] || ! checkpoint_has_mtp_head; then
+if ! checkpoint_has_mtp_head; then
     if [ -n "$EXPECT_AUTO_PROFILE" ] || [ "$ARCH" = mimo_v2 ]; then
         echo "FAIL: required MTP checkpoint not detected at $MODEL"
         exit 1
     fi
-    echo "SKIP: model with MTP head not found at $MODEL"
-    exit 0
+    echo "SKIP $(basename "$0"): no MTP head in $MODEL (${ARCH:-unknown arch})"
+    exit 3
 fi
 
 PASS=0
 FAIL=0
 ARTIFACTS="${MTP_TEST_OUTPUT_DIR:-$(mktemp -d)}"
 mkdir -p "$ARTIFACTS"
-LOG="$ARTIFACTS/mtp_equiv_server.log"
-BOOT=0
-SERVER_PID=""
-exec 3>&1 4>&2
-exec >"$ARTIFACTS/suite.log" 2>&1
-finish_suite() {
-    local rc=$?
-    if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; fi
-    if [ "$rc" -ne 0 ]; then cat "$ARTIFACTS/suite.log" >&4; fi
-}
-trap finish_suite EXIT
-trap 'exit 130' INT TERM
 python3 "$(dirname "$0")/test_mtp_equivalence_strict.py" || exit 1
 
-start_server() { # $1 = extra flags
-    BOOT=$((BOOT+1))
-    # --prefix-cache-entries 0: byte-stable greedy on a HYBRID needs the
-    # prefix cache off (docs/engine-prefix-cache.md) — a warm restore re-runs the recurrence in
-    # a different block size and legitimately flips near-tie argmaxes inside
-    # the byte-compared prefix (the char-~116 drift noted above was this).
-    # --no-drafter: a pack shipping its own drafter/ would otherwise outrank
-    # the MTP head and this script would measure DFlash.
+start_server() { # $1 = boot label, rest = extra flags; SUSHI_* env of the caller reaches the server
+    local label=$1
+    shift
+    # --prefix-cache-entries 0: byte-stable greedy on a HYBRID needs the prefix cache off (docs/engine-prefix-cache.md):
+    # a warm restore re-runs the recurrence in a different block size and legitimately flips near-tie argmaxes.
+    # --no-drafter: a pack shipping its own drafter/ would otherwise outrank the MTP head and this script would
+    # measure DFlash.
     # shellcheck disable=SC2086
-    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS $1 >"$LOG" 2>&1 &
-    SERVER_PID=$!
-    for _ in $(seq 1 120); do
-        curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-        sleep 1
-    done
-    # /health answers as soon as the socket binds — the model is still
-    # loading behind it. Wait for the load's own ready line, timeout scaled
-    # to the checkpoint size.
-    local model_mb ready_secs
-    model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
-    ready_secs=$(( 300 + ${model_mb:-0} / 100 ))
-    for _ in $(seq 1 $((ready_secs / 3)) ); do
-        grep -q "Model ready (loaded on inference thread)" "$LOG" && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-        sleep 3
-    done
-    echo "FAIL: server did not become ready"; cat "$LOG" | tail -20; exit 1
+    sushi_boot "$label" "$MODEL" --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS "$@" || exit $?
+    LOG="$SUSHI_LOG"
+    PORT="$SUSHI_PORT"
 }
 
-stop_server() {
-    if [ -n "$SERVER_PID" ]; then
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-        SERVER_PID=""
-    fi
-    cp "$LOG" "$LOG.boot$BOOT"
-}
+stop_server() { sushi_stop 0; }
 
 chat_nonstream() {
     curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
@@ -367,20 +334,16 @@ PYBYTES
     PASS=$((PASS+1))
 }
 
-echo "── baseline server (--no-mtp) ──"
-start_server "--no-mtp"
-chat_nonstream > "$ARTIFACTS/mtp_base_chat.txt"
-messages_nonstream > "$ARTIFACTS/mtp_base_msg.txt"
-copy_request false > "$ARTIFACTS/mtp_base_copy.txt"
+echo "── MTP server (default-on); the serial baseline is enable_mtp:false on the request ──"
+start_server mtp
+OPTIN='"enable_mtp":false,' chat_nonstream > "$ARTIFACTS/mtp_base_chat.txt"
+OPTIN='"enable_mtp":false,' messages_nonstream > "$ARTIFACTS/mtp_base_msg.txt"
+copy_request false '{"temperature":0,"enable_mtp":false}' > "$ARTIFACTS/mtp_base_copy.txt"
 if grep -q "mode=mtp" "$LOG"; then
-    echo "FAIL: --no-mtp server ran MTP rounds"; FAIL=$((FAIL+1))
+    echo "FAIL: enable_mtp:false requests ran MTP rounds"; FAIL=$((FAIL+1))
 else
-    echo "PASS [no-mtp baseline clean]"; PASS=$((PASS+1))
+    echo "PASS [serial baseline clean]"; PASS=$((PASS+1))
 fi
-stop_server
-
-echo "── MTP server (default-on) ──"
-start_server ""
 # The qwen4_exp head is the checkpoint's own layer and logs its own line; MiMo's heads log theirs.
 HEAD_READY="MTP head ready\|\[qwen4\] MTP head loaded"
 [ "$ARCH" = mimo_v2 ] && HEAD_READY="\[mimo-mtp\] [0-9]* heads loaded"
@@ -460,7 +423,7 @@ echo "── MTP server, prompt lookup off (--no-mtp-lookup) ──"
 # The EV checks need MTP rounds on an echo; with lookup on, an echo is served
 # by lookup rounds instead. The echo runs first: a copy before it would seed the
 # EV surface at the depth cap, where a round has no chunk B to extend into.
-start_server "--no-mtp-lookup"
+start_server nolookup --no-mtp-lookup
 ENGAGE_BASE=0
 # EV-controller engagement (dispatch-hole lesson: output equality can't see a
 # silent fallback). An ECHO workload is the max-confidence case: past the
@@ -510,23 +473,9 @@ stop_server
 echo "── fixed-depth server (SUSHI_MTP_ADAPTIVE=0) ──"
 # The env kill switch must fully revert: legacy cap 3 (not the adaptive auto
 # cap) and zero chunk-B extensions on the same echo workload.
-BOOT=$((BOOT+1))
 # SUSHI_MTP_COST_TABLE=0: the lookup gate and the plan read no measured round
 # times, so a seeded sampled request takes the same rounds streamed or not.
-SUSHI_MTP_ADAPTIVE=0 SUSHI_MTP_COST_TABLE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS >"$LOG" 2>&1 &
-SERVER_PID=$!
-for _ in $(seq 1 120); do
-    curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 1
-done
-# Same readiness rule as start_server: /health is up before the load ends.
-MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
-READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
-for _ in $(seq 1 $((READY_SECS / 3)) ); do
-    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
-    kill -0 "$SERVER_PID" 2>/dev/null || break
-    sleep 3
-done
+SUSHI_MTP_ADAPTIVE=0 SUSHI_MTP_COST_TABLE=0 start_server fixed
 curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
     $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
     \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
@@ -557,7 +506,7 @@ if [ "$ARCH" = mimo_v2 ]; then
     echo "── pinned-depth server (--mtp-min-depth 3 --mtp-max-depth 3) ──"
     # Every MiMo verify row keeps its decode tick's arithmetic, so a pinned depth-3 round
     # must reproduce --no-mtp byte for byte.
-    start_server "--mtp-min-depth 3 --mtp-max-depth 3"
+    start_server pinned --mtp-min-depth 3 --mtp-max-depth 3
     ENGAGE_BASE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
     chat_nonstream > "$ARTIFACTS/mtp_forced_chat.txt"
     check "forced depth 3, chat non-stream" "$ARTIFACTS/mtp_base_chat.txt" "$ARTIFACTS/mtp_forced_chat.txt" yes
