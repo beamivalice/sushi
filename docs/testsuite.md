@@ -50,8 +50,43 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   MTP verify exactness on a real pack: `QWEN4_TEST_MODEL=<pack> zig build test -Doptimize=ReleaseFast -Dmodel=qwen4` with
   `-Dtest-filter=` `qwen4 checkpoint affine8 and dense projections`, `qwen4 verify history row and cache identity`,
   `qwen4 MTP verify token values` and `qwen4 deferred PLE: the captured hidden`.
-- Model scope is `qwen4`, `mimo2`, `glm5`, `dsv41`, `enc` (the encoder) or `shared` (every model). A test's file says
-  its model; a test of one model's code lives in that model's files.
+- Model scope is `qwen4`, `mimo2`, `glm5`, `dsv41`, `enc` (the encoder) or `shared` (every model). A test's folder says
+  its model; a test of one model's code lives in that model's folder ([map and guards](#folder-map-and-scope-guards)).
+
+## Folder map and scope guards
+
+A test's model is its file's folder. Counts at the time of writing; `python3 tests/suite_guards.py --map` reprints the
+table. A test's tier is read from its body: a `tests_host.zig` import is host, a body that reads an env var or skips
+(`SkipZigTest`, `getenv`, `packPath`) is pack, `requireGpu` is gpu, the rest is cpu (an MLX binary, no Metal gate);
+a test that skips only inside a helper counts as gpu or cpu.
+
+| folder | model | test files | host | gpu | pack | cpu | tests |
+|---|---|---|---|---|---|---|---|
+| `src/` | shared (every model) | 99 | 710 | 151 | 73 | 1718 | 2652 |
+| `src/exl3/` | shared (the sushi_exl3 module) | 13 | 0 | 27 | 80 | 138 | 245 |
+| `src/encoder/` | shared (the encoder, `-Dmodel=enc`) | 17 | 0 | 23 | 4 | 51 | 78 |
+| `src/qwen4/` | qwen4 | 16 | 0 | 119 | 67 | 121 | 307 |
+| `src/mimo2/` | mimo2 | 8 | 0 | 13 | 17 | 53 | 83 |
+| `src/glm5/` | glm5 | 46 | 0 | 159 | 27 | 115 | 301 |
+| `src/dsv41/` | dsv41 | 19 | 22 | 114 | 18 | 82 | 236 |
+| total | | 218 | 732 | 606 | 286 | 2278 | 3902 |
+
+Two hermetic guards keep the folders honest. Both are checked by `python3 tests/test_suite_guards.py` (CI runs it) and
+read allowlists that `python3 tests/suite_guards.py --write` regenerates; run it after every landing that moves code,
+and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone checks.
+
+- **Arch-test guard.** A test whose name mentions a model (`qwen`, `mimo`, `glm`, `dsv41`, `deepseek`) must sit in a
+  folder of a model it names, or its name is in `tests/guards/arch-tests.allow`: shared code tested at that model's
+  geometry. The list keys the test name, so moving a test between shared files changes nothing. A stale entry (the
+  test moved into its folder) only prints a note; `--write` drops it. To clear a failure, move the test into
+  `src/<model>/`, or rename it for the shared code it tests.
+- **Model footprint guard.** Shared sources (`src/` root, `src/exl3`, `src/encoder`) may name a model only at
+  dispatch points. `tests/guards/model-footprint.allow` holds one count per model: its mentions (case-insensitive
+  `qwen`, `mimo`, `glm`, `dsv41`/`deepseek`) in those files, outside comments, test blocks and whole test files. A
+  count above its entry fails, naming the three files with the most; a count below prints the number to lower, and
+  `--write` takes it. The entry keys the model, so code moving between shared files keeps its count. The list only
+  shrinks: SWA, the ring cache and FP8 are engine features and never count, and a feature a model needs is written
+  in a shared file without the model's name.
 
 ## Microbenches
 

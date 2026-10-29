@@ -2,7 +2,9 @@
 # sushi-test: tier=tool
 """Scope guards for the Zig sources. Default mode checks; --write regenerates the allowlists in tests/guards/.
 
-    python3 tests/suite_guards.py [--root DIR] [--write]
+    python3 tests/suite_guards.py [--root DIR] [--write | --map]
+
+--map prints the folder map of docs/testsuite.md: test counts per folder and tier.
 
 Arch-test guard: a test whose name mentions a model must live in that model's folder (src/<model>/) unless its
 name is in tests/guards/arch-tests.allow (shared at arch geometry). The list keys the name, not the file, so
@@ -212,11 +214,62 @@ def footprint_check(root, write):
     return fail
 
 
+FOLDERS = [
+    ("src", "shared (every model)"), ("src/exl3", "shared (the sushi_exl3 module)"), ("src/encoder", "shared (the encoder, `-Dmodel=enc`)"),
+    ("src/qwen4", "qwen4"), ("src/mimo2", "mimo2"), ("src/glm5", "glm5"), ("src/dsv41", "dsv41"),
+]
+PACK_MARKS = ("SkipZigTest", "getenv", "packPath")
+
+
+def host_files(root):
+    path = os.path.join(root, "src/tests_host.zig")
+    with open(path) as f:
+        text = f.read()
+    return {"src/" + p for p in re.findall(r'_ = @import\("([^"]+\.zig)"\);', text)}
+
+
+def tier_of(rel, body, host):
+    """host: a src/tests_host.zig file. pack: the body reads an env var or skips. gpu: the body needs Metal. cpu: the rest.
+    A test that skips only inside a helper counts as gpu or cpu."""
+    if rel in host:
+        return "host"
+    if any(k in body for k in PACK_MARKS):
+        return "pack"
+    return "gpu" if "requireGpu" in body else "cpu"
+
+
+def folder_map(root):
+    host = host_files(root)
+    rows = []
+    for d, model in FOLDERS:
+        counts = {"host": 0, "gpu": 0, "pack": 0, "cpu": 0}
+        files = 0
+        for rel in zig_files(root, [d], d != "src"):
+            with open(os.path.join(root, rel)) as f:
+                text = f.read()
+            found, named = tests_of(text)
+            files += any(n is not None for n, _, _ in found)
+            for name, a, b in found:
+                if name is not None:
+                    counts[tier_of(rel, named[a:b], host)] += 1
+        rows.append((d, model, files, counts))
+    out = ["| folder | model | test files | host | gpu | pack | cpu | tests |", "|---|---|---|---|---|---|---|---|"]
+    for d, model, files, c in rows:
+        out.append(f"| `{d}/` | {model} | {files} | {c['host']} | {c['gpu']} | {c['pack']} | {c['cpu']} | {sum(c.values())} |")
+    tot = {k: sum(r[3][k] for r in rows) for k in rows[0][3]}
+    out.append(f"| total | | {sum(r[2] for r in rows)} | {tot['host']} | {tot['gpu']} | {tot['pack']} | {tot['cpu']} | {sum(tot.values())} |")
+    return "\n".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--write", action="store_true", help="regenerate the allowlists instead of checking")
+    ap.add_argument("--map", action="store_true", help="print the folder map table")
     args = ap.parse_args()
+    if args.map:
+        print(folder_map(args.root))
+        return
     fail = arch_check(args.root, args.write) + footprint_check(args.root, args.write)
     sys.exit(1 if fail else 0)
 

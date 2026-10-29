@@ -102,11 +102,24 @@ def footprint_rules(root):
     expect(run(root, "--write")[0] == 0, "--write lowers the entry")
 
 
+def folder_map(root):
+    put(root, "src/tests_host.zig", 'test {\n    _ = @import("engine.zig");\n}\n')
+    put(root, "src/glm5/glm5_gpu.zig", 'test "gpu one" {\n    try mlx.requireGpu();\n}\ntest "pack one" {\n    _ = std.c.getenv("X") orelse return error.SkipZigTest;\n}\n')
+    rc, out = run(root, "--map")
+    row = [l for l in out.splitlines() if l.startswith("| `src/glm5/`")]
+    expect(rc == 0 and row and "| 2 | 0 | 1 | 1 | 1 | 3 |" in row[0], "--map counts a gpu and a pack test in its folder", out)
+    row = [l for l in out.splitlines() if l.startswith("| `src/` ")]
+    expect(row and "| 1 | 1 | 0 | 0 | 0 | 1 |" in row[0], "--map counts a tests_host.zig import as host", out)
+    os.remove(os.path.join(root, "src/tests_host.zig"))
+    os.remove(os.path.join(root, "src/glm5/glm5_gpu.zig"))
+
+
 def main():
     with tempfile.TemporaryDirectory() as root:
         scratch(root)
         arch_rules(root)
         footprint_rules(root)
+        folder_map(root)
     rc, out = run(os.path.dirname(HERE))
     expect(rc == 0, "the repo passes its own allowlists (run tests/suite_guards.py --write after a landing)", out)
 
