@@ -1,13 +1,13 @@
 #!/bin/bash
-. "$(dirname "$0")/../../private_cache.sh"
+# sushi-test: tier=live boot=own pack=default boots=2
 # Qwen3.8-Flash-Next + DFlash2 drafter: engagement and byte-equality with serial decoding.
 #
 # Contract pinned here (one pack per run; the owner's gate is all three Sushi Qwen packs):
 #   1. ENGAGEMENT (with --drafter): the boot logs `DFlash drafter ready`, every bank request logs
 #      `[spec-stats] mode=dflash` with attempts > 0, and the bank accepts drafts (avg_per_round > 0).
-#   2. EQUIVALENCE: greedy output of every bank prompt, with the drafter, equals the output of a
-#      `--no-drafter --no-mtp` boot byte for byte (non-stream), and the streamed answer equals the
-#      non-stream one.
+#   2. EQUIVALENCE: greedy output of every bank prompt, with the drafter, equals the output of the same
+#      boot with `enable_drafter:false, enable_mtp:false` byte for byte (non-stream), and the streamed answer
+#      equals the non-stream one.
 #   3. OPT-OUT: a request with enable_drafter:false logs no mode=dflash line.
 #
 #   4. OPT-IN: a drafter beside the pack is NOT loaded without --drafter: the boot decodes with MTP.
@@ -16,55 +16,32 @@
 #   5. SAMPLED (temperature 1.0, top_p 0.95, top_k 20, what agent clients send): every bank request runs DFlash rounds
 #      and answers; the per-draft acceptance is printed, because a greedy-only bar never sees the runtime gate act.
 #
-# Usage: DFLASH2_QWEN_MODEL=<pack dir> [DFLASH2_QWEN_DRAFTER=<drafter dir>] ./tests/qwen4/test_dflash2_qwen.sh [port]
-# Boot flags: SUSHI_TEST_EXTRA_ARGS (e.g. a pinned block size knob while measuring).
+# The drafter is not part of the pack: DFLASH2_QWEN_DRAFTER names it, and the script SKIPs without it.
 
 set -u
-MODELS="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
-MODEL="${DFLASH2_QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-DRAFTER="${DFLASH2_QWEN_DRAFTER:-$MODELS/incoai/Qwen3.8-Flash-Next-DFlash2}"
-PORT="${1:-11331}"
-BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"
-ARTIFACTS="${DFLASH2_TEST_OUTPUT_DIR:-$(mktemp -d)}"
-mkdir -p "$ARTIFACTS"
+. "$(dirname "$0")/../lib/boot.sh"
+MODEL=$(sushi_pack "${SUSHI_PASS_MODEL:-qwen4}") || exit $?
+DRAFTER="${DFLASH2_QWEN_DRAFTER:-}"
+[ -n "$DRAFTER" ] || { echo "SKIP $(basename "$0"): DFLASH2_QWEN_DRAFTER is not set (the DFlash2 drafter is opt-in and not in the pack)"; exit 3; }
+ARTIFACTS=$(mktemp -d)
+trap 'rm -rf "$ARTIFACTS"' EXIT
 LOG=""
-SERVER_PID=""
 PASS=0
 FAIL=0
 ok() { echo "PASS $1"; PASS=$((PASS + 1)); }
 bad() { echo "FAIL $1"; shift; for line in "$@"; do echo "  $line"; done; FAIL=$((FAIL + 1)); }
 
-for d in "$MODEL" "$DRAFTER"; do
-    [ -f "$d/config.json" ] || { echo "SKIP: $d/config.json not found"; exit 0; }
-done
-[ -f "$DRAFTER/model.safetensors" ] || { echo "SKIP: $DRAFTER/model.safetensors not found"; exit 0; }
+[ -f "$DRAFTER/config.json" ] && [ -f "$DRAFTER/model.safetensors" ] || { echo "SKIP $(basename "$0"): no drafter at $DRAFTER"; exit 3; }
 
-stop_server() {
-    if [ -n "$SERVER_PID" ]; then
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-        SERVER_PID=""
-    fi
-}
-trap stop_server EXIT
-trap 'exit 130' INT TERM
+stop_server() { sushi_stop 0; }
 
 start_server() { # $1 = boot name, rest = flags
     local name=$1
     shift
-    LOG="$ARTIFACTS/server-$name.log"
-    # --prefix-cache-entries 0: a warm restore re-runs the hybrid recurrence in another block size.
-    # shellcheck disable=SC2086
-    "$BIN" --model "${BOOT_MODEL:-$MODEL}" --serve --port "$PORT" --prefix-cache-entries 0 --log-level info $EXTRA_ARGS "$@" >"$LOG" 2>&1 &
-    SERVER_PID=$!
-    local ready_secs=$(( 300 + $(du -sm "$MODEL" 2>/dev/null | awk '{print $1}') / 100 ))
-    for _ in $(seq 1 $((ready_secs / 3))); do
-        grep -q "Model ready (loaded on inference thread)" "$LOG" && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-        sleep 3
-    done
-    echo "FAIL: $name server did not become ready"; tail -20 "$LOG"; exit 1
+    # A warm restore re-runs the hybrid recurrence in another block size, so every cache tier is off.
+    sushi_boot "dflash2-$name" "${BOOT_MODEL:-$MODEL}" --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off --log-level info "$@" || exit $?
+    LOG="$SUSHI_LOG"
+    PORT="$SUSHI_PORT"
 }
 
 # One bank run: prints a JSON list of {"id","text"}; every request is greedy.
@@ -174,11 +151,7 @@ rows = json.load(open(sys.argv[1]))
 sys.exit(0 if all(len(r["text"].replace("\x01", "").strip()) > 0 for r in rows) else 1)
 PYSAMPLED
 [ $? -eq 0 ] && ok "every sampled answer is non-empty" || bad "every sampled answer is non-empty"
-stop_server
-
-echo "== boot 2: serial (--no-drafter --no-mtp)"
-start_server serial --no-drafter --no-mtp
-bank "$ARTIFACTS/serial.json" || bad "bank without the drafter" "request failed"
+bank "$ARTIFACTS/serial.json" '{"enable_drafter": false, "enable_mtp": false}' || bad "serial bank" "request failed"
 stop_server
 
 python3 - "$ARTIFACTS/dflash.json" "$ARTIFACTS/serial.json" <<'PYCMP'
@@ -198,6 +171,5 @@ sys.exit(rc)
 PYCMP
 if [ $? -eq 0 ]; then ok "greedy DFlash2 == greedy serial, byte for byte, all bank prompts"; else bad "greedy DFlash2 == greedy serial"; fi
 
-echo "artifacts: $ARTIFACTS"
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

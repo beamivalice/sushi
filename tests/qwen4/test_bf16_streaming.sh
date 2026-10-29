@@ -1,51 +1,29 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/../../private_cache.sh"
+# sushi-test: tier=live boot=own pack=qwen4-bf16 boots=1
+# The BF16 Flash-Next source streamed from SSD: `sushi kld compare` against the teacher fixture (3 prompts), then a
+# served boot with a short prompt, a 4k prompt and greedy determinism.
 set -euo pipefail
+. "$(dirname "$0")/../lib/boot.sh"
 
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-CHECKPOINT=${QWEN4_BF16_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen/Qwen3.8-Flash-Next}
 FIXTURE=${QWEN4_TEACHER_FIXTURE:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/kld-teacher/mlx-serve-bf16-60x64}
-PORT=${1:-}
-LOG=$(mktemp /tmp/sushi-bf16-stream.XXXXXX.log)
-BODY1=$(mktemp /tmp/sushi-bf16-stream.XXXXXX.1.json)
-BODY2=$(mktemp /tmp/sushi-bf16-stream.XXXXXX.2.json)
-BODY3=$(mktemp /tmp/sushi-bf16-stream.XXXXXX.3.json)
-PID=
+CHECKPOINT=$(sushi_pack qwen4-bf16) || exit $?
+[[ -f "$FIXTURE/baseline.json" ]] || { echo "SKIP $(basename "$0"): teacher fixture $FIXTURE absent"; exit 3; }
+BODY1=$(mktemp)
+BODY2=$(mktemp)
+BODY3=$(mktemp)
+KLD_JSON=$(mktemp)
+trap 'rm -f "$BODY1" "$BODY2" "$BODY3" "$KLD_JSON"' EXIT
 
-cleanup() {
-    if [[ -n "$PID" ]]; then kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi
-    rm -f "$LOG" "$BODY1" "$BODY2" "$BODY3"
-}
-trap cleanup EXIT
-
-if [[ ! -d "$CHECKPOINT" || ! -f "$FIXTURE/baseline.json" ]]; then
-    echo "SKIP bf16 streaming checkpoint or teacher fixture absent"
-    exit 0
-fi
-
-if [[ -z "$PORT" || ! "$PORT" =~ ^[0-9]+$ || "$PORT" -lt 1 || "$PORT" -gt 65535 ]]; then
-    echo "usage: $0 PORT" >&2
-    exit 2
-fi
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use" >&2
-    exit 1
-fi
-
-cd "$ROOT"
-KLD_JSON=$(mktemp /tmp/sushi-bf16-stream.XXXXXX.kld.json)
-./zig-out/bin/sushi kld compare --model "$CHECKPOINT" --fixture "$FIXTURE" --limit 3 --ssd-budget-gb 60 --no-mtp --kv-quant off --json "$KLD_JSON"
+# The compare loads the checkpoint itself, so it holds the lock for its own run.
+"$SUSHI_ROOT/scripts/gpu-lock.sh" acquire "${GPU_LOCK_OWNER:-tests}-bf16-kld"
+rc=0
+"$SUSHI_BIN" kld compare --model "$CHECKPOINT" --fixture "$FIXTURE" --limit 3 --ssd-budget-gb 60 --no-mtp --kv-quant off --json "$KLD_JSON" || rc=$?
+"$SUSHI_ROOT/scripts/gpu-lock.sh" release "${GPU_LOCK_OWNER:-tests}-bf16-kld"
+[[ "$rc" = 0 ]] || exit "$rc"
 jq -e '.mean_kld_to_eos < 0.02 and .mean_top1_to_eos > 0.95' "$KLD_JSON" >/dev/null
-rm -f "$KLD_JSON"
 
-./zig-out/bin/sushi --model "$CHECKPOINT" --serve --host 127.0.0.1 --port "$PORT" --ssd-budget-gb 60 --no-mtp --kv-quant 8 --ctx-size 65536 --metrics --no-vision >"$LOG" 2>&1 &
-PID=$!
-for _ in $(seq 1 1200); do
-    if curl --connect-timeout 1 --max-time 2 -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then break; fi
-    if ! kill -0 "$PID" 2>/dev/null; then cat "$LOG"; exit 1; fi
-    sleep 1
-done
-curl --connect-timeout 2 --max-time 5 -fsS "http://127.0.0.1:$PORT/health" >/dev/null
+sushi_boot bf16 "$CHECKPOINT" --ssd-budget-gb 60 --no-mtp --kv-quant 8 --ctx-size 65536 --metrics --no-vision
+PORT=$SUSHI_PORT
 MODEL_ID=$(curl --connect-timeout 2 --max-time 10 -fsS "http://127.0.0.1:$PORT/v1/models" | jq -er '[.data[] | select(.loaded == true) | .id][0]')
 
 REQ=$(jq -nc --arg model "$MODEL_ID" '{model:$model,messages:[{role:"user",content:"Write one short sentence about Bangkok."}],temperature:0,max_tokens:16,seed:1234,stream:false}')
@@ -56,5 +34,5 @@ cmp <(jq -r '.choices[0].message.content' "$BODY1") <(jq -r '.choices[0].message
 LONG_PROMPT=$(for _ in $(seq 1 12); do sed -n '1,$p' "$FIXTURE/prompts/00_wikitext2-test-00-robert-boulter/prompt.txt"; done)
 jq -n --arg model "$MODEL_ID" --arg content "$LONG_PROMPT" '{model:$model,messages:[{role:"user",content:$content}],temperature:0,max_tokens:4,stream:false}' | curl --connect-timeout 5 --max-time 1800 -fsS -H 'Content-Type: application/json' -d @- "http://127.0.0.1:$PORT/v1/chat/completions" >"$BODY3"
 jq -e '.choices[0].message.content | type == "string"' "$BODY3" >/dev/null
-grep -E '\[expert-stream\]|Prompt processing|tokens/sec' "$LOG" | tail -80
+grep -E '\[expert-stream\]|Prompt processing|tokens/sec' "$SUSHI_LOG" | tail -80
 echo "PASS bf16 streaming kld compare, boot, short prompt, 4k prompt, and greedy determinism"
