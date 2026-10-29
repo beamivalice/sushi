@@ -1,5 +1,6 @@
 test {
     _ = @import("chat.zig");
+    _ = @import("tool_schema.zig");
     _ = @import("tool_calls.zig");
     _ = @import("think_tags.zig");
     _ = @import("format_corpus_test.zig");
