@@ -45,6 +45,30 @@ _sushi_free_port() {
 s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
 }
 
+# Free + inactive + speculative pages in MB: a just-freed pack lands in inactive before it is free again.
+_sushi_free_mb() {
+    vm_stat 2> /dev/null | awk '
+        /page size of/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) ps = $i }
+        /^Pages free:/ { gsub(/\./, "", $3); free = $3 }
+        /^Pages inactive:/ { gsub(/\./, "", $3); inact = $3 }
+        /^Pages speculative:/ { gsub(/\./, "", $3); spec = $3 }
+        END { if (ps == "") ps = 16384; printf "%d", (free + inact + spec) * ps / 1048576 }'
+}
+
+# After a stop the next pack's preflight must see the memory back, or a 90 GB load refuses. Best effort: it warns and goes on.
+_sushi_settle() {
+    local waited=0 now floor
+    [ -n "${SUSHI_FREE_BASELINE_MB:-}" ] || return 0
+    floor=$((SUSHI_FREE_BASELINE_MB - ${SUSHI_SETTLE_GAP_MB:-10240}))
+    while [ "$waited" -lt "${SUSHI_SETTLE_S:-90}" ]; do
+        now=$(_sushi_free_mb)
+        [ "${now:-0}" -lt "$floor" ] || return 0
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo "[boot] WARN: memory did not come back within ${SUSHI_SETTLE_S:-90}s (free $(_sushi_free_mb) MB, floor $floor MB)" >&2
+}
+
 _sushi_size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }
 
 _sushi_tail_from() { tail -c +"$(($2 + 1))" "$1"; }
@@ -69,6 +93,7 @@ sushi_boot() {
     SUSHI_LABEL="$label"
     SUSHI_LOCK_OWNER="${GPU_LOCK_OWNER:-tests}-$label"
     "$SUSHI_ROOT/scripts/gpu-lock.sh" acquire "$SUSHI_LOCK_OWNER" || return 1
+    [ -n "${SUSHI_FREE_BASELINE_MB:-}" ] || { SUSHI_FREE_BASELINE_MB=$(_sushi_free_mb); export SUSHI_FREE_BASELINE_MB; }
 
     SUSHI_LOG="$SUSHI_RUN_DIR/$label.log"
     off=$(_sushi_size "$SUSHI_LOG")
@@ -131,6 +156,7 @@ sushi_stop() {
         state="crash"
         echo "[boot] CRASH: server '$SUSHI_LABEL' (pid $SUSHI_PID) was already gone, exit status $ws; log: $SUSHI_LOG" >&2
     fi
+    _sushi_settle
     printf 'exit=%s server=%s\n' "$rc" "$state" > "$SUSHI_RUN_DIR/$SUSHI_LABEL.END"
     "$SUSHI_ROOT/scripts/gpu-lock.sh" release "$SUSHI_LOCK_OWNER" 2> /dev/null
     unset SUSHI_PID SUSHI_URL SUSHI_PORT SUSHI_PROFILE SUSHI_LOCK_OWNER
