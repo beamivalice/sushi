@@ -561,7 +561,8 @@ fn metricColumns(a: std.mem.Allocator, r: Result) ![]const MetricCol {
             if (std.mem.eql(u8, c.arm, m.arm) and std.mem.eql(u8, c.name, m.name)) break true;
         } else false;
         if (seen) continue;
-        try cols.append(a, .{ .arm = m.arm, .name = m.name, .header = if (r.arms.len > 1) try std.fmt.allocPrint(a, "{s} {s} [{s}]", .{ m.arm, m.name, m.unit }) else try std.fmt.allocPrint(a, "{s} [{s}]", .{ m.name, m.unit }) });
+        const label = if (std.mem.eql(u8, m.name, m.unit)) m.name else try std.fmt.allocPrint(a, "{s} [{s}]", .{ m.name, m.unit });
+        try cols.append(a, .{ .arm = m.arm, .name = m.name, .header = if (r.arms.len > 1) try std.fmt.allocPrint(a, "{s} {s}", .{ m.arm, label }) else label });
     }
     return cols.items;
 }
@@ -763,6 +764,7 @@ fn sampleResult(a: std.mem.Allocator, contended: bool) !Result {
     var run: Run = .{ .a = a, .plan = .{ .bench = &fake_registry[0], .arms = &.{ 0, 1 }, .ref = 0, .rungs = &.{}, .opts = &.{} }, .rounds = 3, .steps_override = null, .pack = null, .cancel = &cancel };
     try run.interleave("rows 1", SampleCtx{ .seen = &seen, .a = a }, sampleArm);
     try run.metric("a", "MB read", "MB", 12.5);
+    try run.metric("a", "GB/s", "GB/s", 400);
     const stamps: Stamps = .{ .commit = "abc1234", .dirty = false, .sha256 = "4b7e..19", .mtime = "2026-10-29 14:02 UTC", .chip = "Apple M5 Max", .qos = 31, .power = "AC", .die_start_c = 46, .lock = "ubench:dsv41.experts", .contended = contended, .time = "20261029T140200" };
     return run.finish(stamps);
 }
@@ -803,6 +805,8 @@ test "ubench json: a result reads back as written, and the table carries ratios 
     try testing.expect(std.mem.indexOf(u8, text, "| b/a ") != null);
     try testing.expect(std.mem.indexOf(u8, text, "2.000") != null);
     try testing.expect(std.mem.indexOf(u8, text, "MB read [MB]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "a GB/s |") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[GB/s]") == null);
     try testing.expect(std.mem.indexOf(u8, text, "1.0 (1.0-1.0)") != null);
 }
 
