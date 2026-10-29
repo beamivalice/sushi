@@ -70,7 +70,7 @@ fn isJsonWhitespaceRun(bytes: []const u8) bool {
 pub const Kind = enum {
     /// The delimited reasoning block Qwen/GLM/DeepSeek/MiMo share: an
     /// opening tag and a closing tag spelling the same base (see
-    /// `chat.BARE_THINK_OPENER` / `BARE_THINK_CLOSER`).
+    /// `think_tags.BARE_THINK_OPENER` / `BARE_THINK_CLOSER`).
     bare_think,
     gemma,
 };

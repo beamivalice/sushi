@@ -324,7 +324,7 @@ pub const ModelConfig = struct {
     /// 128 GB one does, which is most of its budget: the sizer then reported a
     /// 1024-token context and the admission guard refused prompts whose real
     /// peak was a third of the bill. The sizer, `checkAttentionMemory` and
-    /// `generate.effectivePrefillChunk` all read THIS field, so the bill and the
+    /// `prefill_plan.effectivePrefillChunk` all read THIS field, so the bill and the
     /// forward can never disagree. Explicit `--prefill-chunk` still wins.
     pinned_prefill_chunk: u32 = 0,
 
@@ -582,7 +582,7 @@ pub const ModelConfig = struct {
 
     /// Rows below the prompt end a ring checkpoint keeps past its window: the
     /// next turn's match lands a few tokens short of the prompt when the
-    /// template re-renders the generation suffix (`generate.SSM_SNAPSHOT_BACKOFF`).
+    /// template re-renders the generation suffix (`prefill_plan.SSM_SNAPSHOT_BACKOFF`).
     pub const SWA_RING_CHECKPOINT_BACKOFF: u64 = 30;
 
     /// Rows per sliding layer of the prompt-end restore point
@@ -997,7 +997,7 @@ pub const ModelConfig = struct {
     /// so a template whose own default is 'on' is silently overridden to off
     /// for every client that omits the field — the vendor's default mode
     /// becomes unreachable without a vendor-specific flag. An EXPLICIT request
-    /// value always outranks this (see `server.resolveEnableThinking`); it
+    /// value always outranks this (see `request_policy.resolveEnableThinking`); it
     /// only fills a silent request.
     ///
     /// First the checkpoint's OWN declaration
@@ -3019,7 +3019,7 @@ test "ModelConfig addEosToken max capacity" {
 test "EOS merge: chat-terminator added even when config already provided an eos" {
     // Regression for the Qwen2.5-Coder-7B leak: its config.json sets
     // eos_token_id=<|endoftext|> (151643), but its chat template ends turns
-    // with <|im_end|> (151645). The load path (main.zig / scheduler doLoad)
+    // with <|im_end|> (151645). The load path (main.zig / model_load.zig doLoadOnInferenceThread)
     // must ALWAYS merge the tokenizer's chat-terminator EOS — additively and
     // dedup-guarded — not only when config provided none; otherwise <|im_end|>
     // is never a stop token and leaks into the output (broke structured JSON /

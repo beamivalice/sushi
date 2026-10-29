@@ -16,8 +16,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `reasoning_budget_tokens` outranks); a request naming neither takes the arch default (`defaultEnableThinking`);
   on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
 - **Effort vocabulary** `off on minimal low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024
-  budget on inherited arches): each served arch accepts a subset (`model.effortArms`), read through
-  `model.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike. A word outside it
+  budget on inherited arches): each served arch accepts a subset (`effort.effortArms`), read through
+  `effort.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike. A word outside it
   is refused with the accepted list. Announced folds: Qwen `high` and `max` → `xhigh`, GLM `medium` → `high` and
   `xhigh` → `max`. The request is served, and every re-route logs `[effort]` and rides back as
   `X-Sushi-Effort-Notice` plus `effort_notice` (not in the answer text). MiMo's silent on-fold is unchanged.
@@ -212,7 +212,7 @@ the early-stop line + the atomic closer commit as ONE multi-token forward (`comm
 thought is delivered. Every decode tick checks it with the loop stop (`loopGuardTick`), the plain batched tick too
 (`batchedTickRows`): skipped there, a budget under `--max-concurrent` overran by up to ~2.5k tokens while its slot
 batched plain. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder
-(`model.effortArms` for served arches, `responses.effortBudget` for the rest).
+(`effort.effortArms` for served arches, `responses.effortBudget` for the rest).
 Every surface arms it with one precedence: explicit budget (`reasoning_budget_tokens`, Anthropic `budget_tokens`) > the
 request effort word's budget. When the request omits effort, the architecture's `--think` budget supplies the default;
 uncapped effort words fall back to `--reasoning-budget` (unlimited by default). GLM effort words do not impose token caps.
@@ -358,7 +358,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - pi sends its thinking level as `reasoning_effort` through a per-model `thinkingLevelMap` built from the row's
   `reasoning_efforts` (`launch.piEffortFor`: exact, else the next accepted word up, else down, `on` being the lowest;
   Qwen3.8 high → xhigh, MiMo every level → on). pi's `thinkingFormat: qwen` sent only `enable_thinking`, so low/medium
-  never reached the server. The launch tests build their vocabularies from `model.effortArms`.
+  never reached the server. The launch tests build their vocabularies from `effort.effortArms`.
 - omp (a pi fork) has no off entry in its maps: off rides the qwen dialect (`enable_thinking: false`), `whenThinking`
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.

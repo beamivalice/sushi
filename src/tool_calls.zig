@@ -2516,7 +2516,7 @@ fn stripHermesValueFraming(raw: []const u8) []const u8 {
 /// `<arg_key>` dedup (both exist because std.json rejects duplicate object
 /// keys). An unrecognized function name or an undeclared parameter is never
 /// rejected here — schema validation is centralized downstream
-/// (`toolCallConformsToSchema` et al., `src/server.zig`'s
+/// (`toolCallConformsToSchema` et al. in `src/tool_schema.zig`, `src/server.zig`'s
 /// `parseToolCallsForRequest`), exactly as for every other tag-format
 /// dialect. Truncation (EOS or max_tokens mid-call): when no `</function>`
 /// close is found, the param scan is bounded by end-of-text instead — any

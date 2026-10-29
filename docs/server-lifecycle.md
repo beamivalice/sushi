@@ -190,7 +190,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   token: a fresh DFlash2 slot whose prefill sampled EOS finishes `stop` with nothing published, as solo does.
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel
   (also one landing after prefill, `postPrefillTerminal`), failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
-- `src/generate.zig`: generation, MTP orchestration, `commitForcedTokens`; `src/sampler.zig`: sampling;
+- `src/generate.zig`: generation, `commitForcedTokens`; `src/mtp_policy.zig` / `src/mtp_round.zig`: MTP policy and rounds; `src/sampler.zig`: sampling;
   `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts.
 
 ## Threads
@@ -212,7 +212,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - A `submit` that fails before a slot exists (`ModelNotReady`, `GlmKvQuantUnsupported`, `Slot.init`) parks the request's
   `vision_embeddings` in `Scheduler.orphan_vision` (fixed size, no allocation); the inference thread frees it.
 - A handler frees no embeddings array itself: a request refused after its media was encoded (`PreparedMedia.deinit`, the
-  sub-handlers' early returns) parks it through `server.disposeVision` in the same `orphan_vision` list.
+  sub-handlers' early returns) parks it through `Scheduler.orphanVision` in the same `orphan_vision` list.
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.

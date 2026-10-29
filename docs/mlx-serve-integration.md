@@ -1,20 +1,17 @@
 # mlx-serve integration
 
-mlx-serve serves Sushi packs' EXL3 routed experts by importing Sushi's `sushi_exl3` module
-(`src/exl3`). This file is the contract between the two repos: what mlx-serve calls, how it pins
-Sushi, and how a new engine reaches it. The module itself is described in
-[engine-exl3-experts](engine-exl3-experts.md).
+mlx-serve serves Sushi packs' EXL3 routed experts through a vendored copy of Sushi's `sushi_exl3` module
+(`src/exl3`). This file is the contract for a re-vendor: the names mlx-serve calls and what the host owes the
+module. The module itself is described in [engine-exl3-experts](engine-exl3-experts.md).
 
 ## How mlx-serve consumes the module
 
-- **Submodule.** mlx-serve carries Sushi as `lib/sushi` (`.gitmodules`: url
-  `https://github.com/ddalcu/sushi`, a fork of this repo, branch `exl3-module`). The committed
-  gitlink is the pin: a full commit, nothing floats.
-- **Build.** mlx-serve's `build.zig` (`addExl3Module`) builds `lib/sushi/src/exl3/root.zig` as the
-  module `sushi_exl3`, with one import, `mlx_host`, pointing at mlx-serve's own host root.
-  `-Dsushi-dir=/abs/path` builds against a Sushi checkout instead of the submodule.
-- **Use.** `ModelConfig.exl3: ?sushi_exl3.Spec` marks a pack whose routed experts are EXL3
-  (`expert_quant` in `config.json`); every other module stays the host's own affine path.
+mlx-serve vendors Sushi 1.3.0's `src/exl3` as `src/sdk/quant/exl3/sushi/` (ddalcu/mlx-serve#978). It has no `lib/sushi`
+submodule and pins no Sushi commit, so a Sushi change reaches it only by a re-vendor and cannot break its build. The
+copy builds as module `sushi_exl3` with one import, `mlx_host`, which re-exports `mlx`, `log` and `io_util` from
+mlx-serve's own host root. It has diverged from `src/exl3` (Metal sources in `.metal` files, its own host env), and
+Sushi's later `kernel_source.zig`, `project_rows.zig` and `linear.zig` are not in it. A re-vendor takes
+the whole `src/exl3` and keeps the names below at the same paths.
 
 ## The contract
 
@@ -23,7 +20,7 @@ as `pub const`. It never imports a Sushi file by path, so it builds inside any h
 those three.
 
 mlx-serve calls exactly these names. Renaming one, or changing its signature or meaning, breaks
-mlx-serve's build on its next bump; add new names instead, and say so in the CHANGELOG.
+mlx-serve's next re-vendor; add new names instead, and say so in the CHANGELOG.
 
 | name | used for |
 |---|---|
@@ -57,7 +54,7 @@ A `Decode` that names std1 or spec1 without its table is refused by name (`Exl3C
 decoded. A host that only ever sees MCG and MUL1 packs needs no change.
 
 The module's tests run as their own artifacts (`exl3-test-N`) on `zig build test`; a change that
-passes them and keeps the names above is safe to hand over.
+passes them and keeps the names above is safe to re-vendor.
 
 ## What the host owes the module
 
@@ -81,31 +78,3 @@ passes them and keeps the names above is safe to hand over.
 
 Each repo builds its own MLX and mlx-c; the module adds no pin of its own. Both repos pin the
 same commits: MLX 64ea011 (v0.32.3) and mlx-c 56b2d39. Move both pins together.
-
-## Recommended pin
-
-sushi v1.4.0 (90bee8d9), proposed in ddalcu/mlx-serve#933; mlx-serve main pins v1.2.4 (0bc61aa6) until it merges.
-mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#768. Reasons it matters, oldest first:
-- Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
-  fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
-- d1408a57 (after v1.1.1) adds the branch-free NAX prefill GEMM body: each expert GEMM runs in x0.73-0.75 of its time,
-  output bytes unchanged ([perf-baselines](mimo2-perf.md#mimo-prefill-nax-body)).
-- v1.2.3 adds `moeClampedWithShared`, which folds GLM's shared expert into the routed finish reduce on a decode row;
-  `moeClamped` is unchanged, so the bump needs no mlx-serve source change.
-- v1.2.4 adds `moeWithGatedShared`, which folds a gated shared expert into the routed finish reduce on a decode
-  row, and a decode lane that reads its third word through two 32-bit funnels; both bit-identical and additive.
-- v1.3.0 adds `moeRagged` over a `Ragged` bank, the STQ format's experts split into rate groups with their own
-  bit rates, and `shardStampAgrees` for the named codebook table; additive, mlx-serve calls none of them yet.
-- v1.4.0 adds `linear` (trellis-coded dense linears, the STQ trunk) and `parseQuantBlock` for any `expert_quant`-shaped
-  block; additive, mlx-serve calls neither yet.
-
-## Handing a new engine to mlx-serve
-
-1. Land the change on Sushi `main` with `zig build test` green, the `exl3-test-N` artifacts included.
-2. Make the commit reachable from the submodule's url (`ddalcu/sushi`): the fork must fetch it
-   from this repo, or the change must go through it.
-3. Give mlx-serve the full commit hash. mlx-serve bumps the gitlink
-   (`git -C lib/sushi fetch && git -C lib/sushi checkout <sha>`, then commits `lib/sushi`) and runs
-   its own tests.
-
-The gitlink is the whole handoff: no release asset or separate manifest is needed.

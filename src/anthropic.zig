@@ -1071,7 +1071,7 @@ fn handleAnthropicNonStreaming(
     // surface, this path reassigns `final_text` from the result and hands it
     // to parseToolCallsForRequest below. Cutting the markup first would make a
     // real call unparseable. The visible text block is cut at emission instead
-    // (`chat_mod.trimLeakedToolMarkup`), which is where the leak matters.
+    // (`think_tags.trimLeakedToolMarkup`), which is where the leak matters.
     // Reasoning the model generated is always delivered as a thinking block —
     // the request's thinking flag shaped the prompt, never the delivery.
     var routed: ?rp_mod.Delivery = null;

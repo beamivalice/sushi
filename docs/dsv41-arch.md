@@ -337,7 +337,7 @@ expert, so only the logits' direction is held (`dsv41 fused`).
 
 The release's drafter: three sliding-window stages (`mtp.0..2`, window 128, rope theta 10000 and no YaRN, 128 routed
 experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries logprobs or a forced call
-(`generate.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A grammar or JSON schema drafts too
+(`dsv41_dspark.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A grammar or JSON schema drafts too
 ([below](#dspark-grammar)). A repeat or
 presence penalty and the think penalty shift the verify rows by the ids before them (`penaltyShiftRows`, `thinkShiftRows`). A thinking bound
 (Anthropic `budget_tokens`, `reasoning_budget_tokens`) is checked between rounds, and a round verifies at most the thought

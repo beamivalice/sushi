@@ -52,7 +52,7 @@ pub const LoopStop = struct {
     trim_start: usize,
 };
 
-/// Pure decision + trim point. The three tiers live in generate.zig
+/// Pure decision + trim point. The three tiers live in degenerate.zig
 /// (`degenerateTail`); this is where their verdict becomes server behaviour.
 pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     const d = degenerate.degenerateTail(generated_ids) orelse return null;

@@ -48,7 +48,7 @@ fn nthPrimeAfter(start: u64, count: u32) u64 {
     return p;
 }
 
-/// Config-driven bounds; `model.validateQwen4Config` refuses a checkpoint past them at load.
+/// Config-driven bounds; `qwen4_config.validateQwen4Config` refuses a checkpoint past them at load.
 pub const MAX_HEADS = 32;
 pub const MAX_NGRAM_SIZE = 8;
 

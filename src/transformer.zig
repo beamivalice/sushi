@@ -590,7 +590,7 @@ pub fn getGdnKernel(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
 // sliding-window layers ("array" mask during prefill) too, and an optional
 // per-head sink column mimo_v2's sliding layers. The score tensor
 // never exists — O(tile) working memory — so the three prefill OOM guards
-// (generate.boundedPrefillChunk / prefillEvalCadence / server.prefillMemoryNeeded)
+// (prefill_plan.boundedPrefillChunk / prefillEvalCadence / server.prefillMemoryNeeded)
 // drop their score term via `prefillHeadDimFused` when this kernel is active.
 //
 // Scope: seq_len > 1 (prefill), any batch, GQA (Hq % Hk == 0), bf16, causal
@@ -2415,7 +2415,7 @@ pub const Transformer = struct {
     /// glm5: weights only; each slot's `glm5_forward.Request` rides `ForwardCtx.glm5_request`.
     pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "expert_stream", "glm5" };
 
-    /// Whether this model is single-flight at admission (`scheduler.modelExclusiveDecode`).
+    /// Whether this model is single-flight at admission (`slot_admission.modelExclusiveDecode`).
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         // A streamed GLM load (the KLD teacher) admits one claimant per expert stream.
         if (self.glm5) |m| if (m.expert_stream != null) return true;
@@ -2883,7 +2883,7 @@ pub const Transformer = struct {
 
 
 
-    // Mirror of `scheduler.mtpSubGroupSize`: the slots one row-axis tick can carry at this row
+    // Mirror of `mtp_tick.mtpSubGroupSize`: the slots one row-axis tick can carry at this row
     // budget (NAX wide lane 16, stock lane 7) and the drafts each slot gets.
     pub fn specWarmGroupRows(group_cap: usize) usize {
         return if (group_cap >= 16) 4 else 3;

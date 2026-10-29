@@ -1114,7 +1114,7 @@ pub fn appendRawToolDump(path: []const u8, tools_json: ?[]const u8, text: []cons
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
 /// bare-JSON inference, then coerce the arguments to the schema the request
 /// declared. Every surface must go through this — a site that calls
-/// `chat_mod.parseToolCalls` directly silently reintroduces the value-spelling
+/// `tool_calls.parseToolCalls` directly silently reintroduces the value-spelling
 /// type-inference bug (a boolean param arriving as the string "False") on that
 /// surface alone, which no output-equality test can see.
 pub fn parseToolCallsForRequest(
@@ -3304,7 +3304,7 @@ fn ssdFirstBudgetForLoad(
     return budget;
 }
 
-/// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
+/// Impure wrapper for the model-load site (`model_load.doLoadOnInferenceThread`,
 /// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
 /// deliberately has no server.zig import): the weights are resident there, so
 /// `mlx_get_active_memory` is honest. Logs one line when the clamp bites, and publishes the
@@ -5373,7 +5373,7 @@ fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
 
 /// Pure memory model behind checkAttentionMemory. All quantities in bytes,
 /// 25% safety margin included. `chunk` must be the SAME prefill chunk
-/// generate.zig will pick (generate_mod.effectivePrefillChunk) so the
+/// generate.zig will pick (prefill_plan.effectivePrefillChunk) so the
 /// admission guard and the real prefill cannot drift. Terms:
 ///   - kv: persistent for the request; billed at the ACTIVE kv-quant width
 ///     (+0.5 bit/elem group scale/bias overhead when quantized), not a
@@ -5624,7 +5624,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // figure is conservative on plain attention archs and would be a 33%
     // UNDER-bill on a GatedDeltaNet hybrid.
     const envelope: u64 = @max(3 * mlp, mlp + fwd * stream_per_tok);
-    // The dequant+GEMM prefill route (transformer.prefillDqGemm) materializes
+    // The dequant+GEMM prefill route (verify_moe.prefillDqGemm) materializes
     // a bf16 copy of the weight it is about to multiply plus its transpose,
     // and only at forwards wide enough to take that route. Measured against
     // the route off: ~0 at chunk 8192 where the envelope already dominates.
@@ -5675,7 +5675,7 @@ fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     return per_tok;
 }
 
-/// The dequantized-weight working set `transformer.prefillDqGemm` materializes
+/// The dequantized-weight working set `verify_moe.prefillDqGemm` materializes
 /// (a bf16 copy of the weight plus its transpose, ~3 alive across the layer
 /// loop). Chunk-INDEPENDENT — it is weights, not activations — and billed only
 /// where the route can fire: affine-quantized weights, and (inside
@@ -6436,7 +6436,7 @@ pub fn adaptivePrefillWidenStillFits(
     return false;
 }
 
-/// Impure wrapper the prefill loop reaches through `generate.prefill_chunk_adapt`. Logs one
+/// Impure wrapper the prefill loop reaches through `scheduler.prefill_chunk_adapt`. Logs one
 /// line per change, never per boundary (the bench harness greps it).
 pub fn adaptivePrefillWidthNow(
     config: *const model_mod.ModelConfig,
@@ -6489,7 +6489,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // its row index across chunks), so it bills the chunk-bounded envelope —
     // UNLESS the SUSHI_VISION_CHUNKED=0 kill switch restored the
     // whole-prompt forward, in which case `unchunked_prefill` bills the real
-    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
+    // width. Call sites pass prefill_plan.visionPrefillUnchunked(has_vision)
     // so the guard and the prefill loop cannot disagree.
     //
     // Otherwise the width comes from `requestPrefillPick`, the same rule the scheduler pins with.
@@ -7237,7 +7237,7 @@ pub fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) Escaped
 /// to ask another local server for this should not have to learn a second name.
 ///
 /// The flag alone is not enough — the conversation has to BE continuable
-/// (`chat_mod.continuationRequested`). A flag set on a user-final request is
+/// (`think_tags.continuationRequested`). A flag set on a user-final request is
 /// ignored rather than 400'd: the request is perfectly answerable as an
 /// ordinary turn, and refusing it would break the obvious client that sets the
 /// field once for the whole session.

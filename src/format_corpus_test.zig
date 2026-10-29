@@ -1113,7 +1113,7 @@ const corpus = [_]Expect{
         // with `write`. The raw pre-parse bytes were not dumped (the server was
         // not at --log-level debug), so the tag wrapper here is reconstructed; the
         // ARGUMENT SHAPE it produces is the verbatim captured one (pinned
-        // byte-for-byte by the hoistMisplacedRequiredParams tests in chat.zig).
+        // byte-for-byte by the hoistMisplacedRequiredParams tests in tool_schema.zig).
         .family = "gemma4",
         .name = "required `path` buried in the edits items is hoisted to the top level",
         .raw = "<|tool_call>call:edit{edits:[{oldText:<|\"|>old line<|\"|>,newText:<|\"|>new line<|\"|>," ++

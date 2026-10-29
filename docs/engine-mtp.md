@@ -3,7 +3,7 @@
 How the native MTP heads draft and verify: Qwen3.8-Flash-Next's one head and MiMo-V2.6's three, their inputs, the
 spec-verify invariant, draft re-scoring, the measured round-cost table, head KV and norms. Read this before touching
 `src/mtp.zig`, `src/mtp_*.zig`, `src/mimo2/mimo_mtp.zig`, `src/round_cost.zig` or the MTP orchestration in
-`src/generate.zig`.
+`src/generate.zig`, `src/mtp_policy.zig` and `src/mtp_round.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md),
 [qwen4-qsa-long-context](qwen4-qsa-long-context.md), [engine-prefix-cache](engine-prefix-cache.md#spec-state),
@@ -20,7 +20,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 | `src/mimo2/mimo_mtp.zig` | MiMo's three trained heads (`model.mtp.layers.{0,1,2}`), per-request row state |
 | `src/round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`) |
 | `src/mtp_lookup.zig` | Prompt lookup inside the MTP round: the committed-context index and its gate |
-| `src/generate.zig` | MTP orchestration, `commitForcedTokens` |
+| `src/generate.zig` | MTP entry, `commitForcedTokens` |
+| `src/mtp_policy.zig` | adaptive serial/MTP, regime, EV plan and cost table, depth caps (`Generator` methods) |
+| `src/mtp_round.zig` | round chain build and dispatch, batched accept graphs, serial ticks, group verify (`Generator` methods) |
 
 ## The head
 

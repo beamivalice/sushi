@@ -819,7 +819,7 @@ pub const GenerationResult = struct {
     logprobs: ?[]sampler.LogprobResult = null, // per-token logprobs (caller must free)
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`
-    /// ("stop" for loop cuts — see `scheduler.loopStopReason`).
+    /// ("stop" for loop cuts — see `slot_outcome.loopStopReason`).
     /// Static string; nothing to free.
     finish_details: ?[]const u8 = null,
     /// Absolute byte offset into `text` where the constrained JSON payload
@@ -1143,7 +1143,7 @@ pub const Generator = struct {
     /// Set per tick by the scheduler.
     spec_cost_solo: bool = true,
     /// Draft-depth cap while this slot verifies inside a batched group (0 = none):
-    /// the group's rows must stay on the split-K verify lane (`scheduler.mtpGroupRowCap`).
+    /// the group's rows must stay on the split-K verify lane (`mtp_tick.mtpGroupRowCap`).
     mtp_group_cap: u32 = 0,
     mtp_planner_owned: bool = false,
     mtp_planner_pending: bool = false,
