@@ -21,6 +21,7 @@
 #   12-14. Thinking streams: split in live chunks, with tools, and after a tool result
 #   15-17. Thinking x tools x stream grid, and stream == non-stream split
 #   18. Three tool chats over a three-tool catalog parse to structured calls
+#   19. Multi-line code round trip: a writeFile call and a multi-line tool result
 #
 # A thought the token cap cuts open is a legal turn on every row: the rows then assert the split (reasoning kept,
 # nothing in content), never the answer. Thinking rows ask `reasoning_effort: low`, since the split is the subject.
@@ -374,6 +375,23 @@ tool_parse() { # tool_parse <desc> <system prompt> <user prompt>
 tool_parse "shell prompt" "You can call tools. Use the shell tool to run commands." "List the files in /tmp using the shell tool."
 tool_parse "webSearch prompt" "Use the webSearch tool when the user asks to research something." "Research the top 5 open source inference apps."
 tool_parse "writeFile prompt" "Use the writeFile tool to create files." "Create a file at /tmp/hello.txt containing the single word 'hello'."
+
+# ── 19. Multi-line code round trip: a writeFile call carrying code with nested braces keeps its path and content,
+#      and a tool result that is itself multi-line code comes back to a well-formed turn. Whether the model calls
+#      the tool is its choice: a turn with no call reports a SKIP note instead of failing. ──
+SYS_A='You MUST call the writeFile tool. Do not respond with text. Call writeFile with path=\"test.js\" and content that is a simple Express server with one GET route that returns JSON {\"status\":\"ok\"}.'
+WF_TOOL='{"type":"function","function":{"name":"writeFile","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}'
+R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[{\"role\":\"system\",\"content\":\"$SYS_A\"},$(user 'Create a test.js file with an Express server')],\"tools\":[$WF_TOOL],\"max_tokens\":3000,\"temperature\":0,$NOTHINK}")
+if [ "$(jget "$R" "1 if r['calls'] else 0")" = 1 ]; then
+    chk "19. writeFile code: path and multi-line content with nested braces survive in the args" "json.loads(r['calls'][0]['args']).get('path') and len(json.loads(r['calls'][0]['args']).get('content',''))>=20 and '{' in json.loads(r['calls'][0]['args'])['content']"
+else
+    echo -e "  ${YELLOW}SKIP${NC} 19. writeFile code: the model made no call (finish=$(jget "$R" "r['finish']"))"
+fi
+
+RF_TOOL='{"type":"function","function":{"name":"readFile","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}'
+RF_TAIL='{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"readFile","arguments":"{\"path\": \"server.js\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"1| const express = require(\u0027express\u0027);\n2| const app = express();\n3| const cruises = [\n4|   { id: 1, title: \"Med Dream\", price: 999 },\n5|   { id: 2, title: \"Caribbean\", price: 799 },\n6| ];\n7| app.get(\"/api/cruises\", (req, res) => res.json(cruises));\n8| app.listen(3456);"}'
+R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[{\"role\":\"system\",\"content\":\"You are helpful. Be brief.\"},$(user 'Read the server.js file'),$RF_TAIL],\"tools\":[$RF_TOOL],\"max_tokens\":2000,\"temperature\":0,$NOTHINK}")
+chk "19. tool result of multi-line code: the round trip is well-formed (finish, no markup in content, JSON args)" "r['http']==200 and r['finish'] in ('stop','length','tool_calls') and not any(t in r['content'] for t in ('<tool_call','<|tool_call','<tool_response','<|tool_response','</think')) and all(isinstance(json.loads(c['args']),dict) for c in r['calls'])"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
