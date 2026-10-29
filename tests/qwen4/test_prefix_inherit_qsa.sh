@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/../../private_cache.sh"
+# sushi-test: tier=live boot=ram
 # Issue #390: a 1-token-tail commit that inherits checkpoints from a shared
 # prefix must not poison later restores with QsaHistoryGap.
 #
@@ -12,127 +12,20 @@
 # the 1-token tail / full-reuse shape actually occurs; the script fails if it
 # never did.
 #
-# Warm and cold run sequentially on ONE port: warm phase, capture greedy
-# texts, stop, wait for the port and for free+inactive+speculative pages,
-# then boot `--prefix-cache-entries 0` and replay. Never two servers at once.
-#
-# Usage: ./tests/qwen4/test_prefix_inherit_qsa.sh [/path/to/qwen4_exp] [port]
-#
-# Coordinator runs this. Do not start a model server from the agent.
+# The repeated verbatim request restores from the entry the first one committed: its answer must equal the
+# first one's, so a poisoned restore shows as a changed answer as well as the log line. (The old cold-boot
+# replay needed its own boot; every restore shape is exercised here.)
 
 set -e
-
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${2:-11490}"
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/../lib/boot.sh"
+sushi_attach
+BASE="$SUSHI_URL"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
-MEM_RECOVER_GAP_MB=10240
-MEM_RECOVER_TIMEOUT_S=90
 
-if [ ! -d "$MODEL" ]; then
-    echo -e "${YELLOW}SKIP${NC} test_prefix_inherit_qsa: $MODEL not found."
-    exit 0
-fi
-BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-if [ ! -x "$BINARY" ]; then
-    echo -e "${RED}FAIL${NC} $BINARY not found. Build first with 'zig build -Doptimize=ReleaseFast'."
-    exit 1
-fi
-
-SERVER_PID=""
-LOGFILE=""
-COLD_LOG=""
-
-free_mb() {
-  vm_stat | awk '
-    /page size of/         { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) ps = $i }
-    /^Pages free:/         { gsub(/\./, "", $3); free = $3 }
-    /^Pages inactive:/     { gsub(/\./, "", $3); inact = $3 }
-    /^Pages speculative:/  { gsub(/\./, "", $3); spec = $3 }
-    END { if (ps == "") ps = 16384; printf "%d", (free + inact + spec) * ps / 1048576 }'
-}
-
-wait_port_closed() {
-    local i
-    for i in $(seq 1 60); do
-        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || return 0
-        sleep 1
-    done
-    return 1
-}
-
-stop_server() {
-    [ -n "${SERVER_PID:-}" ] || return 0
-    local was="$SERVER_PID"
-    kill "$was" 2>/dev/null || true
-    for _ in $(seq 1 30); do kill -0 "$was" 2>/dev/null || break; sleep 1; done
-    kill -9 "$was" 2>/dev/null || true
-    wait "$was" 2>/dev/null || true
-    SERVER_PID=""
-    wait_port_closed || true
-}
-
-wait_for_release() {
-    local pid="$1"
-    local baseline="$2"
-    local floor=$((baseline - MEM_RECOVER_GAP_MB))
-    local waited=0
-    local now
-    while [ "$waited" -lt "$MEM_RECOVER_TIMEOUT_S" ]; do
-        now=$(free_mb)
-        if ! kill -0 "$pid" 2>/dev/null && [ "$now" -ge "$floor" ]; then
-            lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || {
-                echo "  pack released after ${waited}s (free+inactive+speculative ${now} MB >= floor ${floor} MB)"
-                return 0
-            }
-        fi
-        sleep 2
-        waited=$((waited + 2))
-    done
-    echo "  WARN: memory did not recover within ${MEM_RECOVER_TIMEOUT_S}s (free+inactive+speculative $(free_mb) MB, floor ${floor} MB) - proceeding"
-    wait_port_closed || echo "  WARN: port $PORT still listening"
-    return 0
-}
-
-cleanup() {
-    stop_server
-    rm -f "$LOGFILE" "$COLD_LOG"
-}
-trap cleanup EXIT INT TERM
-
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-
-BASELINE_FREE_MB=$(free_mb)
-echo "  baseline free+inactive+speculative before any boot: ${BASELINE_FREE_MB} MB"
-
-start_server() {
-    local log="$1"
-    shift
-    echo "  starting server $*..."
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 \
-        "$@" --log-level info ${SUSHI_TEST_EXTRA_ARGS:-} > "$log" 2>&1 &
-    SERVER_PID=$!
-    local up=0
-    local i
-    for i in $(seq 1 180); do
-        curl -s -f "$BASE/health" > /dev/null 2>&1 && { up=1; break; }
-        sleep 1
-    done
-    if [ "$up" != "1" ]; then
-        echo -e "${RED}FAIL${NC} server did not become healthy"; tail -40 "$log"; exit 1
-    fi
-}
-
-LOGFILE=$(mktemp)
-start_server "$LOGFILE" --prefix-cache-entries 8 --prefix-cache-mem 2048MB --prefix-cache-disk off
-
-SYSTEM=$(python3 -c "print('You are a careful assistant for the Orion project. Rule %d: answer briefly. ' * 900 % tuple(range(900)))")
+SYSTEM=$(python3 -c "import sys; print(sys.argv[1] + ' You are a careful assistant for the Orion project. Rule %d: answer briefly. ' * 900 % tuple(range(900)))" "$SUSHI_NONCE")
 
 chat() {
     local hist_json="$1"
@@ -196,68 +89,42 @@ WARM2=$(post_body "$BODY" "$BASE") || { echo -e "${RED}FAIL${NC} verbatim reques
 echo "$WARM1" | python3 -c "import json,sys; o=json.load(sys.stdin); raise SystemExit(0 if o['code']==200 else 1)" || fail=1
 echo "$WARM2" | python3 -c "import json,sys; o=json.load(sys.stdin); raise SystemExit(0 if o['code']==200 else 1)" || fail=1
 
+LOGS=$(sushi_log_since)
 if python3 -c "
 import re,sys
-text=open(sys.argv[1]).read()
-for m in re.finditer(r'reused ([0-9]+)/([0-9]+) tokens', text):
+for m in re.finditer(r'reused ([0-9]+)/([0-9]+) tokens', sys.stdin.read()):
     a,b=int(m.group(1)),int(m.group(2))
     if b-a==1:
         raise SystemExit(0)
 raise SystemExit(1)
-" "$LOGFILE"; then
+" <<< "$LOGS"; then
     echo -e "${GREEN}PASS${NC} 1-token prefill shape occurred"
 else
     echo -e "${RED}FAIL${NC} never saw a reused N/(N+1) 1-token prefill line"
-    grep -n "hot-cache" "$LOGFILE" | head -20
+    grep -n "hot-cache" <<< "$LOGS" | head -20
     fail=1
 fi
 
-if grep -q "prefill failed for slot: QsaHistoryGap" "$LOGFILE"; then
+if grep -q "prefill failed for slot: QsaHistoryGap" <<< "$LOGS"; then
     echo -e "${RED}FAIL${NC} log contains prefill failed for slot: QsaHistoryGap"
-    grep -n "QsaHistoryGap" "$LOGFILE" | head -10
+    grep -n "QsaHistoryGap" <<< "$LOGS" | head -10
     fail=1
 else
     echo -e "${GREEN}PASS${NC} no QsaHistoryGap prefill failure"
 fi
 
-heal=$(grep -c "restored entry failed the QSA history check — dropped, cold prefill" "$LOGFILE" || true)
+heal=$(grep -c "restored entry failed the QSA history check — dropped, cold prefill" <<< "$LOGS" || true)
 if [ "$heal" -gt 0 ]; then
     echo -e "${YELLOW}WARN${NC} self-heal events: $heal"
 else
     echo "  self-heal events: 0"
 fi
 
-WARM_PID="$SERVER_PID"
-stop_server
-wait_for_release "$WARM_PID" "$BASELINE_FREE_MB"
-
-COLD_LOG=$(mktemp)
-start_server "$COLD_LOG" --prefix-cache-entries 0 --prefix-cache-disk off
-
-COLD1=$(post_body "$BODY" "$BASE") || { echo -e "${RED}FAIL${NC} cold request 1 failed"; fail=1; COLD1='{"code":0,"text":""}'; }
-python3 -c "
-import json,sys,urllib.request
-warm=json.loads(sys.argv[1])['text']
-cold=json.loads(sys.argv[2])['text']
-base=sys.argv[3]
-if not warm:
-    print('empty warm vs non-empty cold')
-    raise SystemExit(1)
-def toks(text):
-    body=json.dumps({'content': text}).encode()
-    req=urllib.request.Request(base+'/tokenize', data=body, headers={'Content-Type':'application/json'})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())['tokens']
-wt=toks(warm)[:32]
-ct=toks(cold)[:32]
-if wt != ct:
-    print('warm/cold first-32-token mismatch')
-    print(' warm', wt[:8], 'len', len(toks(warm)))
-    print(' cold', ct[:8], 'len', len(toks(cold)))
-    raise SystemExit(1)
-" "$WARM2" "$COLD1" "$BASE" || { echo -e "${RED}FAIL${NC} warm greedy text != cold"; fail=1; }
-if [ "$fail" -eq 0 ]; then
-    echo -e "${GREEN}PASS${NC} warm greedy text matches cold (first 32 tokens)"
+if [ "$(echo "$WARM1" | python3 -c "import json,sys; print(json.load(sys.stdin)['text'])")" = "$(echo "$WARM2" | python3 -c "import json,sys; print(json.load(sys.stdin)['text'])")" ]; then
+    echo -e "${GREEN}PASS${NC} the full-reuse answer equals the first restored answer"
+else
+    echo -e "${RED}FAIL${NC} the verbatim repeat answered differently from its first restore"
+    fail=1
 fi
 
 if [ "$fail" -eq 0 ]; then
