@@ -128,7 +128,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - A flag that shapes a LOAD is retained on the Scheduler with its `*_explicit` bit (`ensureLoaded`'s cold-load
   `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
   resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props
-  settings.mtp.source`). Guard: `tests/test_cold_load_launch_flags.sh`, `tests/test_model_settings.sh`.
+  settings.mtp.source`). Guard: `tests/test_cold_load.sh`.
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
