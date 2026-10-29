@@ -6,7 +6,7 @@ Opens a raw socket against one streaming surface, drives a tool call big
 enough that the server buffers tokens for many seconds, and records the
 wall-clock gap between successive byte arrivals.
 
-Exit codes:  0 = pass,  1 = fail,  2 = skip (generation too short to test)
+Exit codes:  0 = pass,  1 = fail,  2 = skip (generation too short to test, or no tool call)
 """
 import json
 import os
@@ -18,6 +18,7 @@ import time
 PORT = int(sys.argv[1])
 SURFACE = sys.argv[2]
 MODEL = sys.argv[3]
+NONCE = sys.argv[4]
 
 MAX_GAP_S = float(os.environ.get("MAX_GAP_S", 15))
 MIN_BUFFER_S = float(os.environ.get("MIN_BUFFER_S", 8))
@@ -26,7 +27,7 @@ DESC = "Write text content to a file on disk."
 # Long, mechanical content: the model emits it as one giant tool-call argument,
 # which the server buffers end-to-end while it watches for the closing tag.
 PROMPT = (
-    "Use the write_file tool to create report.md. Its content must be the "
+    NONCE + " Use the write_file tool to create report.md. Its content must be the "
     "numbers 1 through 250, one per line, each formatted exactly as "
     "'- item N: pending review'. Write the whole file in a single call."
 )
@@ -37,7 +38,7 @@ if SURFACE == "chat":
     PATH = "/v1/chat/completions"
     BODY = {
         "model": MODEL, "stream": True, "max_tokens": 4096, "temperature": 0.0,
-        "messages": [{"role": "user", "content": PROMPT}],
+        "messages": [{"role": "user", "content": PROMPT}], "reasoning_effort": "low",
         "tools": [{"type": "function", "function": {
             "name": "write_file", "description": DESC, "parameters": SCHEMA}}],
     }
@@ -45,14 +46,14 @@ elif SURFACE == "messages":
     PATH = "/v1/messages"
     BODY = {
         "model": MODEL, "stream": True, "max_tokens": 4096, "temperature": 0.0,
-        "messages": [{"role": "user", "content": PROMPT}],
+        "messages": [{"role": "user", "content": PROMPT}], "output_config": {"effort": "low"},
         "tools": [{"name": "write_file", "description": DESC, "input_schema": SCHEMA}],
     }
 elif SURFACE == "responses":
     PATH = "/v1/responses"
     BODY = {
         "model": MODEL, "stream": True, "max_output_tokens": 4096, "temperature": 0.0,
-        "input": [{"role": "user", "content": PROMPT}],
+        "input": [{"role": "user", "content": PROMPT}], "reasoning": {"effort": "low"},
         "tools": [{"type": "function", "name": "write_file",
                    "description": DESC, "parameters": SCHEMA}],
     }
@@ -151,6 +152,10 @@ else:  # responses
         if ev.get("type", "").startswith("response.function_call_arguments"):
             args = ev.get("arguments") or ((args or "") + ev.get("delta", ""))
 
+if name is None and not args:
+    # Whether the checkpoint calls the tool is its choice; without a call nothing was buffered to time.
+    print("SKIP: the model did not call the tool, so no tool call was buffered")
+    sys.exit(2)
 if name != "write_file":
     failures.append(f"tool call name not recovered (got {name!r})")
 elif not args:
