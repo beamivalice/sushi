@@ -129,20 +129,20 @@ pub fn layerMajorWindows(cfg: *const model.ModelConfig, total: u64, trunk: u64, 
 
 test "GLM teacher reserve bills the NAX arms it takes and nothing under the reference arms" {
     const base = @import("glm5_model.zig");
-    const transformer = @import("../transformer.zig");
-    const gate = transformer.vqmm_nax_probe_override;
+    const nax_gate = @import("../nax_gate.zig");
+    const gate = nax_gate.vqmm_nax_probe_override;
     defer {
-        transformer.vqmm_nax_probe_override = gate;
+        nax_gate.vqmm_nax_probe_override = gate;
         base.leaveTeacher();
     }
     const cfg = model.ModelConfig{ .model_type = "glm5_next", .num_hidden_layers = 45, .full_attention_interval = 4 };
-    transformer.vqmm_nax_probe_override = true;
+    nax_gate.vqmm_nax_probe_override = true;
     base.enterTeacher();
     const on = try armsReserve(&cfg, 512);
     // 34 KDA layers keep a prepared 320x4096 BF16 cluster bank; the 512-row MLA head batches and B1 decode scratch are live.
     try std.testing.expect(on >= 34 * 320 * 4096 * 2 + 512 * 196608 + (32 << 20));
     try std.testing.expectEqual(on, try armsReserve(&cfg, 512));
-    transformer.vqmm_nax_probe_override = false;
+    nax_gate.vqmm_nax_probe_override = false;
     base.enterTeacher();
     try std.testing.expectEqual(@as(u64, 0), try armsReserve(&cfg, 512));
 }

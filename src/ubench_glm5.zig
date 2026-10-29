@@ -6,6 +6,7 @@ const mlx = @import("mlx.zig");
 const io_util = @import("io_util.zig");
 const report = @import("ubench_report.zig");
 const transformer = @import("transformer.zig");
+const nax_gate = @import("nax_gate.zig");
 const model = @import("model.zig");
 const glm = @import("glm5/glm5_model.zig");
 const attention = @import("glm5/glm5_attention.zig");
@@ -53,11 +54,11 @@ const NaxGate = struct {
     saved: ?bool,
 
     fn take() NaxGate {
-        return .{ .saved = transformer.vqmm_nax_probe_override };
+        return .{ .saved = nax_gate.vqmm_nax_probe_override };
     }
 
     fn restore(g: NaxGate) void {
-        transformer.vqmm_nax_probe_override = g.saved;
+        nax_gate.vqmm_nax_probe_override = g.saved;
     }
 };
 
@@ -258,7 +259,7 @@ fn naxOutput(ops: *Ops, in: *const NaxInputs, case: usize, nax: bool) !Arr {
 }
 
 fn sampleNax(c: NaxCase, arm: usize) anyerror!f64 {
-    transformer.vqmm_nax_probe_override = arm == 1;
+    nax_gate.vqmm_nax_probe_override = arm == 1;
     var ops = Ops{ .s = c.s };
     defer ops.deinit();
     const sw = io_util.Stopwatch.init(io());
@@ -272,7 +273,7 @@ fn naxAgreement(s: mlx.mlx_stream, in: *const NaxInputs, case: usize) ![2]f64 {
     var ops = Ops{ .s = s };
     defer ops.deinit();
     for (&outs, 0..) |*o, arm| {
-        transformer.vqmm_nax_probe_override = arm == 1;
+        nax_gate.vqmm_nax_probe_override = arm == 1;
         o.* = try ops.contiguous(try ops.cast(try naxOutput(&ops, in, case, arm == 1), .float32));
         try eval(o.*);
     }
@@ -643,7 +644,7 @@ fn sampleChunk(c: ChunkCase, arm: usize) anyerror!f64 {
     defer arm_scope.deinit();
     var ops = Ops{ .s = c.s };
     defer ops.deinit();
-    transformer.vqmm_nax_probe_override = if (arm == 1) false else c.gate.saved;
+    nax_gate.vqmm_nax_probe_override = if (arm == 1) false else c.gate.saved;
     const history = c.state.processed;
     const sw = io_util.Stopwatch.init(io());
     const out = switch (arm) {

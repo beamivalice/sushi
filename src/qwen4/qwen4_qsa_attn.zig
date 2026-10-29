@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const nax_gate = @import("../nax_gate.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const std = @import("std");
@@ -2881,11 +2882,11 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
     xfm.allocator = testing.allocator;
     xfm.qsa_score_bank_builds = 0;
     const saved_fused = qwen4_qsa_select.qsa_score_fused_override;
-    const saved_nax = trf.vqmm_nax_probe_override;
+    const saved_nax = nax_gate.vqmm_nax_probe_override;
     const saved_sheet = qsa_score_sheet_mb_override;
     defer {
         qwen4_qsa_select.qsa_score_fused_override = saved_fused;
-        trf.vqmm_nax_probe_override = saved_nax;
+        nax_gate.vqmm_nax_probe_override = saved_nax;
         qsa_score_sheet_mb_override = saved_sheet;
     }
     qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;

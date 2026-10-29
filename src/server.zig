@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const nax_gate = @import("nax_gate.zig");
 const qwen4_qsa_select = @import("qwen4/qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4/qwen4_qsa_gather.zig");
 const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
@@ -10387,18 +10388,18 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the sam
     qwen4_qsa_gather.qsa_gather_override = true;
     defer qwen4_qsa_gather.qsa_gather_override = null;
     const saved_fused = qwen4_qsa_select.qsa_score_fused_override;
-    const saved_nax = transformer_mod.vqmm_nax_probe_override;
+    const saved_nax = nax_gate.vqmm_nax_probe_override;
     defer {
         qwen4_qsa_select.qsa_score_fused_override = saved_fused;
-        transformer_mod.vqmm_nax_probe_override = saved_nax;
+        nax_gate.vqmm_nax_probe_override = saved_nax;
     }
-    transformer_mod.vqmm_nax_probe_override = false;
+    nax_gate.vqmm_nax_probe_override = false;
     qwen4_qsa_select.qsa_score_fused_override = true;
     const gathered_composed = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expect(gathered_composed > 0);
     try t.expect(gathered_composed < 4 * 4096 * 250_000);
     try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
-    transformer_mod.vqmm_nax_probe_override = null;
+    nax_gate.vqmm_nax_probe_override = null;
     qwen4_qsa_select.qsa_score_fused_override = true;
     const gathered_fused = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
@@ -10406,7 +10407,7 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the sam
         try t.expect(gathered_fused < gathered_composed);
     }
     qwen4_qsa_select.qsa_score_fused_override = false;
-    transformer_mod.vqmm_nax_probe_override = false;
+    nax_gate.vqmm_nax_probe_override = false;
     const gathered = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expectEqual(gathered_composed, gathered);
     const twin_bill = prefillTransientReserve(&twin, 16, 8192);

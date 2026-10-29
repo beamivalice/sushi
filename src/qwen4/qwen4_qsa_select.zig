@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const nax_gate = @import("../nax_gate.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const mrope = @import("../mrope.zig");
@@ -2263,8 +2264,8 @@ test "qsa score kernel: block ids through qsaSelectTopBlocks are identical on bo
 test "qsa score kernel: never built without NAX" {
     qsa_score_fused_override = true;
     defer qsa_score_fused_override = null;
-    trf.vqmm_nax_probe_override = false;
-    defer trf.vqmm_nax_probe_override = null;
+    nax_gate.vqmm_nax_probe_override = false;
+    defer nax_gate.vqmm_nax_probe_override = null;
     const saved = qsa_score_kernel_cached;
     qsa_score_kernel_cached = null;
     defer qsa_score_kernel_cached = saved;
@@ -2363,11 +2364,11 @@ test "qsa score kernel: TF32 off declines" {
 
 test "qsa score fused: the bill follows the predicate" {
     const saved_fused = qsa_score_fused_override;
-    const saved_nax = trf.vqmm_nax_probe_override;
+    const saved_nax = nax_gate.vqmm_nax_probe_override;
     const saved_sheet = qwen4_qsa_attn.qsa_score_sheet_mb_override;
     defer {
         qsa_score_fused_override = saved_fused;
-        trf.vqmm_nax_probe_override = saved_nax;
+        nax_gate.vqmm_nax_probe_override = saved_nax;
         qwen4_qsa_attn.qsa_score_sheet_mb_override = saved_sheet;
     }
     qwen4_qsa_attn.qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
@@ -2377,7 +2378,7 @@ test "qsa score fused: the bill follows the predicate" {
     const kv = nb * 4;
     const ratio: u64 = 4;
 
-    trf.vqmm_nax_probe_override = false;
+    nax_gate.vqmm_nax_probe_override = false;
     qsa_score_fused_override = true;
     const composed_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
     const composed_bill = qsaPrefillTransientBytes(n_idx, fwd, kv, ratio, 128);
@@ -2398,7 +2399,7 @@ test "qsa score fused: the bill follows the predicate" {
     try testing.expectEqual(composed_bank, cfg.qsaScoreBankBytesPerToken());
 
     qsa_score_fused_override = true;
-    trf.vqmm_nax_probe_override = null;
+    nax_gate.vqmm_nax_probe_override = null;
     qsaScoreFusedArm();
     if (qsaScoreFusedActive()) {
         const fused_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
@@ -2432,11 +2433,11 @@ test "qsa score fused: sizing policy" {
     try testing.expectEqual(@as(u32, 64), qsaScoreNsh(64, 1, .base));
     try testing.expectEqual(@as(u32, 32), qsaScoreNsh(1024, 8, .h4));
     const saved_fused = qsa_score_fused_override;
-    const saved_nax = trf.vqmm_nax_probe_override;
+    const saved_nax = nax_gate.vqmm_nax_probe_override;
     const saved_sheet = qwen4_qsa_attn.qsa_score_sheet_mb_override;
     defer {
         qsa_score_fused_override = saved_fused;
-        trf.vqmm_nax_probe_override = saved_nax;
+        nax_gate.vqmm_nax_probe_override = saved_nax;
         qwen4_qsa_attn.qsa_score_sheet_mb_override = saved_sheet;
     }
     qwen4_qsa_attn.qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
@@ -2504,13 +2505,13 @@ test "qsa score fused: no bank is built under the fused arm" {
     defer _ = mlx.mlx_array_free(pooled);
     try xfm.qsaAppendPooled(&entry, pooled, 0);
     const saved_fused = qsa_score_fused_override;
-    const saved_nax = trf.vqmm_nax_probe_override;
+    const saved_nax = nax_gate.vqmm_nax_probe_override;
     defer {
         qsa_score_fused_override = saved_fused;
-        trf.vqmm_nax_probe_override = saved_nax;
+        nax_gate.vqmm_nax_probe_override = saved_nax;
     }
     qsa_score_fused_override = false;
-    trf.vqmm_nax_probe_override = false;
+    nax_gate.vqmm_nax_probe_override = false;
     _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, false);
     try testing.expect(entry.qsa_score_bank.ctx != null);
     if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
@@ -2519,7 +2520,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     entry.qsa_score_buf = .{ .ctx = null };
     entry.qsa_score_blocks = 0;
     qsa_score_fused_override = true;
-    trf.vqmm_nax_probe_override = null;
+    nax_gate.vqmm_nax_probe_override = null;
     qsaScoreFusedArm();
     if (qsaScoreFusedActive()) {
         _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, true);

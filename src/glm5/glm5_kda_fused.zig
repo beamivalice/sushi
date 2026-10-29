@@ -622,10 +622,10 @@ test "GLM KDA post geometry guards every uint32 shader offset" {
 
 test "GLM SIMD KDA, prework and router arms serve GPUs without NAX" {
     try mlx.requireGpu();
-    const transformer = @import("../transformer.zig");
-    const saved = transformer.vqmm_nax_probe_override;
-    defer transformer.vqmm_nax_probe_override = saved;
-    transformer.vqmm_nax_probe_override = false;
+    const nax_gate = @import("../nax_gate.zig");
+    const saved = nax_gate.vqmm_nax_probe_override;
+    defer nax_gate.vqmm_nax_probe_override = saved;
+    nax_gate.vqmm_nax_probe_override = false;
     const s = mlx.gpuStream();
     var ops = @import("glm5_model.zig").Ops{ .s = s };
     defer ops.deinit();

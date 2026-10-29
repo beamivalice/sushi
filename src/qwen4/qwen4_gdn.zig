@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const nax_gate = @import("../nax_gate.zig");
 const ssm_cache = @import("../ssm_cache.zig");
 const std = @import("std");
 const gdn_decode = @import("gdn_decode.zig");
@@ -3581,21 +3582,21 @@ test "GDN vectorized-gate kernel: a per-channel gate that is UNIFORM per head eq
 
 test "GDN pipelined route: NAX Qwen default, eligibility" {
     const saved_blocked = gdn_blocked_override;
-    const saved_nax = trf.vqmm_nax_probe_override;
+    const saved_nax = nax_gate.vqmm_nax_probe_override;
     defer {
         gdn_blocked_override = saved_blocked;
-        trf.vqmm_nax_probe_override = saved_nax;
+        nax_gate.vqmm_nax_probe_override = saved_nax;
     }
     gdn_blocked_override = true;
-    trf.vqmm_nax_probe_override = true;
+    nax_gate.vqmm_nax_probe_override = true;
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     for ([_][]const u8{ "mimo_v2", "glm5_next", "not_a_served_arch" }) |model_type| {
         try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute(model_type, 64, 128, 128, 2, 4, false, 2).route);
     }
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    trf.vqmm_nax_probe_override = false;
+    nax_gate.vqmm_nax_probe_override = false;
     try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    trf.vqmm_nax_probe_override = true;
+    nax_gate.vqmm_nax_probe_override = true;
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     for ([_]c_int{ 1, 2, 8, 63 }) |seq_len| {
         try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", seq_len, 128, 128, 2, 4, false, 2).route);

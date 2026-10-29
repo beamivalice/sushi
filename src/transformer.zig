@@ -37,6 +37,7 @@ const qwen4_fixture_test = @import("qwen4/qwen4_fixture_test.zig");
 const qwen4_gdn = @import("qwen4/qwen4_gdn.zig");
 const kv_cache = @import("kv_cache.zig");
 const ssm_cache = @import("ssm_cache.zig");
+const nax_gate = @import("nax_gate.zig");
 const GDN_FUSED_MAX_ROWS = qwen4_gdn.GDN_FUSED_MAX_ROWS;
 const GdnPrework = qwen4_gdn.GdnPrework;
 const gdnDecodeFusedEnabled = qwen4_gdn.gdnDecodeFusedEnabled;
@@ -139,15 +140,20 @@ const freeKVEntry = kv_cache.freeKVEntry;
 pub const fusedSdpa256Masked = qwen4_qsa_gather.fusedSdpa256Masked;
 pub const gatherQsa256 = qwen4_qsa_gather.gatherQsa256;
 pub const gatherQsa256Packed = qwen4_qsa_gather.gatherQsa256Packed;
+const gpuArchitecture = nax_gate.gpuArchitecture;
 pub const handoffQsaHistoryToLatest = qwen4_qsa_state.handoffQsaHistoryToLatest;
 pub const keepOnlyLatestQsaHistory = qwen4_qsa_state.keepOnlyLatestQsaHistory;
 pub const kvEntriesBytes = ssm_cache.kvEntriesBytes;
 pub const materializedOwnedCopy = ssm_cache.materializedOwnedCopy;
+pub const macosProductVersion = nax_gate.macosProductVersion;
 pub const mimoGlobalDecodeRebuildMaxKeys = mimo_forward.mimoGlobalDecodeRebuildMaxKeys;
 pub const nextSsmMemberGen = qwen4_ssm_group.nextSsmMemberGen;
 pub const newEmptyKVEntry = kv_cache.newEmptyKVEntry;
 pub const positionDropIndex = ssm_cache.positionDropIndex;
 pub const positionDropIndexUsize = ssm_cache.positionDropIndexUsize;
+const naxMinMForBits = nax_gate.naxMinMForBits;
+pub const naxSdpaPreferred = nax_gate.naxSdpaPreferred;
+pub const naxStatus = nax_gate.naxStatus;
 pub const qsaAttnKernelEnabled = qwen4_qsa_attn.qsaAttnKernelEnabled;
 pub const qsaBatchedGatherEnabled = qwen4_qsa_gather.qsaBatchedGatherEnabled;
 pub const qsaBatchedGatherFloor = qwen4_qsa_gather.qsaBatchedGatherFloor;
@@ -165,9 +171,15 @@ pub const qsaMaskFromBlockSel = qwen4_qsa_attn.qsaMaskFromBlockSel;
 pub const qsaMaskFromBlocks = qwen4_qsa_attn.qsaMaskFromBlocks;
 const qsaNaxArm = qwen4_qsa_gather.qsaNaxArm;
 pub const qsaNaxEnabled = qwen4_qsa_gather.qsaNaxEnabled;
+pub const qsaNaxOsOk = nax_gate.qsaNaxOsOk;
+pub const qsaNaxOsSupported = nax_gate.qsaNaxOsSupported;
 pub const qsaPoolNormRopeFused = qwen4_qsa_select.qsaPoolNormRopeFused;
 pub const qsaPrefillGatherMinKvFrom = qwen4_qsa_gather.qsaPrefillGatherMinKvFrom;
 pub const qsaPrefillTransientBytes = qwen4_qsa_attn.qsaPrefillTransientBytes;
+pub const qsaProbeAllFinite = nax_gate.qsaProbeAllFinite;
+pub const qsaProbeCorruptFirst = nax_gate.qsaProbeCorruptFirst;
+pub const qsaProbeLcgBf16 = nax_gate.qsaProbeLcgBf16;
+pub const qsaProbeMaxAbsDiff = nax_gate.qsaProbeMaxAbsDiff;
 pub const qsaResliceToKeep = qwen4_qsa_state.qsaResliceToKeep;
 pub const qsaRestoreSatisfiesForward = qwen4_qsa_state.qsaRestoreSatisfiesForward;
 pub const qsaScoreFusedActive = qwen4_qsa_select.qsaScoreFusedActive;
@@ -228,6 +240,8 @@ pub const qwen4Standin = qwen4_forward.qwen4Standin;
 const sharedGateRowsEligible = qwen4_forward.sharedGateRowsEligible;
 pub const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
 pub const truncatePooled = ssm_cache.truncatePooled;
+pub const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
+const verifyQmmNaxEnabled = nax_gate.verifyQmmNaxEnabled;
 pub const warmQsaEnvCaches = qwen4_qsa_attn.warmQsaEnvCaches;
 const yarnMscale = qwen4_forward.yarnMscale;
 pub const yarnSpec = qwen4_forward.yarnSpec;
@@ -1197,175 +1211,6 @@ fn runVerifyQmmMsg(
 
 // ── NAX m16 verify tile (M5-class matrix units; see the section comment
 // above for provenance, gating, and the never-build-off-probe rule) ──
-
-/// Case-insensitive prefix match on the M5-class GPU family identifier.
-/// Prefix (not equality) is MTPLX's shipping behavior — device variants
-/// report suffixed forms ("applegpu_g17s", "applegpu_g17d").
-pub fn naxArchGeneration(arch: []const u8) struct { gen: u32, phone: bool } {
-    if (arch.len < 3) return .{ .gen = 0, .phone = false };
-    var buf: [128]u8 = undefined;
-    const n = @min(arch.len, buf.len);
-    for (arch[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    const a = buf[0..n];
-    // Generic compiler targets such as air64_v27 do not name a GPU generation.
-    const suffix = if (std.mem.startsWith(u8, a, "applegpu_g")) a[10..] else if (a[0] == 'g') a[1..] else return .{ .gen = 0, .phone = false };
-    var digits: usize = 0;
-    while (digits < suffix.len and std.ascii.isDigit(suffix[digits])) digits += 1;
-    if (digits == 0 or suffix.len - digits > 1) return .{ .gen = 0, .phone = false };
-    if (digits < suffix.len and !std.ascii.isAlphabetic(suffix[digits])) return .{ .gen = 0, .phone = false };
-    return .{
-        .gen = std.fmt.parseInt(u32, suffix[0..digits], 10) catch 0,
-        .phone = digits < suffix.len and suffix[digits] == 'p',
-    };
-}
-
-pub fn naxArchSupportedFrom(arch: []const u8) bool {
-    const parsed = naxArchGeneration(arch);
-    const floor: u32 = if (parsed.phone) 18 else 17;
-    return parsed.gen >= floor;
-}
-
-pub fn naxArchIsG17(arch: []const u8) bool {
-    return naxArchSupportedFrom(arch);
-}
-
-/// "26.4"/"26.4.1"-style product version at least req_major.req_minor.
-/// Unparseable components read as 0 (mirrors MTPLX: int() failures fall
-/// back to 0, so garbage can never satisfy the floor).
-pub fn macosVersionAtLeast(ver: []const u8, req_major: u32, req_minor: u32) bool {
-    var it = std.mem.splitScalar(u8, ver, '.');
-    const major = std.fmt.parseInt(u32, it.first(), 10) catch 0;
-    const minor: u32 = if (it.next()) |mn| (std.fmt.parseInt(u32, mn, 10) catch 0) else 0;
-    return major > req_major or (major == req_major and minor >= req_minor);
-}
-
-/// The whole availability gate, pure over its inputs (mirror of MTPLX's
-/// nax_available()): not force-fallback, G17-class GPU, macOS >= 26.2 (the
-/// MetalPerformancePrimitives floor).
-pub fn naxAvailableFrom(force_fallback: bool, arch: []const u8, os_ver: []const u8) bool {
-    if (force_fallback) return false;
-    if (!naxArchIsG17(arch)) return false;
-    return macosVersionAtLeast(os_ver, 26, 2);
-}
-
-/// Human-readable NAX status for `--version` / the app's Settings ("nax"
-/// line, first token on/off, remainder the reason). Hardware + OS is the
-/// whole story for OUR binaries: the bundled MLX always ships the NAX
-/// kernels (build-mlx.sh + tests/test_mlx_staged_nax.sh assert them), so
-/// this mirrors MLX's stock-op is_nax_available() gate (GPU gen >= 17,
-/// macOS >= 26.2 — that symbol is not exported, hence the mirror).
-/// Deliberately ignores the verifyQmm-lane QA env switches: those scope
-/// our custom kernel lane, not MLX's stock dispatch.
-pub fn naxStatusFrom(arch: []const u8, os_ver: []const u8) []const u8 {
-    if (!naxArchIsG17(arch)) return "off (requires M5-class GPU)";
-    if (!macosVersionAtLeast(os_ver, 26, 2)) return "off (requires macOS 26.2+)";
-    return "on (M5 neural accelerators)";
-}
-
-/// naxStatusFrom over the real device: mlx device-info arch + sysctl OS
-/// version (same sources as the verifyQmm probe).
-pub fn naxStatus() []const u8 {
-    var arch_buf: [128]u8 = undefined;
-    const arch = gpuArchitecture(&arch_buf) orelse "";
-    var ver_buf: [64]u8 = undefined;
-    const ver = macosProductVersion(&ver_buf) orelse "";
-    return naxStatusFrom(arch, ver);
-}
-
-extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
-
-/// "kern.osproductversion" → "26.4"-style string (the sysctl mirror of
-/// Python's platform.mac_ver()[0]).
-pub fn macosProductVersion(buf: []u8) ?[]const u8 {
-    var len: usize = buf.len;
-    if (sysctlbyname("kern.osproductversion", buf.ptr, &len, null, 0) != 0) return null;
-    var n = @min(len, buf.len);
-    while (n > 0 and buf[n - 1] == 0) n -= 1;
-    if (n == 0) return null;
-    return buf[0..n];
-}
-
-/// GPU architecture identifier off mlx device info ("applegpu_g16" on the
-/// M4 Max). The returned pointer from mlx is borrowed from the info object,
-/// so the string is copied into the caller's buffer before the info frees.
-fn gpuArchitecture(buf: []u8) ?[]const u8 {
-    var dev = mlx.mlx_device{ .ctx = null };
-    if (mlx.mlx_get_default_device(&dev) != 0) return null;
-    defer _ = mlx.mlx_device_free(dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) != 0) return null;
-    var cstr: [*:0]const u8 = undefined;
-    if (mlx.mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
-    const arch = std.mem.span(cstr);
-    if (arch.len == 0 or arch.len > buf.len) return null;
-    @memcpy(buf[0..arch.len], arch);
-    return buf[0..arch.len];
-}
-
-/// Test seam: force the NAX availability probe (null = real probe). Only
-/// ever force FALSE on non-G17 machines — forcing true would let dispatch
-/// build a kernel whose matmul2d pipeline cannot be created off M5-class
-/// hardware.
-pub var vqmm_nax_probe_override: ?bool = null;
-
-var vqmm_nax_avail_cache: ?bool = null;
-
-/// M5-class NAX units present: "applegpu_g17" GPU + macOS >= 26.2.
-/// SUSHI_FORCE_GPU_FAMILY_FALLBACK=1 pretends the units are absent so
-/// an M5 can rehearse the exact M1-M4 plain-SIMD path (QA switch, mirrored
-/// from MTPLX). Cached for the process lifetime (inference-thread caller
-/// discipline, same as the kernel caches).
-pub fn verifyQmmNaxAvailable() bool {
-    if (vqmm_nax_probe_override) |v| return v;
-    if (vqmm_nax_avail_cache) |v| return v;
-    const ok = computeNaxAvailable();
-    vqmm_nax_avail_cache = ok;
-    return ok;
-}
-
-fn computeNaxAvailable() bool {
-    var force = false;
-    if (std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK")) |p| {
-        const v = std.mem.span(p);
-        force = v.len > 0 and v[0] == '1';
-    }
-    var arch_buf: [128]u8 = undefined;
-    const arch = gpuArchitecture(&arch_buf) orelse "";
-    var ver_buf: [64]u8 = undefined;
-    const ver = macosProductVersion(&ver_buf) orelse "";
-    return naxAvailableFrom(force, arch, ver);
-}
-
-var nax_sdpa_avail_cache: ?bool = null;
-pub var nax_sdpa_override: ?bool = null; // test seam
-
-/// mlx >= 0.32.2 serves hd-256 attention on NAX with a fused full-attention
-/// kernel (`sdpa_full_self_attention_nax`), auto only at >= 1024 causal rows
-/// and reachable below that through `force_fused`. Preferred wherever NAX is
-/// available; elsewhere sushi_attn_p256 and the split/vector path serve.
-pub fn naxSdpaPreferred() bool {
-    if (nax_sdpa_override) |v| return v;
-    if (nax_sdpa_avail_cache) |v| return v;
-    const on = computeNaxAvailable();
-    nax_sdpa_avail_cache = on;
-    if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; sushi_attn_p256 causal arm declined\n", .{});
-    return on;
-}
-
-/// Family-wide NAX readiness: the hardware probe passes. This intentionally says nothing about a specific
-/// M/K/N dispatch.
-pub fn verifyQmmNaxEnabled() bool {
-    return verifyQmmEnabled() and verifyQmmNaxAvailable();
-}
-
-/// M width where the NAX tile takes over from the plain-SIMD lanes.
-pub fn naxMinMForBits(bits: u32) c_int {
-    // The byte-per-value q8 NAX tile wins already at M=7 (+6.09% over the
-    // plain lane, five thermally-settled counterbalanced pairs). Packed q4/q6
-    // still lose there, so their measured takeover remains M=8.
-    return if (bits == 8) 7 else 8;
-}
 
 const VQMM_NAX_HEADER: [:0]const u8 =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -2433,104 +2278,6 @@ pub const ATTN_QSA256_KERNEL_HEADER = ATTN_PD_KERNEL_HEADER ++
 // The Metal JIT of a cooperative-tensor kernel happens at first eval, not at
 // construction, so `qsaNaxArm` runs it once (tiny apply + eval, inference
 // thread) and a failure latches the stock gather for the process.
-var qsa_nax_os_cached: ?bool = null;
-
-pub fn qsaNaxOsSupported(version: []const u8) bool {
-    return macosVersionAtLeast(version, 26, 3);
-}
-
-pub fn qsaNaxOsOk() bool {
-    if (qsa_nax_os_cached) |v| return v;
-    var version_buf: [64]u8 = undefined;
-    const supported = qsaNaxOsSupported(macosProductVersion(&version_buf) orelse "");
-    qsa_nax_os_cached = supported;
-    return supported;
-}
-
-pub fn qsaProbeLcgBf16(s: mlx.mlx_stream, shape: []const c_int, seed: u32) ?mlx.mlx_array {
-    var n: usize = 1;
-    for (shape) |d| n *= @intCast(d);
-    const buf = std.heap.page_allocator.alloc(f32, n) catch return null;
-    defer std.heap.page_allocator.free(buf);
-    var state = seed;
-    for (buf) |*x| {
-        state = state *% 1664525 +% 1013904223;
-        x.* = @as(f32, @floatFromInt(state >> 8)) * (1.0 / 16777216.0) - 0.5;
-    }
-    const host = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
-    defer _ = mlx.mlx_array_free(host);
-    var out = mlx.mlx_array_new();
-    if (mlx.mlx_astype(&out, host, .bfloat16, s) != 0) {
-        _ = mlx.mlx_array_free(out);
-        return null;
-    }
-    if (mlx.mlx_array_eval(out) != 0) {
-        _ = mlx.mlx_array_free(out);
-        return null;
-    }
-    return out;
-}
-
-pub fn qsaProbeCorruptFirst(s: mlx.mlx_stream, arr: mlx.mlx_array) ?mlx.mlx_array {
-    var contig = mlx.mlx_array_new();
-    if (mlx.mlx_contiguous(&contig, arr, false, s) != 0) {
-        _ = mlx.mlx_array_free(contig);
-        return null;
-    }
-    defer _ = mlx.mlx_array_free(contig);
-    var f32a = mlx.mlx_array_new();
-    if (mlx.mlx_astype(&f32a, contig, .float32, s) != 0) {
-        _ = mlx.mlx_array_free(f32a);
-        return null;
-    }
-    defer _ = mlx.mlx_array_free(f32a);
-    if (mlx.mlx_array_eval(f32a) != 0) return null;
-    const n = mlx.mlx_array_size(f32a);
-    if (n == 0) return null;
-    const src = mlx.mlx_array_data_float32(f32a) orelse return null;
-    const buf = std.heap.page_allocator.alloc(f32, n) catch return null;
-    defer std.heap.page_allocator.free(buf);
-    @memcpy(buf, src[0..n]);
-    buf[0] += 1.0;
-    const shape = mlx.getShape(arr);
-    const host = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
-    defer _ = mlx.mlx_array_free(host);
-    var out = mlx.mlx_array_new();
-    if (mlx.mlx_astype(&out, host, mlx.mlx_array_dtype(arr), s) != 0) {
-        _ = mlx.mlx_array_free(out);
-        return null;
-    }
-    return out;
-}
-
-pub fn qsaProbeAllFinite(s: mlx.mlx_stream, a: mlx.mlx_array) bool {
-    var fin = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(fin);
-    if (mlx.mlx_isfinite(&fin, a, s) != 0) return false;
-    var all = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(all);
-    if (mlx.mlx_all(&all, fin, false, s) != 0) return false;
-    if (mlx.mlx_array_eval(all) != 0) return false;
-    var ok: bool = false;
-    if (mlx.mlx_array_item_bool(&ok, all) != 0) return false;
-    return ok;
-}
-
-pub fn qsaProbeMaxAbsDiff(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) ?f32 {
-    var sub = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sub);
-    if (mlx.mlx_subtract(&sub, a, b, s) != 0) return null;
-    var ab = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ab);
-    if (mlx.mlx_abs(&ab, sub, s) != 0) return null;
-    var mx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mx);
-    if (mlx.mlx_max(&mx, ab, false, s) != 0) return null;
-    if (mlx.mlx_array_eval(mx) != 0) return null;
-    var v: f32 = 0;
-    if (mlx.mlx_array_item_float32(&v, mx) != 0) return null;
-    return v;
-}
 
 /// Dequantizes chunk `c8` (8 values) of one packed row into `ev`. 4 and 8 bits fill whole uint32
 /// words; 6 bits packs four values into three bytes (little-endian bitstream, `mlx_quantize`'s
@@ -15893,8 +15640,8 @@ test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
     defer vqmm_mixed_plain_test_force = null;
     // The NAX probe must not steal these rows on an M5 box: this test is about
     // the plain-SIMD lanes, and M 2..7 is below the NAX takeover anyway.
-    vqmm_nax_probe_override = false;
-    defer vqmm_nax_probe_override = null;
+    nax_gate.vqmm_nax_probe_override = false;
+    defer nax_gate.vqmm_nax_probe_override = null;
 
     const cases = [_]struct { k: c_int, n: c_int, gs: u32, label: []const u8 }{
         .{ .k = 5120, .n = 17408, .gs = 64, .label = "mlp" }, // MLP gate/up, split-K
@@ -16116,8 +15863,8 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
         // must NOT reach the split-K family (the measured spill cliff past 7
         // live row vectors), and M=17 is past every lane.
         {
-            vqmm_nax_probe_override = false;
-            defer vqmm_nax_probe_override = null;
+            nax_gate.vqmm_nax_probe_override = false;
+            defer nax_gate.vqmm_nax_probe_override = null;
             for ([_]c_int{ 1, 8, 16, 17 }) |bad_m| {
                 const xn: usize = @intCast(bad_m * cs.k);
                 const xbuf = try allocator.alloc(f32, xn);
@@ -16366,89 +16113,6 @@ test "mixedNaxShapeEnabled keeps measured q5/q6/q8 wins and rejects narrow regre
     try testing.expect(!mixedNaxShapeEnabled(8, 32, 5120));
 }
 
-test "NAX availability rejects compiler versions and malformed GPU identifiers" {
-    for ([_][]const u8{ "air64_v27", "AIR64_V27", "metal_27", "foo17", "gfoobar27", "g17dd", "applegpu_g", "applegpu_g17_extra" }) |arch| {
-        try testing.expect(!naxAvailableFrom(false, arch, "26.6.2"));
-    }
-    try testing.expect(naxAvailableFrom(false, "AppleGPU_G17S", "26.6.2"));
-    try testing.expect(naxAvailableFrom(false, "g18p", "26.6.2"));
-    try testing.expect(!naxAvailableFrom(false, "g17p", "26.6.2"));
-}
-
-test "NAX availability probe: G17 prefix + macOS 26.2 floor + fallback rehearsal (pure parts)" {
-    // Mirrors MTPLX's shipping nax_available() gate exactly (nax_verify.py).
-    // Arch: case-insensitive prefix match on "applegpu_g17".
-    try testing.expect(naxArchIsG17("applegpu_g17s"));
-    try testing.expect(naxArchIsG17("AppleGPU_G17"));
-    try testing.expect(naxArchIsG17("applegpu_g17"));
-    try testing.expect(!naxArchIsG17("applegpu_g16")); // M4-class
-    try testing.expect(!naxArchIsG17("applegpu_g13"));
-    try testing.expect(!naxArchIsG17(""));
-    try testing.expect(naxArchIsG17("g17"));
-
-    // macOS floor: >= 26.2 (where MetalPerformancePrimitives ships).
-    try testing.expect(macosVersionAtLeast("26.2", 26, 2));
-    try testing.expect(macosVersionAtLeast("26.4.1", 26, 2));
-    try testing.expect(macosVersionAtLeast("27.0", 26, 2));
-    try testing.expect(macosVersionAtLeast("27", 26, 2));
-    try testing.expect(!macosVersionAtLeast("26.1", 26, 2));
-    try testing.expect(!macosVersionAtLeast("26", 26, 2));
-    try testing.expect(!macosVersionAtLeast("25.5", 26, 2));
-    // Unparseable components read as 0 and never satisfy the floor (MTPLX
-    // semantics: int() failures fall back to 0).
-    try testing.expect(!macosVersionAtLeast("", 26, 2));
-    try testing.expect(!macosVersionAtLeast("garbage", 26, 2));
-    try testing.expect(!macosVersionAtLeast("26.x", 26, 2));
-
-    // The combined gate.
-    try testing.expect(naxAvailableFrom(false, "applegpu_g17d", "26.2"));
-    try testing.expect(!naxAvailableFrom(false, "applegpu_g16", "26.2"));
-    try testing.expect(!naxAvailableFrom(false, "applegpu_g17d", "26.1"));
-    // SUSHI_FORCE_GPU_FAMILY_FALLBACK=1 QA rehearsal: an M5 pretends the
-    // units are absent so the exact M1-M4 plain-SIMD path runs there.
-    try testing.expect(!naxAvailableFrom(true, "applegpu_g17d", "26.4"));
-}
-
-test "naxStatusFrom: on for G17 + 26.2, off names the missing leg (--version / Settings display)" {
-    // Hardware + OS both satisfied → active. Kernels-present is a build-time
-    // invariant for our binaries (build-mlx.sh + tests/test_mlx_staged_nax.sh),
-    // so hardware capability == MLX's stock-op is_nax_available() gate.
-    try testing.expectEqualStrings("on (M5 neural accelerators)", naxStatusFrom("applegpu_g17s", "26.2"));
-    try testing.expectEqualStrings("on (M5 neural accelerators)", naxStatusFrom("applegpu_g17d", "27.0"));
-    // Pre-M5 GPU: the GPU is the blocker regardless of OS.
-    try testing.expectEqualStrings("off (requires M5-class GPU)", naxStatusFrom("applegpu_g16s", "26.4"));
-    try testing.expectEqualStrings("off (requires M5-class GPU)", naxStatusFrom("", "26.4"));
-    // M5 on an old OS: the OS is the blocker (bundle min is 26.2 anyway, but
-    // a dev build can run anywhere).
-    try testing.expectEqualStrings("off (requires macOS 26.2+)", naxStatusFrom("applegpu_g17s", "26.1"));
-}
-
-test "verifyQmmNaxAvailable: false on every non-G17 device (kernel is never built here)" {
-    // The real-device leg of the probe: on this M4 (and every CI runner) the
-    // architecture is not applegpu_g17, so the probe must read false and the
-    // NAX kernel object can never be constructed. On a real M5 the arch IS
-    // G17 and this test only checks the plumbing returned something.
-    var buf: [128]u8 = undefined;
-    const arch = gpuArchitecture(&buf) orelse {
-        // No Metal device info at all: the probe must be false.
-        try testing.expect(!verifyQmmNaxAvailable());
-        return;
-    };
-    try testing.expect(arch.len > 0);
-    var vbuf: [64]u8 = undefined;
-    const ver = macosProductVersion(&vbuf) orelse "<none>";
-    errdefer std.debug.print("[nax-probe] arch={s} macos={s} available={}\n", .{ arch, ver, verifyQmmNaxAvailable() });
-    if (!naxArchIsG17(arch)) {
-        try testing.expect(!verifyQmmNaxAvailable());
-    }
-}
-
-test "naxMinMForBits: q8 takes over at the measured M7, packed widths at M8" {
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBits(4));
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBits(6));
-    try testing.expectEqual(@as(c_int, 7), naxMinMForBits(8));
-}
-
 test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off-M5)" {
     // The half of runVerifyQmmNax that CAN execute without G17 hardware —
     // the exact production helpers (naxPadTo16 / naxSliceRows) wrapped
@@ -16637,8 +16301,8 @@ test "fusedSdpaPrefill: causal parity vs composed SDPA (GQA, ragged shapes, chun
     // The causal arm yields to the stock fused kernel on NAX silicon, so on an
     // M5-class Mac this parity check would DECLINE instead of running — the
     // kernel under test would never be exercised. Pin the arm, not the host.
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x256256);
     const rnd = prng.random();
 
@@ -16782,8 +16446,8 @@ test "fusedSdpaPrefill: only the instantiated (qk, value) width pairs are served
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x19288);
     const rnd = prng.random();
     try std.testing.expect(fusedPdDims(256, 256));
@@ -16848,8 +16512,8 @@ test "fusedSdpaPrefillKv: a quantized cache is read per dispatch, never rebuilt 
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x19282);
     const rnd = prng.random();
 
@@ -16897,8 +16561,8 @@ test "fusedSdpaPrefillKv: a kv6 cache is read per dispatch and matches the dense
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x19286);
     const rnd = prng.random();
     const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 16, 70, 192 }, s);
@@ -16927,8 +16591,8 @@ test "fusedSdpaPrefillKv: an unquantized cache view takes the dense arm unchange
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x19283);
     const rnd = prng.random();
     const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 8, 64, 192 }, s);
@@ -17501,29 +17165,6 @@ test "the sliding arm engages exactly where slidingPrefillFused says it does" {
     try std.testing.expect(engaged_any);
 }
 
-test "qsaNaxOsSupported: cooperative input tensors require macOS 26.3" {
-    try std.testing.expect(!qsaNaxOsSupported("26.2"));
-    try std.testing.expect(qsaNaxOsSupported("26.3"));
-    try std.testing.expect(qsaNaxOsSupported("26.5"));
-    try std.testing.expect(!qsaNaxOsSupported(""));
-}
-
-test "naxArchSupportedFrom: desktop gen>=17, phone gen>=18" {
-    try std.testing.expect(naxArchSupportedFrom("applegpu_g17s"));
-    try std.testing.expect(naxArchSupportedFrom("applegpu_g17"));
-    try std.testing.expect(naxArchSupportedFrom("g17"));
-    try std.testing.expect(naxArchSupportedFrom("applegpu_g18s"));
-    try std.testing.expect(naxArchSupportedFrom("g18"));
-    try std.testing.expect(!naxArchSupportedFrom("applegpu_g16s"));
-    try std.testing.expect(!naxArchSupportedFrom("g16"));
-    try std.testing.expect(!naxArchSupportedFrom("applegpu_g17p"));
-    try std.testing.expect(!naxArchSupportedFrom("g17p"));
-    try std.testing.expect(naxArchSupportedFrom("applegpu_g18p"));
-    try std.testing.expect(naxArchSupportedFrom("g18p"));
-    try std.testing.expect(!naxArchSupportedFrom("garbage"));
-    try std.testing.expect(!naxArchSupportedFrom(""));
-}
-
 // ── Verify-width QSA gather (S = 2 .. FUSED256_MIN_Q_LEN-1) ──
 
 // ── Fused sparse attention at verify widths (sushi_attn_qsa256_q) ──
@@ -17644,8 +17285,8 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     // written for. The preference is PINNED rather than read off the host:
     // `naxSdpaPreferred()` defaults to whether the machine has NAX, so leaving
     // it to the silicon makes this assertion true on an M4 and false on an M5.
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     {
         const causal = try fusedSdpaPrefill(s, q, k, k, 1.0, 0);
         try std.testing.expect(causal != null);
@@ -17656,7 +17297,7 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     // kernel) while the BAND arm stays ours — mlx's NAX kernel takes no band.
     // Nothing pinned that asymmetry before; a decline is invisible from the
     // outside, since the composed fallback is output-equivalent.
-    nax_sdpa_override = true;
+    nax_gate.nax_sdpa_override = true;
     {
         const causal = try fusedSdpaPrefill(s, q, k, k, 1.0, 0);
         try std.testing.expect(causal == null);
@@ -17687,8 +17328,8 @@ test "fusedSdpaPrefill: budgeted kv chunking engages and is exact vs single disp
     fused256_override = true;
     defer fused256_override = null;
     // Causal arm: declines on NAX silicon unless the preference is pinned.
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0xC4A2);
     const rnd = prng.random();
 
@@ -17792,8 +17433,8 @@ test "fusedSdpaPrefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64
     fused256_override = true;
     defer fused256_override = null;
     // Causal arm: declines on NAX silicon unless the preference is pinned.
-    nax_sdpa_override = false;
-    defer nax_sdpa_override = null;
+    nax_gate.nax_sdpa_override = false;
+    defer nax_gate.nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x27B27B);
     const rnd = prng.random();
 

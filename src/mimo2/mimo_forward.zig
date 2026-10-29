@@ -1,6 +1,7 @@
 //! MiMo-V2 forward: sliding/global attention arms, routed-MoE dispatch, batched decode and verify rows.
 
 const trf = @import("../transformer.zig");
+const nax_gate = @import("../nax_gate.zig");
 const Transformer = trf.Transformer;
 const std = @import("std");
 const fp8_block = @import("../fp8_block.zig");
@@ -2994,9 +2995,9 @@ test "qkv matmul2d kernel parity: many splits, and the narrower gqa 4 and 24/4 h
 
 test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs the fp32 truth, no matrix units" {
     try mlx.requireGpu();
-    const saved_nax = trf.vqmm_nax_probe_override;
-    trf.vqmm_nax_probe_override = false;
-    defer trf.vqmm_nax_probe_override = saved_nax;
+    const saved_nax = nax_gate.vqmm_nax_probe_override;
+    nax_gate.vqmm_nax_probe_override = false;
+    defer nax_gate.vqmm_nax_probe_override = saved_nax;
     defer qkv_splitk_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x3D2D_5A11);
     const rnd = prng.random();

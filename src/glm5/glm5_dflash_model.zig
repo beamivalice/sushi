@@ -1047,11 +1047,11 @@ test "GLM verify decides biased tree rows as serial decode under the same bias, 
 }
 
 test "GLM default verification schedule selects only three NAX rows" {
-    const transformer = @import("../transformer.zig");
-    const saved = transformer.vqmm_nax_probe_override;
-    defer transformer.vqmm_nax_probe_override = saved;
+    const nax_gate = @import("../nax_gate.zig");
+    const saved = nax_gate.vqmm_nax_probe_override;
+    defer nax_gate.vqmm_nax_probe_override = saved;
     for ([_]bool{ false, true }) |nax| {
-        transformer.vqmm_nax_probe_override = nax;
+        nax_gate.vqmm_nax_probe_override = nax;
         const automatic = bindDefaultSchedule();
         defer automatic.restore();
         for ([_]usize{ 1, 2, 3, 4, 16 }) |rows| {
