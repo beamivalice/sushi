@@ -22,7 +22,8 @@ for nonce in ('81492017', '52839106', '90371648'):
               + '\nWhat was the passphrase? Answer with the passphrase only.')
     body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}],
             'temperature': 0, 'seed': 1234, 'max_tokens': 32,
-            'enable_mtp': False, 'enable_pld': False, 'stream': False}
+            'enable_mtp': False, 'enable_pld': False, 'stream': False,
+            'enable_thinking': False}
     req = urllib.request.Request(url + '/v1/chat/completions',
                                  data=json.dumps(body).encode(),
                                  headers={'Content-Type': 'application/json'})

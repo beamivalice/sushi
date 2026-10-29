@@ -130,7 +130,7 @@ for i, prompt in enumerate(shorts):
 if not reached_eos:
     raise AssertionError('No accepted-draft EOS was observed; gate did not run')
 reached_cancel = False
-for attempt in range(8):
+for attempt in range(40):
     start = logfile.stat().st_size
     barrier = threading.Barrier(2)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:

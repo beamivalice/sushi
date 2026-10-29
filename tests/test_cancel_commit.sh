@@ -50,10 +50,10 @@ check() {
 # 256-token cancelled-prefill floor) so a cache hit is unambiguous.
 SYSTEM_PROMPT="$SUSHI_NONCE You are an expert software engineer assistant. You provide concise, technically correct answers. You explain trade-offs when relevant. You always cite specific function names, file paths, or line numbers when discussing code. You prefer concrete examples over abstract advice. You do not pad your answers with hedges or apologies. You assume the user is also a software engineer. You write in Markdown when formatting helps. You keep code blocks small and self-contained. You ask clarifying questions only when truly necessary. You favor depth over breadth in your explanations. You show your reasoning when it would help the reader. You never invent APIs. You state uncertainty explicitly when you are unsure."
 
-# A much longer one (~15k tokens) so prefill takes long enough for a
+# A much longer one (~70k tokens) so prefill takes long enough for a
 # mid-prefill kill to land inside it even on a fast box.
 LONG_SYSTEM=""
-for i in $(seq 1 150); do
+for i in $(seq 1 450); do
     LONG_SYSTEM="$LONG_SYSTEM Chapter $i. $SYSTEM_PROMPT"
 done
 

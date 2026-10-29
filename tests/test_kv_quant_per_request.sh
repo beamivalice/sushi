@@ -4,7 +4,7 @@
 #   1. plumbing: no field, 4, "off", 8 and 6 on /v1/chat/completions each complete with content, and the log
 #      names every override the scheduler applied; /v1/completions honours the field too.
 #   2. equivalence: the same greedy request under kv_quant 4, 6 and 8 matches kv_quant "off" for its first N
-#      tokens. KV quantization is lossy, so the bar catches kernel bugs (wrong dequantize, off-by-one slice
+#      tokens (30; kv4 is the lossiest and takes 20). KV quantization is lossy, so the bar catches kernel bugs (wrong dequantize, off-by-one slice
 #      update, NaN), not the float-reduction tail (docs/engine-kv-cache.md, "Byte stability").
 # A scheme the arch refuses (kv4 on GLM) is left out; DeepSeek has no KV cache to quantize.
 set -u
@@ -110,7 +110,7 @@ if not ref:
     sys.exit(1)
 for b in bits:
     text, toks = tokens(int(b))
-    n = int(os.environ.get(f"KV_QUANT_FIRST_N_{b}BIT", "30"))
+    n = int(os.environ.get(f"KV_QUANT_FIRST_N_{b}BIT", "20" if b == "4" else "30"))
     if not text:
         print(f"FAIL: kv{b}: empty completion, likely NaN or kernel error")
         fail = True

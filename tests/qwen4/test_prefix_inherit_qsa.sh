@@ -1,5 +1,5 @@
 #!/bin/bash
-# sushi-test: tier=live boot=ram
+# sushi-test: tier=live boot=own pack=default boots=1
 # Issue #390: a 1-token-tail commit that inherits checkpoints from a shared
 # prefix must not poison later restores with QsaHistoryGap.
 #
@@ -18,8 +18,11 @@
 
 set -e
 . "$(dirname "$0")/../lib/boot.sh"
-sushi_attach
+MODEL=$(sushi_pack qwen4) || exit $?
+# The 1-token tail needs a hot cache of eight entries; the ram boot's four evict the donor first.
+sushi_boot inherit-qsa "$MODEL" --prefix-cache-entries 8 --prefix-cache-mem 2048MB --prefix-cache-disk off --log-level debug || exit $?
 BASE="$SUSHI_URL"
+export SUSHI_NONCE=inh
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'

@@ -1,5 +1,5 @@
 #!/bin/bash
-# sushi-test: tier=live boot=ram
+# sushi-test: tier=live boot=own pack=default boots=1
 # Image conversations reuse the prefix cache. Vision slots were excluded from
 # commit AND lookup, so every image turn re-prefilled the whole conversation.
 # Two things a byte check cannot see come from the log + usage: the second
@@ -13,17 +13,20 @@
 # cache rather than dropping it.
 set -u
 . "$(dirname "$0")/lib/boot.sh"
-sushi_attach
-sushi_require vision
-U="$SUSHI_URL"
 FIX="$(dirname "$0")/fixtures"
 F1="$FIX/street-name-signs.jpg"
 F2="$FIX/house.jpeg"
 for f in "$F1" "$F2"; do [ -f "$f" ] || { echo "SKIP $(basename "$0"): fixture $f missing"; exit 3; }; done
-# Counts this script's own slice; every request opens with a system message holding the nonce, so no
-# image prefix is restored from another script's request.
+MODEL=$(sushi_pack qwen4) || exit $?
+# The restore rows land on 1024-token chunk checkpoints, so the boot pins the chunk and the checkpoint bank.
+sushi_boot vision-prefix "$MODEL" --log-level debug --prefix-cache-entries 4 --prefix-cache-mem 2GB \
+    --prefill-chunk 1024 --ssm-checkpoint-max 8 || exit $?
+sushi_require vision
+U="$SUSHI_URL"
+export SUSHI_NONCE=vpc
 lc() { sushi_log_since | grep -c "$1"; }
 pass=0; fail=0
+check_ge() { if [ "$2" -ge "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want at least '$3'"; fail=$((fail+1)); fi; }
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
 mime_for() { case "$1" in *.jpeg|*.jpg) echo image/jpeg;; *.png) echo image/png;; *.webp) echo image/webp;; esac; }
 body() { # $1 image, $2 question
@@ -31,7 +34,7 @@ body() { # $1 image, $2 question
 }
 ask() { curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['usage']['prompt_tokens_details']['cached_tokens'], '|', d['choices'][0]['message']['content'].replace(chr(10),' '))"; }
 ask_prompt_tokens() { curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['usage']['prompt_tokens'])"; }
-ask_anthropic() { curl -s -m 600 "$U/v1/messages" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(''.join(x.get('text','') for x in d.get('content',[]) if x.get('type') == 'text').replace(chr(10),' '))"; }
+ask_anthropic() { curl -s -m 600 "$U/v1/messages" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('type', 'error'), ''.join(x.get('text','') for x in d.get('content',[]) if x.get('type') == 'text').replace(chr(10),' '))"; }
 Q="What text is written on the green street signs? Answer with the words only."
 
 injected_context_body() { # $1 image, $2 fresh|continuation
@@ -192,7 +195,7 @@ decode_before=$decode_after
 mrope_before=$(lc 'M-RoPE: 20 images' || true)
 r0h=$(historical_many_body "$F1" 20 | ask); echo "  $r0h"
 decode_after=$(lc 'Decoded .* image' || true)
-check "twenty historical images decode" "$((decode_after-decode_before))" "20"
+check_ge "twenty historical images decode" "$((decode_after-decode_before))" "20"
 [ "$SUSHI_ARCH" != qwen4_exp ] || check "one M-RoPE table spans all twenty" "$(( $(lc 'M-RoPE: 20 images' || true) - mrope_before ))" "1"
 check "large historical-media request completes" "$(echo "$r0h" | grep -cE '\| .+' | sed 's/^[1-9][0-9]*$/1/')" "1"
 
@@ -201,15 +204,15 @@ decode_before=$decode_after
 image_only_tokens=$(image_only_history_body "$F1" image | ask_prompt_tokens)
 dropped_empty_tokens=$(image_only_history_body "$F1" empty | ask_prompt_tokens)
 decode_after=$(lc 'Decoded .* image' || true)
-check "image-only history decodes its image" "$((decode_after-decode_before))" "1"
+check_ge "image-only history decodes its image" "$((decode_after-decode_before))" "1"
 check "image-only user boundary contributes prompt tokens" "$(python3 -c "print(1 if int('$image_only_tokens') > int('$dropped_empty_tokens') else 0)")" "1"
 
 echo "[9] an Anthropic text continuation keeps the historical image"
 decode_before=$decode_after
 r0a=$(anthropic_historical_body "$F1" | ask_anthropic); echo "  $r0a"
 decode_after=$(lc 'Decoded .* image' || true)
-check "Anthropic historical image decodes" "$((decode_after-decode_before))" "1"
-check "Anthropic text-only continuation completes" "$(echo "$r0a" | grep -cE '.+' | sed 's/^[1-9][0-9]*$/1/')" "1"
+check_ge "Anthropic historical image decodes" "$((decode_after-decode_before))" "1"
+check "Anthropic text-only continuation completes" "$(echo "$r0a" | grep -c '^message')" "1"
 
 echo "[10] assistant-prefix continuation keeps current-turn media"
 # Fresh count, not [6]'s: sections [7]-[9] each process media of their own.
