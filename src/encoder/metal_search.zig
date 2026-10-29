@@ -1855,28 +1855,3 @@ test "metal_search: the blocked feedback update equals the row-at-a-time loop bi
     feedbackUpdate(prod, cols, err, lt, chunk);
     for (want, prod) |a, b| try t.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
 }
-
-test "metal_search: search throughput (SUSHI_ENCODER_SEARCH_UBENCH)" {
-    if (std.c.getenv("SUSHI_ENCODER_SEARCH_UBENCH") == null) return error.SkipZigTest;
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    const n_tiles: usize = 4096;
-    var prng = std.Random.DefaultPrng.init(4096);
-    const r = prng.random();
-    const tiles = try t.allocator.alloc(f32, n_tiles * tile_len);
-    defer t.allocator.free(tiles);
-    for (tiles) |*v| v.* = r.floatNorm(f32);
-    const rate = format.Rate{ .n = 40 };
-    const dec = format.Decode{ .codebook = .mcg, .window = .w15 };
-    const packed_out = try t.allocator.alloc(u16, n_tiles * rate.n);
-    defer t.allocator.free(packed_out);
-    const recon = try t.allocator.alloc(f32, n_tiles * tile_len);
-    defer t.allocator.free(recon);
-    try encodeTiles(t.allocator, s, rate, dec, tiles, packed_out, recon);
-    // Sustained, not burst: a conversion keeps the GPU busy for minutes.
-    const t0 = stages_mod.nowNs();
-    var calls: usize = 0;
-    while (stages_mod.nowNs() - t0 < 20 * std.time.ns_per_s) : (calls += 1) try encodeTiles(t.allocator, s, rate, dec, tiles, packed_out, recon);
-    const us = @as(f64, @floatFromInt(stages_mod.nowNs() - t0)) / 1e3 / @as(f64, @floatFromInt(calls * n_tiles));
-    std.debug.print("search K2.5 mcg w15: {d:.2} us/tile sustained over {d} tiles\n", .{ us, calls * n_tiles });
-}

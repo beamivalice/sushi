@@ -14,6 +14,7 @@ const box = @import("bench_box.zig");
 const exl3 = @import("sushi_exl3");
 const dsv41 = @import("ubench_dsv41.zig");
 const glm5 = @import("ubench_glm5.zig");
+const encoder = @import("sushi_encoder");
 
 const registry = [_]report.Bench{
     exl3.ubench.dsv41_experts,
@@ -25,6 +26,8 @@ const registry = [_]report.Bench{
     dsv41.topk,
     exl3.ubench.exl3_rate_groups,
     exl3.ubench.exl3_rate_groups_rows,
+    encoder.ubench.factor,
+    encoder.ubench.search,
 } ++ glm5.benches;
 
 const exit_bad_args = 2;

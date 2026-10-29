@@ -233,7 +233,8 @@ fn addUbench(b: *std.Build, build_options: *std.Build.Step.Options, target: std.
         },
     });
     addMlxLib(b, mod);
-    _ = addExl3Module(b, mod, target, .ReleaseFast);
+    const exl3 = addExl3Module(b, mod, target, .ReleaseFast);
+    mod.addImport("sushi_encoder", addEncoderModule(b, mod, exl3, target, .ReleaseFast));
     linkApple(mod, macos_sdk_frameworks);
     return b.addExecutable(.{ .name = "sushi-ubench", .root_module = mod });
 }

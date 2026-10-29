@@ -16,6 +16,8 @@ pub const shard = @import("shard.zig");
 pub const source = @import("source.zig");
 pub const stages = @import("stages.zig");
 pub const pool = @import("pool.zig");
+/// The microbench bodies `sushi-ubench` runs; its host root supplies `report`.
+pub const ubench = @import("ubench.zig");
 
 test {
     _ = capture;

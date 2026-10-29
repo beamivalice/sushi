@@ -345,7 +345,7 @@ pub fn factorBatch(
 
 /// A low-rank Hessian with log-normal channel scales; `spike` adds a rank-one outlier of that many times
 /// mean(diag) * n eigenvalue, the shape of a massive-activation channel.
-fn spdHessian(allocator: std.mem.Allocator, r: std.Random, n: usize, rank: usize, spike: f32) ![]f32 {
+pub fn spdHessian(allocator: std.mem.Allocator, r: std.Random, n: usize, rank: usize, spike: f32) ![]f32 {
     const g = try allocator.alloc(f32, n * rank);
     defer allocator.free(g);
     for (g) |*v| v.* = r.floatNorm(f32);
@@ -648,38 +648,5 @@ test "gpu_factor: a Flash-Next sized bank stays within the float32 bound of the 
         const c = compare(got, want);
         try t.expect(c.frob_rel < bound_frob_large);
         try t.expect(c.max_abs < bound_max_large * c.max_ref);
-    }
-}
-
-test "gpu_factor: factor throughput (SUSHI_ENCODER_FACTOR_UBENCH)" {
-    if (std.c.getenv("SUSHI_ENCODER_FACTOR_UBENCH") == null) return error.SkipZigTest;
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    for ([_][2]usize{ .{ 2560, 32 }, .{ 512, 16 } }) |cfg| {
-        const n = cfg[0];
-        var bank = try Bank.init(t.allocator, 77, 1, n, 64, 0.5);
-        defer bank.deinit();
-        const many = try t.allocator.alloc([]const f32, cfg[1]);
-        defer t.allocator.free(many);
-        const means = try t.allocator.alloc(f64, cfg[1]);
-        defer t.allocator.free(means);
-        const ls = try t.allocator.alloc([]f32, cfg[1]);
-        defer t.allocator.free(ls);
-        for (many, means) |*m, *mean| {
-            m.* = bank.damped[0];
-            mean.* = bank.means[0];
-        }
-        for (0..2) |_| {
-            var stats = Stats{};
-            const t0 = stages_mod.nowNs();
-            try factorBatch(t.allocator, s, many, means, n, .{}, &stats, ls);
-            const dt = stages_mod.nowNs() - t0;
-            for (ls) |l| t.allocator.free(l);
-            std.debug.print("factor n{d} x{d}: {d:.1} ms ({d:.2} ms per matrix)\n", .{ n, cfg[1], @as(f64, @floatFromInt(dt)) / 1e6, @as(f64, @floatFromInt(dt)) / 1e6 / @as(f64, @floatFromInt(cfg[1])) });
-        }
-        const c0 = stages_mod.nowNs();
-        const cpu = try quantize.ldlFactor(t.allocator, bank.raw[0], n);
-        t.allocator.free(cpu);
-        std.debug.print("cpu factor n{d}: {d:.1} ms for one matrix\n", .{ n, @as(f64, @floatFromInt(stages_mod.nowNs() - c0)) / 1e6 });
     }
 }
