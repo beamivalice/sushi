@@ -1,13 +1,13 @@
 #!/bin/bash
-# sushi-test: tier=live boot=own pack=default boots=2
+# sushi-test: tier=live boot=own pack=qwen4 boots=2
 # Qwen3.8-Flash-Next + DFlash2 drafter: engagement and byte-equality with serial decoding.
 #
 # Contract pinned here (one pack per run; the owner's gate is all three Sushi Qwen packs):
 #   1. ENGAGEMENT (with --drafter): the boot logs `DFlash drafter ready`, every bank request logs
 #      `[spec-stats] mode=dflash` with attempts > 0, and the bank accepts drafts (avg_per_round > 0).
-#   2. EQUIVALENCE: greedy output of every bank prompt, with the drafter, equals the output of the same
-#      boot with `enable_drafter:false, enable_mtp:false` byte for byte (non-stream), and the streamed answer
-#      equals the non-stream one.
+#   2. EQUIVALENCE: greedy output of every bank prompt, with the drafter, equals the output of the same boot with
+#      `enable_drafter:false, enable_mtp:false` on the request byte for byte (non-stream), and the streamed answer equals the
+#      non-stream one.
 #   3. OPT-OUT: a request with enable_drafter:false logs no mode=dflash line.
 #
 #   4. OPT-IN: a drafter beside the pack is NOT loaded without --drafter: the boot decodes with MTP.
@@ -16,30 +16,31 @@
 #   5. SAMPLED (temperature 1.0, top_p 0.95, top_k 20, what agent clients send): every bank request runs DFlash rounds
 #      and answers; the per-draft acceptance is printed, because a greedy-only bar never sees the runtime gate act.
 #
-# The drafter is not part of the pack: DFLASH2_QWEN_DRAFTER names it, and the script SKIPs without it.
+# The drafter is opt-in and not in the pack: set DFLASH2_QWEN_DRAFTER=<drafter dir>, or the script SKIPs (3).
+# DFLASH2_TEST_OUTPUT_DIR keeps the bank outputs. Extra boot flags: SUSHI_TEST_EXTRA_ARGS.
 
 set -u
 . "$(dirname "$0")/../lib/boot.sh"
-MODEL=$(sushi_pack "${SUSHI_PASS_MODEL:-qwen4}") || exit $?
+MODEL=$(sushi_pack qwen4) || exit $?
 DRAFTER="${DFLASH2_QWEN_DRAFTER:-}"
-[ -n "$DRAFTER" ] || { echo "SKIP $(basename "$0"): DFLASH2_QWEN_DRAFTER is not set (the DFlash2 drafter is opt-in and not in the pack)"; exit 3; }
-ARTIFACTS=$(mktemp -d)
-trap 'rm -rf "$ARTIFACTS"' EXIT
-LOG=""
+if [ -z "$DRAFTER" ] || [ ! -f "$DRAFTER/config.json" ] || [ ! -f "$DRAFTER/model.safetensors" ]; then
+    echo "SKIP $(basename "$0"): set DFLASH2_QWEN_DRAFTER to a DFlash2 drafter dir (opt-in, not in the pack)"
+    exit 3
+fi
+EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"
+ARTIFACTS="${DFLASH2_TEST_OUTPUT_DIR:-$(mktemp -d)}"
+mkdir -p "$ARTIFACTS"
 PASS=0
 FAIL=0
 ok() { echo "PASS $1"; PASS=$((PASS + 1)); }
 bad() { echo "FAIL $1"; shift; for line in "$@"; do echo "  $line"; done; FAIL=$((FAIL + 1)); }
 
-[ -f "$DRAFTER/config.json" ] && [ -f "$DRAFTER/model.safetensors" ] || { echo "SKIP $(basename "$0"): no drafter at $DRAFTER"; exit 3; }
-
-stop_server() { sushi_stop 0; }
-
-start_server() { # $1 = boot name, rest = flags
-    local name=$1
-    shift
-    # A warm restore re-runs the hybrid recurrence in another block size, so every cache tier is off.
-    sushi_boot "dflash2-$name" "${BOOT_MODEL:-$MODEL}" --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off --log-level info "$@" || exit $?
+start_server() { # $1 = boot name, $2 = pack, rest = flags
+    local name=$1 pack=$2
+    shift 2
+    # --prefix-cache-entries 0: a warm restore re-runs the hybrid recurrence in another block size.
+    # shellcheck disable=SC2086
+    sushi_boot "$name" "$pack" --prefix-cache-entries 0 --log-level info $EXTRA_ARGS "$@" || exit $?
     LOG="$SUSHI_LOG"
     PORT="$SUSHI_PORT"
 }
@@ -115,13 +116,13 @@ BESIDE="$ARTIFACTS/pack-with-drafter"
 mkdir -p "$BESIDE"
 for f in "$MODEL"/*; do ln -sfn "$f" "$BESIDE/$(basename "$f")"; done
 ln -sfn "$DRAFTER" "$BESIDE/dflash2"
-BOOT_MODEL="$BESIDE" start_server beside
+start_server beside "$BESIDE"
 grep -q "decodes with MTP (DFlash2: --drafter <path>)" "$LOG" && ! grep -q "DFlash drafter ready" "$LOG" &&
     ok "a drafter beside the pack is ignored: MTP decodes" || bad "a drafter beside the pack is ignored" "$(grep -E '\[spec\]|DFlash' "$LOG" | head -3)"
-stop_server
+sushi_stop
 
 echo "== boot 1: drafter ($MODEL)"
-start_server dflash --drafter "$DRAFTER"
+start_server dflash "$MODEL" --drafter "$DRAFTER"
 grep -q "DFlash drafter ready" "$LOG" && ok "boot: DFlash drafter ready ($(grep -o 'DFlash drafter ready[^.]*' "$LOG" | head -1))" ||
     bad "boot: DFlash drafter ready" "$(grep -i -E 'dflash|drafter' "$LOG" | head -5)"
 bank "$ARTIFACTS/dflash.json" || bad "bank with the drafter" "request failed"
@@ -134,9 +135,9 @@ AVG_OK=$(grep "mode=dflash" "$LOG" | sed -n 's/.*avg_per_round=\([0-9.]*\).*/\1/
 [ "$AVG_OK" = yes ] && ok "the drafter's tokens are accepted (avg_per_round > 0 somewhere)" || bad "the drafter's tokens are accepted" "every request accepted 0 drafts"
 stream_matches && ok "stream == non-stream with the drafter" || bad "stream == non-stream with the drafter"
 BEFORE=$N_STATS
-bank "$ARTIFACTS/optout.json" '{"enable_drafter": false}' >/dev/null 2>&1
+bank "$ARTIFACTS/serial.json" '{"enable_drafter": false, "enable_mtp": false}' || bad "serial bank on the drafter boot" "request failed"
 AFTER=$(grep -c "mode=dflash" "$LOG")
-# stream_matches ran two dflash requests (2 stats lines); the opt-out bank adds none.
+# stream_matches ran two dflash requests (2 stats lines); the opt-out bank, which is also the serial reference, adds none.
 [ "$AFTER" -eq $((BEFORE + 2)) ] && ok "enable_drafter:false runs no DFlash rounds" || bad "enable_drafter:false runs no DFlash rounds" "stats lines $BEFORE -> $AFTER (expected +2 from the stream pair)"
 SAMPLED_BEFORE=$AFTER
 bank "$ARTIFACTS/sampled.json" '{"temperature": 1.0, "top_p": 0.95, "top_k": 20}' || bad "sampled bank with the drafter" "request failed"
@@ -151,8 +152,7 @@ rows = json.load(open(sys.argv[1]))
 sys.exit(0 if all(len(r["text"].replace("\x01", "").strip()) > 0 for r in rows) else 1)
 PYSAMPLED
 [ $? -eq 0 ] && ok "every sampled answer is non-empty" || bad "every sampled answer is non-empty"
-bank "$ARTIFACTS/serial.json" '{"enable_drafter": false, "enable_mtp": false}' || bad "serial bank" "request failed"
-stop_server
+sushi_stop
 
 python3 - "$ARTIFACTS/dflash.json" "$ARTIFACTS/serial.json" <<'PYCMP'
 import json, sys
@@ -171,5 +171,6 @@ sys.exit(rc)
 PYCMP
 if [ $? -eq 0 ]; then ok "greedy DFlash2 == greedy serial, byte for byte, all bank prompts"; else bad "greedy DFlash2 == greedy serial"; fi
 
+echo "artifacts: $ARTIFACTS"
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
