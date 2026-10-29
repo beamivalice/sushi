@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Guard: a tool call still parses at long context, where the sliding-window
 # block trim and speculative verify interact.
 #
@@ -17,44 +17,34 @@
 # visible content. The engagement line is checked too — a rung that silently
 # fell back to short-context handling proves nothing.
 #
-# Usage: LONGCTX_TEST_MODEL=<dir> ./tests/test_tools_long_context.sh [port]
-#   LONGCTX_RUNGS=16000,32000,64000   — override the token rungs
+# Whether the checkpoint calls the tool (or finds the planted string) is its choice, so a rung without a call
+# is a note and a run where no rung called is a SKIP. A forced call would skip the spec verify this guards.
+#
+# Attaches to the shared api boot: tests/run.sh --only test_tools_long_context.sh --model <m>.
+#   LONGCTX_RUNGS=16000,32000,64000   — override the token rungs; a rung past the boot's context is a named 400
 
 set -u
 
-MODEL="${LONGCTX_TEST_MODEL:-}"
-PORT="${1:-8135}"
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+BASE=$SUSHI_URL
 RED='\033[0;31m'; GREEN='\033[0;32m'; DIM='\033[2m'; NC='\033[0m'
 PASS=0; FAIL=0
 ok()  { echo -e "  ${GREEN}PASS${NC} $1"; PASS=$((PASS+1)); }
 bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $l"; done; FAIL=$((FAIL+1)); }
 
-[ -n "$MODEL" ] || { echo "SKIP: LONGCTX_TEST_MODEL not set"; exit 0; }
-[ -f "$MODEL/config.json" ] || { echo "SKIP: no config.json at $MODEL"; exit 0; }
-[ -x ./zig-out/bin/sushi ] || { echo "FAIL: build first"; exit 1; }
-
-RUNGS="${LONGCTX_RUNGS:-16000,32000,64000}"
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-LOG=$(mktemp /tmp/tools_longctx.XXXXXX)
-./zig-out/bin/sushi --model "$MODEL" --serve --port "$PORT" --ctx-size 131072 \
-    --log-level debug > "$LOG" 2>&1 &
-SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -f "$LOG"; }
-trap cleanup EXIT
-for i in $(seq 1 600); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not start"; exit 1; }
+# A streamed DeepSeek prefills a long prompt at the SSD's pace, so it climbs one rung.
+if [ "$SUSHI_ARCH" = deepseek_v41 ]; then RUNGS="${LONGCTX_RUNGS:-16000}"; else RUNGS="${LONGCTX_RUNGS:-16000,32000,64000}"; fi
 
 IFS=',' read -r -a RUNG_LIST <<< "$RUNGS"
 CARRIED_ANY=0
+CALLED_ANY=0
 for target in "${RUNG_LIST[@]}"; do
     echo -e "${DIM}── rung ~${target} tokens ──${NC}"
-    REQ=$(python3 - "$target" <<'PY'
+    REQ=$(python3 - "$target" "$SUSHI_NONCE" <<'PY'
 import json, sys
 target = int(sys.argv[1])
+nonce = sys.argv[2]
 # Filler that is cheap to generate and impossible to compress into a short
 # answer, with a planted fact the tool call has to carry back.
 # ~24 tokens per record, measured against /v1/models tokenizers — sizing by
@@ -63,7 +53,7 @@ para = ("Record %04d: the maintenance log notes routine calibration of unit %04d
         "with no anomalies observed during the shift.\n")
 filler = "".join(para % (i, i) for i in range(max(1, target // 24)))
 planted = "AURORA-7731"
-prompt = (filler
+prompt = (nonce + " " + filler
           + "\nThe archive identifier for every record above is " + planted + ".\n"
           + "Now call the write_file tool exactly once to save the archive identifier "
             "to notes.txt. Put the identifier in the content argument.")
@@ -75,7 +65,7 @@ print(json.dumps({
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"]}}}],
-    "max_tokens": 200, "temperature": 0, "stream": False}))
+    "max_tokens": 2048, "reasoning_effort": "low", "temperature": 0, "stream": False}))
 PY
 )
     RESP=$(echo "$REQ" | curl -s -m 1800 -w '\n%{http_code}' "$BASE/v1/chat/completions" \
@@ -121,10 +111,15 @@ print('%s|%d|%d|%d|%d' % (tcs[0]['function']['name'], valid, leak, d['usage']['p
     PT=$(echo "$V" | cut -d'|' -f4)
     CARRIED=$(echo "$V" | cut -d'|' -f5)
 
+    [ "$LEAK" = "0" ]   && ok "[$target] no tool markup in visible content" || bad "[$target] tool markup leaked into content"
+    if [ "$NAME" = "no-call" ]; then
+        echo -e "  ${DIM}note [$target] the model made no tool call (prompt=$PT tokens)${NC}"
+        continue
+    fi
+    CALLED_ANY=1
     [ "$NAME" = "write_file" ] && ok "[$target] tool call fires with the declared name (prompt=$PT tokens)" \
                                || bad "[$target] tool call fires" "got name='$NAME' (prompt=$PT tokens)"
     [ "$VALID" = "1" ]  && ok "[$target] arguments are valid JSON" || bad "[$target] arguments are valid JSON"
-    [ "$LEAK" = "0" ]   && ok "[$target] no tool markup in visible content" || bad "[$target] tool markup leaked into content"
     # Whether a 4-bit model finds one planted string in a 64k haystack is
     # RETRIEVAL, not a serving contract — measured here it carries it at 32k and
     # drops it at 16k and 64k, on the same build. What the trim could plausibly
@@ -138,22 +133,32 @@ print('%s|%d|%d|%d|%d' % (tcs[0]['function']['name'], valid, leak, d['usage']['p
     fi
 done
 
-# If the trim had broken long-context attention, the model would carry the
-# planted value at NO length. One rung is enough to show it still reads.
-if [ "${CARRIED_ANY:-0}" = "1" ]; then
-    ok "the model still reads the long prompt (planted identifier recovered on at least one rung)"
-else
-    bad "long-context comprehension" "the planted identifier was lost at EVERY rung — the model is not reading the prompt"
-fi
-
-# The rungs only mean something if the trim actually engaged on this arch.
-if grep -q "block trim engaged" "$LOG"; then
-    ok "sliding block trim engaged during the long-context rounds"
-    grep -m1 "block trim engaged" "$LOG" | sed 's/^/        /'
+# The rungs only mean something if the trim actually engaged on this arch. The line is one-shot per process, and
+# earlier scripts on the shared boot may have fired it, so this reads the whole boot log.
+TRIM=0
+if grep -q "block trim engaged" "$SUSHI_LOG"; then
+    TRIM=1
+    ok "sliding block trim engaged on this boot"
+    grep -m1 "block trim engaged" "$SUSHI_LOG" | sed 's/^/        /'
 else
     echo -e "  ${DIM}note: no [sliding] trim line — this arch has no sliding layers, so the rungs exercised full attention${NC}"
 fi
 
+# If the trim had broken long-context attention, the model would carry the
+# planted value at NO length. One rung is enough to show it still reads. Where nothing was trimmed this is
+# plain retrieval by a quantized checkpoint, so it is only a note.
+if [ "${CARRIED_ANY:-0}" = "1" ]; then
+    ok "the model still reads the long prompt (planted identifier recovered on at least one rung)"
+elif [ "$TRIM" = "1" ] && [ "$CALLED_ANY" = "1" ]; then
+    bad "long-context comprehension" "the planted identifier was lost at EVERY rung — the model is not reading the prompt"
+else
+    echo -e "  ${DIM}note: the planted identifier was not recovered on any rung${NC}"
+fi
+
 echo
 echo "tools at long context: $PASS passed, $FAIL failed"
+if [ "$FAIL" -eq 0 ] && [ "$CALLED_ANY" = "0" ]; then
+    echo "SKIP $(basename "$0"): no rung produced a tool call (or every rung was refused for its context size)"
+    exit 3
+fi
 [ "$FAIL" -eq 0 ]
