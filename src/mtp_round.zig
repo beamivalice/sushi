@@ -2,6 +2,7 @@ const std = @import("std");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const expectError = @import("test_expect.zig").expectError;
 const generate_mod = @import("generate.zig");
+const mtp_policy = @import("mtp_policy.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
@@ -16,30 +17,13 @@ const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
 const transformer_mod = @import("transformer.zig");
 const CommittedArgmax = generate_mod.CommittedArgmax;
-const DraftStepPath = Generator.DraftStepPath;
 const DrafterStepResult = Generator.DrafterStepResult;
 const ForwardCtx = transformer_mod.ForwardCtx;
 const Generator = generate_mod.Generator;
-const LookupLines = Generator.LookupLines;
-const MTP_DRAFT_TEMP = Generator.MTP_DRAFT_TEMP;
-const MTP_DRAFT_TEMP_QWEN4 = Generator.MTP_DRAFT_TEMP_QWEN4;
-const MTP_DRAFT_TOP_K = Generator.MTP_DRAFT_TOP_K;
-const MTP_DRAFT_TOP_P = Generator.MTP_DRAFT_TOP_P;
-const MTP_EV_WARMUP_ROUNDS = Generator.MTP_EV_WARMUP_ROUNDS;
-const MTP_GROUP_ROWS_MAX = Generator.MTP_GROUP_ROWS_MAX;
-const MTP_SAMPLED_PROPOSAL_MIN_TEMP = Generator.MTP_SAMPLED_PROPOSAL_MIN_TEMP;
-const MtpBatchedGraph = Generator.MtpBatchedGraph;
-const MtpCostSource = Generator.MtpCostSource;
-const MtpGraphFn = Generator.MtpGraphFn;
-const MtpHistStash = Generator.MtpHistStash;
-const MtpPreDraft = Generator.MtpPreDraft;
-const MtpRoundBegin = Generator.MtpRoundBegin;
-const MtpRoundOpen = Generator.MtpRoundOpen;
-const MtpRoundPlan = Generator.MtpRoundPlan;
-const MtpRoundState = Generator.MtpRoundState;
-const MtpRowVerdict = Generator.MtpRowVerdict;
-const MtpSerialExit = Generator.MtpSerialExit;
-const SubLap = Generator.SubLap;
+const MTP_EV_WARMUP_ROUNDS = mtp_policy.MTP_EV_WARMUP_ROUNDS;
+const MtpCostSource = mtp_policy.MtpCostSource;
+const MtpRoundPlan = mtp_policy.MtpRoundPlan;
+const SubLap = mtp_policy.SubLap;
 const Transformer = transformer_mod.Transformer;
 const isEosId = generate_mod.isEosId;
 const mtpAdaptiveEnabled = Generator.mtpAdaptiveEnabled;
@@ -53,6 +37,8 @@ const mtpVerifyDraftsMax = Generator.mtpVerifyDraftsMax;
 const testing = std.testing;
 const verifyArgmax = generate_mod.verifyArgmax;
 const verifyRows2d = generate_mod.verifyRows2d;
+const tokenizer_mod = @import("tokenizer.zig");
+const Tokenizer = tokenizer_mod.Tokenizer;
 
 var mtp_trace_sync_env: ?bool = null;
 
@@ -2470,9 +2456,244 @@ pub fn mtpKvLen(self: *const Generator) u32 {
     return @intCast(self.prompt_ids_owned.len + self.generated_ids.items.len);
 }
 
+pub const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, sampler.SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
+
+/// Qwen native-MTP speculative round. Structure mirrors `nextDrafter`
+/// (same verify invariant: cache.step = prompt_len + emitted, t1 NOT in
+/// cache on entry, verify input `[t1, draft[0..m-1]]`, bonus from row m,
+/// partial-accept snapshot/restore + re-forward) with one addition: the
+/// MTP head's committed-history KV cache. Draft steps append m temporary
+/// entries built from MTP-PREDICTED hiddens; after the verify decision we
+/// restore the round-boundary snapshot and re-append the committed pairs
+/// from TRUE trunk hiddens, so the history never accumulates drift.
+pub const MtpHistStash = struct {
+    /// `[n]` int32 committed token ids: `[t1, drafts[0..accepted]]`.
+    ids: mlx.mlx_array,
+    /// `[1, n, H]` trunk hiddens paired 1:1 with `ids` (a lazy concat of
+    /// last_hidden + a verify-capture slice — the handle pins the ~90 KB
+    /// parent until consumed, deliberately NOT a deep copy).
+    hidden: mlx.mlx_array,
+    n: usize,
+    /// Head-cache position of ids[0]'s entry (the producing round's
+    /// mtp_off0). The consume-time truncate drops the producing round's
+    /// stale draft tail past it.
+    off0: usize,
+    /// `ids` on the host (the MiMo head records committed tokens).
+    host_ids: [mtp_mod.MAX_DEPTH + 1]u32 = undefined,
+
+    pub fn deinit(self: *MtpHistStash) void {
+        _ = mlx.mlx_array_free(self.ids);
+        _ = mlx.mlx_array_free(self.hidden);
+    }
+};
+
+/// One round's lazily-built MTP draft chain — the Phase 0/1 state that
+/// cross-round pre-drafting (`mtpMaybePreDraft`) moves into the PREVIOUS
+/// round's tail. Owns every handle it holds; `deinit` frees whatever was
+/// built so far, so it is safe on partial builds and on a pre-draft left
+/// unconsumed at request end.
+pub const MtpPreDraft = struct {
+    plan: MtpRoundPlan,
+    /// Head-cache position of this round's first draft entry.
+    off0: usize,
+    t1: u32,
+    /// `[1]` int32 t1 — the verify input needs it again in Phase 3.
+    t1_arr: mlx.mlx_array,
+    /// Host draft ids, filled at the Phase 4b sync. len = plan.m_hi.
+    drafts: []u32,
+    /// Lazy `[1]` int32 draft ids. len = plan.m_hi; [0..n_drafted) valid.
+    draft_arrs: []mlx.mlx_array,
+    n_drafted: u32,
+    /// Rows the head's first step reads (the stash plus t1); 0 for a lookup chain.
+    head_input_rows: u32 = 1,
+    /// Chunk-A log-confidence graphs (two-chunk plans only). len m_lo.
+    conf_arrs: ?[]mlx.mlx_array,
+    n_conf: u32,
+    /// Proposal densities q, present when depth 0 samples; an argmax
+    /// depth's row is its one-hot. len m_hi; [0..n_qp) valid.
+    q_probs: ?[]mlx.mlx_array,
+    n_qp: u32,
+    /// Chain hidden after the last built step (owned) — a chunk-B
+    /// extension resumes from it; freed once the chain is complete.
+    h_chain: ?mlx.mlx_array,
+    /// Tokens actually drafted this round; starts at m_lo, grows to
+    /// m_hi iff the confidence gate clears at the chunk boundary.
+    m: u32,
+    /// Drafts are a context continuation (`mtpLookupChain`): nothing to
+    /// build, and no MTP statistics are fed.
+    lookup: bool = false,
+
+    pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
+        _ = mlx.mlx_array_free(self.t1_arr);
+        for (self.draft_arrs[0..self.n_drafted]) |arr| _ = mlx.mlx_array_free(arr);
+        allocator.free(self.draft_arrs);
+        if (self.conf_arrs) |slots| {
+            for (slots[0..self.n_conf]) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(slots);
+        }
+        if (self.q_probs) |slots| {
+            for (slots[0..self.n_qp]) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(slots);
+        }
+        if (self.h_chain) |h| _ = mlx.mlx_array_free(h);
+        allocator.free(self.drafts);
+    }
+};
+
+pub const LookupLines = struct {
+    tok: *const Tokenizer,
+    pub fn hasNewline(self: LookupLines, id: u32) bool {
+        return self.tok.tokenHasNewline(id);
+    }
+};
+
+/// What one draft step reads. Both rerank paths skip the head's own vocab
+/// projection (the token comes off the coarse readout's exactly re-scored
+/// top-32); `full_logits` pays the whole lm_head because something
+/// downstream needs a density over the vocabulary. A SAMPLED proposal does
+/// not: q over the shortlist is the proposal's true density, zero off it,
+/// and the verify's residual covers the rest.
+pub const DraftStepPath = enum { rerank_greedy, rerank_sampled, full_logits };
+
+/// Batched accept/correction graph for one stochastic round. Replaces
+/// the per-position construction — m single-element gathers + concat
+/// for accept_p (again for accept_q under sharp drafts) and 1+m
+/// SEPARATE full-vocab log+categorical correction samplers — with
+/// single batched kernels: one [m,1] take_along_axis per accept vector
+/// and ONE [1+m, V] log+categorical covering every possible reject
+/// position plus the full-accept bonus. Identical math and identical
+/// output distributions; only the dispatch count (and the PRNG key
+/// split pattern — one batched categorical draw instead of 1+m
+/// sequential ones) changes.
+pub const MtpBatchedGraph = struct {
+    /// [1+m] int32 pre-sampled corrections (index a = residual sample
+    /// for a reject at position a; index m = full-accept bonus).
+    corr_samples: mlx.mlx_array,
+    /// [m] f32 filtered target probability of each draft.
+    accept_p: mlx.mlx_array,
+    /// [m] f32 proposal density at each draft (sharp drafts only;
+    /// null-ctx under greedy proposals). Typical mode stores its entropy
+    /// floor here instead.
+    accept_q: mlx.mlx_array,
+    /// [m] bool TokenV3 deferral decisions; null for other modes.
+    accept_defer: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: *MtpBatchedGraph) void {
+        _ = mlx.mlx_array_free(self.corr_samples);
+        _ = mlx.mlx_array_free(self.accept_p);
+        if (self.accept_q.ctx != null) _ = mlx.mlx_array_free(self.accept_q);
+        if (self.accept_defer.ctx != null) _ = mlx.mlx_array_free(self.accept_defer);
+    }
+};
+
+/// A speculative round between its draft chain and its verdict. `mtpRoundBegin`
+/// builds it, `mtpRoundVerify` (solo) or the scheduler's group verify fills the
+/// three verify outputs, `mtpRoundFinish` consumes them.
+pub const MtpRoundState = struct {
+    chain: MtpPreDraft,
+    tracing: bool,
+    ph: io_util.Stopwatch,
+    round_watch: io_util.Stopwatch,
+    kv_step_snap: usize,
+    kv_snap: ?transformer_mod.KVCacheSnapshot,
+    moe_seq_offset_snap: usize,
+    /// `[1, 1+m]` int32.
+    verify_input: mlx.mlx_array,
+    /// Positions the verify forward ran; `1 + m` solo, the group's widest row batched.
+    verify_len: u32,
+    /// `c_n`: the positions this row committed, stamped by the finish.
+    retained: u32 = 0,
+    verify_rollback: ?Transformer.VerifyRollback = null,
+    verify_ctx: ?*ForwardCtx = null,
+    verify_argmax: CommittedArgmax = .{},
+    verify_logits: mlx.mlx_array = .{ .ctx = null },
+    new_hidden: mlx.mlx_array = .{ .ctx = null },
+    verify_hidden_all: mlx.mlx_array = .{ .ctx = null },
+    /// The group's joined `[1, Σ(1+m_i), V]` verify block, held by the FIRST
+    /// row's state; the accept side filters it once for every sampled row.
+    group_logits: mlx.mlx_array = .{ .ctx = null },
+    /// Phase-4 terms the group prepared for this row (sampled rows only):
+    /// the accept graph's own outputs, whichever acceptance mode built them.
+    /// `accept_p` null-ctx = this row builds its own in the finish.
+    accept_p: mlx.mlx_array = .{ .ctx = null },
+    accept_q: mlx.mlx_array = .{ .ctx = null },
+    accept_defer: mlx.mlx_array = .{ .ctx = null },
+    corr: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: *MtpRoundState, allocator: std.mem.Allocator) void {
+        self.chain.deinit(allocator);
+        if (self.kv_snap) |*snap| snap.deinit();
+        _ = mlx.mlx_array_free(self.verify_input);
+        self.verify_argmax.deinit();
+        if (self.verify_logits.ctx != null) _ = mlx.mlx_array_free(self.verify_logits);
+        if (self.group_logits.ctx != null) _ = mlx.mlx_array_free(self.group_logits);
+        self.releasePreparedAccept();
+        if (self.new_hidden.ctx != null) _ = mlx.mlx_array_free(self.new_hidden);
+        if (self.verify_hidden_all.ctx != null) _ = mlx.mlx_array_free(self.verify_hidden_all);
+        if (self.verify_ctx) |ctx| {
+            if (ctx.ssm_entries) |entries| for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        }
+        if (self.verify_rollback) |*saved| {
+            saved.restore();
+            saved.deinit();
+        }
+    }
+
+    /// Drop the group-prepared Phase-4 terms, so the row's finish builds its own.
+    pub fn releasePreparedAccept(self: *MtpRoundState) void {
+        inline for (.{ &self.accept_p, &self.accept_q, &self.accept_defer, &self.corr }) |slot| {
+            if (slot.ctx != null) {
+                _ = mlx.mlx_array_free(slot.*);
+                slot.* = .{ .ctx = null };
+            }
+        }
+    }
+};
+
+pub const MtpRowVerdict = struct { accepted: u32, next_pending: u32 };
+
+pub const MTP_GROUP_ROWS_MAX = 32;
+
+pub const MtpRoundOpen = struct {
+    chain: MtpPreDraft,
+    tracing: bool,
+    ph: io_util.Stopwatch,
+    round_watch: io_util.Stopwatch,
+};
+
+pub const MtpRoundBegin = union(enum) { done: ?DrafterStepResult, verify: MtpRoundState, open: MtpRoundOpen };
+
+/// Target temperature at or below which the GREEDY proposal still wins:
+/// the argmax accepts with `p_target[argmax]`, high only while the target
+/// row is sharp. Measured crossover between 0.3 and 0.7 on Flash Next.
+pub const MTP_SAMPLED_PROPOSAL_MIN_TEMP: f32 = 0.5;
+
+// ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
+// Drafts for a stochastic target are SAMPLED from a fixed sharper
+// distribution (constants mirror oMLX's _DRAFT_SAMPLER_*: their comment —
+// matched-temp drafting "collapses to ~10-20% on high-entropy content"),
+// acceptance is the full Leviathan/Chen ratio min(1, p/q) with q = the
+// draft sampler's own filtered distribution, and rejection re-samples
+// from normalize(max(p-q, 0)). Output distribution provably equals the
+// target's filtered p for ANY proposal q (pinned by the toy-vocab
+// exactness test); q only moves the ACCEPTANCE RATE, which is why the
+// draft head's quantization never affects correctness.
+pub const MTP_DRAFT_TEMP: f32 = 0.6;
+
+pub const MTP_DRAFT_TOP_P: f32 = 0.95;
+
+pub const MTP_DRAFT_TOP_K: u32 = 20;
+
+/// Draft temperature is per FAMILY: the sidecar head's 0.6 does not carry
+/// over, and Flash Next drafts best at the target's own temperature.
+pub const MTP_DRAFT_TEMP_QWEN4: f32 = 1.0;
+
+/// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.
+pub const MtpSerialExit = enum { none, drain, capture };
+
 test "a planner-owned slot rejoins the planner after a forced commit, any other takes the serial ramp" {
-    try testing.expectEqual(Generator.MtpSerialExit.none, Generator.mtpSerialExitAfterForced(true));
-    try testing.expectEqual(Generator.MtpSerialExit.drain, Generator.mtpSerialExitAfterForced(false));
+    try testing.expectEqual(MtpSerialExit.none, Generator.mtpSerialExitAfterForced(true));
+    try testing.expectEqual(MtpSerialExit.drain, Generator.mtpSerialExitAfterForced(false));
 }
 
 test "specAcceptProb: full Leviathan ratio, q-clamped" {
@@ -2704,7 +2925,7 @@ test "mtpRoundOff0: a pending history stash overrides the stale cache length" {
     // (step is stale/uncommitted), so the origin is where the stash's entries
     // will END once the consume-time truncate + merged forward run. A round
     // that read mc.step here would draft at the WRONG RoPE offsets.
-    const st = Generator.MtpHistStash{
+    const st = MtpHistStash{
         .ids = .{ .ctx = null },
         .hidden = .{ .ctx = null },
         .n = 3, // t1 + 2 accepted drafts
@@ -2774,7 +2995,7 @@ test "group acceptance: every row's verdict comes from its OWN am, at any accept
 }
 
 test "batched MTP draft rows stop at their own depth and allocation" {
-    var chains: [3]Generator.MtpPreDraft = undefined;
+    var chains: [3]MtpPreDraft = undefined;
     var wide: [5]mlx.mlx_array = undefined;
     var short: [1]mlx.mlx_array = undefined;
     var middle: [3]mlx.mlx_array = undefined;
@@ -2796,7 +3017,7 @@ test "batched MTP draft rows stop at their own depth and allocation" {
 test "batched MTP draft rows stop without touching inactive generators" {
     var gens: [2]Generator = undefined;
     var ptrs = [_]*Generator{ &gens[0], &gens[1] };
-    var chains: [2]Generator.MtpPreDraft = undefined;
+    var chains: [2]MtpPreDraft = undefined;
     chains[0].m = 4;
     chains[0].n_drafted = 4;
     chains[1].m = 1;
@@ -2822,7 +3043,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
     gen.ctx.mrope_pos = null;
     gen.mtp_hist_stash = null;
     gen.last_hidden = .{ .ctx = null };
-    const chain: Generator.MtpPreDraft = .{
+    const chain: MtpPreDraft = .{
         .plan = .{ .m_lo = 1, .m_hi = 2, .tau_ln = 0 },
         .off0 = 0,
         .t1 = 1,
@@ -2837,7 +3058,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
         .h_chain = null,
         .m = 1,
     };
-    const open: Generator.MtpRoundOpen = .{
+    const open: MtpRoundOpen = .{
         .chain = chain,
         .tracing = false,
         .ph = undefined,
@@ -2961,8 +3182,8 @@ test "mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never 
 }
 
 test "mtpLookupCostsFor: a lookup is the MTP round at its draft count minus the head steps, until the lookup row is measured" {
-    const costs = Generator.MTP_EV_DEFAULT_COSTS;
-    const prior = Generator.MtpCostSource.init(costs, 1000, null);
+    const costs = mtp_policy.MTP_EV_DEFAULT_COSTS;
+    const prior = mtp_policy.MtpCostSource.init(costs, 1000, null);
     const c = Generator.mtpLookupCostsFor(prior, 3);
     try testing.expectApproxEqAbs(Generator.mtpEvRoundCostAt(costs, 3, false, 1000), c.mtp, 1e-6);
     for (c.lookup, 0..) |x, ki| {
@@ -2975,7 +3196,7 @@ test "mtpLookupCostsFor: a lookup is the MTP round at its draft count minus the 
     for (0..round_cost.MIN_SAMPLES + 1) |_| _ = t.observe(2, 1000, 30.0, 2.5, true, false);
     _ = t.observeLookup(5, 1000, 500.0, 6.0, true);
     for (0..round_cost.MIN_SAMPLES) |_| _ = t.observeLookup(5, 1000, 40.0, 6.0, true);
-    const live = Generator.MtpCostSource.init(costs, 1000, &t);
+    const live = mtp_policy.MtpCostSource.init(costs, 1000, &t);
     try testing.expect(live.fromTable());
     const m = Generator.mtpLookupCostsFor(live, 2);
     try testing.expectApproxEqAbs(30.0 * live.scale, m.mtp, 1e-4);
@@ -3015,7 +3236,7 @@ test "mtpRoundAcceptObserve: a lookup round feeds only the lookup counters, an M
 test "the lookup gate prices the MTP chain at the width its rounds draft, not the plan's base width" {
     // A two-chunk plan (m_lo 1, extending to 3) whose rounds accept ~2.7: priced at its base width, the
     // MTP side reads 3.7 tokens for a one-draft round and a copy's seven-draft lookup loses.
-    const two_chunk = Generator.MtpRoundPlan{ .m_lo = 1, .m_hi = 3, .tau_ln = 0 };
+    const two_chunk = mtp_policy.MtpRoundPlan{ .m_lo = 1, .m_hi = 3, .tau_ln = 0 };
     try testing.expectEqual(@as(u32, 1), Generator.mtpLookupPriceWidth(two_chunk, 0));
     try testing.expectEqual(@as(u32, 3), Generator.mtpLookupPriceWidth(two_chunk, 2.9));
     try testing.expectEqual(@as(u32, 3), Generator.mtpLookupPriceWidth(two_chunk, 6));
@@ -3028,7 +3249,7 @@ test "the lookup gate prices the MTP chain at the width its rounds draft, not th
     }
     _ = t.observeLookup(7, 1000, 500.0, 8.0, true);
     for (0..round_cost.MIN_SAMPLES) |_| _ = t.observeLookup(7, 1000, 71.0, 7.5, true);
-    const src = Generator.MtpCostSource.init(Generator.MTP_EV_MIMO_EXL3_COSTS, 1000, &t);
+    const src = mtp_policy.MtpCostSource.init(mtp_policy.MTP_EV_MIMO_EXL3_COSTS, 1000, &t);
     try testing.expect(src.fromTable());
     var d: [20]u32 = undefined;
     for (&d, 0..) |*x, i| x.* = @intCast(i);
