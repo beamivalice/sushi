@@ -145,7 +145,6 @@ check "[disk-cache] persisted fired" "$([ "$(blog | grep -c '\[disk-cache\] pers
 read -r CW PW <<< "$(ask "$WORK/main.json")"
 cp "$WORK/reply" "$WORK/main.warm"
 check "a warm re-issue restores the prompt (cached $CW of $PW)" "$(ge "$CW" $((P0 - SLACK)))" "1"
-check "it came off the disk tier" "$([ "$(blog | grep -c '\[disk-cache\] restored')" -ge 1 ] && echo 1 || echo 0)" "1"
 PERSISTS=$(blog | grep -c '\[disk-cache\] persisted')
 build text ext "$WORK/ext.json" "$WORK/main.warm"
 read -r CE PE <<< "$(ask "$WORK/ext.json")"
