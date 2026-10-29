@@ -26,6 +26,7 @@ test {
     _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
+    _ = @import("tool_calls.zig");
     _ = @import("think_tags.zig");
     _ = @import("stop_sequences.zig");
     _ = @import("format_corpus_test.zig");
