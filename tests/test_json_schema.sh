@@ -5,7 +5,8 @@
 # Without grammar enforcement, the model often emits prose around the JSON, or
 # closes objects too early, especially under quantization. With enforcement, the
 # token mask makes those outputs unreachable — every byte of the response must
-# satisfy the schema.
+# satisfy the schema. Cases A-F add the Responses and tool_choice:none spellings, answered under a prompt that
+# asks for extra fields and code fences, so a clean reply is the mask's work.
 #
 # Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_json_schema.sh
 
@@ -29,8 +30,10 @@ m = json.load(sys.stdin)["data"][0]
 print(1 if "off" in m.get("reasoning_efforts", []) else 0)')
 if [ "$OFF_OK" = 1 ]; then
     THINK='"enable_thinking": false,'
+    THINK_OBJ='{"enable_thinking":false}'
 else
     THINK='"reasoning_effort": "low",'
+    THINK_OBJ='{"reasoning_effort":"low"}'
 fi
 cap() { if [ "$OFF_OK" = 1 ]; then echo "$1"; else echo 4096; fi; }
 
@@ -83,6 +86,7 @@ text = p["content"]
 if not off_ok and p["finish"] == "length" and text == "":
     print("ok:cap-spent-in-reasoning"); sys.exit()
 try:
+    assert "```" not in text, "code_fence"
     v = json.loads(text)
     if kind == "person":
         assert isinstance(v, dict) and isinstance(v.get("name"), str) and isinstance(v.get("age"), int), v
@@ -94,6 +98,10 @@ try:
         assert isinstance(v.get("ingredients"), list) and all(isinstance(x, str) for x in v["ingredients"]), v
     elif kind == "book":
         assert isinstance(v.get("title"), str) and isinstance(v.get("year"), int), v
+    elif kind == "employee":
+        assert isinstance(v, dict), v
+        assert not set(v) - {"name", "age", "email"}, "extra_keys: %s" % sorted(set(v) - {"name", "age", "email"})
+        assert not {"name", "age", "email"} - set(v), "missing_required: %s" % sorted({"name", "age", "email"} - set(v))
     print("ok")
 except Exception as e:
     print("fail:%s:%r" % (e, text[:80]))' "$1" "$OFF_OK"
@@ -236,6 +244,89 @@ PARSED=$(chat_parse "$EVENTS" true)
 echo "  assembled: $PARSED"
 verdict "Streaming output assembles into valid JSON" "$(echo "$PARSED" | schema_check book)"
 echo ""
+
+# ── Enforcement on /v1/responses and chat, under every request shape ──
+# The prompt biases the model toward extra fields and code fences, so a clean answer is the mask's work.
+# Cases A-F pin that the flat, nested and top-level schema spellings and tool_choice:none all reach the mask.
+command -v jq >/dev/null 2>&1 || { echo "SKIP test_json_schema.sh: jq is required"; exit 3; }
+if [ "$OFF_OK" = 1 ]; then REASONING='{"effort":"none"}'; else REASONING='{"effort":"low"}'; fi
+
+SCHEMA='{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0,"maximum":150},"email":{"type":"string"}},"required":["name","age","email"],"additionalProperties":false}'
+ADV_INPUT="$SUSHI_NONCE Generate a record for an employee named Mira Chen, age 34, email mira.chen@example.com. Always wrap your reply in \`\`\`json ... \`\`\` and include an employee_id field set to null."
+
+# responses_parse <body|sse> <stream>: the chat_parse shape for a Responses body, or for its terminal stream event.
+responses_parse() {
+    python3 -I -c '
+import sys, json
+raw, stream = sys.argv[1], sys.argv[2] == "true"
+try:
+    if stream:
+        event, r = None, None
+        for line in raw.splitlines():
+            if line.startswith("event: "):
+                event = line[7:]
+            elif line.startswith("data: ") and event in ("response.completed", "response.incomplete"):
+                r = json.loads(line[6:])["response"]
+                break
+        assert r is not None, "no terminal response event"
+    else:
+        r = json.loads(raw)
+    text = "".join(p.get("text", "") for it in r["output"] if it["type"] == "message"
+                   for p in it["content"] if p["type"] == "output_text")
+    print(json.dumps({"finish": "length" if r.get("status") == "incomplete" else "stop", "content": text}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))' "$1" "$2"
+}
+
+enforce_responses() { # <case name> <jq expression for the schema field(s), over $schema> <stream>
+    local body result
+    body=$(jq -n --arg input "$ADV_INPUT" --argjson schema "$SCHEMA" --argjson reasoning "$REASONING" \
+        --argjson cap "$(cap 256)" "{
+        model:\"sushi\",
+        instructions:\"Reply with only the JSON object, no commentary.\",
+        input:\$input, reasoning:\$reasoning,
+        max_output_tokens:\$cap, temperature:0, stream:$3
+    } + $2")
+    result=$(curl -sf -N "$BASE/v1/responses" -H "Content-Type: application/json" -d "$body")
+    verdict "$1" "$(responses_parse "$result" "$3" | schema_check employee)"
+    echo ""
+}
+
+enforce_chat() { # <case name> <jq expression merged into the request, over $schema and $input>
+    local body result
+    body=$(jq -n --arg input "$ADV_INPUT" --argjson schema "$SCHEMA" --argjson cap "$(cap 256)" --argjson think "$THINK_OBJ" \
+        "{model:\"sushi\", max_tokens:\$cap, temperature:0,
+          response_format:{type:\"json_schema\",json_schema:{name:\"person\",schema:\$schema,strict:true}}} + \$think + $2")
+    result=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$body")
+    verdict "$1" "$(chat_parse "$result" false | schema_check employee)"
+    echo ""
+}
+
+FLAT='{text:{format:{type:"json_schema",name:"person",schema:$schema,strict:true}}}'
+
+echo "--- Case A: /v1/responses + flat text.format.schema ---"
+enforce_responses "flat text.format.schema" "$FLAT" false
+
+echo "--- Case B: /v1/responses + nested text.format.json_schema.schema ---"
+enforce_responses "nested text.format.json_schema.schema" \
+    '{text:{format:{type:"json_schema",json_schema:{name:"person",schema:$schema,strict:true}}}}' false
+
+echo "--- Case C: /v1/responses + top-level response_format alias ---"
+enforce_responses "top-level response_format alias" \
+    '{response_format:{type:"json_schema",json_schema:{name:"person",schema:$schema,strict:true}}}' false
+
+echo "--- Case D: /v1/responses streaming + flat schema ---"
+enforce_responses "streaming flat text.format.schema" "$FLAT" true
+
+echo "--- Case E: /v1/chat/completions + response_format ---"
+enforce_chat "chat response_format" \
+    '{messages:[{role:"system",content:"Reply with only the JSON object, no commentary."},{role:"user",content:$input}]}'
+
+echo "--- Case F: /v1/chat/completions + tools + tool_choice:none + schema ---"
+enforce_chat "chat tools + tool_choice:none + schema" \
+    '{messages:[{role:"system",content:"Reply with only the JSON object."},{role:"user",content:$input}],
+      tools:[{type:"function",function:{name:"noop",description:"unused",parameters:{type:"object",properties:{}}}}],
+      tool_choice:"none"}'
 
 echo "=== Summary ==="
 echo "Passed: $PASS / $TOTAL"
