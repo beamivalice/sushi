@@ -206,7 +206,7 @@ read -r CE2 _ <<< "$(ask "$WORK/ext.json")"
 check "the appended turn restores its own prompt from SSD (cached $CE2 of $PE)" "$(ge "$CE2" $((PE - SLACK)))" "1"
 read -r RR2 _ <<< "$(ask "$WORK/m2.json")"
 check "media: the image prefix restores after the restart (cached $RR2)" "$(ge "$RR2" $((PAST_BAR + 1)))" "1"
-if [ "$ARCH" = glm5_next ] && blog | grep -q 'DFlash drafter ready'; then
+if [ "$ARCH" = glm5_next ] && blog | grep -q 'dflash\] auto-detected assistant\|DFlash drafter ready'; then
     check "the assistant context restored beside the trunk" "$([ "$(blog | grep -c 'dflash context restored')" -ge 1 ] && echo 1 || echo 0)" "1"
     check "the per-draft rate stays within 5 points across the restart (${DF_COLD:-none} -> ${DF_HIT:-none})" \
         "$(python3 -c "
