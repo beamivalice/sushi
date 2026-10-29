@@ -168,6 +168,7 @@ test {
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
+    _ = @import("glm5/glm5_rows_tick.zig");
     _ = @import("kld.zig");
     _ = @import("bench.zig");
     _ = @import("gpu_clock.zig");
