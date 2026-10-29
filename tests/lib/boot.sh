@@ -131,7 +131,8 @@ sushi_boot() {
 }
 
 # sushi_stop [status]: TERM the recorded PID, KILL after the wait, release the lock and write
-# <run>/<label>.END. A server that was already gone is a crash: reported, and it returns 1.
+# <run>/<label>.END. A server that was already gone is a crash: reported, and it returns 1, unless the script
+# that stopped it on purpose set SUSHI_EXPECT_GONE.
 sushi_stop() {
     local rc="${1:-0}" state=clean ws waited=0
     [ -n "${SUSHI_PID:-}" ] || return 0
@@ -153,13 +154,17 @@ sushi_stop() {
     else
         { wait "$SUSHI_PID"; } 2> /dev/null
         ws=$?
-        state="crash"
-        echo "[boot] CRASH: server '$SUSHI_LABEL' (pid $SUSHI_PID) was already gone, exit status $ws; log: $SUSHI_LOG" >&2
+        if [ -n "${SUSHI_EXPECT_GONE:-}" ]; then
+            state=gone
+        else
+            state="crash"
+            echo "[boot] CRASH: server '$SUSHI_LABEL' (pid $SUSHI_PID) was already gone, exit status $ws; log: $SUSHI_LOG" >&2
+        fi
     fi
     _sushi_settle
     printf 'exit=%s server=%s\n' "$rc" "$state" > "$SUSHI_RUN_DIR/$SUSHI_LABEL.END"
     "$SUSHI_ROOT/scripts/gpu-lock.sh" release "$SUSHI_LOCK_OWNER" 2> /dev/null
-    unset SUSHI_PID SUSHI_URL SUSHI_PORT SUSHI_PROFILE SUSHI_LOCK_OWNER
+    unset SUSHI_PID SUSHI_URL SUSHI_PORT SUSHI_PROFILE SUSHI_LOCK_OWNER SUSHI_EXPECT_GONE
     [ "$state" != crash ]
 }
 

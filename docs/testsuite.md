@@ -115,6 +115,8 @@ prompt), reads `sushi_log_since` (a line the engine logs once per process, such 
 `knobs` are one boot each per model pass (`knobs` keeps every prefix cache off and boots with a model-settings file
 naming `lib/knobs-bias.json`, written by `sushi_profile_settings`); `SUSHI_TEST_PACK_<MODEL>` overrides a pack,
 `SUSHI_BOOT_TIMEOUT_S` and `SUSHI_STOP_WAIT_S` bound the waits.
+A script that stops its server on purpose (a SIGTERM test) sets `SUSHI_EXPECT_GONE` before `sushi_stop`, so the exit is
+not reported as a crash. A Python `own` script uses `lib/sushi_boot.py` (`Server`, `gpu_lock`, `private_env`, `pack`).
 
 **Runner.** `tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all] [--only glob]
 [--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default (`hermetic,host`, every pass) is what CI runs.

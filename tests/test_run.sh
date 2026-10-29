@@ -330,6 +330,33 @@ except SystemExit as e:
 PY
     sushi_stop 0
     ;;
+gone)
+    sushi_boot l8 "$pack" > /dev/null || exit 9
+    kill -TERM "$SUSHI_PID"
+    while kill -0 "$SUSHI_PID" 2> /dev/null; do sleep 0.1; done
+    SUSHI_EXPECT_GONE=1 sushi_stop 0
+    echo "stop_rc=$?"
+    echo "end=$(cat "$SUSHI_RUN_DIR/l8.END")"
+    echo "lock_after=$(lockhead)"
+    ;;
+pyboot)
+    python3 - "$TESTS/lib" "$pack" <<'PY'
+import os, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import sushi_boot as b
+with b.Server("p1", model=sys.argv[2], flags=["--foo", "bar"]) as s:
+    s.wait_ready()
+    st, _ = b.request(s.base, "/props")
+    print("props=%s" % st)
+    print("lock_during=%s" % subprocess.check_output([str(b.LOCK), "status"], text=True).split()[0])
+    print("argv=%s" % [l for l in s.log_text().splitlines() if l.startswith("argv:")][0])
+    print("home=%s" % [l for l in s.log_text().splitlines() if l.startswith("home:")][0])
+print("end=%s" % (b.run_dir() / "p1.END").read_text().strip())
+print("lock_after=%s" % subprocess.check_output([str(b.LOCK), "status"], text=True).split()[0])
+print("pack_skip=%s" % subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import sushi_boot as b; b.pack('glm5')", sys.argv[1]],
+                                      capture_output=True, text=True, env={**os.environ, "SUSHI_MODELS_DIR": os.environ["WORK"] + "/models"}).returncode)
+PY
+    ;;
 pack)
     export SUSHI_MODELS_DIR="$WORK/models"
     echo "qwen4=$(sushi_pack qwen4)"
@@ -388,6 +415,20 @@ has "  and names the bound" "$(cat "$WORK/noready.err")" "not ready after 2s"
 out=$(scen ignoreterm 2> /dev/null)
 eq "a server that ignores TERM is killed after the wait" "$(val "$out" end)" "exit=0 server=killed"
 eq "  and is gone" "$(val "$out" pid_gone)" "1"
+
+out=$(scen gone 2> /dev/null)
+eq "a server the script stopped on purpose is not a crash when SUSHI_EXPECT_GONE is set" "$(val "$out" stop_rc)" "0"
+eq "  its END marker says gone" "$(val "$out" end)" "exit=0 server=gone"
+eq "  and the lock is released" "$(val "$out" lock_after)" "free"
+
+out=$(scen pyboot 2> /dev/null)
+eq "python Server: ready and /props answers" "$(val "$out" props)" "200"
+eq "  the lock is held as tests-<label>" "$(val "$out" lock_during)" "tests-p1"
+has "  the flags reach the server" "$(val "$out" argv)" "--model $WORK/models/stubpack"
+has "  and the caller's flags come last" "$(val "$out" argv)" "--log-file off --foo bar"
+eq "  a private HOME under the run dir" "$(val "$out" home)" "home: $WORK/run/p1.home"
+eq "  stop writes the END marker and releases the lock" "$(val "$out" end)/$(val "$out" lock_after)" "exit=0 server=clean/free"
+eq "  pack() exits 3 (SKIP) on a missing pack" "$(val "$out" pack_skip)" "3"
 
 out=$(scen trap_exit 2> /dev/null)
 rc=$?
