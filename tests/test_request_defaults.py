@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Check --think defaults, explicit budgets and repetition-penalty aliases.
-
-Run against a Qwen server started with --think medium --reasoning-budget 1.
-The caller owns the model and GPU lock. Requests, responses and server traces
-are saved under --output; no engine settings are changed by this test.
-"""
+# sushi-test: tier=live boot=knobs
+"""Check --think defaults, explicit budgets and repetition-penalty aliases on the knobs boot
+(--think medium --reasoning-budget 1). Requests, responses and server traces are saved under --output."""
 import argparse
 import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import sushi_test as st
 
 
 def reasoning(kind, reply):
@@ -25,12 +28,14 @@ def reasoning(kind, reply):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", required=True)
     parser.add_argument("--model", default="default")
-    parser.add_argument("--server-log", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False)
+    nonce = st.attach()
+    args.url = st.url()
+    args.server_log = Path(os.environ["SUSHI_LOG"])
+    args.output = args.output or Path(tempfile.mkdtemp(prefix="request-defaults-"))
+    args.output.mkdir(parents=True, exist_ok=True)
 
     def post(name, endpoint, body):
         offset = args.server_log.stat().st_size
@@ -51,7 +56,7 @@ def main():
         return reply
 
     records = []
-    prompt = ("Find all positive integers n for which n squared plus 3n plus 1 is a perfect square. "
+    prompt = (nonce + " Find all positive integers n for which n squared plus 3n plus 1 is a perfect square. "
               "Work through the inequalities and verify every boundary carefully.")
     for kind, endpoint in (("chat", "/v1/chat/completions"), ("messages", "/v1/messages"),
                            ("responses", "/v1/responses")):
@@ -75,7 +80,7 @@ def main():
     for kind, endpoint in (("chat", "/v1/chat/completions"), ("legacy", "/v1/completions")):
         body = {"model": args.model, "temperature": 0, "max_tokens": 64, "stream": False,
                 "enable_thinking": False, "enable_mtp": False, "enable_pld": False}
-        prompt = "Write eight short numbered sentences about sorting files, using the word file in every sentence."
+        prompt = nonce + " Write eight short numbered sentences about sorting files, using the word file in every sentence."
         body.update({"messages": [{"role": "user", "content": prompt}]} if kind == "chat" else {"prompt": prompt})
         replies = []
         for name, fields in (("canonical", {"repeat_penalty": 1.2}),
