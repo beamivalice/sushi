@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const transformer_mod = @import("../transformer.zig");
+const kv_cache = @import("../kv_cache.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const model_mod = @import("../model.zig");
@@ -719,9 +720,9 @@ test "acceptance failure restores every unfinished row after verify returns" {
         for (slot.entries, saved_ssm[i]) |*entry, *snapshot| snapshot.* = transformer_mod.ssmSnapshot(entry);
         saved_rows += 1;
     }
-    const syncs = transformer_mod.deferred_ple_group_syncs;
+    const syncs = kv_cache.deferred_ple_group_syncs;
     try Generator.mtpGroupVerify(&gens, &ptrs);
-    try testing.expectEqual(@as(u64, 1), transformer_mod.deferred_ple_group_syncs - syncs);
+    try testing.expectEqual(@as(u64, 1), kv_cache.deferred_ple_group_syncs - syncs);
     for (states) |state| try testing.expect(state.?.verify_rollback != null);
     mlx.fault.arm(1);
     const result = Generator.mtpGroupAccept(&gens, &ptrs);

@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const kv_cache = @import("../kv_cache.zig");
 const std = @import("std");
 const qwen4_mod = @import("qwen4_exp.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
@@ -3114,12 +3115,12 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         try testing.expectEqual(prev_valid_before[i], e.ple_prev_valid);
     }
 
-    const sync_before = trf.deferred_ple_group_syncs;
-    trf.verify_fail_after_flush = 1;
+    const sync_before = kv_cache.deferred_ple_group_syncs;
+    kv_cache.verify_fail_after_flush = 1;
     const flushed_failure = xfm.forwardRowAxisVerify(&rows, &ctxs, &logits, &last, &all, null, null);
-    trf.verify_fail_after_flush = null;
+    kv_cache.verify_fail_after_flush = null;
     try testing.expectError(error.InjectedGroupFlushFailure, flushed_failure);
-    try testing.expectEqual(@as(u64, 1), trf.deferred_ple_group_syncs - sync_before);
+    try testing.expectEqual(@as(u64, 1), kv_cache.deferred_ple_group_syncs - sync_before);
     for (ctxs, 0..) |ctx, row| {
         try testing.expectEqual(offsets_before[row], ctx.moe_seq_offset.*);
         for (ctx.cache.entries, 0..) |entry, layer| try testing.expectEqual(kv_offsets_before[row][layer], entry.offset);

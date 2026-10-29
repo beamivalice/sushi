@@ -1,6 +1,7 @@
 //! Flash-Next hyper-connections and the n-gram PLE table.
 
 const trf = @import("../transformer.zig");
+const kv_cache = @import("../kv_cache.zig");
 const io_util_mod = @import("../io_util.zig");
 const Transformer = trf.Transformer;
 const std = @import("std");
@@ -1245,7 +1246,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
     var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     try mlx.check(mlx.mlx_eval(vec));
     self.verify_laps.ple_sync_ns = sync_lap.read();
-    trf.deferred_ple_group_syncs += 1;
+    kv_cache.deferred_ple_group_syncs += 1;
     var k: usize = 0;
     for (ctxs) |ctx| {
         const p = ctx.ple_pending orelse continue;
@@ -1257,7 +1258,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
         _ = mlx.mlx_array_free(p.emb);
         _ = mlx.mlx_array_free(p.token_ids);
         if (@import("builtin").is_test) {
-            if (trf.verify_fail_after_flush == k) return error.InjectedGroupFlushFailure;
+            if (kv_cache.verify_fail_after_flush == k) return error.InjectedGroupFlushFailure;
         }
     }
 }
