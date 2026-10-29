@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # A reasoning BUDGET must SHORTEN the thought, not hide it — and END it: at the
 # budget the server commits the early-stop line and the closer through the
 # model, so the answer (or tool call) still arrives inside max_tokens.
@@ -18,13 +18,12 @@
 #      finishes with content or a tool call, never `length` (stream + non-stream)
 #   5. /v1/responses enforces the same budget, stream and non-stream
 #
-# Usage: ./tests/test_reasoning_budget_stream.sh [model_dir] [port]
+# Needs a model that thinks (SKIPs otherwise).
 set -u
 
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${2:-11267}"
-BASE="http://127.0.0.1:$PORT"
-BINARY="${BINARY:-./zig-out/bin/sushi}"
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+sushi_require thinking
+BASE=$SUSHI_URL
 BUDGET=24
 PASS=0
 FAIL=0
@@ -35,19 +34,13 @@ check() {
     else FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $1"; fi
 }
 
-if [ ! -d "$MODEL" ]; then echo "skip: model not found ($MODEL)"; exit 0; fi
+OUT=$(mktemp)
+trap 'rm -f "$OUT"' EXIT
 
-LOG=$(mktemp); OUT=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info >"$LOG" 2>&1 &
-SRV=$!
-trap 'kill $SRV 2>/dev/null; rm -f "$LOG" "$OUT"' EXIT
-for _ in $(seq 1 120); do sleep 2; curl -sf "$BASE/health" >/dev/null 2>&1 && break; done
-if ! curl -sf "$BASE/health" >/dev/null 2>&1; then echo "server failed to start"; tail -5 "$LOG"; exit 1; fi
-
-echo "[budget-stream] === $(basename "$MODEL") ==="
+echo "[budget-stream] === $SUSHI_ARCH ==="
 curl -sN -m 300 "$BASE/v1/chat/completions" -H 'content-type: application/json' -d "{
   \"model\":\"x\",
-  \"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Paris? Think about which unit to use first.\"}],
+  \"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE What is the weather in Paris? Think about which unit to use first.\"}],
   \"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\",
     \"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"},\"unit\":{\"type\":\"string\"}},\"required\":[\"location\"]}}}],
   \"max_tokens\":600, \"temperature\":0, \"stream\":true, \"enable_thinking\":true,
@@ -105,7 +98,7 @@ check "the turn ends with an answer or tool call, not length (got '$FIN')" "$([ 
 # Non-stream: same bound, whole body.
 curl -s -m 300 "$BASE/v1/chat/completions" -H 'content-type: application/json' -d "{
   \"model\":\"x\",
-  \"messages\":[{\"role\":\"user\",\"content\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\"}],
+  \"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Explain in two sentences why the sky is blue. Think it through carefully first.\"}],
   \"max_tokens\":600, \"temperature\":0, \"enable_thinking\":true,
   \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
 eval "$(python3 - "$OUT" <<'PY'
@@ -121,7 +114,7 @@ check "non-stream: reasoning inside the budget plus the forced close" "$([ "$NS_
 
 # /v1/responses: the same budget, enforced the same way (it used to be parsed and dropped).
 curl -s -m 300 "$BASE/v1/responses" -H 'content-type: application/json' -d "{
-  \"model\":\"x\", \"input\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\",
+  \"model\":\"x\", \"input\":\"$SUSHI_NONCE Explain in two sentences why the sky is blue. Think it through carefully first.\",
   \"max_output_tokens\":600, \"temperature\":0, \"reasoning\":{\"effort\":\"xhigh\"},
   \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
 eval "$(python3 - "$OUT" <<'PY'
@@ -140,7 +133,7 @@ check "responses: message text present, status completed (got '$RS_STATUS')" "$(
 check "responses: reasoning inside the budget plus the forced close" "$([ "$RS_RCHARS" -le $(((BUDGET + 40) * 8)) ] && echo 1 || echo 0)"
 
 curl -sN -m 300 "$BASE/v1/responses" -H 'content-type: application/json' -d "{
-  \"model\":\"x\", \"input\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\",
+  \"model\":\"x\", \"input\":\"$SUSHI_NONCE Explain in two sentences why the sky is blue. Think it through carefully first.\",
   \"max_output_tokens\":600, \"temperature\":0, \"stream\":true, \"reasoning\":{\"effort\":\"xhigh\"},
   \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
 eval "$(python3 - "$OUT" <<'PY'
