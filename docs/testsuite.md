@@ -55,6 +55,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 ## Where a test lives
 
 - Beside the code it tests, at the bottom of that file. Tests move with their code.
+- A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
+  `-Dmodel=<arch>` runs one folder's tests plus the shared ones.
 - A shared file (`transformer.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.
@@ -78,7 +80,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | change | runs before commit |
 |---|---|
 | host files only (chat, parsers, grammar, tokenizer, pure planners) | `zig build test-host` |
-| one arch's files only | `zig build test -Dtest-filter=<stem>.test.` for each touched file, plus that arch's scripts |
+| one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41>`, plus that arch's scripts |
+| `src/exl3` or `src/encoder` only | `zig build test -Dmodel=exl3` or `-Dmodel=enc` |
 | a shared file, `build.zig` or `mlx.zig` | `zig build test` |
 | a landing on main | `zig build test` with the tiny-fixture envs set, plus the touched area's scripts |
 

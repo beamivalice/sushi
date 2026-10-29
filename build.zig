@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
     linkApple(test_mod, macos_sdk_frameworks);
 
     const test_filter = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat for several)");
+    const test_model = b.option(TestModel, "model", "Run one model folder's tests plus the shared ones (qwen4, mimo2, glm5, dsv41), or only the exl3 or encoder module's");
     const qwen_preprocess_fixture = b.option(
         []const u8,
         "qwen-preprocess-fixture",
@@ -175,10 +176,12 @@ pub fn build(b: *std.Build) void {
     test_host_step.dependOn(&run_host_tests.step);
     if (test_filter == null) test_step.dependOn(&run_host_tests.step);
     // A filtered run stays one binary: bucket filters OR with the user's, they cannot narrow it.
-    const unit_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
+    const unit_tests: []const *std.Build.Step.Compile = if (test_model == .exl3 or test_model == .enc)
+        &.{}
+    else if (test_filter) |f|
         b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .root_module = test_mod, .filters = f })}) catch @panic("OOM")
     else
-        addTestBuckets(b, test_mod);
+        addTestBuckets(b, test_mod, test_model);
     for (unit_tests) |unit_test| {
         test_build.dependOn(&b.addInstallArtifact(unit_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_unit_tests = b.addRunArtifact(unit_test);
@@ -192,7 +195,9 @@ pub fn build(b: *std.Build) void {
     }
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
-    const exl3_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
+    const exl3_tests: []const *std.Build.Step.Compile = if (test_model != null and test_model != .exl3)
+        &.{}
+    else if (test_filter) |f|
         b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .name = "exl3-test", .root_module = exl3_test_mod, .filters = f })}) catch @panic("OOM")
     else
         addExl3TestBins(b, exl3_test_mod);
@@ -206,8 +211,10 @@ pub fn build(b: *std.Build) void {
         .root_module = encoder_mod,
         .filters = test_filter orelse &.{},
     });
-    test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-    test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
+    if (test_model == null or test_model == .enc) {
+        test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
+    }
 
     guardBenchFiles(b);
     const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
@@ -282,12 +289,16 @@ const test_buckets = [_][]const []const u8{
 /// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
 const test_dirs = [_][]const u8{ "src", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
 
-fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
+/// A test's model is its file's folder; the src root is shared.
+const TestModel = enum { qwen4, mimo2, glm5, dsv41, exl3, enc };
+
+fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []const *std.Build.Step.Compile {
     const io = b.graph.io;
     const host_stems = hostStems(b);
     var stems: std.ArrayList([]const u8) = .empty;
     var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     for (test_dirs) |dir_path| {
+        if (model) |m| if (!std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m))) continue;
         var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e });
         defer src.close(io);
         var it = src.iterate();
