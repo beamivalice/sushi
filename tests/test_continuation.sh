@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Guard: continuing a partial assistant reply extends it — it does not restart.
 #
 # A conversation ending in an assistant message used to render that message as
@@ -18,36 +18,23 @@
 # Greedy (temperature 0) throughout: the assertions are about WHERE the prompt
 # ends, and a sampled reply makes a "did it restart?" check a coin flip.
 #
-# Usage: ./tests/test_continuation.sh [model_dir] [port]
-
+# Thinking is turned off (GLM refuses that: a 16-token budget), so the continuation is visible text.
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
 set -u
 
-MODEL=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8133}
-BASE="http://127.0.0.1:$PORT"
+BASE="$SUSHI_URL"
 PASS=0
 FAIL=0
 TOTAL=0
-
-MODEL=$(eval echo "$MODEL")
-if [ ! -d "$MODEL" ]; then echo "SKIP: model not found at $MODEL"; exit 0; fi
-if [ ! -x "./zig-out/bin/sushi" ]; then
-    echo "FAIL: sushi not built — run 'zig build -Doptimize=ReleaseFast' first"
-    exit 1
-fi
 command -v jq >/dev/null 2>&1 || { echo "FAIL: jq is required"; exit 1; }
-
-./zig-out/bin/sushi serve --port $PORT --host 127.0.0.1 --log-level info \
-    --model "$MODEL" >/tmp/sushi-continuation.log 2>&1 &
-SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
-trap cleanup EXIT
-
-for i in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    if [ "$i" -eq 120 ]; then echo "FAIL: server did not start within 120s"; exit 1; fi
-    sleep 1
-done
+if [ "${SUSHI_ARCH:-}" = glm5_next ]; then
+    NT_CHAT='"reasoning_effort": "low", "reasoning_budget_tokens": 16,'
+    NT_MSG='"thinking": {"type": "enabled", "budget_tokens": 16},'
+else
+    NT_CHAT='"enable_thinking": false,'
+    NT_MSG='"thinking": {"type": "disabled"},'
+fi
+USER_MSG="$SUSHI_NONCE Name the three primary colors in one sentence."
 
 run_test() {
     TOTAL=$((TOTAL + 1))
@@ -61,11 +48,11 @@ echo "=== /v1/chat/completions: continue_final_message ==="
 BODY=$(curl -s -m 300 "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "{
     \"model\": \"sushi\",
     \"messages\": [
-        {\"role\": \"user\", \"content\": \"Name the three primary colors in one sentence.\"},
+        {\"role\": \"user\", \"content\": \"$USER_MSG\"},
         {\"role\": \"assistant\", \"content\": \"$PARTIAL\"}
     ],
-    \"continue_final_message\": true,
-    \"temperature\": 0, \"max_tokens\": 40, \"stream\": false
+    \"continue_final_message\": true, $NT_CHAT
+    \"temperature\": 0, \"max_tokens\": 64, \"stream\": false
 }")
 CONT=$(echo "$BODY" | jq -r '.choices[0].message.content // ""')
 
@@ -96,10 +83,10 @@ TOKENS_CONT=$(echo "$BODY" | jq -r '.usage.prompt_tokens // 0')
 TOKENS_PLAIN=$(curl -s -m 300 "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "{
     \"model\": \"sushi\",
     \"messages\": [
-        {\"role\": \"user\", \"content\": \"Name the three primary colors in one sentence.\"},
+        {\"role\": \"user\", \"content\": \"$USER_MSG\"},
         {\"role\": \"assistant\", \"content\": \"$PARTIAL\"}
-    ],
-    \"temperature\": 0, \"max_tokens\": 40, \"stream\": false
+    ], $NT_CHAT
+    \"temperature\": 0, \"max_tokens\": 64, \"stream\": false
 }" | jq -r '.usage.prompt_tokens // 0')
 
 if [ "$TOKENS_CONT" -gt 0 ] && [ "$TOKENS_PLAIN" -gt "$TOKENS_CONT" ]; then
@@ -115,10 +102,10 @@ ABODY=$(curl -s -m 300 "$BASE/v1/messages" -H "Content-Type: application/json" \
     -H "anthropic-version: 2023-06-01" -d "{
     \"model\": \"sushi\",
     \"messages\": [
-        {\"role\": \"user\", \"content\": \"Name the three primary colors in one sentence.\"},
+        {\"role\": \"user\", \"content\": \"$USER_MSG\"},
         {\"role\": \"assistant\", \"content\": \"$PARTIAL\"}
-    ],
-    \"temperature\": 0, \"max_tokens\": 40, \"stream\": false
+    ], $NT_MSG
+    \"temperature\": 0, \"max_tokens\": 64, \"stream\": false
 }")
 ACONT=$(echo "$ABODY" | jq -r '[.content[]? | select(.type=="text") | .text] | join("")')
 
