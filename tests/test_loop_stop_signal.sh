@@ -45,6 +45,9 @@ check() {
 LOG="$(mktemp)"
 trap 'rm -f "$LOG" "$LOG".*' EXIT
 
+# GLM refuses thinking off; a low effort is the nearest request it serves.
+NOTHINK='"enable_thinking":false'
+[ "${SUSHI_ARCH:-}" = glm5_next ] && NOTHINK='"reasoning_effort":"low"'
 MODEL_ID="$(curl -s "$BASE/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
 # A prompt whose only stable continuation is the same short cycle: the
 # period-1..8 tier convicts it within ~130 tokens, so the whole script is fast.
@@ -55,7 +58,7 @@ echo "Loop-stop wire contract on $MODEL_ID"
 # ── 1. chat, non-streaming: signal AND trim ──────────────────────────────
 echo "[1/5] /v1/chat/completions non-streaming"
 BODY=$(curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":false}")
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,$NOTHINK}")
 echo "$BODY" | python3 -c '
 import json,sys
 d=json.load(sys.stdin); ch=d["choices"][0]
@@ -89,7 +92,7 @@ grep -q "^verdict trimmed$" "$LOG.trim"; check "the degenerate tail is cut from 
 # EXACTLY one chunk, and the usage chunk carries an empty choices array.
 echo "[2/5] /v1/chat/completions streaming"
 curl -sN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":false,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,$NOTHINK,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
   > "$LOG.rawstream"
 grep -c '"finish_details":{"type":"repetition_loop"}' "$LOG.rawstream" > "$LOG.stream"
 [ "$(cat "$LOG.stream")" -ge 1 ]; check "the final chunk carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
@@ -150,7 +153,7 @@ grep -q "^finish_reason stop$" "$LOG.cmplusage"; check "streaming completions fi
 # ── 5. an ORDINARY response must be byte-unchanged ───────────────────────
 echo "[5/5] a normal answer says nothing new"
 curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Say hello in five words.\"}],\"max_tokens\":50,\"temperature\":0,\"enable_thinking\":false}" \
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Say hello in five words.\"}],\"max_tokens\":50,\"temperature\":0,$NOTHINK}" \
   | grep -c 'finish_details' > "$LOG.clean"
 [ "$(cat "$LOG.clean")" -eq 0 ]; check "no finish_details on a response that finished normally" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
