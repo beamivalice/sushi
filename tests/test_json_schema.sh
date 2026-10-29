@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Integration test: verify response_format.json_schema is grammar-enforced.
 #
 # Without grammar enforcement, the model often emits prose around the JSON, or
@@ -7,51 +7,32 @@
 # token mask makes those outputs unreachable — every byte of the response must
 # satisfy the schema.
 #
-# Usage: ./tests/test_json_schema.sh [model_dir] [port]
+# Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_json_schema.sh
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8099}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+BASE=$SUSHI_URL
 PASS=0
 FAIL=0
 TOTAL=0
 
-if [ ! -d "$MODEL_DIR" ]; then
-    echo "SKIP: Model not found at $MODEL_DIR"
-    exit 0
-fi
-
 echo "=== JSON Schema Constrained Generation Test ==="
-echo "Model: $MODEL_DIR"
-echo "Port: $PORT"
+echo "Server: $BASE ($SUSHI_ARCH)"
 echo ""
 
-echo "Starting server..."
-./zig-out/bin/sushi --model "$MODEL_DIR" --serve --port $PORT --log-level info 2>/tmp/sushi-test-json-schema.log &
-SERVER_PID=$!
-sleep 2
-
-for i in $(seq 1 30); do
-    if curl -sf "$BASE/health" > /dev/null 2>&1; then
-        echo "Server ready (PID $SERVER_PID)"
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        echo "FAIL: Server did not start within 30s"
-        kill $SERVER_PID 2>/dev/null
-        exit 1
-    fi
-    sleep 1
-done
-echo ""
-
-cleanup() {
-    echo ""
-    echo "Stopping server (PID $SERVER_PID)..."
-    kill $SERVER_PID 2>/dev/null
-    wait $SERVER_PID 2>/dev/null
-}
-trap cleanup EXIT
+# A model that can switch thinking off answers inside the small caps below. One that cannot (GLM) thinks
+# first: it gets a large cap, and a reply that spent the whole cap in reasoning (content empty, finish
+# `length`) is the checkpoint's choice, not a schema failure.
+OFF_OK=$(curl -sf "$BASE/v1/models" | python3 -I -c '
+import sys, json
+m = json.load(sys.stdin)["data"][0]
+print(1 if "off" in m.get("reasoning_efforts", []) else 0)')
+if [ "$OFF_OK" = 1 ]; then
+    THINK='"enable_thinking": false,'
+else
+    THINK='"reasoning_effort": "low",'
+fi
+cap() { if [ "$OFF_OK" = 1 ]; then echo "$1"; else echo 4096; fi; }
 
 run_test() {
     local name="$1"
@@ -67,6 +48,64 @@ run_test() {
     fi
 }
 
+# chat_parse <body> <stream>: prints {"finish": .., "content": ..} for a chat completion or its SSE stream.
+chat_parse() {
+    python3 -I -c '
+import sys, json
+raw, stream = sys.argv[1], sys.argv[2] == "true"
+finish, buf = None, []
+try:
+    if stream:
+        for line in raw.splitlines():
+            if not line.startswith("data: ") or line[6:] == "[DONE]":
+                continue
+            for c in json.loads(line[6:]).get("choices", []):
+                finish = c.get("finish_reason") or finish
+                buf.append(c.get("delta", {}).get("content") or "")
+    else:
+        c = json.loads(raw)["choices"][0]
+        finish, buf = c.get("finish_reason"), [c["message"].get("content") or ""]
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit()
+print(json.dumps({"finish": finish, "content": "".join(buf)}))' "$1" "$2"
+}
+
+# schema_check <kind>: stdin is chat_parse output; prints ok, ok:cap-spent-in-reasoning or fail:<why>.
+schema_check() {
+    python3 -I -c '
+import sys, json
+kind, off_ok = sys.argv[1], sys.argv[2] == "1"
+p = json.load(sys.stdin)
+if "error" in p:
+    print("fail:unparsable_response:" + p["error"]); sys.exit()
+text = p["content"]
+if not off_ok and p["finish"] == "length" and text == "":
+    print("ok:cap-spent-in-reasoning"); sys.exit()
+try:
+    v = json.loads(text)
+    if kind == "person":
+        assert isinstance(v, dict) and isinstance(v.get("name"), str) and isinstance(v.get("age"), int), v
+        assert not set(v) - {"name", "age"}, "unexpected extra keys: %s" % sorted(set(v) - {"name", "age"})
+    elif kind == "enum":
+        assert v in ("red", "green", "blue"), "not in enum: %r" % (v,)
+    elif kind == "recipe":
+        assert isinstance(v.get("name"), str), v
+        assert isinstance(v.get("ingredients"), list) and all(isinstance(x, str) for x in v["ingredients"]), v
+    elif kind == "book":
+        assert isinstance(v.get("title"), str) and isinstance(v.get("year"), int), v
+    print("ok")
+except Exception as e:
+    print("fail:%s:%r" % (e, text[:80]))' "$1" "$OFF_OK"
+}
+
+verdict() { # <name> <schema_check output>
+    case "$2" in
+        ok*) run_test "$1" PASS "" ;;
+        *) run_test "$1" FAIL "$2" ;;
+    esac
+}
+
 # ── Test 1: Simple object schema ──
 echo "--- Test 1: Object with required string + integer ---"
 RESULT=$(curl -sf "$BASE/v1/chat/completions" \
@@ -74,10 +113,11 @@ RESULT=$(curl -sf "$BASE/v1/chat/completions" \
   -d '{
     "model": "sushi",
     "messages": [
-      {"role": "user", "content": "Make up a person record."}
+      {"role": "user", "content": "'"$SUSHI_NONCE"' Make up a person record."}
     ],
-    "max_tokens": 256,
+    "max_tokens": '"$(cap 256)"',
     "temperature": 0.7,
+    '"$THINK"'
     "stream": false,
     "response_format": {
       "type": "json_schema",
@@ -95,29 +135,9 @@ RESULT=$(curl -sf "$BASE/v1/chat/completions" \
       }
     }
   }')
-
-CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
-echo "  raw content: $CONTENT"
-
-PARSED_OK=$(echo "$CONTENT" | python3 -c "
-import sys, json
-try:
-    obj = json.loads(sys.stdin.read())
-    assert isinstance(obj, dict)
-    assert isinstance(obj.get('name'), str)
-    assert isinstance(obj.get('age'), int)
-    extra = set(obj.keys()) - {'name', 'age'}
-    assert not extra, f'unexpected extra keys: {extra}'
-    print('ok')
-except Exception as e:
-    print(f'fail:{e}')
-" 2>/dev/null)
-
-if [ "$PARSED_OK" = "ok" ]; then
-    run_test "Object schema strictly satisfied" "PASS" ""
-else
-    run_test "Object schema strictly satisfied" "FAIL" "$PARSED_OK"
-fi
+PARSED=$(chat_parse "$RESULT" false)
+echo "  parsed: $PARSED"
+verdict "Object schema strictly satisfied" "$(echo "$PARSED" | schema_check person)"
 echo ""
 
 # ── Test 2: Enum constraint ──
@@ -127,10 +147,11 @@ RESULT=$(curl -sf "$BASE/v1/chat/completions" \
   -d '{
     "model": "sushi",
     "messages": [
-      {"role": "user", "content": "Pick a color."}
+      {"role": "user", "content": "'"$SUSHI_NONCE"' Pick a color."}
     ],
-    "max_tokens": 32,
+    "max_tokens": '"$(cap 32)"',
     "temperature": 0.7,
+    '"$THINK"'
     "stream": false,
     "response_format": {
       "type": "json_schema",
@@ -140,23 +161,9 @@ RESULT=$(curl -sf "$BASE/v1/chat/completions" \
       }
     }
   }')
-
-CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
-echo "  raw content: $CONTENT"
-ENUM_OK=$(echo "$CONTENT" | python3 -c "
-import sys, json
-try:
-    v = json.loads(sys.stdin.read())
-    assert v in ('red', 'green', 'blue'), f'not in enum: {v!r}'
-    print('ok')
-except Exception as e:
-    print(f'fail:{e}')
-" 2>/dev/null)
-if [ "$ENUM_OK" = "ok" ]; then
-    run_test "Enum value picked from allowed set" "PASS" ""
-else
-    run_test "Enum value picked from allowed set" "FAIL" "$ENUM_OK"
-fi
+PARSED=$(chat_parse "$RESULT" false)
+echo "  parsed: $PARSED"
+verdict "Enum value picked from allowed set" "$(echo "$PARSED" | schema_check enum)"
 echo ""
 
 # ── Test 3: Nested object with array ──
@@ -166,10 +173,11 @@ RESULT=$(curl -sf "$BASE/v1/chat/completions" \
   -d '{
     "model": "sushi",
     "messages": [
-      {"role": "user", "content": "Make a recipe with name and 3 short ingredients."}
+      {"role": "user", "content": "'"$SUSHI_NONCE"' Make a recipe with name and 3 short ingredients."}
     ],
-    "max_tokens": 256,
+    "max_tokens": '"$(cap 256)"',
     "temperature": 0.7,
+    '"$THINK"'
     "stream": false,
     "response_format": {
       "type": "json_schema",
@@ -190,25 +198,9 @@ RESULT=$(curl -sf "$BASE/v1/chat/completions" \
       }
     }
   }')
-
-CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
-echo "  raw content: $CONTENT"
-RECIPE_OK=$(echo "$CONTENT" | python3 -c "
-import sys, json
-try:
-    obj = json.loads(sys.stdin.read())
-    assert isinstance(obj.get('name'), str)
-    items = obj.get('ingredients')
-    assert isinstance(items, list) and all(isinstance(x, str) for x in items)
-    print('ok')
-except Exception as e:
-    print(f'fail:{e}')
-" 2>/dev/null)
-if [ "$RECIPE_OK" = "ok" ]; then
-    run_test "Nested array-of-string schema satisfied" "PASS" ""
-else
-    run_test "Nested array-of-string schema satisfied" "FAIL" "$RECIPE_OK"
-fi
+PARSED=$(chat_parse "$RESULT" false)
+echo "  parsed: $PARSED"
+verdict "Nested array-of-string schema satisfied" "$(echo "$PARSED" | schema_check recipe)"
 echo ""
 
 # ── Test 4: Streaming JSON schema ──
@@ -218,10 +210,11 @@ EVENTS=$(curl -sf -N "$BASE/v1/chat/completions" \
   -d '{
     "model": "sushi",
     "messages": [
-      {"role": "user", "content": "Make up a book record."}
+      {"role": "user", "content": "'"$SUSHI_NONCE"' Make up a book record."}
     ],
-    "max_tokens": 256,
+    "max_tokens": '"$(cap 256)"',
     "temperature": 0.7,
+    '"$THINK"'
     "stream": true,
     "response_format": {
       "type": "json_schema",
@@ -239,49 +232,15 @@ EVENTS=$(curl -sf -N "$BASE/v1/chat/completions" \
       }
     }
   }' 2>/dev/null)
-
-ASSEMBLED=$(echo "$EVENTS" | python3 -c "
-import sys, json
-buf = []
-for line in sys.stdin:
-    line = line.strip()
-    if not line.startswith('data: '): continue
-    payload = line[len('data: '):]
-    if payload == '[DONE]': break
-    try:
-        chunk = json.loads(payload)
-    except Exception:
-        continue
-    delta = chunk['choices'][0].get('delta', {})
-    if 'content' in delta and delta['content'] is not None:
-        buf.append(delta['content'])
-print(''.join(buf))
-")
-echo "  assembled: $ASSEMBLED"
-STREAM_OK=$(echo "$ASSEMBLED" | python3 -c "
-import sys, json
-try:
-    obj = json.loads(sys.stdin.read())
-    assert isinstance(obj.get('title'), str)
-    assert isinstance(obj.get('year'), int)
-    print('ok')
-except Exception as e:
-    print(f'fail:{e}')
-" 2>/dev/null)
-if [ "$STREAM_OK" = "ok" ]; then
-    run_test "Streaming output assembles into valid JSON" "PASS" ""
-else
-    run_test "Streaming output assembles into valid JSON" "FAIL" "$STREAM_OK"
-fi
+PARSED=$(chat_parse "$EVENTS" true)
+echo "  assembled: $PARSED"
+verdict "Streaming output assembles into valid JSON" "$(echo "$PARSED" | schema_check book)"
 echo ""
 
 echo "=== Summary ==="
 echo "Passed: $PASS / $TOTAL"
 if [ "$FAIL" -gt 0 ]; then
     echo "Failed: $FAIL"
-    echo ""
-    echo "Server log (last 50 lines):"
-    tail -50 /tmp/sushi-test-json-schema.log
     exit 1
 else
     echo "All tests passed!"
