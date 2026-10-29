@@ -33,6 +33,7 @@ test {
     _ = @import("format_corpus_test.zig");
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("server.zig");
+    _ = @import("completions.zig");
     _ = @import("responses_api.zig");
     _ = @import("generation_stream.zig");
     _ = @import("http_conn.zig");
