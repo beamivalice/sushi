@@ -11650,8 +11650,8 @@ test "exl3 clamped routing takes the lane kernels and preserves staged bytes at 
     defer setDecodeParams(.{ .codebook = .mul1, .window = .w16 });
     var random = std.Random.DefaultPrng.init(89031);
     const rnd = random.random();
-    var n: c_int = exl3.Rate.min_n;
-    while (n <= exl3.Rate.max_n) : (n += 2) {
+    for (exl3.ADMITTED_SAMPLE) |sample_n| {
+        const n: c_int = @intCast(sample_n);
         const bits = try a.alloc(u16, experts * 16 * 16 * @as(usize, @intCast(n)));
         defer a.free(bits);
         for (bits) |*v| v.* = rnd.int(u16);
