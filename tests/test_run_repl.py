@@ -49,7 +49,7 @@ def main():
                     if not sent and b"chat is live" in transcript:
                         os.write(master, b"Reply with one short greeting.\n")
                         sent = True
-                    if sent and not finished and re.search(rb"\[\d+ tokens, [\d.]+ tok/s\]", transcript):
+                    if sent and not finished and re.search(rb"\d+ tokens, [\d.]+ tok/s\]", transcript):
                         os.write(master, b"/bye\n")
                         finished = True
                 if child.poll() is not None:
