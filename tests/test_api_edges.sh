@@ -60,7 +60,7 @@ req POST /v1/chat/completions '{"model":"m","messages":[]}';        expect_statu
 req POST /v1/chat/completions '{"model":"m","messages":"x"}';       expect_status 400 "messages not array"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"n\":2}"; expect_status 400 "n>1"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"max_tokens\":5,$NT_CHAT,\"x\":$(python3 -c 'print("["*3000+"]"*3000)')}"
-expect_status 200 "3000-deep nesting in an ignored field"
+expect_status 400 "3000-deep nesting is refused"
 req GET  /v1/chat/completions;                                      expect_status 404 "GET on a POST route"
 req POST /v1/bogus '{"model":"m"}';                                 expect_status 404 "unknown route"
 req OPTIONS /v1/chat/completions;                                   expect_status 204 "CORS preflight"
@@ -122,9 +122,9 @@ if (sushi_require vision) > /dev/null 2>&1; then
     expect_status 400 "messages: undecodable image block refused"
     req POST /v1/responses '{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"http://127.0.0.1:1/x.png"}]}],"max_output_tokens":5}'
     expect_status 400 "responses: remote input_image refused"
-    # a historical (non-active) image is never decoded, so it is never refused
+    # media is read from every message, so a bad image in an earlier turn is refused too
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[$IMG_HTTP,{\"type\":\"text\",\"text\":\"$N old\"}]},{\"role\":\"assistant\",\"content\":\"ok\"},$U],\"max_tokens\":5,$NT_CHAT}"
-    expect_status 200 "chat: a historical bad image is not the active turn's problem"
+    expect_status 400 "chat: a bad image in an earlier message is refused too"
 else
     echo "  (the pack has no vision tower: media checks skipped)"
 fi
@@ -132,8 +132,8 @@ fi
 echo "=== content shapes ==="
 # Prompt-token counts stand in for "the model saw it": equal renderings tokenize to equal counts.
 PT_PARTS=$(prompt_tokens '{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"'"$N"' Repeat exactly: ALPHA"},{"type":"text","text":" BRAVO"}]}],"max_tokens":1,"temperature":0}')
-PT_STRING=$(prompt_tokens '{"model":"m","messages":[{"role":"user","content":"'"$N"' Repeat exactly: ALPHA BRAVO"}],"max_tokens":1,"temperature":0}')
-[[ -n "$PT_PARTS" && "$PT_PARTS" == "$PT_STRING" ]] && ok "text parts join like one string ($PT_PARTS tokens)" || bad "text parts join like one string" "parts=$PT_PARTS string=$PT_STRING"
+PT_STRING=$(prompt_tokens '{"model":"m","messages":[{"role":"user","content":"'"$N"' Repeat exactly: ALPHA\n BRAVO"}],"max_tokens":1,"temperature":0}')
+[[ -n "$PT_PARTS" && "$PT_PARTS" == "$PT_STRING" ]] && ok "text parts join with a newline ($PT_PARTS tokens)" || bad "text parts join with a newline" "parts=$PT_PARTS string=$PT_STRING"
 # \u0000 is how a JSON body carries a NUL byte; the prompt must run on past it
 PT_HEAD=$(prompt_tokens '{"model":"m","messages":[{"role":"user","content":"'"$N"' Line1"}],"max_tokens":1,"temperature":0}')
 PT_NUL=$(prompt_tokens '{"model":"m","messages":[{"role":"user","content":"'"$N"' Line1\u0000Line2. Reply with the word DONE."}],"max_tokens":1,"temperature":0}')
