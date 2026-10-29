@@ -34,7 +34,7 @@
 //! "mlx_pi1.html`}" reached disk). The other two (final answer misfiled as
 //! reasoning_content in tools+thinking streams; omitted max_tokens defaulting
 //! to 256) live in server.zig request handling and are pinned by
-//! tests/test_format_matrix.sh checks 4 and 7 plus tests/test_thinking_split.sh.
+//! tests/test_format_matrix.sh checks 2-4, 7 and 9-11.
 
 const std = @import("std");
 const testing = std.testing;

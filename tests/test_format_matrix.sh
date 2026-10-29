@@ -17,6 +17,7 @@
 #   6. Tool-call fidelity, stream: same via accumulated delta.tool_calls
 #   7. Omitted max_tokens: long answer must NOT truncate at the old 256 default
 #   8. /v1/messages stream + tools + thinking: tool_use block, no leak
+#   9-11. Truncated thinking on /v1/messages, /v1/responses and the chat stream
 #
 # A thought the token cap cuts open is a legal turn on every row: the rows then assert the split (reasoning kept,
 # nothing in content), never the answer. Thinking rows ask `reasoning_effort: low`, since the split is the subject.
@@ -64,13 +65,13 @@ chk() {
     check "$1" "$(jget "$R" "1 if ($2) else 0")"
 }
 
-# One request, normalized: ask <chat|messages> <0|1 stream> <json body>. Prints one JSON object with
-# http, finish, content, reasoning, calls[{name,args}], usage (chat) or text/thinking (messages).
+# One request, normalized: ask <chat|messages|responses> <0|1 stream> <json body>. Prints one JSON object with
+# http, finish, content, reasoning, calls[{name,args}], usage (chat) or text/thinking (messages, responses: text only).
 HELPER=$(cat <<'PY'
 import json, sys, urllib.error, urllib.request
 
 base, mode, stream, body = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
-path = {"chat": "/v1/chat/completions", "messages": "/v1/messages"}[mode]
+path = {"chat": "/v1/chat/completions", "messages": "/v1/messages", "responses": "/v1/responses"}[mode]
 payload = json.loads(body)
 if stream:
     payload["stream"] = True
@@ -99,6 +100,10 @@ def sse(resp):
 
 if out["http"] != 200:
     out["error"] = resp.read().decode("utf-8", "replace")
+elif mode == "responses":
+    d = json.load(resp)
+    out.update(finish=d.get("status"), usage=d.get("usage") or {},
+               text="".join(c.get("text", "") for it in d.get("output", []) if it.get("type") == "message" for c in it.get("content", [])))
 elif mode == "chat" and not stream:
     d = json.load(resp)
     ch = d["choices"][0]
@@ -206,6 +211,7 @@ if [ "$THINKS" = 1 ]; then
     R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":120,\"temperature\":0,$THINK}")
     chk "2. truncated thinking: content empty when the cap cut the thought" "r['finish']!='length' or not r['content']"
     chk "2. truncated thinking: reasoning_content non-empty" "r['reasoning']"
+    chk "2. truncated thinking: usage reasoning_tokens > 0" "r['usage'].get('completion_tokens_details',{}).get('reasoning_tokens',0)>0"
 
     # ── 3. Thinking ON, full round ──
     R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":3000,\"temperature\":0,$THINK}")
@@ -222,6 +228,7 @@ T4=""
 R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":3000,\"temperature\":0,\"tools\":[$BASH_TOOL]$T4}")
 chk "4. stream+tools: answer (391) in CONTENT deltas" "'391' in r['content'] or r['finish']=='length'"
 chk_clean "4. stream+tools: no control-tag leak" content
+[ "$THINKS" != 1 ] || chk "4. stream+tools: reasoning still separated" "r['reasoning']"
 
 # ── 5. Tool-call fidelity, non-stream (pins the brace-swallow bug live) ──
 R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$WRITE_PROMPT],\"max_tokens\":2000,\"temperature\":0,\"reasoning_effort\":\"low\",\"tools\":[$WRITE_TOOL]}")
@@ -251,6 +258,23 @@ R=$(ask messages 1 "{\"model\":\"x\",\"max_tokens\":4000,\"temperature\":0,\"too
 chk "8. /v1/messages stream: tool_use block name == write" "$WRITE_NAME"
 chk "8. /v1/messages stream: args valid + path byte-exact" "$WRITE_NAME and $WRITE_JSON and $WRITE_PATH"
 chk_clean "8. /v1/messages stream: no control-tag leak in deltas" text
+
+if [ "$THINKS" = 1 ]; then
+    # ── 9. /v1/messages: truncated thinking lands in the thinking block ──
+    R=$(ask messages 0 "{\"model\":\"x\",\"max_tokens\":120,\"messages\":[$PROMPT],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4000}}")
+    chk "9. /v1/messages: truncated thinking not in the text block" "r['finish']!='max_tokens' or not r['text']"
+    chk "9. /v1/messages: thinking block non-empty" "r['thinking']"
+
+    # ── 10. /v1/responses: truncated thinking is no message text, and usage reports the reasoning ──
+    R=$(ask responses 0 "{\"model\":\"x\",\"input\":\"$SUSHI_NONCE What is 17*23? Be brief.\",\"max_output_tokens\":120,\"reasoning\":{\"effort\":\"low\"}}")
+    chk "10. /v1/responses: truncated thinking not in message text" "r['finish']!='incomplete' or not r['text']"
+    chk "10. /v1/responses: usage output_tokens_details.reasoning_tokens > 0" "r['usage'].get('output_tokens_details',{}).get('reasoning_tokens',0)>0"
+
+    # ── 11. Stream + thinking, truncated: deltas split, nothing in content ──
+    R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":120,\"temperature\":0,$THINK}")
+    chk "11. stream truncated thinking: reasoning deltas arrive" "r['reasoning']"
+    chk "11. stream truncated thinking: no content deltas when the cap cut the thought" "r['finish']!='length' or not r['content']"
+fi
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
