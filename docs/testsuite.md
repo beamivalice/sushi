@@ -93,6 +93,34 @@ CI runs `test-build` (every test compiles), `test-host` and the hermetic guards 
 A live script defaults to a pack under `${SUSHI_MODELS_DIR:-$HOME/.sushi/models}` that the release gate uses, and skips
 loudly when the pack is missing. Every script is in the [tests/CLAUDE.md](../tests/CLAUDE.md) matrix, or it is deleted.
 
+**Header.** The line after the shebang (`#` for sh/py, `//` for cjs/mjs) is `sushi-test: key=value ...`; a second line
+may add only `needs=<commands>`. Scope is the folder (`tests/qwen4|mimo2|glm5|dsv41/`; the root is shared), never a tag.
+
+| key | values |
+|---|---|
+| `tier` | `hermetic` (no binary), `host` (the binary, no weights, no lock), `pack` (real weights, run.sh takes the lock), `live` (loads a pack over HTTP); `bench`, `tool` and `lib` are never run |
+| `boot` | live only: `api`, `exact`, `ram`, `knobs` attach to a shared boot; `own` boots itself |
+| `pack` | `own` and `pack` only: `default` (the folder's model), `each` (once per model pass), a model key or an alias |
+| `boots` | `own` only: the scripted number of boots, for the ledger |
+
+Exit codes: 0 pass, 1 fail, 3 SKIP (one line naming what is missing).
+
+**Boot helper.** `tests/lib/boot.sh` (flags in `lib/profiles.sh`, Python twin `lib/sushi_test.py`) is the only way a
+script starts a server. `sushi_boot <label> <pack> [flags]` takes the GPU lock, boots on a free port with a private
+`HOME` and `SUSHI_PREFIX_CACHE_DIR` under `SUSHI_RUN_DIR`, and waits for `/health` plus `Model ready`; `sushi_stop`
+(also the EXIT trap) stops by PID and writes `<label>.END`. An attach script calls `sushi_attach` (a nonce for every
+prompt), reads `sushi_log_since`, and asks `sushi_require <mtp|vision|video|batching|stq|thinking|spec>`. Profiles
+`api`, `exact`, `ram` and `knobs` are one boot each per model pass; `SUSHI_TEST_PACK_<MODEL>` overrides a pack,
+`SUSHI_BOOT_TIMEOUT_S` and `SUSHI_STOP_WAIT_S` bound the waits.
+
+**Runner.** `tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all] [--only glob]
+[--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default (`hermetic,host`, every pass) is what CI runs.
+`--list` prints the plan and boots nothing; `--check` refuses a missing or invalid header, a missing or stale matrix
+row and an attach script that launches `sushi` (`--no-matrix` waives the matrix rules until the matrix is complete). A pass builds ReleaseFast, boots each profile once with the lock held
+for that boot only, reboots once after a crash, and stops at the end of the boot that failed unless `--keep-going`.
+The summary and an `END` marker land in `--out` (default `~/.sushi/runs/tests-<ts>/`). `tests/test_run.sh` proves it
+on a fixture tree and a stub server, without a model or a GPU.
+
 ## Cutting a test
 
 - Dead code: the test goes with the code, in the same commit.
