@@ -30,6 +30,7 @@ test {
     _ = @import("format_corpus_test.zig");
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("server.zig");
+    _ = @import("request_policy.zig");
     _ = @import("models_api.zig");
     _ = @import("logprobs.zig");
     _ = @import("model.zig");
