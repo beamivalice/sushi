@@ -52,6 +52,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **`sushi bench`** drives a running server through the release bench: one cold prefill in 8k restore windows up to 128k and three decode samples a rung, on a code and a prose corpus, with the GPU clock read beside every request. `frequency_penalty` now follows OpenAI's definition.
 - **`sushi convert exl3 --codebook` is now `--expert-codebook`** (breaking): `--codebook mcg` becomes `--expert-codebook exl3-mcg` and `--codebook mul1` becomes `--expert-codebook exl3-mul1`; packs and resumable runs are unchanged.
 
+- **Sushi Control 0.1** adds a native macOS menu-bar app for local server controls, optional server login startup and crash recovery, model management, downloads, settings and performance monitoring.
+
 ## v1.3.0 — Qwen EXL3 Quantizer, Adaptive DFlash2, KV6, Dashboard
 
 - **Qwen3.8-Flash-Next EXL3 quantizer**: `sushi convert exl3` writes a Sushi pack from the BF16 checkpoint at the rate you pick, with the trunk in the format the packs serve; runs resume where they stopped, keep finished layers and packs, and fit their Metal threadgroups to any Apple GPU. Check the result with `sushi kld`. Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the M2 Pro report (#57).

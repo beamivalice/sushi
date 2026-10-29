@@ -25,6 +25,9 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -34,9 +37,10 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: No local paths in tracked files
         run: bash tests/test_no_local_paths.sh
@@ -49,12 +53,17 @@ jobs:
       # later runs restore it and never re-save a growing cache. Xcode is in the
       # key because zig caches configure-time SDK paths.
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             .zig-cache
             ~/.cache/zig
           key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}
+
+      - name: Build and test macOS controls
+        run: |
+          apps/SushiControl/macos/test.sh
+          BUILD_DIR="$RUNNER_TEMP/sushi-control" apps/SushiControl/macos/build.sh
 
       - name: Build sushi (Zig, ReleaseFast)
         run: zig build -Doptimize=ReleaseFast

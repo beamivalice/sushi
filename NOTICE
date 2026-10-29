@@ -23,7 +23,7 @@ Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; the tool list is
 adjusted to what codex-cli 0.154 declares.
 
 The DeepSeek-V4.1 image plan, letterbox box and aligner unfold in src/dsv41/dsv41_vision.zig
-follow mlx-serve src/dsv41_vision.zig (https://github.com/ddalcu/mlx-serve),
+follow mlx-serve’s dsv41_vision.zig in its src directory (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; their numbers are
 re-derived against the release's inference/image_processor.py and vision.py.
 
@@ -394,7 +394,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
   * The DeepSeek-V4.1-Flash arm (`src/dsv41/dsv41_{borrow,config,engram,kernels,model,prefix,qat,scope,source,stream,vision}.zig`,
     `src/fixtures/dsv41_chat_template.jinja`,
     `src/fixtures/dsv41_engram_token_map.bin`, the spaced DSML tags in `src/chat.zig`), from
-    mlx-serve's `deepseek_v41.zig`, `src/dsv41_engram.zig` and `src/chat.zig` at f1c3276f
+    mlx-serve's `deepseek_v41.zig`, `dsv41_engram.zig` and `chat.zig` in its src directory at f1c3276f
     by David Dalcu. Modifications: the MLX-native path only (no embedded ds4 engine); the
     op scope, Engram lookup, attention and indexer formulation were rewritten against the
     release's `inference/model.py` and pinned to it by a tiny-model oracle, the expert
