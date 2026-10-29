@@ -5,6 +5,7 @@ const generate_mod = @import("generate.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -1071,9 +1072,9 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
 test "/v1/models rows, loaded or not, name each model's effort words and the one a silent request runs at" {
     const t = std.testing;
     const io = t.io;
-    const saved = model_mod.think_effort_flag;
-    defer model_mod.think_effort_flag = saved;
-    model_mod.think_effort_flag = null;
+    const saved = effort_mod.think_effort_flag;
+    defer effort_mod.think_effort_flag = saved;
+    effort_mod.think_effort_flag = null;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "chat_template.jinja", .data = "{{ messages }}" });

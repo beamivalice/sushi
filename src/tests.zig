@@ -43,6 +43,7 @@ test {
     _ = @import("models_api.zig");
     _ = @import("logprobs.zig");
     _ = @import("model.zig");
+    _ = @import("effort.zig");
     _ = @import("exl3_flat_layout_test.zig");
     _ = @import("generate.zig");
     _ = @import("mtp_policy.zig");

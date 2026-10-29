@@ -7,6 +7,7 @@ test {
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("tokenize_cache.zig");
     _ = @import("round_cost.zig");
+    _ = @import("effort.zig");
     _ = @import("reasoning_protocol.zig");
     _ = @import("json_schema.zig");
     _ = @import("json_grammar.zig");

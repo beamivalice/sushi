@@ -7,6 +7,7 @@ const stop_seq_mod = @import("stop_sequences.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -828,7 +829,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     }
     var effort_word: ?[]const u8 = model_mod.defaultEffortWord(config);
     if (output_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(word, server_mod.server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
+        const cfg = reasoningEffortFromWord(word, server_mod.server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), effort_mod.effortArms(config.model_type)) catch {
             const msg = try effortRefusalFor(allocator, lm, word);
             defer allocator.free(msg);
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);

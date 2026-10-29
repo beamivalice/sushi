@@ -3,6 +3,7 @@ const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -220,7 +221,7 @@ pub fn effortWordOnly(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
     return chat_mod.templateConsumesEffort(cc.chat_template) and !thinkMarkersAtomic(allocator, lm, tok);
 }
 
-pub fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool, arms: ?[]const model_mod.EffortArm) error{EffortRefused}!?ReasoningEffort {
+pub fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool, arms: ?[]const effort_mod.EffortArm) error{EffortRefused}!?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
     return try reasoningEffortFromWord(v.string, default_budget, template_consumes_effort, arms);
@@ -229,14 +230,14 @@ pub fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, templ
 /// One effort word → one thinking config, whatever field carried the word —
 /// OpenAI's flat `reasoning_effort`, Responses' `reasoning.effort` and
 /// Anthropic's `output_config.effort` must not drift on what "low" means.
-/// `arms` is the model's `model.effortArms` table, read through `model.selectEffortPick`.
-pub fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consumes_effort: bool, arms: ?[]const model_mod.EffortArm) error{EffortRefused}!ReasoningEffort {
+/// `arms` is the model's `effort.effortArms` table, read through `effort.selectEffortPick`.
+pub fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consumes_effort: bool, arms: ?[]const effort_mod.EffortArm) error{EffortRefused}!ReasoningEffort {
     if (arms) |table| {
-        var offered: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
+        var offered: [std.enums.values(effort_mod.Effort).len]effort_mod.Effort = undefined;
         for (table, 0..) |a, i| offered[i] = a.effort;
-        const asked = model_mod.parseEffort(word) orelse return error.EffortRefused;
-        const pick = model_mod.selectEffortPick(offered[0..table.len], asked) orelse return error.EffortRefused;
-        const arm = model_mod.findEffortArm(table, pick.effort) orelse return error.EffortRefused;
+        const asked = effort_mod.parseEffort(word) orelse return error.EffortRefused;
+        const pick = effort_mod.selectEffortPick(offered[0..table.len], asked) orelse return error.EffortRefused;
+        const arm = effort_mod.findEffortArm(table, pick.effort) orelse return error.EffortRefused;
         const from: ?[]const u8 = if (pick.rerouted_from) |f| @tagName(f) else null;
         if (arm.effort == .off) return .{ .enable = false, .budget = default_budget, .effort = word, .rerouted_from = from };
         const budget = if (template_consumes_effort) default_budget else arm.budget orelse default_budget;
@@ -271,9 +272,9 @@ pub fn effortModelName(lm: *LoadedModel) []const u8 {
 
 /// One line for the log, the header and `effort_notice`. Caller frees.
 fn makeEffortNotice(allocator: std.mem.Allocator, model_name: []const u8, from_word: []const u8, to_word: []const u8) !EffortNotice {
-    const from = model_mod.parseEffort(from_word) orelse return error.EffortRefused;
-    const to = model_mod.parseEffort(to_word) orelse return error.EffortRefused;
-    const text = try model_mod.formatEffortRerouteNotice(allocator, model_name, from, to);
+    const from = effort_mod.parseEffort(from_word) orelse return error.EffortRefused;
+    const to = effort_mod.parseEffort(to_word) orelse return error.EffortRefused;
+    const text = try effort_mod.formatEffortRerouteNotice(allocator, model_name, from, to);
     errdefer allocator.free(text);
     const esc = try jsonEscape(allocator, text);
     defer allocator.free(esc);
@@ -320,7 +321,7 @@ pub fn withEffortNoticeJson(allocator: std.mem.Allocator, json: []const u8, fiel
 }
 
 /// The 400 text for an effort word the model's table refuses; caller frees.
-pub fn effortRefusal(allocator: std.mem.Allocator, word: []const u8, model_name: []const u8, arms: []const model_mod.EffortArm) ![]u8 {
+pub fn effortRefusal(allocator: std.mem.Allocator, word: []const u8, model_name: []const u8, arms: []const effort_mod.EffortArm) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.print(allocator, "reasoning effort '{s}' is not supported by {s}; use one of: ", .{ word, model_name });
@@ -331,7 +332,7 @@ pub fn effortRefusal(allocator: std.mem.Allocator, word: []const u8, model_name:
 /// The `/v1/models` row fields listing the accepted effort words, the thinking-token budget of
 /// each capped word, and the one a request naming none runs at; "" for an arch without a table.
 pub fn reasoningEffortsJson(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
-    const table = model_mod.effortArms(config.model_type) orelse return allocator.dupe(u8, "");
+    const table = effort_mod.effortArms(config.model_type) orelse return allocator.dupe(u8, "");
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, ",\"reasoning_efforts\":[");
@@ -350,7 +351,7 @@ pub fn reasoningEffortsJson(allocator: std.mem.Allocator, config: *const model_m
 /// The refusal text for `word` on `lm`'s model; caller frees.
 pub fn effortRefusalFor(allocator: std.mem.Allocator, lm: *LoadedModel, word: []const u8) ![]u8 {
     const config = lm.config.?;
-    return effortRefusal(allocator, word, if (lm.id.len > 0) lm.id else config.model_type, model_mod.effortArms(config.model_type).?);
+    return effortRefusal(allocator, word, if (lm.id.len > 0) lm.id else config.model_type, effort_mod.effortArms(config.model_type).?);
 }
 
 /// The client's thinking bool: top-level `enable_thinking`, else `chat_template_kwargs.enable_thinking`.
@@ -826,9 +827,9 @@ test "reasoningEffortFromWord: none disables, words budget exactly like the Open
 }
 
 test "reasoningEffortFromWord: a served arch refuses unknown words, and re-routes only the announced folds" {
-    const qwen = model_mod.effortArms("qwen4_exp").?;
-    const mimo = model_mod.effortArms("mimo_v2").?;
-    const glm = model_mod.effortArms("glm5_next").?;
+    const qwen = effort_mod.effortArms("qwen4_exp").?;
+    const mimo = effort_mod.effortArms("mimo_v2").?;
+    const glm = effort_mod.effortArms("glm5_next").?;
     try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, false, qwen));
     try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, false, qwen));
     for ([_][]const u8{ "high", "max" }) |w| {
@@ -892,7 +893,7 @@ test "withEffortNoticeJson appends the notice and leaves the answer bytes" {
 
 test "effort refusal and /v1/models list name the model's accepted words" {
     const allocator = std.testing.allocator;
-    const qwen = model_mod.effortArms("qwen4_exp").?;
+    const qwen = effort_mod.effortArms("qwen4_exp").?;
     const msg = try effortRefusal(allocator, "minimal", "Qwen3.8-Flash-Next-EXL3-K4", qwen);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("reasoning effort 'minimal' is not supported by Qwen3.8-Flash-Next-EXL3-K4; use one of: off, low, medium, xhigh", msg);
@@ -1140,14 +1141,14 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
         var choices = std.ArrayList(cli.Think).empty;
         defer choices.deinit(a);
         try choices.appendSlice(a, &.{ .model_default, .on });
-        for (model_mod.effortArms(family[0]).?) |arm| try choices.append(a, .{ .effort = arm.effort });
+        for (effort_mod.effortArms(family[0]).?) |arm| try choices.append(a, .{ .effort = arm.effort });
         for (choices.items) |think| {
             const body = try cli.buildPromptBody(a, "  literal prompt\n", think, .{});
             defer a.free(body);
             const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
             defer parsed.deinit();
             const root = parsed.value.object;
-            const effort = try parseReasoningEffort(root, 77, false, model_mod.effortArms(family[0]));
+            const effort = try parseReasoningEffort(root, 77, false, effort_mod.effortArms(family[0]));
             const enable = resolveEnableThinking(root, effort, true);
             try std.testing.expectEqual(think != .effort or think.effort != .off, enable);
             if (think == .effort) {
@@ -1173,13 +1174,13 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
 }
 
 test "thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo folds to on" {
-    for ([_]struct { arch: []const u8, accepted: []const model_mod.Effort }{
+    for ([_]struct { arch: []const u8, accepted: []const effort_mod.Effort }{
         .{ .arch = "glm5_next", .accepted = &.{ .low, .high, .max } },
         .{ .arch = "qwen4_exp", .accepted = &.{ .off, .low, .medium, .xhigh } },
     }) |c| {
-        for (std.enums.values(model_mod.Effort)) |e| {
-            const result = reasoningEffortFromWord(@tagName(e), -1, true, model_mod.effortArms(c.arch));
-            if (std.mem.indexOfScalar(model_mod.Effort, c.accepted, e) != null) {
+        for (std.enums.values(effort_mod.Effort)) |e| {
+            const result = reasoningEffortFromWord(@tagName(e), -1, true, effort_mod.effortArms(c.arch));
+            if (std.mem.indexOfScalar(effort_mod.Effort, c.accepted, e) != null) {
                 const got = try result;
                 try std.testing.expectEqual(e != .off, got.enable);
                 try std.testing.expect(got.rerouted_from == null);
@@ -1200,9 +1201,9 @@ test "thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo
                 try std.testing.expectEqualStrings("xhigh", got.rerouted_from.?);
             } else try std.testing.expectError(error.EffortRefused, result);
         }
-        try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, true, model_mod.effortArms(c.arch)));
+        try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, true, effort_mod.effortArms(c.arch)));
     }
-    const mimo = model_mod.effortArms("mimo_v2");
+    const mimo = effort_mod.effortArms("mimo_v2");
     for ([_][]const u8{ "on", "minimal", "low", "medium", "high", "xhigh", "max" }) |w| {
         const got = try reasoningEffortFromWord(w, -1, true, mimo);
         try std.testing.expect(got.enable);

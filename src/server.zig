@@ -16,6 +16,7 @@ const token_mask = @import("token_mask.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const fp8_block = @import("fp8_block.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const dsv41_config = @import("dsv41/dsv41_config.zig");
 const qwen_vision = @import("qwen4/qwen_vision.zig");
 const vision_common = @import("vision_common.zig");
@@ -7691,7 +7692,7 @@ pub fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
+    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), effort_mod.effortArms(config.model_type)) catch {
         const msg = try effortRefusalFor(allocator, lm, root.get("reasoning_effort").?.string);
         defer allocator.free(msg);
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);

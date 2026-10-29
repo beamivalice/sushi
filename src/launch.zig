@@ -13,6 +13,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 
 pub const Budget = struct { context: u64, output: u64 };
 
@@ -48,7 +49,7 @@ pub const Entry = struct {
 /// pi's thinking levels, in its own order.
 const pi_levels = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh" };
 /// The server's effort vocabulary, in order; `on` ranks below every graded word.
-const server_efforts = @typeInfo(model_mod.Effort).@"enum".field_names;
+const server_efforts = @typeInfo(effort_mod.Effort).@"enum".field_names;
 
 fn listed(words: []const []const u8, w: []const u8) bool {
     for (words) |x| if (std.mem.eql(u8, x, w)) return true;
@@ -1163,8 +1164,8 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
 }
 
 /// A served arch's `/v1/models` `reasoning_efforts`, read from the engine's own table.
-fn advertised(comptime model_type: []const u8) [model_mod.effortArms(model_type).?.len][]const u8 {
-    const arms = comptime model_mod.effortArms(model_type).?;
+fn advertised(comptime model_type: []const u8) [effort_mod.effortArms(model_type).?.len][]const u8 {
+    const arms = comptime effort_mod.effortArms(model_type).?;
     var words: [arms.len][]const u8 = undefined;
     for (arms, 0..) |a, i| words[i] = @tagName(a.effort);
     return words;

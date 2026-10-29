@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 pub const tokenizer = tokenizer_mod;
 pub const kld = kld_mod;
@@ -993,7 +994,7 @@ pub fn main(init: std.process.Init) !void {
         serve_mode = true;
         repl_after_serve = false;
     }
-    model_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
+    effort_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
     const prompt_body = if (prompt) |text| try cli_mod.buildPromptBody(allocator, text, run_opts.think, .{ .max_tokens = max_tokens, .temperature = temperature, .top_p = top_p_flag orelse 1.0, .top_k = top_k_flag orelse 0 }) else null;
     defer if (prompt_body) |body| allocator.free(body);
     var prompt_state: PromptClient = .{ .allocator = allocator, .io = io, .body = prompt_body orelse "", .stream = stream_mode };
@@ -1217,17 +1218,17 @@ pub fn main(init: std.process.Init) !void {
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
     scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
-    if (model_mod.think_effort_flag) |e| if (model_mod.effortArms(config.model_type)) |arms| {
-        var choices: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
+    if (effort_mod.think_effort_flag) |e| if (effort_mod.effortArms(config.model_type)) |arms| {
+        var choices: [std.enums.values(effort_mod.Effort).len]effort_mod.Effort = undefined;
         for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
-        if (model_mod.armForWord(arms, @tagName(e)) == null) {
+        if (effort_mod.armForWord(arms, @tagName(e)) == null) {
             var w = std.Io.Writer.Allocating.init(allocator);
             defer w.deinit();
             try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, choices[0..arms.len]);
             log.err("--think: {s}\n", .{w.written()});
             std.process.exit(1);
-        } else if (model_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
-            log.info("[effort] " ++ model_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
+        } else if (effort_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
+            log.info("[effort] " ++ effort_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
         };
     };
     if (config.glm_fp8_trunk) {
