@@ -316,9 +316,6 @@ pub fn mimoSlidingRowsAttn(
 /// Test seam: global verify forwards whose rows went through row-group passes.
 pub var mimo_global_rows_mpp_count: u32 = 0;
 
-/// Meter seam: false keeps every global verify row on its own dispatch.
-pub var mimo_global_rows_override: ?bool = null;
-
 /// A spec verify's rows, or a global prefill too short for the fused kernel, each attending
 /// exactly the keys its own decode tick would have seen through `mimoDecodeAttn`, so an
 /// accepted row is the serial row bit for bit. `kv_view` is the forward's cache update: it
@@ -357,7 +354,6 @@ pub fn mimoGlobalRowsGroup(left: c_int) c_int {
 /// its last row's split partition: a shorter row then reads at most one more page, fully masked,
 /// which adds exact zeros. Null = the per-row path serves.
 pub fn mimoGlobalRowsMpp(s: mlx.mlx_stream, q_rope: mlx.mlx_array, kv_view: *const DenseKVView, seq_len: c_int, attn_scale: f32) !?mlx.mlx_array {
-    if (mimo_global_rows_override == false) return null;
     if (seq_len < 2 or seq_len >= FUSED256_MIN_Q_LEN or !kv_view.has_quant_triple or !mimoDecodeUsesNax()) return null;
     const t_k = mlx.getShape(kv_view.k_triple_q)[2];
     const first = t_k - seq_len + 1;
@@ -868,7 +864,6 @@ pub fn mimoDecodePrep(
 ) !?DenseKVView {
     const kvc = ctx.cache.config;
     if (kvc.scheme != .affine or (kvc.bits != 8 and kvc.bits != 6) or kvc.group_size != 64) return null;
-    if (mimo_qkv_prep_override == false) return null;
     const angles = try self.qkAngleRowsFor(if (is_global) 0 else 1, rope_dims, rope_base, .{ .ctx = null }, offset, rows, 1.0);
     var prep = (try mimoDecodeQkvPrep(self.s, proj[0], proj[1], proj[2], angles, h_count, kv_h, rope_dims, rows, kvc.bits)) orelse return null;
     errdefer _ = mlx.mlx_array_free(prep.q);
@@ -1259,9 +1254,6 @@ pub const MimoQkvPrepKey = struct { hq: c_int, hk: c_int, rd: c_int, rows: c_int
 
 /// Two layer geometries (global, sliding) at every verify width, for each of the two cache widths.
 pub var mimo_qkv_prep_cfgs: [4 * MIMO_VERIFY_ROWS_MAX]?struct { key: MimoQkvPrepKey, cfg: mlx.mlx_fast_metal_kernel_config } = @splat(null);
-
-/// Test and fwd-meter seam: false keeps the composed rope + quantize.
-pub var mimo_qkv_prep_override: ?bool = null;
 
 pub const MimoQkvPrep = struct {
     q: mlx.mlx_array, // [1, HQ, rows, 192], roped

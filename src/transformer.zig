@@ -17065,7 +17065,6 @@ pub const Transformer = struct {
                     ssm.ssm_state = f.ssm_state;
                     f.ssm_state = .{ .ctx = null };
                     gdn_verify_recur_engaged = true;
-                    gdn_verify_fold_calls += 1;
                     if (!gdn_verify_fold_engaged) {
                         gdn_verify_fold_engaged = true;
                         log.info("[gdn] verify fold engaged: S={d} Hk={d} Hv={d}\n", .{ seq_len, num_k_heads, num_v_heads });
@@ -21629,11 +21628,10 @@ pub fn gdnDecodeFusedEnabled() bool {
     return gdn_decode_fused_override orelse true;
 }
 
-pub var gdn_decode_recur_override: ?bool = null; // test and fwd-ubench arm seam
+pub var gdn_decode_recur_override: ?bool = null; // test seam
 var gdn_decode_recur_engaged: bool = false;
 var gdn_verify_recur_engaged: bool = false;
-pub var gdn_verify_fold_override: ?bool = null; // parity and same-process timing
-pub var gdn_verify_fold_calls: u64 = 0;
+pub var gdn_verify_fold_override: ?bool = null; // parity test seam
 var gdn_verify_fold_engaged = false;
 
 fn gdnVerifyFoldFor(seq_len: c_int) bool {
@@ -22219,13 +22217,10 @@ fn shortlistSparseLogits(s: mlx.mlx_stream, lists: []const mtp_mod.Shortlist, vo
 
 /// Rows an argmax-only shortlist readout serves: a decode tick and every verify width.
 const LMHEAD_SHORTLIST_MAX_ROWS: usize = 16;
-/// Fwd-meter arm seam; null = on unless the diagnostic SUSHI_LMHEAD_FULL=1 forces the full head.
-pub var lmhead_shortlist_override: ?bool = null;
 var lmhead_full_env: ?bool = null;
 var lmhead_shortlist_audit_env: ?bool = null;
 
 fn lmHeadShortlistOn() bool {
-    if (lmhead_shortlist_override) |v| return v;
     return !diagEnvOnCached(&lmhead_full_env, "SUSHI_LMHEAD_FULL");
 }
 

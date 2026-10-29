@@ -35,8 +35,6 @@ const std = @import("std");
 pub var slot_vision_free_test_hook: ?*const fn (mlx.mlx_array) void = null;
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
-const mimo_forward = @import("mimo_forward.zig");
-const qwen4_qsa = @import("qwen4_qsa.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
@@ -2818,44 +2816,6 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
 
-/// The verify-rows arms a forward microbench width runs.
-fn ubenchRowArms(rows: usize, is_mimo: bool, both: bool) []const bool {
-    const eligible = is_mimo and rows > 1 and rows <= transformer_mod.MIMO_VERIFY_ROWS_MAX;
-    if (!eligible) return &.{false};
-    return if (both) &.{ false, true } else &.{true};
-}
-
-/// One forward-microbench block: its verify-rows arm and its QSA pooled-key arm.
-const UbenchArm = struct {
-    verify_rows: bool,
-    /// null keeps the shipped default; false runs the composed chain, true the fused kernel.
-    qsa_pool: ?bool = null,
-
-    /// Arms the block and zeroes the fused-launch count it reports.
-    fn apply(self: UbenchArm, ctx: *ForwardCtx) void {
-        ctx.verify_rows = self.verify_rows;
-        qwen4_qsa.qsa_pool_rope_fused_override = self.qsa_pool;
-        transformer_mod.qsa_pool_rope_dispatches = 0;
-    }
-
-    fn poolName(self: UbenchArm) []const u8 {
-        const fused = self.qsa_pool orelse return "default";
-        return if (fused) "fused" else "composed";
-    }
-};
-
-/// A width's blocks: each verify-rows arm, run A B B A over the QSA pooled-key chain (A) and kernel (B)
-/// when `pool_arms` asks.
-fn ubenchArms(buf: *[8]UbenchArm, rows: usize, is_mimo: bool, row_arms: bool, pool_arms: bool) []const UbenchArm {
-    const pools: []const ?bool = if (pool_arms) &.{ false, true, true, false } else &.{null};
-    var n: usize = 0;
-    for (ubenchRowArms(rows, is_mimo, row_arms)) |verify_rows| for (pools) |pool| {
-        buf[n] = .{ .verify_rows = verify_rows, .qsa_pool = pool };
-        n += 1;
-    };
-    return buf[0..n];
-}
-
 /// A resident MiMo warms its verify rows with or without its heads: a PLD request verifies on them too.
 fn mimoVerifyWarmWanted(config: *const ModelConfig) bool {
     return config.isMimo() and !config.expert_streaming;
@@ -4709,63 +4669,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 }
                 log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
             }
-            // SUSHI_DECODE_FWD_UBENCH_ROW_ARMS=1: a MiMo verify width runs twice, the
-            // prefill-shaped forward first, then the verify rows (decode arithmetic per row).
-            const row_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_ROW_ARMS");
-            // SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1: every width runs the GDN chain and the fused
-            // decode step (`gdn_decode.step`) as off, on, on, off passes in this one process.
-            const gdn_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GDN_ARMS");
-            defer transformer_mod.gdn_decode_recur_override = null;
-            const fold_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS");
-            defer transformer_mod.gdn_verify_fold_override = null;
-            // SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS=1: each width runs A B B A, A the composed QSA
-            // pooled-key chain and B the fused kernel; each arm logs its fused launches.
-            const pool_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS");
-            defer qwen4_qsa.qsa_pool_rope_fused_override = null;
-            // SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1: MiMo's composed rope + kv8 quantize (off) and
-            // the one-dispatch prep (on) as off, on, on, off passes.
-            const qkv_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS");
-            defer mimo_forward.mimo_qkv_prep_override = null;
-            // SUSHI_DECODE_FWD_UBENCH_LMHEAD_ARMS=1: argmax-only forwards on the full lm_head (off) and
-            // the coarse shortlist (on) as off, on, on, off passes; the heads load later, so it builds
-            // its own coarse copy for the meter.
-            const lm_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_LMHEAD_ARMS");
-            // SUSHI_DECODE_FWD_UBENCH_GLOBAL_ROWS_ARMS=1: MiMo global verify rows one dispatch each (off)
-            // and in row groups sharing one page walk each (on) as off, on, on, off passes.
-            const rows_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GLOBAL_ROWS_ARMS");
-            defer mimo_forward.mimo_global_rows_override = null;
-            const lm_built = lm_arms and xfm_ptr.lm_head_coarse == null;
-            if (lm_built) xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
-            defer if (lm_arms) {
-                if (lm_built) if (xfm_ptr.lm_head_coarse) |*c| {
-                    c.deinit();
-                    xfm_ptr.lm_head_coarse = null;
-                };
-                transformer_mod.lmhead_shortlist_override = null;
-            };
-            var arm_buf: [8]UbenchArm = undefined;
             for (widths[0..n_widths]) |rows| {
-            for (ubenchArms(&arm_buf, rows, xfm_ptr.config.isMimo(), row_arms, pool_arms)) |arm| {
-            const abba: []const ?bool = &.{ false, true, true, false };
-            const abba2: []const ?bool = &.{ false, true, true, false, false, true, true, false };
-            const no_arms: []const ?bool = &.{null};
-            for (if (qkv_arms) abba2 else if (gdn_arms or fold_arms or lm_arms or rows_arms) abba else no_arms) |gdn_arm| {
-            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else if (qkv_arms or lm_arms or rows_arms) null else gdn_arm;
-            mimo_forward.mimo_global_rows_override = if (rows_arms) gdn_arm else null;
-            if (lm_arms) transformer_mod.lmhead_shortlist_override = gdn_arm;
-            transformer_mod.gdn_verify_fold_override = if (fold_arms) gdn_arm else null;
-            mimo_forward.mimo_qkv_prep_override = if (qkv_arms) gdn_arm else null;
-            transformer_mod.gdn_verify_fold_calls = 0;
-            if (gdn_arm) |on| log.info("[fwd-ubench] {s} arm: {s}\n", .{ if (rows_arms) "global rows" else if (lm_arms) "lm_head shortlist" else if (qkv_arms) "qkv prep" else if (fold_arms) "gdn fold" else "gdn recur", if (on) "on" else "off" });
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
             defer sch.allocator.free(tok_slice);
             for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
             const tok = tok_slice.ptr;
             const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
             ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
-            arm.apply(&ctx);
-            if (lm_arms) ctx.argmax_only = true;
-            log.info("[fwd-ubench] rows={d} capture={} verify_rows={} qsa_pool={s}\n", .{ tok_slice.len, ctx.capture_ssm_seq, arm.verify_rows, arm.poolName() });
+            ctx.verify_rows = xfm_ptr.config.isMimo() and rows > 1 and rows <= transformer_mod.MIMO_VERIFY_ROWS_MAX;
+            log.info("[fwd-ubench] rows={d} capture={} verify_rows={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, ctx.verify_rows });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
@@ -4808,7 +4720,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 _ = mlx.mlx_array_free(lg);
                 done += 1;
             }
-            if (fold_arms) log.info("[fwd-ubench] gdn fold launches: {d}\n", .{transformer_mod.gdn_verify_fold_calls});
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
             log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
@@ -4863,7 +4774,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             }
             const ms_nolm = @as(f64, @floatFromInt(sw_nolm.read())) / 1.0e6 / @as(f64, @floatFromInt(@max(done_nolm, 1)));
             ctx.skip_lm_head = false;
-            log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms; qsa_pool={s} fused launches={d}\n", .{ ms_nolm, ms - ms_nolm, arm.poolName(), transformer_mod.qsa_pool_rope_dispatches });
+            log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
             if (profile_pass) {
                 transformer_mod.decodeProfileSession(@intCast(rows));
                 for (0..n) |_| {
@@ -4874,8 +4785,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     _ = mlx.mlx_array_free(lg);
                 }
                 transformer_mod.decodeProfileSession(0);
-            }
-            }
             }
             }
             log.info("[fwd-ubench] done\n", .{});
@@ -12687,21 +12596,6 @@ test "a commitment is released as the cache allocates it" {
     // A DFlash2 request reserves its whole capacity after prefill.
     try testing.expectEqual(@as(u64, 0), outstandingGrowth(6, 6));
     try testing.expectEqual(@as(u64, 0), outstandingGrowth(6, 7));
-}
-
-test "the fwd-ubench QSA pooled-key arms interleave composed and fused A B B A inside each verify-rows arm" {
-    var buf: [8]UbenchArm = undefined;
-    const off = [_]UbenchArm{.{ .verify_rows = false }};
-    try testing.expectEqualSlices(UbenchArm, &off, ubenchArms(&buf, 3, false, false, false));
-    const qwen = [_]UbenchArm{
-        .{ .verify_rows = false, .qsa_pool = false }, .{ .verify_rows = false, .qsa_pool = true },
-        .{ .verify_rows = false, .qsa_pool = true },  .{ .verify_rows = false, .qsa_pool = false },
-    };
-    try testing.expectEqualSlices(UbenchArm, &qwen, ubenchArms(&buf, 3, false, false, true));
-    const mimo = ubenchArms(&buf, 3, true, true, true);
-    try testing.expectEqual(@as(usize, 8), mimo.len);
-    try testing.expectEqualSlices(UbenchArm, &qwen, mimo[0..4]);
-    for (mimo[4..], qwen) |got, want| try testing.expectEqual(UbenchArm{ .verify_rows = true, .qsa_pool = want.qsa_pool }, got);
 }
 
 
