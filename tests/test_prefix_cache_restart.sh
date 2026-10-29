@@ -41,6 +41,9 @@ case "$ARCH" in glm5_next) THINK='{"reasoning_effort":"low"}' ;; *) THINK='{"ena
 case "$ARCH" in qwen4_exp | mimo_v2) THINK=$(jq -c '. + {enable_mtp:false}' <<< "$THINK") ;; esac
 FD_ARM=0
 [ "$ARCH" = qwen4_exp ] && FD_ARM=1
+# The fd arm's entry alone writes a ~100 MB SSM checkpoint per 1024 tokens, so its budget must not evict the others.
+DISK=4GB
+[ "$FD_ARM" = 1 ] && DISK=24GB
 
 pyh() { # a request-body builder and a poster, keyed by its first argument
     python3 -I - "$@" <<'PY'
@@ -111,7 +114,7 @@ boot() {
     LOGOFF=${LOGOFF// /}
     # shellcheck disable=SC2046
     sushi_boot "$LABEL" "$MODEL" $(sushi_profile_flags api "$KEY") --prefix-cache-entries 4 --prefix-cache-mem off \
-        --prefix-cache-disk 4GB --prefill-chunk 1024 $([ "$FD_ARM" = 1 ] && echo --ctx-size 65536) "$@" || exit $?
+        --prefix-cache-disk "$DISK" --prefill-chunk 1024 $([ "$FD_ARM" = 1 ] && echo --ctx-size 65536) "$@" || exit $?
     CACHE="$SUSHI_RUN_DIR/$LABEL.kv-cache"
 }
 blog() { tail -c +$((LOGOFF + 1)) "$SUSHI_LOG"; }
