@@ -29,6 +29,7 @@ const reservedPrefillTokens = prefill_plan.reservedPrefillTokens;
 const walkChunkEnds = prefill_plan.walkChunkEnds;
 const generate = @import("../generate.zig");
 const Generator = generate.Generator;
+const mtp_round = @import("../mtp_round.zig");
 const MtpHeadRef = generate.MtpHeadRef;
 
 test "a 40k Qwen prefill checkpoints every 8192 tokens at any chunk width the ladder takes" {
@@ -384,16 +385,16 @@ const MtpChainTestSlot = struct {
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
-    const predraft = Generator.mtp_predraft_enabled;
+    const predraft = mtp_round.mtp_predraft_enabled;
     const bounds_before = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
-        Generator.mtp_predraft_enabled = predraft;
+        mtp_round.mtp_predraft_enabled = predraft;
         depth_bounds.active = bounds_before;
         group_planner.enabled_override = planner;
     }
     // Observe the completed-round stash before any successor consumes it.
-    Generator.mtp_predraft_enabled = false;
+    mtp_round.mtp_predraft_enabled = false;
     group_planner.enabled_override = true;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -528,15 +529,15 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
 test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, every later depth a one-hot at its draft (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
-    const predraft = Generator.mtp_predraft_enabled;
+    const predraft = mtp_round.mtp_predraft_enabled;
     const bounds_before = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
-        Generator.mtp_predraft_enabled = predraft;
+        mtp_round.mtp_predraft_enabled = predraft;
         depth_bounds.active = bounds_before;
         group_planner.enabled_override = planner;
     }
-    Generator.mtp_predraft_enabled = false;
+    mtp_round.mtp_predraft_enabled = false;
     group_planner.enabled_override = false;
     const depth: u32 = 3;
     depth_bounds.active = .{ .min = depth, .max = depth };

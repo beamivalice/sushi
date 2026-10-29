@@ -282,7 +282,7 @@ fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void 
 /// do not name.
 const test_buckets = [_][]const []const u8{
     &.{ "transformer", "gdn_decode", "cli", "launch" },
-    &.{ "generate", "mtp_policy", "scheduler", "prefix_cache", "kv_disk_cache", "disk_placement", "restore_dump", "mtp", "dflash" },
+    &.{ "generate", "mtp_policy", "mtp_round", "scheduler", "prefix_cache", "kv_disk_cache", "disk_placement", "restore_dump", "mtp", "dflash" },
     &.{ "server", "responses" },
 };
 
