@@ -1910,6 +1910,14 @@ fn expectLe(label: []const u8, got: f64, bound: f64) !void {
     return error.KernelOutsideBar;
 }
 
+const F32_ULP: f64 = 0x1p-23;
+const NO_WORSE_ULPS = 16;
+
+/// `got` is no worse than `reference` plus the rounding noise of two f32 results, both relative to the peak.
+fn expectNoWorse(label: []const u8, got: f64, reference: f64) !void {
+    return expectLe(label, got, reference + NO_WORSE_ULPS * F32_ULP);
+}
+
 fn relErrF(got: []const f32, want: []const f32) f64 {
     var peak: f64 = 1e-30;
     for (want) |v| peak = @max(peak, @abs(v));
@@ -2078,7 +2086,7 @@ test "dsv41 moe decode: the gate-up and down-expand kernels are no further from 
     const err_kernel = relErr(try hostOf(&sc, got), truth);
     const err_composed = relErr(try hostOf(&sc, want), truth);
     try expectLe("kernel vs truth", err_kernel, 1e-5);
-    try expectLe("kernel vs composed's error", err_kernel, @max(err_composed, 2e-6));
+    try expectNoWorse("kernel vs composed's error", err_kernel, err_composed);
 }
 
 test "dsv41 moe decode: in bf16 the kernels give the composed chain's stream to a few bf16 ulps" {
@@ -2111,7 +2119,7 @@ test "dsv41 gate: the router logits are no further from the f64 truth than the f
             for (0..D) |k| s += @as(f64, xh[l * D + k]) * wh[e * D + k];
             truth[l * E + e] = s;
         };
-        try expectLe("kernel vs truth", relErr(got, truth), @max(relErr(comp, truth), 2e-6));
+        try expectNoWorse("kernel vs truth", relErr(got, truth), relErr(comp, truth));
     }
 }
 
@@ -2292,7 +2300,7 @@ test "dsv41 dense f32x: the product is no further from the f64 truth than the wi
             for (0..K) |k| s += @as(f64, xh[l * K + k]) * wh[n * K + k];
             truth[l * N + n] = s;
         };
-        try expectLe("kernel vs truth", relErr(got, truth), @max(relErr(comp, truth), 2e-6));
+        try expectNoWorse("kernel vs truth", relErr(got, truth), relErr(comp, truth));
     }
 }
 
@@ -2509,7 +2517,7 @@ test "dsv41 decode attention: every split count is no further from the f64 truth
     const err_comp = relErr(comp, truth);
     for ([_]usize{ 1, 2, 4, 5 }) |splits| {
         const got = try hostOf(&sc, try attnDecodeSplit(&sc, decodeArgs(&a, .float32, null), splits));
-        try expectLe("attn decode vs truth", relErr(got, truth), @max(err_comp, 2e-6));
+        try expectNoWorse("attn decode vs truth", relErr(got, truth), err_comp);
     }
 }
 
@@ -2654,7 +2662,7 @@ test "dsv41 index scores: the scalar and the matrix kernels are no further from 
             try cv.append(testing.allocator, comp[i]);
             try tv.append(testing.allocator, s);
         };
-        try expectLe("index scores vs truth", relErr(gv.items, tv.items), @max(relErr(cv.items, tv.items), 2e-6));
+        try expectNoWorse("index scores vs truth", relErr(gv.items, tv.items), relErr(cv.items, tv.items));
     }
 }
 
@@ -2786,8 +2794,8 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     const ref = try composedHc(&sc, &d, d.x);
     try truthHc(&sc, &d, d.x, z_truth, h_truth);
     const st = try hcStage(&sc, d.x, null, d.cpre, d.w, d.hw, d.eps);
-    try expectLe("stage z", relErr(try hostOf(&sc, st.z), z_truth), @max(relErr(try hostOf(&sc, ref.z), z_truth), 2e-6));
-    try expectLe("stage h", relErr(try hostOf(&sc, st.h), h_truth), @max(relErr(try hostOf(&sc, ref.h), h_truth), 2e-6));
+    try expectNoWorse("stage z", relErr(try hostOf(&sc, st.z), z_truth), relErr(try hostOf(&sc, ref.z), z_truth));
+    try expectNoWorse("stage h", relErr(try hostOf(&sc, st.h), h_truth), relErr(try hostOf(&sc, ref.h), h_truth));
     // the expanded stream: the chain's `hcExpand`, then the same two outputs of its mixes
     const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
     const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
@@ -2802,11 +2810,11 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
         for (0..d.hc) |j| acc += @as(f64, ch[j * d.hc + i]) * xh[j * d.d + c];
         x1_truth[i * d.d + c] = acc;
     };
-    try expectLe("expanded stream", relErr(try hostOf(&sc, sx.x1), x1_truth), @max(relErr(try hostOf(&sc, x1_ref), x1_truth), 2e-6));
+    try expectNoWorse("expanded stream", relErr(try hostOf(&sc, sx.x1), x1_truth), relErr(try hostOf(&sc, x1_ref), x1_truth));
     const ref1 = try composedHc(&sc, &d, x1_ref);
     try truthHc(&sc, &d, sx.x1, z_truth, h_truth);
-    try expectLe("expand stage z", relErr(try hostOf(&sc, sx.z), z_truth), @max(relErr(try hostOf(&sc, ref1.z), z_truth), 2e-6));
-    try expectLe("expand stage h", relErr(try hostOf(&sc, sx.h), h_truth), @max(relErr(try hostOf(&sc, ref1.h), h_truth), 2e-6));
+    try expectNoWorse("expand stage z", relErr(try hostOf(&sc, sx.z), z_truth), relErr(try hostOf(&sc, ref1.z), z_truth));
+    try expectNoWorse("expand stage h", relErr(try hostOf(&sc, sx.h), h_truth), relErr(try hostOf(&sc, ref1.h), h_truth));
 }
 
 test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and expanded stream to bf16 ulps" {

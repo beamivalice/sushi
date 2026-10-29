@@ -8534,6 +8534,7 @@ fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
     var peaks: Exl3F32Peaks = .{};
     var err_new: f64 = 0;
     var err_comp: f64 = 0;
+    var ulps_sq: f64 = 0;
     const truth = try alloc.alloc(f32, c.hidden);
     for (0..c.rows) |r| {
         const slots = f.slots[r * c.topk ..][0..c.topk];
@@ -8562,13 +8563,25 @@ fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
             try std.testing.expect(std.math.isFinite(g) and std.math.isFinite(b) and std.math.isFinite(v));
             err_new += (g - v) * (g - v);
             err_comp += (b - v) * (b - v);
+            const u = bf16Ulp(v);
+            ulps_sq += u * u;
         }
     }
-    if (err_new > err_comp) {
-        std.debug.print("n40 bf16 truth seed={d} win={d}: squared error {d:.9} > composite {d:.9}\n", .{ seed, win, err_new, err_comp });
+    if (@sqrt(err_new) > @sqrt(err_comp) + BF16_NO_WORSE_ULPS * @sqrt(ulps_sq)) {
+        std.debug.print("n40 bf16 truth seed={d} win={d}: squared error {d:.9} > composite {d:.9} (rms bar {d} ulps of {d:.9})\n", .{ seed, win, err_new, err_comp, BF16_NO_WORSE_ULPS, @sqrt(ulps_sq) });
         return error.PrefillWorseThanComposite;
     }
 }
+
+/// The bf16 spacing at `v`, the unit a bf16 result's rounding is measured in.
+fn bf16Ulp(v: f64) f64 {
+    if (v == 0) return 0;
+    return std.math.ldexp(@as(f64, 1), std.math.frexp(v).exponent - 8);
+}
+
+/// How far the kernel's rms error may sit above the composite's, in bf16 ulps: both round their stores to bf16,
+/// and a flipped rounding moves either by a fraction of an ulp.
+const BF16_NO_WORSE_ULPS = 0.1;
 
 test "exl3 n40 NAX BF16 prefill no worse than composite against f32 truth" {
     for ([_]c_int{32}) |win| {
