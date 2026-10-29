@@ -122,7 +122,7 @@ slot's `moe_seq_offset`; the pad-waste cap reads `KVCache.kvLenForBatching`. Bat
   prompts at kv8 either). MiMo: `[kv-attn] matmul2d packed attention engaged: bits=6 gs=64 DK=192 DV=128 Hq=64 Hkv=4 Tq=1 Tk=4105` and
   `[mimo-verify] global rows in matmul2d row groups engaged: rows=3 keys=4108`, as at kv8; the split-K arm stays off on a NAX GPU.
 - `tests/glm5/test_glm_prefix_reuse.sh` passes at kv8 and at kv6 (every restore, the cold-vs-warm logprob bounds, and the BF16 request
-  that never restores the kv6 entry); `tests/test_kv_quant_per_request.sh` and `tests/test_kv_quant_equivalence.sh` pass on
+  that never restores the kv6 entry); `tests/test_kv_quant_per_request.sh` (plumbing and equivalence) passes on
   Sushi-2.6bpw with kv6 (first 30 tokens byte-identical to dense at 4, 6 and 8 bits).
 - GLM kv6 smoke on Sushi-2.4bpw: loads, answers, and DFlash2 engages (`[spec-stats] mode=dflash ... avg_per_round=2.38`);
   `[glm] native kv6 MLA: 4576 latent + 704 pooled-index bytes/token` (11 MLA layers at 416 bytes).

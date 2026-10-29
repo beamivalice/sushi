@@ -1,164 +1,131 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
-# Wave 1.A — per-request `kv_quant` body field.
-#
-# Starts the server with `--kv-quant off` (the process-level default) and
-# fires three back-to-back requests against /v1/chat/completions:
-#   1. no `kv_quant` field         → inherits process default (off)
-#   2. {"kv_quant": 4}              → per-request override to 4-bit affine
-#   3. {"kv_quant": "off"}          → explicit override back to dense
-# All three must complete with non-empty content. The 4-bit request is the
-# critical one — if SubmitParams.kv_quant_config plumbing or the slot's
-# KVCache.initWithConfig is broken, the request returns garbage / pad-only.
-#
-# Hot-prefix-cache scheme isolation: a follow-up identical request under
-# scheme A must NOT pick up a cache hit from a prior scheme-B commit. We
-# assert that the second 4-bit request emits a `[hot-cache] reused N/M`
-# line whose match length is 0 against the dense-default first request.
-# (Tightly testing this requires same prompt + different scheme; we do
-# scheme-flip while pinning the prompt and assert no cross-scheme hit.)
-#
-# Usage:
-#   ./tests/test_kv_quant_per_request.sh [/path/to/model] [port]
-# Defaults: model = ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, port = 8094.
+# sushi-test: tier=live boot=exact
+# Per-request `kv_quant` body field, on one boot whose process default is the shipping kv8.
+#   1. plumbing: no field, 4, "off", 8 and 6 on /v1/chat/completions each complete with content, and the log
+#      names every override the scheduler applied; /v1/completions honours the field too.
+#   2. equivalence: the same greedy request under kv_quant 4, 6 and 8 matches kv_quant "off" for its first N
+#      tokens. KV quantization is lossy, so the bar catches kernel bugs (wrong dequantize, off-by-one slice
+#      update, NaN), not the float-reduction tail (docs/engine-kv-cache.md, "Byte stability").
+# A scheme the arch refuses (kv4 on GLM) is left out; DeepSeek has no KV cache to quantize.
+set -u
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+case "$SUSHI_ARCH" in
+    deepseek_v41) echo "SKIP $(basename "$0"): deepseek_v41 has no KV cache to quantize"; exit 3 ;;
+    glm5_next) BITS="6 8" ;;
+    *) BITS="4 6 8" ;;
+esac
 
-set -e
-
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${2:-8094}"
-BASE="http://127.0.0.1:$PORT"
+BASE="$SUSHI_URL"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
 NC='\033[0m'
-
-if [ ! -d "$MODEL" ]; then
-    echo -e "${YELLOW}SKIP${NC} test_kv_quant_per_request: $MODEL not found."
-    exit 0
-fi
-if [ ! -f "$MODEL/config.json" ]; then
-    echo -e "${RED}FAIL${NC} $MODEL/config.json missing — not a valid model directory."
-    exit 1
-fi
-
-BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-if [ ! -x "$BINARY" ]; then
-    echo -e "${RED}FAIL${NC} $BINARY not found. Build first with 'zig build -Doptimize=ReleaseFast'."
-    exit 1
-fi
-
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-
-LOGFILE=$(mktemp)
-echo "  starting server (--kv-quant off, --prefix-cache-entries 4 --prefix-cache-mem 2GB)..."
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant off --prefix-cache-entries 4 --prefix-cache-mem 2GB ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
-SERVER_PID=$!
-
-cleanup() {
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-    rm -f "$LOGFILE"
-}
-trap cleanup EXIT
-
-up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then
-        up=1
-        break
-    fi
-    sleep 1
-done
-if [ "$up" != "1" ]; then
-    echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
-    tail -30 "$LOGFILE"
-    exit 1
-fi
+FAIL=0
 
 fire() {
     # $1 = label, $2 = optional kv_quant field value (empty = no field)
-    local label="$1"
-    local kvq="$2"
-    local extra=""
-    if [ -n "$kvq" ]; then
-        extra=", \"kv_quant\": $kvq"
-    fi
-    local body
-    body=$(curl -s -X POST -H "Content-Type: application/json" \
-        -d "{\"model\":\"sushi\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one short sentence.\"}],\"max_tokens\":32,\"temperature\":0.0,\"stream\":false${extra}}" \
+    local label="$1" extra="" body content
+    [ -z "$2" ] || extra=", \"kv_quant\": $2"
+    body=$(curl -s -m 600 -X POST -H "Content-Type: application/json" \
+        -d "{\"model\":\"sushi\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Say hello in one short sentence.\"}],\"max_tokens\":32,\"temperature\":0.0,\"stream\":false${extra}}" \
         "$BASE/v1/chat/completions")
-    local content
-    content=$(echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('choices',[{}])[0].get('message',{}).get('content',''))" 2>/dev/null || echo "")
-    if [ -z "$content" ] || [ "$content" = "None" ]; then
+    content=$(echo "$body" | python3 -c "import sys,json; m=json.load(sys.stdin)['choices'][0]['message']; print((m.get('reasoning_content') or '') + (m.get('content') or ''))" 2>/dev/null || echo "")
+    if [ -z "$content" ]; then
         echo -e "${RED}FAIL${NC} $label: empty/null content"
         echo "  body: $(echo "$body" | head -c 400)"
-        return 1
+        FAIL=1
+        return
     fi
     echo -e "${GREEN}PASS${NC} $label: $(echo "$content" | head -c 80)..."
-    return 0
 }
 
-FAIL=0
-echo
 echo "== per-request kv_quant override =="
-fire "request #1 (no kv_quant field, inherits process default 'off')" "" || FAIL=1
-sleep 1
-fire "request #2 (kv_quant: 4 — per-request 4-bit override)" "4" || FAIL=1
-sleep 1
-fire "request #3 (kv_quant: \"off\" — explicit dense)" '"off"' || FAIL=1
-sleep 1
-fire "request #4 (kv_quant: 8 — per-request 8-bit)" "8" || FAIL=1
-sleep 1
-fire "request #5 (kv_quant: 6 — per-request 6-bit)" "6" || FAIL=1
+fire "request without kv_quant (inherits the process default)" ""
+fire "kv_quant \"off\" (explicit dense)" '"off"'
+for b in $BITS; do
+    fire "kv_quant $b" "$b"
+done
 
-# Hot-cache scheme isolation: server log MUST contain a kv-quant override log
-# line for each non-default request — that's how we know the parse hit the
-# scheduler path. And the cache MUST report a fresh resident line per scheme
-# transition without crashing.
 echo
 echo "== server log: kv-quant override lines =="
-if ! grep -q "kv-quant override: affine 4-bit" "$LOGFILE"; then
-    echo -e "${RED}FAIL${NC} expected '  kv-quant override: affine 4-bit' line in server log"
-    FAIL=1
-else
-    echo -e "${GREEN}PASS${NC} per-request 4-bit override observed in server log"
-fi
-if ! grep -q "kv-quant override: affine 6-bit" "$LOGFILE"; then
-    echo -e "${RED}FAIL${NC} expected '  kv-quant override: affine 6-bit' line in server log"
-    FAIL=1
-else
-    echo -e "${GREEN}PASS${NC} per-request 6-bit override observed in server log"
-fi
-if ! grep -q "kv-quant override: affine 8-bit" "$LOGFILE"; then
-    echo -e "${RED}FAIL${NC} expected '  kv-quant override: affine 8-bit' line in server log"
-    FAIL=1
-else
-    echo -e "${GREEN}PASS${NC} per-request 8-bit override observed in server log"
-fi
-if ! grep -q "kv-quant override: off" "$LOGFILE"; then
-    echo -e "${RED}FAIL${NC} expected '  kv-quant override: off' line in server log"
-    FAIL=1
-else
+LOGS=$(sushi_log_since)
+for b in $BITS; do
+    if grep -q "kv-quant override: affine $b-bit" <<< "$LOGS"; then
+        echo -e "${GREEN}PASS${NC} per-request $b-bit override observed in server log"
+    else
+        echo -e "${RED}FAIL${NC} expected 'kv-quant override: affine $b-bit' line in server log"
+        FAIL=1
+    fi
+done
+if grep -q "kv-quant override: off" <<< "$LOGS"; then
     echo -e "${GREEN}PASS${NC} per-request 'off' override observed in server log"
+else
+    echo -e "${RED}FAIL${NC} expected 'kv-quant override: off' line in server log"
+    FAIL=1
 fi
 
 # /v1/completions once ignored the field: the override line must appear for it too.
 echo
 echo "== /v1/completions per-request kv_quant =="
-before=$(grep -c "kv-quant override: affine 4-bit" "$LOGFILE" || true)
-curl -s -X POST -H "Content-Type: application/json" \
-    -d '{"model":"sushi","prompt":"Say hello.","max_tokens":8,"temperature":0.0,"kv_quant":4}' \
+before=$(sushi_log_since | grep -c "kv-quant override: affine 8-bit")
+curl -s -m 300 -X POST -H "Content-Type: application/json" \
+    -d "{\"model\":\"sushi\",\"prompt\":\"$SUSHI_NONCE Say hello.\",\"max_tokens\":8,\"temperature\":0.0,\"kv_quant\":8}" \
     "$BASE/v1/completions" > /dev/null
 sleep 1
-after=$(grep -c "kv-quant override: affine 4-bit" "$LOGFILE" || true)
+after=$(sushi_log_since | grep -c "kv-quant override: affine 8-bit")
 if [ "$after" -gt "$before" ]; then
-    echo -e "${GREEN}PASS${NC} /v1/completions honoured the per-request 4-bit override"
+    echo -e "${GREEN}PASS${NC} /v1/completions honoured the per-request 8-bit override"
 else
-    echo -e "${RED}FAIL${NC} /v1/completions ignored kv_quant: 4"
+    echo -e "${RED}FAIL${NC} /v1/completions ignored kv_quant: 8"
     FAIL=1
 fi
+
+echo
+echo "== kv_quant equivalence against off =="
+python3 - "$BASE" "$SUSHI_NONCE" "$BITS" <<'PY' || FAIL=1
+import json, os, sys, urllib.request
+
+base, nonce, bits = sys.argv[1], sys.argv[2], sys.argv[3].split()
+PROMPT = nonce + ' Recite the first paragraph of "A Tale of Two Cities" by Charles Dickens.'
+
+
+def post(path, body):
+    req = urllib.request.Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.load(r)
+
+
+def tokens(kv):
+    body = {"model": "sushi", "messages": [{"role": "user", "content": PROMPT}], "max_tokens": 200,
+            "temperature": 0.0, "stream": False, "enable_mtp": False, "kv_quant": kv}
+    m = post("/v1/chat/completions", body)["choices"][0]["message"]
+    text = (m.get("reasoning_content") or "") + (m.get("content") or "")
+    return text, post("/tokenize", {"content": text})["tokens"]
+
+
+ref_text, ref = tokens("off")
+fail = False
+if not ref:
+    print("FAIL: kv_quant off produced no tokens")
+    sys.exit(1)
+for b in bits:
+    text, toks = tokens(int(b))
+    n = int(os.environ.get(f"KV_QUANT_FIRST_N_{b}BIT", "30"))
+    if not text:
+        print(f"FAIL: kv{b}: empty completion, likely NaN or kernel error")
+        fail = True
+        continue
+    if len(ref) < n or len(toks) < n:
+        print(f"FAIL: kv{b} vs off: SHORT len(ref)={len(ref)} len(quant)={len(toks)} need>={n}")
+        fail = True
+        continue
+    diff = next((i for i in range(n) if ref[i] != toks[i]), -1)
+    if diff < 0:
+        print(f"PASS kv{b} vs off: first {n} tokens byte-identical")
+    else:
+        print(f"FAIL: kv{b} vs off: DIFF at index {diff}: ref={ref[diff]} quant={toks[diff]}")
+        fail = True
+sys.exit(1 if fail else 0)
+PY
 
 exit $FAIL
