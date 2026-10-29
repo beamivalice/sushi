@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const mtp_mod = @import("mtp.zig");
@@ -4413,10 +4414,10 @@ pub fn qsaScoreFusedOffGuard() struct {
 /// The incidents these bills reproduce ran an engine that rebuilt the whole kv8 cache per layer.
 fn qsaWholeRebuildGuard() struct {
     pub fn deinit(_: @This()) void {
-        transformer_mod.qsa_attn_kernel_override = null;
+        qwen4_qsa_attn.qsa_attn_kernel_override = null;
     }
 } {
-    transformer_mod.qsa_attn_kernel_override = false;
+    qwen4_qsa_attn.qsa_attn_kernel_override = false;
     return .{};
 }
 
@@ -19565,9 +19566,9 @@ test "a QSA arch's kv-quant dequant scratch follows the widest forward that stil
     // A short prompt never rebuilds more than it stores.
     try t.expectEqual(@as(u64, 1000) * layer_bytes, kvDequantScratchBytes(&cfg, 1000, 16));
     // Either kill switch brings the whole-cache rebuild (the generic term) back.
-    transformer_mod.qsa_attn_kernel_override = false;
+    qwen4_qsa_attn.qsa_attn_kernel_override = false;
     try t.expectEqual(@as(u64, 0), kvDequantScratchBytes(&cfg, seq, 16));
-    transformer_mod.qsa_attn_kernel_override = null;
+    qwen4_qsa_attn.qsa_attn_kernel_override = null;
     transformer_mod.qsa_gather_override = false;
     defer transformer_mod.qsa_gather_override = null;
     try t.expectEqual(@as(u64, 0), kvDequantScratchBytes(&cfg, seq, 16));

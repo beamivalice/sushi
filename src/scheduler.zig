@@ -35,6 +35,7 @@ const std = @import("std");
 pub var slot_vision_free_test_hook: ?*const fn (mlx.mlx_array) void = null;
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
@@ -10247,17 +10248,17 @@ test "batchKvLenOf bills raw when the gather switch for that width is off" {
     const prev_b = transformer_mod.qsa_batched_gather_override;
     const prev_g = transformer_mod.qsa_gather_override;
     const prev_d = transformer_mod.qsa_decode_gather_override;
-    const prev_v = transformer_mod.qsa_verify_gather_override;
+    const prev_v = qwen4_qsa_attn.qsa_verify_gather_override;
     defer {
         transformer_mod.qsa_batched_gather_override = prev_b;
         transformer_mod.qsa_gather_override = prev_g;
         transformer_mod.qsa_decode_gather_override = prev_d;
-        transformer_mod.qsa_verify_gather_override = prev_v;
+        qwen4_qsa_attn.qsa_verify_gather_override = prev_v;
     }
     transformer_mod.qsa_batched_gather_override = true;
     transformer_mod.qsa_gather_override = true;
     transformer_mod.qsa_decode_gather_override = true;
-    transformer_mod.qsa_verify_gather_override = true;
+    qwen4_qsa_attn.qsa_verify_gather_override = true;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
         .indexer_budget = 2048,
@@ -10279,7 +10280,7 @@ test "batchKvLenOf bills raw when the gather switch for that width is off" {
     try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1));
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4));
     transformer_mod.qsa_decode_gather_override = true;
-    transformer_mod.qsa_verify_gather_override = false;
+    qwen4_qsa_attn.qsa_verify_gather_override = false;
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1));
     try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4));
 }
@@ -10325,21 +10326,21 @@ test "a 300k slot beside a 1k slot groups on the sparse bill" {
 test "S>=2 pad-waste floor is max of gather and verify mins" {
     const prev_b = transformer_mod.qsa_batched_gather_override;
     const prev_g = transformer_mod.qsa_gather_override;
-    const prev_v = transformer_mod.qsa_verify_gather_override;
+    const prev_v = qwen4_qsa_attn.qsa_verify_gather_override;
     const prev_gm = transformer_mod.qsa_gather_min_kv_override;
-    const prev_vm = transformer_mod.qsa_verify_gather_min_kv_override;
+    const prev_vm = qwen4_qsa_attn.qsa_verify_gather_min_kv_override;
     defer {
         transformer_mod.qsa_batched_gather_override = prev_b;
         transformer_mod.qsa_gather_override = prev_g;
-        transformer_mod.qsa_verify_gather_override = prev_v;
+        qwen4_qsa_attn.qsa_verify_gather_override = prev_v;
         transformer_mod.qsa_gather_min_kv_override = prev_gm;
-        transformer_mod.qsa_verify_gather_min_kv_override = prev_vm;
+        qwen4_qsa_attn.qsa_verify_gather_min_kv_override = prev_vm;
     }
     transformer_mod.qsa_batched_gather_override = true;
     transformer_mod.qsa_gather_override = true;
-    transformer_mod.qsa_verify_gather_override = true;
+    qwen4_qsa_attn.qsa_verify_gather_override = true;
     transformer_mod.qsa_gather_min_kv_override = 20_000;
-    transformer_mod.qsa_verify_gather_min_kv_override = 16_384;
+    qwen4_qsa_attn.qsa_verify_gather_min_kv_override = 16_384;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
         .indexer_budget = 2048,
