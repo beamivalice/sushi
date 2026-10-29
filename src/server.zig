@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const attn_kernels = @import("attn_kernels.zig");
 const nax_gate = @import("nax_gate.zig");
 const qwen4_qsa_select = @import("qwen4/qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4/qwen4_qsa_gather.zig");
@@ -3753,8 +3754,8 @@ test "oneSessionFor: an unnamed budget grows only into room the n-gram table and
 
 test "oneSessionFor: a full MiMo cache leaves a cold full-context prompt its bill at the pinned width" {
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     const GiB: u64 = 1 << 30;
     var cfg = mimoV2FlashBillConfig();
     const ctx: u64 = 454_656;
@@ -5131,8 +5132,8 @@ test "chooseRequestPrefillChunk: the explicit flag caps it, the gate outranks it
 
 test "an explicit --prefill-chunk is the widest width a request may run, not a pin" {
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     const saved_chunk = generate_mod.prefill_chunk_override;
     const saved_explicit = generate_mod.prefill_chunk_explicit;
     defer {
@@ -10202,8 +10203,8 @@ test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-widt
 
 test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     const t = std.testing;
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = false;
+    defer attn_kernels.fused256_override = null;
     // 26B-A4B shape at 100K ctx, chunk 512 (what the bounded chunk picks there).
     // fp16: kv 30x2x100000x8x256x2 = 24.576 GB; scores 16x512x100000x2 = 1.6384 GB;
     //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
@@ -10224,8 +10225,8 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
 
 test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
     const t = std.testing;
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = false;
+    defer attn_kernels.fused256_override = null;
     // The PR-#69 failure case: Qwen3.6-35B-A3B shape (whose checkpoint OMITS
     // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
     // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
@@ -10241,8 +10242,8 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
 
 test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch" {
     const t = std.testing;
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = false;
+    defer attn_kernels.fused256_override = null;
     // Same shape, head_dim 128 vs 256 (kv scaled by hdim too, so compare the
     // full bills computed by hand): hd=128 fp16 -> kv 12.288 GB + 0 scores +
     // mlp 69.2 MB, x1.25.
@@ -10273,8 +10274,8 @@ test "prefillMemoryNeeded: the SCORE width decides the score term, not the store
     // `sushi_attn_pd` serves qk 192 now, so the composed sheet survives only
     // under the kill switch — which is precisely where confusing the two
     // widths would zero a sheet that is really there.
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = false;
+    defer attn_kernels.fused256_override = null;
     const honest = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{});
     const blind = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, stored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{});
     // The difference is exactly the score tensor: heads x chunk x seq x 2, x1.25.
@@ -10289,7 +10290,7 @@ test "prefillMemoryNeeded: the SCORE width decides the score term, not the store
     );
     // With the kernel serving the width there is no sheet to attribute, so the
     // two widths agree — at zero, not by accident.
-    transformer_mod.fused256_override = true;
+    attn_kernels.fused256_override = true;
     try t.expectEqual(
         blind,
         prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{}),
@@ -10301,8 +10302,8 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
     // Default (sushi_attn_p256 active): the composed score scratch never exists,
     // so hd 256 bills exactly the hd-256 KV + mlp — the unfused bill minus the
     // 1.6384 GB x1.25 score term from the test above.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     try t.expectEqual(
         @as(u64, 32_854_507_520 + 671_088_640 - 2_048_000_000),
         prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
@@ -10489,8 +10490,8 @@ test "prefillMemoryNeeded: a GDN trunk's prefill peaks stay covered" {
     // The rows are the measured peaks minus the exact conv_state pin the
     // compaction removed ((linear_layers - 5) x chunk x qkv x 2).
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
 
     // Hidden 5120, ffn 17408, 64 layers / 16 caching, hd 256,
     // 48 GatedDeltaNet layers x (2x16x128 + 48x128) elems x 2 B of stream.
@@ -10511,8 +10512,8 @@ test "prefillMemoryNeeded: a GDN trunk's prefill peaks stay covered" {
 
 test "prefillMemoryNeeded: the new terms fire only where the measurement put them" {
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     const q27 = .{ .seq = 9320, .h = 24, .kvh = 4, .kvpt = 65536, .hd = 256, .hidden = 5120, .ffn = 17408 };
     const stream: u64 = 48 * (2 * 16 * 128 + 48 * 128) * 2;
     const dq: u64 = 3 * 17408 * 5120 * 2;
@@ -10648,8 +10649,8 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     try t.expect(after < available);
     // The score term is the ONLY one the key bound may touch: same call with a
     // fused head_dim has no score scratch, so the bound changes nothing.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     try t.expectEqual(
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0, .{}),
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0, .{}),
@@ -12445,8 +12446,8 @@ test "a ringed arch's kv-quant dequant scratch is one layer's rebuild, not the m
 
     // Composed: the widest rebuild is a GLOBAL layer at the prompt length,
     // 2 kv heads of qk 192 + v 128. The sliding layers rebuild their ring.
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = false;
+    defer attn_kernels.fused256_override = null;
     try t.expectEqual(seq * 2 * (192 + 128) * 2, kvDequantScratchBytes(&cfg, seq, 1024));
     // The generic expression this replaces reads the SLIDING head count and
     // doubles the qk width: 1.8x here, 2.4x at the shipped 4/8-head geometry.
@@ -12455,19 +12456,19 @@ test "a ringed arch's kv-quant dequant scratch is one layer's rebuild, not the m
 
     // Fused: the global layers read the packed cache per dispatch, so their
     // rebuild stops scaling with the prompt at all.
-    transformer_mod.fused256_override = true;
+    attn_kernels.fused256_override = true;
     const fused = kvDequantScratchBytes(&cfg, seq, 1024);
     try t.expectEqual(
         MOE_PREFILL_COEXIST * @as(u64, @intCast(transformer_mod.PACKED_KV_SLICE_MAX)) * 2 * (192 + 128) * 2,
         fused,
     );
     try t.expectEqual(fused, kvDequantScratchBytes(&cfg, 2 * seq, 1024));
-    transformer_mod.fused256_override = false;
+    attn_kernels.fused256_override = false;
 
     // A decode forward bills whatever the global-layer decode rebuilds whole: a floor's worth of keys.
-    transformer_mod.fused256_override = true;
+    attn_kernels.fused256_override = true;
     try t.expectEqual(fused, kvDequantScratchBytes(&cfg, seq, 1));
-    transformer_mod.fused256_override = false;
+    attn_kernels.fused256_override = false;
 
     // A short prompt never rebuilds more than it stores, and below the ring the
     // widest layer is a SLIDING one: it carries more KV heads than a global.
@@ -12540,8 +12541,8 @@ test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sh
     const seq: u64 = 512 * 1024;
     const chunk: u64 = 1024;
     // Pin the arm, not the host: the guard and the dispatch read one switch.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
 
     // One global layer's composed sheet at this prompt, the term the kernel removes.
     const global_sheet: u64 = @as(u64, cfg.num_attention_heads) * chunk * seq * 2;
@@ -12554,14 +12555,14 @@ test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sh
     // Kill switch: composed attention restores both sheets, and the bill with them. The
     // band sheet is prompt-length independent, `window + fwd - 1` keys wide, at the same
     // coexistence the other per-layer prefill transients are billed at.
-    transformer_mod.fused256_override = false;
+    attn_kernels.fused256_override = false;
     try t.expectEqual(MOE_PREFILL_COEXIST * @as(u64, cfg.num_attention_heads) * chunk * (128 + chunk - 1) * 2, slidingBandScoreBytes(&cfg, chunk));
     try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{}) > fused_bill +| global_sheet);
 
     // An arch with no ring never acquires the band term.
     var plain = cfg;
     plain.model_type = "not_a_served_arch";
-    transformer_mod.fused256_override = true;
+    attn_kernels.fused256_override = true;
     try t.expectEqual(@as(u64, 0), slidingBandScoreBytes(&plain, chunk));
 }
 
@@ -12618,8 +12619,8 @@ test "mimo_v2 with an SSD tier bills a restored global layer beside its first gr
 
 test "mimo_v2 prefills at the widest width its request bill admits, not at the load-time pin" {
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     const cfg = mimoV2FlashBillConfig();
     const kv_bits: u64 = 8;
     const seq: u64 = 500_000;
@@ -12657,8 +12658,8 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
 test "mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has room" {
     // The per-chunk estimator once stepped a 64k MiMo prompt down to 512 on a box that had room.
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     const cfg = mimoV2FlashBillConfig();
     const kv_bits: u64 = 8;
     const GiB: u64 = 1 << 30;
@@ -12678,8 +12679,8 @@ test "mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has roo
 
 test "the load line calls a per-request arch's pin the fallback, not the width it prefills at" {
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     const saved = per_request_chunk_override;
     defer per_request_chunk_override = saved;
     const cfg = mimoV2FlashBillConfig();
@@ -12783,20 +12784,20 @@ test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the 
     const cfg = mimoV2FlashBillConfig();
     const seq: u64 = 500_000;
     const chunk: u64 = 2048;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
-    defer transformer_mod.sliding_prefill_fused_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
+    defer attn_kernels.sliding_prefill_fused_override = null;
 
-    transformer_mod.sliding_prefill_fused_override = false;
+    attn_kernels.sliding_prefill_fused_override = false;
     const band = slidingBandScoreBytes(&cfg, chunk);
     try t.expectEqual(MOE_PREFILL_COEXIST * 64 * chunk * (128 + chunk - 1) * 2, band);
     const composed = prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{});
-    transformer_mod.sliding_prefill_fused_override = null;
+    attn_kernels.sliding_prefill_fused_override = null;
     try t.expectEqual(composed - band, prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{}));
 
     // One predicate decides the dispatch and the bill, at every width and switch state.
     for ([_]?bool{ null, false }) |ov| {
-        transformer_mod.sliding_prefill_fused_override = ov;
+        attn_kernels.sliding_prefill_fused_override = ov;
         for ([_]u64{ 1, 8, 15, 16, 512, 2048, 4096 }) |fwd| {
             try t.expectEqual(transformer_mod.slidingPrefillFused(&cfg, fwd), slidingBandScoreBytes(&cfg, fwd) == 0);
         }

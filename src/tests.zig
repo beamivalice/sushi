@@ -64,6 +64,7 @@ test {
     _ = @import("qwen4/qwen4_config.zig");
     _ = @import("ssm_cache.zig");
     _ = @import("nax_gate.zig");
+    _ = @import("attn_kernels.zig");
     _ = @import("kv_cache.zig");
     _ = @import("qwen4/qwen4_forward.zig");
     _ = @import("qwen4/qwen4_fixture_test.zig");

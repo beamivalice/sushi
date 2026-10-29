@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const attn_kernels = @import("../attn_kernels.zig");
 const nax_gate = @import("../nax_gate.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
@@ -133,7 +134,7 @@ pub fn qsaAttnKernelEnabled() bool {
 }
 
 pub fn qsaAttnCfgBuilds() usize {
-    return trf.qsa_attn_cfgs.builds;
+    return attn_kernels.qsa_attn_cfgs.builds;
 }
 var qsa_attn_engaged_bits: OneShotBits = .{};
 
@@ -2781,7 +2782,7 @@ test "qsa sparse attn: the config key is kv- and kb-INDEPENDENT (one build per w
     }
     try std.testing.expectEqual(after_three, qsaAttnCfgBuilds());
     // Past SLOTS distinct widths the LRU evicts.
-    try std.testing.expect(@TypeOf(trf.qsa_attn_cfgs).SLOTS == 4);
+    try std.testing.expect(@TypeOf(attn_kernels.qsa_attn_cfgs).SLOTS == 4);
 }
 
 test "takeContig releases `view` exactly once on every faulted op (CPU stream, no GPU)" {

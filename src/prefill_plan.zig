@@ -1,5 +1,6 @@
 const std = @import("std");
 const transformer_mod = @import("transformer.zig");
+const attn_kernels = @import("attn_kernels.zig");
 const model_mod = @import("model.zig");
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const testing = std.testing;
@@ -597,8 +598,8 @@ test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel a
     // still scales the MoE-gather / KV-concat transients — measured +22 GB
     // peak for +3% speed at a 99K prompt. The cap deliberately ignores
     // prefillHeadDimFused (see the fn doc); pin that with the override ON.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false, false));
 }
 
@@ -624,7 +625,7 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
     // `sushi_attn_pd` serves that width now: no score tensor, so the budget
     // formula measures nothing and the chunk keeps its default at every
     // context. Without this the formula pins the 512 floor past ~256k.
-    transformer_mod.fused256_override = true;
+    attn_kernels.fused256_override = true;
     const saved_explicit = generate.prefill_chunk_explicit;
     defer generate.prefill_chunk_explicit = saved_explicit;
     generate.prefill_chunk_explicit = false;
@@ -643,8 +644,8 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
 
     // Composed (`fused256_override = false`): scores are back and so is the
     // budget, unchanged — guards and dispatch move on ONE switch.
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = false;
+    defer attn_kernels.fused256_override = null;
     // Short prompts keep the full chunk: 32 * 8192 * 8192 * 2B = 4 GiB exactly.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 192, 32, 8192, false, true, false));
     // Then it halves with the prompt, holding one score tensor at the budget.
@@ -669,7 +670,7 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
     // non-sliding hd-256 class — and its old shrink to 1024 at 64K starved the
     // dequant+GEMM qmm route (engages at M >= 2048): the 64K rung was the
     // ladder's weakest for exactly this reason.
-    std.debug.assert(transformer_mod.fused256_override == null);
+    std.debug.assert(attn_kernels.fused256_override == null);
     // DENSE hybrids: no expert-gather transients, and a
     // full-size chunk halves per-chunk dequant sweeps — chunk 8192 measured
     // +1.4% over 4096 at the 8K rung, flat at 32K.
@@ -690,7 +691,7 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
 }
 
 test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 rung, an ungated one caps at 4096" {
-    std.debug.assert(transformer_mod.fused256_override == null);
+    std.debug.assert(attn_kernels.fused256_override == null);
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, true, true));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, true, true));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 400_000, false, true, true));
@@ -706,8 +707,8 @@ test "boundedPrefillChunk: composed-causal keeps the 2048 cap + score formula" {
     // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
     // Chunking IS block-level causal skipping for composed attention, and
     // the score transient shrinks with it.
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn_kernels.fused256_override = false;
+    defer attn_kernels.fused256_override = null;
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false, false, false));
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false, false, false));
     // The scores-budget formula still wins BELOW the cap: 64K on 24 heads

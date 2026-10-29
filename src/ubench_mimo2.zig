@@ -7,6 +7,7 @@ const log = @import("log.zig");
 const report = @import("ubench_report.zig");
 const fp8_block = @import("fp8_block.zig");
 const transformer = @import("transformer.zig");
+const attn_kernels = @import("attn_kernels.zig");
 const kv_quant = @import("kv_quant.zig");
 const mimo_forward = @import("mimo2/mimo_forward.zig");
 const model_mod = @import("model.zig");
@@ -525,8 +526,8 @@ fn sampleGlobal(c: GlobalCase, arm_index: usize) anyerror!f64 {
         try mlx.check(mlx.mlx_array_eval(out));
     }
     const ns = sw.read();
-    c.dispatches[arm_index] = transformer.fused256_last_dispatch_count;
-    c.engaged.* = transformer.attn_pd_last_arm;
+    c.dispatches[arm_index] = attn_kernels.fused256_last_dispatch_count;
+    c.engaged.* = attn_kernels.attn_pd_last_arm;
     return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(c.calls));
 }
 

@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const attn_kernels = @import("../attn_kernels.zig");
 const std = @import("std");
 const qwen4_mod = @import("qwen4_exp.zig");
 const mlx = @import("../mlx.zig");
@@ -1126,8 +1127,8 @@ fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const Qs
 test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ragged tiles, kv chunking)" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    trf.fused256_override = true;
-    defer trf.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     var prng = std.Random.DefaultPrng.init(0x45a45a);
     const rnd = prng.random();
 
@@ -1159,8 +1160,8 @@ test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ra
 test "fusedSdpa256Masked: an unaligned last-axis slice declines and the fallback reads exactly; aligned is bit-identical to a contiguous copy" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    trf.fused256_override = true;
-    defer trf.fused256_override = null;
+    attn_kernels.fused256_override = true;
+    defer attn_kernels.fused256_override = null;
     var prng = std.Random.DefaultPrng.init(0x5E7_5E7);
     const rnd = prng.random();
 
