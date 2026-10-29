@@ -7,7 +7,7 @@ import tempfile
 
 def main():
     suite = pathlib.Path(__file__).with_name('test_mtp_equivalence.sh').read_text()
-    check = suite[suite.index('check() {'):suite.index('\necho "── baseline server')]
+    check = suite[suite.index('check() {'):suite.index('\necho "── MTP server (default-on)')]
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
         expected = root / 'expected'
