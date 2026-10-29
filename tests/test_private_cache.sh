@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=hermetic
 # Repo-hygiene gate: the prefix cache's SSD tier is on by default, so a test script that boots a server
 # without its own cache root would read, write and sweep the real ~/.sushi/kv-cache.
 #   [1] tests/private_cache.sh gives a script a private root under HOME, wipes only a root it made,

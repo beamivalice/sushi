@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Oracle for the qwen4_exp (Qwen3.8-Flash-Next) port, on a TINY random model.
 
 Two phases, run from the torch venv (transformers main carries the arch):

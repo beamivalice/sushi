@@ -1,3 +1,4 @@
+# sushi-test: tier=tool
 """Capture tiny complete BF16 MLA source outputs and an absorbed-rounding comparison.
 
 This is a reference fixture utility. It does not load or convert a checkpoint.

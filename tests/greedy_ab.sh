@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=bench
 . "$(dirname "$0")/private_cache.sh"
 # Greedy on/off comparison for a decode-path change. Boots the same model twice,
 # once per arm of a kill switch, and diffs the temp-0 continuation.

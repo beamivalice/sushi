@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Reference oracle for the MiMo-ViT tower (src/mimo2/mimo_vision.zig).
 
 Runs the checkpoint's OWN `MiMoVisionTransformer` (modeling_mimo_v2.py) on the

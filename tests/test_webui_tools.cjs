@@ -1,3 +1,4 @@
+// sushi-test: tier=hermetic needs=node,playwright
 // Exercise the actual page functions without a browser or model.
 const fs = require('node:fs');
 const vm = require('node:vm');

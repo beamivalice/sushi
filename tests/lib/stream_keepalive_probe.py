@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=lib
 """Streaming-silence probe for tests/test_stream_keepalive.sh.
 
 Opens a raw socket against one streaming surface, drives a tool call big

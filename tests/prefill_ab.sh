@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=bench
 . "$(dirname "$0")/private_cache.sh"
 # Prefill-time A/B for a kill switch. Boots once per arm and reads the SERVER's
 # own `timings.prompt_ms`, never client-side timing.

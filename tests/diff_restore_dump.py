@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Diff two restore-dump safetensors files.
 
 Usage:

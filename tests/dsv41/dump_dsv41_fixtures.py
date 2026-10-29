@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Oracle for the deepseek_v41 port: DeepSeek's own inference/model.py (the V4.1-Flash release),
 run in fp32 on the CPU over a TINY random model.
 

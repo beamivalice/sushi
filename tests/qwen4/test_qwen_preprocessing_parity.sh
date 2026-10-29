@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=pack pack=default
 # CPU-only Qwen preprocessing parity against the pinned mlx-vlm processor.
 set -euo pipefail
 cd "$(dirname "$0")/../.."

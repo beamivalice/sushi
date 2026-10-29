@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Reference-parity oracle for the MiMo-V2.6 engine arm (model_type "mimo_v2").
 
 The full 309B checkpoint cannot run in torch here, so this builds a TINY

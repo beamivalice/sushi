@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Self-update end to end, offline. A local HTTP server stands in for GitHub (SUSHI_UPDATE_API, the test-only hook)
 # and serves releases staged from this tree the way release.yml packages them: the current build, and the same

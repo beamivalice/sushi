@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Byte-exact reference for the embedded DeepSeek-V4.1 chat template: the release's own
 `encoding/encoding.py` renders the shapes the server sends, and the Zig test renders the same
 cases through jinja.cpp.

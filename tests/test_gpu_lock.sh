@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=hermetic
 # test_gpu_lock.sh — the one-heavy-GPU-job lock (scripts/gpu-lock.sh).
 #
 # Checks, on a private lock dir:

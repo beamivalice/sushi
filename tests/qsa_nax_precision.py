@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Float64 oracle for the stock and NAX QSA gather kernels (mx.fast.metal_kernel + numpy).
 
 Default: production bf16-store bar vs numpy float64, then a named f32-output

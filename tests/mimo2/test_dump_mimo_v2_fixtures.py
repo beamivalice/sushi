@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=hermetic
 """Contract tests for tests/mimo2/dump_mimo_v2_fixtures.py (the mimo_v2 oracle).
 
 Hermetic half (stdlib only): the fixture SCHEMA the Zig parity test will be

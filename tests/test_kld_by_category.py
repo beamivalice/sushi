@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=hermetic
 """Guard for tests/kld_by_category.py. Stdlib only; a passing run prints nothing.
 
     python3 tests/test_kld_by_category.py

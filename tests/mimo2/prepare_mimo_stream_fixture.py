@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Create a tiny mixed-precision pack from dump_mimo_v2_fixtures.py output."""
 import argparse
 import json

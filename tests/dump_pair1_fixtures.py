@@ -1,3 +1,4 @@
+# sushi-test: tier=tool
 """Write src/exl3/fixtures/exl3_pair1_tiles.safetensors: random packed PAIR1 tiles at every even rate from
 K1.5 to K4, each decoded row-major by sashimi's numpy reference (`decode_packed_tile`). CPU only.
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=pack pack=default
 # Qwen3-VL vision encoder parity vs the mlx-vlm reference.
 #
 # Builds a fixture (reference pixel_values + post-merger embeddings) with

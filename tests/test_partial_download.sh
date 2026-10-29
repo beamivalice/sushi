@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Interrupted-pull recovery (issue: Ctrl-C during `sushi run qwen3.8-flash-next`'s
 # download, rerun → SIGSEGV instead of resuming). Two bugs, two checks:

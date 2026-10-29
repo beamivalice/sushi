@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # The browser chat page: `GET /`, `GET /chat` and `GET /dashboard` serve the page embedded from
 # src/webui/index.html, every other method on those paths is a 405, the API

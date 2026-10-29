@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """DeepSeek-V4.1's Engram token map, built from the tokenizer exactly as DeepSeek's inference/engram.py
 (`build_compressed_token_map`) builds it, packed into src/fixtures/dsv41_engram_token_map.bin.
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Build a Qwen3-VL vision parity fixture for sushi's QwenVision encoder.
 
 Runs the mlx-vlm reference vision tower on a fixture image and dumps:

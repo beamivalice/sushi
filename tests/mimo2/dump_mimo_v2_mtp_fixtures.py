@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Oracle for the MiMo-V2.6 MTP heads (`model.mtp.layers.{k}`) on the TINY fixture model.
 
 The HF reference skips `model.mtp.*`, so the head is rendered here from the HF

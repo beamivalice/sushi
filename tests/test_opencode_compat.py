@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=host
 """Exercise generated launch scripts against both OpenCode CLI flag contracts."""
 import argparse
 import http.server

@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=hermetic
 # Static guard: the Brewfile lists every Homebrew formula the build needs.
 # CI installs only what the Brewfile names, and GitHub's runner image carries extra tools, so a missing
 # formula stays green there while a clean Mac fails. Silent when clean; HERMETIC.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=host
 """Test effort selection and persistent settings against a hermetic models API."""
 import argparse
 import http.server

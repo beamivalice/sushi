@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=hermetic
 # Repo-hygiene gate: no tracked file names a development box's own directories.
 # Tests and scripts find packs under ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}; raw measurement files stay private.
 # Prints the offending file:line and fails; prints nothing when clean.

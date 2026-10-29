@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Dump DFlash2 reference oracles from the REAL incoai/Qwen3.8-27B-DFlash2.
 
 Reference = z-lab/dflash `dflash/model_mlx.py` (the released MLX

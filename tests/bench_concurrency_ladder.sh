@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=bench
 . "$(dirname "$0")/private_cache.sh"
 # Concurrency ladder: client-observed per-stream and aggregate decode tok/s at N
 # concurrent users, MTP on and off. One CSV row per (binary, model, mode, N).

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Harvest real (declared tool schema, raw model output) pairs from sushi
 into a replay fixture.
 

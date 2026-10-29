@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """CPU oracle for DeepSeek-V4.1's image input: the release's own `inference/image_processor.py` and
 `inference/vision.py`, run as the release runs them (bf16 default dtype, CPU) on two fixed images
 with the pack's bf16 vision tensors. Only those tensors are read; peak RAM is about 3 GB.

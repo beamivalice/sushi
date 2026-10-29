@@ -1,4 +1,5 @@
 #!/bin/zsh
+# sushi-test: tier=bench
 . "$(dirname "$0")/../../private_cache.sh"
 # Same-boot qwen4_exp A/B harness (M4 Max numbers in docs/gotchas/engine-mlx.md;
 # the M5 box re-measures with the same script).

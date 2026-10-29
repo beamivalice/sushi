@@ -1,3 +1,4 @@
+// sushi-test: tier=hermetic needs=node,playwright
 // The page's Chat/Dashboard navigator, driven in a real headless browser against stubbed endpoints:
 // no sushi server, no model. Needs Playwright with a Chromium build (global or local install); skips without one.
 const fs = require('node:fs');

@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=hermetic
 . "$(dirname "$0")/private_cache.sh"
 # test_mlx_staged_nax.sh — static guard for the self-built, NAX-enabled MLX runtime.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=bench
 . "$(dirname "$0")/private_cache.sh"
 # bench_mtp_lookup.sh — the MTP prompt-lookup workload: agent-style copies and edits of a file in
 # context, plus tasks that copy nothing. A benchmark driver, NOT a test.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=bench
 . "$(dirname "$0")/private_cache.sh"
 # Boot one model, fire the decode forward micro-bench at load, print the lines,
 # shut down. Diagnostic helper for decode-perf work — NOT a test.

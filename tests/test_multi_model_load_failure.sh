@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Plan 05 Phase F — a model that fails to LOAD surfaces as a named 500.
 #

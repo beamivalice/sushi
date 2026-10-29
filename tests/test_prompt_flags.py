@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=host
 """One-shot CLI regressions; set SUSHI_PROMPT_MODEL for the live model arms."""
 import os
 from pathlib import Path

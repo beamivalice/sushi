@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # `--parent-pid <pid>`: a host that runs sushi as a guest engine names its own pid, and sushi must shut down once
 # that process is gone. A crashed host otherwise leaves a sushi process holding GPU memory.

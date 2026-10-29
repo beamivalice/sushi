@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Hermetic BPE fixtures for the two supported Split grammars (tokenizers 0.22+).
 No model weights or proprietary vocabulary: train tiny tokenizers on this corpus.
 """

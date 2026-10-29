@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 # test_test_runner_quiet.sh — a passing test prints NOTHING, on either stream.
 #
 # CLAUDE.md already bans stdout from a test: under `zig build test` fd 1 is the

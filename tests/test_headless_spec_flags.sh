@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Regression test: headless serve mode must honor the CLI's launch flags.
 #

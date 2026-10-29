@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=host
 """A failed model load becomes retryable through HTTP rescan, without a real model."""
 import json
 import os

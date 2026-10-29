@@ -1,3 +1,4 @@
+// sushi-test: tier=hermetic needs=node,playwright
 // The chat page's SSD prefix-cache meter, driven through the page's own functions without a browser or model.
 const fs = require('node:fs');
 const vm = require('node:vm');

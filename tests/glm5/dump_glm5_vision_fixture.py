@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """CPU oracle from the original HF GLM-5.3 vision model and image processor.
 
 Run with torch, torchvision, safetensors and a transformers version containing

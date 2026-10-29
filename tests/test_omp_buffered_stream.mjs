@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+// sushi-test: tier=hermetic needs=node
 // Run with bun and OMP_AI_MODULE pointing to omp's installed pi-ai package.
 // The public client API receives mocked SSE; no model, tool or network runs.
 import assert from 'node:assert/strict';

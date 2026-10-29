@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=hermetic
 import pathlib
 import subprocess
 import tempfile

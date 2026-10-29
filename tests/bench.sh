@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=bench
 # bench.sh — the release bench for ONE model: boots a sushi server, drives it with `sushi bench`, stops it.
 #
 #   ./tests/bench.sh --version 1.4.0 <pack> [-- <sushi serve flags>]

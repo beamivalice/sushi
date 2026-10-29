@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # `--model-dir` is REPEATABLE, and every folder it names is actually served.
 #

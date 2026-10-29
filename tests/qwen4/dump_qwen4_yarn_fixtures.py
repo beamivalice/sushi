@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Dump the YaRN oracle for qwen4_exp (Qwen3.8-Flash-Next) context extension.
 
 Answers one question with numbers the Zig engine is checked against: what does

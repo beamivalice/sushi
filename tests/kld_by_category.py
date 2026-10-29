@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Per-category tables of `sushi kld compare --json` output.
 
 A prompt's category is its id up to the first '-' (`code-rust-...` -> code). Each cell is position-weighted to the

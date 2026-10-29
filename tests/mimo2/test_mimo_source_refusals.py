@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=host
 """Check raw-source refusals without loading model weights."""
 import os
 from pathlib import Path

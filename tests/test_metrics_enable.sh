@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Runtime metrics: a server booted WITHOUT --metrics turns them on through `POST /metrics/enable`.
 #

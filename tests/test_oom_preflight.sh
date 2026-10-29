@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Regression test for the GPU-OOM pre-flight refusal path (issue #47).
 #

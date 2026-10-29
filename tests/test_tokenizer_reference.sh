@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=pack pack=each
 # CPU-only real-pack parity. No server restart or model weights needed.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

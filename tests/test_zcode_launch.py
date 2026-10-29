@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=host
 """CPU-only launch contract test; optionally exercise the real ZCode CLI.
 
 python3 tests/test_zcode_launch.py --bin <sushi or launch_cli binary>

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Dump DFlash reference oracles from the REAL Muse-Glimmer-30B assistant.
 
 Reference = transformers' `MuseGlimmerAssistantModel` (released in 5.15.0)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Build a CPU-only Qwen image-preprocessing parity fixture.
 
 The fixture starts from decoded RGB bytes and captures the reference

@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=hermetic
 # test_build_mlx_pins.sh — build-mlx.sh refuses a submodule checkout that is not the
 # revision the superproject pins (a pull without `git submodule update`), before building.
 #
