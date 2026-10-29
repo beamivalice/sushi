@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+# sushi-test: tier=tool
+"""Scope guards for the Zig sources. Default mode checks; --write regenerates the allowlists in tests/guards/.
+
+    python3 tests/suite_guards.py [--root DIR] [--write]
+
+Arch-test guard: a test whose name mentions a model must live in that model's folder (src/<model>/) unless its
+name is in tests/guards/arch-tests.allow (shared at arch geometry). The list keys the name, not the file, so
+moving a test between shared files never breaks it.
+"""
+import argparse
+import os
+import re
+import sys
+
+MODELS = {
+    "qwen4": re.compile(r"(?<![a-z])qwen", re.I),
+    "mimo2": re.compile(r"(?<![a-z])mimo", re.I),
+    "glm5": re.compile(r"(?<![a-z])glm", re.I),
+    "dsv41": re.compile(r"(?<![a-z])(dsv41|deepseek)", re.I),
+}
+ALLOW_DIR = "tests/guards"
+ARCH_ALLOW = f"{ALLOW_DIR}/arch-tests.allow"
+
+
+def blank(text, keep_strings):
+    """The text with comments (and, unless keep_strings, string and char contents) replaced by spaces, newlines kept."""
+    out = list(text)
+    i, n = 0, len(text)
+
+    def wipe(a, b):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = text[i]
+        if c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            wipe(i, j)
+            i = j
+        elif c == "\\" and text.startswith("\\\\", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            if not keep_strings:
+                wipe(i, j)
+            i = j
+        elif c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            if not keep_strings:
+                wipe(i + 1, min(j, n))
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+TEST_HEAD = re.compile(r'(?<![\w.@])test\s*(?:"(\s*)"|[A-Za-z_]\w*)?\s*\{')
+
+
+def tests_of(text):
+    """(name or None, start, end) of every test block, found on a view whose strings are blanked."""
+    shape = blank(text, False)
+    named = blank(text, True)
+    found = []
+    for m in TEST_HEAD.finditer(shape):
+        depth, k = 1, m.end()
+        while k < len(shape) and depth:
+            depth += {"{": 1, "}": -1}.get(shape[k], 0)
+            k += 1
+        name = None
+        if m.group(1) is not None:
+            q = shape.index('"', m.start(), m.end())
+            name = named[q + 1 : q + 1 + len(m.group(1))]
+        found.append((name, m.start(), k))
+    return found, named
+
+
+def zig_files(root, dirs, recurse):
+    for d in dirs:
+        base = os.path.join(root, d)
+        if not os.path.isdir(base):
+            continue
+        for dp, dn, fn in os.walk(base):
+            if not recurse:
+                dn[:] = []
+            dn.sort()
+            for f in sorted(fn):
+                if f.endswith(".zig"):
+                    yield os.path.relpath(os.path.join(dp, f), root)
+
+
+def model_dirs(root):
+    return [m for m in ("qwen4", "mimo2", "glm5", "dsv41") if os.path.isdir(os.path.join(root, "src", m))]
+
+
+def all_tests(root):
+    """(rel path, line, name) of every named test under src/."""
+    for rel in zig_files(root, ["src"], True):
+        with open(os.path.join(root, rel)) as f:
+            text = f.read()
+        found, _ = tests_of(text)
+        for name, start, _end in found:
+            if name is not None:
+                yield rel, text.count("\n", 0, start) + 1, name
+
+
+def folder_model(rel):
+    parts = rel.split("/")
+    return parts[1] if len(parts) > 2 and parts[1] in MODELS else None
+
+
+def arch_violations(root):
+    """Tests named for a model that live outside every model folder they name: {name: [file:line]}."""
+    bad = {}
+    for rel, line, name in all_tests(root):
+        named = {m for m, rx in MODELS.items() if rx.search(name)}
+        if named and folder_model(rel) not in named:
+            bad.setdefault(name, []).append(f"{rel}:{line}")
+    return bad
+
+
+def read_allow(root, rel):
+    path = os.path.join(root, rel)
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [l.rstrip("\n") for l in f if l.strip() and not l.startswith("#")]
+
+
+def write_allow(root, rel, header, lines):
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("".join(f"# {h}\n" for h in header) + "".join(l + "\n" for l in lines))
+
+
+def arch_check(root, write):
+    bad = arch_violations(root)
+    if write:
+        write_allow(root, ARCH_ALLOW, [
+            "Tests named for a model that stay outside src/<model>/ because they test shared code at that model's geometry.",
+            "Generated: python3 tests/suite_guards.py --write. One test name per line; it keys the name, not the file.",
+        ], sorted(bad))
+        return 0
+    allowed = set(read_allow(root, ARCH_ALLOW))
+    fail = 0
+    for name in sorted(set(bad) - allowed):
+        fail += 1
+        print(f"arch-test guard: {bad[name][0]}: test \"{name}\" names a model but is outside its folder; "
+              f"move it into src/<model>/ or list it with --write", file=sys.stderr)
+    for name in sorted(allowed - set(bad)):
+        print(f"arch-test guard: \"{name}\" is no longer outside its folder; run --write to drop it", file=sys.stderr)
+    return fail
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument("--write", action="store_true", help="regenerate the allowlists instead of checking")
+    args = ap.parse_args()
+    fail = arch_check(args.root, args.write)
+    sys.exit(1 if fail else 0)
+
+
+if __name__ == "__main__":
+    main()

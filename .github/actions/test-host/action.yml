@@ -29,6 +29,7 @@ runs:
           bash "tests/$t.sh" || { echo "::error::tests/$t.sh failed"; fail=1; }
           echo "::endgroup::"
         done
+        python3 tests/test_suite_guards.py || { echo "::error::tests/test_suite_guards.py failed"; fail=1; }
         bash tests/run.sh --check || { echo "::error::tests/run.sh --check failed"; fail=1; }
         TEST_STEP=test-host bash tests/test_test_runner_quiet.sh || { echo "::error::tests/test_test_runner_quiet.sh failed"; fail=1; }
         exit $fail
