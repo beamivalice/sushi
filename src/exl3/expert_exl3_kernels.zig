@@ -6483,7 +6483,7 @@ test "exl3 decode and prefill arms agree with the indexed chain at production ge
 /// One MiMo-V2.6-Flash MoE layer's shape and routing on the GPU arms: hidden
 /// != inter, every expert holding its OWN bank, and a routing that leaves some
 /// experts unrouted while giving others more rows than one GEMM window holds.
-const MimoMoeCase = struct {
+pub const MimoMoeCase = struct {
     e: usize,
     hidden: usize,
     inter: usize,
@@ -6500,9 +6500,9 @@ const MimoMoeCase = struct {
 
 /// The served w12 pack's own scale magnitudes: |suh| is ~0.01 and |svh| ~1,
 /// so the residual's size reaches the arm's f16 planes through the GEMMs.
-const MIMO_BANKS = [4]f32{ 0.0126, 1.03, 0.0083, 1.009 };
+pub const MIMO_BANKS = [4]f32{ 0.0126, 1.03, 0.0083, 1.009 };
 
-const MimoMoeFixture = struct {
+pub const MimoMoeFixture = struct {
     arrays: [10]mlx.mlx_array,
     gate_t: []u16,
     up_t: []u16,
@@ -6515,7 +6515,7 @@ const MimoMoeFixture = struct {
     slots: []u32,
     scores: []f32,
 
-    fn deinit(self: *MimoMoeFixture) void {
+    pub fn deinit(self: *MimoMoeFixture) void {
         for (self.arrays) |a| _ = mlx.mlx_array_free(a);
     }
 };
@@ -9912,7 +9912,7 @@ test "exl3 PAIR1 weight readers decode every K1.5 to K4 rate exactly" {
     }
 }
 
-const SPEC1_W15 = exl3.Decode.tabled(.spec1, .w15);
+pub const SPEC1_W15 = exl3.Decode.tabled(.spec1, .w15);
 const STD1_W15 = exl3.Decode.tabled(.std1, .w15);
 
 // The NAX fragment, simdgroup-matrix and decode-lane readers decode spec1 and std1 through the same
@@ -10519,14 +10519,6 @@ test "exl3 expert grouping leads each run of GROUP same-expert slots, at any slo
     };
 }
 
-const GROUP_LINK_SOURCE: [:0]const u8 =
-    \\const uint i = thread_position_in_grid.x;
-    \\if (i >= uint(LEN)) return;
-    \\out[i] = a[i];
-    \\if (i == 0u && float(dep[0]) == 1.5e30f) out[0] = a[1];
-;
-var group_link_kernel: ?mlx.mlx_fast_metal_kernel = null;
-
 /// A verify block's routing at a stated overlap: row 0 and the replacement draws come from `mimoRouting`'s
 /// skewed draw, and every later expert is instead one of the previous row's with probability `carry`.
 fn carriedRouting(alloc: std.mem.Allocator, rows: usize, topk: usize, e: usize, carry: f32, rnd: std.Random) ![]u32 {
@@ -10559,13 +10551,12 @@ fn compactRouting(slots: []u32, e: usize, alloc: std.mem.Allocator) !usize {
     return next;
 }
 
-const GroupArm = struct { name: []const u8, prepared: bool, group: ?c_int, selfprep: bool };
+pub const CarriedBlock = struct { f: MimoMoeFixture, slots: []u32, used: usize };
 
-const CarriedBlock = struct { f: MimoMoeFixture, slots: []u32, used: usize };
-
-/// A bf16 decode block over `real.e` experts routed by `carriedRouting`, its bank cut to the experts touched.
-fn carriedBlock(alloc: std.mem.Allocator, real: MimoMoeCase, carry: f32) !CarriedBlock {
-    var prng = std.Random.DefaultPrng.init(0x6d656d + real.rows * 31 + real.rate.n);
+/// A bf16 decode block over `real.e` experts routed by `carriedRouting`, its bank cut to the experts touched. The routing
+/// never depends on the rate, so two rates compare over the same experts.
+pub fn carriedBlock(alloc: std.mem.Allocator, real: MimoMoeCase, carry: f32) !CarriedBlock {
+    var prng = std.Random.DefaultPrng.init(0x6d656d + real.rows * 31);
     const slots = try carriedRouting(alloc, real.rows, real.topk, real.e, carry, prng.random());
     const used = try compactRouting(slots, real.e, alloc);
     var c = real;
@@ -10581,139 +10572,38 @@ fn carriedBlock(alloc: std.mem.Allocator, real: MimoMoeCase, carry: f32) !Carrie
     return .{ .f = f, .slots = slots, .used = used };
 }
 
-const GROUP_ARMS_NAMES = 6;
-
-/// The arms the grouping ubench interleaves; `live` marks the ones that differ from another at `rows`.
-fn groupArms(rows: usize, names: *[2][16]u8) !struct { arms: [GROUP_ARMS_NAMES]GroupArm, live: [GROUP_ARMS_NAMES]bool } {
-    const bucket = naturalBucket(rows);
-    const arms = [GROUP_ARMS_NAMES]GroupArm{
-        .{ .name = "fused", .prepared = false, .group = null, .selfprep = false },
-        .{ .name = "prep", .prepared = true, .group = 0, .selfprep = false },
-        .{ .name = "pairs", .prepared = true, .group = 2, .selfprep = false },
-        .{ .name = try std.fmt.bufPrint(&names[0], "mem{d}", .{bucket}), .prepared = true, .group = bucket, .selfprep = false },
-        .{ .name = try std.fmt.bufPrint(&names[1], "mem{d}+sp", .{bucket}), .prepared = true, .group = bucket, .selfprep = true },
-        .{ .name = "mem4", .prepared = true, .group = 4, .selfprep = false },
-    };
-    var live: [GROUP_ARMS_NAMES]bool = @splat(true);
-    // One row never groups; at two rows the sized arm is `pairs`; mem4 is the sized arm up to four rows.
-    for (0..arms.len) |i| {
-        if (rows == 1 and i > 0) live[i] = false;
-        if (i == 3 and bucket == 2) live[i] = false;
-        if (i == 5 and bucket <= 4) live[i] = false;
-    }
-    return .{ .arms = arms, .live = live };
+/// The served decode chain (pair, middle, down, reduce) over block fixture `f`, fed `x`.
+pub fn decodeChain(s: mlx.mlx_stream, f: *const MimoMoeFixture, x: mlx.mlx_array) !mlx.mlx_array {
+    const a = f.arrays;
+    return moeSwigluFused(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], .bfloat16);
 }
 
+/// How the grouping bench forces a multi-row decode block: the prepared plane or the self-preparing pair, and the
+/// member capacity (0 = ungrouped, null = the served choice).
+pub const GroupArm = struct { prepared: bool, group: ?c_int };
+pub const GROUP_ARMS = [_][]const u8{ "fused", "prep", "pairs", "sized" };
 
-fn setGroupArm(arm: GroupArm) void {
+/// What arm `i` of `GROUP_ARMS` forces at `rows`. One row never groups, and at two rows `sized` is `pairs`; an arm the
+/// rows cannot tell from another takes that one's setting.
+pub fn groupArm(rows: usize, i: usize) GroupArm {
+    const fused: GroupArm = .{ .prepared = false, .group = null };
+    if (rows == 1) return fused;
+    return switch (i) {
+        0 => fused,
+        1 => .{ .prepared = true, .group = 0 },
+        2 => .{ .prepared = true, .group = 2 },
+        else => .{ .prepared = true, .group = naturalBucket(rows) },
+    };
+}
+
+pub fn setGroupArm(arm: GroupArm) void {
     prepared_mid_force = arm.prepared;
     group_force = arm.group;
-    pair_selfprep_for_test = arm.selfprep;
 }
 
-/// Nanoseconds for `steps` dependent full decode chains (pair, middle, down, reduce) over block fixture `f`.
-fn groupChainNs(s: mlx.mlx_stream, f: *const MimoMoeFixture, c: MimoMoeCase, steps: usize) !u64 {
-    const a = f.arrays;
-    const link = try getNamedKernel(&group_link_kernel, "sushi_exl3_group_link", &.{ "a", "dep" }, &.{"out"}, GROUP_LINK_SOURCE, "");
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ @intCast(c.rows), @intCast(c.hidden) }, 2, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(c.rows * c.hidden), 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LEN", @intCast(c.rows * c.hidden)));
-    var x = try applyUnary(s, link, &.{ a[8], a[8] }, cfg);
-    defer _ = mlx.mlx_array_free(x);
-    for (0..steps) |_| {
-        const y = try moeSwigluFused(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], .bfloat16);
-        defer _ = mlx.mlx_array_free(y);
-        const next = try applyUnary(s, link, &.{ a[8], y }, cfg);
-        _ = mlx.mlx_array_free(x);
-        x = next;
-    }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var sw = io_util.Stopwatch.init(io);
-    try mlx.check(mlx.mlx_array_eval(x));
-    return sw.read();
-}
-
-// Full decode chain per step at 1 to 8 rows on Flash-Next (2560x640, E512, top-10) and DeepSeek
-// (5120x2304, E384, top-6) geometry. Arms interleaved in one process, median of 7 rounds of 32 steps:
-// `fused` is the chain Flash-Next serves (self-prepared pair, fused middle+down), `prep` the prepared
-// chain ungrouped, `pairs` today's MiMo pair grouping, `mem` the member-capacity arm sized to the rows
-// (`memN` pins capacity N, `+sp` prepares the pair inputs in-kernel). The routing is the skewed draw
-// of `mimoRouting` over the real expert count at carry 0 and 0.5 (each expert is the previous row's with
-// that probability), renumbered to the experts the block touches. Prints only under SUSHI_EXL3_GROUP_UBENCH.
-test "exl3 grouped decode timing across rows and overlap (SUSHI_EXL3_GROUP_UBENCH=1)" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_EXL3_GROUP_UBENCH"))) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    defer {
-        setDecodeParams(.mul1);
-        prepared_mid_force = null;
-        group_force = null;
-        pair_selfprep_for_test = false;
-    }
-    const geoms = [_]struct { name: []const u8, hidden: usize, inter: usize, topk: usize, e: usize }{
-        .{ .name = "flash", .hidden = 2560, .inter = 640, .topk = 10, .e = 512 },
-        .{ .name = "deepseek", .hidden = 5120, .inter = 2304, .topk = 6, .e = 384 },
-    };
-    const rates = [_]struct { n: u32, dec: exl3.Decode, name: []const u8 }{
-        .{ .n = 32, .dec = .{ .codebook = .mcg, .window = .w15 }, .name = "mcg" },
-        .{ .n = 40, .dec = .{ .codebook = .mcg, .window = .w15 }, .name = "mcg" },
-        .{ .n = 48, .dec = .{ .codebook = .mcg, .window = .w15 }, .name = "mcg" },
-        .{ .n = 64, .dec = .{ .codebook = .mcg, .window = .w15 }, .name = "mcg" },
-        .{ .n = 36, .dec = SPEC1_W15, .name = "stq" },
-        .{ .n = 42, .dec = SPEC1_W15, .name = "stq" },
-    };
-    const ROUNDS = 7;
-    for (geoms) |geom| for (rates) |rate| for ([_]usize{ 1, 2, 3, 4, 6, 8 }) |rows| for ([_]f32{ 0, 0.5 }) |carry| {
-        if (rows == 1 and carry > 0) continue;
-        setDecodeParams(rate.dec);
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-        const real: MimoMoeCase = .{ .e = geom.e, .hidden = geom.hidden, .inter = geom.inter, .topk = geom.topk, .rows = rows, .rate = .{ .n = rate.n }, .dec = rate.dec, .seed = 14000 + rate.n, .banks = MIMO_BANKS, .x_scale = 3 };
-        var block = try carriedBlock(alloc, real, carry);
-        defer block.f.deinit();
-        const f = block.f;
-        const c = real;
-        const slots = block.slots;
-        const used = block.used;
-        const counts = try alloc.alloc(u32, used);
-        @memset(counts, 0);
-        for (slots) |v| counts[v] += 1;
-        const max_members = std.mem.max(u32, counts);
-        var name_buf: [2][16]u8 = undefined;
-        const set = try groupArms(rows, &name_buf);
-        const arms = set.arms;
-        const live = set.live;
-        var us: [arms.len][ROUNDS + 1]f64 = undefined;
-        for (arms, 0..) |arm, i| {
-            if (!live[i]) continue;
-            setGroupArm(arm);
-            grouped_widest = 0;
-            _ = try groupChainNs(s, &f, c, 2);
-            if (rows > 1) try std.testing.expectEqual(arm.group orelse 0, grouped_widest);
-        }
-        for (0..ROUNDS + 1) |round| {
-            for (0..arms.len) |j| {
-                const i = (round + j) % arms.len;
-                if (!live[i]) continue;
-                setGroupArm(arms[i]);
-                us[i][round] = @as(f64, @floatFromInt(try groupChainNs(s, &f, c, 32))) / 32e3;
-            }
-        }
-        std.debug.print("[exl3-group] {s} n{d} {s} rows {d} carry {d:.1} slots {d} experts {d} max-members {d}:", .{ geom.name, rate.n, rate.name, rows, carry, slots.len, used, max_members });
-        var base: f64 = 0;
-        for (arms, 0..) |arm, i| {
-            if (!live[i]) continue;
-            std.mem.sort(f64, us[i][1..], {}, std.sort.asc(f64));
-            const med = us[i][1 + ROUNDS / 2];
-            if (i == 0) base = med;
-            std.debug.print(" {s} {d:.1} us ({d:.3})", .{ arm.name, med, med / base });
-        }
-        std.debug.print("\n", .{});
-    };
+pub fn clearGroupArm() void {
+    prepared_mid_force = null;
+    group_force = null;
 }
 
 test "exl3 grouped decode timing arms all engage and keep the served chain's bytes" {
@@ -10723,9 +10613,7 @@ test "exl3 grouped decode timing arms all engage and keep the served chain's byt
     setDecodeParams(dec);
     defer {
         setDecodeParams(.mul1);
-        prepared_mid_force = null;
-        group_force = null;
-        pair_selfprep_for_test = false;
+        clearGroupArm();
     }
     for ([_]usize{ 1, 2, 4, 8 }) |rows| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -10735,8 +10623,6 @@ test "exl3 grouped decode timing arms all engage and keep the served chain's byt
         var block = try carriedBlock(alloc, real, 0.5);
         defer block.f.deinit();
         try std.testing.expect(block.used >= real.topk and block.used <= block.slots.len);
-        var names: [2][16]u8 = undefined;
-        const set = try groupArms(rows, &names);
         var want: ?mlx.mlx_array = null;
         defer if (want) |w| {
             _ = mlx.mlx_array_free(w);
@@ -10744,14 +10630,12 @@ test "exl3 grouped decode timing arms all engage and keep the served chain's byt
         var want_c = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(want_c);
         var want_bytes: []const u8 = &.{};
-        for (set.arms, set.live) |arm, live| {
-            if (!live) continue;
+        for (0..GROUP_ARMS.len) |i| {
+            const arm = groupArm(rows, i);
             setGroupArm(arm);
             grouped_widest = 0;
-            _ = try groupChainNs(s, &block.f, real, 2);
+            const y = try decodeChain(s, &block.f, block.f.arrays[8]);
             if (rows > 1) try std.testing.expectEqual(arm.group orelse 0, grouped_widest);
-            const a = block.f.arrays;
-            const y = try moeSwigluFused(s, a[8], a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], .bfloat16);
             if (want == null) {
                 want = y;
                 want_bytes = try bf16Bytes(s, y, &want_c);
@@ -10805,339 +10689,6 @@ const LANE_LINK_SOURCE: [:0]const u8 =
     \\if (i == 0u && float(dep[0]) == 1.5e30f) out[0] = a[1];
 ;
 var lane_link_kernel: ?mlx.mlx_fast_metal_kernel = null;
-
-/// Nanoseconds for `steps` dependent pair + fused-down GEMV steps over one-row fixture `f`.
-fn laneChainNs(s: mlx.mlx_stream, f: *const MimoMoeFixture, c: MimoMoeCase, steps: usize) !u64 {
-    const a = f.arrays;
-    const hidden: c_int = @intCast(c.hidden);
-    const inter: c_int = @intCast(c.inter);
-    const nslots: c_int = @intCast(c.topk);
-    const link = try getNamedKernel(&lane_link_kernel, "sushi_exl3_lane_link", &.{ "a", "dep" }, &.{"out"}, LANE_LINK_SOURCE, "");
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, hidden }, 2, .float16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, hidden, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LEN", hidden));
-    var x = try applyUnary(s, link, &.{ a[8], a[8] }, cfg);
-    defer _ = mlx.mlx_array_free(x);
-    for (0..steps) |_| {
-        const inner = try pairGemv(s, x, a[3], a[3], a[0], a[1], a[7], hidden, inter, nslots, @intCast(c.topk), 0);
-        defer _ = mlx.mlx_array_free(inner[0]);
-        defer _ = mlx.mlx_array_free(inner[1]);
-        const y = try downGemvFusedMid(s, inner[0], inner[1], a[2], a[4], a[4], a[5], a[7], inter, hidden, nslots);
-        defer _ = mlx.mlx_array_free(y);
-        const next = try applyUnary(s, link, &.{ a[8], y }, cfg);
-        _ = mlx.mlx_array_free(x);
-        x = next;
-    }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var sw = io_util.Stopwatch.init(io);
-    try mlx.check(mlx.mlx_array_eval(x));
-    return sw.read();
-}
-
-// Decode GEMV steps and prefill GEMMs of each low rate over n32's, interleaved, at Flash-Next
-// geometry. Prints only under SUSHI_EXL3_LOWK_UBENCH (a diagnostic, never a test).
-test "exl3 low-rate decode and prefill timing over n32 (SUSHI_EXL3_LOWK_UBENCH=1)" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_EXL3_LOWK_UBENCH"))) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    defer setDecodeParams(.mul1);
-    const rates = [_]u32{ 24, 26, 28, 30, 34, 36, 40, 48 };
-    const io = std.Io.Threaded.global_single_threaded.io();
-    for ([_]exl3.Window{ .w8, .w12, .w15 }) |win| {
-        const dec: exl3.Decode = .{ .codebook = .mcg, .window = win };
-        setDecodeParams(dec);
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const ref_case: MimoMoeCase = .{ .e = 16, .hidden = 2560, .inter = 640, .topk = 10, .rows = 1, .rate = .{ .n = 32 }, .dec = dec, .seed = 3232 };
-        var ref = try mimoMoeFixture(arena.allocator(), ref_case);
-        defer ref.deinit();
-        for (rates) |n| {
-            var c = ref_case;
-            c.rate = .{ .n = n };
-            c.seed = 3200 + n;
-            var rate_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-            defer rate_arena.deinit();
-            var rate = try mimoMoeFixture(rate_arena.allocator(), c);
-            defer rate.deinit();
-            var ratios: [9]f64 = undefined;
-            var step_us: [9]f64 = undefined;
-            for (&ratios, &step_us, 0..) |*ratio, *us, round| {
-                var ns: [2]u64 = undefined;
-                for (0..2) |j| {
-                    const k = (round + j) % 2;
-                    ns[k] = try laneChainNs(s, if (k == 0) &rate else &ref, if (k == 0) c else ref_case, 48);
-                }
-                ratio.* = @as(f64, @floatFromInt(ns[0])) / @as(f64, @floatFromInt(ns[1]));
-                us.* = @as(f64, @floatFromInt(ns[0])) / 48e3;
-            }
-            std.mem.sort(f64, &ratios, {}, std.sort.asc(f64));
-            std.mem.sort(f64, &step_us, {}, std.sort.asc(f64));
-            std.debug.print("[lowk-decode] w{d} n{d} over n32: {d:.3} ({d:.1} us per step)\n", .{ win.bits(), n, ratios[ratios.len / 2], step_us[step_us.len / 2] });
-        }
-        if (!gemmNaxOn()) continue;
-        const E: c_int = 128;
-        const run: usize = 40;
-        const nslots: usize = @as(usize, @intCast(E)) * run;
-        const alloc = arena.allocator();
-        const ids = try alloc.alloc(u32, nslots);
-        for (ids, 0..) |*v, i| v.* = @intCast(i / run);
-        const eids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(nslots)}, 1, .uint32);
-        defer _ = mlx.mlx_array_free(eids);
-        var prng = std.Random.DefaultPrng.init(0x10c);
-        const rnd = prng.random();
-        for ([_][2]c_int{ .{ 2560, 640 }, .{ 640, 2560 } }) |shape| {
-            const xh = try alloc.alloc(u16, nslots * @as(usize, @intCast(shape[0])));
-            for (xh) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 0.2);
-            const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(nslots), shape[0] }, 2, .float16);
-            defer _ = mlx.mlx_array_free(x);
-            const tab = try gemmWindowTable(s, eids, @intCast(nslots), 32, true);
-            defer _ = mlx.mlx_array_free(tab.starts);
-            defer _ = mlx.mlx_array_free(tab.nlives);
-            const it = @divExact(shape[0], 16);
-            const ot = @divExact(shape[1], 16);
-            var banks: [rates.len + 1]mlx.mlx_array = undefined;
-            const all_n = [_]u32{32} ++ rates;
-            for (&banks, all_n) |*b, n| {
-                const tr_h = try alloc.alloc(u16, @intCast(E * it * ot * @as(c_int, @intCast(n))));
-                for (tr_h) |*v| v.* = @truncate(rnd.int(u32));
-                b.* = mlx.mlx_array_new_data(tr_h.ptr, &[_]c_int{ E, it, ot, @intCast(n) }, 4, .uint16);
-            }
-            defer for (banks) |b| {
-                _ = mlx.mlx_array_free(b);
-            };
-            const ROUNDS = 7;
-            var t: [rates.len + 1][ROUNDS]u64 = undefined;
-            for (0..ROUNDS + 1) |r| {
-                for (banks, 0..) |b, bi| {
-                    var sw = io_util.Stopwatch.init(io);
-                    const got = try innerGemmSortedTable(s, x, b, eids, 32, true, tab);
-                    try mlx.check(mlx.mlx_array_eval(got));
-                    if (r > 0) t[bi][r - 1] = sw.read();
-                    _ = mlx.mlx_array_free(got);
-                }
-            }
-            for (&t) |*row| std.mem.sort(u64, row, {}, std.sort.asc(u64));
-            for (rates, 1..) |n, bi| {
-                const ratio = @as(f64, @floatFromInt(t[bi][ROUNDS / 2])) / @as(f64, @floatFromInt(t[0][ROUNDS / 2]));
-                std.debug.print("[lowk-prefill] w{d} {d}->{d} n{d} over n32: {d:.3} (n32 {d:.1} us)\n", .{ win.bits(), shape[0], shape[1], n, ratio, @as(f64, @floatFromInt(t[0][ROUNDS / 2])) / 1000.0 });
-            }
-        }
-    }
-}
-
-// Decode (one row), verify (three and four rows) and the prefill GEMM of each rate above K4 over K4's, MCG and SPEC1,
-// at Flash-Next geometry (512 experts, 2560 x 640, top-10). The four arms (codebook x rate) are interleaved in one
-// process and each keeps its fastest round. Prints only under SUSHI_EXL3_WIDE_UBENCH (a diagnostic, never a test).
-test "exl3 rates above K4: decode, verify and prefill timing over K4 (SUSHI_EXL3_WIDE_UBENCH=1)" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_EXL3_WIDE_UBENCH"))) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const api = @import("root.zig");
-    defer setDecodeParams(.mul1);
-    const experts: c_int = 512;
-    const hidden: c_int = 2560;
-    const inter: c_int = 640;
-    const topk: c_int = 10;
-    const decs = [_]exl3.Decode{ .{ .codebook = .mcg, .window = .w15 }, SPEC1_W15 };
-    const names = [_][]const u8{ "mcg", "spec1" };
-    const calls: usize = 24;
-    const rounds: usize = 9;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var prng = std.Random.DefaultPrng.init(0x5eed64);
-    const rnd = prng.random();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const ones = try alloc.alloc(u16, @intCast(experts * hidden));
-    @memset(ones, exl3.f32ToF16Bits(1.0));
-    const Owned = struct {
-        arrays: [9]mlx.mlx_array,
-        bank: api.Bank,
-        fn make(r: std.Random, one: []const u16, n: c_int) !@This() {
-            var out: @This() = undefined;
-            var projs: [3]api.Proj = undefined;
-            for (&projs, [_][2]c_int{ .{ hidden, inter }, .{ hidden, inter }, .{ inter, hidden } }, 0..) |*pj, d, i| {
-                const words = try std.heap.page_allocator.alloc(u16, @intCast(experts * @divExact(d[0], 16) * @divExact(d[1], 16) * n));
-                defer std.heap.page_allocator.free(words);
-                r.bytes(std.mem.sliceAsBytes(words));
-                pj.* = .{
-                    .trellis = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ experts, @divExact(d[0], 16), @divExact(d[1], 16), n }, 4, .uint16),
-                    .suh = mlx.mlx_array_new_data(one.ptr, &[_]c_int{ experts, d[0] }, 2, .float16),
-                    .svh = mlx.mlx_array_new_data(one.ptr, &[_]c_int{ experts, d[1] }, 2, .float16),
-                };
-                out.arrays[3 * i ..][0..3].* = .{ pj.trellis, pj.suh, pj.svh };
-            }
-            out.bank = .{ .gate = projs[0], .up = projs[1], .down = projs[2] };
-            return out;
-        }
-        fn deinit(self: *const @This()) void {
-            for (self.arrays) |x| _ = mlx.mlx_array_free(x);
-        }
-    };
-    const k4 = try Owned.make(rnd, ones, 64);
-    defer k4.deinit();
-    for ([_]c_int{ 72, 80, 96, 112, 128 }) |n| {
-        const wide = try Owned.make(rnd, ones, n);
-        defer wide.deinit();
-        for ([_]c_int{ 1, 3, 4 }) |rows| {
-            var xs: [calls]mlx.mlx_array = undefined;
-            var inds: [calls]mlx.mlx_array = undefined;
-            var scores: [calls]mlx.mlx_array = undefined;
-            const nslot: usize = @intCast(rows * topk);
-            for (&xs, &inds, &scores) |*x, *ids, *sc| {
-                const xf = try alloc.alloc(f32, @intCast(rows * hidden));
-                for (xf) |*v| v.* = (rnd.float(f32) - 0.5) * 0.2;
-                const x32 = mlx.mlx_array_new_data(xf.ptr, &[_]c_int{ 1, rows, hidden }, 3, .float32);
-                defer _ = mlx.mlx_array_free(x32);
-                x.* = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_astype(x, x32, .bfloat16, s));
-                const ih = try alloc.alloc(u32, nslot);
-                for (0..@intCast(rows)) |r| {
-                    const row = ih[r * @as(usize, @intCast(topk)) ..][0..@intCast(topk)];
-                    for (row, 0..) |*e, j| pick: while (true) {
-                        e.* = rnd.uintLessThan(u32, @intCast(experts));
-                        for (row[0..j]) |prev| if (prev == e.*) continue :pick;
-                        break;
-                    };
-                }
-                ids.* = mlx.mlx_array_new_data(ih.ptr, &[_]c_int{ 1, rows, topk }, 3, .uint32);
-                const sh = try alloc.alloc(f32, nslot);
-                @memset(sh, 1.0 / @as(f32, @floatFromInt(topk)));
-                sc.* = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{ 1, rows, topk }, 3, .float32);
-            }
-            defer for (xs, inds, scores) |x, ids, sc| {
-                _ = mlx.mlx_array_free(x);
-                _ = mlx.mlx_array_free(ids);
-                _ = mlx.mlx_array_free(sc);
-            };
-            var us: [4][rounds]f64 = undefined;
-            for (0..rounds + 1) |round| {
-                for (0..4) |j| {
-                    const ai = (round + j) % 4;
-                    const dec = decs[ai / 2];
-                    setDecodeParams(dec);
-                    const bank = if (ai % 2 == 0) k4.bank else wide.bank;
-                    var outs: [calls]mlx.mlx_array = undefined;
-                    for (&outs, xs, inds, scores) |*o, x, ids, sc| o.* = try api.moe(s, x, bank, ids, sc, dec, rows > 1);
-                    defer for (outs) |o| {
-                        _ = mlx.mlx_array_free(o);
-                    };
-                    const vec = mlx.mlx_vector_array_new();
-                    defer _ = mlx.mlx_vector_array_free(vec);
-                    for (outs) |o| _ = mlx.mlx_vector_array_append_value(vec, o);
-                    var sw = io_util.Stopwatch.init(io);
-                    try mlx.check(mlx.mlx_eval(vec));
-                    const t_ns = sw.read();
-                    if (round > 0) us[ai][round - 1] = @as(f64, @floatFromInt(t_ns)) / 1e3 / @as(f64, @floatFromInt(calls));
-                }
-            }
-            var best: [4]f64 = undefined;
-            for (&us, &best) |*row, *v| v.* = std.mem.min(f64, row);
-            std.debug.print("[wide-decode] n{d} rows {d}:", .{ n, rows });
-            for (names, 0..) |name, c| std.debug.print(" {s} K4 {d:.1} us, n{d} {d:.1} us ({d:.3});", .{ name, best[2 * c], n, best[2 * c + 1], best[2 * c + 1] / best[2 * c] });
-            std.debug.print("\n", .{});
-        }
-        if (!gemmNaxOn()) continue;
-        const E: c_int = 128;
-        const run: usize = 40;
-        const nslots: usize = @as(usize, @intCast(E)) * run;
-        const ids = try alloc.alloc(u32, nslots);
-        for (ids, 0..) |*v, i| v.* = @intCast(i / run);
-        const eids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(nslots)}, 1, .uint32);
-        defer _ = mlx.mlx_array_free(eids);
-        for ([_][2]c_int{ .{ hidden, inter }, .{ inter, hidden } }) |shape| {
-            const xh = try alloc.alloc(u16, nslots * @as(usize, @intCast(shape[0])));
-            for (xh) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 0.2);
-            const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(nslots), shape[0] }, 2, .float16);
-            defer _ = mlx.mlx_array_free(x);
-            const tab = try gemmWindowTable(s, eids, @intCast(nslots), 32, true);
-            defer _ = mlx.mlx_array_free(tab.starts);
-            defer _ = mlx.mlx_array_free(tab.nlives);
-            const it = @divExact(shape[0], 16);
-            const ot = @divExact(shape[1], 16);
-            var banks: [2]mlx.mlx_array = undefined;
-            for (&banks, [_]c_int{ 64, n }) |*b, bn| {
-                const tr_h = try std.heap.page_allocator.alloc(u16, @intCast(E * it * ot * bn));
-                defer std.heap.page_allocator.free(tr_h);
-                rnd.bytes(std.mem.sliceAsBytes(tr_h));
-                b.* = mlx.mlx_array_new_data(tr_h.ptr, &[_]c_int{ E, it, ot, bn }, 4, .uint16);
-            }
-            defer for (banks) |b| {
-                _ = mlx.mlx_array_free(b);
-            };
-            var t: [4][rounds]u64 = undefined;
-            for (0..rounds + 1) |round| {
-                for (0..4) |j| {
-                    const ai = (round + j) % 4;
-                    setDecodeParams(decs[ai / 2]);
-                    var sw = io_util.Stopwatch.init(io);
-                    const got = try innerGemmSortedTable(s, x, banks[ai % 2], eids, 32, true, tab);
-                    try mlx.check(mlx.mlx_array_eval(got));
-                    if (round > 0) t[ai][round - 1] = sw.read();
-                    _ = mlx.mlx_array_free(got);
-                }
-            }
-            var best: [4]f64 = undefined;
-            for (&t, &best) |*row, *v| v.* = @as(f64, @floatFromInt(std.mem.min(u64, row))) / 1e3;
-            std.debug.print("[wide-prefill] n{d} {d}->{d}:", .{ n, shape[0], shape[1] });
-            for (names, 0..) |name, c| std.debug.print(" {s} K4 {d:.1} us, n{d} {d:.1} us ({d:.3});", .{ name, best[2 * c], n, best[2 * c + 1], best[2 * c + 1] / best[2 * c] });
-            std.debug.print("\n", .{});
-        }
-    }
-}
-
-// One-row decode chain at every even rate n24..n64, Flash-Next geometry, MCG w15: the tree's
-// funnel lane reader against the 64-bit merge of the third word, interleaved in one process.
-// Prints only under SUSHI_EXL3_CHAIN_UBENCH (a diagnostic, never a test).
-test "exl3 decode chain timing at every rate, funnel lane reader vs the 64-bit merge (SUSHI_EXL3_CHAIN_UBENCH=1)" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_EXL3_CHAIN_UBENCH"))) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
-    setDecodeParams(dec);
-    defer setDecodeParams(.mul1);
-    const header = comptime metalReplaceAll(codebookHelpers(.mcg, .w15), "!wide && full>", "false>");
-    var base: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
-    const pair = try getNamedKernel(&base[0], "sushi_exl3_pair_gemv_merge64", &.{ "x", "suhg", "suhu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_GEMV_SOURCE, header);
-    const down = try getNamedKernel(&base[1], "sushi_exl3_down_fused_merge64", &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" }, &.{"y"}, DOWN_FUSED_SOURCE, header);
-    defer for (base) |k| {
-        _ = mlx.mlx_fast_metal_kernel_free(k.?);
-    };
-    const pair_slot = &pair_gemv_kernel[cbIndex(.mcg)][dec.window.index()];
-    const down_slot = &down_fused_kernel[cbIndex(.mcg)][dec.window.index()];
-    const ROUNDS = 9;
-    var n: u32 = 24;
-    while (n <= 64) : (n += 2) {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const c: MimoMoeCase = .{ .e = 16, .hidden = 2560, .inter = 640, .topk = 10, .rows = 1, .rate = .{ .n = n }, .dec = dec, .seed = 5200 + n };
-        var f = try mimoMoeFixture(arena.allocator(), c);
-        defer f.deinit();
-        _ = try laneChainNs(s, &f, c, 4);
-        const tree_pair = pair_slot.*;
-        const tree_down = down_slot.*;
-        defer pair_slot.* = tree_pair;
-        defer down_slot.* = tree_down;
-        var us: [2][ROUNDS + 1]f64 = undefined;
-        for (0..ROUNDS + 1) |round| {
-            for (0..2) |j| {
-                const arm = (round + j) % 2;
-                pair_slot.* = if (arm == 0) pair else tree_pair;
-                down_slot.* = if (arm == 0) down else tree_down;
-                us[arm][round] = @as(f64, @floatFromInt(try laneChainNs(s, &f, c, 48))) / 48e3;
-            }
-        }
-        var med: [2]f64 = undefined;
-        for (&us, &med) |*a, *m| {
-            std.mem.sort(f64, a[1..], {}, std.sort.asc(f64));
-            m.* = a[1 + ROUNDS / 2];
-        }
-        std.debug.print("[exl3-chain] n{d} merge64 {d:.1} us, funnel {d:.1} us per step ({d:.3})\n", .{ n, med[0], med[1], med[1] / med[0] });
-    }
-}
 
 test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;

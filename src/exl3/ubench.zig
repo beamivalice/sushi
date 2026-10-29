@@ -630,3 +630,170 @@ pub fn sharedFoldDsv41(run: *report.Run) anyerror!void {
         }
     }
 }
+
+const MCG_W15: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
+
+const RATES_TEXT = [_][]const u8{
+    "24", "26", "28", "30", "32", "34", "36", "38", "40", "42", "44", "46", "48", "50", "52", "54",
+    "56", "58", "60", "62", "64", "72", "80", "96", "112", "128",
+};
+
+pub const decode_chain: report.Bench = .{
+    .name = "shared.exl3_decode_chain",
+    .scope = .shared,
+    .what = "EXL3 decode chain (pair GEMV, middle, down, reduce) at Flash-Next geometry: a rate against n32, n48 and n64, 1 to 4 rows",
+    .unit = .us,
+    .steps = 32,
+    .axes = &.{
+        .{ .name = "codebook", .values = &.{ "mcg", "spec1" }, .numeric = false },
+        .{ .name = "rate", .values = &RATES_TEXT, .numeric = false },
+        .{ .name = "rows", .values = &.{ "1", "3", "4" } },
+    },
+    .arms = &.{ "n32", "n48", "n64", "rate" },
+    .ref = "n48",
+    .run = runDecodeChain,
+};
+
+const ChainStep = struct { f: *const kernels.MimoMoeFixture };
+
+fn chainStep(c: ChainStep, s: mlx.mlx_stream, _: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    return kernels.decodeChain(s, c.f, x);
+}
+
+/// Nanoseconds of one chain step over fixture `f`: the chain less the link floor measured beside it.
+fn stepNs(s: mlx.mlx_stream, f: *const kernels.MimoMoeFixture, steps: usize) !f64 {
+    const x0 = f.arrays[8];
+    const ns = try bench.chainNs(s, x0, steps, ChainStep{ .f = f }, chainStep);
+    const floor = try bench.chainNs(s, x0, steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(steps));
+}
+
+const ChainSample = struct { s: mlx.mlx_stream, dec: exl3.Decode, f: [4]*const kernels.MimoMoeFixture, steps: usize };
+
+fn sampleDecodeChain(smp: ChainSample, arm: usize) anyerror!f64 {
+    kernels.setDecodeParams(smp.dec);
+    return stepNs(smp.s, smp.f[arm], smp.steps);
+}
+
+fn flashBlock(alloc: std.mem.Allocator, dec: exl3.Decode, n: u32, rows: usize) !kernels.CarriedBlock {
+    return kernels.carriedBlock(alloc, .{ .e = FLASH_EXPERTS, .hidden = FLASH_HIDDEN, .inter = FLASH_INTER, .topk = FLASH_TOPK, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = 5200 + n + 97 * rows, .banks = kernels.MIMO_BANKS, .x_scale = 3 }, 0);
+}
+
+fn runDecodeChain(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    const bases = [3]u32{ 32, 48, 64 };
+    for (run.axis("codebook")) |cb_text| {
+        const dec: exl3.Decode = if (std.mem.eql(u8, cb_text, "spec1")) kernels.SPEC1_W15 else MCG_W15;
+        try dec.requireTable();
+        for (run.axis("rows")) |rows_text| {
+            const rows = try std.fmt.parseInt(usize, rows_text, 10);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var base: [3]kernels.CarriedBlock = undefined;
+            for (&base, bases) |*b, n| b.* = try flashBlock(arena.allocator(), dec, n, rows);
+            defer for (&base) |*b| b.f.deinit();
+            for (run.axis("rate")) |rate_text| {
+                const n = try std.fmt.parseInt(u32, rate_text, 10);
+                var rung_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer rung_arena.deinit();
+                var block = try flashBlock(rung_arena.allocator(), dec, n, rows);
+                defer block.f.deinit();
+                const label = try std.fmt.allocPrint(run.a, "{s} n{d} rows {d}", .{ cb_text, n, rows });
+                const smp: ChainSample = .{ .s = s, .dec = dec, .f = .{ &base[0].f, &base[1].f, &base[2].f, &block.f }, .steps = run.steps(32) };
+                try run.interleave(label, smp, sampleDecodeChain);
+                const bytes: f64 = @as(f64, @floatFromInt(block.used * 3 * (FLASH_HIDDEN / 16) * (FLASH_INTER / 16) * n)) * 2;
+                const us = run.lastMedianNs("rate") / 1e3;
+                try run.metric("rate", "MB read", "MB", bytes / 1e6);
+                try run.metric("rate", "GB/s", "GB/s", bench.gbps(bytes, us));
+            }
+        }
+    }
+}
+
+const GroupGeom = struct { name: []const u8, hidden: usize, inter: usize, topk: usize, e: usize };
+const GROUP_GEOMS = [_]GroupGeom{
+    .{ .name = "flash", .hidden = 2560, .inter = 640, .topk = 10, .e = 512 },
+    .{ .name = "deepseek", .hidden = 5120, .inter = 2304, .topk = 6, .e = 384 },
+};
+const GroupRate = struct { name: []const u8, n: u32, dec: exl3.Decode };
+const GROUP_RATES = [_]GroupRate{
+    .{ .name = "mcg32", .n = 32, .dec = MCG_W15 },
+    .{ .name = "mcg40", .n = 40, .dec = MCG_W15 },
+    .{ .name = "mcg48", .n = 48, .dec = MCG_W15 },
+    .{ .name = "mcg64", .n = 64, .dec = MCG_W15 },
+    .{ .name = "stq36", .n = 36, .dec = kernels.SPEC1_W15 },
+    .{ .name = "stq42", .n = 42, .dec = kernels.SPEC1_W15 },
+};
+
+pub const grouped_decode: report.Bench = .{
+    .name = "shared.exl3_grouped_decode",
+    .scope = .shared,
+    .what = "EXL3 decode chain at 1 to 8 rows with verify rows sharing expert reads: ungrouped, prepared, pairs and the member capacity sized to the rows",
+    .unit = .us,
+    .steps = 32,
+    .axes = &.{
+        .{ .name = "geometry", .values = &.{ "flash", "deepseek" }, .numeric = false },
+        .{ .name = "rate", .values = &.{ "mcg32", "mcg40", "mcg48", "mcg64", "stq36", "stq42" }, .numeric = false },
+        .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "6", "8" } },
+        .{ .name = "carry", .values = &.{ "0", "0.5" }, .numeric = false },
+    },
+    .arms = &kernels.GROUP_ARMS,
+    .ref = "fused",
+    .run = runGroupedDecode,
+};
+
+const GroupSample = struct { s: mlx.mlx_stream, f: *const kernels.MimoMoeFixture, dec: exl3.Decode, rows: usize, steps: usize };
+
+fn sampleGrouped(smp: GroupSample, arm: usize) anyerror!f64 {
+    kernels.setDecodeParams(smp.dec);
+    kernels.setGroupArm(kernels.groupArm(smp.rows, arm));
+    return stepNs(smp.s, smp.f, smp.steps);
+}
+
+fn runGroupedDecode(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer {
+        kernels.setDecodeParams(.mul1);
+        kernels.clearGroupArm();
+    }
+    for (GROUP_GEOMS) |geom| {
+        if (!listed(run.axis("geometry"), geom.name)) continue;
+        for (GROUP_RATES) |rate| {
+            if (!listed(run.axis("rate"), rate.name)) continue;
+            try rate.dec.requireTable();
+            for (run.axis("rows")) |rows_text| {
+                const rows = try std.fmt.parseInt(usize, rows_text, 10);
+                for (run.axis("carry")) |carry_text| {
+                    if (rows == 1 and !std.mem.eql(u8, carry_text, "0")) continue;
+                    const carry = try std.fmt.parseFloat(f32, carry_text);
+                    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer arena.deinit();
+                    const alloc = arena.allocator();
+                    const real: kernels.MimoMoeCase = .{ .e = geom.e, .hidden = geom.hidden, .inter = geom.inter, .topk = geom.topk, .rows = rows, .rate = .{ .n = rate.n }, .dec = rate.dec, .seed = 14000 + rate.n, .banks = kernels.MIMO_BANKS, .x_scale = 3 };
+                    var block = try kernels.carriedBlock(alloc, real, carry);
+                    defer block.f.deinit();
+                    const counts = try alloc.alloc(u32, block.used);
+                    @memset(counts, 0);
+                    for (block.slots) |v| counts[v] += 1;
+                    kernels.setDecodeParams(rate.dec);
+                    for (kernels.GROUP_ARMS, 0..) |name, i| {
+                        if (!run.hasArm(name)) continue;
+                        const arm = kernels.groupArm(rows, i);
+                        kernels.setGroupArm(arm);
+                        kernels.grouped_widest = 0;
+                        const y = try kernels.decodeChain(s, &block.f, block.f.arrays[8]);
+                        defer _ = mlx.mlx_array_free(y);
+                        try mlx.check(mlx.mlx_array_eval(y));
+                        if (rows > 1 and kernels.grouped_widest != (arm.group orelse 0)) run.invalid("an arm did not engage its member capacity");
+                    }
+                    const label = try std.fmt.allocPrint(run.a, "{s} {s} rows {d} carry {s}", .{ geom.name, rate.name, rows, carry_text });
+                    const smp: GroupSample = .{ .s = s, .f = &block.f, .dec = rate.dec, .rows = rows, .steps = run.steps(32) };
+                    try run.interleave(label, smp, sampleGrouped);
+                    try run.metric("fused", "experts", "n", @floatFromInt(block.used));
+                    try run.metric("fused", "max members", "n", @floatFromInt(std.mem.max(u32, counts)));
+                }
+            }
+        }
+    }
+}

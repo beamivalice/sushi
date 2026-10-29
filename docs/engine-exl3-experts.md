@@ -151,17 +151,15 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   one k-tile per step) ran the one-row chain 1.27x n62's; through the funnel it runs 0.93x.
 - **A reader change is timed on every served pack's decode before it lands** (forward meter, against its parent): the
   byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K1.5 to K4, the
-  range the converters write: the test `every K1.5 to K4 rate decodes within a margin of n48` holds each even n from
-  24 to 64 within 1.12x of n48's GEMV steps. Rates below K1.5 and above K4 stay admitted and tested for correctness
-  (SPEC1 at every reader, GEMM, chain and f32-truth bar on `spec1-w15`'s rows); `SUSHI_EXL3_WIDE_UBENCH=1` times
-  K4.5/5/6/7/8 against K4 (decode, verify rows 3 and 4, prefill GEMM). `SUSHI_EXL3_LOWK_UBENCH=1` on the exl3 test binary prints n24..n48's decode chain and sorted prefill
-  GEMMs over n32's at Flash-Next geometry (w8, w12, w15), interleaved in one process; `SUSHI_EXL3_CHAIN_UBENCH=1`
-  times the one-row chain at every even n from 24 to 64, the lane funnel against the 64-bit merge.
+  range the converters write: `sushi-ubench run shared.exl3_decode_chain` times the decode chain of every even n from
+  24 to 64, and of K4.5/5/6/7/8, against n32, n48 and n64 in one process at Flash-Next geometry (MCG and SPEC1, 1, 3 and
+  4 rows), and each even n from 24 to 64 stays within 1.12x of n48's chain. Rates below K1.5 and above K4 stay admitted
+  and tested for correctness (SPEC1 at every reader, GEMM, chain and f32-truth bar on `spec1-w15`'s rows).
 - **Rates above K4 on the M5 Max** (pre-port tree, GPU lock, QUIET, fans max, AC, `taskpolicy -a`). The one-row chain,
   SPEC1 over SPEC1's K2, median of 7 repeats: K4.5 1.10, K5 1.13, K6 1.22, K6.5 1.27, K7 1.52, K7.5 1.73, K8 1.52.
   - There are two reader cliffs, the same on MCG: n110-112 (about 70 us against 61 at n108) and n114-126 (about 80 us,
     above n128's 70).
-  - `SUSHI_EXL3_WIDE_UBENCH`, at 512 experts, ratios over K4 in one process:
+  - At 512 experts, ratios over K4 in one process:
 
     | rate | decode, 1 row | verify, 3-4 rows | prefill GEMM |
     |---|---|---|---|
@@ -176,8 +174,9 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   one-row decode tick's. Served: buckets of 2 on MiMo only. Built and byte-tested at 2, 4, 8 and 16 members for any
   slot count up to 512 (one ballot per 32 slots), on every codec: a bucket above 2 runs one output tile per
   threadgroup, a block of `m` members takes the smallest rung (1, 2, 3, 4, 6, 8, 12, 16) that holds it, and rungs
-  above 8 decode a weight once and sweep the members over it. `SUSHI_EXL3_GROUP_UBENCH=1` on the exl3 test binary times
-  ungrouped, pairs and the member arms in one process at 1-8 rows on Flash-Next and DeepSeek geometry.
+  above 8 decode a weight once and sweep the members over it. `sushi-ubench run shared.exl3_grouped_decode` times
+  ungrouped, prepared, pairs and the member capacity sized to the rows in one process at 1-8 rows on Flash-Next and
+  DeepSeek geometry.
 - **A decode GEMV slot is bound by its own FMA and input path**, not the weight decode or DRAM, so deduplicating
   shared experts recovers only 4-7% of the expert kernels at 3-4 rows.
 - **GLM's one-row decode GEMVs are latency-bound, not ALU-bound**: two tiles per group and two k-tiles per iteration

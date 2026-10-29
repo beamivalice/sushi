@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 162 vars. By kind: tradeoff levers 14, diagnostics 48, microbenches 47, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 159 vars. By kind: tradeoff levers 14, diagnostics 48, microbenches 44, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -77,7 +77,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
 | `SUSHI_VISION_CHUNKED` | `generate.zig:1533` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
-## Microbenches (47)
+## Microbenches (44)
 
 In-process meters. Load-time meters run on the served binary; the rest are tests that skip when unset.
 
@@ -88,12 +88,11 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_DECODE_FWD_UBENCH_S`, `SUSHI_DECODE_FWD_UBENCH_KV` | `scheduler.zig` | `<rows>[,...]` verify widths to time; `<tokens>` prefill before timing | load | yes: perf-baselines |
 | `SUSHI_DECODE_FWD_UBENCH_PROFILE` | `scheduler.zig` | one extra profiled pass per width | load | no |
 | `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:89, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
-| `SUSHI_EXL3_CODEBOOK_AB`, `SUSHI_EXL3_GEMM_ARMS`, `SUSHI_EXL3_LOWK_UBENCH`, `SUSHI_EXL3_CHAIN_UBENCH`, `SUSHI_EXL3_GEMM_COUNTS` | `exl3/expert_exl3_kernels.zig` | EXL3 codebook A/B, served-vs-reference GEMM arms, low-rate decode chain, every-rate decode chain (lane funnel vs 64-bit merge); `_COUNTS=<file>` replays per-layer expert counts into the arms meter | test | yes: engine-exl3-experts, mimo2-perf |
+| `SUSHI_EXL3_CODEBOOK_AB`, `SUSHI_EXL3_GEMM_ARMS`, `SUSHI_EXL3_GEMM_COUNTS` | `exl3/expert_exl3_kernels.zig` | EXL3 codebook A/B, served-vs-reference GEMM arms; `_COUNTS=<file>` replays per-layer expert counts into the arms meter | test | yes: engine-exl3-experts, mimo2-perf |
 | `SUSHI_DSV41_STQ_UBENCH`, `SUSHI_UBENCH_STEPS`, `SUSHI_UBENCH_ROUNDS` | `exl3/linear.zig`, `exl3/bench_util.zig` | DeepSeek-V4.1 STQ trunk linears (`=<shape filter>` or `1`) as chains of dependent calls; steps per chain and rounds | test | yes: engine-exl3-experts, perf-baselines |
 | `SUSHI_EXL3_ROWS_SWEEP` | `exl3/expert_exl3_kernels.zig` | the multi-row kernel's launch geometries per trunk shape, chained and independent (`qwen4`, `glm5`, `dsv41`) | test | yes: engine-exl3-experts |
 | `SUSHI_DSV41_TRUNK_UBENCH`, `SUSHI_DSV41_TRUNK_UBENCH_ROWS` | `exl3/expert_exl3_kernels.zig` | DeepSeek trunk linears at the real shapes by width under the served geometry, with a streaming memory floor (`=<shape filter>` or `1`; `_ROWS=1,2,..`) | test | yes: engine-exl3-experts |
 | `SUSHI_EXL3_ROWS_SIMD_UBENCH` | `exl3/expert_exl3_kernels.zig` | the SIMD multi-row kernel on DeepSeek's trunk linears and Qwen's lm_head at 1 to 8 rows, chained, against the pre-split loop (run with `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` where NAX exists) | test | yes: engine-exl3-experts |
-| `SUSHI_EXL3_WIDE_UBENCH` | `exl3/expert_exl3_kernels.zig` | K4.5 to K8 decode, verify and prefill against K4 | test | yes: engine-exl3-experts |
 | `SUSHI_GLM_T1_UBENCH` | `exl3/expert_exl3_kernels.zig` | GLM one-row routed chain meter at E288 4096/2048 n36 and n40 w14: per-phase µs per layer, lane vs one-row GEMVs interleaved | test | yes: glm5-clamped-experts |
 | `SUSHI_EXL3_LAYER_UBENCH` | `exl3/expert_exl3_kernels.zig:82` | prints per-stage EXL3 expert timings (adds syncs) | once | yes: engine-exl3-experts, qwen4-perf |
 | `SUSHI_FP8_UBENCH`, `SUSHI_FP8_UBENCH_SHAPE`, `SUSHI_FP8_UBENCH_SWEEP` | `fp8_block.zig` | FP8 trunk GEMV meter (`<reps>`, shape filter, `direct` sweep) | test | yes: mimo2-perf |
