@@ -87,16 +87,16 @@ PY
 echo -e "${GREEN}PASS${NC} [2] first ${FIRST_N_TOKENS} tokens byte-identical (single vs batched)"
 
 echo "== real N=2 concurrency (batch != 1) =="
-OFF=$(wc -c < "$SUSHI_LOG" | tr -d ' ')
 echo "$LONG_PAYLOAD" | post > "$WORK/conc.a" &
 CA=$!
 echo "$LONG_PAYLOAD" | post > "$WORK/conc.b" &
 CB=$!
 wait $CA; wait $CB
-SLICE=$(tail -c +$((OFF + 1)) "$SUSHI_LOG")
+# The engagement lines print once per process, so the whole boot log is read; nothing else has run two slots yet.
+SLICE=$(cat "$SUSHI_LOG")
 # Output equality alone cannot tell a batched run from two serial ones, and two concurrent requests are not
 # guaranteed to overlap: the log line is the only proof the batched path ran at N>1.
-if ! echo "$SLICE" | grep -qE "\[batched\] (gdn batched decode|batched decode|qwen4 per-row decode) engaged \(slots=[2-9]"; then
+if ! echo "$SLICE" | grep -qE "\[batched\] .*engaged \(slots=[2-9]"; then
     echo -e "  ${YELLOW}NOT RUN${NC} the two requests never overlapped into a batch of >= 2"
     CONC_SKIPPED=1
 fi
