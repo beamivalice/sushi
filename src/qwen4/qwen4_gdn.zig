@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const ssm_cache = @import("../ssm_cache.zig");
 const std = @import("std");
 const gdn_decode = @import("gdn_decode.zig");
 const mlx = @import("../mlx.zig");
@@ -2509,9 +2510,9 @@ fn gdnDecayCase(state_f32: bool) !void {
 fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int) !usize {
     const t = std.testing;
     const s = mlx.gpuStream();
-    const saved = trf.compact_conv_state_override;
-    trf.compact_conv_state_override = true;
-    defer trf.compact_conv_state_override = saved;
+    const saved = ssm_cache.compact_conv_state_override;
+    ssm_cache.compact_conv_state_override = true;
+    defer ssm_cache.compact_conv_state_override = saved;
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.spec_capture_ssm = false;
@@ -2573,9 +2574,9 @@ fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int
 }
 
 fn conv1dBitCopy(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int, compact: bool, s: mlx.mlx_stream) !struct { out: mlx.mlx_array, conv_state: mlx.mlx_array } {
-    const saved = trf.compact_conv_state_override;
-    trf.compact_conv_state_override = compact;
-    defer trf.compact_conv_state_override = saved;
+    const saved = ssm_cache.compact_conv_state_override;
+    ssm_cache.compact_conv_state_override = compact;
+    defer ssm_cache.compact_conv_state_override = saved;
 
     var xfm: Transformer = undefined;
     xfm.s = s;
@@ -2599,9 +2600,9 @@ fn conv1dBitCopy(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int, compact: 
 }
 
 fn conv1dTwoChunk(batch: c_int, t1: c_int, t2: c_int, cdim: c_int, kernel: c_int, compact: bool, s: mlx.mlx_stream) !struct { out: mlx.mlx_array, conv_state: mlx.mlx_array } {
-    const saved = trf.compact_conv_state_override;
-    trf.compact_conv_state_override = compact;
-    defer trf.compact_conv_state_override = saved;
+    const saved = ssm_cache.compact_conv_state_override;
+    ssm_cache.compact_conv_state_override = compact;
+    defer ssm_cache.compact_conv_state_override = saved;
 
     var xfm: Transformer = undefined;
     xfm.s = s;
@@ -3177,7 +3178,7 @@ pub fn conv1dWithCache(
             const owned = try materializedOwnedCopy(self.s, new_conv_state);
             _ = mlx.mlx_array_free(new_conv_state);
             new_conv_state = owned;
-            trf.compact_conv_state_copy_count += 1;
+            ssm_cache.compact_conv_state_copy_count += 1;
         }
         _ = mlx.mlx_array_free(ssm.conv_state);
         ssm.conv_state = new_conv_state;
@@ -4176,16 +4177,16 @@ test "conv1dWithCache decode width does not copy the tail" {
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    const saved = trf.compact_conv_state_override;
-    defer trf.compact_conv_state_override = saved;
-    trf.compact_conv_state_override = true;
-    trf.compact_conv_state_copy_count = 0;
+    const saved = ssm_cache.compact_conv_state_override;
+    defer ssm_cache.compact_conv_state_override = saved;
+    ssm_cache.compact_conv_state_override = true;
+    ssm_cache.compact_conv_state_copy_count = 0;
     const on = try conv1dBitCopy(1, 1, 32, 4, true, s);
     defer {
         _ = mlx.mlx_array_free(on.out);
         _ = mlx.mlx_array_free(on.conv_state);
     }
-    try t.expectEqual(@as(u64, 0), trf.compact_conv_state_copy_count);
+    try t.expectEqual(@as(u64, 0), ssm_cache.compact_conv_state_copy_count);
     const off = try conv1dBitCopy(1, 1, 32, 4, false, s);
     defer {
         _ = mlx.mlx_array_free(off.out);
