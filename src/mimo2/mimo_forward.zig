@@ -1,6 +1,7 @@
 //! MiMo-V2 forward: sliding/global attention arms, routed-MoE dispatch, batched decode and verify rows.
 
 const trf = @import("../transformer.zig");
+const moe_router = @import("../moe_router.zig");
 const nax_gate = @import("../nax_gate.zig");
 const Transformer = trf.Transformer;
 const std = @import("std");
@@ -3270,8 +3271,8 @@ test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x11_6C_0DE);
     const rnd = prng.random();
-    trf.moe_router_fused_override = true;
-    defer trf.moe_router_fused_override = null;
+    moe_router.moe_router_fused_override = true;
+    defer moe_router.moe_router_fused_override = null;
 
     const ROWS: c_int = 256;
     const E: c_int = 512;
@@ -3301,9 +3302,9 @@ test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512
     defer _ = mlx.mlx_array_free(fused.inds);
     defer _ = mlx.mlx_array_free(fused.norm_scores);
 
-    trf.moe_router_fused_override = false;
+    moe_router.moe_router_fused_override = false;
     const chain = try groupLimitedRouting(l32, bias, K, NG, TOPKG, true, ROUTE_SCALE, s);
-    trf.moe_router_fused_override = true;
+    moe_router.moe_router_fused_override = true;
     defer _ = mlx.mlx_array_free(chain.inds);
     defer _ = mlx.mlx_array_free(chain.norm_scores);
 
@@ -3392,8 +3393,8 @@ test "fused MoE router reproduces the sigmoid+bias routing chain" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5EED2026);
     const rnd = prng.random();
-    trf.moe_router_fused_override = true;
-    defer trf.moe_router_fused_override = null;
+    moe_router.moe_router_fused_override = true;
+    defer moe_router.moe_router_fused_override = null;
 
     const ROWS: c_int = 4;
     const E: c_int = 256;
@@ -3499,8 +3500,8 @@ test "fused MoE router reproduces the mimo_v2 sigmoid+bias routing chain in f32"
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x2113_0F32);
     const rnd = prng.random();
-    trf.moe_router_fused_override = true;
-    defer trf.moe_router_fused_override = null;
+    moe_router.moe_router_fused_override = true;
+    defer moe_router.moe_router_fused_override = null;
 
     const ROWS: c_int = 256;
     const E: c_int = 256;
