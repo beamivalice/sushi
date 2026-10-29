@@ -13,6 +13,11 @@
 set -u
 . "$(dirname "$0")/lib/boot.sh"; sushi_attach
 sushi_require mtp
+# DeepSeek reports its DSpark head as an MTP head in /props but never plans MTP rounds.
+if [ "$SUSHI_ARCH" = deepseek_v41 ]; then
+    echo "SKIP $(basename "$0"): DeepSeek speculates with DSpark, not MTP rounds"
+    exit 3
+fi
 BASE=$SUSHI_URL
 WORK=$(mktemp -d /tmp/mtp_adaptive.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
