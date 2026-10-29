@@ -9,7 +9,8 @@
 # asks for extra fields and code fences, so a clean reply is the mask's work.
 #
 # The last section is the #331 guard: completed schema JSON reaches CONTENT on every mask-building surface (chat,
-# Responses, Messages), and a completion cap spent in reasoning keeps empty content with `length`.
+# Responses, Messages), a completion cap spent in reasoning keeps empty content with `length`, and protocol-looking
+# strings in schema data survive every surface with thinking on and off.
 #
 # Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_json_schema.sh
 
@@ -448,6 +449,100 @@ else
         && run_test "a reasoning request reaches a grammar decision" PASS "" \
         || run_test "a reasoning request reaches a grammar decision" FAIL "no [grammar] decision line"
 fi
+
+# Protocol-looking strings inside schema data must survive every surface, thinking on and off.
+echo "--- marker data survives all HTTP surfaces with thinking on and off ---"
+if python3 -I - "$BASE" "$OFF_OK" "$EFFORT_MED" "$SUSHI_NONCE" <<'PYEOF'
+import json
+import sys
+import urllib.request
+
+BASE, OFF_OK, WORD, NONCE = sys.argv[1].rstrip('/'), sys.argv[2] == '1', sys.argv[3], sys.argv[4]
+MARKERS = '<think>kept</think> </think:opensource> <|channel>thought <|channel|>final <|content_thinking|> to=self<|message|> <tool_call>literal</tool_call>'
+SCHEMA = {
+    'type': 'object',
+    'properties': {'note': {'type': 'string', 'enum': [MARKERS]}},
+    'required': ['note'],
+    'additionalProperties': False,
+}
+
+
+def request(surface, streaming, thinking):
+    cap = 4096 if thinking else 256
+    body = {'model': 'sushi', 'temperature': 0, 'stream': streaming}
+    prompt = NONCE + ' Return the JSON object required by the schema.'
+    if surface == 'responses':
+        body.update(max_output_tokens=cap, input=prompt, reasoning={'effort': WORD if thinking else 'none'},
+                    text={'format': {'type': 'json_schema', 'name': 'markers', 'strict': True, 'schema': SCHEMA}})
+    else:
+        body.update(max_tokens=cap, messages=[{'role': 'user', 'content': prompt}])
+        if surface == 'messages':
+            body.update(thinking={'type': 'enabled' if thinking else 'disabled', 'budget_tokens': -1}, output_config={'format': {'type': 'json_schema', 'schema': SCHEMA}})
+        else:
+            body.update(enable_thinking=thinking, reasoning_budget_tokens=-1, response_format={'type': 'json_schema', 'json_schema': {'name': 'markers', 'strict': True, 'schema': SCHEMA}})
+    req = urllib.request.Request(BASE + '/v1/' + surface, json.dumps(body).encode(), {'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=600) as response:
+        raw = response.read().decode()
+    if not streaming:
+        result = json.loads(raw)
+        if surface == 'responses':
+            content = ''.join(c['text'] for item in result['output'] if item['type'] == 'message' for c in item['content'] if c['type'] == 'output_text')
+            reasoning = [item for item in result['output'] if item['type'] == 'reasoning' and item.get('summary')]
+            tokens = result['usage']['output_tokens']
+            exhausted = result.get('status') == 'incomplete'
+        elif surface == 'messages':
+            content = ''.join(c['text'] for c in result['content'] if c['type'] == 'text')
+            reasoning = [c for c in result['content'] if c['type'] == 'thinking' and c.get('thinking')]
+            tokens = result['usage']['output_tokens']
+            exhausted = result.get('stop_reason') == 'max_tokens'
+        else:
+            content = result['choices'][0]['message']['content']
+            reasoning = result['choices'][0]['message'].get('reasoning_content')
+            tokens = result['usage']['completion_tokens']
+            exhausted = result['choices'][0]['finish_reason'] == 'length'
+        assert 0 < tokens <= cap, result
+    else:
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: {')]
+        assert events, raw
+        if surface == 'responses':
+            content = ''.join(e['delta'] for e in events if e.get('type') == 'response.output_text.delta')
+            reasoning = [e for e in events if e.get('type') == 'response.reasoning_summary_text.delta' and e.get('delta')]
+            done = [e for e in events if e.get('type') in ('response.completed', 'response.incomplete')]
+            assert done, events
+            exhausted = any(e['response'].get('status') == 'incomplete' for e in done)
+        elif surface == 'messages':
+            content = ''.join(e['delta']['text'] for e in events if e.get('type') == 'content_block_delta' and e['delta']['type'] == 'text_delta')
+            reasoning = [e for e in events if e.get('type') == 'content_block_delta' and e['delta']['type'] == 'thinking_delta' and e['delta'].get('thinking')]
+            exhausted = any(e.get('type') == 'message_delta' and e['delta'].get('stop_reason') == 'max_tokens' for e in events)
+            assert any(e.get('type') == 'message_stop' for e in events), events
+        else:
+            content = ''.join(c.get('delta', {}).get('content', '') or '' for e in events for c in e.get('choices', []))
+            reasoning = [c['delta'].get('reasoning_content') for e in events for c in e.get('choices', []) if c.get('delta', {}).get('reasoning_content')]
+            finishes = [c.get('finish_reason') for e in events for c in e.get('choices', [])]
+            exhausted = 'length' in finishes
+            assert exhausted or 'stop' in finishes, events
+    if thinking and exhausted and not content:
+        # The checkpoint spent the whole cap thinking: nothing was misrouted, so there is nothing to compare.
+        print(f'PASS: {surface}, stream={streaming}: cap spent in reasoning, thinking={thinking}', flush=True)
+        return
+    assert json.loads(content) == {'note': MARKERS}, content
+    if not thinking:
+        assert not reasoning, reasoning
+    print(f'PASS: {surface}, stream={streaming}: exact marker data, thinking={thinking}', flush=True)
+
+
+# A model that cannot switch thinking off (GLM) has no thinking=False arm.
+for thinking in ((False, True) if OFF_OK else (True,)):
+    for surface in ('chat/completions', 'messages', 'responses'):
+        for streaming in (False, True):
+            request(surface, streaming, thinking)
+PYEOF
+then
+    run_test "marker data survives all HTTP surfaces with thinking on and off" PASS ""
+else
+    run_test "marker data survives all HTTP surfaces with thinking on and off" FAIL "routing regression"
+fi
+echo ""
 
 echo "=== Summary ==="
 echo "Passed: $PASS / $TOTAL"
