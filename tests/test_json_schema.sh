@@ -8,6 +8,9 @@
 # satisfy the schema. Cases A-F add the Responses and tool_choice:none spellings, answered under a prompt that
 # asks for extra fields and code fences, so a clean reply is the mask's work.
 #
+# The last section is the #331 guard: completed schema JSON reaches CONTENT on every mask-building surface (chat,
+# Responses, Messages), and a completion cap spent in reasoning keeps empty content with `length`.
+#
 # Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_json_schema.sh
 
 . "$(dirname "$0")/lib/boot.sh"
@@ -24,10 +27,12 @@ echo ""
 # A model that can switch thinking off answers inside the small caps below. One that cannot (GLM) thinks
 # first: it gets a large cap, and a reply that spent the whole cap in reasoning (content empty, finish
 # `length`) is the checkpoint's choice, not a schema failure.
-OFF_OK=$(curl -sf "$BASE/v1/models" | python3 -I -c '
+read -r OFF_OK CAPPED EFFORT_MED EFFORT_LOW < <(curl -sf "$BASE/v1/models" | python3 -I -c '
 import sys, json
 m = json.load(sys.stdin)["data"][0]
-print(1 if "off" in m.get("reasoning_efforts", []) else 0)')
+e = m.get("reasoning_efforts", [])
+pick = lambda *w: next((x for x in w if x in e), "on")
+print(int("off" in e), int(bool(m.get("reasoning_effort_budgets"))), pick("medium", "low"), pick("low"))')
 if [ "$OFF_OK" = 1 ]; then
     THINK='"enable_thinking": false,'
     THINK_OBJ='{"enable_thinking":false}'
@@ -35,6 +40,7 @@ else
     THINK='"reasoning_effort": "low",'
     THINK_OBJ='{"reasoning_effort":"low"}'
 fi
+TOL_BASE=$((1 - OFF_OK))
 cap() { if [ "$OFF_OK" = 1 ]; then echo "$1"; else echo 4096; fi; }
 
 run_test() {
@@ -74,16 +80,17 @@ except Exception as e:
 print(json.dumps({"finish": finish, "content": "".join(buf)}))' "$1" "$2"
 }
 
-# schema_check <kind>: stdin is chat_parse output; prints ok, ok:cap-spent-in-reasoning or fail:<why>.
+# schema_check <kind> [tolerate]: stdin is chat_parse output; prints ok, ok:cap-spent-in-reasoning (accepted when
+# tolerate is 1, default TOL_BASE) or fail:<why>.
 schema_check() {
     python3 -I -c '
 import sys, json
-kind, off_ok = sys.argv[1], sys.argv[2] == "1"
+kind, tolerate = sys.argv[1], sys.argv[2] == "1"
 p = json.load(sys.stdin)
 if "error" in p:
     print("fail:unparsable_response:" + p["error"]); sys.exit()
 text = p["content"]
-if not off_ok and p["finish"] == "length" and text == "":
+if tolerate and p["finish"] == "length" and text == "":
     print("ok:cap-spent-in-reasoning"); sys.exit()
 try:
     assert "```" not in text, "code_fence"
@@ -98,13 +105,15 @@ try:
         assert isinstance(v.get("ingredients"), list) and all(isinstance(x, str) for x in v["ingredients"]), v
     elif kind == "book":
         assert isinstance(v.get("title"), str) and isinstance(v.get("year"), int), v
+    elif kind == "answer":
+        assert isinstance(v, dict) and "answer" in v, v
     elif kind == "employee":
         assert isinstance(v, dict), v
         assert not set(v) - {"name", "age", "email"}, "extra_keys: %s" % sorted(set(v) - {"name", "age", "email"})
         assert not {"name", "age", "email"} - set(v), "missing_required: %s" % sorted({"name", "age", "email"} - set(v))
     print("ok")
 except Exception as e:
-    print("fail:%s:%r" % (e, text[:80]))' "$1" "$OFF_OK"
+    print("fail:%s:%r" % (e, text[:80]))' "$1" "${2:-$TOL_BASE}"
 }
 
 verdict() { # <name> <schema_check output>
@@ -327,6 +336,118 @@ enforce_chat "chat tools + tool_choice:none + schema" \
     '{messages:[{role:"system",content:"Reply with only the JSON object."},{role:"user",content:$input}],
       tools:[{type:"function",function:{name:"noop",description:"unused",parameters:{type:"object",properties:{}}}}],
       tool_choice:"none"}'
+
+# ── Reasoning and the schema: the answer reaches content on every surface ──
+# Finite reasoning budgets (a capped effort, an explicit budget) render thinking off and mask from token 0; supported
+# unlimited reasoning defers the mask to the reasoning boundary. Either way the schema JSON must reach content.
+# A model with no capped effort may spend a whole cap thinking: that is accepted (TOL_THINK), never asserted.
+if [ "$CAPPED" = 1 ]; then THINK_CAP=512; THINK_RCAP=2048; else THINK_CAP=4096; THINK_RCAP=4096; fi
+TOL_THINK=$((1 - CAPPED))
+ANSWER_SCHEMA='{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}'
+PROMPT="$SUSHI_NONCE A basket starts with 17 apples. Six are removed, then three groups of two are added. Give the final count."
+
+# messages_parse <sse>: the chat_parse shape for a streamed /v1/messages reply.
+messages_parse() {
+    python3 -I -c '
+import sys, json
+finish, buf = "stop", []
+try:
+    for line in sys.argv[1].splitlines():
+        if not line.startswith("data: {"):
+            continue
+        e = json.loads(line[6:])
+        if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta":
+            buf.append(e["delta"]["text"])
+        elif e.get("type") == "message_delta" and e["delta"].get("stop_reason") == "max_tokens":
+            finish = "length"
+    print(json.dumps({"finish": finish, "content": "".join(buf)}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))' "$1"
+}
+
+schema_body() { # <jq object over $schema, $p, $cap, $word>
+    jq -n --argjson schema "$ANSWER_SCHEMA" --arg p "$PROMPT" --argjson cap "$1" --arg word "$2" "$3"
+}
+
+echo "--- /v1/chat/completions: reasoning_effort + json_schema, non-stream ---"
+BODY=$(schema_body "$THINK_CAP" "$EFFORT_MED" '{model:"sushi", max_tokens:$cap, temperature:0, stream:false, reasoning_effort:$word,
+    response_format:{type:"json_schema",json_schema:{name:"answer",strict:true,schema:$schema}},
+    messages:[{role:"user",content:$p}]}')
+RESULT=$(curl -s -m 600 "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY")
+verdict "schema JSON lands in content (chat, non-stream)" "$(chat_parse "$RESULT" false | schema_check answer "$TOL_THINK")"
+
+echo "--- /v1/chat/completions: same request, stream ---"
+BODY=$(schema_body "$THINK_CAP" "$EFFORT_LOW" '{model:"sushi", max_tokens:$cap, temperature:0, stream:true, reasoning_effort:$word,
+    response_format:{type:"json_schema",json_schema:{name:"answer",strict:true,schema:$schema}},
+    messages:[{role:"user",content:$p}]}')
+RESULT=$(curl -s -m 600 -N "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY")
+verdict "schema JSON lands in delta.content (chat, stream)" "$(chat_parse "$RESULT" true | schema_check answer "$TOL_THINK")"
+
+echo "--- /v1/responses: reasoning.effort + text.format json_schema ---"
+BODY=$(schema_body "$THINK_RCAP" "$EFFORT_MED" '{model:"sushi", max_output_tokens:$cap, temperature:0, stream:false,
+    reasoning:{effort:$word}, text:{format:{type:"json_schema",name:"answer",strict:true,schema:$schema}}, input:$p}')
+RESULT=$(curl -s -m 600 "$BASE/v1/responses" -H "Content-Type: application/json" -d "$BODY")
+verdict "schema JSON lands in output_text (responses)" "$(responses_parse "$RESULT" false | schema_check answer "$TOL_THINK")"
+
+echo "--- /v1/messages: finite thinking budget + json_schema, stream ---"
+BODY=$(schema_body "$THINK_CAP" "" '{model:"sushi", max_tokens:$cap, temperature:0, stream:true,
+    thinking:{type:"enabled",budget_tokens:256}, output_config:{format:{type:"json_schema",schema:$schema}},
+    messages:[{role:"user",content:$p}]}')
+RESULT=$(curl -s -m 600 -N "$BASE/v1/messages" -H "Content-Type: application/json" -d "$BODY")
+verdict "schema JSON lands in text delta (messages, finite budget)" "$(messages_parse "$RESULT" | schema_check answer "$TOL_THINK")"
+
+# Whether 64 tokens is exhausted mid-thought is the checkpoint's choice: the hard completion cap must not force a
+# boundary, reserve answer tokens or move reasoning to content, so only routing, accounting and the finish reason count.
+for STREAMING in false true; do
+    echo "--- /v1/chat/completions: reasoning exhausts max_tokens, stream=$STREAMING ---"
+    BODY=$(schema_body 64 "" '{model:"sushi", max_tokens:$cap, temperature:0, stream:'"$STREAMING"',
+        enable_thinking:true, reasoning_budget_tokens:-1, stream_options:{include_usage:true},
+        response_format:{type:"json_schema",json_schema:{name:"answer",strict:true,schema:$schema}},
+        messages:[{role:"user",content:$p}]}')
+    BODY=$(curl -s -m 600 -N "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY")
+    if [ "$STREAMING" = true ]; then
+        RESULT=$(echo "$BODY" | sed -n 's/^data: \({.*}\)$/\1/p' | jq -s '{
+            finish_reason: [.[] | .choices[]? | .finish_reason // empty] | last,
+            completion_tokens: [.[] | .usage.completion_tokens // empty] | last,
+            content: [.[] | .choices[]? | .delta.content // empty] | join(""),
+            reasoning: [.[] | .choices[]? | .delta.reasoning_content // empty] | join("")
+        }' 2>/dev/null)
+    else
+        RESULT=$(echo "$BODY" | jq '{
+            finish_reason: .choices[0].finish_reason,
+            completion_tokens: .usage.completion_tokens,
+            content: (.choices[0].message.content // ""),
+            reasoning: (.choices[0].message.reasoning_content // "")
+        }' 2>/dev/null)
+    fi
+    if echo "$RESULT" | jq -e '(.finish_reason == "length" and .completion_tokens == 64 and
+        .content == "" and (.reasoning | length > 0)) or
+        (.finish_reason == "stop" and .completion_tokens < 64 and (.content | fromjson | .answer != null))' >/dev/null 2>&1; then
+        run_test "reasoning-only length stop respects completion cap (stream=$STREAMING)" PASS ""
+    else
+        run_test "reasoning-only length stop respects completion cap (stream=$STREAMING)" FAIL "$(echo "$RESULT" | head -c 240)"
+    fi
+done
+
+# Only the log lines this script's requests produced count. The Qwen thinking protocol is the one whose lines are
+# known: other archs resolve their own protocol, so they are held to one grammar decision line.
+LOGS=$(sushi_log_since)
+log_has() { printf '%s\n' "$LOGS" | grep -Eq "$1"; }
+if [ "$CAPPED" = 1 ]; then
+    log_has '\[grammar\] finite reasoning budget; rerendered with thinking off' \
+        && run_test "finite budgets retain thinking-off fallback" PASS "" \
+        || run_test "finite budgets retain thinking-off fallback" FAIL "missing fallback log"
+    log_has '\[grammar\] deferring JSON schema' \
+        && run_test "supported unlimited request defers grammar" PASS "" \
+        || run_test "supported unlimited request defers grammar" FAIL "missing deferral log"
+    log_has '\[grammar\] reasoning boundary (reached|forced)' \
+        && run_test "deferred grammar activates at a boundary" PASS "" \
+        || run_test "deferred grammar activates at a boundary" FAIL "missing activation log"
+else
+    log_has '\[grammar\] (deferring JSON schema|enforcing JSON schema from token 0|.*rerendered with thinking off)' \
+        && run_test "a reasoning request reaches a grammar decision" PASS "" \
+        || run_test "a reasoning request reaches a grammar decision" FAIL "no [grammar] decision line"
+fi
 
 echo "=== Summary ==="
 echo "Passed: $PASS / $TOTAL"
