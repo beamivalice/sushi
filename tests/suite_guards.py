@@ -7,6 +7,12 @@
 Arch-test guard: a test whose name mentions a model must live in that model's folder (src/<model>/) unless its
 name is in tests/guards/arch-tests.allow (shared at arch geometry). The list keys the name, not the file, so
 moving a test between shared files never breaks it.
+
+Model footprint guard: shared sources (src/ root, src/exl3, src/encoder) may name a model only at dispatch points.
+tests/guards/model-footprint.allow holds, per model, how many mentions the shared sources may keep. A count above
+its entry fails; below it prints the number to lower. The entry keys the model, not the file, so code moving
+between shared files keeps its count. Comments, test blocks, whole test files and src/<model>/ do not count;
+engine features (SWA, ring cache, FP8) are not model names.
 """
 import argparse
 import os
@@ -21,6 +27,8 @@ MODELS = {
 }
 ALLOW_DIR = "tests/guards"
 ARCH_ALLOW = f"{ALLOW_DIR}/arch-tests.allow"
+FOOTPRINT_ALLOW = f"{ALLOW_DIR}/model-footprint.allow"
+SHARED_DIRS = [("src", False), ("src/exl3", True), ("src/encoder", True)]
 
 
 def blank(text, keep_strings):
@@ -157,12 +165,59 @@ def arch_check(root, write):
     return fail
 
 
+def is_test_file(rel):
+    stem = os.path.basename(rel)[: -len(".zig")]
+    return stem.endswith("_test") or stem.startswith(("test_", "tests_"))
+
+
+def footprint(root):
+    """({model: mentions}, {model: {file: mentions}}) over the shared sources' non-test code."""
+    total = {m: 0 for m in MODELS}
+    by_file = {m: {} for m in MODELS}
+    for d, recurse in SHARED_DIRS:
+        for rel in zig_files(root, [d], recurse):
+            if is_test_file(rel):
+                continue
+            with open(os.path.join(root, rel)) as f:
+                found, text = tests_of(f.read())
+            for _, a, b in found:
+                text = text[:a] + " " * (b - a) + text[b:]
+            for m, rx in MODELS.items():
+                n = len(rx.findall(text))
+                if n:
+                    total[m] += n
+                    by_file[m][rel] = n
+    return total, by_file
+
+
+def footprint_check(root, write):
+    total, by_file = footprint(root)
+    if write:
+        write_allow(root, FOOTPRINT_ALLOW, [
+            "Mentions of each model in the shared sources (src/ root, src/exl3, src/encoder), outside comments and tests.",
+            "The count may only shrink. Generated: python3 tests/suite_guards.py --write. Keyed by model, not file.",
+        ], [f"{m} {total[m]}" for m in MODELS])
+        return 0
+    allowed = {l.split()[0]: int(l.split()[1]) for l in read_allow(root, FOOTPRINT_ALLOW)}
+    fail = 0
+    for m in MODELS:
+        have, may = total[m], allowed.get(m, 0)
+        if have > may:
+            fail += 1
+            worst = ", ".join(f"{f} {n}" for f, n in sorted(by_file[m].items(), key=lambda kv: -kv[1])[:3])
+            print(f"model footprint guard: {m}: {have} mention{'s' * (have != 1)} in shared sources, allows {may}; "
+                  f"name a model only in its src folder or at a dispatch point (largest: {worst})", file=sys.stderr)
+        elif have < may:
+            print(f"model footprint guard: lower {m} to {have} (was {may}): run --write", file=sys.stderr)
+    return fail
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--write", action="store_true", help="regenerate the allowlists instead of checking")
     args = ap.parse_args()
-    fail = arch_check(args.root, args.write)
+    fail = arch_check(args.root, args.write) + footprint_check(args.root, args.write)
     sys.exit(1 if fail else 0)
 
 
