@@ -42,7 +42,8 @@ post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"c
 wait $P1 $P2 $P3 $P4 $P5 $P6 $P7
 
 # engagement: the group really formed
-SLOTS=$(sushi_log_since | grep -oE "\[batched\] .*engaged \(slots=[0-9]+" | grep -oE "[0-9]+$" | sort -n | tail -1)
+# Engagement lines are logged once per process, so an earlier script on this boot may have logged it: read the whole log.
+SLOTS=$(grep -oE "\[batched\] .*engaged \(slots=[0-9]+" "$SUSHI_LOG" | grep -oE "[0-9]+$" | sort -n | tail -1)
 [[ -n "$SLOTS" && "$SLOTS" -ge 2 ]] && ok "batched decode engaged (max slots=$SLOTS)" || bad "batched decode engaged" "no [batched] engaged line with slots>=2"
 
 # tools (stream): the call carries its own code, args valid JSON

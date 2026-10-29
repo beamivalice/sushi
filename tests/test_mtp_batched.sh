@@ -59,7 +59,8 @@ PYEOF
     fi
 done
 [ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} $N concurrent MTP streams match solo (fixed depth; near-ties acquitted on the batched verify)"
-sushi_log_since > "$LOG"
+# Engagement lines are logged once per process, so an earlier script on this boot may have logged them.
+cp "$SUSHI_LOG" "$LOG"
 if [ "$IS_QWEN4" = 1 ]; then
     grep -q "gdn batched verify engaged" "$LOG" && { echo -e "${RED}FAIL${NC} qwen4 rounds must stay solo (no batched verify yet)"; fail=1; }
     [ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} qwen4 MTP users interleave on their own head state"

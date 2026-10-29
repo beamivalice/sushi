@@ -3,6 +3,7 @@
 """A prefill past 8192 tokens through the NAX QSA gather: the passphrase is recalled and `[qsa-gather] engaged:
 sushi_qsa_nax_precise` is logged. The default boot runs NAX; the prefix cache is off so no prompt is restored."""
 import json
+import os
 from pathlib import Path
 import sys
 import urllib.request
@@ -33,4 +34,4 @@ for nonce in ('81492017', '52839106', '90371648'):
     answer = result['choices'][0]['message']['content']
     assert 'MAGNOLIA-7731' in answer, result
 expected = '[qsa-gather] engaged: sushi_qsa_nax_precise'
-assert expected in st.log_since(), f'Missing engagement: {expected}'
+assert expected in Path(os.environ['SUSHI_LOG']).read_text(errors='replace'), f'Missing engagement: {expected}'

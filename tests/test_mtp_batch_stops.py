@@ -149,6 +149,6 @@ for attempt in range(8):
         break
 if not reached_cancel:
     raise AssertionError('No mid-round cancellation publication was observed; gate did not run')
-if '[batched] row-axis mtp verify engaged (slots=2' not in st.log_since():
+if '[batched] row-axis mtp verify engaged (slots=2' not in logfile.read_text(errors='replace'):  # logged once per process
     raise AssertionError('Grouped verify did not engage')
 print('RESULT: 2 passed, 0 failed; artifacts=' + str(out), flush=True)
