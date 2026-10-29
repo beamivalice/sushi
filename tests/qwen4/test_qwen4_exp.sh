@@ -8,7 +8,7 @@
 # plausibly too. [7] sends an image (tower + M-RoPE engagement lines) and
 # SKIPs when the pack's index names no tower tensor (`vision_tower.` or `model.visual.`). [11] reboots
 # `--no-vision` (tower absent, text works, media 400s by name). SKIPs without the pack.
-#   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_exp.sh [port]
+#   QWEN4_MODEL=<pack dir> ./tests/qwen4/test_qwen4_exp.sh [port]
 set -u
 MODEL="${QWEN4_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11411}"

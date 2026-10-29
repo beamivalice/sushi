@@ -16,7 +16,7 @@
 # texts, stop, wait for the port and for free+inactive+speculative pages,
 # then boot `--prefix-cache-entries 0` and replay. Never two servers at once.
 #
-# Usage: ./tests/test_prefix_inherit_qsa.sh [/path/to/qwen4_exp] [port]
+# Usage: ./tests/qwen4/test_prefix_inherit_qsa.sh [/path/to/qwen4_exp] [port]
 #
 # Coordinator runs this. Do not start a model server from the agent.
 

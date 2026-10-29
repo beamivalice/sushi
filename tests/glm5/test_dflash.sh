@@ -5,7 +5,7 @@
 #
 #   DFLASH_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw \
 #   DFLASH_TEST_DRAFTER=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw/dflash2 \
-#       ./tests/test_dflash.sh
+#       ./tests/glm5/test_dflash.sh
 #
 # Pins the live contract: the sidecar probe classifies the assistant as
 # DFlash (boot log), rounds ENGAGE (`[spec-stats] mode=dflash attempts>0` —

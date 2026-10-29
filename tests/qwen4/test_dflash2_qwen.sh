@@ -16,7 +16,7 @@
 #   5. SAMPLED (temperature 1.0, top_p 0.95, top_k 20, what agent clients send): every bank request runs DFlash rounds
 #      and answers; the per-draft acceptance is printed, because a greedy-only bar never sees the runtime gate act.
 #
-# Usage: DFLASH2_QWEN_MODEL=<pack dir> [DFLASH2_QWEN_DRAFTER=<drafter dir>] ./tests/test_dflash2_qwen.sh [port]
+# Usage: DFLASH2_QWEN_MODEL=<pack dir> [DFLASH2_QWEN_DRAFTER=<drafter dir>] ./tests/qwen4/test_dflash2_qwen.sh [port]
 # Boot flags: SUSHI_TEST_EXTRA_ARGS (e.g. a pinned block size knob while measuring).
 
 set -u

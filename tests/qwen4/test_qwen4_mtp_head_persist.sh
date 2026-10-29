@@ -4,7 +4,7 @@
 # is not KV-only (it owns a QSA key history), so a cache hit used to draft from an empty head.
 # Asserts the invariant: the second turn is a hot-cache hit AND the head is restored, the
 # answer matches the persist-OFF answer, and `SUSHI_MTP_HEAD_PERSIST=0` shows no restore line.
-#   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_mtp_head_persist.sh [port]
+#   QWEN4_MODEL=<pack dir> ./tests/qwen4/test_qwen4_mtp_head_persist.sh [port]
 set -u
 MODEL="${QWEN4_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 PORT="${1:-11413}"
