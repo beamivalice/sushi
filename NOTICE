@@ -354,8 +354,8 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     leaves room for the n-gram table's page cache and a cold full-context
     prompt. The app-side settings changes are not ported.
   * The SSD restore that evaluates each chunk before opening the next and
-    drops the MLX error its failure latched (`src/kv_disk_cache.zig`, section 7
-    of `tests/test_prefix_cache_disk.sh`), from mlx-serve #527 by @brandondyal.
+    drops the MLX error its failure latched (`src/kv_disk_cache.zig`, the fd-limit
+    arm of `tests/test_prefix_cache_restart.sh`), from mlx-serve #527 by @brandondyal.
     Modifications: the ring-restore entry point drops its latch too.
   * The first append after a short shared restore sizes its copy from the
     request rather than the donor's buffer (`src/transformer.zig`), from

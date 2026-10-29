@@ -243,7 +243,7 @@ Qwen prefill chunks write through continuously in SSD-only mode (no env turns it
 prefill writes through too and frees each checkpoint's RAM copy once it is staged ([GLM](glm5-prefix-cache.md#glm)). Hybrid SSM checkpoints, MiMo ring
 restore points and GLM state ([GLM](glm5-prefix-cache.md#glm)) survive restart. Image-bearing entries persist whole, keyed by their media
 chain, so a text -> image -> text conversation restores past its images after a restart (issue #47;
-`tests/test_media_prefix_persist.sh` runs that on all three archs). RAM+SSD is the opt-in
+`tests/test_prefix_cache_restart.sh` runs that on every arch). RAM+SSD is the opt-in
 `--prefix-cache-mem` arrangement. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
 `~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.
 
