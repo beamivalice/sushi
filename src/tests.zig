@@ -168,6 +168,7 @@ test {
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
+    _ = @import("vision_queue.zig");
     _ = @import("model_load.zig");
     _ = @import("mimo2/mimo_scheduler_test.zig");
     _ = @import("dsv41/dsv41_thought_point.zig");
