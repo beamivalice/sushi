@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const nax_gate = @import("nax_gate.zig");
 const qwen4_qsa_select = @import("qwen4/qwen4_qsa_select.zig");
@@ -10622,8 +10623,8 @@ test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the
     try t.expectEqual(@as(u64, 0), prefillDequantWeightBytes(&mxfp8));
 
     // The estimator must not bill an allocation the kill switch removed.
-    transformer_mod.prefill_dq_gemm_override = false;
-    defer transformer_mod.prefill_dq_gemm_override = null;
+    verify_moe.prefill_dq_gemm_override = false;
+    defer verify_moe.prefill_dq_gemm_override = null;
     try t.expectEqual(@as(u64, 0), prefillDequantWeightBytes(&cfg));
 }
 
