@@ -290,7 +290,7 @@ const Rope = struct { freqs: A };
 // ── state ────────────────────────────────────────────────────────────────
 
 /// Rows appended one chunk at a time, in a buffer that grows by `rows_grow_div`'s fraction.
-const Rows = struct {
+pub const Rows = struct {
     /// The rows `[cap, width]` in `dtype`, or packed: E2M1 codes `[cap, width/2]` u8.
     buf: A = none,
     /// Packed: the scale bytes `[cap, width/group]`.
@@ -304,7 +304,7 @@ const Rows = struct {
 
     const Pack = struct { mode: qat_mod.Qat, group: usize };
 
-    fn deinit(self: *Rows) void {
+    pub fn deinit(self: *Rows) void {
         if (self.buf.ctx != null) _ = mlx.mlx_array_free(self.buf);
         if (self.sbuf.ctx != null) _ = mlx.mlx_array_free(self.sbuf);
     }
@@ -336,7 +336,7 @@ const Rows = struct {
         buf.* = up;
     }
 
-    fn append(self: *Rows, sc: *Scope, x: A) !void {
+    pub fn append(self: *Rows, sc: *Scope, x: A) !void {
         const n = dim(x, 0);
         if (n == 0) return;
         const s = sc.s;
@@ -357,7 +357,7 @@ const Rows = struct {
     }
 
     /// Rows [0, n) as values.
-    fn rows(self: *const Rows, sc: *Scope, n: usize) !A {
+    pub fn rows(self: *const Rows, sc: *Scope, n: usize) !A {
         return self.rowsIn(sc, 0, n);
     }
 
@@ -1409,7 +1409,7 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
 
 /// The `k` largest of each row of `x` as int32 indices: ascending with ties to the lower index on the kernel, else
 /// unordered.
-fn topkRows(sc: *Scope, m: *const Model, x: A, k: usize) !A {
+pub fn topkRows(sc: *Scope, m: *const Model, x: A, k: usize) !A {
     if (fusedOn(sc, m) and mlx.mlx_array_ndim(x) == 2) return kernels.topkIndices(sc, try sc.astype(x, .float32), k);
     return sc.astype(try sc.topkIdx(x, k), .int32);
 }
@@ -1418,7 +1418,7 @@ fn topkRows(sc: *Scope, m: *const Model, x: A, k: usize) !A {
 /// (`scores` `[L, nb]`, unreachable groups -inf; `lens` `[L, 1]` int32 the groups each query sees),
 /// the block holding the query's newest group pinned. A bool mask over `nb`, or none when every
 /// block is kept.
-fn candidateBlocks(sc: *Scope, m: *const Model, li: usize, scores: A, lens: A, bs: usize, kb: usize) !A {
+pub fn candidateBlocks(sc: *Scope, m: *const Model, li: usize, scores: A, lens: A, bs: usize, kb: usize) !A {
     if ((dim(scores, 1) + bs - 1) / bs <= kb) return none;
     return candidateMask(sc, m, li, try blockMax(sc, scores, bs), lens, bs, kb);
 }
@@ -1470,7 +1470,7 @@ fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A,
 /// The indexer's scores `[Ls, nb]` of `q` (f32 `[Ls, ih, ihd]`) against `keys`: sum over heads of the weight (the
 /// projection `w` times `wscale`) times relu(q . k), -inf past the groups a query sees. A kernel for a few rows, the
 /// matrix kernel for a wide block, else the op chain over key tiles.
-fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32, p0: usize, r: usize) !A {
+pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32, p0: usize, r: usize) !A {
     const Ls = dim(q, 0);
     const nb = dim(keys, 0);
     const ih = dim(q, 1);
@@ -1501,7 +1501,7 @@ fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32, p0
 }
 
 /// What `indexStream` returns: the top-k key ids per query (ascending) and the candidate-block mask, or none.
-const Streamed = struct { idx: A, cand: A };
+pub const Streamed = struct { idx: A, cand: A };
 
 /// A running top-k of `[L, k]` ids and values, folded over tiles of scores whose columns arrive in id order.
 const Running = struct {
@@ -1536,7 +1536,7 @@ const Running = struct {
 /// running top-k, so no `[Ls, nb]` scores exist: the picks are the whole row's, bit for bit. `mask` (a candidate-block
 /// mask or none) keeps only its blocks of `bs` keys. With `kb` > 0 it also returns this layer's candidate mask, the
 /// same fold over the block maxima (`lens` pins each query's newest block as `candidateMask` does).
-fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize, tile: usize, mask: A, bs: usize, kb: usize, lens: A) !Streamed {
+pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize, tile: usize, mask: A, bs: usize, kb: usize, lens: A) !Streamed {
     std.debug.assert(tile % kernels.indexKeyTile(rows.dtype) == 0 and (bs == 0 or tile % bs == 0));
     const n_blocks = if (bs > 0) (nb + bs - 1) / bs else 0;
     var picks = Running{};
@@ -4805,13 +4805,13 @@ test "dsv41 Engram: the carried look-ahead is freed by a reset, by a failed pass
     try testing.expect(m.engram_ahead != null);
 }
 
-const AttnCase = struct { L: usize, wp: usize, K: usize, nc: usize, holes: bool = true, H: usize = 64, hd: usize = 512, window: usize = 128 };
+pub const AttnCase = struct { L: usize, wp: usize, K: usize, nc: usize, holes: bool = true, H: usize = 64, hd: usize = 512, window: usize = 128 };
 
-const AttnData = struct { q: A, keys: A, comp: A, topk: A, band: A, sink: A };
+pub const AttnData = struct { q: A, keys: A, comp: A, topk: A, band: A, sink: A };
 
 /// bf16 rows at the release's attention shape: a span of `c.L` queries over the window rows from `c.wp` and `c.K`
 /// picks into `c.nc` compressed rows, some picks -1 and some whole rows of them.
-fn attnCaseData(sc: *Scope, c: AttnCase, seed: u64) !AttnData {
+pub fn attnCaseData(sc: *Scope, c: AttnCase, seed: u64) !AttnData {
     const H: c_int = @intCast(c.H);
     const hd: c_int = @intCast(c.hd);
     const window = c.window;
@@ -4891,30 +4891,17 @@ test "dsv41 fused attention: the one-pass kernel is no further from the f32 trut
         const fused = try sc_mod.hostF32(try kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .float32));
         const err_core = maxRelErr(core, truth);
         const err_fused = maxRelErr(fused, truth);
-        if (@import("../transformer.zig").diagEnvOn("SUSHI_DSV41_ATTN_UBENCH")) std.debug.print("case {d}: core {e}, fused {e}\n", .{ ci_, err_core, err_fused });
+        errdefer std.debug.print("case {d}: core {e}, fused {e}\n", .{ ci_, err_core, err_fused });
         // Without NAX the composed core's GEMMs are true f32 and sit near the kernel's own accumulation noise.
         try testing.expect(err_fused <= err_core + NO_WORSE_F32_ULPS * 0x1p-23);
         try testing.expect(err_fused < 3e-5);
     }
 }
 
-const AttnArm = enum { core, wide, fused };
-
-fn runAttnArm(sc: *Scope, arm: AttnArm, d: AttnData, c: AttnCase, scale: f32) !A {
-    return switch (arm) {
-        .core => attnCore(sc, d.sink, d.q, d.keys, d.band, d.comp, d.topk, scale, .bfloat16),
-        .wide => kernels.attnWide(sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16),
-        .fused => kernels.attnFused(sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16),
-    };
-}
-
-// One attention span at DeepSeek-V4.1's geometry (64 heads x 512, window 128, 512 picks): the f32 composed core, the
-// f16 wide arm and the fused kernel, interleaved in one process, best of 8 each, with the span's peak bytes beyond
-// its inputs. Prints only under SUSHI_DSV41_ATTN_UBENCH.
 const StreamCase = struct { L: usize, nb: usize, r: usize, tile: usize, distinct: usize, masked: bool = false };
 
 /// Index keys at the release's width with only `distinct` different rows, so scores tie across tiles.
-fn streamKeys(sc: *Scope, nb: usize, distinct: usize, seed: u64) !Rows {
+pub fn streamKeys(sc: *Scope, nb: usize, distinct: usize, seed: u64) !Rows {
     var rows = Rows{ .width = 128, .dtype = .bfloat16, .pack = .{ .mode = .fp4_ue8m0, .group = 32 } };
     errdefer rows.deinit();
     const base = try sc.astype(try sc_mod_randn(sc, &.{ ci(distinct), 128 }, seed), .bfloat16);
@@ -4927,7 +4914,7 @@ fn streamKeys(sc: *Scope, nb: usize, distinct: usize, seed: u64) !Rows {
     return rows;
 }
 
-fn sc_mod_randn(sc: *Scope, shape: []const c_int, seed: u64) !A {
+pub fn sc_mod_randn(sc: *Scope, shape: []const c_int, seed: u64) !A {
     var rk = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_random_key(&rk, seed));
     _ = try sc.keep(rk);
@@ -4988,176 +4975,6 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
     }
 }
 
-/// MLX peak bytes beyond the active ones while `f` builds and evaluates its results.
-fn peakOf(sc: *Scope, comptime f: anytype, args: anytype) !usize {
-    _ = mlx.mlx_synchronize(sc.s);
-    _ = mlx.mlx_clear_cache();
-    _ = mlx.mlx_reset_peak_memory();
-    var active: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active);
-    var run = Scope.init(testing.allocator, sc.s);
-    defer run.deinit();
-    const out = try @call(.auto, f, .{&run} ++ args);
-    try evalAll(&out);
-    var pk: usize = 0;
-    _ = mlx.mlx_get_peak_memory(&pk);
-    return pk -| active;
-}
-
-const WholeArgs = struct { rows: *const Rows, nb: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize, bs: usize, with_blocks: bool, lens: A };
-
-/// `indexer`'s non-streamed arm: the whole row's scores, the candidate mask when asked, the top-k.
-fn indexWholeArm(sc: *Scope, a: WholeArgs) ![2]A {
-    var fake: Model = undefined;
-    fake.fused = true;
-    fake.trace = null;
-    const keys = try a.rows.rows(sc, a.nb);
-    const scores = try indexScores(sc, &fake, a.q, keys, a.w, a.wscale, a.p0, a.r);
-    const idx = try topkRows(sc, &fake, scores, a.k);
-    return .{ idx, if (a.with_blocks) try candidateBlocks(sc, &fake, 0, scores, a.lens, a.bs, 2048) else idx };
-}
-
-/// `indexer`'s decode-width arm: packed keys scored whole, a later layer's candidate mask applied, the top-k.
-fn indexNarrowArm(sc: *Scope, a: WholeArgs, mask: A) ![2]A {
-    var fake: Model = undefined;
-    fake.fused = true;
-    fake.trace = null;
-    const pk = a.rows.pack.?;
-    var scores = try kernels.indexScoresPacked(sc, a.q, try sc.slice(a.rows.buf, 0, 0, a.nb), try sc.slice(a.rows.sbuf, 0, 0, a.nb), a.w, a.wscale, a.p0, a.r, pk.mode, pk.group);
-    if (mask.ctx != null) {
-        var o = mlx.mlx_array_new();
-        const rep = try sc.res(mlx.mlx_repeat_axis(&o, mask, ci(a.bs), -1, sc.s), &o);
-        scores = try sc.where(try sc.slice(rep, -1, 0, a.nb), scores, try sc.f(-std.math.inf(f32)));
-    }
-    const idx = try topkRows(sc, &fake, scores, a.k);
-    return .{ idx, idx };
-}
-
-fn indexStreamArm(sc: *Scope, a: WholeArgs, tile: usize) ![2]A {
-    const got = try indexStream(sc, a.rows, a.nb, a.q, a.w, a.wscale, a.p0, a.r, a.k, tile, none, a.bs, if (a.with_blocks) 2048 else 0, a.lens);
-    return .{ got.idx, if (a.with_blocks) got.cand else got.idx };
-}
-
-// The indexer's context-scaled working set at DeepSeek-V4.1's release shapes (32 heads x 128, top-512, blocks of 8): the
-// MLX peak beyond the inputs of one wide span, whole scores against the streamed top-k, per context. Prints only under
-// SUSHI_DSV41_INDEX_UBENCH.
-test "dsv41 index stream peak bytes by context (SUSHI_DSV41_INDEX_UBENCH=1)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_DSV41_INDEX_UBENCH")) return error.SkipZigTest;
-    const gpu = mlx.gpuStream();
-    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    var sc = Scope.init(testing.allocator, gpu);
-    defer sc.deinit();
-    const tile: usize = @intCast(cfg_mod.index_stream_tile);
-    // Encoder owners (ratio 2, 256-row span) and decoder owners (ratio 1, the 128-row CED tail).
-    for ([_]struct { L: usize, r: usize }{ .{ .L = 256, .r = 2 }, .{ .L = 128, .r = 1 } }) |g| {
-        for ([_]usize{ 16384, 65536, 262144, 524288, 1048576 }) |ctx| {
-            const nb = ctx / g.r;
-            var rows = try streamKeys(&sc, nb, 4096, 0x4d0);
-            defer rows.deinit();
-            const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(g.L), 32, 128 }, 0x5d0), .float32);
-            const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(g.L), 32 }, 0x6d0), .bfloat16);
-            const lens_h = try testing.allocator.alloc(i32, g.L);
-            defer testing.allocator.free(lens_h);
-            for (lens_h, 0..) |*v, i| v.* = @intCast((ctx - g.L + i + 1) / g.r);
-            const lens = try sc.ints(lens_h, &.{ ci(g.L), 1 });
-            try evalAll(&.{ q, w, rows.buf, rows.sbuf, lens });
-            const a = WholeArgs{ .rows = &rows, .nb = nb, .q = q, .w = w, .wscale = 0.01, .p0 = ctx - g.L, .r = g.r, .k = 512, .bs = 8, .with_blocks = nb / 8 > 2048, .lens = lens };
-            const whole = try peakOf(&sc, indexWholeArm, .{a});
-            const streamed = try peakOf(&sc, indexStreamArm, .{ a, tile });
-            std.debug.print("dsv41-index L {d} ratio {d} ctx {d}: whole {d} MB, streamed {d} MB\n", .{ g.L, g.r, ctx, whole >> 20, streamed >> 20 });
-        }
-    }
-    // A decode or verify block: 16 rows over every key, with and without the candidate mask a later layer applies.
-    for ([_]usize{ 65536, 262144, 524288, 1048576 }) |ctx| {
-        const L = 16;
-        var rows = try streamKeys(&sc, ctx, 4096, 0x4d0);
-        defer rows.deinit();
-        const q = try sc.astype(try sc_mod_randn(&sc, &.{ L, 32, 128 }, 0x5d0), .float32);
-        const w = try sc.astype(try sc_mod_randn(&sc, &.{ L, 32 }, 0x6d0), .bfloat16);
-        var lens_h: [L]i32 = undefined;
-        for (&lens_h, 0..) |*v, i| v.* = @intCast(ctx - L + i + 1);
-        const lens = try sc.ints(&lens_h, &.{ L, 1 });
-        var fake: Model = undefined;
-        fake.fused = true;
-        fake.trace = null;
-        const full = try kernels.indexScoresPacked(&sc, q, try sc.slice(rows.buf, 0, 0, ctx), try sc.slice(rows.sbuf, 0, 0, ctx), w, 0.01, ctx - L, 1, rows.pack.?.mode, rows.pack.?.group);
-        const mask = try candidateBlocks(&sc, &fake, 0, full, lens, 8, 2048);
-        try evalAll(&.{ q, w, rows.buf, rows.sbuf, lens, mask });
-        const a = WholeArgs{ .rows = &rows, .nb = ctx, .q = q, .w = w, .wscale = 0.01, .p0 = ctx - L, .r = 1, .k = 512, .bs = 8, .with_blocks = false, .lens = lens };
-        const plain = try peakOf(&sc, indexNarrowArm, .{ a, none });
-        const masked = try peakOf(&sc, indexNarrowArm, .{ a, mask });
-        std.debug.print("dsv41-index narrow L {d} ctx {d}: packed keys {d} MB, with the mask {d} MB\n", .{ L, ctx, plain >> 20, masked >> 20 });
-    }
-}
-
-fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
-    return @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
-}
-
-// A decode block's indexer stages per context (release shapes, packed keys), each evaluated alone, best of 15 ms.
-// Prints only under SUSHI_DSV41_INDEX_UBENCH.
-test "dsv41 decode index stage timing by context (SUSHI_DSV41_INDEX_UBENCH=1)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_DSV41_INDEX_UBENCH")) return error.SkipZigTest;
-    const gpu = mlx.gpuStream();
-    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var sc = Scope.init(testing.allocator, gpu);
-    defer sc.deinit();
-    var fake: Model = undefined;
-    fake.fused = true;
-    fake.trace = null;
-    for ([_]usize{ 32768, 65536, 131072, 262144 }) |nb| {
-        var rows = try streamKeys(&sc, nb, 4096, 0x4d0);
-        defer rows.deinit();
-        const pk = rows.pack.?;
-        for ([_]usize{ 1, 2, 4 }) |L| {
-            const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0), .float32);
-            const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32 }, 0x6d0), .bfloat16);
-            const lens_h = try testing.allocator.alloc(i32, L);
-            defer testing.allocator.free(lens_h);
-            for (lens_h, 0..) |*v, i| v.* = @intCast(nb - L + i + 1);
-            const lens = try sc.ints(lens_h, &.{ ci(L), 1 });
-            const codes = try sc.slice(rows.buf, 0, 0, nb);
-            const scl = try sc.slice(rows.sbuf, 0, 0, nb);
-            const full = try kernels.indexScoresPacked(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
-            const mask = try candidateBlocks(&sc, &fake, 0, full, lens, 8, 2048);
-            try evalAll(&.{ q, w, lens, codes, scl, full, mask });
-            var best: [5]f64 = @splat(std.math.inf(f64));
-            for (0..16) |rep| {
-                var t = Scope.init(testing.allocator, gpu);
-                defer t.deinit();
-                var t0 = std.Io.Timestamp.now(io, .boot);
-                const scores = try kernels.indexScoresPacked(&t, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
-                try evalAll(&.{scores});
-                const a = msSince(io, t0);
-                t0 = std.Io.Timestamp.now(io, .boot);
-                var o = mlx.mlx_array_new();
-                const rep_m = try t.res(mlx.mlx_repeat_axis(&o, mask, 8, -1, t.s), &o);
-                const masked = try t.where(try t.slice(rep_m, -1, 0, nb), scores, try t.f(-std.math.inf(f32)));
-                try evalAll(&.{masked});
-                const b = msSince(io, t0);
-                t0 = std.Io.Timestamp.now(io, .boot);
-                const idx = try topkRows(&t, &fake, masked, 512);
-                try evalAll(&.{idx});
-                const c = msSince(io, t0);
-                t0 = std.Io.Timestamp.now(io, .boot);
-                const cand = try candidateBlocks(&t, &fake, 0, scores, lens, 8, 2048);
-                try evalAll(&.{cand});
-                const d = msSince(io, t0);
-                t0 = std.Io.Timestamp.now(io, .boot);
-                const s2 = try kernels.indexScoresPacked(&t, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
-                const ix2 = try topkRows(&t, &fake, s2, 512);
-                try evalAll(&.{ix2});
-                const e = msSince(io, t0);
-                if (rep > 0) for ([_]f64{ a, b, c, d, e }, 0..) |v, i| {
-                    best[i] = @min(best[i], v);
-                };
-            }
-            std.debug.print("dsv41-index-decode nb {d} L {d}: scores {d:.3} ms, mask {d:.3}, topk {d:.3}, cand-source blocks {d:.3}, scores+topk {d:.3}\n", .{ nb, L, best[0], best[1], best[2], best[3], best[4] });
-        }
-    }
-}
-
 // A later index source's picks over the candidate blocks' keys alone are the masked whole scan's, ties included (the
 // keys repeat every 4096, so scores tie across blocks).
 test "dsv41 index decode: scoring the candidate blocks' keys picks what the masked whole scan picks" {
@@ -5192,76 +5009,6 @@ test "dsv41 index decode: scoring the candidate blocks' keys picks what the mask
         const keys = try kernels.candidateKeys(&sc, try topkRows(&sc, &fake, gathered, 512), ids, 8);
         const got = try sc.where(try sc.lt(keys, lens), keys, try sc.i(-1));
         try expectSameInts(want, got);
-    }
-}
-
-fn growArm(sc: *Scope, rows: *Rows, chunk: A) ![2]A {
-    try rows.append(sc, chunk);
-    return .{ rows.buf, rows.sbuf };
-}
-
-// What a row store's growth holds beyond its rows: the peak while a full buffer grows by its fraction. Prints only under
-// SUSHI_DSV41_INDEX_UBENCH.
-test "dsv41 rows growth peak bytes (SUSHI_DSV41_INDEX_UBENCH=1)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_DSV41_INDEX_UBENCH")) return error.SkipZigTest;
-    const gpu = mlx.gpuStream();
-    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    var sc = Scope.init(testing.allocator, gpu);
-    defer sc.deinit();
-    for ([_]struct { width: usize, mode: qat_mod.Qat, group: usize }{ .{ .width = 512, .mode = .fp4_e4m3, .group = 16 }, .{ .width = 128, .mode = .fp4_ue8m0, .group = 32 } }) |g| {
-        for ([_]usize{ 262144, 1048576 }) |n| {
-            var rows = Rows{ .width = g.width, .dtype = .bfloat16, .pack = .{ .mode = g.mode, .group = g.group } };
-            defer rows.deinit();
-            const base = try sc.astype(try sc_mod_randn(&sc, &.{ 4096, ci(g.width) }, 0x7d0), .bfloat16);
-            const full = try sc.broadcast(try sc.expand(base, 0), &.{ ci(n / 4096), 4096, ci(g.width) });
-            try rows.append(&sc, try sc.reshape(full, &.{ ci(n), ci(g.width) }));
-            try evalAll(&.{ rows.buf, rows.sbuf });
-            const chunk = try sc.slice(base, 0, 0, 2048);
-            try evalAll(&.{chunk});
-            const pk = try peakOf(&sc, growArm, .{ &rows, chunk });
-            const bytes = n * (g.width / 2 + g.width / g.group);
-            std.debug.print("dsv41-rows width {d} used {d}: {d} MB held, growth peak beyond that {d} MB\n", .{ g.width, n, bytes >> 20, pk >> 20 });
-        }
-    }
-}
-
-test "dsv41 attention span timing and peak bytes (SUSHI_DSV41_ATTN_UBENCH=1)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_DSV41_ATTN_UBENCH")) return error.SkipZigTest;
-    const gpu = mlx.gpuStream();
-    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    var base = Scope.init(testing.allocator, gpu);
-    defer base.deinit();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const scale = 1.0 / @sqrt(@as(f32, 512));
-    for ([_]AttnCase{ .{ .L = 256, .wp = 127, .K = 512, .nc = 4096, .holes = false }, .{ .L = 128, .wp = 127, .K = 512, .nc = 4096, .holes = false }, .{ .L = 256, .wp = 127, .K = 0, .nc = 0 } }) |c| {
-        const d = try attnCaseData(&base, c, 0xa77);
-        try evalAll(&.{ d.q, d.keys, d.band, d.sink });
-        if (c.K > 0) try evalAll(&.{ d.comp, d.topk });
-        var best: [3]f64 = @splat(std.math.inf(f64));
-        var peak: [3]usize = @splat(0);
-        for (0..17) |rep| for (std.enums.values(AttnArm)) |arm| {
-            var sc = Scope.init(testing.allocator, gpu);
-            defer sc.deinit();
-            _ = mlx.mlx_synchronize(gpu);
-            _ = mlx.mlx_clear_cache();
-            _ = mlx.mlx_reset_peak_memory();
-            var active: usize = 0;
-            _ = mlx.mlx_get_active_memory(&active);
-            const t0 = std.Io.Timestamp.now(io, .boot);
-            const y = try runAttnArm(&sc, arm, d, c, scale);
-            try mlx.check(mlx.mlx_array_eval(y));
-            const ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
-            var pk: usize = 0;
-            _ = mlx.mlx_get_peak_memory(&pk);
-            if (rep > 0) best[@intFromEnum(arm)] = @min(best[@intFromEnum(arm)], ms);
-            peak[@intFromEnum(arm)] = pk -| active;
-        };
-        std.debug.print("dsv41-attn span {d} K {d}: core {d:.2} ms {d} MB, wide f16 {d:.2} ms {d} MB, fused {d:.2} ms {d} MB\n", .{
-            c.L,                              c.K,
-            best[@intFromEnum(AttnArm.core)], peak[@intFromEnum(AttnArm.core)] >> 20,
-            best[@intFromEnum(AttnArm.wide)], peak[@intFromEnum(AttnArm.wide)] >> 20,
-            best[@intFromEnum(AttnArm.fused)], peak[@intFromEnum(AttnArm.fused)] >> 20,
-        });
     }
 }
 

@@ -84,7 +84,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   tile scores the bits of the whole list's columns (`indexScoresTile` takes the tile's key offset, a multiple of the
   kernel's key tile). A decode-width block (up to 16 rows) scores the packed index keys directly
   (`indexScoresPacked`), with no unpacked copy. A trace run keeps the whole scores.
-- **Decode indexer cost, by context** (`SUSHI_DSV41_INDEX_UBENCH=1 -Dtest-filter="dsv41 decode index stage timing"`): the
+- **Decode indexer cost, by context** (`sushi-ubench run dsv41.index_decode`): the
   score pass is one thread a key and linear in keys AND rows (the FMAs and threadgroup loads of q, not the key reads, bound
   it); the top-k is one threadgroup a row. A plain step at 209k tokens cost ~4 ms more than at 5k (serial `--no-mtp`, 46079949:
   40.0 against 47.8 tok/s), nearly all of it the eight index sources. A decode block's later index sources (layers 24-36)
@@ -100,7 +100,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   one row) with k <= 512 splits each row over 8 chunks; each chunk's threadgroup selects its own top-k and one merge
   threadgroup selects over the chunks' picks, which are ascending in row index, so the indices, their order and the ties
   (lower index) are the one-threadgroup kernel's (`dsv41 topk split` test: random, 8-level tied and -inf rows, n to
-  262144). `SUSHI_DSV41_TOPK_UBENCH=1 -Dtest-filter="dsv41 topk split timing"`, per row of work with eight scans in one eval,
+  262144). `sushi-ubench run dsv41.topk`, per row of work with eight scans in one eval,
   best of 15, splits 1 to 8: n 262144 1 row 0.065 to 0.041 ms, 16 rows 0.186 to 0.149; n 524288 1 row 0.127 to 0.051
   (16 rows 0.413 to 0.279); n 131072 1 row 0.055 to 0.042, 4 and 16 rows a tie. n up to 65536 and the k = 2048 block maxima
   tie or lose a little at any split (the merge costs what the split saves); 32 splits lose everywhere. Output is
@@ -154,7 +154,7 @@ A bill follows the storage in the same commit; every term below is an ESTIMATE u
 | State per request | `Config.stateFixedBytes`: the 40 window rings in the activation dtype (128 x 512 x 2 B each) and the open pooling groups (up to ratio - 1 rows of kv and gate, f32); with DSpark the stage windows and the rings' verify slack |
 | Forward transient | `Config.forwardCap(rows, seq)` / `chunkCap(chunk, seq)`: the transient cap a forward runs under and admission bills ([dsv41-memory](dsv41-memory.md#transient-caps)); 2.3 MiB a prefill row, the decode block's scores and the rows' growth per context token, a quarter over, 256 MiB slack |
 | Fill peak | none: slabs are filled in place, the union workspace (a layer's 384 experts) is billed once at load beside the cache and bounce (`scheduler.loadStagingBytes`) and sits in active memory after |
-| Indexer peak by context | `SUSHI_DSV41_INDEX_UBENCH=1 zig build test -Dtest-filter="dsv41 index stream peak"`: MLX `peak - active` of one span at the release shapes (32 heads x 128, top-512, blocks of 8). 256 rows at ratio 2: whole scores 12 / 58 / 211 / 415 / 823 MB at 16k / 64k / 256k / 512k / 1M context, streamed 13 / 58 / 81 / 81 / 81 MB. The 128-row CED tail at ratio 1: whole 13 / 62 / 239 / 476 / 948 MB, streamed 13 / 44 / 44 / 44 / 44 MB. A 16-row decode block over the packed keys: 4 / 16 / 32 / 64 MB, 9 / 36 / 72 / 144 MB with a candidate mask. A row store's growth holds 1.06 x its bytes beyond them (306 MB for 1M compressed rows, 72 MB for 1M index keys; 1.25 x at the old quarter). Synthetic keys, no model; the live per-chunk peak on the pack is the check |
+| Indexer peak by context | `sushi-ubench run dsv41.index_peak`, `dsv41.index_block_peak`, `dsv41.rows_growth`: MLX `peak - active` of one span at the release shapes (32 heads x 128, top-512, blocks of 8). 256 rows at ratio 2: whole scores 12 / 58 / 211 / 415 / 823 MB at 16k / 64k / 256k / 512k / 1M context, streamed 13 / 58 / 81 / 81 / 81 MB. The 128-row CED tail at ratio 1: whole 13 / 62 / 239 / 476 / 948 MB, streamed 13 / 44 / 44 / 44 / 44 MB. A 16-row decode block over the packed keys: 4 / 16 / 32 / 64 MB, 9 / 36 / 72 / 144 MB with a candidate mask. A row store's growth holds 1.06 x its bytes beyond them (306 MB for 1M compressed rows, 72 MB for 1M index keys; 1.25 x at the old quarter). Synthetic keys, no model; the live per-chunk peak on the pack is the check |
 | Measured transient | Per-chunk MLX `peak - active` (`SUSHI_PREFILL_CHUNK_PEAK`) of the CED prefill on an STQ pack: 2.63 GB at 512 rows, 3.56 GB at 1024, 4.05 GB at a 1507-row last chunk, nearly flat in the context (512 rows: 2.64 GB at 18k, 2.60 GB at 108k, about 0.6 KB a context token). The bill uses `chunk + 511` rows, 400 B a row per hidden channel (2.0 MB a row) and 3 score copies per context token; the bracket test pins bill >= 1.1x each measurement and <= 4x. Before the per-span scopes and CED: ~6.2-6.9 MB a row and 33 KB a context token. These per-chunk numbers predate the streamed top-k; the bill is refitted from the indexer table above, so re-measure the live peak before trusting a margin |
 | Engram | each table's row cache (`dsv41_engram.cacheBytes`: 1M rows at 272 B, 0.57 GB for both), billed with the trunk, so the expert cache gives it up; the page cache carries the rest |
 

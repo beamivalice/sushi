@@ -12,9 +12,16 @@ pub const log = @import("log.zig");
 pub const report = @import("ubench_report.zig");
 const box = @import("bench_box.zig");
 const exl3 = @import("sushi_exl3");
+const dsv41 = @import("ubench_dsv41.zig");
 
 const registry = [_]report.Bench{
     exl3.ubench.dsv41_experts,
+    dsv41.index_decode,
+    dsv41.index_peak,
+    dsv41.index_block_peak,
+    dsv41.rows_growth,
+    dsv41.attn_span,
+    dsv41.topk,
 };
 
 const exit_bad_args = 2;

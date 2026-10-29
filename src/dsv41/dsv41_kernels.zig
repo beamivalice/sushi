@@ -462,7 +462,7 @@ pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !
 }
 
 /// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
-/// below them, or at a wide k, the merge costs what the split saves (`dsv41 topk split timing`).
+/// below them, or at a wide k, the merge costs what the split saves (`sushi-ubench run dsv41.topk`).
 pub fn topkSplits(rows: usize, n: usize, k: usize) usize {
     if (rows > topk_split_rows or k > topk_split_max_k) return 1;
     return if (n >= (if (rows == 1) topk_split_min_n_one_row else topk_split_min_n)) topk_splits else 1;
@@ -1859,7 +1859,7 @@ const testing = std.testing;
 const model = @import("dsv41_model.zig");
 const Config = @import("dsv41_config.zig").Config;
 
-fn randn(sc: *Scope, shape: []const c_int, dt: mlx.mlx_dtype, seed: u64, std_dev: f32) !A {
+pub fn randn(sc: *Scope, shape: []const c_int, dt: mlx.mlx_dtype, seed: u64, std_dev: f32) !A {
     var key = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_random_key(&key, seed));
     _ = try sc.keep(key);
@@ -2225,58 +2225,6 @@ test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long 
             try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, g)));
         }
         try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndices(&sc, x, k)));
-    }
-}
-
-// Decode top-k at the release shapes by split count, arms interleaved per rep; best and median of 15 evals, and eight
-// independent rows of work in one eval (a decode token's eight index sources). Prints only under SUSHI_DSV41_TOPK_UBENCH.
-test "dsv41 topk split timing by context (SUSHI_DSV41_TOPK_UBENCH=1)" {
-    if (!@import("../transformer.zig").diagEnvOn("SUSHI_DSV41_TOPK_UBENCH")) return error.SkipZigTest;
-    const gpu = mlx.gpuStream();
-    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var sc = Scope.init(testing.allocator, gpu);
-    defer sc.deinit();
-    const Shape = struct { n: usize, k: usize };
-    const splits = [_]usize{ 1, 2, 4, 8, 16, 32 };
-    for ([_]usize{ 65536, 262144, 524288 }) |ctx| {
-        // Index scores at ratio 2 and ratio 1, the candidate source's block maxima, a later source's gathered keys.
-        for ([_]Shape{ .{ .n = ctx / 2, .k = 512 }, .{ .n = ctx, .k = 512 }, .{ .n = ctx / 8, .k = 2048 }, .{ .n = 16384, .k = 512 } }) |sh| {
-            for ([_]usize{ 1, 4, 16 }) |L| {
-                var xs: [8]A = undefined;
-                for (&xs, 0..) |*x, i| x.* = try sc.add(try randn(&sc, &.{ @intCast(L), @intCast(sh.n) }, .float32, 90 + i, 1.0), try sc.f(@floatFromInt(i)));
-                try sc_mod.evalAll(&xs);
-                var tm: [splits.len][2][16]f64 = undefined;
-                var skip: [splits.len]bool = undefined;
-                for (splits, 0..) |g, gi| skip[gi] = sh.n / g < sh.k;
-                for (0..16) |rep| {
-                    for (splits, 0..) |g, gi| {
-                        if (skip[gi]) continue;
-                        var t = Scope.init(testing.allocator, gpu);
-                        defer t.deinit();
-                        var t0 = std.Io.Timestamp.now(io, .boot);
-                        const one = try topkIndicesSplit(&t, xs[0], sh.k, g);
-                        try sc_mod.evalAll(&.{one});
-                        tm[gi][0][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
-                        var outs: [8]A = undefined;
-                        t0 = std.Io.Timestamp.now(io, .boot);
-                        for (&outs, xs) |*o, x| o.* = try topkIndicesSplit(&t, x, sh.k, g);
-                        try sc_mod.evalAll(&outs);
-                        tm[gi][1][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
-                    }
-                }
-                for (splits, 0..) |g, gi| {
-                    if (skip[gi]) continue;
-                    var line: [2][2]f64 = undefined;
-                    for (0..2) |w| {
-                        const v = tm[gi][w][1..];
-                        std.mem.sort(f64, v, {}, std.sort.asc(f64));
-                        line[w] = .{ v[0], v[v.len / 2] };
-                    }
-                    std.debug.print("dsv41-topk ctx {d} n {d} k {d} L {d} splits {d}: one eval best {d:.3} med {d:.3} ms; x8 per row-of-work best {d:.3} med {d:.3} ms\n", .{ ctx, sh.n, sh.k, L, g, line[0][0], line[0][1], line[1][0] / 8, line[1][1] / 8 });
-                }
-            }
-        }
     }
 }
 

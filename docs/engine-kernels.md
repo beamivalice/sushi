@@ -145,8 +145,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   (its f32 matmul keeps ~11 bits).
 - A matrix's per-lane (row, column) is `fm = (lane / 4 & 4) + (lane / 2) % 4`, `fn = (lane / 4 & 2) * 2 + (lane % 2) * 2`
   with `thread_elements()`: the online rescale and the output store use it instead of a threadgroup round trip.
-- Release shape (64 heads x 512, window 128, 512 picks), best of 16 interleaved on the M5 Max, `SUSHI_DSV41_ATTN_UBENCH=1`
-  test "dsv41 attention span timing": span 256 core 13-15 ms, f16 `attnWide` 5.9-6.8 ms, fused 2.7-3.3 ms; span 128
+- Release shape (64 heads x 512, window 128, 512 picks), best of 16 interleaved on the M5 Max, `sushi-ubench run dsv41.attn_span`:
+  span 256 core 13-15 ms, f16 `attnWide` 5.9-6.8 ms, fused 2.7-3.3 ms; span 128
   core 6.3-7.2, wide 2.8-3.2, fused 1.5-1.7; window-only span 256 core 3.6-4.0, wide 2.1, fused 0.7-1.0. Peak bytes beyond
   the inputs a span: core 897 MB, wide 284 MB, fused 16 MB (the output). Four simdgroups were 15% slower than eight.
   The box was shared with other Metal compiles, so the fused arm spread up to 2x between runs; core and wide hold.

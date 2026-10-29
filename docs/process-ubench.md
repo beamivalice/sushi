@@ -67,3 +67,9 @@ A `--contended` number is a smoke, never a recorded baseline.
 | bench | scope | what it times |
 |---|---|---|
 | `dsv41.experts` | dsv41 | the 384-expert PAIR1 grouped chain at the plan's layers 2, 5, 23 and the DSpark stage bank, by rows and routing mode |
+| `dsv41.index_decode` | dsv41 | a decode block's indexer stages over packed keys (scores, mask applied, top-512, candidate-source blocks, scores + top-k), by keys and rows |
+| `dsv41.index_peak` | dsv41 | one wide span's indexer, whole scores against the streamed top-k, by context; MLX peak beyond the inputs in MB, reported as the lowest and the highest over the rounds (when freed buffers are released varies from run to run, so the floor and the worst case differ; a bill covers the worst) |
+| `dsv41.index_block_peak` | dsv41 | a 16-row decode block's indexer with and without the candidate mask, by context; peak MB (min and max) |
+| `dsv41.rows_growth` | dsv41 | a full row store growing by one chunk: time, held MB and the peak beyond them (min and max) |
+| `dsv41.attn_span` | dsv41 | one attention span at the release geometry: composed core, f16 wide arm, fused kernel; peak MB (min and max) |
+| `dsv41.topk` | dsv41 | the decode top-k over index scores, one threadgroup a row against the served split, per row of work in one eval of one or eight |
