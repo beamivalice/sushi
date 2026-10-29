@@ -24,15 +24,9 @@ set -u
 
 . "$(dirname "$0")/lib/boot.sh"; sushi_attach
 BASE=$SUSHI_URL
-BIN=$SUSHI_BIN
 PASS=0
 FAIL=0
 TOTAL=0
-
-if [ ! -x "$BIN" ]; then
-    echo "FAIL: sushi not built — run 'zig build -Doptimize=ReleaseFast' first"
-    exit 1
-fi
 
 run_test() {
     TOTAL=$((TOTAL+1))
@@ -41,7 +35,7 @@ run_test() {
 }
 
 # ── [1] unknown agent ──
-OUT=$("$BIN" launch not-an-agent 2>&1)
+OUT=$(sushi_cli launch not-an-agent 2>&1)
 if [ $? -ne 0 ] && echo "$OUT" | grep -q "claude" && echo "$OUT" | grep -q "aider"; then
     run_test "unknown agent errors naming the choices" PASS
 else
@@ -49,7 +43,7 @@ else
 fi
 
 # ── [2] no server ──
-OUT=$("$BIN" launch omp --url http://127.0.0.1:59999 2>&1)
+OUT=$(sushi_cli launch omp --url http://127.0.0.1:59999 2>&1)
 if [ $? -ne 0 ] && echo "$OUT" | grep -qi "sushi serve"; then
     run_test "dead server instructs how to start one" PASS
 else
@@ -67,7 +61,7 @@ print((r["data"][0].get("meta") or {}).get("context_length") or 0)
 ')
 
 # ── [3] omp --print ──
-OUT=$("$BIN" launch omp --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch omp --print --url "$BASE" 2>&1)
 OK=1
 echo "$OUT" | grep -q 'export PI_CODING_AGENT_DIR="$HOME/.sushi/omp"' || OK=0
 echo "$OUT" | grep -q "omp --model 'sushi/$MODEL_ID'" || OK=0
@@ -81,7 +75,7 @@ else
 fi
 
 # ── [4] codex --print ──
-OUT=$("$BIN" launch codex --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch codex --print --url "$BASE" 2>&1)
 OK=1
 echo "$OUT" | grep -q 'export CODEX_HOME="$HOME/.sushi/codex"' || OK=0
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
@@ -99,7 +93,7 @@ else
 fi
 
 # ── [5] claude --print ──
-OUT=$("$BIN" launch claude --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch claude --print --url "$BASE" 2>&1)
 EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 2)))")
 OK=1
 echo "$OUT" | grep -q "export ANTHROPIC_BASE_URL='$BASE'" || OK=0
@@ -115,7 +109,7 @@ else
 fi
 
 # ── [6] passthrough args ──
-OUT=$("$BIN" launch codex --print --url "$BASE" -- resume 2>&1)
+OUT=$(sushi_cli launch codex --print --url "$BASE" -- resume 2>&1)
 if echo "$OUT" | grep -q "\"\$CODEX_BIN\" 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
@@ -123,7 +117,7 @@ else
 fi
 
 # ── [7] pi --print: every thinking level reaches the server as a word it accepts ──
-OUT=$("$BIN" launch pi --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch pi --print --url "$BASE" 2>&1)
 WORDS=$(python3 - "$BASE" ~/.sushi/pi/models.json <<'PY'
 import json, sys, urllib.request
 rows = {r["id"]: r for r in json.load(urllib.request.urlopen(sys.argv[1] + "/v1/models"))["data"]}

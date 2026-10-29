@@ -109,7 +109,7 @@ Exit codes: 0 pass, 1 fail, 3 SKIP (one line naming what is missing).
 script starts a server. `sushi_boot <label> <pack> [flags]` takes the GPU lock, boots on a free port with a private
 `HOME` and `SUSHI_PREFIX_CACHE_DIR` under `SUSHI_RUN_DIR`, and waits for `/health` plus `Model ready`; `sushi_stop`
 (also the EXIT trap) stops by PID and writes `<label>.END`. An attach script calls `sushi_attach` (a nonce for every
-prompt), reads `sushi_log_since`, and asks `sushi_require <mtp|vision|video|batching|stq|thinking|spec>`. Profiles
+prompt), reads `sushi_log_since`, runs the binary as a client through `sushi_cli` (`launch`), and asks `sushi_require <mtp|vision|video|batching|stq|thinking|spec>`. Profiles
 `api`, `exact`, `ram` and `knobs` are one boot each per model pass; `SUSHI_TEST_PACK_<MODEL>` overrides a pack,
 `SUSHI_BOOT_TIMEOUT_S` and `SUSHI_STOP_WAIT_S` bound the waits.
 

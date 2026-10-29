@@ -162,6 +162,9 @@ _sushi_exit() {
 # sushi_alive: the booted server still runs
 sushi_alive() { [ -n "${SUSHI_PID:-}" ] && kill -0 "$SUSHI_PID" 2> /dev/null; }
 
+# sushi_cli <args>: run the binary as a client of the booted server (`launch`); an attach script never names it itself
+sushi_cli() { "$SUSHI_BIN" "$@"; }
+
 # sushi_attach: top of every attach script. The nonce starts every prompt, so no script restores another's prefix.
 sushi_attach() {
     if [ -z "${SUSHI_URL:-}" ] || [ -z "${SUSHI_LOG:-}" ]; then
