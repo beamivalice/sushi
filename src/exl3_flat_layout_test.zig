@@ -866,10 +866,10 @@ test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank acr
 
 test "EXL3 streaming CPU refusals survive the registry and HTTP boundary" {
     const registry = @import("model_registry.zig").ModelRegistry;
-    const server = @import("server.zig");
+    const generation_stream = @import("generation_stream.zig");
     inline for (.{ error.Exl3RateGroupsStreamingUnsupported, error.Exl3GateUpRateMismatch }) |err| {
         try std.testing.expectEqual(err, registry.loadErrorFromName(@errorName(err)));
-        const refusal = server.loadRefusalFor(err) orelse return error.MissingNamedRefusal;
+        const refusal = generation_stream.loadRefusalFor(err) orelse return error.MissingNamedRefusal;
         try std.testing.expect(refusal.type.len > 0 and refusal.message.len > 0);
     }
 }

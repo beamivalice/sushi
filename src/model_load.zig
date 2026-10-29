@@ -53,6 +53,7 @@ const publishDiskStats = scheduler_mod.publishDiskStats;
 const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
 
 const exl3_kernels = @import("sushi_exl3").kernels;
+const request_media = @import("request_media.zig");
 
 /// Phase A1: model-load plan executed on the scheduler's inference thread.
 ///
@@ -500,7 +501,7 @@ pub fn resolveStreamedVision(budget_bytes: u64, config: *const ModelConfig, spli
     const cost = VisionCost{
         .on = want,
         .tower_bytes = split.vision,
-        .encode_bytes = @import("server.zig").largestImageEncodeBytes(config),
+        .encode_bytes = request_media.largestImageEncodeBytes(config),
         .slots_without = if (without.ledger) |l| l.slots_per_layer else 0,
         .slots_with = if (with) |w| (if (w.ledger) |l| l.slots_per_layer else null) else null,
     };
@@ -972,7 +973,7 @@ test "streamed vision: the tower comes out of the ssd budget only when asked, re
     const split = model_mod.ResidentSplit{ .trunk = 9_900_000_000, .mtp = 0, .vision = 897_862_112 };
     const GiB: u64 = 1 << 30;
     const fused: u64 = 9_830_400;
-    const encode = @import("server.zig").largestImageEncodeBytes(&cfg);
+    const encode = request_media.largestImageEncodeBytes(&cfg);
     try t.expect(encode > 0);
 
     const off = try resolveStreamedVision(60 * GiB, &cfg, split, fused, false);

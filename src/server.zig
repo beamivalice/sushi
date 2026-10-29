@@ -59,129 +59,14 @@ const VisionEncoder = vision_mod.VisionEncoder;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 const anthropic = @import("anthropic.zig");
-pub const buildAnthropicStreamError = anthropic.buildAnthropicStreamError;
-pub const isAnthropicRoute = anthropic.isAnthropicRoute;
-const anthropicImageUrl = anthropic.anthropicImageUrl;
-const readAnthropicMessages = anthropic.readAnthropicMessages;
-pub const sendAnthropicError = anthropic.sendAnthropicError;
-pub const sendAnthropicEvent = anthropic.sendAnthropicEvent;
-const handleAnthropicMessages = anthropic.handleAnthropicMessages;
-const handleAnthropicCountTokens = anthropic.handleAnthropicCountTokens;
 const completions = @import("completions.zig");
-pub const completionShowsToken = completions.completionShowsToken;
-pub const completionText = completions.completionText;
-pub const handleCompletions = completions.handleCompletions;
 const responses_api = @import("responses_api.zig");
-pub const getOrInitResponseStore = responses_api.getOrInitResponseStore;
-const deinitGlobalResponseStore = responses_api.deinitGlobalResponseStore;
-pub const buildResponsesStreamError = responses_api.buildResponsesStreamError;
-pub const splitConstrainedResponse = responses_api.splitConstrainedResponse;
-pub const sendResponsesEvent = responses_api.sendResponsesEvent;
-const handleResponsesGet = responses_api.handleResponsesGet;
-const handleResponsesDelete = responses_api.handleResponsesDelete;
-const handleResponsesCompact = responses_api.handleResponsesCompact;
-pub const handleResponses = responses_api.handleResponses;
 const generation_stream = @import("generation_stream.zig");
-const PREFILL_NOFIT_MSG = generation_stream.PREFILL_NOFIT_MSG;
-pub const EMPTY_PROMPT_MSG = generation_stream.EMPTY_PROMPT_MSG;
-const GenErrorWire = generation_stream.GenErrorWire;
-pub const mapGenerationError = generation_stream.mapGenerationError;
-const sendGenerationError = generation_stream.sendGenerationError;
-const visibleToolPreamble = generation_stream.visibleToolPreamble;
-const nonStreamingViaScheduler = generation_stream.nonStreamingViaScheduler;
-const handleNonStreamingGeneration = generation_stream.handleNonStreamingGeneration;
-pub const StreamMode = generation_stream.StreamMode;
-const StreamingTokenStream = generation_stream.StreamingTokenStream;
-pub const requestSpecModes = generation_stream.requestSpecModes;
-const noteMtpRefused = generation_stream.noteMtpRefused;
-pub const pickStreamMode = generation_stream.pickStreamMode;
-const handleStreamingGeneration = generation_stream.handleStreamingGeneration;
-pub const loadRefusalFor = generation_stream.loadRefusalFor;
-const sendNamedLoadRefusal = generation_stream.sendNamedLoadRefusal;
-const sendLoadFailedResponse = generation_stream.sendLoadFailedResponse;
-const contextOverflowMessage = generation_stream.contextOverflowMessage;
-const formatTimingsObject = generation_stream.formatTimingsObject;
-const formatPerfBracket = generation_stream.formatPerfBracket;
-pub const contentTokenRange = generation_stream.contentTokenRange;
-pub const sendStreamIdle = generation_stream.sendStreamIdle;
-const beatStreamKeepalive = generation_stream.beatStreamKeepalive;
 const http_conn = @import("http_conn.zig");
-const startListener = http_conn.startListener;
-const WsBridge = http_conn.WsBridge;
-pub const Conn = http_conn.Conn;
-const closeEmbeddedListener = http_conn.closeEmbeddedListener;
-const routeRequestModel = http_conn.routeRequestModel;
-const crossOriginRefused = http_conn.crossOriginRefused;
-const routeExists = http_conn.routeExists;
-const ConnThreadArgs = http_conn.ConnThreadArgs;
-const readRequestWithin = http_conn.readRequestWithin;
-const isStatusRoute = http_conn.isStatusRoute;
-const isTextGenRoute = http_conn.isTextGenRoute;
-const sendSseHeaders = http_conn.sendSseHeaders;
-const apiKeyGateApplies = http_conn.apiKeyGateApplies;
-const findHeaderValueCI = http_conn.findHeaderValueCI;
-const apiKeyAuthorized = http_conn.apiKeyAuthorized;
-const sendUnauthorized = http_conn.sendUnauthorized;
-const serveOneForTest = http_conn.serveOneForTest;
-const handleResponsesWebSocket = http_conn.handleResponsesWebSocket;
 const request_media = @import("request_media.zig");
-const MediaFault = request_media.MediaFault;
-const responsesMediaRefusal = request_media.responsesMediaRefusal;
-const decodeImageUrlInto = request_media.decodeImageUrlInto;
-const openAiImageUrl = request_media.openAiImageUrl;
-const flattenMedia = request_media.flattenMedia;
-pub const visionEncodeBill = request_media.visionEncodeBill;
-pub const largestImageEncodeBytes = request_media.largestImageEncodeBytes;
-const visionEncodeBillBytes = request_media.visionEncodeBillBytes;
-pub const visionEncodeAvailable = request_media.visionEncodeAvailable;
-const PreparedMedia = request_media.PreparedMedia;
-const placeRequestMedia = request_media.placeRequestMedia;
-const prepareRequestMedia = request_media.prepareRequestMedia;
-const visionPreprocFromConfig = request_media.visionPreprocFromConfig;
-pub const decodeEncodedImage = request_media.decodeEncodedImage;
-const RequestMedia = request_media.RequestMedia;
 const request_policy = @import("request_policy.zig");
-const resolveSamplingDefault = request_policy.resolveSamplingDefault;
-const resolveThinkPenalty = request_policy.resolveThinkPenalty;
-const armThinkPenalty = request_policy.armThinkPenalty;
-const omittedMaxTokensDefault = request_policy.omittedMaxTokensDefault;
-const launchMaxTokensDefault = request_policy.launchMaxTokensDefault;
-const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
-const maxTokensOrigin = request_policy.maxTokensOrigin;
-const describeMaxTokens = request_policy.describeMaxTokens;
-const clampMaxTokens = request_policy.clampMaxTokens;
-pub const chatTemplateSupportsThinking = request_policy.chatTemplateSupportsThinking;
-pub const optSamplingRecJson = request_policy.optSamplingRecJson;
-const effortWordOnly = request_policy.effortWordOnly;
-const parseReasoningEffort = request_policy.parseReasoningEffort;
-const reasoningEffortFromWord = request_policy.reasoningEffortFromWord;
-const EffortNotice = request_policy.EffortNotice;
-const effortModelName = request_policy.effortModelName;
-const clearEffortNotice = request_policy.clearEffortNotice;
-const holdEffortNotice = request_policy.holdEffortNotice;
-const writeEffortNoticeHeader = request_policy.writeEffortNoticeHeader;
-const withEffortNoticeJson = request_policy.withEffortNoticeJson;
-pub const effortRefusal = request_policy.effortRefusal;
-pub const reasoningEffortsJson = request_policy.reasoningEffortsJson;
-const effortRefusalFor = request_policy.effortRefusalFor;
-const responsesEnableThinking = request_policy.responsesEnableThinking;
-const checkThinkingSupport = request_policy.checkThinkingSupport;
-pub const resolveEnableThinking = request_policy.resolveEnableThinking;
-const schemaMasksThinking = request_policy.schemaMasksThinking;
-const resolvePreserveThinking = request_policy.resolvePreserveThinking;
-const parseRepeatPenalty = request_policy.parseRepeatPenalty;
-const parseAdditivePenalty = request_policy.parseAdditivePenalty;
 const models_api = @import("models_api.zig");
-pub const renderModelEntry = models_api.renderModelEntry;
-const handleModels = models_api.handleModels;
-const handleModelsRescan = models_api.handleModelsRescan;
-const settingsPropsJson = models_api.settingsPropsJson;
-const handleProps = models_api.handleProps;
-const handlePropsNoModel = models_api.handlePropsNoModel;
 const logprobs = @import("logprobs.zig");
-const StreamLogprobs = logprobs.StreamLogprobs;
-const formatCompletionsLogprobs = logprobs.formatCompletionsLogprobs;
-const formatLogprobsObject = logprobs.formatLogprobsObject;
 /// Global flag set by signal handler for graceful shutdown.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
 /// Number of live per-connection threads. Incremented before each spawn,
@@ -268,7 +153,7 @@ pub fn ensurePortFree(io: std.Io, host: []const u8, port: u16) (error{InvalidHos
         s.close(io);
         return error.AddressInUse;
     } else |_| {}
-    var probe = try startListener(host, port);
+    var probe = try http_conn.startListener(host, port);
     probe.deinit(io);
 }
 
@@ -288,12 +173,7 @@ const mtp_plan = @import("mtp_plan.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const sampler = @import("sampler.zig");
 const think_penalty = @import("think_penalty.zig");
-const nowSecs = io_util.nowSecs;
-const nowMs = io_util.nowMs;
-const nowMsMonotonic = io_util.nowMsMonotonic;
-const Stopwatch = io_util.Stopwatch;
 
-const nextCompletionId = io_util.nextCompletionId;
 
 fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
@@ -555,8 +435,8 @@ const chat_page_html = @embedFile("webui/index.html");
 pub var g_web_edit: bool = false;
 
 /// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
-fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, body: []const u8) !void {
-    const origin = findHeaderValueCI(headers, "origin") orelse "";
+fn handleWebTools(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: []const u8, body: []const u8) !void {
+    const origin = http_conn.findHeaderValueCI(headers, "origin") orelse "";
     if (!peerIsLoopback(stream) or !update_mod.isLoopbackHost(listen_host) or
         !update_mod.originMatches(origin, listen_host, listen_port))
     {
@@ -607,7 +487,7 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const 
 }
 
 /// Explicit folder-picker navigation, separate from the model's confined file tools.
-fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *Conn, root: []const u8) !void {
+fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *http_conn.Conn, root: []const u8) !void {
     var dir = std.Io.Dir.openDirAbsolute(stream.io, root, .{ .iterate = true }) catch
         return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Cannot browse this folder", 400);
     defer dir.close(stream.io);
@@ -1348,9 +1228,9 @@ pub fn serve(
     // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
     scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
     defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
-    scheduler_mod.vision_encode_available = &visionEncodeAvailable;
-    scheduler_mod.vision_encode_bill = &visionEncodeBillBytes;
-    scheduler_mod.vision_image_decode = &decodeEncodedImage;
+    scheduler_mod.vision_encode_available = &request_media.visionEncodeAvailable;
+    scheduler_mod.vision_encode_bill = &request_media.visionEncodeBillBytes;
+    scheduler_mod.vision_image_decode = &request_media.decodeEncodedImage;
     scheduler_mod.vision_fit_fault = &towerFitFaultText;
     defer scheduler_mod.vision_encode_available = null;
 
@@ -1428,7 +1308,7 @@ pub fn serve(
     listen_host = host;
     listen_port = port;
     // Parse host address
-    var server = startListener(host, port) catch |err| {
+    var server = http_conn.startListener(host, port) catch |err| {
         var msg_buf: [512]u8 = undefined;
         if (startupRefusal(err, host, port, &msg_buf)) |msg| {
             log.err("{s}\n", .{msg});
@@ -1437,7 +1317,7 @@ pub fn serve(
         return err;
     };
     var client_thread: ?std.Thread = null;
-    defer closeEmbeddedListener(io, &server, client_thread);
+    defer http_conn.closeEmbeddedListener(io, &server, client_thread);
     listen_port = server.socket.address.ip4.port;
     client_thread = if (server_config.on_ready) |ready| try ready(listen_port) else null;
 
@@ -1474,8 +1354,8 @@ pub fn serve(
     } else {
         log.info("Reasoning budget: unlimited\n", .{});
     }
-    if (launchMaxTokensDefault() > 0) {
-        log.info("default max_tokens for omitted requests: {d}\n", .{launchMaxTokensDefault()});
+    if (request_policy.launchMaxTokensDefault() > 0) {
+        log.info("default max_tokens for omitted requests: {d}\n", .{request_policy.launchMaxTokensDefault()});
     }
     if (scheduler.dflash != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
@@ -1556,7 +1436,7 @@ pub fn serve(
         // thread, so the connection thread NEVER touches `xfm.s` directly —
         // it parses HTTP, encodes the prompt, calls `scheduler.submit`,
         // reads tokens via `slot.waitNext`, and writes the response.
-        const args = allocator.create(ConnThreadArgs) catch |err| {
+        const args = allocator.create(http_conn.ConnThreadArgs) catch |err| {
             log.err("conn thread args alloc failed: {}\n", .{err});
             accepted_stream.close(io);
             continue;
@@ -1601,18 +1481,18 @@ pub fn serve(
             log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
     }
 
-    deinitGlobalResponseStore();
+    responses_api.deinitGlobalResponseStore();
 
     log.info("\nShutting down gracefully...\n", .{});
 }
 
-fn handleConnectionThread(args: *ConnThreadArgs) void {
+fn handleConnectionThread(args: *http_conn.ConnThreadArgs) void {
     // Decrement LAST (declared first → runs after every other defer), so the
     // shutdown drain in `serve` only sees this thread leave once it has fully
     // returned from `complete()` and closed its socket.
     defer _ = active_conn_threads.fetchSub(1, .acq_rel);
-    var conn: Conn = undefined;
-    Conn.init(&conn, args.accepted_stream, args.io);
+    var conn: http_conn.Conn = undefined;
+    http_conn.Conn.init(&conn, args.accepted_stream, args.io);
     defer conn.close();
     handleConnection(args.allocator, &conn) catch |err| {
         switch (err) {
@@ -1646,7 +1526,7 @@ const REQUEST_READ_LIMIT_MS: i64 = 30_000;
 
 pub fn handleConnection(
     allocator: std.mem.Allocator,
-    stream: *Conn,
+    stream: *http_conn.Conn,
 ) !void {
     // Plan 05: resolve which model this request targets. The registry was
     // set up in `serve()`; per-POST routing happens after we read the body
@@ -1657,7 +1537,7 @@ pub fn handleConnection(
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Server not ready", 503);
         return;
     };
-    const raw = (try readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) orelse return;
+    const raw = (try http_conn.readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) orelse return;
     defer allocator.free(raw.buf);
     const total_read = raw.len;
     const header_end_pos = raw.header_end;
@@ -1682,14 +1562,14 @@ pub fn handleConnection(
     //    exposure. Browser-facing pages get a `WWW-Authenticate: Basic`
     //    challenge so a browser prompts for the key; API clients
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
-    if (apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)) and
+    if (http_conn.apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)) and
         !std.mem.eql(u8, method, "OPTIONS") and
         !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) and
         !(std.mem.eql(u8, method, "GET") and isChatPagePath(path)) and
-        !apiKeyAuthorized(request[0..header_end_pos], raw_path))
+        !http_conn.apiKeyAuthorized(request[0..header_end_pos], raw_path))
     {
         log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        try sendUnauthorized(stream);
+        try http_conn.sendUnauthorized(stream);
         return;
     }
 
@@ -1752,7 +1632,7 @@ pub fn handleConnection(
         try sendResponse(stream, "204 No Content", "text/plain", "");
         return;
     }
-    if (crossOriginRefused(method, path, request[0..header_end_pos], listen_host, listen_port)) {
+    if (http_conn.crossOriginRefused(method, path, request[0..header_end_pos], listen_host, listen_port)) {
         log.debug("{s} {s} -> 403 (foreign Origin)\n", .{ method, path });
         try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "This route accepts browser requests from this server's own page only", 403);
         return;
@@ -1784,24 +1664,24 @@ pub fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
-        try handleModels(allocator, stream);
+        try models_api.handleModels(allocator, stream);
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
         const id = path["/v1/responses/".len..];
-        try handleResponsesGet(allocator, stream, id);
+        try responses_api.handleResponsesGet(allocator, stream, id);
         return;
     }
     if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, path, "/v1/responses/")) {
         const id = path["/v1/responses/".len..];
-        try handleResponsesDelete(allocator, stream, id);
+        try responses_api.handleResponsesDelete(allocator, stream, id);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses/compact")) {
         // Compaction is a pure data transformation — no model load needed.
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleResponsesCompact(allocator, stream, body);
+        try responses_api.handleResponsesCompact(allocator, stream, body);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/load-model")) {
@@ -1822,7 +1702,7 @@ pub fn handleConnection(
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
         // Absorb models downloaded AFTER boot (the Model Browser pulls while
         // the server runs; discovery only walks the roots at startup).
-        try handleModelsRescan(allocator, stream);
+        try models_api.handleModelsRescan(allocator, stream);
         return;
     }
 
@@ -1858,13 +1738,13 @@ pub fn handleConnection(
         parseModelFromBody(request_body) orelse queryModel(&query_model_buf, raw_path) orelse "",
     );
     const home: ?[]const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else null;
-    switch (routeRequestModel(registry, requested_model_id, home)) {
+    switch (http_conn.routeRequestModel(registry, requested_model_id, home)) {
         .entry => |id| requested_model_id = id,
         .default => requested_model_id = "",
         .not_found => {
             const msg = "No model is registered at that path; POST /v1/load-model with the absolute path registers it";
-            if (isAnthropicRoute(path)) {
-                try sendAnthropicError(allocator, stream, "not_found_error", msg, 404);
+            if (anthropic.isAnthropicRoute(path)) {
+                try anthropic.sendAnthropicError(allocator, stream, "not_found_error", msg, 404);
             } else {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", msg, 404);
             }
@@ -1876,7 +1756,7 @@ pub fn handleConnection(
     // to earn its 400. The post-load `text_gen_reject` below stays the
     // authoritative crash barrier (this peek can't see `--model` primaries
     // with no arch hint until they're resident).
-    if (requested_model_id.len > 0 and isTextGenRoute(method, path)) {
+    if (requested_model_id.len > 0 and http_conn.isTextGenRoute(method, path)) {
         // Entry and snapshot under ONE hold — plain `peek` unlocks before it
         // returns. `arch_hint` outlives the unlock: entry-owned, freed in
         // `deinit`.
@@ -1888,8 +1768,8 @@ pub fn handleConnection(
         };
         if (target) |t| {
             if (textGenRejectReason(t)) |reason| {
-                if (isAnthropicRoute(path)) {
-                    try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+                if (anthropic.isAnthropicRoute(path)) {
+                    try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
                 } else {
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
                 }
@@ -1904,7 +1784,7 @@ pub fn handleConnection(
     // and the unknown path only 404s afterwards. `POST /v1/load` (the route is
     // /v1/load-model) cost 2m42s and 121 GB resident for a typo, and the same
     // one-liner pins the box for anyone who sends it. Placed above every load.
-    if (!routeExists(path)) {
+    if (!http_conn.routeExists(path)) {
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
         return;
     }
@@ -1920,7 +1800,7 @@ pub fn handleConnection(
             break :blk e.state == .ready;
         } else |_| false;
         if (!resident) {
-            try handlePropsNoModel(allocator, stream);
+            try models_api.handlePropsNoModel(allocator, stream);
             return;
         }
     }
@@ -1938,14 +1818,14 @@ pub fn handleConnection(
             // model): /props keeps answering with the live memory counters —
             // the app's tray polls it, and a 503 here read as "0 MB".
             if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
-                try handlePropsNoModel(allocator, stream);
+                try models_api.handlePropsNoModel(allocator, stream);
                 return;
             }
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
             return;
         },
         error.LoadFailed => {
-            try sendLoadFailedResponse(allocator, stream, scheduler, requested_model_id);
+            try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, requested_model_id);
             return;
         },
         error.Shutdown => {
@@ -1958,7 +1838,7 @@ pub fn handleConnection(
         // registry preserves by name answers 503 under that name; anything
         // else is a 500 with the error name, never a hung connection.
         else => {
-            if (try sendNamedLoadRefusal(allocator, stream, scheduler, requested_model_id, err)) return;
+            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, requested_model_id, err)) return;
             log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
@@ -1970,7 +1850,7 @@ pub fn handleConnection(
         },
     };
     // A status read must not look like use — see `isStatusRoute`.
-    const status_read = isStatusRoute(method, path);
+    const status_read = http_conn.isStatusRoute(method, path);
     defer if (status_read) scheduler.releaseStatus(lm) else scheduler.release(lm);
 
     // A model loaded on demand freezes its own auto-context here, for the same
@@ -1996,13 +1876,13 @@ pub fn handleConnection(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
-        try handleResponsesWebSocket(allocator, stream, request[0..header_end_pos], lm);
+        try http_conn.handleResponsesWebSocket(allocator, stream, request[0..header_end_pos], lm);
         return;
     }
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
-        try handleProps(allocator, stream, lm);
+        try models_api.handleProps(allocator, stream, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -2018,23 +1898,23 @@ pub fn handleConnection(
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleCompletions(allocator, stream, body, lm);
+        try completions.handleCompletions(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages")) {
         if (text_gen_reject) |reason| {
-            try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleAnthropicMessages(allocator, stream, body, lm);
+        try anthropic.handleAnthropicMessages(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages/count_tokens")) {
         if (text_gen_reject) |reason| {
-            try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleAnthropicCountTokens(allocator, stream, body, lm);
+        try anthropic.handleAnthropicCountTokens(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -2042,7 +1922,7 @@ pub fn handleConnection(
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleResponses(allocator, stream, body, lm);
+        try responses_api.handleResponses(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/tokenize")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -3103,17 +2983,17 @@ test "Sushi quant memory request refusal carries the actual KV width MTP and max
     try std.testing.expect(std.mem.indexOf(u8, message, "Maximum context: 64000 tokens") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "KV4") != null);
     slot_memory_context_refusal = refusal;
-    const wire = mapGenerationError(error.PrefillDoesNotFit, &buf);
+    const wire = generation_stream.mapGenerationError(error.PrefillDoesNotFit, &buf);
     try std.testing.expectEqual(@as(u32, 400), wire.code);
     try std.testing.expect(std.mem.indexOf(u8, wire.message, "Maximum context: 64000 tokens") != null);
     try std.testing.expectEqual(@as(?model_registry_mod.MemoryContextRefusal, null), slot_memory_context_refusal);
-    try std.testing.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
+    try std.testing.expectEqualStrings(generation_stream.PREFILL_NOFIT_MSG, generation_stream.mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
 pub fn testDsv41Vp() !chat_mod.VisionPreproc {
     var cfg: model_mod.ModelConfig = .{};
     cfg.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    return visionPreprocFromConfig(&cfg);
+    return request_media.visionPreprocFromConfig(&cfg);
 }
 
 test "Sushi quant memory rejects an oversized context with an exact maximum at KV8" {
@@ -6804,11 +6684,11 @@ const IdleUnloadFit = struct {
     }
 };
 
-pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, keep_id: []const u8, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
+pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, keep_id: []const u8, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
     if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).glmLatentBits() == null) {
         const msg = "GLM native MLA cache supports kv_quant 8, 6 or off.";
         if (is_anthropic) {
-            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+            try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
         }
@@ -6862,7 +6742,7 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_
         defer allocator.free(msg);
         countRejected();
         if (is_anthropic) {
-            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+            try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         }
@@ -6925,7 +6805,7 @@ pub fn modelQuantizationLabel(allocator: std.mem.Allocator, config: *const model
 /// Plan 05 Phase E: explicit cold-load. Strict on unknown ids (404 — the
 /// caller asked for a specific id, not "anything"). Routes through
 /// scheduler.ensureLoaded so eviction/back-pressure kicks in.
-fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
+fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
@@ -6995,11 +6875,11 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             return;
         },
         error.LoadFailed => {
-            try sendLoadFailedResponse(allocator, stream, scheduler, requested_id);
+            try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, requested_id);
             return;
         },
         else => {
-            if (try sendNamedLoadRefusal(allocator, stream, scheduler, requested_id, err)) return;
+            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, requested_id, err)) return;
             log.warn("  -> 500 ({s}) on /v1/load-model\n", .{@errorName(err)});
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
@@ -7090,7 +6970,7 @@ test "an unload body naming an unrecognised key is a 400, not the default model"
 /// `POST /v1/unload-model` `{"model": id}`. Frees the model's resident GPU
 /// state (the stub stays registered so it can reload). Idempotent. Returns a
 /// small status payload confirming the model is unloaded.
-fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
+fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
@@ -7192,7 +7072,7 @@ fn busyForUpdate(io: std.Io) bool {
 /// SIGTERM path; main then replaces the process with the updater (`update.relaunchIfRequested`).
 /// Turns metrics on for the running server; 200 whether this call did it or it was already on. Counters start
 /// from zero at the moment of the first enable.
-fn handleMetricsEnable(stream: *Conn) !void {
+fn handleMetricsEnable(stream: *http_conn.Conn) !void {
     const changed = instr.process.enable();
     startGaugeSampler() catch |err| {
         log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
@@ -7202,7 +7082,7 @@ fn handleMetricsEnable(stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", if (changed) "{\"metrics\":true,\"already_enabled\":false}" else "{\"metrics\":true,\"already_enabled\":true}");
 }
 
-fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, raw_path: []const u8) !void {
+fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: []const u8, raw_path: []const u8) !void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     var rbuf: [512]u8 = undefined;
     var vbuf: [64]u8 = undefined;
@@ -7211,9 +7091,9 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8
         .bind_host = listen_host,
         .port = listen_port,
         .peer_loopback = peerIsLoopback(stream),
-        .origin = findHeaderValueCI(headers, "origin"),
+        .origin = http_conn.findHeaderValueCI(headers, "origin"),
         .key_set = g_api_key != null,
-        .key_ok = apiKeyAuthorized(headers, raw_path),
+        .key_ok = http_conn.apiKeyAuthorized(headers, raw_path),
         .host_managed = host_managed,
         .busy = busyForUpdate(stream.io),
         .install = update_mod.selfInstallRefusal(stream.io, &ebuf, &rbuf),
@@ -7221,7 +7101,7 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8
     };
     if (update_mod.guard(ask)) |r| {
         log.info("[update] POST /v1/update -> {d}: {s}\n", .{ r.code, r.message });
-        if (r.code == 401) return sendUnauthorized(stream);
+        if (r.code == 401) return http_conn.sendUnauthorized(stream);
         return sendErrorResponse(allocator, stream, r.status, r.kind, r.message, r.code);
     }
     const body = try std.fmt.allocPrint(allocator, "{{\"status\":\"updating\",\"from\":\"{s}\",\"to\":\"{s}\"}}", .{ update_mod.version, latest.? });
@@ -7234,7 +7114,7 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8
 
 fn handleTokenize(
     allocator: std.mem.Allocator,
-    stream: *Conn,
+    stream: *http_conn.Conn,
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
@@ -7276,7 +7156,7 @@ fn handleTokenize(
 
 fn handleDetokenize(
     allocator: std.mem.Allocator,
-    stream: *Conn,
+    stream: *http_conn.Conn,
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
@@ -7458,7 +7338,7 @@ pub fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
 
 pub fn handleChatCompletions(
     allocator: std.mem.Allocator,
-    stream: *Conn,
+    stream: *http_conn.Conn,
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
@@ -7511,7 +7391,7 @@ pub fn handleChatCompletions(
 
     var wire = WireMessages.init(allocator);
     defer wire.deinit();
-    try readOpenAiMessages(&wire, messages_val.array.items, visionPreprocFromConfig(config));
+    try readOpenAiMessages(&wire, messages_val.array.items, request_media.visionPreprocFromConfig(config));
     const messages = &wire.messages;
     if (wire.media.refusal()) |fault| {
         log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{fault.text()});
@@ -7527,23 +7407,23 @@ pub fn handleChatCompletions(
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → auto (peg to remaining context).
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
-    const max_tokens: u32 = resolveRequestMaxTokens(
+    const max_tokens: u32 = request_policy.resolveRequestMaxTokens(
         requested_max_tokens,
-        omittedMaxTokensDefault(getEffectiveContextLength(config)),
+        request_policy.omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
     // For the request log line only: which of the three sources this came from.
-    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
+    const max_tokens_origin = request_policy.maxTokensOrigin(requested_max_tokens, request_policy.launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const temperature = request_policy.resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const top_p = request_policy.resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
+    const top_k = request_policy.resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
-    const repeat_penalty = parseRepeatPenalty(root);
+    const repeat_penalty = request_policy.parseRepeatPenalty(root);
 
-    const presence_penalty = parseAdditivePenalty(root, "presence_penalty");
-    const frequency_penalty = parseAdditivePenalty(root, "frequency_penalty");
+    const presence_penalty = request_policy.parseAdditivePenalty(root, "presence_penalty");
+    const frequency_penalty = request_policy.parseAdditivePenalty(root, "frequency_penalty");
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -7698,18 +7578,18 @@ pub fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), effort_mod.effortArms(config.model_type)) catch {
-        const msg = try effortRefusalFor(allocator, lm, root.get("reasoning_effort").?.string);
+    const effort_cfg = request_policy.parseReasoningEffort(root, server_config.default_reasoning_budget, request_policy.effortWordOnly(allocator, lm, tok), effort_mod.effortArms(config.model_type)) catch {
+        const msg = try request_policy.effortRefusalFor(allocator, lm, root.get("reasoning_effort").?.string);
         defer allocator.free(msg);
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         return;
     };
-    var effort_notice: ?EffortNotice = null;
+    var effort_notice: ?request_policy.EffortNotice = null;
     defer if (effort_notice) |n| n.deinit(allocator);
-    defer clearEffortNotice(stream);
-    if (effort_cfg) |e| effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), e);
-    var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking());
-    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
+    defer request_policy.clearEffortNotice(stream);
+    if (effort_cfg) |e| effort_notice = try request_policy.holdEffortNotice(allocator, stream, request_policy.effortModelName(lm), e);
+    var enable_thinking = request_policy.resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking());
+    if (!try request_policy.checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     const default_effort_budget = model_mod.defaultThinkBudget(config, server_config.default_reasoning_budget);
@@ -7801,15 +7681,15 @@ pub fn handleChatCompletions(
     // POST assistant-last history here and expect a fresh turn, and turning
     // that into a prefill would change what every one of them gets back.
     const continue_final = continueFinalMessageRequested(root, messages.items);
-    var tokenize_sw = Stopwatch.init(stream.io);
+    var tokenize_sw = io_util.Stopwatch.init(stream.io);
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    var prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return sendGenerationError(allocator, stream, err, .openai);
+    var prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
         schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, true);
     }
-    switch (schemaMasksThinking(
+    switch (request_policy.schemaMasksThinking(
         grammar_schema_val != null,
         has_tools,
         enable_thinking,
@@ -7821,7 +7701,7 @@ pub fn handleChatCompletions(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return sendGenerationError(allocator, stream, err, .openai);
+            prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -7835,15 +7715,15 @@ pub fn handleChatCompletions(
     const tokenize_ns = tokenize_sw.read();
 
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
-    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
+    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, request_policy.describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Every message's media, placed and encoded; the slot takes the
     // embeddings and M-RoPE table at submit, `deinit` frees what it did not.
     const cache_key = requestCacheKey(root);
-    var req_media: PreparedMedia = .{};
+    var req_media: request_media.PreparedMedia = .{};
     defer req_media.deinit(allocator);
-    switch (try prepareRequestMedia(allocator, lm, messages.items, &prompt_ids_raw, getEffectiveContextLength(config))) {
+    switch (try request_media.prepareRequestMedia(allocator, lm, messages.items, &prompt_ids_raw, getEffectiveContextLength(config))) {
         .ready => |r| req_media = r,
         .refused => |fault| {
             allocator.free(prompt_ids_raw);
@@ -7862,13 +7742,13 @@ pub fn handleChatCompletions(
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
         countRejected();
         var ovf_buf: [160]u8 = undefined;
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", generation_stream.contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
 
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+    const effective_max_tokens = request_policy.clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
@@ -7925,7 +7805,7 @@ pub fn handleChatCompletions(
 
     // A decode-time bound owns the budget; the surfaces then deliver the
     // whole (closed) thought instead of trimming it.
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = request_policy.armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, request_policy.resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
     const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
         return;
@@ -7953,15 +7833,15 @@ pub fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
-            sendGenerationError(allocator, stream, err, .openai) catch {};
+            generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
-            sendGenerationError(allocator, stream, err, .openai) catch {};
+            generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
 }
@@ -7990,7 +7870,7 @@ pub fn requestBillsMtpHead(
     sampling: sampler.SamplingParams,
     logprobs_n: u32,
 ) bool {
-    return requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n).use_mtp;
+    return generation_stream.requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n).use_mtp;
 }
 
 test "the bill prices the MTP head only for a request that runs it: a DFlash2 request never builds the head's cache" {
@@ -8020,7 +7900,7 @@ test "the bill prices the MTP head only for a request that runs it: a DFlash2 re
 
 // ── Shared utilities ──
 
-pub fn sendResponse(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+pub fn sendResponse(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     logHttpResponse(status, content_type, body);
     try sendResponseFramed(stream, status, content_type, body);
 }
@@ -8029,12 +7909,12 @@ pub fn sendResponse(stream: *Conn, status: []const u8, content_type: []const u8,
 /// only a one-line status summary. For high-frequency, self-describing bodies
 /// where the full dump is pure noise: the Prometheus scrape (`/metrics`, hit
 /// every couple seconds) and the panel's JSON feed (`/metrics.json`, ~1 Hz).
-fn sendResponseQuiet(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+fn sendResponseQuiet(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     if (log.isDebug()) log.debug("[http] <- {s} {s} body={d}b (scrape; body not logged)\n", .{ status, content_type, body.len });
     try sendResponseFramed(stream, status, content_type, body);
 }
 
-pub fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+pub fn sendResponseFramed(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     const extra = stream.effort_notice_json orelse "";
     const inject = extra.len > 0 and body.len > 0 and body[body.len - 1] == '}' and std.mem.indexOf(u8, body, "\"effort_notice\":") == null;
     const out_len = body.len + if (inject) extra.len else 0;
@@ -8050,7 +7930,7 @@ pub fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []con
         out_len,
     }) catch return error.Overflow;
     try stream.writeAllNoFlush(hdr);
-    try writeEffortNoticeHeader(stream);
+    try request_policy.writeEffortNoticeHeader(stream);
     try stream.writeAllNoFlush("\r\n");
     stream.length_framed = true;
     if (inject) {
@@ -8341,7 +8221,7 @@ fn ipIsLoopback(addr: std.Io.net.IpAddress) bool {
     };
 }
 
-fn peerIsLoopback(conn: *const Conn) bool {
+fn peerIsLoopback(conn: *const http_conn.Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
 }
 
@@ -8388,12 +8268,12 @@ test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
     for ([_][]const u8{ "/metrics", "/metrics.json" }) |path| {
         const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\n\r\n", .{path});
         defer t.allocator.free(request);
-        const off = try serveOneForTest(request);
+        const off = try http_conn.serveOneForTest(request);
         defer t.allocator.free(off);
         try t.expect(std.mem.startsWith(u8, off, "HTTP/1.1 503 "));
         try t.expect(std.mem.indexOf(u8, responseBody(off), "POST /metrics/enable") != null);
     }
-    const first = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    const first = try http_conn.serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
     defer t.allocator.free(first);
     try t.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200 OK\r\n"));
     try t.expectEqualStrings("{\"metrics\":true,\"already_enabled\":false}", responseBody(first));
@@ -8401,13 +8281,13 @@ test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
     for ([_][]const u8{ "/metrics", "/metrics.json" }) |path| {
         const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\n\r\n", .{path});
         defer t.allocator.free(request);
-        const on = try serveOneForTest(request);
+        const on = try http_conn.serveOneForTest(request);
         defer t.allocator.free(on);
         try t.expect(std.mem.startsWith(u8, on, "HTTP/1.1 200 OK\r\n"));
     }
     const core = instr.current().?;
     core.recordRejected();
-    const again = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    const again = try http_conn.serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
     defer t.allocator.free(again);
     try t.expect(std.mem.startsWith(u8, again, "HTTP/1.1 200 OK\r\n"));
     try t.expectEqualStrings("{\"metrics\":true,\"already_enabled\":true}", responseBody(again));
@@ -8421,7 +8301,7 @@ test "an unknown endpoint is a 404 that never reaches model resolution" {
     const prev_sch = global_scheduler;
     defer global_scheduler = prev_sch;
     global_scheduler = &sch;
-    const response = try serveOneForTest("POST /v1/load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"model\":\"m\"}");
+    const response = try http_conn.serveOneForTest("POST /v1/load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"model\":\"m\"}");
     defer t.allocator.free(response);
     try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 404 Not Found\r\n"));
     try t.expect(std.mem.indexOf(u8, responseBody(response), "Unknown endpoint") != null);
@@ -8531,7 +8411,7 @@ pub fn countRejected() void {
     if (instr.current()) |m| m.recordRejected();
 }
 
-pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
+pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
 
@@ -8578,7 +8458,7 @@ pub fn chatTemplateKwargBool(root: std.json.ObjectMap, key: []const u8) ?bool {
 /// The model's chat config as this request renders it.
 pub fn renderConfigFor(chat_config: *const chat_mod.ChatConfig, root: std.json.ObjectMap, flag: ?bool, setting: ?bool) chat_mod.ChatConfig {
     var cfg = chat_config.*;
-    cfg.preserve_thinking = resolvePreserveThinking(chatTemplateKwargBool(root, "preserve_thinking"), flag, setting);
+    cfg.preserve_thinking = request_policy.resolvePreserveThinking(chatTemplateKwargBool(root, "preserve_thinking"), flag, setting);
     return cfg;
 }
 
@@ -8718,7 +8598,7 @@ pub const ReadContent = struct {
 /// so the template renders its placeholder there.
 pub fn readContentParts(
     allocator: std.mem.Allocator,
-    media: *RequestMedia,
+    media: *request_media.RequestMedia,
     texts: *std.ArrayList([]const u8),
     parts: []const std.json.Value,
     vocab: WireVocab,
@@ -8742,10 +8622,10 @@ pub fn readContentParts(
             if (t != .string or t.string.len == 0) continue;
             joined_len += t.string.len + @intFromBool(joined_len > 0);
         } else if (vocab == .openai and std.mem.eql(u8, ptype, "image_url")) {
-            if (media.addImage(img_slot, openAiImageUrl(part), vp, pos))
+            if (media.addImage(img_slot, request_media.openAiImageUrl(part), vp, pos))
                 try placed.append(allocator, .{ .at = joined_len, .kind = .image });
         } else if (vocab == .anthropic and std.mem.eql(u8, ptype, "image")) {
-            const url = try anthropicImageUrl(allocator, part);
+            const url = try anthropic.anthropicImageUrl(allocator, part);
             defer if (url) |u| allocator.free(u);
             if (media.addImage(img_slot, url, vp, pos))
                 try placed.append(allocator, .{ .at = joined_len, .kind = .image });
@@ -8789,13 +8669,13 @@ pub fn readContentParts(
 pub const WireMessages = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(chat_mod.Message) = .empty,
-    media: RequestMedia,
+    media: request_media.RequestMedia,
     tool_call_lists: std.ArrayList([]const chat_mod.ToolCall) = .empty,
     /// Joined text, serialized tool arguments and other strings messages borrow.
     texts: std.ArrayList([]const u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) WireMessages {
-        return .{ .allocator = allocator, .media = RequestMedia.init(allocator) };
+        return .{ .allocator = allocator, .media = request_media.RequestMedia.init(allocator) };
     }
 
     pub fn deinit(self: *WireMessages) void {
@@ -8883,14 +8763,14 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
 
 /// The encode's fit check, before it runs: `visionEncodeBill` must fit what the
 /// GPU has left.
-pub fn towerFitFault(config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize, available: u64) ?MediaFault {
+pub fn towerFitFault(config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize, available: u64) ?request_media.MediaFault {
     if (config.qv_heads == 0) return null;
-    const bill = visionEncodeBill(config, images, videos, rows);
+    const bill = request_media.visionEncodeBill(config, images, videos, rows);
     const worst = bill.largest_group_patches;
     const needed = bill.bytes;
     if (needed <= available) return null;
     const mb: u64 = 1024 * 1024;
-    return MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ needed / mb, worst, available / mb });
+    return request_media.MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ needed / mb, worst, available / mb });
 }
 
 fn towerFitFaultText(out: []u8, config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize, available: u64) ?[]const u8 {
@@ -8923,7 +8803,7 @@ pub fn testWire(body: []const u8, vocab: WireVocab) !struct { parsed: std.json.P
     const items = parsed.value.object.get("messages").?.array.items;
     switch (vocab) {
         .openai => try readOpenAiMessages(&wire, items, test_qwen_vp),
-        .anthropic => try readAnthropicMessages(&wire, items, test_qwen_vp),
+        .anthropic => try anthropic.readAnthropicMessages(&wire, items, test_qwen_vp),
     }
     return .{ .parsed = parsed, .wire = wire };
 }
@@ -9756,7 +9636,7 @@ test "requestCacheKey: prompt_cache_key > metadata.user_id > system prompt > ano
 
 test "settingsPropsJson: /props names the greedy tail and where it came from" {
     for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
-        const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
+        const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
         defer testing.allocator.free(frag);
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
         defer parsed.deinit();
@@ -10998,10 +10878,10 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     try testing.expect(std.mem.indexOf(u8, m, "resident-model budget") != null);
 
     // One mapping serves both load switches; a second literal is the drift.
-    try testing.expectEqualStrings("out_of_memory", loadRefusalFor(error.NotEnoughMemory).?.type);
-    try testing.expectEqualStrings(not_enough_memory_message, loadRefusalFor(error.NotEnoughMemory).?.message);
-    try testing.expectEqualStrings("out_of_memory", loadRefusalFor(error.InsufficientMemory).?.type);
-    try testing.expectEqualStrings(insufficient_free_memory_message, loadRefusalFor(error.InsufficientMemory).?.message);
+    try testing.expectEqualStrings("out_of_memory", generation_stream.loadRefusalFor(error.NotEnoughMemory).?.type);
+    try testing.expectEqualStrings(not_enough_memory_message, generation_stream.loadRefusalFor(error.NotEnoughMemory).?.message);
+    try testing.expectEqualStrings("out_of_memory", generation_stream.loadRefusalFor(error.InsufficientMemory).?.type);
+    try testing.expectEqualStrings(insufficient_free_memory_message, generation_stream.loadRefusalFor(error.InsufficientMemory).?.message);
 }
 
 test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {
@@ -11135,7 +11015,7 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const without = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{});
     try t.expect(with_terms > without + 3_000_000_000);
     // The sentinel runs through the same path: an omitted max_tokens must not move the bill past the context.
-    const sentinel: u64 = omittedMaxTokensDefault(@intCast(@min(getEffectiveContextLength(&cfg), 1_048_576)));
+    const sentinel: u64 = request_policy.omittedMaxTokensDefault(@intCast(@min(getEffectiveContextLength(&cfg), 1_048_576)));
     const with_sentinel = prefillRequestTerms(&cfg, seq, sentinel, 8, chunk, .{});
     const with_explicit = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
     try t.expect(with_sentinel.reserved_kv_bytes < 8 * 1024 * 1024 * 1024);
@@ -11169,7 +11049,7 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
     try t.expectEqual(@as(u64, 1_048_576), ctx);
     const seq: u64 = 383_067;
     const chunk: u64 = 4096;
-    const clamped: u64 = clampMaxTokens(@intCast(omittedMaxTokensDefault(@intCast(ctx))), @intCast(seq), @intCast(ctx));
+    const clamped: u64 = request_policy.clampMaxTokens(@intCast(request_policy.omittedMaxTokensDefault(@intCast(ctx))), @intCast(seq), @intCast(ctx));
     try t.expectEqual(ctx - seq, clamped); // 665,509 — the live number
 
     // The reservation is bounded by the headroom, not by the context.
@@ -13156,7 +13036,7 @@ test "chat_template_kwargs is read in one place, and only a bool counts" {
 }
 
 test "settingsPropsJson: /props reports the prefill decode share" {
-    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
+    const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
     defer testing.allocator.free(frag);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
     defer parsed.deinit();
@@ -13391,7 +13271,7 @@ test "a streamed --vision load proves its largest image encode beside the budget
     cfg.expert_streaming = true;
     const kv = expertStreamingPlannedKvBytes(&cfg);
     try std.testing.expectEqual(kv, expertStreamingBesideBudgetBytes(&cfg));
-    cfg.expert_vision_encode_bytes = largestImageEncodeBytes(&cfg);
+    cfg.expert_vision_encode_bytes = request_media.largestImageEncodeBytes(&cfg);
     try std.testing.expect(cfg.expert_vision_encode_bytes > 1 << 30);
     try std.testing.expectEqual(kv + cfg.expert_vision_encode_bytes, expertStreamingBesideBudgetBytes(&cfg));
     try std.testing.expect(!ssdBudgetAdmits(32 << 30, expertStreamingBesideBudgetBytes(&cfg), (32 << 30) + kv));

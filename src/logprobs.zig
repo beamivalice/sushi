@@ -4,7 +4,8 @@ const scheduler_mod = @import("scheduler.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const sampler = @import("sampler.zig");
 const server = @import("server.zig");
-const contentTokenRange = server.contentTokenRange;
+const generation_stream = @import("generation_stream.zig");
+const contentTokenRange = generation_stream.contentTokenRange;
 const jsonEscape = server.jsonEscape;
 
 /// Streaming-side logprobs accumulator.

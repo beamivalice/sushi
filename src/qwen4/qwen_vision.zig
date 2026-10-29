@@ -1353,7 +1353,7 @@ test "qwen vision ubench: encode time and scratch peak per image and video" {
         });
         if (bill < peak[1]) under_billed = true;
     }
-    const server = @import("../server.zig");
+    const request_media = @import("../request_media.zig");
     const merge2 = config.qv_merge * config.qv_merge;
     for ([_][3]u32{ .{ 1, 46, 82 }, .{ 2, 46, 82 }, .{ 4, 46, 82 }, .{ 8, 46, 82 }, .{ 2, 24, 42 }, .{ 8, 24, 42 }, .{ 2, cap_side, cap_side }, .{ 8, cap_side, cap_side } }) |v| {
         const n: c_int = @intCast(v[0] * v[1] * v[2]);
@@ -1388,7 +1388,7 @@ test "qwen vision ubench: encode time and scratch peak per image and video" {
         }
         const rows: u64 = @as(u64, @intCast(n)) / merge2;
         const video = [_]@import("../chat.zig").VideoData{.{ .pixels = std.mem.sliceAsBytes(host), .grid_t = v[0], .grid_h = v[1], .grid_w = v[2] }};
-        const bill = server.visionEncodeBill(&config, &.{}, &video, rows).bytes;
+        const bill = request_media.visionEncodeBill(&config, &.{}, &video, rows).bytes;
         const mb = 1e6;
         const peak_f: f64 = @floatFromInt(peak);
         const bill_f: f64 = @floatFromInt(bill);
