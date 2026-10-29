@@ -794,13 +794,30 @@ const TestWeight = struct {
     }
 };
 
-const ErrStats = struct { max: f64 = 0, rms: f64 = 0, max_rel_summands: f64 = 0, finite: bool = true };
+const ErrStats = struct { max: f64 = 0, rms: f64 = 0, max_rel_summands: f64 = 0, ulp_rms: f64 = 0, ulp_max: f64 = 0, finite: bool = true };
+
+/// The bf16 spacing at `v`, the unit a bf16 output's rounding is measured in.
+fn bf16Ulp(v: f64) f64 {
+    if (v == 0) return 0;
+    return std.math.ldexp(@as(f64, 1), std.math.frexp(v).exponent - 8);
+}
+
+/// How far the kernel's errors may sit above the reference's, in bf16 ulps of the truth: both round their stores
+/// to bf16, and a flipped rounding moves an element by one ulp, an rms by a fraction of it.
+const NO_WORSE_RMS_ULPS = 0.1;
+const NO_WORSE_MAX_ULPS = 1.0;
+
+fn expectNoWorse(kernel: ErrStats, reference: ErrStats) !void {
+    try testing.expect(kernel.rms <= reference.rms + NO_WORSE_RMS_ULPS * kernel.ulp_rms);
+    try testing.expect(kernel.max <= reference.max + NO_WORSE_MAX_ULPS * kernel.ulp_max);
+}
 
 /// Error of `got` (one output's [m, rows] values) against the fp64 truth of the
 /// source weights, each element also relative to its sum |w*x|.
 fn errStats(tw: *const TestWeight, x: []const f32, m: usize, part: usize, got: []const f32) ErrStats {
     var st = ErrStats{};
     var acc: f64 = 0;
+    var ulp_sq: f64 = 0;
     var count: usize = 0;
     const rows = tw.split.partRows(part);
     for (0..tw.n) |row| {
@@ -820,10 +837,14 @@ fn errStats(tw: *const TestWeight, x: []const f32, m: usize, part: usize, got: [
             st.max = @max(st.max, e);
             if (summands > 0) st.max_rel_summands = @max(st.max_rel_summands, e / summands);
             acc += e * e;
+            const u = bf16Ulp(truth);
+            ulp_sq += u * u;
+            st.ulp_max = @max(st.ulp_max, u);
             count += 1;
         }
     }
     st.rms = @sqrt(acc / @as(f64, @floatFromInt(count)));
+    st.ulp_rms = @sqrt(ulp_sq / @as(f64, @floatFromInt(count)));
     return st;
 }
 
@@ -920,8 +941,7 @@ test "fp8 block GEMV is no worse than the bf16-dequant route against fp64 truth"
                     const ks = errStats(&tw, x, m, p, got);
                     const rs = errStats(&tw, x, m, p, want);
                     try testing.expect(ks.finite and rs.finite);
-                    try testing.expect(ks.rms <= rs.rms);
-                    try testing.expect(ks.max <= rs.max);
+                    try expectNoWorse(ks, rs);
                 }
             }
         }
