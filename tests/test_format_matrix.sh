@@ -20,6 +20,7 @@
 #   9-11. Truncated thinking on /v1/messages, /v1/responses and the chat stream
 #   12-14. Thinking streams: split in live chunks, with tools, and after a tool result
 #   15-17. Thinking x tools x stream grid, and stream == non-stream split
+#   18. Three tool chats over a three-tool catalog parse to structured calls
 #
 # A thought the token cap cuts open is a legal turn on every row: the rows then assert the split (reasoning kept,
 # nothing in content), never the answer. Thinking rows ask `reasoning_effort: low`, since the split is the subject.
@@ -356,6 +357,23 @@ if [ "$THINKS" = 1 ]; then
     check "17. stream and non-stream split identically" "$([ -n "$NS" ] && [ "$NS" = "$ST" ] && echo 1 || echo 0)"
     chk "17. the answer is content, not reasoning (or the cap cut the thought)" "r['content'] or r['finish']=='length'"
 fi
+
+# ── 18. Three tool chats with a three-tool catalog: the parser's output is a structured call, never tool-call XML
+#      in content, and a direct answer is not an empty reply. Thinking is off where the arch has an off mode;
+#      GLM asks effort low instead. ──
+NOTHINK='"enable_thinking":false'
+[ "$GLM" = 1 ] && NOTHINK='"reasoning_effort":"low"'
+TOOLS3='[{"type":"function","function":{"name":"shell","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},{"type":"function","function":{"name":"webSearch","description":"Search the web with DuckDuckGo","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},{"type":"function","function":{"name":"writeFile","description":"Write a small file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]'
+
+tool_parse() { # tool_parse <desc> <system prompt> <user prompt>
+    R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[{\"role\":\"system\",\"content\":\"$2\"},$(user "$3")],\"tools\":$TOOLS3,\"max_tokens\":2000,\"temperature\":0,$NOTHINK}")
+    chk "18. $1: no tool-call XML in content" "not any(t in r['content'] for t in ('<tool_call','</tool_call>','</tool_request>'))"
+    chk "18. $1: a well-formed call (declared name, JSON-object args, finish tool_calls) or a non-empty answer" "(r['finish']=='tool_calls' and r['calls'][0]['name'] in ('shell','webSearch','writeFile') and isinstance(json.loads(r['calls'][0]['args']),dict)) if r['calls'] else (r['content'].strip() or (r['finish']=='length' and r['reasoning']))"
+}
+
+tool_parse "shell prompt" "You can call tools. Use the shell tool to run commands." "List the files in /tmp using the shell tool."
+tool_parse "webSearch prompt" "Use the webSearch tool when the user asks to research something." "Research the top 5 open source inference apps."
+tool_parse "writeFile prompt" "Use the writeFile tool to create files." "Create a file at /tmp/hello.txt containing the single word 'hello'."
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
