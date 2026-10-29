@@ -1,27 +1,23 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Integration tests for the opt-in observability layer (--metrics):
 #   * GET /metrics       — Prometheus text exposition (headless scraping)
 #   * GET /metrics.json  — open JSON feed of the same counters
 #
 # There is NO admin dashboard and NO admin mutations — the feeds are read-only.
 #
+# The api boot serves with --metrics (the 503-when-off arm is test_metrics_enable.sh [1]). The server
+# is shared with other scripts, so counters are asserted as deltas around this script's own requests.
+#
 # Tests:
-#  1. Without --metrics: /metrics + /metrics.json → 503.
 #  2. With    --metrics: /metrics → 200 Prometheus text; /metrics.json → 200 JSON.
 #  3. After one chat request: counters/histograms increment; live-gauge holds
 #                             (live > 0 after a request, live == total at rest).
-#
-# Usage: ./tests/test_metrics.sh [model_dir] [port]
-#   Starts its own servers. Default model: the Flash-Next EXL3 pack.
 
 set -u
 
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${2:-11291}"
-BASE="http://127.0.0.1:$PORT"
-BINARY="${BINARY:-./zig-out/bin/sushi}"
-LOG=/tmp/test_metrics.log
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+BASE=$SUSHI_URL
 PASS=0
 FAIL=0
 
@@ -38,47 +34,24 @@ check() {
     fi
 }
 
-if [ ! -d "$MODEL" ]; then
-    echo "SKIP: model dir not found: $MODEL (pass as first arg)"
-    exit 0
-fi
-
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-
-wait_health() {
-    for _ in $(seq 1 90); do
-        curl -sf "$BASE/health" >/dev/null 2>&1 && return 0
-        sleep 1
+# Live rows of /metrics.json: requests another script left running must finish before an at-rest check.
+live_rows() {
+    curl -s -m 2 "$BASE/metrics.json" | python3 -c "
+import json,sys
+try: print(sum(1 for r in json.load(sys.stdin)['sessions'] if r['phase'] != 'cached'))
+except Exception: print(-1)" 2>/dev/null
+}
+wait_rest() {
+    for _ in $(seq 1 120); do
+        [ "$(live_rows)" = "0" ] && return 0
+        sleep 0.5
     done
-    echo "FAIL: server never became healthy on port $PORT"
-    return 1
+    echo "  NOTE  /metrics.json still lists live sessions after 60s"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
-# Phase 1: Without --metrics, /metrics* return 503
-# ════════════════════════════════════════════════════════════════════════════
-echo ""
-echo "── Phase 1: without --metrics ──"
-
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --log-level warn > "$LOG" 2>&1 &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true' EXIT
-wait_health
-
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics")
-check "GET /metrics without --metrics → 503" "$([ "$STATUS" = "503" ] && echo 1 || echo 0)"
-
-BODY=$(curl -s "$BASE/metrics")
-check "503 body mentions 'not enabled'" "$(echo "$BODY" | grep -q "not enabled" && echo 1 || echo 0)"
-
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics.json")
-check "GET /metrics.json without --metrics → 503" "$([ "$STATUS" = "503" ] && echo 1 || echo 0)"
-
-kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
-sleep 1
+# A counter's value as an integer; empty when the series is missing.
+counter() { curl -s "$BASE/metrics" | grep "^$1 " | awk '{print $2}' | cut -d. -f1; }
+is_int() { case "$1" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 2: With --metrics, both endpoints answer
@@ -86,15 +59,11 @@ sleep 1
 echo ""
 echo "── Phase 2: with --metrics (idle — no requests yet) ──"
 
-# --log-level info so the "Prometheus metrics: ENABLED" startup line is visible.
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --metrics --log-level info > "$LOG" 2>&1 &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true' EXIT
-wait_health
-
+# The boot predates the attach, so the startup line is read from the whole log.
 check "startup log: 'Prometheus metrics: ENABLED'" \
-    "$(grep -q "Prometheus metrics: ENABLED" "$LOG" && echo 1 || echo 0)"
+    "$(grep -q "Prometheus metrics: ENABLED" "$SUSHI_LOG" && echo 1 || echo 0)"
 
+wait_rest
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics")
 check "GET /metrics with --metrics → 200" "$([ "$STATUS" = "200" ] && echo 1 || echo 0)"
 
@@ -120,10 +89,10 @@ check "sushi:memory_mb gauge present (TYPE line)" \
 check "sushi:generation_tokens_live gauge present (TYPE line)" \
     "$(echo "$BODY" | grep -q "# TYPE sushi:generation_tokens_live gauge" && echo 1 || echo 0)"
 
-check "request_success_total is 0 before any requests" \
-    "$(echo "$BODY" | grep "^vllm:request_success_total " | grep -q " 0$" && echo 1 || echo 0)"
-check "prompt_tokens_total is 0 before any requests" \
-    "$(echo "$BODY" | grep "^vllm:prompt_tokens_total " | grep -q " 0$" && echo 1 || echo 0)"
+check "request_success_total is a non-negative integer" \
+    "$(is_int "$(counter vllm:request_success_total)" && echo 1 || echo 0)"
+check "prompt_tokens_total is a non-negative integer" \
+    "$(is_int "$(counter vllm:prompt_tokens_total)" && echo 1 || echo 0)"
 
 # JSON feed shape
 JSTATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics.json")
@@ -138,11 +107,11 @@ check "/metrics.json has 'histograms' key" "$(echo "$JBODY" | grep -q '"histogra
 check "/metrics.json has 'generation_tokens_live'" \
     "$(echo "$JBODY" | grep -q '"generation_tokens_live"' && echo 1 || echo 0)"
 check "/metrics.json has 'bucket_counts'"  "$(echo "$JBODY" | grep -q '"bucket_counts"' && echo 1 || echo 0)"
-check "/metrics.json 'sessions' is an empty array when idle" \
+check "/metrics.json 'sessions' is an array with no live row when idle" \
     "$(echo "$JBODY" | python3 -c "
 import json,sys
 s = json.load(sys.stdin).get('sessions')
-print(1 if isinstance(s, list) and len(s) == 0 else 0)" 2>/dev/null)"
+print(1 if isinstance(s, list) and all(r['phase'] == 'cached' for r in s) else 0)" 2>/dev/null)"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -151,34 +120,41 @@ print(1 if isinstance(s, list) and len(s) == 0 else 0)" 2>/dev/null)"
 echo ""
 echo "── Phase 3: after one chat completion ──"
 
+SUCCESS0=$(counter vllm:request_success_total)
+PT0=$(counter vllm:prompt_tokens_total)
+TTFT0=$(counter vllm:time_to_first_token_seconds_count)
+E2E0=$(counter vllm:e2e_request_latency_seconds_count)
+INF0=$(counter 'vllm:time_to_first_token_seconds_bucket{le="+Inf"}')
+CANCEL0=$(counter vllm:request_cancelled_total)
+
 CHAT=$(curl -s -X POST "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d '{"model":"sushi","messages":[{"role":"user","content":"Reply with one word: OK"}],"max_tokens":5,"temperature":0}')
+    -d "{\"model\":\"sushi\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Reply with one word: OK\"}],\"max_tokens\":5,\"temperature\":0}")
 
 check "chat completion returned a response" \
     "$(echo "$CHAT" | grep -q '"choices"' && echo 1 || echo 0)"
 
 BODY2=$(curl -s "$BASE/metrics")
 
-check "request_success_total == 1 after one request" \
-    "$(echo "$BODY2" | grep "^vllm:request_success_total " | grep -q " 1$" && echo 1 || echo 0)"
+delta() { echo $(($(counter "$1") - $2)); }
 
-PT=$(echo "$BODY2" | grep "^vllm:prompt_tokens_total " | awk '{print $2}')
-check "prompt_tokens_total > 0 after one request" \
-    "$([ -n "$PT" ] && [ "$PT" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+check "request_success_total grew by 1 after one request" \
+    "$([ "$(delta vllm:request_success_total "$SUCCESS0")" = "1" ] && echo 1 || echo 0)"
 
-check "vllm:time_to_first_token_seconds_count == 1" \
-    "$(echo "$BODY2" | grep "^vllm:time_to_first_token_seconds_count " | grep -q " 1$" && echo 1 || echo 0)"
+check "prompt_tokens_total grew after one request" \
+    "$([ "$(delta vllm:prompt_tokens_total "$PT0")" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
 
-check "vllm:e2e_request_latency_seconds_count == 1" \
-    "$(echo "$BODY2" | grep "^vllm:e2e_request_latency_seconds_count " | grep -q " 1$" && echo 1 || echo 0)"
+check "vllm:time_to_first_token_seconds_count grew by 1" \
+    "$([ "$(delta vllm:time_to_first_token_seconds_count "$TTFT0")" = "1" ] && echo 1 || echo 0)"
 
-TTFT_INF=$(echo "$BODY2" | grep 'vllm:time_to_first_token_seconds_bucket{le="+Inf"}' | awk '{print $2}')
-check "TTFT +Inf bucket == 1" \
-    "$([ "$TTFT_INF" = "1" ] && echo 1 || echo 0)"
+check "vllm:e2e_request_latency_seconds_count grew by 1" \
+    "$([ "$(delta vllm:e2e_request_latency_seconds_count "$E2E0")" = "1" ] && echo 1 || echo 0)"
 
-check "request_cancelled_total == 0" \
-    "$(echo "$BODY2" | grep "^vllm:request_cancelled_total " | grep -q " 0$" && echo 1 || echo 0)"
+check "TTFT +Inf bucket grew by 1" \
+    "$([ "$(delta 'vllm:time_to_first_token_seconds_bucket{le="+Inf"}' "$INF0")" = "1" ] && echo 1 || echo 0)"
+
+check "request_cancelled_total did not move" \
+    "$([ "$(delta vllm:request_cancelled_total "$CANCEL0")" = "0" ] && echo 1 || echo 0)"
 
 # memory_mb must reflect the loaded model footprint (phys_footprint, not
 # resident_size). Any loaded model footprints >500 MB.
@@ -189,6 +165,7 @@ check "sushi:memory_mb > 500 (phys_footprint, not resident_size)" \
 # generation_tokens_live (live tok/s source) = completed + in-flight. The gauge
 # sampler ticks every 2s, so wait one cadence. With nothing decoding at scrape
 # time it must equal generation_tokens_total AND be > 0.
+wait_rest
 sleep 3
 BODY3=$(curl -s "$BASE/metrics")
 GEN=$(echo "$BODY3" | grep "^vllm:generation_tokens_total " | awk '{print $2}')
@@ -209,6 +186,7 @@ echo ""
 echo "── Phase 4: live prefill gauge ──"
 
 # At rest, no prefill is in flight.
+wait_rest
 sleep 3
 IDLE_PRE=$(curl -s "$BASE/metrics" | grep "^sushi:prefill_tokens_live " | awk '{print $2}')
 check "prefill_tokens_live == 0 at rest" \
@@ -216,7 +194,7 @@ check "prefill_tokens_live == 0 at rest" \
 
 # Build a prompt big enough that prefill spans several chunks (chunk = 8192
 # tokens), then poll the gauge WHILE the request is still in flight.
-BIG=$(python3 -c "print(('The quick brown fox jumps over the lazy dog. ' * 2600).strip())")
+BIG=$(python3 -c "import sys; print(sys.argv[1] + ' ' + ('The quick brown fox jumps over the lazy dog. ' * 2600).strip())" "$SUSHI_NONCE")
 REQ=$(python3 -c "
 import json,sys
 print(json.dumps({'model':'sushi','stream':False,'max_tokens':1,'temperature':0,
@@ -264,35 +242,46 @@ check "requests_prefilling back to 0 after the request completes" \
 echo ""
 echo "── Phase 5: prefill tok/s excludes cached tokens ──"
 
-read_counter() { curl -s "$BASE/metrics" | grep "^$1 " | awk '{print $2}'; }
+# Restores below 256 tokens never come from the SSD tier (the api boot has no RAM tier), so the prompt is
+# longer than that. The first run's SSD write is asynchronous: repeat until a request reports a restore.
+WARM=$(python3 -c "
+import json,sys
+print(json.dumps({'model':'sushi','max_tokens':1,'temperature':0,
+                  'messages':[{'role':'user','content':sys.argv[1] + ' Count slowly: ' + ' '.join('n%d' % i for i in range(700))}]}))" "$SUSHI_NONCE")
+CACHED=0
+for _ in $(seq 1 8); do
+    P1=$(counter vllm:prompt_tokens_total)
+    F1=$(counter sushi:prefill_tokens_total)
+    C1=$(counter sushi:prefix_cache_tokens_total)
+    CACHED=$(curl -s -m 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$WARM" \
+        | python3 -c "
+import json,sys
+try: print(json.load(sys.stdin)['usage'].get('prompt_tokens_details', {}).get('cached_tokens', 0))
+except Exception: print(0)")
+    P2=$(counter vllm:prompt_tokens_total)
+    F2=$(counter sushi:prefill_tokens_total)
+    C2=$(counter sushi:prefix_cache_tokens_total)
+    [ "$CACHED" -gt 0 ] 2>/dev/null && break
+    sleep 1
+done
 
-# Same prompt twice: the second request must hit the hot prefix cache.
-WARM='{"model":"sushi","max_tokens":1,"temperature":0,"messages":[{"role":"user","content":"Count slowly and describe each number in one clause: one two three four five six seven eight nine ten eleven twelve."}]}'
-curl -s -m 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$WARM" >/dev/null
-P1=$(read_counter "vllm:prompt_tokens_total")
-F1=$(read_counter "sushi:prefill_tokens_total")
-
-curl -s -m 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$WARM" >/dev/null
-P2=$(read_counter "vllm:prompt_tokens_total")
-F2=$(read_counter "sushi:prefill_tokens_total")
-C2=$(read_counter "sushi:prefix_cache_tokens_total")
-
-DP=$((P2 - P1))   # billed prompt tokens of the warm request
+DP=$((P2 - P1))   # billed prompt tokens of the last request
 DF=$((F2 - F1))   # tokens it actually forwarded
+DC=$((C2 - C1))   # tokens it restored
 
 check "warm request still bills its full prompt (prompt_tokens_total +$DP)" \
     "$([ "$DP" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
 check "warm request forwards FEWER tokens than it bills ($DF < $DP)" \
     "$([ "$DF" -lt "$DP" ] 2>/dev/null && echo 1 || echo 0)"
-check "prefix_cache_tokens_total > 0 after a cache hit" \
-    "$([ -n "$C2" ] && [ "$C2" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+check "prefix_cache_tokens_total grew after a cache hit (+$DC)" \
+    "$([ "$DC" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
 # The invariant that makes prefill tok/s trustworthy.
-check "forwarded + restored == billed ($F2 + $C2 == $P2)" \
-    "$([ $((F2 + C2)) -eq "$P2" ] 2>/dev/null && echo 1 || echo 0)"
+check "forwarded + restored == billed ($DF + $DC == $DP)" \
+    "$([ $((DF + DC)) -eq "$DP" ] 2>/dev/null && echo 1 || echo 0)"
 
 # The panel divides by this counter; it must never exceed the billed total.
-check "prefill_tokens_total <= prompt_tokens_total" \
-    "$([ "$F2" -le "$P2" ] 2>/dev/null && echo 1 || echo 0)"
+check "prefill_tokens_total grew by no more than prompt_tokens_total" \
+    "$([ "$DF" -le "$DP" ] 2>/dev/null && echo 1 || echo 0)"
 
 # ── Phase 6: per-request live sessions ──
 #
@@ -302,10 +291,11 @@ check "prefill_tokens_total <= prompt_tokens_total" \
 echo ""
 echo "── Phase 6: live per-request sessions ──"
 
+BIG6=$(python3 -c "import sys; print(sys.argv[1] + ' six ' + ('The quick brown fox jumps over the lazy dog. ' * 1300).strip())" "$SUSHI_NONCE")
 REQ6=$(python3 -c "
 import json,sys
 print(json.dumps({'model':'sushi','stream':False,'max_tokens':64,'temperature':0,
-                  'messages':[{'role':'user','content':sys.stdin.read()}]}))" <<< "$BIG")
+                  'messages':[{'role':'user','content':sys.stdin.read()}]}))" <<< "$BIG6")
 curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$REQ6" >/dev/null &
 CURL_PID=$!
 
@@ -341,12 +331,21 @@ check "sessions row appears while a request is live" "$SAW_ROW"
 check "row carries context_length, requested max_tokens, age, prefill|decode phase" "$GOOD_ROW"
 check "request_id is stable across two polls of one request" "$STABLE_ID"
 
+wait_rest
 sleep 2
 REST6=$(curl -s "$BASE/metrics.json")
 check "no live rows again at rest (no resurrected rows)" \
     "$(echo "$REST6" | python3 -c "
 import json,sys
 print(1 if all(r['phase'] == 'cached' for r in json.load(sys.stdin)['sessions']) else 0)" 2>/dev/null)"
+
+# Cached rows list the RAM hot cache, which the SSD-only api boot does not keep.
+RAM_ON=$(curl -s "$BASE/props" | python3 -c "
+import json,sys
+print(1 if json.load(sys.stdin)['settings']['prefix_cache']['ram_enabled'] else 0)" 2>/dev/null)
+if [ "$RAM_ON" != "1" ]; then
+    echo "  NOTE  RAM prefix tier off: the cached-row and restored-entry checks are skipped"
+else
 check "the finished request left cached rows with zero request fields and an entry's bytes" \
     "$(echo "$REST6" | python3 -c "
 import json,sys
@@ -362,7 +361,7 @@ print(1 if ok else 0)" 2>/dev/null)"
 cached_lens() { curl -s "$BASE/metrics.json" | python3 -c "
 import json,sys
 print(' '.join(str(r['context_tokens']) for r in json.load(sys.stdin)['sessions'] if r['phase'] == 'cached'))"; }
-REQ7='{"model":"sushi","stream":false,"max_tokens":512,"temperature":0,"messages":[{"role":"user","content":"Count from one to three hundred in words, separated by commas."}]}'
+REQ7="{\"model\":\"sushi\",\"stream\":false,\"max_tokens\":512,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Count from one to three hundred in words, separated by commas.\"}]}"
 BEFORE7=$(cached_lens)
 curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$REQ7" >/dev/null
 sleep 1
@@ -399,6 +398,7 @@ check "the repeated prompt decoded from a restore ($RESTORED_POLLS polls)" \
     "$([ "$RESTORED_POLLS" -gt 0 ] && echo 1 || echo 0)"
 check "its restored entry was never listed beside it ($DUP_POLLS duplicate polls)" \
     "$([ "$RESTORED_POLLS" -gt 0 ] && [ "$DUP_POLLS" -eq 0 ] && echo 1 || echo 0)"
+fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
@@ -410,6 +410,6 @@ else
     echo -e "${RED}FAIL${NC} $FAIL/$TOTAL tests failed"
     echo ""
     echo "--- Server log (last 20 lines) ---"
-    tail -20 "$LOG" 2>/dev/null || true
+    sushi_log_since | tail -20
     exit 1
 fi
