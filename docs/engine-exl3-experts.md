@@ -448,7 +448,7 @@ into `moeDecodeClamped`'s reduce.
 - **Launches**: 10 a layer become 5, so 200 fewer per serial token (40 layers) and per verify round, and 15 fewer on a
   drafting round (three DSpark stage layers). A launch costs ~1.76 us of gap; the saving is larger because the shared
   chain's tails fill with routed work.
-- **Chain per layer** (`SUSHI_DSV41_SHARED_UBENCH=1`, exl3 test binary, base `2db0e8d5`, ReleaseFast, GPU lock, QUIET,
+- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=dsv41` times the routed-first order; this table, base `2db0e8d5`, ReleaseFast, GPU lock, QUIET,
   `taskpolicy -a`, fans auto, M5 Max, median of 21 interleaved rounds of 16 dependent steps, layer 2 plan, us):
 
   | rows | shared separate | fused (routed first) | fused (shared first) | routed only | fused / separate |

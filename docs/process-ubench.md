@@ -82,5 +82,6 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `glm5.mla_chunk_stages` | glm5 | a 2048-row chunk's index scores, top-512 selection and whole attention, by context |
 | `shared.exl3_rate_groups` | shared | one Flash-Next MoE layer as uniform n32, the masked `moeGroups` and the one-dispatch grouped chain: seven rate layouts at decode rows 1 and 4 and three at prefill chunks 512 and 2048, SPEC1 and PAIR1 |
 | `shared.exl3_rate_groups_rows` | shared | a DeepSeek-V4.1 layer (384 experts, four PAIR1 groups) through the grouped prefill chain with every expert routed 1 to 48 rows, as ms per layer, us per expert and TFLOP/s |
+| `shared.shared_expert_fold` | shared | one MoE layer with the shared expert separate, folded into the routed launches, and absent, over 8 distinct banks: Flash-Next (one bank, rate groups), GLM (one bank), DeepSeek-V4.1 (layer 2's four PAIR1 groups, with the fused chain's launch count), at 1 to 8 rows |
 | `enc.factor` | enc | the block-LDL factor of a Hessian bank at n512 x16 and n2560 x32: float32 on the GPU against the float64 CPU oracle, ms per matrix |
 | `enc.search` | enc | trellis search at K2.5 (n40, MCG, window 15) over 4096 random tiles, sustained back to back, us per tile |

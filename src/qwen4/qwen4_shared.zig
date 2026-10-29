@@ -43,19 +43,18 @@ pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const tfm.MoeMlpWeights, inds: Arr
     return result;
 }
 
-const Ops = @import("../glm5/glm5_model.zig").Ops;
-const test_dec: api.format.Decode = .{ .codebook = .mcg, .window = .w15 };
-const hidden: usize = 2560;
-const inter: usize = 640;
-const topk: usize = 10;
+pub const Ops = @import("../glm5/glm5_model.zig").Ops;
+pub const test_dec: api.format.Decode = .{ .codebook = .mcg, .window = .w15 };
+pub const hidden: usize = 2560;
+pub const inter: usize = 640;
+pub const topk: usize = 10;
 
 fn bf16(v: f32) u16 {
     return @truncate(@as(u32, @bitCast(v)) >> 16);
 }
 
 /// An affine8 bank at group `group`: random codes, positive scales and centred biases at `gain`.
-fn affineBank(ops: *Ops, rnd: std.Random, rows: usize, k: usize, group: usize, gain: f32) !api.qwen_riders.Affine {
-    const a = std.testing.allocator;
+fn affineBank(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, rows: usize, k: usize, group: usize, gain: f32) !api.qwen_riders.Affine {
     const codes = try a.alloc(u32, rows * k / 4);
     defer a.free(codes);
     const scales = try a.alloc(u16, rows * k / group);
@@ -76,8 +75,7 @@ fn affineBank(ops: *Ops, rnd: std.Random, rows: usize, k: usize, group: usize, g
     };
 }
 
-fn randomBf16(ops: *Ops, rnd: std.Random, shape: []const c_int, spread: f32) !Arr {
-    const a = std.testing.allocator;
+pub fn randomBf16(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, shape: []const c_int, spread: f32) !Arr {
     var n: usize = 1;
     for (shape) |d| n *= @intCast(d);
     const values = try a.alloc(u16, n);
@@ -87,7 +85,7 @@ fn randomBf16(ops: *Ops, rnd: std.Random, shape: []const c_int, spread: f32) !Ar
 }
 
 /// A routed bank of `experts` at gate/up rate `n` and down rate `down_n`, random codewords at Qwen's width.
-fn routedBank(ops: *Ops, experts: c_int, n: c_int, down_n: c_int, seed: u64) !api.Bank {
+pub fn routedBank(ops: *Ops, experts: c_int, n: c_int, down_n: c_int, seed: u64) !api.Bank {
     var projections: [3]api.Proj = undefined;
     for (&projections, 0..) |*projection, i| {
         const input: c_int = if (i == 2) inter else hidden;
@@ -105,7 +103,7 @@ fn routedBank(ops: *Ops, experts: c_int, n: c_int, down_n: c_int, seed: u64) !ap
     return .{ .gate = projections[0], .up = projections[1], .down = projections[2] };
 }
 
-fn routing(ops: *Ops, rnd: std.Random, rows: usize, experts: usize) !struct { ids: Arr, scores: Arr } {
+pub fn routing(ops: *Ops, rnd: std.Random, rows: usize, experts: usize) !struct { ids: Arr, scores: Arr } {
     var ids: [8 * topk]u32 = undefined;
     var probs: [8 * topk]f32 = undefined;
     for (0..rows) |r| {
@@ -122,30 +120,30 @@ fn routing(ops: *Ops, rnd: std.Random, rows: usize, experts: usize) !struct { id
     return .{ .ids = try ops.own(mlx.mlx_array_new_data(&ids, &shape, 3, .uint32)), .scores = try ops.cast(f32_scores, .bfloat16) };
 }
 
-const Weights = struct {
+pub const Weights = struct {
     shared: api.qwen_riders.Shared,
     logit: api.qwen_riders.Affine,
     group: usize,
 };
 
-fn weights(ops: *Ops, rnd: std.Random, s: mlx.mlx_stream, hidden_k: usize, width: usize, group: usize, gain: f32) !Weights {
+pub fn weights(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, s: mlx.mlx_stream, hidden_k: usize, width: usize, group: usize, gain: f32) !Weights {
     return .{
         .shared = .{
-            .gate = try affineBank(ops, rnd, width, hidden_k, group, gain),
-            .up = try affineBank(ops, rnd, width, hidden_k, group, gain),
-            .down = try affineBank(ops, rnd, hidden_k, width, group, gain),
+            .gate = try affineBank(ops, a, rnd, width, hidden_k, group, gain),
+            .up = try affineBank(ops, a, rnd, width, hidden_k, group, gain),
+            .down = try affineBank(ops, a, rnd, hidden_k, width, group, gain),
             .sigmoid = try tfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator),
         },
-        .logit = try affineBank(ops, rnd, 1, hidden_k, 64, gain),
+        .logit = try affineBank(ops, a, rnd, 1, hidden_k, 64, gain),
         .group = group,
     };
 }
 
-const Chain = union(enum) { bank: api.Bank, ragged: *const api.Ragged };
+pub const Chain = union(enum) { bank: api.Bank, ragged: *const api.Ragged };
 
 /// Today's chain for the layer: the shared projections as `moeSharedDown` and `moeSharedGateLogit` run them, then the
 /// routed experts with the gated shared add as `moeExl3` runs them.
-fn separate(ops: *Ops, x: Arr, w: Weights, chain: Chain, ids: Arr, scores: Arr, dec: api.format.Decode) !Arr {
+pub fn separate(ops: *Ops, x: Arr, w: Weights, chain: Chain, ids: Arr, scores: Arr, dec: api.format.Decode) !Arr {
     const s = ops.s;
     const g = try ops.own(try tfm.qmatmulBits(x, w.shared.gate.weight, w.shared.gate.scales, w.shared.gate.biases, 8, @intCast(w.group), .affine, s));
     const u = try ops.own(try tfm.qmatmulBits(x, w.shared.up.weight, w.shared.up.scales, w.shared.up.biases, 8, @intCast(w.group), .affine, s));
@@ -195,12 +193,12 @@ test "Qwen shared expert folded into the one-bank routed launches is bit exact t
         for ([_]usize{ 128, 64 }) |group| for ([_]f32{ 1, 0.05 }) |gain| {
             var wops = Ops{ .s = s };
             defer wops.deinit();
-            const w = try weights(&wops, rnd, s, hidden, inter, group, gain);
+            const w = try weights(&wops, std.testing.allocator, rnd, s, hidden, inter, group, gain);
             for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |rows| {
                 var scope = Ops{ .s = s };
                 defer scope.deinit();
                 const route = try routing(&scope, rnd, rows, @intCast(experts));
-                const x = try randomBf16(&scope, rnd, &.{ 1, @intCast(rows), hidden }, 4);
+                const x = try randomBf16(&scope, std.testing.allocator, rnd, &.{ 1, @intCast(rows), hidden }, 4);
                 const want = try separate(&scope, x, w, .{ .bank = bank }, route.ids, route.scores, kind.dec);
                 // The router kernel's own logit rides in at one row, the rider's at every width.
                 for ([_]bool{ false, true }) |router_logit| for ([_]bool{ false, true }) |first| {
@@ -226,7 +224,7 @@ test "Qwen shared expert folded into the one-bank routed launches is bit exact t
 }
 
 const group_sizes = [_]c_int{ 5, 9, 10 };
-const group_rates = [_][3]c_int{ .{ 32, 32, 32 }, .{ 44, 44, 44 }, .{ 64, 64, 48 } };
+pub const group_rates = [_][3]c_int{ .{ 32, 32, 32 }, .{ 44, 44, 44 }, .{ 64, 64, 48 } };
 
 fn raggedLayer(ops: *Ops, s: mlx.mlx_stream) !api.Ragged {
     var banks: [3]api.Bank = undefined;
@@ -245,10 +243,10 @@ test "Qwen shared expert folded into the rate-grouped routed launches is bit exa
     var rb = try raggedLayer(&ops, s);
     defer rb.deinit();
     for ([_]api.format.Decode{ test_dec, api.format.Decode.tabled(.spec1, .w15) }) |dec| for ([_]f32{ 1, 0.05 }) |gain| {
-        const w = try weights(&ops, rnd, s, hidden, inter, 128, gain);
+        const w = try weights(&ops, std.testing.allocator, rnd, s, hidden, inter, 128, gain);
         for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |rows| {
             const route = try routing(&ops, rnd, rows, 24);
-            const x = try randomBf16(&ops, rnd, &.{ 1, @intCast(rows), hidden }, 4);
+            const x = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, @intCast(rows), hidden }, 4);
             const want = try separate(&ops, x, w, .{ .ragged = &rb }, route.ids, route.scores, dec);
             for ([_]bool{ false, true }) |router_logit| for ([_]bool{ false, true }) |first| {
                 if (router_logit and rows != 1) continue;
@@ -281,18 +279,18 @@ test "Qwen shared expert fold declines what the separate chain must run" {
     var rb = try raggedLayer(&ops, s);
     defer rb.deinit();
     const bank = try routedBank(&ops, 24, 64, 64, 91);
-    const w = try weights(&ops, rnd, s, hidden, inter, 128, 1);
+    const w = try weights(&ops, std.testing.allocator, rnd, s, hidden, inter, 128, 1);
     var with_logit = w.shared;
     with_logit.logit = w.logit;
     const four = try routing(&ops, rnd, 4, 24);
-    const x4 = try randomBf16(&ops, rnd, &.{ 1, 4, hidden }, 4);
+    const x4 = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, 4, hidden }, 4);
     const before = api.qwen_fold.foldedCount() + api.rate_groups.qwenFoldedCount();
     const dispatches = api.kernels.fusedDispatchCount();
     const fold = api.qwen_fold.moeGatedSharedFolded;
     const rag = api.rate_groups.moeGatedSharedFolded;
     // Nine rows are past the verify width.
     const nine = try routing(&ops, rnd, 8, 24);
-    const x9 = try randomBf16(&ops, rnd, &.{ 1, 9, hidden }, 4);
+    const x9 = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, 9, hidden }, 4);
     try std.testing.expect((try fold(s, x9, bank, nine.ids, nine.scores, test_dec, with_logit, null)) == null);
     try std.testing.expect((try rag(s, x9, &rb, nine.ids, nine.scores, test_dec, with_logit, null)) == null);
     // Ids of another row count, f16 activations, a missing gate logit, a gate of the wrong width.
@@ -300,7 +298,7 @@ test "Qwen shared expert fold declines what the separate chain must run" {
     try std.testing.expect((try fold(s, try ops.cast(x4, .float16), bank, four.ids, four.scores, test_dec, with_logit, null)) == null);
     try std.testing.expect((try fold(s, x4, bank, four.ids, four.scores, test_dec, w.shared, null)) == null);
     try std.testing.expect((try rag(s, x4, &rb, four.ids, four.scores, test_dec, w.shared, null)) == null);
-    const short = try randomBf16(&ops, rnd, &.{3}, 1);
+    const short = try randomBf16(&ops, std.testing.allocator, rnd, &.{3}, 1);
     try std.testing.expect((try fold(s, x4, bank, four.ids, four.scores, test_dec, w.shared, short)) == null);
     // Shared banks the riders do not read: four-bit codes, group 32, a hidden width off the 128 grid, f32 scales.
     var narrow = with_logit;
@@ -313,87 +311,4 @@ test "Qwen shared expert fold declines what the separate chain must run" {
     try std.testing.expect((try fold(s, x4, bank, four.ids, four.scores, .{ .codebook = .spec1, .window = .w15 }, with_logit, null)) == null);
     try std.testing.expectEqual(before, api.qwen_fold.foldedCount() + api.rate_groups.qwenFoldedCount());
     try std.testing.expectEqual(dispatches, api.kernels.fusedDispatchCount());
-}
-
-test "Qwen shared fold per layer chain (SUSHI_QWEN_FOLD_UBENCH)" {
-    if (!tfm.diagEnvOn("SUSHI_QWEN_FOLD_UBENCH")) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const layers = 8;
-    const rounds = 21;
-    const experts = 64;
-    var random = std.Random.DefaultPrng.init(913);
-    const rnd = random.random();
-    var ops = Ops{ .s = s };
-    defer ops.deinit();
-    defer {
-        api.qwen_fold.shared_first = false;
-        api.rate_groups.fused_shared_first = false;
-    }
-    const names = [_][]const u8{ "separate", "fused routed first", "fused shared first", "routed only" };
-    for ([_]bool{ false, true }) |grouped| {
-        var bops: [layers]Ops = @splat(.{ .s = s });
-        defer for (&bops) |*b| b.deinit();
-        var banks: [layers]api.Bank = undefined;
-        var ragged: [layers]api.Ragged = undefined;
-        var made: usize = 0;
-        defer for (ragged[0..made]) |*r| r.deinit();
-        var w: [layers]Weights = undefined;
-        for (0..layers) |l| {
-            w[l] = try weights(&bops[l], rnd, s, hidden, inter, 128, 1);
-            if (grouped) {
-                var parts: [3]api.Bank = undefined;
-                for (&parts, [_]c_int{ 20, 20, 24 }, group_rates, 0..) |*p, count, r, g| p.* = try routedBank(&bops[l], count, r[0], r[2], 500 + 100 * @as(u64, @intCast(l)) + @as(u64, @intCast(g)));
-                ragged[l] = try api.Ragged.init(s, &parts);
-                made += 1;
-            } else banks[l] = try routedBank(&bops[l], experts, 64, 64, 900 + @as(u64, @intCast(l)));
-        }
-        const dec = if (grouped) api.format.Decode.tabled(.spec1, .w15) else test_dec;
-        const label = if (grouped) "grouped" else "one-bank";
-        for ([_]usize{ 1, 2, 3, 4, 6, 8 }) |rows| {
-            var rops = Ops{ .s = s };
-            defer rops.deinit();
-            var ids: [layers]Arr = undefined;
-            var scores: [layers]Arr = undefined;
-            for (0..layers) |l| {
-                const route = try routing(&rops, rnd, rows, 60);
-                ids[l] = route.ids;
-                scores[l] = route.scores;
-            }
-            var times: [4][rounds]f64 = undefined;
-            for (0..rounds + 1) |rep| for (0..4) |arm| {
-                api.qwen_fold.shared_first = arm == 2;
-                api.rate_groups.fused_shared_first = arm == 2;
-                var scope = Ops{ .s = s };
-                defer scope.deinit();
-                var x = try randomBf16(&scope, rnd, &.{ 1, @intCast(rows), hidden }, 4);
-                try mlx.check(mlx.mlx_array_eval(x));
-                const sw = @import("../io_util.zig").Stopwatch.init(io);
-                for (0..layers) |l| {
-                    const chain: Chain = if (grouped) .{ .ragged = &ragged[l] } else .{ .bank = banks[l] };
-                    x = switch (arm) {
-                        0 => try separate(&scope, x, w[l], chain, ids[l], scores[l], dec),
-                        3 => try scope.own(switch (chain) {
-                            .bank => |b| try api.moe(s, x, b, ids[l], scores[l], dec, false),
-                            .ragged => |r| try api.moeRagged(s, x, r, ids[l], scores[l], dec, false, null, null),
-                        }),
-                        else => blk: {
-                            var sh = w[l].shared;
-                            sh.logit = w[l].logit;
-                            const got = switch (chain) {
-                                .bank => |b| try api.qwen_fold.moeGatedSharedFolded(s, x, b, ids[l], scores[l], dec, sh, null),
-                                .ragged => |r| try api.rate_groups.moeGatedSharedFolded(s, x, r, ids[l], scores[l], dec, sh, null),
-                            };
-                            break :blk try scope.own(got orelse return error.TestExpectedFold);
-                        },
-                    };
-                }
-                try mlx.check(mlx.mlx_array_eval(x));
-                if (rep > 0) times[arm][rep - 1] = @as(f64, @floatFromInt(sw.read())) / 1e3 / layers;
-            };
-            for (&times) |*t| std.mem.sort(f64, t, {}, std.sort.asc(f64));
-            for (names, times) |name, t| std.debug.print("[qwen-fold-ubench] {s} rows {d} {s}: {d:.1} us per layer\n", .{ label, rows, name, t[rounds / 2] });
-            std.debug.print("[qwen-fold-ubench] {s} rows {d} fused / separate: {d:.3} (median of {d} rounds of {d} dependent layers)\n", .{ label, rows, times[1][rounds / 2] / times[0][rounds / 2], rounds, layers });
-        }
-    }
 }

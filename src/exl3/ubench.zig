@@ -519,3 +519,114 @@ fn runRows(run: *report.Run) anyerror!void {
         try run.metric("grouped", "TFLOP/s", "TFLOP/s", flop / (ms / 1e3) / 1e12);
     }
 }
+
+// ---- shared.shared_expert_fold, DeepSeek-V4.1 rungs: the shared expert beside the 384-expert routed chain ----
+
+/// Arm indices into `shared.shared_expert_fold`'s arms.
+const FoldArm = enum { separate, fused, routed_only };
+
+const FoldCtx = struct {
+    base: Ctx,
+    bank: root.Bank,
+    dec: exl3.Decode,
+    zeros: mlx.mlx_array,
+    ones: mlx.mlx_array,
+    arm: FoldArm,
+};
+
+fn foldStep(c: FoldCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const rows = c.base.rows;
+    const pair1: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    if (c.arm == .fused) {
+        kernels.setDecodeParams(pair1);
+        const se: rate_groups.SharedExpert = .{ .bank = c.bank, .dec = c.dec };
+        return (try rate_groups.moeDecodeClampedSharedFused(s, x, c.base.rb, c.base.routes[i % ROUTE_SETS], c.base.scores, c.base.topk, .float32, se, LIMIT)) orelse error.SharedFuseDeclined;
+    }
+    var sy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sy);
+    if (c.arm == .separate) {
+        var x3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x3);
+        try mlx.check(mlx.mlx_reshape(&x3, x, &[_]c_int{ 1, rows, @intCast(HIDDEN) }, 3, s));
+        kernels.setDecodeParams(c.dec);
+        const sy3 = try root.moeClamped(s, x3, c.bank, c.zeros, c.ones, c.dec, LIMIT);
+        defer _ = mlx.mlx_array_free(sy3);
+        try mlx.check(mlx.mlx_reshape(&sy, sy3, &[_]c_int{ rows, @intCast(HIDDEN) }, 2, s));
+    }
+    kernels.setDecodeParams(pair1);
+    return rate_groups.moeDecodeClamped(s, x, c.base.rb, c.base.routes[i % ROUTE_SETS], c.base.scores, c.base.topk, .float32, if (c.arm == .separate) sy else null, null, LIMIT);
+}
+
+const FoldSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize, c: FoldCtx };
+
+/// Nanoseconds of one layer: the chain less the link floor measured beside it.
+fn foldSample(smp: FoldSample, arm: usize) anyerror!f64 {
+    var c = smp.c;
+    c.arm = @enumFromInt(arm);
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, c, foldStep);
+    const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
+}
+
+/// The plan's layer 2 (four PAIR1 groups, top-6) with a SPEC1 n64 shared expert, at every `rows` rung in force.
+pub fn sharedFoldDsv41(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0xd54e);
+    const rnd = prng.random();
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    const lay = LAYOUTS[0];
+    var banks: [8]root.Bank = undefined;
+    for (lay.groups, 0..) |g, i| banks[i] = try bench.makeBank(rnd, HIDDEN, INTER, g.n, g.experts, 0.02, 0.9);
+    var rb = try rate_groups.Ragged.init(s, banks[0..lay.groups.len]);
+    defer rb.deinit();
+    const st = rb.storage();
+    const vec = mlx.mlx_vector_array_new_data(&st, st.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+    for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
+    var sbank = try bench.makeBank(rnd, HIDDEN, INTER, .{ 64, 64, 64 }, 1, 0.02, 0.9);
+    defer bench.freeBank(&sbank);
+    for (run.axis("rows")) |rows_text| {
+        const rows = try std.fmt.parseInt(usize, rows_text, 10);
+        var routes: [ROUTE_SETS]mlx.mlx_array = undefined;
+        _ = makeRoutes(rnd, &rb, rows, lay.topk, .uniform, &routes);
+        defer for (routes) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const xh = try std.heap.page_allocator.alloc(u16, rows * HIDDEN);
+        defer std.heap.page_allocator.free(xh);
+        for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
+        const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(HIDDEN) }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(x0);
+        var scv: [256 * 6]f32 = undefined;
+        for (&scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+        const scores = mlx.mlx_array_new_data(&scv, &[_]c_int{@intCast(rows * lay.topk)}, 1, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        var zi: [16]i32 = @splat(0);
+        var one: [16]f32 = @splat(1);
+        const zeros = mlx.mlx_array_new_data(&zi, &[_]c_int{ 1, @intCast(rows), 1 }, 3, .int32);
+        defer _ = mlx.mlx_array_free(zeros);
+        const ones = mlx.mlx_array_new_data(&one, &[_]c_int{ 1, @intCast(rows), 1 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(ones);
+        const base: Ctx = .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = false };
+        const smp: FoldSample = .{ .s = s, .x0 = x0, .steps = run.steps(16), .c = .{ .base = base, .bank = sbank, .dec = exl3.Decode.tabled(.spec1, .w15), .zeros = zeros, .ones = ones, .arm = .separate } };
+        var launches: [3]u32 = @splat(0);
+        for (&launches, 0..) |*n, arm| {
+            if (!run.hasArm(@tagName(@as(FoldArm, @enumFromInt(arm))))) continue;
+            kernels.resetFusedDispatchCount();
+            var c = smp.c;
+            c.arm = @enumFromInt(arm);
+            const y = try foldStep(c, s, 0, x0);
+            try mlx.check(mlx.mlx_array_eval(y));
+            _ = mlx.mlx_array_free(y);
+            n.* = kernels.fusedDispatchCount();
+        }
+        const label = try std.fmt.allocPrint(run.a, "dsv41 grouped rows {d}", .{rows});
+        try run.interleave(label, smp, foldSample);
+        for (launches, 0..) |n, arm| {
+            const name = @tagName(@as(FoldArm, @enumFromInt(arm)));
+            if (run.hasArm(name)) try run.metric(name, "launches", "n", @floatFromInt(n));
+        }
+    }
+}

@@ -779,7 +779,6 @@ test { _ = glm_group2; }
 test {
     _ = rate_groups;
     _ = linear;
-    _ = @import("dsv41_ubench.zig");
     _ = @import("dsv41_real.zig");
 }
 

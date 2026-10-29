@@ -693,7 +693,7 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   `moeWithGatedShared` / `moeRagged`), real 2560/640/top-10 geometry, 1 to 8 rows, MCG at n64, n32 and n44/n44/n64, spec1
   grouped at n32/44/64 (down n48), shared g128 and g64, large and small gains, router logit and rider logit, either
   part's threadgroups first, three launches a layer; one decline test.
-- **Chain per layer** (`SUSHI_QWEN_FOLD_UBENCH=1`, main test binary, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
+- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=qwen4`; this table, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
   fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over distinct banks, 64 experts, random
   routes; separate = production shared chain incl. its N=1 logit; uncommitted tree on `a9853b3e`, us):
 

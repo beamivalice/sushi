@@ -158,7 +158,7 @@ four rows; down: sixteen rows, a simdgroup per four), so every output element ha
   n36, for gate/up and down stored at 6/6/6, 5/5/5, 8/8/8, 5/5/8, 8/8/6 (and 6/6/5 on one row) bits, large and small gains
   (the clamps both ways), with either part's threadgroups first; five launches a layer (`glm_fold.launchCount`). Two more
   tests cover the declines.
-- **Chain per layer** (`SUSHI_GLM_FOLD_UBENCH=1` on the main test binary, base `f831f1e5` plus the rows change,
+- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=glm5` times the routed-first order; this table, base `f831f1e5` plus the rows change,
   ReleaseFast, GPU lock, `taskpolicy -a`, fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over eight
   distinct banks, shared A6, routed n36 mcg w12, random routes, us):
 

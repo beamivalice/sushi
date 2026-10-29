@@ -179,8 +179,8 @@ test "GLM one-token KDA projections are bit exact to the staged q/k/v, f_a, g_a 
         var fx = shared.Fixture{};
         defer fx.deinit();
         var banks: [3]Bank = undefined;
-        for (&banks) |*bank| bank.* = try fx.bank(rnd, rows, 4096, bits, 0.5);
-        const x = try ops.own(try shared.randomRow(rnd, 4096, 4));
+        for (&banks) |*bank| bank.* = try fx.bank(std.testing.allocator, rnd, rows, 4096, bits, 0.5);
+        const x = try ops.own(try shared.randomRow(std.testing.allocator, rnd, 4096, 4));
         var dense: [3]Arr = undefined;
         for (&dense, [_]usize{ 128, 128, 64 }) |*w, n| {
             const values = try std.testing.allocator.alloc(u16, n * 4096);
@@ -209,14 +209,14 @@ test "GLM one-token KDA projections decline unserved banks and widths" {
     const rnd = random.random();
     var fx = shared.Fixture{};
     defer fx.deinit();
-    const bank = try fx.bank(rnd, 16, 1024, 6, 1);
-    const x = try shared.randomRow(rnd, 1024, 2);
+    const bank = try fx.bank(std.testing.allocator, rnd, 16, 1024, 6, 1);
+    const x = try shared.randomRow(std.testing.allocator, rnd, 1024, 2);
     defer _ = mlx.mlx_array_free(x);
-    const matrix = try shared.randomRow(rnd, 4 * 1024, 1);
+    const matrix = try shared.randomRow(std.testing.allocator, rnd, 4 * 1024, 1);
     defer _ = mlx.mlx_array_free(matrix);
     // Dense weights must be [rows, width] row-major; a flat vector is not.
     try std.testing.expect((try project(s, x, .{ bank, bank, bank }, .{ .fa = matrix, .ga = matrix, .beta = matrix })) == null);
-    const narrow = try shared.randomRow(rnd, 512, 2);
+    const narrow = try shared.randomRow(std.testing.allocator, rnd, 512, 2);
     defer _ = mlx.mlx_array_free(narrow);
     try std.testing.expect((try project(s, narrow, .{ bank, bank, bank }, .{ .fa = matrix, .ga = matrix, .beta = matrix })) == null);
 }
