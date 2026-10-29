@@ -1,3 +1,4 @@
+// sushi-test: tier=tool
 // Generate a real-browser renderer regression page. Open the output HTML and expect all PASS.
 // No model, network image, npm dependency or private conversation data is needed.
 const fs = require('node:fs');
