@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Regression tests for client-disconnect handling during long prefills.
 #
 # Pins the 2026-06-10 live failure: Claude Code with a huge MCP toolset sent a
@@ -19,16 +19,14 @@
 #      prefill at the next chunk boundary), and the next request isn't stuck
 #      behind a ghost.
 #
-# Usage: ./tests/test_disconnect_cancel.sh [model_dir] [port]
-#   Starts its own server. Default model: the Flash-Next EXL3 pack.
-
+# Cancellation takes effect at a chunk boundary and the boot's chunk is auto-sized, so no check holds a
+# wall-clock bound: the cancel is proven by its log line and by the session list going idle.
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
 set -u
 
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${2:-11264}"
-BASE="http://127.0.0.1:$PORT"
-BINARY="${BINARY:-./zig-out/bin/sushi}"
-LOG=/tmp/test_disconnect_cancel.log
+BASE="$SUSHI_URL"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 PASS=0
 FAIL=0
 
@@ -45,88 +43,77 @@ check() {
     fi
 }
 
-if [ ! -d "$MODEL" ]; then
-    echo "SKIP: model dir not found: $MODEL"
-    exit 0
-fi
+# requests the server still prefills or decodes
+live_sessions() {
+    curl -s -m 10 "$BASE/metrics.json" | python3 -c 'import sys,json; print(sum(1 for x in json.load(sys.stdin).get("sessions",[]) if x.get("phase") in ("prefill","decode")))'
+}
+# waits (at most 180 s) for the session list to go idle; the last count stays in $LIVE
+wait_idle() {
+    for _ in $(seq 1 180); do
+        LIVE=$(live_sessions)
+        [ "$LIVE" = 0 ] && return 0
+        sleep 1
+    done
+    return 1
+}
+count_log() { sushi_log_since | grep -c "$1"; }
 
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-# Cancellation takes effect at a chunk boundary; auto-sized chunks can exceed
-# the entire 12s bound under GPU contention. Pin the workload, not a looser deadline.
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 32768 --prefill-chunk 512 --metrics --log-level debug > "$LOG" 2>&1 &
-SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
-
-for _ in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 2
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"; exit 1; }
-
-# ~27K-token unique-ish prompts (≈40-60s cold prefill on E4B) — slow enough
-# that keepalives and the disconnect window are clearly observable. Distinct
-# seeds per check: a shared prompt would let check 2's ghost ride check 1's
-# hot-prefix-cache entry and skip the cold prefill entirely.
+# ~36K-token unique-ish prompts, long enough on every arch that keepalives and the
+# disconnect window are clearly observable. Distinct seeds per check: a shared prompt would let
+# check 2's ghost ride check 1's prefix-cache entry and skip the cold prefill entirely.
 big_body() { # $1 = seed -> JSON on stdout
     python3 - "$1" <<'EOF'
-import json, random, sys
+import json, os, random, sys
 random.seed(int(sys.argv[1]))
 words = ["alpha","bridge","cobalt","delta","ember","fjord","glacier","harbor",
          "isotope","jasper","kelvin","lumen","meridian","nectar","onyx","prism"]
-text = " ".join(random.choice(words) + str(i % 97) for i in range(9000))
+text = " ".join(random.choice(words) + str(i % 97) for i in range(12000))
 print(json.dumps({
     "model": "m", "max_tokens": 40, "stream": True,
-    "messages": [{"role": "user", "content": "Summarize this in one word: " + text}],
+    "messages": [{"role": "user", "content": os.environ["SUSHI_NONCE"] + " Summarize this in one word: " + text}],
 }))
 EOF
 }
-big_body 7 > /tmp/disconnect_cancel_big.json
-big_body 1234 > /tmp/disconnect_cancel_big2.json
+big_body 7 > "$WORK/big.json"
+big_body 1234 > "$WORK/big2.json"
+OK_BODY='{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Say OK."}]}'
 
 echo "1. keepalive pings flow during a long prefill (/v1/messages stream)"
-# Small chunks trade throughput for cancellation latency; let the full prompt finish.
-curl -sN -m 300 "$BASE/v1/messages" -H 'Content-Type: application/json' \
-    -d @/tmp/disconnect_cancel_big.json > /tmp/disconnect_keepalive.sse
-PINGS=$(grep -c '"type":"ping"' /tmp/disconnect_keepalive.sse)
+curl -sN -m 600 "$BASE/v1/messages" -H 'Content-Type: application/json' \
+    -d @"$WORK/big.json" > "$WORK/keepalive.sse"
+PINGS=$(grep -c '"type":"ping"' "$WORK/keepalive.sse")
 echo "    -> $PINGS ping event(s)"
 check "≥2 ping events (initial + ≥1 during prefill)" "$([ "$PINGS" -ge 2 ] && echo 1 || echo 0)"
-grep -q '"type":"message_stop"' /tmp/disconnect_keepalive.sse
+grep -q '"type":"message_stop"' "$WORK/keepalive.sse"
 check "request still completes normally" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 echo "2. disconnect mid-prefill cancels the ghost; next request not blocked"
+CANCELS_BEFORE=$(count_log "client disconnected")
 # Client gives up after 3s — mirrors Claude Code's timeout+retry behavior.
 curl -sN -m 3 "$BASE/v1/messages" -H 'Content-Type: application/json' \
-    -d @/tmp/disconnect_cancel_big2.json > /dev/null 2>&1
-START=$(date +%s)
-SMALL=$(curl -s -m 60 "$BASE/v1/messages" -H 'Content-Type: application/json' \
-    -d '{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"Say OK."}]}')
-ELAPSED=$(( $(date +%s) - START ))
-echo "    -> follow-up request took ${ELAPSED}s"
+    -d @"$WORK/big2.json" > /dev/null 2>&1
+SMALL=$(curl -s -m 600 "$BASE/v1/messages" -H 'Content-Type: application/json' -d "$OK_BODY")
 echo "$SMALL" | grep -q '"type":"message"'
 check "follow-up request succeeded" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-# Post-fix: ghost noticed within one keepalive interval (10s) + chunk abort.
-# Pre-fix: the follow-up waits out the ghost's entire remaining prefill+decode.
-check "follow-up completed in <12s (ghost cancelled)" "$([ "$ELAPSED" -lt 12 ] && echo 1 || echo 0)"
-grep -q "client disconnected" "$LOG"
-check "server logged the disconnect-cancel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+wait_idle
+echo "    -> requests still generating after the follow-up: $LIVE"
+check "no request still prefilling for the departed client" "$([ "$LIVE" = 0 ] && echo 1 || echo 0)"
+# Pre-fix, the ghost ground through its whole prefill and never logged a cancel.
+check "server logged the disconnect-cancel" "$([ "$(count_log "client disconnected")" -gt "$CANCELS_BEFORE" ] && echo 1 || echo 0)"
 
 echo "3. disconnect mid-decode cancels a non-stream ghost (/v1/messages stream=false)"
 # A non-stream request never idles once tokens flow, so an idle-only peer probe misses a client that left mid-decode.
 curl -s -m 5 "$BASE/v1/messages" -H 'Content-Type: application/json' \
-    -d '{"model":"m","max_tokens":6000,"stream":false,"messages":[{"role":"user","content":"Count from 1 to 3000, one number per line."}]}' > /dev/null 2>&1
+    -d '{"model":"m","max_tokens":6000,"stream":false,"messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Count from 1 to 3000, one number per line."}]}' > /dev/null 2>&1
 # A batching server serves a follow-up beside a ghost, so timing cannot tell; the live session list can.
 sleep 8
-LIVE=$(curl -s -m 10 "$BASE/metrics.json" | python3 -c 'import sys,json; print(sum(1 for x in json.load(sys.stdin).get("sessions",[]) if x.get("phase") in ("prefill","decode")))')
+LIVE=$(live_sessions)
 echo "    -> requests still generating 8s after the client left: $LIVE"
 check "no request still decoding for the departed client" "$([ "$LIVE" = 0 ] && echo 1 || echo 0)"
-SMALL=$(curl -s -m 120 "$BASE/v1/messages" -H 'Content-Type: application/json' \
-    -d '{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"Say OK."}]}')
+SMALL=$(curl -s -m 600 "$BASE/v1/messages" -H 'Content-Type: application/json' -d "$OK_BODY")
 echo "$SMALL" | grep -q '"type":"message"'
 check "follow-up request succeeded" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-grep -q "client disconnected while decoding (non-stream)" "$LOG"
+sushi_log_since | grep -q "client disconnected while decoding (non-stream)"
 check "server logged the non-stream decode cancel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 echo ""
