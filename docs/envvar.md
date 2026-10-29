@@ -55,11 +55,11 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DFLASH_TRACE` | `generate.zig:8026` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `transformer.zig:24530` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_DUMP_RESTORE` | `restore_dump.zig:31` | `<dir>` dumps prefix-restore tensors | once | no |
-| `SUSHI_EXL3_STAGE_PROFILE` | `exl3/expert_exl3_kernels.zig:103` | syncs and times each stage of a routed MoE layer (pair GEMV, down, reduce, sort, token prepare, GEMMs), logged as `[exl3-stage]` | once | yes: engine-exl3-experts |
-| `SUSHI_EXL3_SWIGLU_MAXABS` | `exl3/expert_exl3_kernels.zig:104` | dumps SwiGLU activation maxima (f16 overflow hunt) | once | yes: engine-exl3-experts |
-| `SUSHI_EXL3_UNION_HIST` | `exl3/expert_exl3_kernels.zig:164` | logs per-layer expert-count histograms (`[exl3-counts]`) on prefill | once | yes: engine-exl3-experts, qwen4-perf |
+| `SUSHI_EXL3_STAGE_PROFILE` | `exl3/expert_exl3_kernels.zig:108` | syncs and times each stage of a routed MoE layer (pair GEMV, down, reduce, sort, token prepare, GEMMs), logged as `[exl3-stage]` | once | yes: engine-exl3-experts |
+| `SUSHI_EXL3_SWIGLU_MAXABS` | `exl3/expert_exl3_kernels.zig:130` | dumps SwiGLU activation maxima (f16 overflow hunt) | once | yes: engine-exl3-experts |
+| `SUSHI_EXL3_UNION_HIST` | `exl3/expert_exl3_kernels.zig:190` | logs per-layer expert-count histograms (`[exl3-counts]`) on prefill | once | yes: engine-exl3-experts, qwen4-perf |
 | `SUSHI_EXPERT_DEFER_SYNC` | `qwen4_forward.zig:1970` | `1` forces synchronous expert verification for an exact schedule comparison | once | yes: engine-expert-streaming |
-| `SUSHI_FORCE_GPU_FAMILY_FALLBACK` | `transformer.zig:1532, exl3/expert_exl3_kernels.zig:1253` | `1` pretends the matrix units are absent to rehearse the M1-M4 path on an M5; the EXL3 and verify-qmm parity tests set it | once | yes: glm5-arch, glm5-kernels, glm5-perf, ... |
+| `SUSHI_FORCE_GPU_FAMILY_FALLBACK` | `transformer.zig:1532, exl3/expert_exl3_kernels.zig:1112` | `1` pretends the matrix units are absent to rehearse the M1-M4 path on an M5; the EXL3 and verify-qmm parity tests set it | once | yes: glm5-arch, glm5-kernels, glm5-perf, ... |
 | `SUSHI_KERNEL_BUILD_LOG` | `mlx_kernel_keys.zig` (the `mlx_fast_metal_kernel_*` wrappers of `mlx.zig`) | `1` logs every custom-kernel library key MLX has not compiled yet as `[kernel-build] #N name src=... template args -> outputs in: inputs`; each is a Metal compile on the inference thread | once | yes: engine-mlx-gotchas |
 | `SUSHI_KVQ_PARITY_TRACE`, `SUSHI_MIMO_VISION_DIAG`, `SUSHI_EXL3_PARITY_TRACE` | `transformer.zig`, `mimo_forward.zig`, `mimo_vision.zig`, `mimo_fixture_test.zig` | prints extra parity / vision diagnostics inside a test (the EXL3 one: the MiMo EXL3 tests' relative RMS) | test | yes: CLAUDE |
 | `SUSHI_LAYER_CAP` | `transformer.zig:22297` | `<n>` runs only the first n layers so a ms-vs-layers slope is measurable (`tests/fwd_ubench.sh`) | once | yes: tests/CLAUDE |
@@ -87,7 +87,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_DECODE_FWD_UBENCH` | `model_load.zig:1760` | `<n>` times n decode-width forwards at load (no sampling, no cache bookkeeping), then resets the KV | load | yes: engine-kernels, mimo2-arch, mimo2-perf, ... |
 | `SUSHI_DECODE_FWD_UBENCH_S`, `SUSHI_DECODE_FWD_UBENCH_KV` | `model_load.zig` | `<rows>[,...]` verify widths to time; `<tokens>` prefill before timing | load | yes: perf-baselines |
 | `SUSHI_DECODE_FWD_UBENCH_PROFILE` | `model_load.zig` | one extra profiled pass per width | load | no |
-| `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:177, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
+| `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:177, exl3/expert_exl3_kernels.zig:1080` | `<n>` times n decode ticks end to end | once | no |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `glm5_rows_tick.zig`, `model_load.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
 | `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `glm5_rows_tick.zig`, `model_load.zig` | `<n>` rounds per width B in 1..4 of plain decode at load, then one request's 1..8-row chain verify (ms, and bit-equality of every row against serial decode) and a routed layer's feed-forward at 1..8 rows; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
 | `SUSHI_VISION_Q8_REPORT`, `SUSHI_QWEN_VISION_UBENCH` | `dsv41_vision.zig`, `dsv41_thought_point.zig`, `qwen_vision.zig` | requantized-tower report (cosine, time) on a real tower, Qwen vision encoder meter (`<reps>`) | test | yes: mimo2-perf, tests/CLAUDE |
@@ -131,7 +131,7 @@ Kept because the launch flag cannot express what the env does.
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
 | `SUSHI_MTP_ADAPTIVE` | `generate.zig:8059` | `0` selects the windowed depth controller, a different algorithm that can also disable MTP; `--mtp-min-depth n --mtp-max-depth n` pins a depth but cannot express it | once | yes: engine-mtp, tests/CLAUDE, --help |
-| `SUSHI_PREFIX_CACHE_DIR` | `kv_disk_cache.zig:4332` | absolute directory for the SSD prefix cache (default under `~/.sushi`); `--prefix-cache-disk` sets a size, not a directory | boot | yes: engine-prefix-cache, tests/CLAUDE, --help |
+| `SUSHI_PREFIX_CACHE_DIR` | `disk_placement.zig:484` | absolute directory for the SSD prefix cache (default under `~/.sushi`); `--prefix-cache-disk` sets a size, not a directory | boot | yes: engine-prefix-cache, tests/CLAUDE, --help |
 
 ## Reads to fix
 

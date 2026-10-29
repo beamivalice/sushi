@@ -18,6 +18,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 | `src/exl3/rate_groups.zig` | Rate-grouped layers: the ragged bank (`Ragged`), the one-dispatch mixed-rate decode kernels, the per-group prefill GEMMs |
 | `src/exl3/expert_exl3.zig` | Host reference decoders (MUL1, MCG, STD1, SPEC1, PAIR1), `Rate`, `Window`, `Decode`, fixtures |
 | `src/exl3/expert_exl3_kernels.zig` | Prefill run-aligned 32-row window GEMM (NAX body, K4 fast branch; simdgroup-matrix body off NAX; scalar body), decode chain (`moeSwigluFused`), `DECODE_ROWS_MAX` (16), `usesPrefillArm` |
+| `src/exl3/kernel_source.zig` | Kernel source assembly: codebook and decode helpers, the slot table of built kernels, `CfgCache` |
+| `src/exl3/project_rows.zig` | The dense multi-row projection (`projectRows`, `PROJECT_ROWS_MAX`, `rows_exact`) behind `linear.zig` |
+| `src/exl3/sorted_windows.zig` | The GPU window table and the sorted-inverse finish (`gpuWindowPrefillOn`) that every model's prefill rides |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab (`gateUpSwiglu`; `downReduce`) for the unquantized HF checkpoint |
 
 **`src/exl3` is a module** (`sushi_exl3`), so another MLX host (mlx-serve) can serve EXL3 packs through the same code.
@@ -104,7 +107,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
   branch; ONE GEMM config reused across window counts (a per-row-count JIT compiled per novel prompt length).
-- **At the two served geometries (`mimoPrefillOn`: MiMo, Flash-Next) the routing never leaves the GPU**: one
+- **At the two served geometries (`gpuWindowPrefillOn`: MiMo, Flash-Next) the routing never leaves the GPU**: one
   threadgroup (a thread per expert, at most 512) builds the window table and the inverse sort order, and the finish
   reduce reads the sorted down plane through that inverse, bytes equal to un-sorting it first. Any other geometry
   builds the table on the host (a sync) and un-sorts with a copy ([perf-baselines](qwen4-perf.md#exl3-gpu-routing-meta)).
@@ -123,7 +126,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   ([perf-baselines](qwen4-perf.md#m2max-64gb)).
 - **Decode**: four dispatches per MoE layer — pair prepare, split-K pair GEMV with f32 inner planes, fused mid+down
   GEMV, f32 finish reduce (`moeSwigluFused`; top-k ≤ 32, named refusal above). On MiMo geometry the SwiGLU mid is
-  prepared once per (row, expert) (`preparedMidOn`, disabled for Qwen; like `mimoPrefillOn` it keys on geometry,
+  prepared once per (row, expert) (`preparedMidOn`, disabled for Qwen; like `gpuWindowPrefillOn` it keys on geometry,
   never on the rate), and the pair input too, in its own dispatch (`pairPrepare`): five dispatches. A pair
   threadgroup would otherwise re-derive its K span of x (64 times per slot). Rows ≤ `DECODE_ROWS_MAX` or verify rows take this
   chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider

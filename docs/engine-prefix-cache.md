@@ -2,7 +2,7 @@
 
 How prompt-prefix KV reuse works: the hot RAM cache, hybrid (GDN/QSA) restore points, the SSD tier and SSD-first
 mode, checkouts and donations, spec state riding the cache, and GLM's native state. Read this before touching `src/prefix_cache.zig`,
-`src/kv_disk_cache.zig` or `src/kv_disk_writer.zig`.
+`src/kv_disk_cache.zig`, `src/disk_placement.zig` or `src/kv_disk_writer.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-kv-cache.md),
 [engine-memory-admission](engine-memory-admission.md), [engine-mtp](engine-mtp.md),
@@ -13,11 +13,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | File | Role |
 |---|---|
 | `src/prefix_cache.zig` | Hot prefix cache (`--prefix-cache-entries`, `--prefix-cache-mem`) |
-| `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`), its default budget (`resolveDiskBudget`) and startup/usage lines |
+| `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
+| `src/disk_placement.zig` | The SSD tier's default budget (`resolveDiskBudget`), cache roots and model fingerprint, and the startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
-| `src/glm5/glm5_prefix.zig` | GLM restore points: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
-| `src/dsv41/dsv41_prefix.zig` | DeepSeek-V4.1 restore points: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
+| `src/glm5/glm5_prefix.zig` | GLM restore points and the `HotPrefixCache` arms and tests that serve them: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
+| `src/dsv41/dsv41_prefix.zig` | DeepSeek-V4.1 restore points and the `HotPrefixCache` arms and tests that serve them: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
 
 ## Basics
 
@@ -173,24 +174,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   every served model; `--prefix-cache-mem <n>` turns it on and `--prefix-cache-mem 0` (or `off`) keeps it off. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
   SSD-first (`prefix_cache.ssdFirstActive`: a disk tier and RAM off).
 - **The SSD tier is on and sized per model at load** (`server.prefixCacheDiskForLoad` through
-  `LoadParams.prefix_cache_disk_resolver`, the pure `kv_disk_cache.resolveDiskBudget`):
+  `LoadParams.prefix_cache_disk_resolver`, the pure `disk_placement.resolveDiskBudget`):
   `min(entries x context x bytes_per_token + 2 GB, 20 GB, free disk - 4 GB)`. **Sizes are binary: 1 GB = 1 GiB and 1 KB = 1 KiB**, as
   `--prefix-cache-disk 20GB` is read; every `GB` and `KB` in the lines, the logs and the page is that unit.
   - entries = `--prefix-cache-entries`; context = the model's PINNED served context (`diskContextForLoad` runs the
     idempotent `pinAutoContext`), so the line, `/props` and `/v1/models` name one number; free disk =
-    `kv_disk_cache.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
+    `disk_placement.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
   - bytes_per_token = `server.diskBytesPerToken`, from the SERIALIZED geometry: KV rows at the served width, the one
     pooled QSA history an entry writes, the MTP head's KV and history where the head is on, and a recurrent state's
     share of the point kept on every 8192 tokens (`ssmCheckpointBytes / POINT_GRID`). The QSA score bank is
     execution state and never counts, so no QSA switch moves it. DFlash2's window and MiMo's ring files are fixed per
     entry, not per token; the 2 GB slack is all the formula leaves them.
-  - **The tier's own bytes on disk count as free** (`kv_disk_cache.tierBytes` is added to the volume's free space at
+  - **The tier's own bytes on disk count as free** (`disk_placement.tierBytes` is added to the volume's free space at
     resolution, as `refreshDiskBudget` adds `total_bytes` live), and `DiskTier.operator_cap` is only the flag or the
     formula / 20 GB cap, never a free-space number; else a restart on a full volume evicts what the last boot stored.
   - A result of zero or less turns the tier off and one line says why. `--prefix-cache-disk <n>` is the budget as
     given (an operator's cap: the tier still stores no more than the volume leaves) and `0`/`off` disables;
     `--prefix-cache-entries 0` disables both tiers.
-  - It is a budget, not a preallocation, and ONE reserve governs it: free space less 4 GB (`kv_disk_cache.freeDiskRoom`,
+  - It is a budget, not a preallocation, and ONE reserve governs it: free space less 4 GB (`disk_placement.freeDiskRoom`,
     `DISK_FREE_RESERVE`) at resolution, before every store (`refreshDiskBudget`) and in the report. A budget under 1 GB
     still stores.
   - **The tier comes up before anything is sized for it.** `doLoadOnInferenceThread` resolves and attaches it first; a

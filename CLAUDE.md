@@ -114,7 +114,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, round-cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |
-| `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier | engine-prefix-cache |
+| `prefix_cache.zig` / `kv_disk_cache.zig` / `disk_placement.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier and its budget and roots | engine-prefix-cache |
 | `mlx_kernel_keys.zig` | custom-kernel library keys behind `mlx.zig`'s kernel wrappers (`SUSHI_KERNEL_BUILD_LOG`) | engine-mlx-gotchas |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
 | `vision.zig` / `vision_common.zig` / `qwen4/qwen_vision.zig` / `mimo2/mimo_vision.zig` / `glm5/glm5_vision.zig` / `mrope.zig` | media INPUT: shared preprocessing, Qwen3-VL + M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |

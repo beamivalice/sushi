@@ -700,7 +700,7 @@ bytes whatever plain and drafted rounds the policy (`dspark_rows.Policy`) picks 
 (`SUSHI_DSV41_DSPARK_ROWS`). A row's bytes depend on the arm of each linear it passes through, so each linear has one arm at
 every width. The trunk linears (`projectRows`) were the only arms that changed with the width: the one-row step took the SIMD
 rows arm and 2 or more rows the NAX arm, whose k sums differ. A DSpark round now runs the NAX arm at one row too
-(`kernels.rows_exact`, set around `verify`), except the lm_head, whose SIMD rows arm equals its one-row launch bit for bit and
+(`project_rows.rows_exact`, set around `verify`), except the lm_head, whose SIMD rows arm equals its one-row launch bit for bit and
 is the faster one up to 5 rows, so it takes the SIMD arm at every width. The rest is already width-invariant, by test: the shared
 expert's one-row coop chain against the lane chain (`STQ shared expert at DeepSeek's shape`), the expert-grouped routed chain
 (`verify rows that decode each distinct expert once`), the per-row commit and attention, router and indexer rows (the indexer's
