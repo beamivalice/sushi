@@ -1,12 +1,10 @@
 #!/bin/bash
-# Integration test for POST /v1/messages/count_tokens.
+# sushi-test: tier=live boot=api
+# Integration test for POST /v1/messages/count_tokens, attached to the shared api boot.
 # The count must equal the prompt /v1/messages prefills for the same body: usage.input_tokens
 # plus usage.cache_read_input_tokens (input_tokens excludes the cached part).
-# Usage: ./tests/test_anthropic_count_tokens.sh [port]
-# Requires a running sushi server with a loaded model.
-
-PORT=${1:-8080}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+BASE=$SUSHI_URL
 FIXTURE="$(cd "$(dirname "$0")" && pwd)/../src/fixtures/count_tokens_sample.json"
 PASS=0
 FAIL=0
@@ -70,12 +68,7 @@ prefilled() {
 echo "=== Anthropic count_tokens Integration Tests ==="
 echo "Server: $BASE"
 
-if ! curl -sf "$BASE/health" > /dev/null 2>&1; then
-    echo "SKIP: Server not running on port $PORT"
-    exit 0
-fi
-
-SAMPLE=$(cat "$FIXTURE")
+SAMPLE=$(python3 -c "import sys,json,os; d=json.load(sys.stdin); m=d['messages'][0]; m['content']=os.environ['SUSHI_NONCE']+' '+m['content']; print(json.dumps(d))" < "$FIXTURE")
 TOOLS=$(with_fields "$SAMPLE" '{"tools": [{"name": "get_time", "description": "Get the time in a city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]}')
 THINKING=$(with_fields "$SAMPLE" '{"thinking": {"type": "enabled", "budget_tokens": 1024}}')
 
