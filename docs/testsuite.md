@@ -85,7 +85,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | change | runs before commit |
 |---|---|
 | host files only (chat, parsers, grammar, tokenizer, pure planners) | `zig build test-host` |
-| one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41>`, plus that arch's scripts |
+| one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41>`, plus `tests/run.sh --tier live --model <arch>` for the scripts it touches (`--only <glob>` narrows) |
 | `src/exl3` or `src/encoder` only | `zig build test -Dmodel=exl3` or `-Dmodel=enc` |
 | a shared file, `build.zig` or `mlx.zig` | `zig build test` |
 | a landing on main | `zig build test` with the tiny-fixture envs set, plus the touched area's scripts |
@@ -126,7 +126,7 @@ not reported as a crash. A Python `own` script uses `lib/sushi_boot.py` (`Server
 **Runner.** `tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all] [--only glob]
 [--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default (`hermetic,host`, every pass) is what CI runs.
 `--list` prints the plan and boots nothing; `--check` refuses a missing or invalid header, a missing or stale matrix
-row and an attach script that launches `sushi` (`--no-matrix` waives the matrix rules until the matrix is complete). A pass builds ReleaseFast, boots each profile once with the lock held
+row and an attach script that launches `sushi` (`--no-matrix` waives the matrix rules for a tree under construction). A pass builds ReleaseFast, boots each profile once with the lock held
 for that boot only, reboots once after a crash, and stops at the end of the boot that failed unless `--keep-going`.
 The summary and an `END` marker land in `--out` (default `~/.sushi/runs/tests-<ts>/`). `tests/test_run.sh` proves it
 on a fixture tree and a stub server, without a model or a GPU.
