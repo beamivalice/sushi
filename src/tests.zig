@@ -17,6 +17,7 @@ test {
     _ = expert_stream;
     _ = expert_bf16_kernels;
     _ = @import("mimo2/mimo_quant_test.zig");
+    _ = @import("mimo2/mimo_config.zig");
     _ = @import("mimo2/mimo_generate_test.zig");
     _ = @import("expert_io.zig");
     _ = @import("imatrix.zig");
