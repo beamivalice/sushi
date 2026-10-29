@@ -1,6 +1,7 @@
 //! Flash-Next quantized sparse attention: block pooling, scoring and top-block selection.
 
 const trf = @import("../transformer.zig");
+const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const Transformer = trf.Transformer;
 const std = @import("std");
@@ -426,7 +427,7 @@ pub fn qsaSelectTopBlocks(
     const tg = qsaSelectTgFor(rows);
     const digits = qsaSelectDigitBits(rows);
     const key = QsaSelectCfgKey{ .rows = rows, .k = kb, .tg = tg, .digits = digits };
-    const sel_cfgs: [1]mlx.mlx_fast_metal_kernel_config = trf.qsa_select_cfgs.get(key) orelse blk: {
+    const sel_cfgs: [1]mlx.mlx_fast_metal_kernel_config = qwen4_qsa_select.qsa_select_cfgs.get(key) orelse blk: {
         const config = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const o_shape = [_]c_int{ 1, rows, kb };
@@ -436,7 +437,7 @@ pub fn qsaSelectTopBlocks(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TGS", tg));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", kb));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DIGITS", digits));
-        trf.qsa_select_cfgs.put(key, .{config});
+        qwen4_qsa_select.qsa_select_cfgs.put(key, .{config});
         break :blk .{config};
     };
 
@@ -515,7 +516,7 @@ pub fn qsaSelectTopBlocksSplit(
     const merge_tg: c_int = QSA_SELECT_TG_DEFAULT;
     const digits = qsaSelectDigitBits(rows);
     const key = QsaSelectSplitCfgKey{ .rows = rows, .k = kb, .slice_tg = slice_tg, .merge_tg = merge_tg, .digits = digits };
-    const cfgs: [2]mlx.mlx_fast_metal_kernel_config = trf.qsa_select_split_cfgs.get(key) orelse blk: {
+    const cfgs: [2]mlx.mlx_fast_metal_kernel_config = qwen4_qsa_select.qsa_select_split_cfgs.get(key) orelse blk: {
         const local_cfg = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(local_cfg);
         const local_shape = [_]c_int{ 1, rows, loc_count };
@@ -534,7 +535,7 @@ pub fn qsaSelectTopBlocksSplit(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge_cfg, "TGS", merge_tg));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge_cfg, "K", kb));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge_cfg, "DIGITS", digits));
-        trf.qsa_select_split_cfgs.put(key, .{ local_cfg, merge_cfg });
+        qwen4_qsa_select.qsa_select_split_cfgs.put(key, .{ local_cfg, merge_cfg });
         break :blk .{ local_cfg, merge_cfg };
     };
 

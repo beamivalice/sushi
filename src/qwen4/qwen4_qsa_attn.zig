@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
@@ -2826,8 +2827,8 @@ test "takeContig releases `view` exactly once on every faulted op (CPU stream, n
 
 test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95k" {
     const t = std.testing;
-    trf.qsa_score_fused_override = false;
-    defer trf.qsa_score_fused_override = null;
+    qwen4_qsa_select.qsa_score_fused_override = false;
+    defer qwen4_qsa_select.qsa_score_fused_override = null;
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(null));
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(""));
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom("wide"));
@@ -2879,26 +2880,26 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.qsa_score_bank_builds = 0;
-    const saved_fused = trf.qsa_score_fused_override;
+    const saved_fused = qwen4_qsa_select.qsa_score_fused_override;
     const saved_nax = trf.vqmm_nax_probe_override;
     const saved_sheet = qsa_score_sheet_mb_override;
     defer {
-        trf.qsa_score_fused_override = saved_fused;
+        qwen4_qsa_select.qsa_score_fused_override = saved_fused;
         trf.vqmm_nax_probe_override = saved_nax;
         qsa_score_sheet_mb_override = saved_sheet;
     }
     qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
-    trf.qsa_score_fused_override = true;
+    qwen4_qsa_select.qsa_score_fused_override = true;
 
     const fwd: u64 = 4096;
     const kv: u64 = 262144 * 4;
     const ratio: u64 = 4;
-    trf.qsa_score_fused_override = false;
+    qwen4_qsa_select.qsa_score_fused_override = false;
     const composed_n2 = qsaPrefillTransientBytes(2, fwd, kv, ratio, 128);
     const composed_hd64 = qsaPrefillTransientBytes(4, fwd, kv, ratio, 64);
     const composed_rows_n2 = qsaScoreRowsPerChunk(2, kv / ratio, fwd, 128);
     const composed_rows_hd64 = qsaScoreRowsPerChunk(4, kv / ratio, fwd, 64);
-    trf.qsa_score_fused_override = true;
+    qwen4_qsa_select.qsa_score_fused_override = true;
     try testing.expect(!qsaScoreFusedActiveFor(1, 2, 128));
     try testing.expect(!qsaScoreFusedActiveFor(1, 4, 64));
     try testing.expectEqual(composed_n2, qsaPrefillTransientBytes(2, fwd, kv, ratio, 128));
