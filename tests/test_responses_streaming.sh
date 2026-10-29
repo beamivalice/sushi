@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Integration test: /v1/responses streaming emits deltas incrementally.
 #
 # Regression for the bug surfaced by Local LLM Bench run #6 where
@@ -8,62 +8,44 @@
 # made TTFT == total generation time and produced absurd decode tok/s
 # (e.g. 1.7M tok/s) because the bench measured deltas-per-second.
 #
-# Real streaming should emit many delta events spaced over the decode
-# window — mirroring what /v1/chat/completions and /v1/messages do.
+# Real streaming should emit many delta events — mirroring what
+# /v1/chat/completions and /v1/messages do.
 #
-# Usage: ./tests/test_responses_streaming.sh [model_dir] [port]
+# Attaches to the shared api boot: tests/run.sh --only test_responses_streaming.sh --model <m>.
 
 set -u
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8099}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+BASE=$SUSHI_URL
+PORT=${SUSHI_URL##*:}
 PASS=0
 FAIL=0
 TOTAL=0
 
-if [ ! -d "$MODEL_DIR" ]; then
-    echo "SKIP: Model not found at $MODEL_DIR"
-    exit 0
-fi
-
-if [ ! -x "./zig-out/bin/sushi" ]; then
-    echo "FAIL: ./zig-out/bin/sushi not built"
-    exit 1
-fi
-
 echo "=== /v1/responses Streaming Increment Test ==="
-echo "Model: $MODEL_DIR"
-echo "Port: $PORT"
+echo "Server: $BASE ($SUSHI_ARCH)"
 echo ""
 
-echo "Starting server..."
-./zig-out/bin/sushi --model "$MODEL_DIR" --serve --port $PORT --log-level info \
-    >/tmp/sushi-stream-test.log 2>&1 &
-SERVER_PID=$!
-sleep 2
+# GLM cannot turn thinking off (low is its cheapest word), so it gets low and room for the thought.
+if [ "$SUSHI_ARCH" = glm5_next ]; then
+    EFFORT=low
+    EXTRA=4096
+else
+    EFFORT=none
+    EXTRA=0
+fi
 
-for i in $(seq 1 30); do
-    if curl -sf "$BASE/health" > /dev/null 2>&1; then
-        echo "Server ready (PID $SERVER_PID)"
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        echo "FAIL: Server did not start within 30s"
-        kill $SERVER_PID 2>/dev/null
-        exit 1
-    fi
-    sleep 1
-done
-echo ""
-
-cleanup() {
-    echo ""
-    echo "Stopping server (PID $SERVER_PID)..."
-    kill $SERVER_PID 2>/dev/null
-    wait $SERVER_PID 2>/dev/null
+# rbody <json>: "@N" becomes the attach nonce (every prompt starts with it), and the body gets the arch's cheap
+# reasoning effort plus its token headroom unless it names its own.
+rbody() {
+    python3 -I -c 'import json, sys
+d = json.loads(sys.argv[1].replace("@N", sys.argv[2]))
+d.setdefault("reasoning", {"effort": sys.argv[3]})
+if "max_output_tokens" in d:
+    d["max_output_tokens"] += int(sys.argv[4])
+print(json.dumps(d))' "$1" "$SUSHI_NONCE" "$EFFORT" "$EXTRA"
 }
-trap cleanup EXIT
 
 run_test() {
     local name="$1"
@@ -79,8 +61,7 @@ run_test() {
     fi
 }
 
-# Capture an SSE stream with relative wall-clock timestamps per line.
-# Output lines: <ms_since_request_start>\t<sse_line>
+# Capture an SSE stream, one line per event line: <ms_since_request_start>\t<sse_line>
 sse_with_timestamps() {
     local body="$1"
     python3 - "$BASE" "$body" <<'PY'
@@ -105,8 +86,8 @@ PY
 
 # ── Test A: text streaming emits multiple output_text.delta events ──
 echo "--- Test A: incremental output_text.delta events ---"
-BODY='{"model":"sushi","input":"Count from 1 to 20 separated by commas.","max_output_tokens":80,"temperature":0,"stream":true}'
-SSE=$(sse_with_timestamps "$BODY")
+BODY='{"model":"sushi","input":"@N Count from 1 to 20 separated by commas.","max_output_tokens":80,"temperature":0,"stream":true}'
+SSE=$(sse_with_timestamps "$(rbody "$BODY")")
 
 DELTA_COUNT=$(echo "$SSE" | grep -c $'\tdata: {"type":"response.output_text.delta"' || true)
 echo "  observed output_text.delta events: $DELTA_COUNT"
@@ -116,35 +97,38 @@ else
     run_test "incremental output_text.delta (>=3)" "FAIL" "got $DELTA_COUNT (expected ≥3 for ~20-token output)"
 fi
 
-# Span between first and last delta should reflect actual decode time.
-# With buffered emission, all deltas land within a few ms of each other
-# at the end of generation; with real streaming they span ≥100ms.
-SPAN_MS=$(echo "$SSE" | python3 -c '
-import sys
-firsts = []
+# Buffered emission is one delta carrying everything; real streaming splits it, and the pieces must
+# add up to the text that output_text.done reports.
+JOIN=$(echo "$SSE" | python3 -c '
+import sys, json
+deltas, done = [], None
 for line in sys.stdin:
-    parts = line.split("\t", 1)
-    if len(parts) != 2: continue
-    ms, payload = parts
-    if "response.output_text.delta" in payload:
-        firsts.append(int(ms))
-if len(firsts) < 2:
-    print(0)
+    _, _, payload = line.rstrip("\n").partition("\t")
+    if not payload.startswith("data: {"):
+        continue
+    ev = json.loads(payload[6:])
+    if ev.get("type") == "response.output_text.delta":
+        deltas.append(ev["delta"])
+    elif ev.get("type") == "response.output_text.done":
+        done = ev["text"]
+if done is None:
+    print("no output_text.done")
+elif "".join(deltas) != done:
+    print("deltas do not join to output_text.done")
 else:
-    print(firsts[-1] - firsts[0])
+    print("ok")
 ')
-echo "  span(first delta → last delta): ${SPAN_MS}ms"
-if [ "$SPAN_MS" -ge 100 ]; then
-    run_test "deltas spread across decode window (>=100ms)" "PASS" ""
+if [ "$JOIN" = ok ]; then
+    run_test "deltas join to output_text.done" "PASS" ""
 else
-    run_test "deltas spread across decode window (>=100ms)" "FAIL" "span=${SPAN_MS}ms (deltas bunched — buffered emission)"
+    run_test "deltas join to output_text.done" "FAIL" "$JOIN"
 fi
 echo ""
 
 # ── Test B: reasoning streaming emits multiple summary_text.delta events ──
 echo "--- Test B: incremental reasoning_summary_text.delta events ---"
-BODY='{"model":"sushi","input":"What is 12 + 34? Think step by step.","reasoning":{"effort":"medium"},"max_output_tokens":256,"temperature":0,"stream":true}'
-SSE=$(sse_with_timestamps "$BODY")
+BODY='{"model":"sushi","input":"@N What is 12 + 34? Think step by step.","reasoning":{"effort":"medium"},"max_output_tokens":256,"temperature":0,"stream":true}'
+SSE=$(sse_with_timestamps "$(rbody "$BODY")")
 
 R_DELTA_COUNT=$(echo "$SSE" | grep -c $'\tdata: {"type":"response.reasoning_summary_text.delta"' || true)
 T_DELTA_COUNT=$(echo "$SSE" | grep -c $'\tdata: {"type":"response.output_text.delta"' || true)
@@ -168,8 +152,8 @@ echo ""
 # The WebSocket transport must NOT get one (its terminator is the
 # response.completed event itself) — this test covers HTTP only.
 echo "--- Test C: terminal data: [DONE] sentinel (HTTP SSE) ---"
-BODY='{"model":"sushi","input":"Say hi.","max_output_tokens":16,"temperature":0,"stream":true}'
-SSE=$(sse_with_timestamps "$BODY")
+BODY='{"model":"sushi","input":"@N Say hi.","max_output_tokens":16,"temperature":0,"stream":true}'
+SSE=$(sse_with_timestamps "$(rbody "$BODY")")
 
 LAST_DATA=$(echo "$SSE" | grep $'\tdata: ' | tail -1 | cut -f2-)
 COMPLETED_COUNT=$(echo "$SSE" | grep -c $'\tdata: {"type":"response.completed"' || true)
@@ -192,10 +176,12 @@ echo ""
 # expects to poll — a silent lie flagged by llmprobe. A clean 400 is the
 # honest answer (probes report it as "unsupported", not failed).
 echo "--- Test D: background:true returns 400 ---"
-BG_BODY='{"model":"sushi","input":"Say hi.","max_output_tokens":16,"background":true}'
-BG_CODE=$(curl -s -o /tmp/responses_bg_test.out -w '%{http_code}' \
-    -X POST "$BASE/v1/responses" -H 'Content-Type: application/json' -d "$BG_BODY")
-BG_BODY_OUT=$(cat /tmp/responses_bg_test.out)
+BG_BODY='{"model":"sushi","input":"@N Say hi.","max_output_tokens":16,"background":true}'
+BG_OUT=$(mktemp)
+BG_CODE=$(curl -s -o "$BG_OUT" -w '%{http_code}' \
+    -X POST "$BASE/v1/responses" -H 'Content-Type: application/json' -d "$(rbody "$BG_BODY")")
+BG_BODY_OUT=$(cat "$BG_OUT")
+rm -f "$BG_OUT"
 echo "  status: $BG_CODE"
 if [ "$BG_CODE" = "400" ] && echo "$BG_BODY_OUT" | grep -q "background"; then
     run_test "background:true rejected with 400 naming background" "PASS" ""
@@ -211,9 +197,10 @@ echo ""
 # chained sessions. Two chained turns on one socket must complete with zero
 # [DONE] frames.
 echo "--- Test E: WS transport — chained turns, zero [DONE] frames ---"
-WS_OUT=$(python3 - "$PORT" <<'PY'
+WS_OUT=$(python3 - "$PORT" "$SUSHI_NONCE" "$EFFORT" "$EXTRA" <<'PY'
 import base64, json, os, socket, sys
 
+nonce, effort, extra = sys.argv[2], sys.argv[3], int(sys.argv[4])
 sock = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=120)
 key = base64.b64encode(os.urandom(16)).decode()
 sock.sendall((
@@ -273,10 +260,10 @@ def run_turn(body):
         if ev.get("type") in ("response.failed", "response.incomplete"):
             raise RuntimeError(ev.get("type"))
 
-turn = {"type": "response.create", "model": "sushi", "input": "Say hi.",
-        "max_output_tokens": 16, "temperature": 0}
+turn = {"type": "response.create", "model": "sushi", "input": f"{nonce} Say hi.",
+        "max_output_tokens": 16 + extra, "temperature": 0, "reasoning": {"effort": effort}}
 id1, done1 = run_turn(turn)
-turn2 = dict(turn, input="Say bye.", previous_response_id=id1)
+turn2 = dict(turn, input=f"{nonce} Say bye.", previous_response_id=id1)
 id2, done2 = run_turn(turn2)
 print(f"ws {0 if (done1 or done2) else 1} chained={bool(id1 and id2)} done_frames={done1 or done2}")
 PY
@@ -296,14 +283,14 @@ echo ""
 # body and then ECONNRESET instead of EOF. The reader here waits out that timer
 # after the server has finished (this test takes over a minute).
 echo "--- Test F: tools + reasoning budget — a lagging reader ends with EOF, not a reset ---"
-F_OUT=$(python3 - "$PORT" <<'PY'
+F_OUT=$(python3 - "$PORT" "$SUSHI_NONCE" <<'PY'
 import json, socket, subprocess, sys, time
 
 port = int(sys.argv[1])
 fin_timeout = int(subprocess.check_output(["sysctl", "-n", "net.inet.tcp.fin_timeout"]).strip()) / 1000
 body = json.dumps({
     "model": "sushi",
-    "input": "What is the weather in Paris? Think about which unit to use first.",
+    "input": f"{sys.argv[2]} What is the weather in Paris? Think about which unit to use first.",
     "tools": [{"type": "function", "name": "get_weather", "description": "Get the current weather for a city",
                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
     "reasoning": {"effort": "medium"}, "reasoning_budget_tokens": 24,
