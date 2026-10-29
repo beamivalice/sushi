@@ -86,7 +86,7 @@ kernels) loaded through `taskpolicy -a env DYLD_LIBRARY_PATH=…`, plus `SUSHI_F
 M1–M4 kernels on M5 clocks and bandwidth, so the numbers order arms; they are not an M1–M4's speed. 2026-10-04,
 `taskpolicy -a`, lock per run, contended box (other workers queued), not quiet.
 
-Sparse latent attention at 16K history (`SUSHI_GLM_ATTN_UBENCH=1`, one process, arms interleaved, median of 12,
+Sparse latent attention at 16K history (`sushi-ubench run glm5.mla_chunk_attn`, one process, arms interleaved, median of 12,
 `4f174096`); error is row 0 against an FP64 oracle:
 
 | rows | stage | scalar | FP32 composite | fused NAX | max abs error (scalar / composite / NAX) |
@@ -96,7 +96,7 @@ Sparse latent attention at 16K history (`SUSHI_GLM_ATTN_UBENCH=1`, one process, 
 | 1 | stock (TF32) | 1.054 ms | 0.549 ms | 1.366 ms | 7.58e-3 / 8.05e-3 / 7.58e-3 |
 | 8 | stock (TF32) | 1.699 ms | 0.487 ms | 0.464 ms | 7.75e-3 / 7.75e-3 / 7.75e-3 |
 
-NAX-shaped arms on MLX's non-NAX kernels (`SUSHI_GLM_ARMS_UBENCH=1`, NAX-less stage, median of 10, `4f174096`): A6
+NAX-shaped arms on MLX's non-NAX kernels (`sushi-ubench run glm5.nax_arms`, NAX-less stage, median of 10, `4f174096`): A6
 dense-once T2048 4096→8192 10.38 → 9.52 ms and KDA cluster 0.667 → 0.623 ms, both bit-exact; MLA three-row verify
 batch 0.179 = 0.179 ms, exact; MLA head batch query 14.15 → 3.64 ms and value 20.14 → 3.85 ms, rel L2 2.6e-3 / 3.2e-3
 (a numerics change). All stay NAX-only: none has passed the model gate or the drift screen off NAX.
@@ -399,7 +399,7 @@ Verify is the median `glm_round_ms verify` over the 36–37 requests of each boo
 - Engagement in the new 2bpw log: `[glm] copy-free QKV engaged (A5g128)`, `[glm-dflash] coefficient hoist rows engaged
   (A5g128)`, `[glm-dflash] affine row tiles engaged (A5g128)`. The A6 lines come from `lm_head`. Both greedy answers
   matched the old binary byte for byte in every 2bpw boot.
-- Component, `SUSHI_GLM_QMM_UBENCH` (3 rows, 12 distinct banks per arm, lock, not a quiet window): 8192x4096 serial
+- Component, `sushi-ubench run glm5.verify_qmm` (3 rows, 12 distinct banks per arm, lock, not a quiet window): 8192x4096 serial
   stock 0.104 ms, A5 hoist 0.0645, A5 row tiles 0.078 (A6 hoist 0.089); 4096x16384 0.210 / 0.130 / 0.146. An A5
   hoist holding all 24 coefficients at once ran 0.191 ms, slower than the serial rows.
 
@@ -461,7 +461,7 @@ tests, `taskpolicy -a`, GPU lock per boot, 2026-10-04: 2048-row chunks prefilled
 ## Prefill: A6 dense-once beyond the KDA banks
 
 Per call at 2048 rows, qmm against dequantize + dense NAX GEMM, six calls per graph, medians of 9, arms interleaved in
-one process (`SUSHI_GLM_A6_SHAPES_UBENCH=1`, `a6296520` ancestry, `taskpolicy -a`, GPU lock, QUIET, AC). Bytes are
+one process (`sushi-ubench run glm5.a6_trunk`, `a6296520` ancestry, `taskpolicy -a`, GPU lock, QUIET, AC). Bytes are
 compared with qmm on random banks.
 
 | K→N | projection | qmm | dense-once | bytes | served |
@@ -525,7 +525,7 @@ Baseline, main `a28b15de`, which prefilled at 512 rows (the quarter-share rule; 
 Inside the 128K prefill: 556 tok/s at 0-8K, 454 at 24-32K, 317 at 56-64K, 193 at 120-128K, the scalar index scorer
 (one MLA layer at 128K: scores 553 of 634 ms per 2048-row chunk). At 128K DFlash2 (25.0) lost to serial (26.3).
 
-Component meter, quiet box (load 0.94), lock, `SUSHI_GLM_LONGCTX_UBENCH`: one MLA layer on a synthetic kv8 state, whole
+Component meter, quiet box (load 0.94), lock, `sushi-ubench run glm5.mla_chunk_stages`: one MLA layer on a synthetic kv8 state, whole
 sparse attention per 2048-row chunk, arms interleaved in one process (cumulative; `641a9300` carries all four):
 
 | context | main | + tree scorer | + B32 tiles | + ranked top-512 | + lazy NAX tiles |
@@ -555,7 +555,7 @@ peaked 2.14 GB above active at 32K and 2.80 GB at 128K (bill 4,984 MiB). A 2K pr
 rows and 853 at 2048 (one request each).
 
 Settle-one-behind tiles and 32-row selection (`12d2e5f6` + `ebb7224c`), Sushi-2.4bpw kv8, GPU lock + QUIET, `taskpolicy -a`.
-Whole attention per 2048-row chunk (`SUSHI_GLM_LONGCTX_UBENCH`, one MLA layer, contended box, 6K-32K): about 9 ms lower
+Whole attention per 2048-row chunk (`sushi-ubench run glm5.mla_chunk_stages`, one MLA layer, contended box, 6K-32K): about 9 ms lower
 than the paired-tile schedule (57 → 48 ms at 6K-16K); the 32-row selection adds −1 to −1.4 ms (locked, quiet:
 48.7 vs 50.1 at 6K, 56.3 vs 57.5 at 16K). Model level, one boot with a per-request arm switch, ABBA x2, `--no-drafter`,
 prefix cache off, greedy text equal: 7.5K prompt 661.5 → 672.9 tok/s (+1.7%), 15.9K prompt 621.2 → 632.6 (+1.8%).
@@ -563,7 +563,7 @@ prefix cache off, greedy text equal: 7.5K prompt 661.5 → 672.9 tok/s (+1.7%), 
 Serial decode row (`runRow`, this branch on main `075978d7`), Sushi-2.4bpw kv8, `--no-drafter`, `SUSHI_GLM_ROWS_UBENCH=24` B=1
 serial ms/token, arms alternated every round in one boot (12 rounds each), GPU lock + QUIET + AC, `taskpolicy -a`:
 1K 27.93 → 27.71 (−0.8%), 8K 29.35 → 28.76 (−2.0%), 16K 30.38 → 29.79 (−1.9%); one earlier boot: 27.84 → 27.56, 29.82 → 29.49.
-`SUSHI_GLM_DECODE_UBENCH` per MLA layer (µs, dependent 16-layer chain, ~20 µs of it chain plumbing), before → after: 1K 129 → 116,
+`sushi-ubench run glm5.mla_decode_attn` per MLA layer (µs, dependent 16-layer chain, ~20 µs of it chain plumbing), before → after: 1K 129 → 116,
 8K 172 → 157, 32K 187 → 177, 128K 230 → 218.
 
 Quiet bench, binary `b8267038` (carries the four wins), llmprobe 0.6.13 `--bench-only --rungs 2k,8k,32k,128k --runs 1`,
@@ -629,7 +629,7 @@ Bytes equal the lane chain's at n32..64 and 72/80/96/112/128 (small shape) and a
 ## Prefill: KDA prework reads q/k/v in place (T2048 layer, 8K prompt)
 
 Settings: Sushi-2.4bpw trunk shapes, `taskpolicy -a`, GPU lock, QUIET, AC power, base `ad562c40`. Synthetic T2048 layer
-(`SUSHI_GLM_KDA_PREFILL_UBENCH`, stages queued one eval each, medians of 14, minima in brackets): dequant q,k,v 1.1,
+(`sushi-ubench run glm5.kda_prefill`, stages queued one eval each, medians of 14, minima in brackets): dequant q,k,v 1.1,
 q,k,v GEMMs 7.3, concat 0.57, dequant o 0.33, o GEMM 2.6, FA/GA/beta cluster 0.6, f_b+g_b 0.55, prework 0.89, recurrence
 3.6, post 0.39; whole layer 14.7 (stages overlap). A single 8192^3 bf16 GEMM runs 60 TFLOPs, the QKV GEMMs 56, the
 output GEMM 53. Dropping the concat (prework addresses the three projections): prework 1.29 -> 0.89 ms with the concat,
