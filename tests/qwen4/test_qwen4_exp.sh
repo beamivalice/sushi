@@ -5,8 +5,7 @@
 # call + round-trip, streaming delta cleanliness, and a prompt past the QSA
 # budget (2048 tokens) — asserted through the server's own
 # `[qsa] sparse attention engaged` line, since a dense fallback answers
-# plausibly too. [7] sends an image (tower + M-RoPE engagement lines) and
-# SKIPs when the pack's index names no tower tensor (`vision_tower.` or `model.visual.`). [11] reboots
+# plausibly too. Image input lives in test_media.sh. [11] reboots
 # `--no-vision` (tower absent, text works, media 400s by name). SKIPs without the pack.
 #   QWEN4_MODEL=<pack dir> ./tests/qwen4/test_qwen4_exp.sh [port]
 set -u
@@ -104,7 +103,6 @@ fi
 apr=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1 | sed -E 's/.*avg_per_round=([0-9.]+).*/\1/')
 echo "  avg accepted per round: $apr"
 check "acceptance floor 0.5/round" "$(python3 -c "print(1 if float('${apr:-0}')>=0.5 else 0)")" "1"
-echo "[7] image turn (vision tower + M-RoPE)"
 IMAGE="$(dirname "$0")/../fixtures/house.jpeg"
 img=""
 if [ -f "$IMAGE" ]; then
@@ -112,27 +110,6 @@ if [ -f "$IMAGE" ]; then
   img=$(python3 -c "
 import json,sys
 print(json.dumps({'messages':[{'role':'user','content':[{'type':'text','text':'What is the main subject of this image? One word.'},{'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+sys.argv[1]}}]}],'max_tokens':48,'temperature':0,'enable_thinking':False}))" "$B64")
-fi
-if grep -qE '"(vision_tower|model\.visual)\.' "$MODEL/model.safetensors.index.json" 2>/dev/null && [ -f "$IMAGE" ]; then
-  resp=$(echo "$img" | curl -s -m 600 -w '\n%{http_code}' "$U/v1/chat/completions" -H 'content-type: application/json' -d @-)
-  code=$(echo "$resp" | tail -1)
-  ians=$(echo "$resp" | sed '$d' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])" 2>/dev/null)
-  echo "  -> $(echo "$ians" | tr '\n' ' ' | cut -c1-80)"
-  check "image http 200" "$code" "200"
-  check "image answer names the house" "$(echo "$ians" | grep -ciE 'house|home|building|cottage' | sed 's/^[1-9][0-9]*$/1/')" "1"
-  check "vision encoder load line" "$(grep -c 'Vision encoder: Qwen3-VL ViT' "$LOG")" "1"
-  check "m-rope engaged" "$(grep -c 'M-RoPE: 1 images' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
-  echo "[7b] MTP on the image turn (head reads the slot's M-RoPE table)"
-  nm7=$(grep -c 'spec-stats\] mode=mtp' "$LOG")
-  imgm=$(echo "$img" | python3 -c "import sys,json; d=json.load(sys.stdin); d['enable_mtp']=True; print(json.dumps(d))")
-  mans=$(echo "$imgm" | curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])")
-  echo "  -> $(echo "$mans" | tr '\n' ' ' | cut -c1-80)"
-  check "mtp engaged on the image turn" "$(python3 -c "print(1 if $(grep -c 'spec-stats\] mode=mtp' "$LOG") > $nm7 else 0)")" "1"
-  check "mtp image answer == serial (tie-aware)" "$(same_or_tie "$img" "$mans")" "1"
-  # Sampled AFTER an image turn: tower weights are lazy until first use.
-  vis_bytes=$(curl -s "$U/props" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory']['active_bytes'])")
-else
-  echo "  SKIP: pack has no vision tower"
 fi
 # Widest batched decode group the scheduler reports while $c1 and $c2 run.
 peak_group() {
