@@ -125,6 +125,7 @@ test {
     _ = @import("dsv41/dsv41_stream.zig");
     _ = @import("dsv41/dsv41_borrow.zig");
     _ = @import("dsv41/dsv41_prefix.zig");
+    _ = @import("dsv41/dsv41_prefix_cache_test.zig");
     _ = @import("dsv41/dsv41_generate_test.zig");
     _ = @import("dsv41/dsv41_kernels.zig");
     _ = @import("glm5/glm5_next.zig");

@@ -8,6 +8,13 @@ const transformer = @import("../transformer.zig");
 const model = @import("dsv41_model.zig");
 const expert_usage = @import("expert_usage.zig");
 const testing = std.testing;
+const KVCache = transformer.KVCache;
+const SSMCheckpoint = transformer.SSMCheckpoint;
+const dsv41_model = @import("dsv41_model.zig");
+const io_util = @import("../io_util.zig");
+const kv_disk_cache = @import("../kv_disk_cache.zig");
+const log = @import("../log.zig");
+const pc = @import("../prefix_cache.zig");
 
 /// Snapshot layers a restore point holds: each model slot's four arrays ride two layers' conv and ssm fields
 /// (the aux and pooled fields mean a QSA history to the cache, so they stay empty). A slot array the
@@ -260,6 +267,99 @@ pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, drop: ?*const exper
     if (drop) |d| try key.print(allocator, "-drop{d}-{x:0>16}", .{ d.n, d.digest() });
     if (pick_tolerance > 0) try key.print(allocator, "-pick{x:0>8}", .{@as(u32, @bitCast(pick_tolerance))});
     return key.toOwnedSlice(allocator);
+}
+
+/// A DeepSeek-V4.1 request restores its whole state from the entry's checkpoint into the model.
+pub fn lookupAndRestoreDsv41(
+    self: *pc.HotPrefixCache,
+    target_cache: *KVCache,
+    target_moe_seq_offset: *usize,
+    dsv: *dsv41_model.Model,
+    s: mlx.mlx_stream,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    vision_key: u64,
+    media_start: ?usize,
+    media_chain: []const pc.MediaSpan,
+    slot_id: ?usize,
+    skip: bool,
+) !pc.LookupResult {
+    return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .dsv41 = dsv }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, null, null, slot_id, skip);
+}
+
+/// DeepSeek: the live state rolled back in place to the deepest point of the slot's last request that this prompt
+/// shares, when no stored point reaches further: no read, no copy. Null leaves the state as it was.
+pub fn rollbackLiveDsv41(
+    self: *pc.HotPrefixCache,
+    m: *dsv41_model.Model,
+    target_cache: *KVCache,
+    target_moe_seq_offset: *usize,
+    s: mlx.mlx_stream,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    media_limits: kv_disk_cache.MediaLimits,
+    ram_match: anytype,
+) ?pc.LookupResult {
+    const live = &self.live_dsv41;
+    const cap: usize = if (media_limits.rule) |r| (r.limitFor(r.ctx, live.vision_key, live.media_start) orelse 0) else kv_disk_cache.MediaLimits.UNBOUNDED;
+    const idx = live.pick(m, prompt_ids, has_tools, cap) orelse return null;
+    const pos = live.points.items[idx].pos;
+    var stored: usize = if (ram_match) |rm| blk: {
+        const cps = self.entries.items[rm.idx].ssm_checkpoints orelse break :blk 0;
+        break :blk (pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, rm.shared) orelse break :blk 0).pos;
+    } else 0;
+    if (self.disk) |*d| if (d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits)) |hm| {
+        stored = @max(stored, hm.cp);
+    };
+    if (stored > pos) return null;
+    live.rollback(self.allocator, m, idx, prompt_ids) catch |err| {
+        log.warn("  [dsv41-prefix] live state not rolled back: {s}; a stored point serves\n", .{@errorName(err)});
+        live.clear(self.allocator);
+        return null;
+    };
+    target_cache.truncate(0, s) catch {};
+    target_cache.step = pos;
+    target_moe_seq_offset.* = pos;
+    self.last_restored_live = true;
+    return .{ .matched = pos, .full_match = false, .slot_owned = true };
+}
+
+/// DeepSeek's write-through: the request's restore points so far go to the SSD tier and every one of them
+/// leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
+/// commit returns. Below the tier's floor nothing is written and the points stay for the commit.
+/// `held` names the phase that waited on the writer, for the log.
+pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
+    if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+    var pending = false;
+    for (cps) |*cp| pending = pending or !cp.isReleased();
+    if (!pending) return;
+    markRows(cache) catch |err| {
+        log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
+        return;
+    };
+    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.keep(self.allocator, m, cp) catch |err| {
+        log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
+    };
+    const staged_before = self.disk.?.point_bytes_written;
+    var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+    self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
+    const bytes = self.disk.?.point_bytes_written - staged_before;
+    for (cps) |*cp| cp.release();
+    // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
+    log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
+}
+
+/// The request's state at `tokens.len`, which must be where the model stands, as one restore point straight to the
+/// SSD tier: shared rows, staged and released before the next forward appends.
+pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, s: mlx.mlx_stream) !void {
+    var cps = [1]SSMCheckpoint{try captureShared(self.allocator, m, tokens.len)};
+    defer cps[0].deinit(self.allocator);
+    self.writeThroughDsv41(m, cache, tokens, has_tools, media, &cps, s, "decode");
+}
+
+/// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
+pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp) void {
+    self.live_dsv41.publish(self.allocator, m, tokens, has_tools, media.key, media.start);
 }
 
 test "layoutKey: a boot that drops other experts or picks leniently has its own namespace" {
