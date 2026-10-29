@@ -342,7 +342,7 @@ pub var qsa_nax_override: ?bool = null;
 var qsa_nax_env: ?bool = null;
 
 /// Default on: the hardware gate (`qsaNaxEligible`) decides. `SUSHI_QSA_NAX=0` forces the stock
-/// gather: `tests/test_qsa_nax_prefill.py` runs its stock arm with it.
+/// gather.
 pub fn qsaNaxEnabledFrom(raw: ?[]const u8) bool {
     const v = raw orelse return true;
     return !std.mem.eql(u8, v, "0");

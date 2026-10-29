@@ -75,7 +75,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_MTP_COST_TABLE` | `generate.zig:7548` | `0` uses the prior only, no measured round costs; `tests/test_mtp_equivalence.sh` needs it for a seeded sampled byte comparison | once | yes: engine-mtp, tests/CLAUDE |
 | `SUSHI_MTP_HEAD_PERSIST` | `generate.zig:505` | default on: Qwen4 MTP head history rides the prefix cache; `0` turns it off for `tests/qwen4/test_qwen4_mtp_head_persist.sh` | once | yes: tests/CLAUDE |
 | `SUSHI_PREFILL_INTERLEAVE` | `scheduler.zig:6630` | default on: a cold prefill yields to decode streams; `0` is the byte-identity reference of `tests/test_prefill_interleave.sh` | once | yes: server-lifecycle, tests/CLAUDE |
-| `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
+| `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path (dev A/B lever; `tests/qwen4/test_qsa_nax_prefill.py` runs the default NAX arm) | once | no |
 | `SUSHI_VISION_CHUNKED` | `prefill_plan.zig:328` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
 ## Microbenches (19)
