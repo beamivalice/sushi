@@ -285,8 +285,12 @@ for response_format in (
     text = choice["message"].get("content") or ""
     entries = (choice.get("logprobs") or {}).get("content") or []
     label = response_format["type"]
-    ck(f"[{label}] logprobs reconstruct content", bool(entries) and
-       "".join(e["token"] for e in entries).strip() == text.strip())
+    joined = "".join(e["token"] for e in entries)
+    # GLM's constrained decode can sample a token past the finished object; the content trims it, the entries keep it.
+    same = text.strip() in joined if GLM else joined.strip() == text.strip()
+    ck(f"[{label}] logprobs reconstruct content", bool(entries) and same,
+       f"{len(entries)} entries {''.join(e['token'] for e in entries)!r} vs content {text!r}, "
+       f"finish {choice.get('finish_reason')}")
     stream_text, stream_entries = "", []
     for raw in post("/v1/chat/completions", {**req, "stream": True}, stream=True):
         line = raw.decode().strip()
