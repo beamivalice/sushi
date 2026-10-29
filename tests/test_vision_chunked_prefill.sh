@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=own pack=default boots=2
 # Vision prefill chunking: an image-bearing prompt must prefill in chunks like
 # text does, instead of one whole-prompt forward (issue #197 — the unchunked
 # width is what the memory guard bills, so long conversations + one screenshot
@@ -18,31 +18,13 @@
 # near-tie argmaxes across widths (same class as MTP verify — legit).
 #
 # Requires a vision model; SKIPs without one.
-#   VISION_CHUNK_TEST_MODEL=/path ./tests/test_vision_chunked_prefill.sh [port]
 
 set -u
+. "$(dirname "$0")/lib/boot.sh"
 
-PORT="${1:-11499}"
-BINARY="${BINARY:-./zig-out/bin/sushi}"
-MODEL="${VISION_CHUNK_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
+MODEL=$(sushi_pack qwen4) || exit $?
 WORK="$(mktemp -d)"
-SERVER_PID=""
-
-cleanup() {
-    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null
-    rm -rf "$WORK"
-}
-trap cleanup EXIT
-
-if [ ! -x "$BINARY" ]; then
-    echo "[fail] $BINARY not found — build first: zig build -Doptimize=ReleaseFast"
-    exit 1
-fi
-if [ ! -d "$MODEL" ]; then
-    echo "[skip] no vision model at $MODEL (set VISION_CHUNK_TEST_MODEL)"
-    exit 0
-fi
+trap 'rm -rf "$WORK"' EXIT
 
 # A deterministic quadrant PNG (red TL, blue TR, green BL, yellow BR) — the
 # answer depends on reading the WHOLE image, so losing the later vision rows
@@ -88,29 +70,14 @@ PYEOF
 
 run_arm() {
     local arm="$1" env_val="$2"
-    local log="$WORK/$arm.log"
-    SUSHI_VISION_CHUNKED="$env_val" \
-        "$BINARY" --serve --model "$MODEL" --prefill-chunk 32 \
-        --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
-        --log-level debug --log-file "$log" \
-        >"$WORK/$arm.stdout" 2>&1 &
-    SERVER_PID=$!
-    local ready=0
-    for _ in $(seq 1 240); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { ready=1; break; }
-        sleep 0.5
-    done
-    if [ "$ready" -ne 1 ]; then
-        echo "[fail] server did not start ($arm arm)"
-        exit 1
-    fi
-    curl -sf -m 300 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    SUSHI_VISION_CHUNKED="$env_val" sushi_boot "vision-$arm" "$MODEL" --prefill-chunk 32 --prefix-cache-entries 0 --log-level debug || exit $?
+    sushi_require vision
+    curl -sf -m 300 "$SUSHI_URL/v1/chat/completions" \
         -H 'Content-Type: application/json' \
         --data-binary @"$WORK/req.json" > "$WORK/$arm.resp.json" \
         || { echo "[fail] request failed ($arm arm)"; exit 1; }
-    sleep 1
-    kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
-    sleep 1
+    cp "$SUSHI_LOG" "$WORK/$arm.log"
+    sushi_stop 0
 }
 
 run_arm off 0
