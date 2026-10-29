@@ -264,7 +264,7 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 - `PageSlab` epoch leases (`free → filling → ready → leased → readers_complete → reclaimable`, CPU writes only in
   `filling`).
 - `importSlab` = `mlx_array_new_data_managed_payload` verified by pointer identity (`ExpertSlabImportCopied`
-  refuses). Bench: `tests/ssd_fill_bench.sh`.
+  refuses). Bench: the `expert io ssd microbench` test (`QWEN4_BF16_STREAM_MODEL=<pack>`), waiting to move into `sushi-ubench`.
 - **MLX releases an IMPORTED host buffer asynchronously**: `mlx_array_free` returns BEFORE the payload deleter runs;
   wait for the deleter (`SlabOperand.destroy`), leak (counted, logged on the breakdown line) rather than unmap what
   MLX still holds.
