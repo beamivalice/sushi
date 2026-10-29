@@ -112,10 +112,12 @@ mark=$(log_size)
 SYS6="$SUSHI_NONCE You are an expert software engineer assistant. You provide concise, technically correct answers. You explain trade-offs when relevant. You always cite specific function names, file paths, or line numbers when discussing code. You prefer concrete examples over abstract advice. You do not pad your answers with hedges or apologies. You assume the user is also a software engineer. You write in Markdown when formatting helps. You keep code blocks small and self-contained. You ask clarifying questions only when truly necessary. You favor depth over breadth in your explanations. You show your reasoning when it would help the reader."
 A_ASSISTANT="A mutex protects shared resources from race conditions, while a semaphore limits concurrent access to a fixed-size pool. Both use atomic operations under the hood."
 B_ASSISTANT="TCP is connection-oriented and reliable, with handshakes, retransmits, and ordered delivery. UDP is connectionless and fire-and-forget, relying on the application for any reliability guarantees."
+# GLM's template has no thinking-off mode.
+case "$SUSHI_ARCH" in glm5_next) THINK='{"reasoning_effort":"low"}' ;; *) THINK='{"enable_thinking":false}' ;; esac
 # $1 = user1, $2 = assistant1 (empty = single turn), $3 = user2; prints the usage object.
 hot_turn() {
     jq -nc --arg s "$SYS6" --arg u1 "$1" --arg a1 "$2" --arg u2 "$3" \
-        '{model:"x",messages:([{role:"system",content:$s},{role:"user",content:$u1}] + (if $a1 == "" then [] else [{role:"assistant",content:$a1},{role:"user",content:$u2}] end)),max_tokens:1,temperature:0.0,stream:false,enable_thinking:false}' \
+        '{model:"x",messages:([{role:"system",content:$s},{role:"user",content:$u1}] + (if $a1 == "" then [] else [{role:"assistant",content:$a1},{role:"user",content:$u2}] end)),max_tokens:1,temperature:0.0,stream:false} + $think' --argjson think "$THINK" \
         | curl -sf -m 600 -X POST "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d @- | jq -c '.usage'
 }
 A1="What is the difference between a mutex and a semaphore?"
