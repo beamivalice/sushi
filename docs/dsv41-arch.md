@@ -194,7 +194,7 @@ Prefill width:
   - At 8k and longer a 2048 bill is the 1024 bill plus 2500 MiB (1024 more rows at 400 B a channel, x 5/4). At
     budget 96 (13020 MiB to serve) prompts up to ~413k take 2048, up to ~642k take 1024, and the rest take 512.
   - Measured transient at 2048 rows: 4.35 GB, and 5.15 GB on a 2524-row last chunk (8.7k prompt), inside the bill.
-- Its attention scores only each row's picked keys, so the dense score-sheet narrowing (`boundedPrefillChunk`) never
+- Its attention scores only each row's picked keys, so the dense score-sheet narrowing (`prefill_plan.boundedPrefillChunk`) never
   applies (`prefillScoreHeadDim` is 0). Before this change, every prompt past ~32k ran at 512.
 - The advertised context is the longest prompt its own request bill admits at the fallback width
   (`memoryContextAtChunk`). Past the indexer's scores (now streamed) the bill grows with 0.9 KB of state, 0.6 KB of

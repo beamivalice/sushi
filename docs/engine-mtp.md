@@ -50,7 +50,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   invariant; a committed argmax is a `CommittedArgmax` (only `verifyArgmax` builds one, masking reserved ids).
 - A reasoning budget (or loop-recovery close) keeps MTP on for the answer: the forced closer re-seeds the head
   (`mtpResumeAfterForced`: qwen4 head reset; MiMo's three heads take the hole like an adaptive serial block) and the slot
-  ramps back through the serial exit. A round before the bound may emit at most the thought room (`ThinkBound.room`):
+  ramps back through the serial exit. A round before the bound may emit at most the thought room (`mtp_plan.ThinkBound.room`):
   drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. Grouped rounds
   take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1 is a plain planner row), and a
   planner-owned slot rejoins the planner after the close instead of the serial ramp. DSpark takes the same cut
@@ -93,7 +93,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - <a id="greedy-shortlist"></a>**A greedy MiMo forward reads the trunk head through the drafts' shortlist**
   (`lmHeadShortlistFor`, up to 16 argmax-only rows, serial ticks and verify rows alike): the coarse top-32 per row,
   re-scored through the full head (the same qmv, so each value is the full readout's), every other id -inf. The copy
-  exists with MTP or without, so MTP == serial holds by construction. Gate `generate.argmaxOnlyRequest` (greedy or
+  exists with MTP or without, so MTP == serial holds by construction. Gate `sampler.argmaxOnlyRequest` (greedy or
   top-1; no penalty, logprobs, grammar, forced call); `kld` reads the full head. Not certified: a full argmax
   outside the top-32 changes the token; `SUSHI_LMHEAD_SHORTLIST_AUDIT=1` counts such rows, `SUSHI_LMHEAD_FULL=1`
   reads the full head ([perf-baselines](mimo2-perf.md#mimo-lmhead-shortlist)).
@@ -228,7 +228,7 @@ chain/group paths still capture per row. `dflash_policy.ladder()` is that table 
   nothing there, `server.mtpHeadKvLine`); a spec sidecar under another scheme is declined at restore and rewritten
   on the next commit. Head persistence with its QSA half: `tests/test_qwen4_mtp_head_persist.sh`.
 - Acceptance modes `exact|typical|tokenv3` (`mtp_acceptance.zig`, per-model `mtp_acceptance`).
-  Only sampled decoding reads the mode: temperature < 0.01 (`isGreedyTemperature`, shared with serial sampling) always takes the argmax check (`mtpAcceptRowGreedy`), so
+  Only sampled decoding reads the mode: temperature < 0.01 (`sampler.isGreedyTemperature`, shared with serial sampling) always takes the argmax check (`mtpAcceptRowGreedy`), so
   greedy output is identical under every mode. Sushi-4bpw at T=1.0 / top_k 20 / top_p 0.95, 16 fixture prompts x 512,
   2 seeds, binary b64c5a0e: typical 0.2 decoded 80.0 / 76.6 tok/s vs exact 69.2 / 63.3 (2.4-2.6 vs 2.1-2.2 tokens per
   round); target NLL of the emitted text 0.7819 vs 0.7805 nats, a paired difference inside the seed noise (~0.1 nats).

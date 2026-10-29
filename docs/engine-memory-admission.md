@@ -350,7 +350,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - One `[admission] needed=… available=… reclaimable=… width=… verdict=…` line per decision.
 - An explicit `--prefill-chunk N` caps the per-request ladder, never pins it: N if it fits, else the widest rung
   below N that fits, down to 512; refused only when that floor does not fit. `requestPrefillPick` is the one rule for
-  the bill and the scheduler, `generate.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed
+  the bill and the scheduler, `prefill_plan.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed
   load prove that floor (`perRequestFloorWidth`).
 - A long prefill evicts the hot cache on the INFERENCE thread to be admitted (`evictLruToAdmit`) on every arch where
   `admissionEvictsHotCache` holds (qwen4_exp and the ringed mimo_v2; the connection thread's `creditedAdmissionBill`

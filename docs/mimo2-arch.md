@@ -274,7 +274,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **The prefill chunk is chosen per request** (`perRequestPrefillChunk` covers a ringed arch): the widest rung up
   to 2048 whose admission bill fits live memory, which is 2048 at every context to 256k on a 128 GB Mac. An
   explicit `--prefill-chunk` caps the ladder and may raise the default as far as the 4096 ceiling
-  (`boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
+  (`prefill_plan.boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
   ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)), but their bytes differ, so the output of a
   prompt longer than 2048 tokens depends on the width memory allowed. The ungated load-time pin subtracts the
   hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback,

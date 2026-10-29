@@ -50,7 +50,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   scorer boots with the cache off.
 - Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
-  span (`ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
+  span (`prefill_plan.ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
   (`KVCache.ringCheckpoint`, `Entry.ring_cps`, up to `RING_CHECKPOINT_MAX` = 8): each ringed layer's
   window + 30 rows at a position (down to the window when the ring holds no more, as one restored off a checkpoint
@@ -258,12 +258,12 @@ reply every turn. A thinking request with tools now takes one more point mid-dec
 
 - **The closer is what every turn shares** (`replay` tests in `chat.zig`, pack tokenizer and real template): Qwen re-renders
   `<think>\n` + trimmed thought + `\n</think>\n\n`, GLM `<think>` + thought + `</think>`, and both repeat the whole reply. A thought
-  starting in whitespace or ending in any the template does not write is re-rendered (`generate.thoughtEdgesSurvive`) and
+  starting in whitespace or ending in any the template does not write is re-rendered (`mtp_plan.thoughtEdgesSurvive`) and
   its point dropped; a client must send `reasoning_content` back as delivered.
 - **Armed** by `scheduler.armThoughtPoint` for thinking + tools, a prompt of 512 tokens or more ending in `<think>`, and a
   speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either.
-- **The round carrying the closer ends on it** (`generate.thoughtRound`): Qwen's verified round accepts only through the
-  closer and the next accepted draft is pending (`cutMtpRound`), so the stream is the whole round's byte for byte; GLM's
+- **The round carrying the closer ends on it** (`mtp_plan.thoughtRound`): Qwen's verified round accepts only through the
+  closer and the next accepted draft is pending (`mtp_plan.cutMtpRound`), so the stream is the whole round's byte for byte; GLM's
   budget is cut to the pool position at or below the closer, and a closer in the round's first rows can leave none.
 - **The state is the newest checkpoint, held from the closer to the commit and billed to a request that takes one** (`WarmPrefix.thought`, `server.qwenThoughtPointBytes`,
   `glmThoughtPointBytes`: 58.8 or 110 MB, 147.6 MB). Both tiers treat it as any checkpoint under the cap of 160; an
@@ -281,10 +281,10 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   at f32). Below `MIN_PERSIST_TOKENS` nothing is written, so nothing is released. A failed write is released too: not a
   restore point, and the entry is poisoned at the next commit (`harvestWriteFailures`).
 - **Restore points sit on an 8192-token grid and at each prompt's end, to 1M tokens, on every arch** (Qwen: the
-  checkpoint stride is `effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless `--prefill-chunk` is wider, which
+  checkpoint stride is `prefill_plan.effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless `--prefill-chunk` is wider, which
   coarsens the grid; GLM: `glm_capture_stride`, [glm5-prefix-cache](glm5-prefix-cache.md); DeepSeek: `row_span`). The SSD
   tier keeps 160 per entry (`SSM_DISK_MAX_PER_ENTRY`), so no count thins a conversation below 1M tokens.
-  `--ssm-checkpoint-max` (16) caps only the states held in memory (`generate.thinHeldCheckpoints` skips released ones);
+  `--ssm-checkpoint-max` (16) caps only the states held in memory (`prefill_plan.thinHeldCheckpoints` skips released ones);
   it never thins what a write-through has put on disk.
 - **One conversation over the SSD budget drops its oldest points first.** Other conversations go whole, least recently
   used first (`gcToBudget`). When one entry alone outgrows the tier, `DiskTier.pointBudget` prices the rows plus the
@@ -296,7 +296,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   bytes it held (`released_bytes`). A restore at any position reads its file.
 - **A request the write-through cannot serve** (a span under one disk chunk) releases nothing, so its list is thinned
   to two (`scheduler.qwenCheckpointCap`) and it holds three states while one is captured. The thinning is
-  span-preserving whatever the prompt carries (`generate.checkpointDropIndex`): a media record persists whole, so
+  span-preserving whatever the prompt carries (`prefill_plan.checkpointDropIndex`): a media record persists whole, so
   there is no boundary to protect, and protecting one dropped every checkpoint ABOVE the image — exactly the state
   the next image-bearing turn restores from. The byte-budget trim never lands on a released checkpoint.
   `transformer.SSM_RESIDENT_MAX` is the number the admission bill counts

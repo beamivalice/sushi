@@ -16,7 +16,7 @@ item).
 | Spec decode for sampled requests | works | point-mass draft, exact accept rule (`Generator.dsparkSampledVerdict`); sampled determinism test |
 | Spec decode under repeat / presence / think penalty | works | verify rows shifted by `penaltyShiftRows`, `thinkShiftRows`; distinct-id test |
 | Spec decode under a thinking bound (Anthropic `budget_tokens`, `reasoning_budget_tokens`) | works | bound checked between rounds (a round is cut to the thought room), DSpark resumes for the answer; `a thinking bound that fires mid-round` |
-| Spec decode with logprobs, grammar, forced call | N/A | MTP refuses the same three (`mtpRefusal`); they decode serially |
+| Spec decode with logprobs, grammar, forced call | N/A | MTP refuses the same three (`mtp_plan.mtpRefusal`); they decode serially |
 | Batched decode, several slots | gap | `ownsModuleDecodeState`: one request at a time; `/props` `batching.reason = exclusive` |
 | Hot / SSD prefix cache | works | restore points of the whole state, RAM and SSD tiers, bit-identical to cold ([dsv41-arch](dsv41-arch.md#prefix-cache)) |
 | Per-request prefill chunk ladder | works | `perRequestPrefillChunk` is true for the arch; each request takes the widest rung its bill admits ([dsv41-arch](dsv41-arch.md#ced)) |

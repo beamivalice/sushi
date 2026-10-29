@@ -119,7 +119,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
   omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's
   `providers.streamFirstEventTimeoutSeconds` controls it, with zero allowing unlimited initial buffering.
-  `--timeout` remains a token-progress STALL timeout (`StallClock`).
+  `--timeout` remains a token-progress STALL timeout (`degenerate.StallClock`).
 - **NO string built from model bytes is guaranteed UTF-8**: sanitizing lives INSIDE the escaper (`chat.utf8Next`
   under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
   escaped at the SINK.
@@ -137,17 +137,17 @@ before reading a completed stream and requires clean EOF.
 
 ## Seeds, logprobs, sampling
 
-- **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey`).
+- **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`sampler.seedKey`).
 - Logprobs are the MODEL's distribution (pre-temperature), ids travel WITH values, entry belongs to the RETURNED
   token (one-token delay); `logprobs.content` describes `message.content` (`contentTokenRange`); streaming logprobs
   are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.
-- Logprobs are `logits - logsumexp` in f32 (`computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
+- Logprobs are `logits - logsumexp` in f32 (`sampler.computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
   apart between -16 and -32.
 - Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded.
-- Top-k and top-p are ONE pass (`filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
-  constantly; `ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
-  `top_p` 0 is GREEDY (`applyTopP` floors at `floatMin(f32)`).
-- A sampler never draws a RESERVED special or PADDING row (`installSuppressMask`; logprobs stay RAW).
+- Top-k and top-p are ONE pass (`sampler.filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
+  constantly; `sampler.ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
+  `top_p` 0 is GREEDY (`sampler.applyTopP` floors at `floatMin(f32)`).
+- A sampler never draws a RESERVED special or PADDING row (`sampler.installSuppressMask`; logprobs stay RAW).
 - **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
   (`requestEosSlice`); stop sequences and the loop stops still end it, and its text skips `special: true` tokens
@@ -155,7 +155,7 @@ before reading a completed stream and requires clean EOF.
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
 - **A repeat/presence/frequency penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
-  drafter path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+  drafter path (`mtp_plan.draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
   MTP does run: each verify row carries the penalty ([engine-mtp](engine-mtp.md#spec-verify-invariant)).
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
   completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off. OpenAI's `presence_penalty` and

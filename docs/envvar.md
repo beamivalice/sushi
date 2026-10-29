@@ -20,7 +20,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_DSV41_DSPARK_EXACT` | `transformer.zig` (`initDsv41`) | default on: a DSpark round's trunk linears give a row the same bytes at every verify width (the NAX arm at one row too, the lm_head on the SIMD rows arm), so greedy text is the same at every round-width mix; `0` takes the faster arms (SIMD one-row step, NAX head), whose text may differ with the mix | load | yes: dsv41-arch |
 | `SUSHI_LMHEAD_FULL` | `transformer.zig:24018` | `1` reads the full lm_head instead of the greedy top-32 shortlist (MiMo; the shortlist is not certified exact) | once | yes: engine-mtp |
 | `SUSHI_LOOP_TRIM` | `scheduler.zig:6233` | default on: trims displayed loop-stop replies; `0` keeps the whole degenerate tail for strict bytes (`tests/test_loop_stop_signal.sh` boots both) | once | yes: server-http-apis, tests/CLAUDE |
-| `SUSHI_MTP_ADAPTIVE_SERIAL` | `generate.zig:9517` | default on; `0` disables the adaptive speculate-vs-serial vote at long KV (`tests/test_mtp_adaptive.sh` boots both) | once | yes: mimo2-perf, tests/CLAUDE |
+| `SUSHI_MTP_ADAPTIVE_SERIAL` | `generate.zig:8675` | default on; `0` disables the adaptive speculate-vs-serial vote at long KV (`tests/test_mtp_adaptive.sh` boots both) | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_MTP_DRAFT_HEAD_BITS` | `mtp.zig:427, mimo_mtp.zig:33` | coarse rerank readout width (default 3, MiMo 2; `0\|off` disables); verification is untouched | load | yes: mimo2-mtp |
 | `SUSHI_NGRAM_WARM` | `qwen4_exp.zig:146` | default on: pread the Flash-Next n-gram table at load; `0` skips it | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_QSA_SCORE_SHEET_MB` | `transformer.zig:5868` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
@@ -52,7 +52,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DSV41_COMPOSED` | `transformer.zig`, `dsv41_model.zig` | `1` runs deepseek_v41 on the op chains instead of the fused kernels (the KLD A/B's teacher arm; the load logs `[dsv41] fused kernels on\|off`) | load | yes: dsv41-arch |
 | `SUSHI_DSV41_DSPARK_ROWS` | `generate.zig` | deepseek_v41 DSpark diagnostic: `sweep` cycles the verify width 1..8 per round, `<n>` forces it, `log` keeps the policy; each round logs `[dspark-round]` (ctx, rows, draft and verify ms, confidence logits) | request | yes: dsv41-arch |
 | `SUSHI_DSV41_VERIFY_PROFILE` | `transformer.zig`, `dsv41_model.zig` | `1` times every stage of decode-width chunks (a verify) as `[dsv41-prof]` lines, each stage evaluated before the next (the absolute ms inflate about 2x) | load | yes: dsv41-arch |
-| `SUSHI_DFLASH_TRACE` | `generate.zig:8862` | `1` per-phase DFlash round wall-time trace | once | no |
+| `SUSHI_DFLASH_TRACE` | `generate.zig:8026` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `transformer.zig:24530` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_DUMP_RESTORE` | `restore_dump.zig:31` | `<dir>` dumps prefix-restore tensors | once | no |
 | `SUSHI_EXL3_STAGE_PROFILE` | `exl3/expert_exl3_kernels.zig:103` | syncs and times each stage of a routed MoE layer (pair GEMV, down, reduce, sort, token prepare, GEMMs), logged as `[exl3-stage]` | once | yes: engine-exl3-experts |
@@ -66,17 +66,17 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_LMHEAD_SHORTLIST_AUDIT` | `transformer.zig:15409` | `1` re-reads the full head on every shortlist row and counts disagreements | once | yes: engine-mtp, mimo2-perf |
 | `SUSHI_MOE_DUMP` | `transformer.zig:22410` | `<dir>` writes one forward's MoE tensors as raw f32 | once | no |
 | `SUSHI_MOE_GATHER_TRACE`, `SUSHI_VQMM_PARITY_DEBUG`, `REPLAY_DUMP_SOFT` | `transformer.zig`, `tool_traffic_replay_test.zig` | extra prints inside a test | test | no |
-| `SUSHI_MTP_TRACE` | `generate.zig:8915, round_cost.zig:780` | `1` per-round MTP phase trace; also disarms round-cost persistence | once | yes: mimo2-perf, qwen4-perf, tests/CLAUDE |
-| `SUSHI_MTP_TRACE_SYNC` | `generate.zig:7162` | drains the GPU before the verify build so the `sync` lap is separable; read only while tracing | once | no |
+| `SUSHI_MTP_TRACE` | `generate.zig:8079, round_cost.zig:780` | `1` per-round MTP phase trace; also disarms round-cost persistence | once | yes: mimo2-perf, qwen4-perf, tests/CLAUDE |
+| `SUSHI_MTP_TRACE_SYNC` | `generate.zig:6424` | drains the GPU before the verify build so the `sync` lap is separable; read only while tracing | once | no |
 | `SUSHI_PROFILE_ATTN` | `qwen4_forward.zig:2992` | `1` logs synced indexer/projection/QSA/tail laps per Qwen4 forward | once | yes: qwen4-qsa-long-context |
 | `SUSHI_PREFILL_CHUNK_PEAK` | `generate.zig` | at `--log-level debug`, resets the MLX peak after each `[prefill-trace] mem` line, so each line's `peak_bytes` is its own chunk's | once | yes: dsv41-arch |
 | `SUSHI_RAW_DUMP_FILE` | `server.zig:11999, server.zig:17261` | `<abs path>` appends the full pre-parse buffer of every tools request (corpus harvest) | per tool request | yes: server-tool-calling |
 | `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` | `exl3/expert_exl3_kernels.zig` | prefill GEMM window rows (default 32) and `0` unaligns it; the window-geometry parity tests drive both | once | yes: engine-exl3-experts |
-| `SUSHI_MTP_COST_TABLE` | `generate.zig:8369` | `0` uses the prior only, no measured round costs; `tests/test_mtp_equivalence.sh` needs it for a seeded sampled byte comparison | once | yes: engine-mtp, tests/CLAUDE |
-| `SUSHI_MTP_HEAD_PERSIST` | `generate.zig:600` | default on: Qwen4 MTP head history rides the prefix cache; `0` turns it off for `tests/test_qwen4_mtp_head_persist.sh` | once | yes: tests/CLAUDE |
+| `SUSHI_MTP_COST_TABLE` | `generate.zig:7548` | `0` uses the prior only, no measured round costs; `tests/test_mtp_equivalence.sh` needs it for a seeded sampled byte comparison | once | yes: engine-mtp, tests/CLAUDE |
+| `SUSHI_MTP_HEAD_PERSIST` | `generate.zig:505` | default on: Qwen4 MTP head history rides the prefix cache; `0` turns it off for `tests/test_qwen4_mtp_head_persist.sh` | once | yes: tests/CLAUDE |
 | `SUSHI_PREFILL_INTERLEAVE` | `scheduler.zig:6630` | default on: a cold prefill yields to decode streams; `0` is the byte-identity reference of `tests/test_prefill_interleave.sh` | once | yes: server-lifecycle, tests/CLAUDE |
 | `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
-| `SUSHI_VISION_CHUNKED` | `generate.zig:1533` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
+| `SUSHI_VISION_CHUNKED` | `prefill_plan.zig:328` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
 ## Microbenches (29)
 
@@ -88,7 +88,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_DECODE_FWD_UBENCH` | `scheduler.zig:4321` | `<n>` times n decode-width forwards at load (no sampling, no cache bookkeeping), then resets the KV | load | yes: engine-kernels, mimo2-arch, mimo2-perf, ... |
 | `SUSHI_DECODE_FWD_UBENCH_S`, `SUSHI_DECODE_FWD_UBENCH_KV` | `scheduler.zig` | `<rows>[,...]` verify widths to time; `<tokens>` prefill before timing | load | yes: perf-baselines |
 | `SUSHI_DECODE_FWD_UBENCH_PROFILE` | `scheduler.zig` | one extra profiled pass per width | load | no |
-| `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:89, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
+| `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:177, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
 | `SUSHI_EXL3_LAYER_UBENCH` | `transformer.zig` | prints the relative RMS in the MiMo EXL3 correctness tests | test | yes: CLAUDE |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `scheduler.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
 | `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `scheduler.zig` | `<n>` rounds per width B in 1..4 of plain decode at load, then one request's 1..8-row chain verify (ms, and bit-equality of every row against serial decode) and a routed layer's feed-forward at 1..8 rows; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
@@ -104,8 +104,8 @@ Inputs and hooks that real-pack tests and scripts use.
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
 | `DFLASH_FIXTURES`, `DFLASH_ASSISTANT_DIR`, `DFLASH2_FIXTURES`, `DFLASH2_ASSISTANT_DIR` | `dflash.zig` | DFlash oracle fixtures and sidecar dirs (set by the `tests/dump_dflash*_fixtures.py` dumpers) | test | no |
-| `MIMO_V2_MODEL`, `MIMO_V2_SOURCE`, `MIMO_V2_FIXTURE`, `MIMO_V2_MTP_FIXTURE`, `MIMO_VISION_ORACLE`, `MIMO_STREAM_FIXTURE`, `MIMO_SLICED_REAL_FIXTURE`, `MIMO_SLICED_OUTPUT`, `MIMO_DIFFERENTIAL_FIXTURE`, `MIMO_DIFFERENTIAL_LAYER`, `MIMO_DIFFERENTIAL_PACK`, `MIMO_PACK_REFERENCE` | `transformer.zig`, `generate.zig`, `mimo_mtp.zig`, `mimo_vision.zig` | MiMo pack, source checkpoint and oracle-fixture inputs for real-pack tests | test | yes: tests/CLAUDE, mimo2-arch |
-| `MTP_TEST_MODEL`, `MTP_LMHEAD_TEST_FILE`, `SINGLE_MTP_TEST_CONTEXT` | `transformer.zig`, `generate.zig` | MTP real-pack tests (pack, lm_head blob, context length) | test | yes: tests/CLAUDE |
+| `MIMO_V2_MODEL`, `MIMO_V2_SOURCE`, `MIMO_V2_FIXTURE`, `MIMO_V2_MTP_FIXTURE`, `MIMO_VISION_ORACLE`, `MIMO_STREAM_FIXTURE`, `MIMO_SLICED_REAL_FIXTURE`, `MIMO_SLICED_OUTPUT`, `MIMO_DIFFERENTIAL_FIXTURE`, `MIMO_DIFFERENTIAL_LAYER`, `MIMO_DIFFERENTIAL_PACK`, `MIMO_PACK_REFERENCE` | `transformer.zig`, `mimo_generate_test.zig`, `mimo_mtp.zig`, `mimo_vision.zig` | MiMo pack, source checkpoint and oracle-fixture inputs for real-pack tests | test | yes: tests/CLAUDE, mimo2-arch |
+| `MTP_TEST_MODEL`, `MTP_LMHEAD_TEST_FILE`, `SINGLE_MTP_TEST_CONTEXT` | `transformer.zig`, `qwen4_generate_test.zig` | MTP real-pack tests (pack, lm_head blob, context length) | test | yes: tests/CLAUDE |
 | `QWEN4_FIXTURE`, `QWEN4_FIXTURE_BF16`, `QWEN4_FIXTURE_VISION`, `QWEN4_ROWS_OLD`, `QWEN4_TEST_HF_MODEL`, `QWEN4_TEST_PREFIX_TOKENS`, `QWEN4_VERIFY_BENCH`, `QWEN4_YARN_FIXTURES`, `QWEN4_BF16_STREAM_MODEL` | `transformer.zig`, `mrope.zig`, `expert_io.zig` | oracle fixtures, HF source dir and probe switches for the Qwen4 oracle tests | test | yes: tests/CLAUDE |
 | `QWEN4_TEST_MODEL` | `transformer.zig:10796, transformer.zig:10819, transformer.zig:10960, +27` | `<pack dir>` for the real-pack Qwen4 tests; they skip without it | test | yes: mlx-serve-sync, server-lifecycle, tests/CLAUDE |
 | `QWEN_VISION_TEST_MODEL`, `QWEN_VISION_FIXTURE`, `QWEN_PREPROCESS_FIXTURE`, `QV_GH`, `QV_GW`, `QWEN_MID_SYSTEM_MODEL_DIR` | `qwen_vision.zig`, `chat.zig` | Qwen vision/preprocess oracle inputs and a chat-template pack | test | yes: server-tool-calling, tests/CLAUDE |
@@ -133,7 +133,7 @@ Kept because the launch flag cannot express what the env does.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `SUSHI_MTP_ADAPTIVE` | `generate.zig:8895` | `0` selects the windowed depth controller, a different algorithm that can also disable MTP; `--mtp-min-depth n --mtp-max-depth n` pins a depth but cannot express it | once | yes: engine-mtp, tests/CLAUDE, --help |
+| `SUSHI_MTP_ADAPTIVE` | `generate.zig:8059` | `0` selects the windowed depth controller, a different algorithm that can also disable MTP; `--mtp-min-depth n --mtp-max-depth n` pins a depth but cannot express it | once | yes: engine-mtp, tests/CLAUDE, --help |
 | `SUSHI_PREFIX_CACHE_DIR` | `kv_disk_cache.zig:4332` | absolute directory for the SSD prefix cache (default under `~/.sushi`); `--prefix-cache-disk` sets a size, not a directory | boot | yes: engine-prefix-cache, tests/CLAUDE, --help |
 
 ## Reads to fix

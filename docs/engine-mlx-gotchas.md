@@ -150,4 +150,4 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   (GLM sets it) is honoured in `bpeMerge`. The parity script covers GLM, Qwen and MiMo on code and tool-call text.
 - DeepSeek's `Scope.out` handle belongs to the caller: a `block` result chained through a loop in a scope must be
   adopted with `sc.keep` or it leaks every iteration (the DSpark draft leaked its stage outputs per round). Guard: the
-  `DSpark requests leave the MLX active memory flat` test in `generate.zig`.
+  `DSpark requests leave the MLX active memory flat` test in `dsv41/dsv41_generate_test.zig`.
