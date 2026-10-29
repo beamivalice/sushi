@@ -992,6 +992,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     }
     if (self.xfm.moe_layers != null) self.xfm.compileMoeRouting();
     if (self.config.linear_num_key_heads > 0) self.xfm.compileGdnGate();
+    if (self.config.isQwen4()) self.xfm.compileQwen4Hc();
     return self;
 }
 
