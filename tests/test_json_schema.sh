@@ -397,6 +397,16 @@ BODY=$(schema_body "$THINK_CAP" "" '{model:"sushi", max_tokens:$cap, temperature
 RESULT=$(curl -s -m 600 -N "$BASE/v1/messages" -H "Content-Type: application/json" -d "$BODY")
 verdict "schema JSON lands in text delta (messages, finite budget)" "$(messages_parse "$RESULT" | schema_check answer "$TOL_THINK")"
 
+if [ "$CAPPED" = 1 ]; then
+    echo "--- /v1/chat/completions: unlimited reasoning defers the grammar to the boundary ---"
+    BODY=$(schema_body 4096 "" '{model:"sushi", max_tokens:$cap, temperature:0, stream:false,
+        enable_thinking:true, reasoning_budget_tokens:-1,
+        response_format:{type:"json_schema",json_schema:{name:"answer",strict:true,schema:$schema}},
+        messages:[{role:"user",content:$p}]}')
+    RESULT=$(curl -s -m 600 "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY")
+    verdict "schema JSON lands in content (chat, unlimited reasoning)" "$(chat_parse "$RESULT" false | schema_check answer 1)"
+fi
+
 # Whether 64 tokens is exhausted mid-thought is the checkpoint's choice: the hard completion cap must not force a
 # boundary, reserve answer tokens or move reasoning to content, so only routing, accounting and the finish reason count.
 for STREAMING in false true; do
