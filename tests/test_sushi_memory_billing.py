@@ -26,6 +26,16 @@ CTX = 1248
 ABSURD_CTX = 4_000_000_000
 
 
+FAILURES = []
+
+
+def expect(ok, message):
+    """A contract row: a miss is reported and the run goes on, so one boot shows every row it breaks."""
+    if not ok:
+        FAILURES.append(message)
+        print(f"FAIL {message}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--refusals-only", action="store_true")
@@ -43,27 +53,26 @@ def main():
         status, listing = b.request(base, "/v1/models")
         assert status == 200, listing
         loaded = next(m for m in listing["data"] if m.get("loaded"))
-        assert loaded["meta"]["mtp_loaded"] == enabled, loaded["meta"]
-        assert ("image" in loaded["input_modalities"]) == enabled, loaded["input_modalities"]
+        expect(loaded["meta"]["mtp_loaded"] == enabled, f"{server.label}: mtp_loaded {loaded['meta']}")
+        expect(("image" in loaded["input_modalities"]) == enabled, f"{server.label}: modalities {loaded['input_modalities']}")
         if enabled:
-            assert loaded["bytes_resident"] > base_bytes, (loaded["bytes_resident"], base_bytes)
+            expect(loaded["bytes_resident"] > base_bytes, f"{server.label}: resident {loaded['bytes_resident']} not above {base_bytes}")
         status, props = b.request(base, "/props")
         assert status == 200, props
-        assert props["default_generation_settings"]["n_ctx"] == CTX, props["default_generation_settings"]
-        assert props["settings"]["kv_cache"]["scheme"] == "kv8", props["settings"]
-        assert props["settings"]["kv_quant"] == "8", props["settings"]
-        assert props["settings"]["mtp"]["loaded"] == enabled, props["settings"]["mtp"]
-        assert props["settings"]["mtp"]["default_on"] == enabled, props["settings"]["mtp"]
+        expect(props["default_generation_settings"]["n_ctx"] == CTX, f"{server.label}: n_ctx {props['default_generation_settings']}")
+        expect(props["settings"]["kv_cache"]["scheme"] == "kv8" and props["settings"]["kv_quant"] == "8", f"{server.label}: kv {props['settings']}")
+        expect(props["settings"]["mtp"]["loaded"] == enabled and props["settings"]["mtp"]["default_on"] == enabled,
+               f"{server.label}: mtp {props['settings']['mtp']}")
         found = re.findall(r"\[preflight\] weights ~([0-9.]+) GB, needs ~([0-9.]+) GB", server.log_text())
         assert len(found) == 1, found
         weights, needed = map(float, found[0])
         # The billed weights plus the larger of the measured warmup plus the 1 GiB net and the context bill.
         warmup = 0.25 if name.startswith("MiMo") else (1.25 if enabled else 0.125)
-        assert needed - weights >= 1.0 + warmup - 0.01, (weights, needed, warmup)
-        assert 0 < props["memory"]["active_bytes"] <= props["memory"]["peak_bytes"], props["memory"]
+        expect(needed - weights >= 1.0 + warmup - 0.01, f"{server.label}: needs {needed} < weights {weights} + 1 + warmup {warmup}")
+        expect(0 < props["memory"]["active_bytes"] <= props["memory"]["peak_bytes"], f"{server.label}: memory {props['memory']}")
         peak = props["memory"]["peak_bytes"] / 2**30
-        assert peak <= needed + 0.005, props["memory"]
-        assert needed - peak <= 3.0, (needed, peak)
+        expect(peak <= needed + 0.005, f"{server.label}: peak {peak:.2f} GiB above the billed need {needed} GB (weights {weights}): {props['memory']}")
+        expect(needed - peak <= 3.0, f"{server.label}: the bill {needed} sits {needed - peak:.2f} above the peak {peak:.2f}")
         (out / f"{server.label}.props.json").write_text(json.dumps(props, indent=2))
         status, reply = b.request(base, "/v1/chat/completions", {
             "model": loaded["id"], "messages": [{"role": "user", "content": "Reply with one greeting."}],
@@ -116,7 +125,8 @@ def main():
         _, props = b.request(server.base, "/props")
         assert props["memory"]["active_bytes"] < 512 * 1024 * 1024, props["memory"]
         assert "Loading model-" not in server.log_text()
-    return 0
+    print(f"{len(FAILURES)} contract row(s) failed" if FAILURES else "all contract rows passed", flush=True)
+    return 1 if FAILURES else 0
 
 
 if __name__ == "__main__":
