@@ -71,6 +71,7 @@ test {
     _ = @import("moe_gqmv.zig");
     _ = @import("moe_stream_compute.zig");
     _ = @import("layer_weights.zig");
+    _ = @import("forward_diag.zig");
     _ = @import("kv_cache.zig");
     _ = @import("qwen4/qwen4_forward.zig");
     _ = @import("qwen4/qwen4_fixture_test.zig");

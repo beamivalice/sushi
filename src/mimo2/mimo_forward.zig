@@ -1,6 +1,7 @@
 //! MiMo-V2 forward: sliding/global attention arms, routed-MoE dispatch, batched decode and verify rows.
 
 const trf = @import("../transformer.zig");
+const forward_diag = @import("../forward_diag.zig");
 const moe_router = @import("../moe_router.zig");
 const nax_gate = @import("../nax_gate.zig");
 const Transformer = trf.Transformer;
@@ -516,8 +517,8 @@ pub const MimoWarmRows = u32;
 // EXL3 and qmv pipelines, and the packed global attention its matmul2d set past the key
 // floor; left to the first request, each compile stalled a round 450-630 ms on a new binary.
 pub fn warmupMimoVerify(self: *Transformer, kv_config: KVQuantConfig) !MimoWarmRows {
-    trf.moe_dump_warmup_depth += 1;
-    defer trf.moe_dump_warmup_depth -= 1;
+    forward_diag.moe_dump_warmup_depth += 1;
+    defer forward_diag.moe_dump_warmup_depth -= 1;
     if (!self.config.isMimo()) return 0;
     const sl = try Transformer.SpecWarmSlot.init(self, kv_config);
     defer {
@@ -656,7 +657,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const prof = prof_on and seq_len <= decodeProfileRows();
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(h));
-        trf.decode_prof.embed_ns += pclk.lap();
+        forward_diag.decode_prof.embed_ns += pclk.lap();
     }
     // One-shot dtype trace. A residual stream that is wider than the
     // weights promotes EVERY projection's weight on read, which inflates
@@ -725,7 +726,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         const li: u32 = @intCast(layer_idx);
         const lw = &ml[layer_idx];
 
-        if (dumping) trf.moe_dump_layer = li;
+        if (dumping) forward_diag.moe_dump_layer = li;
         const normed = if (carried_normed.ctx != null) blk: {
             const c = carried_normed;
             carried_normed = .{ .ctx = null };
@@ -740,7 +741,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         defer _ = mlx.mlx_array_free(attn_out);
         if (prof) {
             try mlx.check(mlx.mlx_array_eval(attn_out));
-            trf.decode_prof.attn_ns += pclk.lap();
+            forward_diag.decode_prof.attn_ns += pclk.lap();
         }
 
         {
@@ -772,7 +773,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
                 _ = mlx.mlx_array_free(ff_normed);
                 ff_normed = try self.rmsNorm(h, lw.post_attn_norm);
             }
-            if (lw.mlp == .moe) moeDumpTensor(self.s, "hin", trf.moe_dump_layer, h);
+            if (lw.mlp == .moe) moeDumpTensor(self.s, "hin", forward_diag.moe_dump_layer, h);
             const mlp_out = switch (lw.mlp) {
                 .moe => |*mw| if (is_mimo and self.expert_stream != null)
                     try self.moeMLPStreamed(ctx, ff_normed, mw, @intCast(layer_idx))
@@ -799,7 +800,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
         if (prof) {
             try mlx.check(mlx.mlx_array_eval(h));
-            trf.decode_prof.mlp_ns += pclk.lap();
+            forward_diag.decode_prof.mlp_ns += pclk.lap();
         }
 
         // DFlash capture: this h IS `hidden_states[li+1]` — the layer's
@@ -847,9 +848,9 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(logits));
-        trf.decode_prof.lmhead_ns += pclk.lap();
-        trf.decode_prof.calls += 1;
-        if (trf.decode_prof.calls % 64 == 0) decodeProfReport();
+        forward_diag.decode_prof.lmhead_ns += pclk.lap();
+        forward_diag.decode_prof.calls += 1;
+        if (forward_diag.decode_prof.calls % 64 == 0) decodeProfReport();
     }
 
     return logits;

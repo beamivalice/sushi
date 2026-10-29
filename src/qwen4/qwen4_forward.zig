@@ -1,6 +1,7 @@
 //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
 
 const trf = @import("../transformer.zig");
+const forward_diag = @import("../forward_diag.zig");
 const moe_gqmv = @import("../moe_gqmv.zig");
 const qwen4_gdn = @import("qwen4_gdn.zig");
 const Transformer = trf.Transformer;
@@ -2009,7 +2010,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     var layer_idx: usize = 0;
     while (layer_idx < layerCap(cfg.num_hidden_layers)) {
         const li: u32 = @intCast(layer_idx);
-        if (dumping) trf.moe_dump_layer = li;
+        if (dumping) forward_diag.moe_dump_layer = li;
         const lw = &ml[layer_idx];
         const entry = &entries[layer_idx];
         const next_safe = defer_moe and layer_idx + 1 < layerCap(cfg.num_hidden_layers) and streamedSuccessorSafe(&ml[layer_idx + 1]);
