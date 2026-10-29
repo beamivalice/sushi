@@ -464,7 +464,7 @@ Forced-depth-3 MTP == serial on the same 3 prompts, on the new kernel rebased on
 <a id="mimo-longctx-prefill-attn"></a>
 ### MiMo long-context prefill: what the global layers' attention costs (kernels of 819b4751)
 
-In-process microbench `SUSHI_ATTN_PD_UBENCH=1` (test filter "MiMo prefill attention per chunk"): one chunk over a kv8
+In-process microbench `sushi-ubench run mimo2.prefill_attn`: one chunk over a kv8
 cache built by `KVCache.update`, the served `fusedSdpaPrefillKv` chain, arms interleaved, median of 5. Built on
 5834210c, whose attention code is unchanged in 819b4751. `taskpolicy -a`, locks `attn-ub1` / `attn-ub2`, fans at max,
 2026-10-01. The table gives ms per global layer per chunk (Hq 64 / Hk 4, qk 192 / v 128, causal); where two runs

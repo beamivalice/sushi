@@ -448,7 +448,9 @@ pub const Run = struct {
         var rows: std.ArrayList(Row) = .empty;
         for (run.rows.items) |acc| {
             var cells: std.ArrayList(Cell) = .empty;
-            for (run.plan.arms) |i| try cells.append(run.a, .{ .arm = b.arms[i], .ns = acc.samples[i].items });
+            for (run.plan.arms) |i| {
+                if (acc.samples[i].items.len > 0) try cells.append(run.a, .{ .arm = b.arms[i], .ns = acc.samples[i].items });
+            }
             try rows.append(run.a, .{ .label = acc.label, .cells = cells.items });
         }
         var axes: std.ArrayList(Selection) = .empty;
@@ -782,6 +784,24 @@ test "ubench run: every arm is warmed once, then sampled in the rotated order ea
     cancel.store(true, .release);
     try testing.expectError(error.Interrupted, run.interleave("rows 4", SampleCtx{ .seen = &seen, .a = a }, sampleArm));
     try testing.expectEqual(@as(usize, 1), run.rows.items.len);
+}
+
+test "ubench run: a rung that timed only some arms has no cell for the others" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var seen: std.ArrayList(usize) = .empty;
+    var run: Run = .{ .a = a, .plan = .{ .bench = &fake_registry[0], .arms = &.{1}, .ref = 0, .rungs = &.{}, .opts = &.{} }, .rounds = 2, .steps_override = null, .pack = null, .cancel = &cancel };
+    try run.interleave("rows 1", SampleCtx{ .seen = &seen, .a = a }, sampleArm);
+    run.plan.arms = &.{ 0, 1 };
+    const stamps: Stamps = .{ .commit = "abc1234", .dirty = false, .sha256 = "4b7e..19", .mtime = "2026-10-29 14:02 UTC", .chip = "Apple M5 Max", .power = "AC", .lock = "ubench:dsv41.experts", .contended = false, .time = "20261029T140200" };
+    const r = try run.finish(stamps);
+    try testing.expectEqual(@as(usize, 1), r.rows[0].cells.len);
+    try testing.expectEqualStrings("b", r.rows[0].cells[0].arm);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try renderTable(&aw.writer, a, r);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "| rows 1 |") != null);
 }
 
 test "ubench json: a result reads back as written, and the table carries ratios and metrics" {

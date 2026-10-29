@@ -241,8 +241,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
 - Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;
   `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX reference and served bodies in one boot).
-- Time MiMo's prefill attention for one chunk with `SUSHI_ATTN_PD_UBENCH=1` (test filter "MiMo prefill attention per
-  chunk"). Knobs: `_QL`, `_KL` (empty skips the main table), `_BUDGETS`, `_LEAN`, `_REPS`; kernel variants on the
-  dense chain at `_ABL_KL` keys: `_ABL=1` (ablations) and `_ALT=<a.metal>,...` (replacement sources, byte-checked
-  against the served kernel).
+- Time MiMo's prefill attention for one chunk with `sushi-ubench run mimo2.prefill_attn` (`--rungs ql=...`, `--rungs kl=...`;
+  kL = qL is the chunk alone): a global layer's served chain against pre-dequantized K/V, and a sliding layer's fused band
+  kernel against the composed SDPA. MiMo's global decode attention (dense, dequant rebuild, matmul2d, split-K, kv 2k to
+  512k) is `sushi-ubench run mimo2.global_decode_attn`.
 - Every timing run takes the GPU lock and restores QoS ([CLAUDE.md, Team process](../CLAUDE.md#team-process)).

@@ -1381,7 +1381,7 @@ pub fn mimoDecodeQkvPrep(
 pub const QKV_SPLITK_KEYS_PER_SPLIT: c_int = 512;
 pub const QKV_SPLITK_MIN_SPLITS: c_int = 64;
 pub const QKV_SPLITK_MAX_SPLITS: c_int = 128;
-/// µbench seam: split geometry (keys per split, split floor, split cap).
+/// Test seam: split geometry (keys per split, split floor, split cap).
 pub var qkv_splitk_split_override: ?[3]c_int = null;
 
 pub fn qkvSplitKSplits(t_k: c_int) c_int {
@@ -1814,13 +1814,9 @@ var qkv_mpp_cfg_keys: [2][@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvMppCfgKey = @splat(
 var qkv_mpp_probed: [16]?struct { key: QkvMppKey, ok: bool } = @splat(null);
 var qkv_mpp_engaged: bool = false;
 
-/// µbench seam: split geometry (pages per split, split cap).
-pub var qkv_mpp_split_override: ?[2]c_int = null;
-
 pub fn qkvMppSplits(t_k: c_int) c_int {
-    const g = qkv_mpp_split_override orelse .{ QKV_MPP_PAGES_PER_SPLIT, QKV_MPP_MAX_SPLITS };
     const pages = @divTrunc(t_k + QKV_MPP_PAGE - 1, QKV_MPP_PAGE);
-    return std.math.clamp(@divTrunc(pages, g[0]), 1, g[1]);
+    return std.math.clamp(@divTrunc(pages, QKV_MPP_PAGES_PER_SPLIT), 1, QKV_MPP_MAX_SPLITS);
 }
 
 fn qkvMppMRows(key: QkvMppKey) c_int {
@@ -2241,151 +2237,6 @@ fn qkvPackedParityCase(comptime cand_fn: anytype, rnd: std.Random, h_q: c_int, h
         std.debug.print("[qkv-packed parity] Hq={d} Hkv={d} DK={d} DV={d} bits={d} Tk={d} Tq={d}: kernel max {e:.3} rms {e:.3} | dense max {e:.3} rms {e:.3}\n", .{ h_q, h_kv, dk, dv, bits, t_prefill + t_q, t_q, ce.max, ce.rms, de.max, de.rms });
     }
     try testing.expect(pass);
-}
-
-const KvqUbArm = union(enum) {
-    empty,
-    /// SDPA over the view's dense arrays, which the view builds once.
-    dense,
-    /// Dequantize the triples on every call, then SDPA: what a decode step does.
-    dense_rebuild,
-    /// matmul2d at (pages per split, split cap).
-    mpp: [2]c_int,
-    /// split-K at (keys per split, split floor, split cap).
-    split_k: [3]c_int,
-};
-
-/// MiMo global decode (64/4 heads, qk 192 / v 128) over nine dependent layers, each over its OWN
-/// cache so small contexts cannot hide in the SLC; arms interleave per rep, `arms[0]` is the empty
-/// chain. us/call = (chain - empty chain) / 9.
-fn kvqDecodeUbench(comptime tag: []const u8, arms: []const KvqUbArm) !void {
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var prng = std.Random.DefaultPrng.init(0x3D2D_BE7C);
-    const rnd = prng.random();
-    const h_q: c_int = 64;
-    const h_kv: c_int = 4;
-    const layers: usize = 9;
-    const reps: usize = 7;
-    const max_arms = 8;
-    const scale: f32 = 1.0 / @sqrt(192.0);
-    const none = mlx.mlx_array{ .ctx = null };
-    const bits: u8 = if (diagEnvOn("SUSHI_KVQ_MPP_UBENCH_KV4")) 4 else 8;
-    defer qkv_mpp_split_override = null;
-    defer qkv_splitk_split_override = null;
-
-    const Next = struct {
-        // [1,64,1,128] -> [1,64,1,192]: the next layer's query depends on this layer's output.
-        fn f(st: mlx.mlx_stream, out: mlx.mlx_array) !mlx.mlx_array {
-            var head = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(head);
-            try mlx.check(mlx.mlx_slice(&head, out, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, 64, 1, 64 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, st));
-            const parts = [_]mlx.mlx_array{ out, head };
-            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            var q = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_concatenate_axis(&q, vec, 3, st));
-            return q;
-        }
-    };
-
-    std.debug.print("\n[" ++ tag ++ "] MiMo global decode 64/4 qk192/v128 kv{d} gs64, {d} dependent layers, median of {d}\n", .{ bits, layers, reps });
-    std.debug.print("[" ++ tag ++ "]      kv ", .{});
-    for (arms[1..]) |arm| switch (arm) {
-        .empty => {},
-        .dense => std.debug.print("|   dense_us  GB/s ", .{}),
-        .dense_rebuild => std.debug.print("| rebuild_us  GB/s ", .{}),
-        .mpp => |g| std.debug.print("| mpp{d}/{d}_us  GB/s ", .{ g[0], g[1] }),
-        .split_k => |g| std.debug.print("| sk{d}/{d}/{d}_us  GB/s ", .{ g[0], g[1], g[2] }),
-    };
-    std.debug.print("\n", .{});
-    for ([_]c_int{ 2048, 4096, 8192, 16384, 65536, 262144, 524288 }) |kv| {
-        var caches: [layers]KVCache = undefined;
-        var views: [layers]DenseKVView = undefined;
-        var built: usize = 0;
-        defer for (0..built) |i| {
-            views[i].deinit();
-            caches[i].deinit();
-        };
-        for (0..layers) |i| {
-            caches[i] = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(bits));
-            {
-                const k = try testRandWeightBf16(rnd, &[_]c_int{ 1, h_kv, kv - 1, 192 }, s);
-                defer _ = mlx.mlx_array_free(k);
-                const v = try testRandWeightBf16(rnd, &[_]c_int{ 1, h_kv, kv - 1, 128 }, s);
-                defer _ = mlx.mlx_array_free(v);
-                var d0 = try caches[i].update(0, k, v, s, 0);
-                d0.deinit();
-            }
-            const k1 = try testRandWeightBf16(rnd, &[_]c_int{ 1, h_kv, 1, 192 }, s);
-            defer _ = mlx.mlx_array_free(k1);
-            const v1 = try testRandWeightBf16(rnd, &[_]c_int{ 1, h_kv, 1, 128 }, s);
-            defer _ = mlx.mlx_array_free(v1);
-            views[i] = try caches[i].update(0, k1, v1, s, 0);
-            built += 1;
-            const ev = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(ev);
-            for ([_]mlx.mlx_array{ views[i].k_triple_q, views[i].k_triple_scales, views[i].k_triple_biases, views[i].v_triple_q, views[i].v_triple_scales, views[i].v_triple_biases }) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
-            try mlx.check(mlx.mlx_eval(ev));
-        }
-        var bytes: f64 = 0;
-        for ([_]mlx.mlx_array{ views[0].k_triple_q, views[0].k_triple_scales, views[0].k_triple_biases, views[0].v_triple_q, views[0].v_triple_scales, views[0].v_triple_biases }) |a|
-            bytes += @floatFromInt(mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a));
-        const q0 = try attn256RandBf16Scaled(rnd, &[_]c_int{ 1, h_q, 1, 192 }, 8.0, s);
-        defer _ = mlx.mlx_array_free(q0);
-
-        var samples: [max_arms][reps]f64 = undefined;
-        for (0..reps + 2) |r| {
-            for (arms, 0..) |arm, ai| {
-                const t0 = std.Io.Timestamp.now(io, .boot);
-                var q = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_array_set(&q, q0));
-                for (0..layers) |l| {
-                    var out = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(out);
-                    switch (arm) {
-                        .empty => try mlx.check(mlx.mlx_slice(&out, q, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, 64, 1, 128 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s)),
-                        .dense => try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, views[l].k, views[l].v, scale, "", none, .{ .ctx = null }, false, s)),
-                        .dense_rebuild => {
-                            const kd = try kv_quant.dequantizeAffine(s, views[l].k_triple_q, views[l].k_triple_scales, views[l].k_triple_biases, views[l].group_size, bits);
-                            defer _ = mlx.mlx_array_free(kd);
-                            const vd = try kv_quant.dequantizeAffine(s, views[l].v_triple_q, views[l].v_triple_scales, views[l].v_triple_biases, views[l].group_size, bits);
-                            defer _ = mlx.mlx_array_free(vd);
-                            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vd, scale, "", none, .{ .ctx = null }, false, s));
-                        },
-                        .mpp => |g| {
-                            qkv_mpp_split_override = g;
-                            _ = mlx.mlx_array_free(out);
-                            out = (try qkvAttnMppKernel(s, q, &views[l], scale, "")) orelse return error.KernelDeclined;
-                        },
-                        .split_k => |g| {
-                            qkv_splitk_split_override = g;
-                            _ = mlx.mlx_array_free(out);
-                            out = (try qkvAttnSplitKKernel(s, q, &views[l], scale, "")) orelse return error.KernelDeclined;
-                        },
-                    }
-                    const nq = try Next.f(s, out);
-                    _ = mlx.mlx_array_free(q);
-                    q = nq;
-                }
-                try mlx.check(mlx.mlx_array_eval(q));
-                _ = mlx.mlx_array_free(q);
-                if (r >= 2) samples[ai][r - 2] = @as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e3;
-            }
-        }
-        var med: [max_arms]f64 = undefined;
-        for (0..arms.len) |a| {
-            std.mem.sort(f64, &samples[a], {}, std.sort.asc(f64));
-            med[a] = samples[a][reps / 2];
-        }
-        std.debug.print("[" ++ tag ++ "] {d:>7} ", .{kv});
-        for (1..arms.len) |a| {
-            const us = @max(0.001, (med[a] - med[0]) / @as(f64, @floatFromInt(layers)));
-            std.debug.print("| {d:>10.1}  {d:>5.0} ", .{ us, bytes / us / 1e3 });
-        }
-        std.debug.print("\n", .{});
-        _ = mlx.mlx_clear_cache();
-    }
 }
 
 /// Serial decode ticks against one verify forward over the same rows, on twin caches.
@@ -3166,23 +3017,6 @@ test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs t
     qkv_splitk_split_override = null;
     try qkvPackedParityCase(qkvAttnSplitKKernel, rnd, 24, 2, 256, 256, 8, 3000, 1);
     try qkvPackedParityCase(qkvAttnSplitKKernel, rnd, 24, 2, 256, 256, 6, 3000, 1);
-}
-
-test "qkv matmul2d µbench: MiMo global decode, dense dequant+SDPA vs matmul2d split sweep (SUSHI_KVQ_MPP_UBENCH=1)" {
-    if (!diagEnvOn("SUSHI_KVQ_MPP_UBENCH")) return error.SkipZigTest;
-    try kvqDecodeUbench("kvq-mpp", &.{ .empty, .dense, .{ .mpp = .{ QKV_MPP_PAGES_PER_SPLIT, QKV_MPP_MAX_SPLITS } }, .{ .mpp = .{ 8, 128 } }, .{ .mpp = .{ 2, 512 } } });
-}
-
-test "qkv split-K µbench: MiMo global decode, dequant rebuild+SDPA vs split-K geometry sweep (SUSHI_KVQ_SPLITK_UBENCH=1)" {
-    if (!diagEnvOn("SUSHI_KVQ_SPLITK_UBENCH")) return error.SkipZigTest;
-    try kvqDecodeUbench("kvq-splitk", &.{
-        .empty,
-        .dense_rebuild,
-        .{ .split_k = .{ QKV_SPLITK_KEYS_PER_SPLIT, QKV_SPLITK_MIN_SPLITS, QKV_SPLITK_MAX_SPLITS } },
-        .{ .split_k = .{ 512, 32, 128 } },
-        .{ .split_k = .{ 256, 64, 128 } },
-        .{ .split_k = .{ 512, 64, 256 } },
-    });
 }
 
 test "qkvMppDecodeServes: decode width, packed cache, and the measured kv floor" {
