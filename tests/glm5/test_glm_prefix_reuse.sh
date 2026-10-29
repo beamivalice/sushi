@@ -1,5 +1,5 @@
 #!/bin/bash
-# sushi-test: tier=live boot=ram
+# sushi-test: tier=live boot=own pack=glm5 boots=1
 # test_glm_prefix_reuse.sh — GLM-5.3-Flash prefix reuse: KDA checkpoints on the prefill chunk grid
 # and at the prompt end, MLA rows below them (docs/glm5-prefix-cache.md#glm). Pins, greedy, one
 # hot entry:
@@ -13,17 +13,18 @@
 #  4. A BF16-latent request never restores a kv8 entry.
 #  5. A stream cancelled mid-decode still commits its prompt for the next request.
 #
-# Every cold arm starts from a cache holding nothing it shares: unrelated raw completions past the
-# ram boot's four entries evict it first.
+# Every cold arm starts from a cache holding nothing it shares: an unrelated raw completion evicts
+# the one hot entry. The boot keeps one entry; the eviction policy keeps a long entry beside short ones.
 
 set -uo pipefail
 
 . "$(dirname "$0")/../lib/boot.sh"
-sushi_attach
+MODEL=$(sushi_pack glm5) || exit $?
+sushi_boot glm-prefix "$MODEL" --prefix-cache-entries 1 --prefix-cache-mem 1GB --prefix-cache-disk off --log-level info || exit $?
 BASE="$SUSHI_URL"
+export SUSHI_NONCE="glp$$"
 BOUND="${GLM_RESTORE_BOUND_NATS:-0.5}"
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
-# Logged once at load, before this script attached.
 grep -q '\[glm\] prefix cache' "$SUSHI_LOG" || { echo "fail: the GLM prefix cache did not arm"; exit 1; }
 
 words() { python3 -c "import random,sys; r=random.Random($1); w='agent tool file cache ring window layer prompt reply token session restore commit budget chunk kernel latent pool state'.split(); print(' '.join(r.choice(w) for _ in range($2)))"; }
@@ -46,13 +47,9 @@ chat() {
         + (if $lp then {logprobs:true,top_logprobs:1} else {} end)
         + (if $kv == "" then {} else {kv_quant:($kv|tonumber)} end)'
 }
-# Five distinct entries push the target past the ram boot's four.
 unrelated() {
-    local i
-    for i in 1 2 3 4 5; do
-        curl -sf --max-time 600 -X POST "$BASE/v1/completions" -H 'Content-Type: application/json' \
-            -d "{\"prompt\":\"$SUSHI_NONCE-$i Lorem ipsum dolor sit amet, consectetur adipiscing elit.\",\"max_tokens\":4,\"temperature\":0}" >/dev/null || return 1
-    done
+    curl -sf --max-time 600 -X POST "$BASE/v1/completions" -H 'Content-Type: application/json' \
+        -d "{\"prompt\":\"$SUSHI_NONCE Lorem ipsum dolor sit amet, consectetur adipiscing elit.\",\"max_tokens\":4,\"temperature\":0}" >/dev/null
 }
 text() { echo "$1" | jq -r '(.choices[0].message.reasoning_content // "") + "\u0001" + (.choices[0].message.content // "")'; }
 field() { echo "$1" | jq -r "$2"; }

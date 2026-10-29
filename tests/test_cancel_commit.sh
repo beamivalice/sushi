@@ -32,6 +32,8 @@ PASS=0
 FAIL=0
 # kv4 rides the request on the archs that serve it (GLM refuses kv4, DeepSeek has no KV cache).
 case "$SUSHI_ARCH" in qwen4_exp | mimo_v2) KVQ=4 ;; *) KVQ=null ;; esac
+# GLM's template has no thinking-off mode.
+case "$SUSHI_ARCH" in glm5_next) THINK='{"reasoning_effort":"low"}' ;; *) THINK='{"enable_thinking":false}' ;; esac
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -71,8 +73,8 @@ log_after() { sushi_log_since | tail -c +"$(($1 + 1))"; }
 body_chat() {
     local sys="$1" stream="$2" maxtok="$3"
     jq -nc --arg s "$sys" \
-        '{model:"x",messages:[{role:"system",content:$s},{role:"user",content:"Tell me about cache invalidation."}],max_tokens:$mt,temperature:0.0,stream:$st,enable_thinking:false,kv_quant:$kvq}' \
-        --argjson mt "$maxtok" --argjson st "$stream" --argjson kvq "$KVQ"
+        '{model:"x",messages:[{role:"system",content:$s},{role:"user",content:"Tell me about cache invalidation."}],max_tokens:$mt,temperature:0.0,stream:$st,kv_quant:$kvq} + $think' \
+        --argjson think "$THINK" --argjson mt "$maxtok" --argjson st "$stream" --argjson kvq "$KVQ"
 }
 
 # ─────────────────────────────────────────────────────────────────────────
