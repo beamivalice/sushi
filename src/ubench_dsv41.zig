@@ -411,7 +411,7 @@ fn sampleAttn(s: *AttnSample, arm: usize) anyerror!f64 {
     const y = try switch (@as(AttnArm, @enumFromInt(arm))) {
         .core => model.attnCore(&sc, d.sink, d.q, d.keys, d.band, d.comp, d.topk, scale, .bfloat16),
         .wide => kernels.attnWide(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16),
-        .fused => kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16),
+        .fused => kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16, null),
     };
     try mlx.check(mlx.mlx_array_eval(y));
     const ns = sw.read();
@@ -441,6 +441,77 @@ fn runAttnSpan(run: *report.Run) anyerror!void {
     }
 }
 
+// ── dsv41.attn_epilogue ─────────────────────────────────────────────────
+
+pub const attn_epilogue: report.Bench = .{
+    .name = "dsv41.attn_epilogue",
+    .scope = .dsv41,
+    .what = "one prefill span's heads as the grouped wo_a takes them, at the release geometry (64 heads x 512, 8 groups, QAT on, span at 30,720): the fused kernel then the rotation, fp8 round trip and transpose as ops, against the kernel's store doing all three; MLX peak beyond the inputs",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{.{ .name = "span", .values = &.{ "256k512", "128k512", "256k0" }, .numeric = false }},
+    .arms = &.{ "chain", "fold" },
+    .ref = "chain",
+    .run = runAttnEpilogue,
+};
+
+const epi_pos0: usize = 30720;
+const epi_groups = 8;
+
+const EpiSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, rows: ?*const model.Rows, freqs: A, pos: A, peak: [2]Range = @splat(.{}) };
+
+fn sampleEpilogue(s: *EpiSample, arm: usize) anyerror!f64 {
+    const scale = 1.0 / @sqrt(@as(f32, 512));
+    const c = s.c;
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    const p = Peak.begin(s.gpu);
+    var sw = io_util.Stopwatch.init(io());
+    const picks: model.Picks = if (s.rows) |r| try model.packedPicks(&sc, r, s.d.topk, true) else .{};
+    const epi: kernels.Epilogue = .{ .freqs = s.freqs, .rd = 64, .pos0 = epi_pos0, .qat = true, .og = epi_groups };
+    const y = if (arm == 1)
+        try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, c.wp, c.window, picks, scale, .bfloat16, epi)
+    else blk: {
+        const heads = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, c.wp, c.window, picks, scale, .bfloat16, null);
+        const rot = try kernels.ropeTail(&sc, heads, s.freqs, s.pos, 64, true, .none, null);
+        const grouped = try sc.reshape(rot, &.{ ci(c.L), epi_groups, ci(c.H * c.hd / epi_groups) });
+        break :blk try sc.transpose(try qat_mod.qat(&sc, grouped, .fp8_ue8m0, 32), &.{ 1, 0, 2 });
+    };
+    try mlx.check(mlx.mlx_array_eval(y));
+    const ns = sw.read();
+    s.peak[arm].add(p.end());
+    return @floatFromInt(ns);
+}
+
+fn runAttnEpilogue(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const Case = struct { name: []const u8, c: model.AttnCase };
+    const cases = [_]Case{
+        .{ .name = "256k512", .c = .{ .L = 256, .wp = 127, .K = 512, .nc = 4096, .holes = false } },
+        .{ .name = "128k512", .c = .{ .L = 128, .wp = 127, .K = 512, .nc = 4096, .holes = false } },
+        .{ .name = "256k0", .c = .{ .L = 256, .wp = 127, .K = 0, .nc = 0 } },
+    };
+    var f: [32]f32 = undefined;
+    qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
+    for (cases) |cs| {
+        if (!listed(run.axis("span"), cs.name)) continue;
+        var base = Scope.init(alloc, gpu);
+        defer base.deinit();
+        const d = try model.attnCaseData(&base, cs.c, 0xa77);
+        var store: ?model.Rows = if (cs.c.K > 0) try model.packedStore(&base, d.comp) else null;
+        defer if (store) |*r| r.deinit();
+        const freqs = try base.floats(&f, &.{32});
+        const pos = try model.posArray(&base, epi_pos0, cs.c.L, 1);
+        try evalAll(&.{ d.q, d.keys, d.sink, freqs, pos });
+        if (store) |r| try evalAll(&.{ d.topk, r.buf, r.sbuf });
+        var s: EpiSample = .{ .gpu = gpu, .d = d, .c = cs.c, .rows = if (store) |*r| r else null, .freqs = freqs, .pos = pos };
+        const label = try std.fmt.allocPrint(run.a, "span {d} K {d}", .{ cs.c.L, cs.c.K });
+        try run.interleave(label, &s, sampleEpilogue);
+        try s.peak[0].metrics(run, "chain", "peak");
+        try s.peak[1].metrics(run, "fold", "peak");
+    }
+}
+
 // ── dsv41.picks_span ────────────────────────────────────────────────────
 
 pub const picks_span: report.Bench = .{
@@ -467,7 +538,7 @@ fn samplePicks(s: *PicksSample, arm: usize) anyerror!f64 {
     const p = Peak.begin(s.gpu);
     var sw = io_util.Stopwatch.init(io());
     const picks = try model.packedPicks(&sc, s.rows, s.d.topk, arm == 1);
-    const y = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, s.c.wp, s.c.window, picks, scale, .bfloat16);
+    const y = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, s.c.wp, s.c.window, picks, scale, .bfloat16, null);
     try mlx.check(mlx.mlx_array_eval(y));
     const ns = sw.read();
     s.peak[arm].add(p.end());

@@ -922,7 +922,8 @@ pub fn attnWide(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, 
 /// matrix products: it scores its channels (`S` partials, summed in simdgroup order) and accumulates its slice of
 /// the output. The softmax is online in f32, seeded by the sink (max = sink, sum = 1, zero value), so rows with
 /// no key leave 0. P reaches the bf16 matrix unit as a high and a low part, which keeps ~16 bits of it.
-/// meta = {wp, window, K, nc}.
+/// With EPI the heads leave as attnOut takes them: inverse-rotated at `meta[4] + l`, fp8-rounded (QAT) and written
+/// `[og, L, GIN]`. meta = {wp, window, K, nc, pos0}.
 const ATTN_FUSED_HEAD =
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int l = threadgroup_position_in_grid.y, h0 = threadgroup_position_in_grid.x * HB;
@@ -1084,21 +1085,69 @@ const ATTN_FUSED_TAIL =
     \\#pragma clang loop unroll(full)
     \\for (int r = 0; r < RT; ++r) {
     \\  const float inv = rl[r * 8 + fm];
-    \\  device OT* dst = out + (size_t(l) * H + h0 + r * 8 + fm) * D + d0 + fn;
-    \\  #pragma clang loop unroll(full)
-    \\  for (int d = 0; d < DT; ++d) {
-    \\    const auto e = o[r][d].thread_elements();
-    \\    dst[d * 8] = OT(e[0] * inv);
-    \\    dst[d * 8 + 1] = OT(e[1] * inv);
+    \\  const int head = h0 + r * 8 + fm;
+    \\  if (EPI) {
+    \\    float v[DT][2];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int d = 0; d < DT; ++d) {
+    \\      const auto e = o[r][d].thread_elements();
+    \\      v[d][0] = float(OT(e[0] * inv));
+    \\      v[d][1] = float(OT(e[1] * inv));
+    \\      const int c = d0 + d * 8 + fn;
+    \\      if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[d][0], v[d][1], meta[4] + l, freqs[(c - (D - RD)) / 2]);
+    \\    }
+    \\    #pragma clang loop unroll(full)
+    \\    for (int g = 0; g < DT / 4 && QAT; ++g) {
+    \\      float amax = 0.0f;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = g * 4; d < g * 4 + 4; ++d) amax = metal::max(amax, metal::max(metal::abs(v[d][0]), metal::abs(v[d][1])));
+    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+    \\      const float sc = qat_scale<0>(amax);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int d = g * 4; d < g * 4 + 4; ++d) {
+    \\        v[d][0] = float(static_cast<OT>(qat_round<0>(v[d][0], sc)));
+    \\        v[d][1] = float(static_cast<OT>(qat_round<0>(v[d][1], sc)));
+    \\      }
+    \\    }
+    \\    #pragma clang loop unroll(full)
+    \\    for (int d = 0; d < DT; ++d) {
+    \\      const int flat = head * D + d0 + d * 8 + fn;
+    \\      device OT* dst = out + (size_t(flat / GIN) * q_shape[0] + l) * GIN + flat % GIN;
+    \\      dst[0] = OT(v[d][0]);
+    \\      dst[1] = OT(v[d][1]);
+    \\    }
+    \\  } else {
+    \\    device OT* dst = out + (size_t(l) * H + head) * D + d0 + fn;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int d = 0; d < DT; ++d) {
+    \\      const auto e = o[r][d].thread_elements();
+    \\      dst[d * 8] = OT(e[0] * inv);
+    \\      dst[d * 8 + 1] = OT(e[1] * inv);
+    \\    }
     \\  }
     \\}
+;
+
+/// The epilogue's rotation of one channel pair: `ROPE_TAIL_SOURCE`'s inverse rotation, rounded to T.
+const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
+    \\template <typename T>
+    \\inline void dsv41_rope_pair(thread float& a, thread float& b, int pos, float freq) {
+    \\  #pragma clang fp contract(off)
+    \\  const float theta = float(pos) * freq;
+    \\  const float cs = metal::precise::cos(theta), sn = -metal::precise::sin(theta);
+    \\  const float x1 = a, x2 = b;
+    \\  a = float(T(x1 * cs - x2 * sn));
+    \\  b = float(T(x1 * sn + x2 * cs));
+    \\}
+    \\
 ;
 
 const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
 const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
 
-var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE };
-var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = qat_mod.PACK_HEADER };
+var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE, .header = ATTN_EPI_HEADER };
+var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
 
 const fused_hb = 16;
 const fused_nsg = 8;
@@ -1109,50 +1158,71 @@ pub fn attnFusedFits(h: usize, d: usize) bool {
     return h % fused_hb == 0 and d % (fused_nsg * 8) == 0;
 }
 
+/// What attnOut does to the heads before `wo_a`, done by the kernel's store: the tail's inverse rotation at
+/// `pos0 + row`, the fp8 round trip (`qat`), and the `[og, L, H * D / og]` layout.
+pub const Epilogue = struct { freqs: A, rd: usize, pos0: usize, qat: bool, og: usize };
+
+/// Whether the store can hold an `Epilogue` for `h` heads of `d` channels: fp8 groups of 32 lie inside a simdgroup's slice.
+pub fn attnEpilogueFits(h: usize, d: usize, og: usize) bool {
+    return attnFusedFits(h, d) and d % (fused_nsg * 32) == 0 and (h * d) % og == 0 and (h * d / og) % 32 == 0;
+}
+
 /// `attnWide` without the intermediates or the f16: `attnCore`'s heads `[L, H, D]` for `q` `[L, H, D]` (bf16)
 /// against the window rows `keys_w` (query i sees rows (wp + i - window, wp + i]) and the compressed rows
-/// `comp_rows` it picked (`topk` `[L, K]`), f32 throughout past the bf16 operands.
-pub fn attnFused(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+/// `comp_rows` it picked (`topk` `[L, K]`), f32 throughout past the bf16 operands. With `epi` they leave as attnOut
+/// takes them.
+pub fn attnFused(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype, epi: ?Epilogue) !A {
     const dt = mlx.mlx_array_dtype(q);
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const keys = try sc.astype(keys_w, dt);
     const comp = if (K > 0) try sc.astype(comp_rows, dt) else keys;
     const picks = if (K > 0) try sc.astype(topk, .int32) else sc_mod.none;
-    return attnFusedLaunch(sc, &attn_fused_def, sink, q, keys, &.{comp}, wp, window, K, if (K > 0) dim(comp_rows, 0) else 0, picks, scale, out_dt, &.{});
+    return attnFusedLaunch(sc, &attn_fused_def, sink, q, keys, &.{comp}, wp, window, K, if (K > 0) dim(comp_rows, 0) else 0, picks, scale, out_dt, &.{}, epi);
 }
 
 /// `attnFused` with the picked rows read where the compressed store keeps them: `codes` `[rows, D / 2]` and
 /// `scales` `[rows, D / group]` (`qat_mod.packFp4`'s form), `topk` the ids into them. Each row is decoded as
 /// `qat_mod.unpackFp4` does, so the heads are the bytes `attnFused` gives for the unpacked rows.
-pub fn attnFusedPacked(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, codes: A, scales: A, mode: qat_mod.Qat, group: usize, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+pub fn attnFusedPacked(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, codes: A, scales: A, mode: qat_mod.Qat, group: usize, topk: A, scale: f32, out_dt: mlx.mlx_dtype, epi: ?Epilogue) !A {
     std.debug.assert(group % 8 == 0 and dim(codes, 1) * 2 == dim(q, 2));
     const keys = try sc.astype(keys_w, mlx.mlx_array_dtype(q));
     const extra = [_]Tmpl{ .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) } };
-    return attnFusedLaunch(sc, &attn_fused_fp4_def, sink, q, keys, &.{ codes, scales }, wp, window, dim(topk, 1), dim(codes, 0), try sc.astype(topk, .int32), scale, out_dt, &extra);
+    return attnFusedLaunch(sc, &attn_fused_fp4_def, sink, q, keys, &.{ codes, scales }, wp, window, dim(topk, 1), dim(codes, 0), try sc.astype(topk, .int32), scale, out_dt, &extra, epi);
 }
 
 /// `comp`: the picked rows' arrays, as `def` takes them; `picks`: `topk` as int32, none without picks.
-fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const A, wp: usize, window: usize, K: usize, nc: usize, picks: A, scale: f32, out_dt: mlx.mlx_dtype, extra: []const Tmpl) !A {
+fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const A, wp: usize, window: usize, K: usize, nc: usize, picks: A, scale: f32, out_dt: mlx.mlx_dtype, extra: []const Tmpl, epi: ?Epilogue) !A {
     const L = dim(q, 0);
     const H = dim(q, 1);
     const D = dim(q, 2);
-    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), ci(nc) };
+    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), ci(nc), if (epi) |e| ci(e.pos0) else 0 };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
-    var ins: [8]A = undefined;
+    var ins: [9]A = undefined;
     ins[0] = q;
     ins[1] = keys;
     @memcpy(ins[2..][0..comp.len], comp);
     var n = 2 + comp.len;
-    for ([_]A{ if (picks.ctx != null) picks else meta, sink, meta, try f32Const(sc, &.{scale}) }) |a| {
+    for ([_]A{ if (picks.ctx != null) picks else meta, sink, meta, try f32Const(sc, &.{scale}), if (epi) |e| e.freqs else try f32Const(sc, &.{0}) }) |a| {
         ins[n] = a;
         n += 1;
     }
-    var tmpl: [6]Tmpl = undefined;
-    const base = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = fused_hb }, .{ .name = "NSG", .v = fused_nsg }, .{ .name = "KT", .v = fused_kt } };
+    var tmpl: [10]Tmpl = undefined;
+    const og = if (epi) |e| e.og else 1;
+    const base = [_]Tmpl{
+        .{ .name = "D", .v = ci(D) },
+        .{ .name = "HB", .v = fused_hb },
+        .{ .name = "NSG", .v = fused_nsg },
+        .{ .name = "KT", .v = fused_kt },
+        .{ .name = "EPI", .v = @intFromBool(epi != null) },
+        .{ .name = "RD", .v = if (epi) |e| ci(e.rd) else 0 },
+        .{ .name = "QAT", .v = if (epi) |e| @intFromBool(e.qat) else 0 },
+        .{ .name = "GIN", .v = ci(H * D / og) },
+    };
     @memcpy(tmpl[0..base.len], &base);
     @memcpy(tmpl[base.len..][0..extra.len], extra);
     var o: [1]A = undefined;
-    try launch(sc, def, ins[0..n], &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
+    const out_shape: [3]c_int = if (epi != null) .{ ci(og), ci(L), ci(H * D / og) } else .{ ci(L), ci(H), ci(D) };
+    try launch(sc, def, ins[0..n], &.{.{ .shape = &out_shape, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
     return o[0];
 }
 

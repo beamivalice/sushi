@@ -647,6 +647,8 @@ pub const Model = struct {
     /// Wide spans take the f16 core (`kernels.attnWide`): faster, and f16 scores change the output, so it is off
     /// until a KLD run clears it.
     attn_f16: bool = false,
+    /// A wide span's attention kernel stores the heads as `wo_a` takes them; off, the op chain does (the tests' oracle).
+    attn_epilogue: bool = true,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
@@ -1317,7 +1319,7 @@ fn hcMixes(sc: *Scope, m: *const Model, x: A, hc: *const Hc) !qat_mod.Split {
 
 // ── attention ────────────────────────────────────────────────────────────
 
-fn posArray(sc: *Scope, first: usize, n: usize, step: usize) !A {
+pub fn posArray(sc: *Scope, first: usize, n: usize, step: usize) !A {
     const host = try sc.a.alloc(i32, n);
     defer sc.a.free(host);
     for (host, 0..) |*v, i| v.* = @intCast(first + i * step);
@@ -1837,6 +1839,8 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         return attnOut(sc, m, ly, o, m.qat_on);
     }
     const one_pass = fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd);
+    // The kernel's store does attnOut's rotation, round trip and layout; the heads are no longer a tensor to trace.
+    const fold = one_pass and rd > 0 and m.attn_epilogue and m.trace == null and kernels.attnEpilogueFits(H, hd, c.o_groups);
     const n_spans = (L + span - 1) / span;
     const heads = try sc.a.alloc(A, n_spans);
     defer sc.a.free(heads);
@@ -1870,7 +1874,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         }
         const K = if (picks.any()) dim(picks.topk, 1) else 0;
         const head = if (one_pass)
-            try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act)
+            try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act, if (fold) kernels.Epilogue{ .freqs = rope, .rd = rd, .pos0 = p0 + a, .qat = m.qat_on, .og = c.o_groups } else null)
         else if (m.attn_f16 and fus and (m.act == .bfloat16 or m.act == .float16) and wk + K <= kernels.attn_softmax_max_cols)
             try kernels.attnWide(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
         else
@@ -1886,16 +1890,19 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     }
     try ls.win.write(kv, p0, sc.s);
 
-    const out = try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
+    const out = if (fold)
+        try attnOutGrouped(sc, ly, try sc.concat(heads, 1))
+    else
+        try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
     if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
     return out;
 }
 
 /// `kernels.attnFused` over a span's `picks`: a packed store is decoded inside the kernel when `q` is the store's dtype.
-pub fn fusedHeads(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, picks: Picks, scale: f32, out_dt: mlx.mlx_dtype) !A {
-    const rows = picks.store orelse return kernels.attnFused(sc, sink, q, keys_w, wp, window, picks.comp_rows, picks.topk, scale, out_dt);
+pub fn fusedHeads(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, picks: Picks, scale: f32, out_dt: mlx.mlx_dtype, epi: ?kernels.Epilogue) !A {
+    const rows = picks.store orelse return kernels.attnFused(sc, sink, q, keys_w, wp, window, picks.comp_rows, picks.topk, scale, out_dt, epi);
     const pk = rows.pack.?;
-    return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf, rows.sbuf, pk.mode, pk.group, picks.topk, scale, out_dt);
+    return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf, rows.sbuf, pk.mode, pk.group, picks.topk, scale, out_dt, epi);
 }
 
 /// What a DSpark stage's block attends over: `keys`, its window of committed main rows, then the block's own rows.
@@ -1943,7 +1950,12 @@ fn attnOut(sc: *Scope, m: *const Model, ly: *const Layer, o: A, rounded: bool) !
     const gin = c.heads * c.head_dim / og;
     const grouped = try sc.reshape(o, &.{ ci(L), ci(og), ci(gin) });
     const ob = if (rounded) grouped else try qatIf(sc, m, grouped, .fp8_ue8m0, 32);
-    const obg = try sc.transpose(ob, &.{ 1, 0, 2 }); // [og, L, in]
+    return attnOutGrouped(sc, ly, try sc.transpose(ob, &.{ 1, 0, 2 }));
+}
+
+/// `attnOut` from the heads as `[og, L, in]`, rotated and rounded.
+fn attnOutGrouped(sc: *Scope, ly: *const Layer, obg: A) !A {
+    const L = dim(obg, 1);
     const oa = if (ly.wo_a.stq) |q|
         try q.applyGrouped(sc, obg)
     else if (ly.wo_a.s.ctx == null)
@@ -4918,7 +4930,7 @@ test "dsv41 fused attention: the one-pass kernel is no further from the f32 trut
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
         const truth = try sc_mod.hostF32(try attnCore(&cs, d.sink, d.q, d.keys, d.band, d.comp, d.topk, scale, .float32));
         const core = try sc_mod.hostF32(try attnCore(&sc, d.sink, d.q, d.keys, d.band, d.comp, d.topk, scale, .float32));
-        const fused = try sc_mod.hostF32(try kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .float32));
+        const fused = try sc_mod.hostF32(try kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .float32, null));
         const err_core = maxRelErr(core, truth);
         const err_fused = maxRelErr(fused, truth);
         errdefer std.debug.print("case {d}: core {e}, fused {e}\n", .{ ci_, err_core, err_fused });
@@ -4961,11 +4973,96 @@ test "dsv41 packed picks: the fused kernel reading the picked rows packed gives 
         for (&heads, [_]bool{ false, true }) |*h, raw| {
             const picks = try packedPicks(&sc, &rows, d.topk, raw);
             try testing.expectEqual(raw, picks.store != null);
-            h.* = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16));
+            h.* = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, null));
         }
         defer for (heads) |h| testing.allocator.free(h);
         errdefer std.debug.print("case {d}\n", .{ci_});
         try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(heads[0]), std.mem.sliceAsBytes(heads[1]));
+    }
+}
+
+test "dsv41 attention epilogue: the kernel's store gives attnOut's rotated, fp8-rounded, grouped heads of the op chain, byte for byte (release span shapes, both row sources)" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const cases = [_]struct { c: AttnCase, pos0: usize, qat: bool }{
+        .{ .c = .{ .L = 256, .wp = 127, .K = 512, .nc = 700 }, .pos0 = 30720, .qat = true },
+        .{ .c = .{ .L = 256, .wp = 127, .K = 512, .nc = 4096, .holes = false }, .pos0 = 0, .qat = true },
+        .{ .c = .{ .L = 128, .wp = 127, .K = 0, .nc = 0 }, .pos0 = 1048000, .qat = true },
+        .{ .c = .{ .L = 100, .wp = 63, .K = 512, .nc = 40 }, .pos0 = 777, .qat = false },
+        .{ .c = .{ .L = 17, .wp = 5, .K = 512, .nc = 9 }, .pos0 = 5, .qat = true },
+    };
+    const og = 8;
+    var f: [32]f32 = undefined;
+    qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
+    for (cases, 0..) |t, ci_| {
+        const c = t.c;
+        var sc = Scope.init(testing.allocator, gpu);
+        defer sc.deinit();
+        const d = try attnCaseData(&sc, c, 0xe91 + ci_);
+        var rows = try packedStore(&sc, if (c.K > 0) d.comp else try sc.zeros(&.{ 2, 512 }, .bfloat16));
+        defer rows.deinit();
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
+        const freqs = try sc.floats(&f, &.{32});
+        const pos = try posArray(&sc, t.pos0, c.L, 1);
+        const epi: kernels.Epilogue = .{ .freqs = freqs, .rd = 64, .pos0 = t.pos0, .qat = t.qat, .og = og };
+        for ([_]bool{ false, true }) |raw| {
+            if (raw and c.K == 0) continue;
+            const picks: Picks = if (c.K > 0) try packedPicks(&sc, &rows, d.topk, raw) else .{};
+            const heads = try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, null);
+            const rot = try kernels.ropeTail(&sc, heads, freqs, pos, 64, true, .none, null);
+            const gin = c.H * c.hd / og;
+            const grouped = try sc.reshape(rot, &.{ ci(c.L), og, ci(gin) });
+            const rounded = if (t.qat) try qat_mod.qat(&sc, grouped, .fp8_ue8m0, 32) else grouped;
+            const want = try hostRows(&sc, try sc.contiguous(try sc.transpose(rounded, &.{ 1, 0, 2 })));
+            defer testing.allocator.free(want);
+            const got = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, epi));
+            defer testing.allocator.free(got);
+            errdefer std.debug.print("case {d} raw {}\n", .{ ci_, raw });
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+            // The comparison sees a rotation by the wrong position.
+            var off = epi;
+            off.pos0 += 1;
+            const bad = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, off));
+            defer testing.allocator.free(bad);
+            try testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(bad)));
+        }
+    }
+}
+
+fn epiFixtureDir() ![]const u8 {
+    return std.mem.span(std.c.getenv("DSV41_EPI_TINY") orelse return error.SkipZigTest);
+}
+
+test "dsv41 attention epilogue: a prefill on the kernel's store gives the op chain's logits and state, byte for byte (DSV41_EPI_TINY)" {
+    try mlx.requireGpu();
+    const dir = try epiFixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    for ([_]bool{ true, false }) |qat| {
+        const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = qat }, s);
+        defer m.deinit();
+        try testing.expect(kernels.attnEpilogueFits(m.cfg.heads, m.cfg.head_dim, m.cfg.o_groups));
+        var runs: [2]Run = .{ .{}, .{} };
+        defer for (&runs) |*r| r.deinit();
+        for ([_]bool{ false, true }, &runs) |epi, *r| {
+            m.attn_epilogue = epi;
+            resetState(m);
+            // wider than a verify block, so every chunk is a wide span; the second starts past the first's window
+            try r.take(&sc, try extendSpan(m, ids[0..20], .all, 16));
+            try r.take(&sc, try extendSpan(m, ids[20..TINY_S], .all, 16));
+            r.slots = try testing.allocator.alloc(Slot, slotCount(m));
+            @memset(r.slots, nil_slot);
+            try captureState(m, r.slots);
+        }
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(runs[0].rows.items), std.mem.sliceAsBytes(runs[1].rows.items));
+        try expectSlotsBits(&sc, runs[0].slots, runs[1].slots);
     }
 }
 

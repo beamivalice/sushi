@@ -63,6 +63,12 @@ STQ_GEOMETRY = dict(
     index_head_dim=128,
 )
 STQ_VOCAB = 256
+# `--geometry epilogue`: 16 heads of 256 channels, the width the fused attention kernel's store (`attnEpilogueFits`) needs,
+# for the epilogue test (`DSV41_EPI_TINY`); the mechanisms are the default geometry's.
+EPILOGUE_GEOMETRY = dict(
+    hidden_size=256, num_attention_heads=16, head_dim=256, q_lora_rank=128, o_lora_rank=128, o_groups=2,
+    index_head_dim=128,
+)
 E2M1 = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float32)
 E4M3_MAX = 448.0
 # the kernels multiply by the f32 reciprocal, which differs from a division at exact powers of two
@@ -509,12 +515,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reference", required=True, help="DeepSeek-V4.1-Flash inference/ directory")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--geometry", choices=("default", "stq"), default="default")
+    ap.add_argument("--geometry", choices=("default", "stq", "epilogue"), default="default")
     a = ap.parse_args()
     if a.geometry == "stq":
         global VOCAB
         VOCAB = STQ_VOCAB
         CFG.update(STQ_GEOMETRY, vocab_size=VOCAB, engram_compressed_vocab_size=VOCAB, dspark_noise_token_id=VOCAB - 1)
+    if a.geometry == "epilogue":
+        CFG.update(EPILOGUE_GEOMETRY)
     torch.set_default_dtype(torch.float32)
     kernel = Kernel()
     ref, ref_engram = load_reference(os.path.abspath(a.reference), kernel)

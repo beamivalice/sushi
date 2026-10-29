@@ -272,6 +272,8 @@ tests at the output; `zig build test` caches a passing env-gated run, so re-run 
 
 `DSV41_TINY` takes the DEFAULT-geometry dump (no `--geometry`); a `--geometry stq` dump there fails `dsv41 fused: prefill ...` at `attn_2` (diff 0.39, bar 0.010). `DSV41_STQ_TINY` takes the STQ PACK built from the `--geometry stq` dump, not the dump itself.
 
+`DSV41_EPI_TINY` takes the `--geometry epilogue` dump (16 heads x 256, hidden 256; the default geometry's 4 heads and the STQ one's 2 are below the fused attention kernel's 16-head tile, so only this one prefills through `attnEpilogueFits`). `dsv41 attention epilogue: a prefill ...` runs two wide chunks on and off `Model.attn_epilogue` and compares every logit row and the captured state bytes.
+
 | Test | Bar |
 |---|---|
 | prefill, whole and in 13-row chunks over 5-row spans, QAT off, CPU stream | every layer's trace within 1e-4 of its peak, logits 2e-3 |

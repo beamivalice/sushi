@@ -155,6 +155,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   for byte; it replaces the gather on wide bf16 spans. `sushi-ubench run dsv41.picks_span` (c5fec957 + this kernel, quiet box, AC, 7
   rounds): span 256 3.4 ms against 6.1 for gather + fused, span 128 1.8 against 3.1; peak beyond the inputs 16 MB
   against 182 MB. Resident 32K prefill (`--drop-expert 128`, one boot an arm, profiled): 1016.5 to 1078.4 tok/s.
+- Both kernels take an `Epilogue` (`attnEpilogueFits`: head width a multiple of 256): the store does what `attnOut` did to the
+  heads, in the same order, so the bytes are the op chain's: round to the activation dtype, the tail's inverse rotation
+  (`ropeTail`'s math, `meta[4] + row` the position), the fp8 / 32 / ue8m0 round trip over each 32 channels (four lanes of
+  a matrix row, `simd_shuffle_xor` 1 and 8), written `[og, L, H * D / og]` for the grouped `wo_a`. A span's heads concatenate
+  on axis 1; `m.trace` keeps the unfused chain. Pinned by `dsv41 attention epilogue` (five release span shapes, both row
+  sources, QAT on and off, positions to 1M; a rotation by the wrong position must differ).
+  `dsv41 attention epilogue: a prefill ...` (`DSV41_EPI_TINY`, `--geometry epilogue`) takes two wide chunks through `attention()` on and off
+  `Model.attn_epilogue` and compares every logit row and the captured state bytes. `sushi-ubench run dsv41.attn_epilogue` (a9d1ac0e,
+  AC, 9 rounds, median ms per span, op chain against the store): 256 x 512 picks 3.8 to 3.2, 128 x 512 2.0 to 1.7, 256 x 0 1.8 to 1.2; peak beyond
+  the inputs 48 to 16 MB (256 rows). Resident 32K prefill (`--drop-expert 128 --ssd-budget-gb 94`, `SUSHI_DSV41_PREFILL_PROFILE=1`, one boot an arm, ea8941a7
+  then a9d1ac0e): 1168.6 to 1186.9 tok/s; mean over the 16 full chunks `attn_out` 181.9 to 143.7 ms, `core` 468.7 to 484.6 (the store's work), chunk
+  total 1489.7 to 1466.6 ms.
 
 ## Verify lanes
 
