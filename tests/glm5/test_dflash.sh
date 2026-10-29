@@ -1,6 +1,6 @@
 #!/bin/bash
-# sushi-test: tier=live boot=api
-# DFlash2 block-drafter integration on the GLM api boot (the pack ships its drafter in dflash2/).
+# sushi-test: tier=live boot=ram
+# DFlash2 block-drafter integration on the GLM ram boot (the context restore needs the RAM tier) (the pack ships its drafter in dflash2/).
 #
 # Pins the live contract: the sidecar probe classifies the assistant as DFlash (boot log), rounds ENGAGE
 # (`[spec-stats] mode=dflash attempts>0` - engagement COUNTS, never output shape), greedy dflash-on equals
@@ -296,7 +296,6 @@ CTX_PROMPT="Repeat this sentence exactly, word for word: the keeper trimmed the 
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_COLD=$(slice | grep -o 'per_draft_pct=[0-9.]*' | tail -1)
 RESTORES_COLD=$(slice | grep -c "dflash context restored" || true)
-sleep 3 # the api boot keeps no RAM tier: the entry reaches the SSD tier in the background
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_HIT=$(slice | grep -o 'per_draft_pct=[0-9.]*' | tail -1)
 RESTORES_HIT=$(slice | grep -c "dflash context restored" || true)
