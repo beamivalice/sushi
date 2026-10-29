@@ -240,7 +240,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   checkpoint's own tower run in torch bf16 does the same (0.99697; per block ~1.000 through 13, 0.995 at 27).
   Real weights, 448x640 image (280 tokens), vs the reference on the CPU in f32: preprocessing max |diff| 3.6e-7;
   features cos 0.99718 all-bf16 -> 0.99945 f32 stream (RMS ratio 1.0032).
-- **Encode time**, one image, best of 5 (`mimo vision ubench`; `taskpolicy -a`, fans max, die <= 65 C at start;
+- **Encode time**, one image, best of 5 (`sushi-ubench run mimo2.vision_encode`; `taskpolicy -a`, fans max, die <= 65 C at start;
   all-bf16 = eee7d24, f32 stream = the served code, which also evaluates per block):
 
   | patches (tokens) | all-bf16 | f32 stream | cost |

@@ -16,6 +16,7 @@ const dsv41 = @import("ubench_dsv41.zig");
 const glm5 = @import("ubench_glm5.zig");
 const shared = @import("ubench_shared.zig");
 const encoder = @import("sushi_encoder");
+const ubench_mimo2 = @import("ubench_mimo2.zig");
 
 const registry = [_]report.Bench{
     exl3.ubench.dsv41_experts,
@@ -31,6 +32,8 @@ const registry = [_]report.Bench{
     exl3.ubench.prefill_gemm,
     exl3.ubench.trunk_rows,
     exl3.ubench.routed_t1,
+    ubench_mimo2.fp8_gemv,
+    ubench_mimo2.vision_encode,
     exl3.ubench.exl3_rate_groups,
     exl3.ubench.exl3_rate_groups_rows,
     encoder.ubench.factor,

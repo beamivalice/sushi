@@ -16,10 +16,6 @@ pub var gemv_max_rows: c_int = 16;
 /// Widest input that reads x straight from device memory; wider stages it. Every row of a
 /// direct input keeps its one-row arithmetic, so this bounds a MiMo verify's width.
 pub var gemv_direct_max_rows: c_int = 8;
-/// Geometry overrides for the microbench sweep; 0 = the measured default.
-pub var gemv_rows_per_sg: c_int = 0;
-pub var gemv_sgs: c_int = 0;
-pub var gemv_stage_tiles: c_int = 0;
 /// The serving projection's matrix-unit tile covers these widths; 0 disables it.
 pub var tile_min_rows: c_int = 9;
 pub var tile_max_rows: c_int = 128;
@@ -539,11 +535,9 @@ fn checkWeight(s: mlx.mlx_stream, w: mlx.mlx_array, scales: mlx.mlx_array, split
 fn gemvKey(dtype: mlx.mlx_dtype, m: c_int, k: c_int, split: RowSplit) CfgKey {
     const direct = m <= gemv_direct_max_rows;
     // Past four rows two stored rows per simdgroup share each x read; no row's sum moves.
-    const nr: c_int = if (gemv_rows_per_sg > 0) gemv_rows_per_sg else if (!direct) 4 else if (m <= 4) 1 else 2;
-    const sgs: c_int = if (gemv_sgs > 0) gemv_sgs else if (!direct) 8 else if (m <= 4) 2 else 8;
-    var tiles: c_int = if (gemv_stage_tiles > 0) gemv_stage_tiles else 1;
-    if (@rem(k, 128 * tiles) != 0) tiles = 1;
-    return .{ .kind = if (direct) .gemv else .staged, .dtype = dtype, .m = m, .k = k, .tp = split.tp, .parts = split.parts, .nr = nr, .sgs = sgs, .tiles = if (direct) 0 else tiles, .vsb = @bitCast(roundedTo(dtype, split.v_scale)) };
+    const nr: c_int = if (!direct) 4 else if (m <= 4) 1 else 2;
+    const sgs: c_int = if (!direct) 8 else if (m <= 4) 2 else 8;
+    return .{ .kind = if (direct) .gemv else .staged, .dtype = dtype, .m = m, .k = k, .tp = split.tp, .parts = split.parts, .nr = nr, .sgs = sgs, .tiles = if (direct) 0 else 1, .vsb = @bitCast(roundedTo(dtype, split.v_scale)) };
 }
 
 /// `v` as `mlx_astype` would store it in `dtype`, widened back to f32.
@@ -580,16 +574,12 @@ pub fn projectServing(
     return projectRoute(s, x, w, scales, split, out, tile_nax and !reference_route);
 }
 
-/// Row tiles per threadgroup at most; the microbench sweeps it.
-pub var tile_block_tiles: c_int = TILE_ROW_TILES;
-
 /// `mt` 16-row tiles per threadgroup over `blocks` z blocks, as even as whole tiles allow.
 const TilePlan = struct { mt: c_int, blocks: c_int };
 
 fn tilePlan(m: c_int) TilePlan {
     const tiles = @divTrunc(m + 15, 16);
-    const cap = std.math.clamp(tile_block_tiles, 1, TILE_ROW_TILES);
-    const blocks = @divTrunc(tiles + cap - 1, cap);
+    const blocks = @divTrunc(tiles + TILE_ROW_TILES - 1, TILE_ROW_TILES);
     return .{ .mt = @divTrunc(tiles + blocks - 1, blocks), .blocks = blocks };
 }
 
@@ -1418,248 +1408,4 @@ test "fp8 block refuses weights outside its contract by name" {
     const xw = mlx.mlx_array_new_data(&xs, &[_]c_int{ 2, 64 }, 2, .float32);
     defer _ = mlx.mlx_array_free(xw);
     try testing.expectError(error.Fp8ShapeMismatch, project(s, xw, w, sc, RowSplit.dense(128), &out));
-}
-
-const BenchClock = struct {
-    io: std.Io,
-    start: std.Io.Timestamp,
-    mark_ns: u64 = 0,
-
-    fn init() BenchClock {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        return .{ .io = io, .start = std.Io.Timestamp.now(io, .boot) };
-    }
-
-    fn lap(self: *BenchClock) u64 {
-        const cum: u64 = @intCast(self.start.untilNow(self.io, .boot).nanoseconds);
-        const d = cum - self.mark_ns;
-        self.mark_ns = cum;
-        return d;
-    }
-};
-
-fn medianNs(samples: []u64) f64 {
-    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-    return @floatFromInt(samples[samples.len / 2]);
-}
-
-/// One trunk linear at MiMo's geometry in all three storages the A/B compares.
-const BenchShape = struct { name: []const u8, split: RowSplit, k: c_int, fp8: bool = true };
-
-const BENCH_SHAPES = [_]BenchShape{
-    .{ .name = "qkv global", .split = .{ .tp = 4, .parts = .{ 3072, 192, 128 } }, .k = 4096 },
-    .{ .name = "qkv sliding", .split = .{ .tp = 4, .parts = .{ 3072, 384, 256 } }, .k = 4096 },
-    .{ .name = "L0 gate/up", .split = RowSplit.dense(16384), .k = 4096 },
-    .{ .name = "L0 down", .split = RowSplit.dense(4096), .k = 16384 },
-    .{ .name = "o_proj", .split = RowSplit.dense(4096), .k = 8192, .fp8 = false },
-    .{ .name = "lm_head", .split = RowSplit.dense(152576), .k = 4096, .fp8 = false },
-};
-
-const BENCH_COPIES = 6;
-
-/// `fp8_staged` stages x at every width, against the arm `fp8` takes there.
-const BenchArm = enum { bf16, fp8, fp8_staged, fp8_tile, affine8 };
-
-const BenchWeights = struct {
-    fp8_w: [BENCH_COPIES]mlx.mlx_array = @splat(.{}),
-    fp8_s: [BENCH_COPIES]mlx.mlx_array = @splat(.{}),
-    /// Per copy, per output: the bf16 route's `[in, out]` view and the affine
-    /// triple, as the served paths bind them.
-    bf16_t: [BENCH_COPIES][3]mlx.mlx_array = @splat(@splat(.{})),
-    aq: [BENCH_COPIES][3][3]mlx.mlx_array = @splat(@splat(@splat(.{}))),
-
-    fn deinit(self: *BenchWeights) void {
-        for (&self.fp8_w) |a| _ = mlx.mlx_array_free(a);
-        for (&self.fp8_s) |a| _ = mlx.mlx_array_free(a);
-        for (&self.bf16_t) |row| for (row) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        for (&self.aq) |row| for (row) |t| for (t) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-    }
-};
-
-fn benchWeights(s: mlx.mlx_stream, shape: BenchShape, seed: u64) !BenchWeights {
-    var bw = BenchWeights{};
-    errdefer bw.deinit();
-    const n: c_int = @intCast(shape.split.tp * shape.split.rowsPerRank());
-    const srows: c_int = @intCast(shape.split.tp * shape.split.blocksPerRank());
-    for (0..BENCH_COPIES) |c| {
-        var rk = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(rk);
-        try mlx.check(mlx.mlx_random_key(&rk, seed + c));
-        var bits = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(bits);
-        const lo = mlx.mlx_array_new_int(0);
-        defer _ = mlx.mlx_array_free(lo);
-        const hi = mlx.mlx_array_new_int(126);
-        defer _ = mlx.mlx_array_free(hi);
-        try mlx.check(mlx.mlx_random_randint(&bits, lo, hi, &[_]c_int{ n, shape.k }, 2, .int32, rk, s));
-        try mlx.check(mlx.mlx_astype(&bw.fp8_w[c], bits, .uint8, s));
-        const one = mlx.mlx_array_new_float(3e-4);
-        defer _ = mlx.mlx_array_free(one);
-        try mlx.check(mlx.mlx_full(&bw.fp8_s[c], &[_]c_int{ srows, @divExact(shape.k, 128) }, 2, one, .float32, s));
-        var dense: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
-        defer for (&dense) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        try dequantize(s, bw.fp8_w[c], bw.fp8_s[c], shape.split, &dense);
-        for (0..shape.split.outputs()) |p| {
-            try mlx.check(mlx.mlx_array_eval(dense[p]));
-            try mlx.check(mlx.mlx_transpose(&bw.bf16_t[c][p], dense[p], s));
-            var parts = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(parts);
-            try mlx.check(mlx.mlx_quantize(&parts, dense[p], mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
-            for (0..3) |i| {
-                try mlx.check(mlx.mlx_vector_array_get(&bw.aq[c][p][i], parts, i));
-                try mlx.check(mlx.mlx_array_eval(bw.aq[c][p][i]));
-            }
-        }
-        try mlx.check(mlx.mlx_array_eval(bw.fp8_w[c]));
-        try mlx.check(mlx.mlx_array_eval(bw.fp8_s[c]));
-    }
-    return bw;
-}
-
-fn benchOp(s: mlx.mlx_stream, arm: BenchArm, shape: BenchShape, bw: *const BenchWeights, c: usize, x: mlx.mlx_array, v: mlx.mlx_vector_array) !void {
-    var outs: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
-    defer for (&outs) |a| if (a.ctx != null) {
-        _ = mlx.mlx_array_free(a);
-    };
-    switch (arm) {
-        .fp8 => try project(s, x, bw.fp8_w[c], bw.fp8_s[c], shape.split, &outs),
-        .fp8_tile => try projectServing(s, x, bw.fp8_w[c], bw.fp8_s[c], shape.split, &outs),
-        .fp8_staged => {
-            const armed = gemv_direct_max_rows;
-            defer gemv_direct_max_rows = armed;
-            gemv_direct_max_rows = 0;
-            try project(s, x, bw.fp8_w[c], bw.fp8_s[c], shape.split, &outs);
-        },
-        .bf16 => for (0..shape.split.outputs()) |p| {
-            outs[p] = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_matmul(&outs[p], x, bw.bf16_t[c][p], s));
-        },
-        .affine8 => for (0..shape.split.outputs()) |p| {
-            outs[p] = mlx.mlx_array_new();
-            const t = bw.aq[c][p];
-            try mlx.check(mlx.mlx_quantized_matmul(&outs[p], x, t[0], t[1], t[2], true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", s));
-        },
-    }
-    for (outs[0..shape.split.outputs()]) |a| _ = mlx.mlx_vector_array_append_value(v, a);
-}
-
-fn armBytes(arm: BenchArm, shape: BenchShape) f64 {
-    const nk: f64 = @as(f64, @floatFromInt(shape.split.tp * shape.split.rowsPerRank())) * @as(f64, @floatFromInt(shape.k));
-    return switch (arm) {
-        .bf16 => 2 * nk,
-        .fp8, .fp8_staged, .fp8_tile => nk + @as(f64, @floatFromInt(shape.split.tp * shape.split.blocksPerRank())) * @as(f64, @floatFromInt(shape.k)) / 128.0 * 4.0,
-        .affine8 => nk + nk / 64.0 * 4.0,
-    };
-}
-
-fn benchCell(s: mlx.mlx_stream, shape: BenchShape, bw: *const BenchWeights, m: c_int, arms: []const BenchArm, laps: usize) !void {
-    const alloc = testing.allocator;
-    var rk = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rk);
-    try mlx.check(mlx.mlx_random_key(&rk, 7));
-    var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
-    var xf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xf);
-    try mlx.check(mlx.mlx_random_normal(&xf, &[_]c_int{ 1, m, shape.k }, 3, .float32, 0, 1, rk, s));
-    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
-    try mlx.check(mlx.mlx_array_eval(x));
-    const t = try alloc.alloc(u64, arms.len * laps);
-    defer alloc.free(t);
-    var clock = BenchClock.init();
-    for (0..laps + 3) |lap| {
-        for (arms, 0..) |arm, ai| {
-            const v = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(v);
-            for (0..BENCH_COPIES) |c| try benchOp(s, arm, shape, bw, c, x, v);
-            _ = clock.lap();
-            try mlx.check(mlx.mlx_eval(v));
-            const d = clock.lap();
-            if (lap >= 3) t[ai * laps + lap - 3] = d;
-        }
-    }
-    for (arms, 0..) |arm, ai| {
-        const us = medianNs(t[ai * laps ..][0..laps]) / BENCH_COPIES / 1000.0;
-        const armed = gemv_direct_max_rows;
-        if (arm == .fp8_staged) gemv_direct_max_rows = 0;
-        const key = gemvKey(.bfloat16, m, shape.k, shape.split);
-        gemv_direct_max_rows = armed;
-        std.debug.print("[fp8-ubench] {s:<12} M={d:>5} {s:<8} {d:>9.1} us {d:>7.1} GB/s  ({s} NR={d} SGS={d} S={d})\n", .{
-            shape.name, m, @tagName(arm), us, armBytes(arm, shape) / (us * 1000.0), @tagName(key.kind), key.nr, key.sgs, key.tiles,
-        });
-    }
-}
-
-test "fp8 block microbench vs bf16 and affine-8 at MiMo's trunk shapes (SUSHI_FP8_UBENCH=1)" {
-    const raw = std.c.getenv("SUSHI_FP8_UBENCH") orelse return error.SkipZigTest;
-    if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const armed_tile = tile_nax;
-    defer tile_nax = armed_tile;
-    tile_nax = naxForTest();
-    // The tile arm at every width, to find where it stops winning.
-    const armed_max = tile_max_rows;
-    defer tile_max_rows = armed_max;
-    tile_max_rows = 1 << 20;
-    const armed_block = tile_block_tiles;
-    defer tile_block_tiles = armed_block;
-    const sweep_raw: []const u8 = if (std.c.getenv("SUSHI_FP8_UBENCH_SWEEP")) |r| std.mem.sliceTo(r, 0) else "";
-    const tile_sweep = std.mem.eql(u8, sweep_raw, "tile");
-    const sweep = sweep_raw.len > 0 and !tile_sweep;
-    const only = std.c.getenv("SUSHI_FP8_UBENCH_SHAPE");
-    for (BENCH_SHAPES, 0..) |shape, si| {
-        if (only) |name| if (!std.mem.eql(u8, std.mem.sliceTo(name, 0), shape.name)) continue;
-        var bw = try benchWeights(s, shape, 0xF8 + si * 16);
-        defer bw.deinit();
-        const arms: []const BenchArm = if (shape.fp8) &.{ .bf16, .fp8, .fp8_tile, .affine8 } else &.{ .bf16, .affine8 };
-        for ([_]c_int{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 2048 }) |m| {
-            try benchCell(s, shape, &bw, m, arms, if (m > 16) 5 else 30);
-        }
-        if (shape.fp8) for ([_]c_int{ 4, 5, 6, 7, 8 }) |m| try benchCell(s, shape, &bw, m, &.{ .fp8, .fp8_staged }, 60);
-        if (shape.fp8 and tile_nax) {
-            const armed_min = tile_min_rows;
-            defer tile_min_rows = armed_min;
-            tile_min_rows = 9;
-            for ([_]c_int{ 9, 12, 16 }) |m| try benchCell(s, shape, &bw, m, &.{ .fp8, .fp8_tile }, 30);
-            if (tile_sweep) for ([_]c_int{ 2, 4, 8 }) |tiles| {
-                tile_block_tiles = tiles;
-                std.debug.print("[fp8-ubench] tile block {d} tiles\n", .{tiles});
-                for ([_]c_int{ 32, 128, 256, 512 }) |m| try benchCell(s, shape, &bw, m, &.{.fp8_tile}, 10);
-            };
-            tile_block_tiles = armed_block;
-        }
-        if (sweep and shape.fp8) {
-            const armed = gemv_direct_max_rows;
-            defer {
-                gemv_rows_per_sg = 0;
-                gemv_sgs = 0;
-                gemv_stage_tiles = 0;
-                gemv_direct_max_rows = armed;
-            }
-            // The direct arm's geometry at verify widths: rows per simdgroup and simdgroups per
-            // group move no row's arithmetic, only how many rows share each x read.
-            for ([_]c_int{ 5, 6, 7, 8 }) |m| for ([_]c_int{ 1, 2, 4, 8 }) |nr| for ([_]c_int{ 2, 4, 8 }) |sg| {
-                gemv_direct_max_rows = gemv_max_rows;
-                gemv_rows_per_sg = nr;
-                gemv_sgs = sg;
-                try benchCell(s, shape, &bw, m, &.{.fp8}, 30);
-            };
-            if (std.mem.eql(u8, std.mem.sliceTo(std.c.getenv("SUSHI_FP8_UBENCH_SWEEP").?, 0), "direct")) continue;
-            for ([_]c_int{ 4, 8, 16 }) |m| for ([_]c_int{ 2, 4, 8 }) |nr| for ([_]c_int{ 4, 8 }) |sg| for ([_]c_int{ 1, 2 }) |tiles| {
-                gemv_direct_max_rows = 0;
-                gemv_rows_per_sg = nr;
-                gemv_sgs = sg;
-                gemv_stage_tiles = tiles;
-                try benchCell(s, shape, &bw, m, &.{.fp8}, 20);
-            };
-        }
-        _ = mlx.mlx_clear_cache();
-    }
 }

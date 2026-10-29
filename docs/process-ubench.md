@@ -91,3 +91,5 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `shared.shared_expert_fold` | shared | one MoE layer with the shared expert separate, folded into the routed launches, and absent, over 8 distinct banks: Flash-Next (one bank, rate groups), GLM (one bank), DeepSeek-V4.1 (layer 2's four PAIR1 groups, with the fused chain's launch count), at 1 to 8 rows |
 | `enc.factor` | enc | the block-LDL factor of a Hessian bank at n512 x16 and n2560 x32: float32 on the GPU against the float64 CPU oracle, ms per matrix |
 | `enc.search` | enc | trellis search at K2.5 (n40, MCG, window 15) over 4096 random tiles, sustained back to back, us per tile |
+| `mimo2.fp8_gemv` | mimo2 | the FP8 trunk linear at MiMo's per-rank shapes (qkv global and sliding, gate/up, down) by rows: GEMV, the 9-128-row tile (NAX only) and the dequant route against bf16 and affine-8, with GB/s |
+| `mimo2.vision_encode` | mimo2 | the MiMo-ViT encode of one image at 14x14, 68x120 and 96x96 patches on the real tower (`--pack` the MiMo checkpoint), with the scratch peak beside `encodeScratchBytes` |

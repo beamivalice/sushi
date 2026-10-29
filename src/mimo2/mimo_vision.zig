@@ -525,7 +525,7 @@ pub const MimoVision = struct {
 /// Transient bytes one image's encode needs on top of the resident tower, at
 /// `n_patches` patches: one block's f32 activations (the stream is evaluated
 /// per block) plus a fixed floor. Covers the measured peak (`mimo vision
-/// ubench`) with >= 25% margin from 196 to 9216 patches.
+/// bill`) with >= 25% margin from 196 to 9216 patches.
 pub fn encodeScratchBytes(config: *const ModelConfig, n_patches: u64) u64 {
     const per_patch: u64 = 4 * (8 * @as(u64, config.qv_hidden) + 6 * @as(u64, config.qv_intermediate) +
         6 * @as(u64, config.qv_heads + 2 * config.mvit_kv_heads) * config.qv_head_dim);
@@ -900,14 +900,11 @@ test "mimo vision real: preprocessing and the bf16 tower match the f32 reference
     try testing.expect(ratio > 0.99 and ratio < 1.01);
 }
 
-// Encode time and scratch peak on the real tower at a small image and at the
-// engine's 1536² cap (random pixels; the numerics are the parity test's job):
-//   MIMO_V2_SOURCE=<checkpoint> SUSHI_MIMO_VISION_UBENCH=<reps> \
-//   zig build test -Doptimize=ReleaseFast -Dtest-filter="mimo vision ubench"
-test "mimo vision ubench: encode time and scratch peak per image" {
-    const reps_raw = std.c.getenv("SUSHI_MIMO_VISION_UBENCH") orelse return error.SkipZigTest;
+// The bill covers the measured scratch peak on the real tower, first run and steady (random pixels; the numerics are
+// the parity test's job). Time per grid: `sushi-ubench run mimo2.vision_encode --pack <checkpoint>`.
+//   MIMO_V2_SOURCE=<checkpoint> zig build test -Doptimize=ReleaseFast -Dtest-filter="mimo vision bill"
+test "mimo vision bill: encode scratch stays within encodeScratchBytes per image" {
     const raw_dir = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
-    const reps = std.fmt.parseInt(u32, std.mem.span(reps_raw), 10) catch return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     const dir = std.mem.span(raw_dir);
@@ -919,41 +916,26 @@ test "mimo vision ubench: encode time and scratch peak per image" {
     var tower = try MimoVision.init(a, config, &weights);
     defer tower.deinit();
     const feat: c_int = @intCast(3 * config.qv_temporal_patch * config.qv_patch * config.qv_patch);
-    var under_billed = false;
     for ([_][2]u32{ .{ 14, 14 }, .{ 68, 120 }, .{ 96, 96 } }) |g| {
         const n: c_int = @intCast(g[0] * g[1]);
         var pv = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pv);
-        const shape = [_]c_int{ n, feat };
-        try mlx.check(mlx.mlx_random_normal(&pv, &shape, 2, .float32, 0, 1, .{ .ctx = null }, tower.s));
+        try mlx.check(mlx.mlx_random_normal(&pv, &[_]c_int{ n, feat }, 2, .float32, 0, 1, .{ .ctx = null }, tower.s));
         try mlx.check(mlx.mlx_array_eval(pv));
-        var best: u64 = std.math.maxInt(u64);
-        var first_peak: usize = 0;
-        var steady_peak: usize = 0;
-        for (0..reps + 1) |r| {
+        var peak_over: usize = 0;
+        for (0..2) |_| {
             try mlx.check(mlx.mlx_synchronize(tower.s));
             var before: usize = 0;
             _ = mlx.mlx_get_active_memory(&before);
             _ = mlx.mlx_reset_peak_memory();
-            const t0 = std.Io.Timestamp.now(io, .boot);
             const out = try tower.forward(pv, g[0], g[1]);
             try mlx.check(mlx.mlx_array_eval(out));
             try mlx.check(mlx.mlx_synchronize(tower.s));
-            const ns: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
             var peak: usize = 0;
             _ = mlx.mlx_get_peak_memory(&peak);
             _ = mlx.mlx_array_free(out);
-            if (r == 0) first_peak = peak -| before else {
-                best = @min(best, ns);
-                steady_peak = @max(steady_peak, peak -| before);
-            }
+            peak_over = @max(peak_over, peak -| before);
         }
-        const bill = encodeScratchBytes(&config, @intCast(n));
-        std.debug.print("[mimo-vit ubench] grid {d}x{d} ({d} patches, {d} tokens): best {d:.1} ms of {d}, scratch peak {d:.1} MB (first run {d:.1} MB), bill {d:.1} MB\n", .{
-            g[0],                                       g[1],                                      n,                                   @divExact(n, 4), @as(f64, @floatFromInt(best)) / 1e6, reps,
-            @as(f64, @floatFromInt(steady_peak)) / 1e6, @as(f64, @floatFromInt(first_peak)) / 1e6, @as(f64, @floatFromInt(bill)) / 1e6,
-        });
-        if (bill < @max(steady_peak, first_peak)) under_billed = true;
+        try testing.expect(encodeScratchBytes(&config, @intCast(n)) >= peak_over);
     }
-    try testing.expect(!under_billed);
 }

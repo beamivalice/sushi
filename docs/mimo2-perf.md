@@ -306,7 +306,7 @@ boot, A B B A (A = d1408a57, B = this change): decode 69.8 / 70.0 -> 73.8 / 70.5
 <a id="mimo-verify-8"></a>
 ### MiMo-V2.6-Flash-Sushi-2.3bpw: verify to 8 rows and prompt lookup in MTP rounds (this change vs main 27e81cfc)
 
-FP8 trunk GEMV, `SUSHI_FP8_UBENCH=1` (`_SWEEP=direct` for the geometry), bf16 x, six weight copies, median of 30-60
+FP8 trunk GEMV (`sushi-ubench run mimo2.fp8_gemv` times the shipped geometry; the NR and SGS columns are the recorded sweep), bf16 x, six weight copies, median of 30-60
 laps, `taskpolicy -a`, GPU lock, busy box, 2026-10-01; us per call at 8 rows (5-7 rows rank the same):
 
 | shape | staged (NR 4, SGS 8) | direct, one-row geometry (NR 1, SGS 2) | direct, NR 2, SGS 8 (shipped past 4 rows) |
@@ -341,7 +341,7 @@ tok/s over the four runs per arm:
 <a id="mimo-fp8-tile"></a>
 ### MiMo-V2.6-Flash-Sushi-2.3bpw: the FP8 trunk audit and the 9-128-row tile (this change, measured at 01319267)
 
-Audit, `SUSHI_FP8_UBENCH=1` at MiMo's trunk shapes, six weight copies, arms interleaved in one process, medians of 5-30
+Audit, `sushi-ubench run mimo2.fp8_gemv` at MiMo's trunk shapes, six weight copies, arms interleaved in one process, medians of 5-30
 laps, `taskpolicy -a`, GPU lock, fans at max, 180 s idle, 2026-10-04:
 
 - 1-4 rows (direct GEMV): 443-477 GB/s against ~538 delivered, 1.7x MLX's bf16 GEMV and 4-12% ahead of its affine-8
