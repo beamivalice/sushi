@@ -27,7 +27,9 @@
 
 const std = @import("std");
 const testing = std.testing;
-const chat = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
+const tool_calls_mod = @import("tool_calls.zig");
+const tool_schema = @import("tool_schema.zig");
 
 const fixture = @embedFile("fixtures/tool_traffic.jsonl");
 
@@ -116,11 +118,11 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
 
         // Mirror the server exactly: normalize → parse → (bare-JSON inference is
         // schema-dependent and skipped here) → coerce.
-        const normalized = try chat.normalizeEmbeddedThinkBlocks(testing.allocator, raw);
+        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(testing.allocator, raw);
         defer if (normalized) |n| testing.allocator.free(n);
         const text: []const u8 = normalized orelse raw;
 
-        const calls = try chat.parseToolCalls(testing.allocator, text);
+        const calls = try tool_calls_mod.parseToolCalls(testing.allocator, text);
         defer if (calls) |cs| {
             for (cs) |tc| {
                 testing.allocator.free(tc.name);
@@ -132,7 +134,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         if (calls == null) {
             // Nothing parsed as a call ⇒ the text is shown to the user
             // (content side of the always-delivered split, same as the server).
-            const content = chat.splitThinkBlock(text, true, false).content;
+            const content = think_tags.splitThinkBlock(text, true, false).content;
             // Legitimate output has AT MOST ONE close marker per style per turn
             // (one thought block). The strip logic guarantees no leak for that.
             // A model that emits ≥2 bare closes with no matching structure is
@@ -172,10 +174,10 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         const before = try arena.alloc([]const u8, cs.len);
         for (cs, 0..) |tc, i| before[i] = try arena.dupe(u8, tc.arguments);
         const conformed_before = try arena.alloc(bool, cs.len);
-        for (cs, 0..) |tc, i| conformed_before[i] = chat.toolCallConformsToSchema(testing.allocator, tc, tools_json);
+        for (cs, 0..) |tc, i| conformed_before[i] = tool_schema.toolCallConformsToSchema(testing.allocator, tc, tools_json);
 
-        try chat.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
-        try chat.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
+        try tool_schema.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
+        try tool_schema.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
 
         for (cs, 0..) |tc, i| {
             // R1: emitted arguments must be valid JSON (HARD — a client parses them).
@@ -187,7 +189,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
                 hardFail("emitted arguments are not valid JSON", idx, tc.arguments);
             }
 
-            const conforms_after = if (parse_ok) chat.toolCallConformsToSchema(testing.allocator, tc, tools_json) else false;
+            const conforms_after = if (parse_ok) tool_schema.toolCallConformsToSchema(testing.allocator, tc, tools_json) else false;
 
             // R2 (no-regression): coercion may only IMPROVE conformance, never
             // reduce it. A call that did NOT conform and STILL doesn't is
@@ -213,8 +215,8 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         // R3: coercion is idempotent.
         const once = try arena.alloc([]const u8, cs.len);
         for (cs, 0..) |tc, i| once[i] = try arena.dupe(u8, tc.arguments);
-        try chat.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
-        try chat.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
+        try tool_schema.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
+        try tool_schema.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
         for (cs, 0..) |tc, i| {
             if (!std.mem.eql(u8, once[i], tc.arguments)) {
                 hardFail("coercion is not idempotent", idx, tc.arguments);

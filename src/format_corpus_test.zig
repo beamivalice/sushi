@@ -39,6 +39,9 @@
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
+const tool_calls_mod = @import("tool_calls.zig");
+const tool_schema = @import("tool_schema.zig");
 const stop_sequences = @import("stop_sequences.zig");
 
 test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
@@ -1753,13 +1756,13 @@ test "format corpus: recorded model outputs across families" {
     for (corpus) |entry| {
         // ── Normalize first (mirrors the server: re-opened mid-text thought
         // channels merge into one leading block before any parse/split). ──
-        const normalized = try chat.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
+        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
         defer if (normalized) |n| allocator.free(n);
         const raw: []const u8 = normalized orelse entry.raw;
 
         // ── Tool calls (when calls parse, content is suppressed and only
         // tool deltas + reasoning are emitted). ──
-        var calls = try chat.parseToolCalls(allocator, raw);
+        var calls = try tool_calls_mod.parseToolCalls(allocator, raw);
         defer if (calls) |cs| {
             for (cs) |tc| {
                 allocator.free(tc.name);
@@ -1776,9 +1779,9 @@ test "format corpus: recorded model outputs across families" {
         // container arg is hoisted back to the top level, and (3) arguments are
         // coerced to the schema's types before any client sees them.
         if (entry.tools_json) |tj| {
-            if (calls) |cs| calls = try chat.filterInferredBySchema(allocator, cs, tj);
-            if (calls) |cs| try chat.hoistMisplacedRequiredParams(allocator, cs, tj);
-            if (calls) |cs| try chat.coerceToolArgsToSchema(allocator, cs, tj);
+            if (calls) |cs| calls = try tool_schema.filterInferredBySchema(allocator, cs, tj);
+            if (calls) |cs| try tool_schema.hoistMisplacedRequiredParams(allocator, cs, tj);
+            if (calls) |cs| try tool_schema.coerceToolArgsToSchema(allocator, cs, tj);
         }
 
         if (entry.no_tool_calls and calls != null) {
@@ -1841,7 +1844,7 @@ test "format corpus: recorded model outputs across families" {
                 // what strict clients validate and reject on. Any future entry
                 // that supplies a `tools_json` is covered automatically.
                 if (entry.tools_json) |tj| {
-                    if (!chat.toolCallConformsToSchema(allocator, tc, tj)) {
+                    if (!tool_schema.toolCallConformsToSchema(allocator, tc, tj)) {
                         try fail(entry, "tool argument type contradicts the declared schema", tc.arguments);
                     }
 
@@ -1851,7 +1854,7 @@ test "format corpus: recorded model outputs across families" {
                     // have required properties X". The chokepoint hoists it, so
                     // nothing may still be buried here. Any future entry with a
                     // tools_json is covered automatically.
-                    if (chat.requiredParamIsBuried(allocator, tc, tj)) {
+                    if (tool_schema.requiredParamIsBuried(allocator, tc, tj)) {
                         try fail(entry, "a required param is still buried inside a container arg", tc.arguments);
                     }
                 }
@@ -1906,7 +1909,7 @@ test "format corpus: recorded model outputs across families" {
         // DELIVERS whatever reasoning the model generated (thinking-off is
         // enforced prompt-side via think_tags.noThinkTailSuffix, never by dropping
         // generated tokens). `entry.thinking` documents the original request.
-        const split: chat.ThinkSplit = chat.splitThinkBlock(raw, true, entry.opened_by_template);
+        const split: think_tags.ThinkSplit = think_tags.splitThinkBlock(raw, true, entry.opened_by_template);
         // When tool calls parsed, the server emits NO content from this text.
         const content: []const u8 = if (calls != null) "" else split.content;
 
@@ -1979,7 +1982,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         // helper covers `</think>`).
         const close_end: ?usize = blk: {
             var best: ?usize = null;
-            if (chat.indexOfThinkCloseTag(entry.raw, 0)) |c| best = c.pos + c.len;
+            if (think_tags.indexOfThinkCloseTag(entry.raw, 0)) |c| best = c.pos + c.len;
             if (std.mem.indexOf(u8, entry.raw, "<channel|>")) |p| {
                 const e = p + "<channel|>".len;
                 if (best == null or e < best.?) best = e;
@@ -1991,7 +1994,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         var i: usize = 1;
         while (i <= entry.raw.len) : (i += 1) {
             const buf = entry.raw[0..i];
-            const gate = chat.streamThinkGate(buf, true, think_closed);
+            const gate = think_tags.streamThinkGate(buf, true, think_closed);
             if (think_closed) break; // post-split buffers start fresh in the real path
             if (close_end == null or i < close_end.?) {
                 if (gate == .flush_text) {
@@ -2009,7 +2012,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         // Truncated thinking (no close tag at all) must hold to the very end —
         // end-of-stream handling owns it from there.
         if (close_end == null) {
-            const gate = chat.streamThinkGate(entry.raw, true, false);
+            const gate = think_tags.streamThinkGate(entry.raw, true, false);
             if (gate == .flush_text) {
                 try fail(entry, "gate flushed truncated thinking as text", entry.raw);
             }
@@ -2017,7 +2020,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     }
 
     // Invariant 3, directly: once think_closed, prose streams.
-    try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
+    try testing.expectEqual(think_tags.StreamThinkGate.flush_text, think_tags.streamThinkGate("The visible answer.", true, true));
 }
 
 test "format corpus: no flush boundary lands inside a tool-call opener, any family" {
@@ -2072,7 +2075,7 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
                 var i: usize = at + 1;
                 while (i < at + marker.len) : (i += 1) {
                     checked += 1;
-                    if (!chat.streamShouldBufferForTools(entry.raw[0..i])) {
+                    if (!think_tags.streamShouldBufferForTools(entry.raw[0..i])) {
                         try fail(entry, "flush boundary inside a tool-call opener", entry.raw[0..i]);
                     }
                 }
@@ -2202,7 +2205,7 @@ const dialects = [_]Dialect{
 };
 
 fn firstCallArg(allocator: std.mem.Allocator, raw: []const u8, key: []const u8) !?struct { name: []const u8, value: ?[]const u8 } {
-    const calls = (try chat.parseToolCalls(allocator, raw)) orelse return null;
+    const calls = (try tool_calls_mod.parseToolCalls(allocator, raw)) orelse return null;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -2277,7 +2280,7 @@ test "format corpus: a parameter VALUE never decides the call" {
             const raw = try std.mem.concat(allocator, u8, &.{ shape.pre, value, shape.post });
             defer allocator.free(raw);
 
-            const calls = (try chat.parseToolCalls(allocator, raw)) orelse continue;
+            const calls = (try tool_calls_mod.parseToolCalls(allocator, raw)) orelse continue;
             defer {
                 for (calls) |tc| {
                     allocator.free(tc.name);
@@ -2317,7 +2320,7 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
     // result through the serializer, read it back, and require the same call.
     const allocator = testing.allocator;
     for (dialects) |d| {
-        const calls = (try chat.parseToolCalls(allocator, d.raw)) orelse {
+        const calls = (try tool_calls_mod.parseToolCalls(allocator, d.raw)) orelse {
             std.debug.print("\n[{s}] {s}: no call to round-trip\n", .{ d.family, d.dialect });
             return error.DialectNotParsed;
         };
@@ -2541,7 +2544,7 @@ test "format corpus: a forced tool_choice reaches the prompt once, on every temp
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
         .{ .name = "no tools (fallback injection)", .tpl = no_tools_chatml },
     };
-    const choices = [_]chat.ToolChoice{ .required, .{ .named = "get_time" } };
+    const choices = [_]tool_calls_mod.ToolChoice{ .required, .{ .named = "get_time" } };
     const messages = [_]chat.Message{.{ .role = "user", .content = "What time is it?" }};
     for (cases) |c| {
         var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
@@ -2595,7 +2598,7 @@ test "format corpus: a forced call is the family's own call markup and parses ba
         errdefer std.debug.print("\n[{s}] forced {s}\n answer {s}\n", .{ c.name, forced, answer });
         try testing.expect(std.mem.startsWith(u8, answer, forced));
 
-        const parsed = (try chat.parseToolCalls(allocator, answer)) orelse return error.ForcedCallNotParsed;
+        const parsed = (try tool_calls_mod.parseToolCalls(allocator, answer)) orelse return error.ForcedCallNotParsed;
         defer {
             for (parsed) |tc| {
                 allocator.free(tc.name);
@@ -2637,7 +2640,7 @@ test "format corpus: a string value parses back byte-exact from each family's ow
             defer allocator.free(rendered);
             const start = std.mem.indexOf(u8, rendered, c.open).?;
             const end = std.mem.indexOf(u8, rendered, c.close).? + c.close.len;
-            const parsed = (try chat.parseToolCalls(allocator, rendered[start..end])) orelse return error.CallNotParsed;
+            const parsed = (try tool_calls_mod.parseToolCalls(allocator, rendered[start..end])) orelse return error.CallNotParsed;
             defer {
                 for (parsed) |tc| {
                     allocator.free(tc.name);
@@ -2680,7 +2683,7 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
             const want = history[0 .. std.mem.lastIndexOf(u8, history, partial).? + partial.len];
             errdefer std.debug.print("\n[{s}] thinking={}\n want tail {s}\n got tail  {s}\n", .{ c.name, thinking, want[want.len -| 60..], cont[cont.len -| 60..] });
             try testing.expectEqualStrings(want, cont);
-            try testing.expect(!chat.promptTailOpensThink(cont));
+            try testing.expect(!think_tags.promptTailOpensThink(cont));
         }
     }
 }
@@ -2688,7 +2691,7 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
 /// Streams the thought in `raw` one byte at a time the way each chat stream path
 /// does and returns (tools path, no-tools path) deltas joined.
 fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![2][]u8 {
-    const close_at = chat.indexOfThinkCloseTag(raw, 0).?.pos;
+    const close_at = think_tags.indexOfThinkCloseTag(raw, 0).?.pos;
     const through_close = raw[0 .. close_at + "</think>".len];
 
     // Tools path: the open block's split, settled, then the closed split's rest.
@@ -2697,11 +2700,11 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     var streamed: usize = 0;
     for (1..through_close.len + 1) |i| {
         const buf = through_close[0..i];
-        const split = chat.splitThinkBlock(buf, true, opened);
+        const split = think_tags.splitThinkBlock(buf, true, opened);
         const rc = split.reasoning_content orelse continue;
         const closed = i == through_close.len;
-        const ready = if (closed) rc else chat.settledReasoning(rc);
-        if (chat.unstreamedReasoning(ready, streamed)) |fresh| {
+        const ready = if (closed) rc else think_tags.settledReasoning(rc);
+        if (think_tags.unstreamedReasoning(ready, streamed)) |fresh| {
             try tools.appendSlice(allocator, fresh);
             streamed = ready.len;
         }
@@ -2716,11 +2719,11 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     var shipped = false;
     for (raw[body_from .. close_at + "</think>".len]) |byte| {
         try pending.append(allocator, byte);
-        if (chat.indexOfThinkCloseTag(pending.items, 0)) |close| {
-            try plain.appendSlice(allocator, chat.closedThoughtDelta(pending.items[0..close.pos], shipped));
+        if (think_tags.indexOfThinkCloseTag(pending.items, 0)) |close| {
+            try plain.appendSlice(allocator, think_tags.closedThoughtDelta(pending.items[0..close.pos], shipped));
             break;
         }
-        const flush = chat.openThoughtFlush(pending.items, shipped);
+        const flush = think_tags.openThoughtFlush(pending.items, shipped);
         const delta = pending.items[flush.skip..][0..flush.ship];
         if (delta.len > 0) shipped = true;
         try plain.appendSlice(allocator, delta);
@@ -2741,7 +2744,7 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
     for (corpus) |e| {
         if (std.mem.count(u8, e.raw, "</think>") != 1) continue;
         // Tool markup inside a thought is cut as a leak, a class of its own.
-        if (chat.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
+        if (think_tags.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
         const opens = std.mem.startsWith(u8, e.raw, "<think>");
         if (!opens and !e.opened_by_template) continue;
         try cases.append(allocator, .{ .raw = e.raw, .opened = e.opened_by_template and !opens });
@@ -2760,7 +2763,7 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
     for (edges) |raw| try cases.append(allocator, .{ .raw = raw, .opened = true });
     try testing.expect(cases.items.len > edges.len);
     for (cases.items) |c| {
-        const want = chat.splitThinkBlock(c.raw[0 .. chat.indexOfThinkCloseTag(c.raw, 0).?.pos + "</think>".len], true, c.opened).reasoning_content orelse "";
+        const want = think_tags.splitThinkBlock(c.raw[0 .. think_tags.indexOfThinkCloseTag(c.raw, 0).?.pos + "</think>".len], true, c.opened).reasoning_content orelse "";
         const got = try streamThought(allocator, c.raw, c.opened);
         defer for (got) |g| allocator.free(g);
         errdefer std.debug.print("\nraw: {s}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, want, got[0], got[1] });
@@ -2779,9 +2782,9 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
     errdefer tools.deinit(allocator);
     var streamed: usize = 0;
     for (@max(first, 1)..cut + 1) |i| {
-        const rc = chat.splitThinkBlock(raw[0..i], true, opened).reasoning_content orelse "";
-        const ready = if (i == cut) rc else chat.settledReasoning(rc);
-        if (chat.unstreamedReasoning(ready, streamed)) |fresh| {
+        const rc = think_tags.splitThinkBlock(raw[0..i], true, opened).reasoning_content orelse "";
+        const ready = if (i == cut) rc else think_tags.settledReasoning(rc);
+        if (think_tags.unstreamedReasoning(ready, streamed)) |fresh| {
             try tools.appendSlice(allocator, fresh);
             streamed = ready.len;
         }
@@ -2791,26 +2794,26 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
     errdefer plain.deinit(allocator);
     var held = std.ArrayList(u8).empty;
     defer held.deinit(allocator);
-    if (!opened) try held.appendSlice(allocator, chat.modelThinkOpener(false, raw[0..first]).?);
+    if (!opened) try held.appendSlice(allocator, think_tags.modelThinkOpener(false, raw[0..first]).?);
     var consumed = false;
     var shipped = false;
     for (raw[first..cut]) |byte| {
         try held.append(allocator, byte);
-        if (!consumed and (held.items.len >= "<think>".len or !chat.thinkOpenerPossible(held.items))) {
+        if (!consumed and (held.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(held.items))) {
             consumed = true;
-            const l = chat.thinkOpenTagLenAt(held.items) orelse 0;
+            const l = think_tags.thinkOpenTagLenAt(held.items) orelse 0;
             std.mem.copyForwards(u8, held.items[0 .. held.items.len - l], held.items[l..]);
             held.shrinkRetainingCapacity(held.items.len - l);
         }
         if (!consumed) continue;
-        const flush = chat.openThoughtFlush(held.items, shipped);
+        const flush = think_tags.openThoughtFlush(held.items, shipped);
         try plain.appendSlice(allocator, held.items[flush.skip..][0..flush.ship]);
         if (flush.ship > 0) shipped = true;
         const keep = held.items[flush.skip + flush.ship ..];
         std.mem.copyForwards(u8, held.items[0..keep.len], keep);
         held.shrinkRetainingCapacity(keep.len);
     }
-    try plain.appendSlice(allocator, chat.cutThoughtDelta(held.items, consumed, shipped));
+    try plain.appendSlice(allocator, think_tags.cutThoughtDelta(held.items, consumed, shipped));
     return .{ try tools.toOwnedSlice(allocator), try plain.toOwnedSlice(allocator) };
 }
 
@@ -2825,7 +2828,7 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
     defer cases.deinit(allocator);
     for (corpus) |e| {
         if (std.mem.count(u8, e.raw, "</think>") != 1) continue;
-        if (chat.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
+        if (think_tags.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
         const opens = std.mem.startsWith(u8, e.raw, "<think>");
         if (!opens and !e.opened_by_template) continue;
         try cases.append(allocator, .{ .raw = e.raw, .opened = !opens });
@@ -2844,7 +2847,7 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
         const first: usize = if (c.opened) 1 else "<think>".len;
         const end = std.mem.indexOf(u8, c.raw, "</think>").? + "</think>".len;
         for (first..end) |cut| {
-            const want = chat.splitThinkBlock(c.raw[0..cut], true, c.opened).reasoning_content orelse "";
+            const want = think_tags.splitThinkBlock(c.raw[0..cut], true, c.opened).reasoning_content orelse "";
             const got = try streamCutThought(allocator, c.raw, cut, c.opened);
             defer for (got) |g| allocator.free(g);
             errdefer std.debug.print("\nraw: {s}\ncut: {d}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, cut, want, got[0], got[1] });

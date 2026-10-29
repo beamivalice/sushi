@@ -1,13 +1,14 @@
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
-const BARE_INVOKE = chat.BARE_INVOKE;
+const tool_calls_mod = @import("tool_calls.zig");
+const BARE_INVOKE = tool_calls_mod.BARE_INVOKE;
 const ChatConfig = chat.ChatConfig;
-const FUNCTION_CALLS_TAG = chat.FUNCTION_CALLS_TAG;
+const FUNCTION_CALLS_TAG = tool_calls_mod.FUNCTION_CALLS_TAG;
 const Message = chat.Message;
 const ToolCall = chat.ToolCall;
 const mimoTemplateConfig = chat.mimoTemplateConfig;
-const miniCpm5AttrValue = chat.miniCpm5AttrValue;
+const miniCpm5AttrValue = tool_calls_mod.miniCpm5AttrValue;
 const renderChatTemplate = chat.renderChatTemplate;
 
 /// The FIRST unclosed think/thought opener: the earliest `<|channel>thought`

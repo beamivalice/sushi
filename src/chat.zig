@@ -5,61 +5,8 @@ const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 const tool_schema = @import("tool_schema.zig");
-pub const jsonIsValidObject = tool_schema.jsonIsValidObject;
-pub const ParsedToolCall = tool_schema.ParsedToolCall;
-pub const toolCallConformsToSchema = tool_schema.toolCallConformsToSchema;
-pub const requiredParamIsBuried = tool_schema.requiredParamIsBuried;
-pub const coerceToolArgsToSchema = tool_schema.coerceToolArgsToSchema;
-pub const hoistMisplacedRequiredParams = tool_schema.hoistMisplacedRequiredParams;
-pub const toolNameIsDeclared = tool_schema.toolNameIsDeclared;
-pub const filterInferredBySchema = tool_schema.filterInferredBySchema;
-pub const inferBareJsonToolCalls = tool_schema.inferBareJsonToolCalls;
 const tool_calls_mod = @import("tool_calls.zig");
-pub const parseToolCalls = tool_calls_mod.parseToolCalls;
-const balancedJsonObject = tool_calls_mod.balancedJsonObject;
-pub const BARE_INVOKE = tool_calls_mod.BARE_INVOKE;
-pub const FUNCTION_CALLS_TAG = tool_calls_mod.FUNCTION_CALLS_TAG;
-const looseRepairContainer = tool_calls_mod.looseRepairContainer;
-pub const miniCpm5AttrValue = tool_calls_mod.miniCpm5AttrValue;
-pub const ToolChoice = tool_calls_mod.ToolChoice;
-pub const parseToolChoice = tool_calls_mod.parseToolChoice;
-pub const declaredToolNames = tool_calls_mod.declaredToolNames;
-pub const toolChoiceNamesUndeclared = tool_calls_mod.toolChoiceNamesUndeclared;
-const appendToolSystemPrompt = tool_calls_mod.appendToolSystemPrompt;
 const think_tags = @import("think_tags.zig");
-const tagLenAt = think_tags.tagLenAt;
-pub const thinkOpenTagLenAt = think_tags.thinkOpenTagLenAt;
-pub const indexOfThinkCloseTag = think_tags.indexOfThinkCloseTag;
-pub const tool_markup_openers = think_tags.tool_markup_openers;
-pub const trimLeakedToolMarkup = think_tags.trimLeakedToolMarkup;
-pub const ThinkSplit = think_tags.ThinkSplit;
-pub const modelThinkOpener = think_tags.modelThinkOpener;
-pub const isChannelMarkerToken = think_tags.isChannelMarkerToken;
-pub const BARE_THINK_OPENER = think_tags.BARE_THINK_OPENER;
-pub const BARE_THINK_CLOSER = think_tags.BARE_THINK_CLOSER;
-pub const promptTailOpensThink = think_tags.promptTailOpensThink;
-pub const promptThinkTailClass = think_tags.promptThinkTailClass;
-pub const noThinkTailSuffix = think_tags.noThinkTailSuffix;
-const contentChannelTail = think_tags.contentChannelTail;
-pub const continuationRequested = think_tags.continuationRequested;
-const continuationPrefill = think_tags.continuationPrefill;
-pub const splitThinkBlock = think_tags.splitThinkBlock;
-pub const splitThinkBlockKeepingMarkup = think_tags.splitThinkBlockKeepingMarkup;
-pub const normalizeEmbeddedThinkBlocks = think_tags.normalizeEmbeddedThinkBlocks;
-pub const thinkOpenerPossible = think_tags.thinkOpenerPossible;
-pub const endsWithPartialThinkOpen = think_tags.endsWithPartialThinkOpen;
-pub const streamShouldBufferForTools = think_tags.streamShouldBufferForTools;
-pub const StreamThinkGate = think_tags.StreamThinkGate;
-pub const streamThinkGate = think_tags.streamThinkGate;
-pub const ThinkScan = think_tags.ThinkScan;
-pub const streamThinkGateScan = think_tags.streamThinkGateScan;
-pub const streamTailIsReasoning = think_tags.streamTailIsReasoning;
-pub const streamContentLead = think_tags.streamContentLead;
-pub const settledReasoning = think_tags.settledReasoning;
-pub const openThoughtFlush = think_tags.openThoughtFlush;
-pub const closedThoughtDelta = think_tags.closedThoughtDelta;
-pub const cutThoughtDelta = think_tags.cutThoughtDelta;
-pub const unstreamedReasoning = think_tags.unstreamedReasoning;
 
 pub const ToolCall = struct {
     id: []const u8,
@@ -471,7 +418,7 @@ pub fn renderChatTemplate(
     // fallback synthesis) sees exactly the message list
     // an ordinary turn would have. The template must open the assistant turn
     // once, which it only does when the trailing assistant is not in `messages`.
-    const prefill = continuationPrefill(messages, continue_final);
+    const prefill = think_tags.continuationPrefill(messages, continue_final);
     const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
 
     if (chat_config.chat_template.len == 0) {
@@ -605,10 +552,10 @@ pub fn renderChatTemplate(
         if (prefill) |partial| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{
-                collapsed, contentChannelTail(collapsed), partial,
+                collapsed, think_tags.contentChannelTail(collapsed), partial,
             });
         }
-        if (noThinkTailSuffix(collapsed, enable_thinking)) |suffix| {
+        if (think_tags.noThinkTailSuffix(collapsed, enable_thinking)) |suffix| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
         }
@@ -858,8 +805,8 @@ const ProbeCall = struct { between: []const u8, head: []const u8, after: []const
 
 fn locateProbeCall(rendered: []const u8) ?ProbeCall {
     const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
-    const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], BARE_THINK_CLOSER) orelse return null;
-    const between = rendered[closer_at + BARE_THINK_CLOSER.len .. name_at];
+    const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], think_tags.BARE_THINK_CLOSER) orelse return null;
+    const between = rendered[closer_at + think_tags.BARE_THINK_CLOSER.len .. name_at];
     const head = std.mem.trimStart(u8, between, " \t\r\n");
     if (head.len == 0) return null;
     return .{ .between = between, .head = head, .after = rendered[name_at + probe_name.len ..] };
@@ -947,7 +894,7 @@ pub fn synthesizeToolFallbackMessages(
     var tool_prompt: ?[]const u8 = null;
     if (inject_tool_prompt and tools_json != null) {
         var buf = std.ArrayList(u8).empty;
-        try appendToolSystemPrompt(arena, &buf, tools_json.?, tool_choice_instruction);
+        try tool_calls_mod.appendToolSystemPrompt(arena, &buf, tools_json.?, tool_choice_instruction);
         tool_prompt = try buf.toOwnedSlice(arena);
     }
 
@@ -1437,7 +1384,7 @@ fn fallbackFormatChat(
 
     if (tools_json != null and !has_system) {
         try result.appendSlice(allocator, "<|im_start|>system\n");
-        try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+        try tool_calls_mod.appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
         try result.appendSlice(allocator, "<|im_end|>\n");
     }
 
@@ -1446,7 +1393,7 @@ fn fallbackFormatChat(
             try result.appendSlice(allocator, "<|im_start|>system\n");
             try result.appendSlice(allocator, msg.content);
             try result.appendSlice(allocator, "\n\n");
-            try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+            try tool_calls_mod.appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
             try result.appendSlice(allocator, "<|im_end|>\n");
         } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
             try result.appendSlice(allocator, "<|im_start|>assistant\n");
@@ -3383,8 +3330,8 @@ pub fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatC
     const gen = try tok.encodeMarked(a, raw);
     errdefer a.free(gen);
 
-    const split = splitThinkBlock(raw, true, thinking);
-    const parsed = if (tools != null) try parseToolCalls(a, raw) else null;
+    const split = think_tags.splitThinkBlock(raw, true, thinking);
+    const parsed = if (tools != null) try tool_calls_mod.parseToolCalls(a, raw) else null;
     defer if (parsed) |calls| {
         for (calls) |c| {
             a.free(c.name);

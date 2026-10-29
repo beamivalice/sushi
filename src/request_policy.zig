@@ -2,6 +2,7 @@ const std = @import("std");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
 const model_mod = @import("model.zig");
 const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
@@ -45,7 +46,7 @@ pub fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config
 /// The in-stream thinking bound needs atomic think markers.
 fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
     if (lm.transformer == null) return false;
-    return atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) != null;
+    return atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER) != null;
 }
 
 /// The think penalty's lambda: the request's `think_penalty` > `--think-penalty` >
@@ -67,8 +68,8 @@ fn thinkPenaltyFor(lambda: f32, enable_thinking: bool, opener: ?u32, closer: ?u3
 pub fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, lambda: f32) think_penalty.ThinkPenalty {
     if (!enable_thinking or lm.transformer == null) return .{};
     if (!@import("think_penalty.zig").needsSpan(lambda, lm.transformer.?.logit_bias)) return .{};
-    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
-    var tp = thinkPenaltyFor(@max(lambda, 1), enable_thinking, atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER), closer, promptOpensThink(allocator, tok, prompt_ids));
+    const closer = atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER);
+    var tp = thinkPenaltyFor(@max(lambda, 1), enable_thinking, atomicTokenId(allocator, tok, think_tags.BARE_THINK_OPENER), closer, promptOpensThink(allocator, tok, prompt_ids));
     tp.lambda = if (tp.lambda > 0) lambda else 0;
     if (tp.armed()) log.info("  think penalty {d}: markers lowered inside the reasoning span\n", .{lambda});
     return tp;
@@ -972,13 +973,13 @@ test "schema thinking policy defers only a resolved reasoning protocol" {
     // A think tail classifies as resolvable (the resolver owns the
     // capability checks); channel-family and plain ChatML tails do not, and
     // keep the fallback — capability is never the tail's alone to decide.
-    try std.testing.expect(chat_mod.promptThinkTailClass("<|im_start|>assistant\n<think>") == .bare);
+    try std.testing.expect(think_tags.promptThinkTailClass("<|im_start|>assistant\n<think>") == .bare);
     const unsupported_tails = [_][]const u8{
         "<|channel|>analysis<|message|>",
         "<|im_start|>assistant\n",
     };
     for (unsupported_tails) |tail| {
-        try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, chat_mod.promptThinkTailClass(tail) != .none));
+        try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, think_tags.promptThinkTailClass(tail) != .none));
     }
 }
 
@@ -1163,7 +1164,7 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
             defer a.free(rendered);
             try std.testing.expect(std.mem.indexOf(u8, rendered, "literal prompt") != null);
             if (std.mem.eql(u8, family[0], "qwen4_exp")) {
-                try std.testing.expectEqual(enable, chat_mod.promptTailOpensThink(rendered));
+                try std.testing.expectEqual(enable, think_tags.promptTailOpensThink(rendered));
             } else {
                 try std.testing.expect(std.mem.endsWith(u8, rendered, if (enable) "<|im_start|>assistant\n" else "<think></think>"));
             }

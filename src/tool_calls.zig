@@ -9,20 +9,21 @@ const splitThinkBlock = think_tags.splitThinkBlock;
 const streamShouldBufferForTools = think_tags.streamShouldBufferForTools;
 const testing = std.testing;
 const chat = @import("chat.zig");
+const tool_schema = @import("tool_schema.zig");
 const ChatConfig = chat.ChatConfig;
 const Dsv41Replay = chat.Dsv41Replay;
 const Message = chat.Message;
-const ParsedToolCall = chat.ParsedToolCall;
+const ParsedToolCall = tool_schema.ParsedToolCall;
 const ReplayCase = chat.ReplayCase;
 const ToolCall = chat.ToolCall;
 const appendJsonString = chat.appendJsonString;
 const dsv41_image_atom = chat.dsv41_image_atom;
-const jsonIsValidObject = chat.jsonIsValidObject;
+const jsonIsValidObject = tool_schema.jsonIsValidObject;
 const loadChatConfig = chat.loadChatConfig;
 const renderChatTemplate = chat.renderChatTemplate;
 const replayTurn = chat.replayTurn;
 const synthesizeToolFallbackMessages = chat.synthesizeToolFallbackMessages;
-const toolNameIsDeclared = chat.toolNameIsDeclared;
+const toolNameIsDeclared = tool_schema.toolNameIsDeclared;
 
 /// `<tool_call>` followed by a special token spelled where `<` belongs
 /// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none.

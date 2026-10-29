@@ -1,6 +1,9 @@
 const std = @import("std");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
+const tool_calls_mod = @import("tool_calls.zig");
+const tool_schema = @import("tool_schema.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const expert_stream_mod = @import("expert_stream.zig");
@@ -153,7 +156,7 @@ fn emitConstrainedResponses(a: std.mem.Allocator, stream: *Conn, seq: *u64, reas
     }
 }
 
-pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: sampler.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
+pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: sampler.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !think_tags.ThinkSplit {
     if (sampling.constraint) |c| {
         if (c.proto) |p| {
             routed.* = rp_mod.Delivery.init(p);
@@ -165,7 +168,7 @@ pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.D
             return .{ .reasoning_content = if (reasoning.len == 0) null else reasoning, .content = d.content.items };
         }
     }
-    return if (keep_markup) chat_mod.splitThinkBlockKeepingMarkup(text, true, opened) else chat_mod.splitThinkBlock(text, true, opened);
+    return if (keep_markup) think_tags.splitThinkBlockKeepingMarkup(text, true, opened) else think_tags.splitThinkBlock(text, true, opened);
 }
 
 /// Wrap a Responses-API streaming event payload with `sequence_number` (which
@@ -585,7 +588,7 @@ fn handleResponsesInner(
     };
     var has_tools = root.get("tools") != null;
 
-    const tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
+    const tool_choice = tool_calls_mod.parseToolChoice(root.get("tool_choice"));
     const tool_choice_instruction = try tool_choice.instruction(allocator);
     defer if (tool_choice_instruction) |ins| allocator.free(ins);
     if (tool_choice == .none) has_tools = false;
@@ -598,7 +601,7 @@ fn handleResponsesInner(
             if (reshaped.len <= 2) has_tools = false; // "[]" — no function tools
         };
     }
-    if (has_tools and chat_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
+    if (has_tools and tool_calls_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
         log.warn("POST /v1/responses -> 400 (tool_choice names an undeclared function)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
         return;
@@ -1071,7 +1074,7 @@ fn handleResponsesInner(
                 try think_buf.appendSlice(allocator, token_text);
 
                 // Skip a literal think opener if the template did not pre-inject one.
-                if (!skipped_think_open and (think_buf.items.len >= 7 or !chat_mod.thinkOpenerPossible(think_buf.items))) {
+                if (!skipped_think_open and (think_buf.items.len >= 7 or !think_tags.thinkOpenerPossible(think_buf.items))) {
                     if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
                         var skip: usize = 7;
                         while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -1107,7 +1110,7 @@ fn handleResponsesInner(
                 };
 
                 if (close_match) |m| {
-                    const before = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                    const before = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                     thought_shipped = false;
                     if (before.len > 0) {
                         if (!streamed_reasoning_started) {
@@ -1142,7 +1145,7 @@ fn handleResponsesInner(
                 } else if (skipped_think_open) {
                     // Flush what the closed thought will certainly deliver: a partial
                     // close tag, a trailing "\n " run and a split code point wait.
-                    const flush = chat_mod.openThoughtFlush(think_buf.items, thought_shipped);
+                    const flush = think_tags.openThoughtFlush(think_buf.items, thought_shipped);
                     const safe_len = flush.skip + flush.ship;
                     if (safe_len > 0) {
                         if (flush.ship > 0) {
@@ -1165,13 +1168,13 @@ fn handleResponsesInner(
                 // Skip Gemma 4 channel tags that may leak after the thinking block.
                 // A think block the MODEL opens: seeded like a template-injected one.
                 // Checked before the marker skip, which would swallow a bare `<think>`.
-                if (!streamed_message_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+                if (!streamed_message_started) if (think_tags.modelThinkOpener(channel_armed, token_text)) |opener| {
                     channel_armed = false;
                     in_think_block = true;
                     try think_buf.appendSlice(allocator, opener);
                     continue;
                 };
-                if (chat_mod.isChannelMarkerToken(token_text)) {
+                if (think_tags.isChannelMarkerToken(token_text)) {
                     channel_armed = !streamed_message_started and std.mem.eql(u8, token_text, "<|channel>");
                     continue;
                 }
@@ -1195,7 +1198,7 @@ fn handleResponsesInner(
         }
 
         // Flush any remaining think buffer (no close tag found) as reasoning.
-        const think_tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
+        const think_tail = think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
         if (!client_gone and in_think_block and think_tail.len > 0 and !active_has_tools) {
             if (!streamed_reasoning_started) {
                 streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -1266,7 +1269,7 @@ fn handleResponsesInner(
     var normalized_text: ?[]u8 = null;
     defer if (normalized_text) |n| allocator.free(n);
     if (sampling.constraint == null or sampling.constraint.?.proto == null) {
-        normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+        normalized_text = try think_tags.normalizeEmbeddedThinkBlocks(allocator, final_text);
         if (normalized_text) |n| final_text = n;
     }
 
@@ -1280,7 +1283,7 @@ fn handleResponsesInner(
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 
-    var tool_calls: ?[]chat_mod.ParsedToolCall = null;
+    var tool_calls: ?[]tool_schema.ParsedToolCall = null;
     if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
         tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
     }

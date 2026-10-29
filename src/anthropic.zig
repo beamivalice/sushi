@@ -3,6 +3,8 @@ const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
+const tool_calls_mod = @import("tool_calls.zig");
+const think_tags = @import("think_tags.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const expert_stream_mod = @import("expert_stream.zig");
@@ -704,7 +706,7 @@ const AnthropicPrompt = struct {
     tools_json: ?[]const u8 = null,
     has_tools: bool = false,
     allow_parallel_tools: bool = true,
-    tool_choice: chat_mod.ToolChoice = .auto,
+    tool_choice: tool_calls_mod.ToolChoice = .auto,
     tool_choice_instruction: ?[]const u8 = null,
     enable_thinking: bool = false,
     reasoning_budget: i32 = -1,
@@ -781,10 +783,10 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
                     }
                 }
             }
-            p.tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
+            p.tool_choice = tool_calls_mod.parseToolChoice(root.get("tool_choice"));
             if (p.tool_choice == .none) p.has_tools = false;
             p.tool_choice_instruction = try p.tool_choice.instruction(allocator);
-            if (chat_mod.toolChoiceNamesUndeclared(allocator, p.tool_choice, p.tools_json)) {
+            if (tool_calls_mod.toolChoiceNamesUndeclared(allocator, p.tool_choice, p.tools_json)) {
                 log.warn("POST {s} -> 400 (tool_choice names an undeclared tool)\n", .{route.path()});
                 try sendAnthropicError(allocator, stream, "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
                 return false;
@@ -885,7 +887,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     // ordinary turn rather than a 400: the client never asked for a
     // continuation, so refusing its request would take away an answer this
     // endpoint has always given.
-    p.continue_final = chat_mod.continuationRequested(messages.items);
+    p.continue_final = think_tags.continuationRequested(messages.items);
     var tokenize_sw = Stopwatch.init(stream.io);
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
@@ -1050,7 +1052,7 @@ fn handleAnthropicNonStreaming(
     var normalized_text: ?[]u8 = null;
     defer if (normalized_text) |n| allocator.free(n);
     if (sampling.constraint == null or sampling.constraint.?.proto == null) {
-        normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+        normalized_text = try think_tags.normalizeEmbeddedThinkBlocks(allocator, final_text);
         if (normalized_text) |n| final_text = n;
     }
 
@@ -1078,7 +1080,7 @@ fn handleAnthropicNonStreaming(
         const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, tok, prompt_ids));
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
-            const t = chat_mod.trimLeakedToolMarkup(r);
+            const t = think_tags.trimLeakedToolMarkup(r);
             break :blk if (t.len > 0) t else null;
         } else null;
         if (split_reasoning) |reasoning| {
@@ -1126,7 +1128,7 @@ fn handleAnthropicNonStreaming(
             });
 
             // The same pre-markup text the stream flushes as a text delta.
-            const tu_preamble = visibleToolPreamble(chat_mod.trimLeakedToolMarkup(final_text));
+            const tu_preamble = visibleToolPreamble(think_tags.trimLeakedToolMarkup(final_text));
             if (tu_preamble.len > 0) {
                 if (block_count > 0) try content.append(allocator, ',');
                 const esc_pre = try jsonEscape(allocator, tu_preamble);
@@ -1158,7 +1160,7 @@ fn handleAnthropicNonStreaming(
             // No tool calls — emit text block. Nothing parsed, so any tool
             // markup still in here is unparsed wreckage: cut it at emission.
             if (block_count > 0) try content.append(allocator, ',');
-            const esc_text = try jsonEscape(allocator, if (routed != null) final_text else chat_mod.trimLeakedToolMarkup(final_text));
+            const esc_text = try jsonEscape(allocator, if (routed != null) final_text else think_tags.trimLeakedToolMarkup(final_text));
             defer allocator.free(esc_text);
             const text_block = try std.fmt.allocPrint(allocator,
                 \\{{"type":"text","text":{s}}}
@@ -1169,7 +1171,7 @@ fn handleAnthropicNonStreaming(
     } else {
         // No tools — emit text block
         if (block_count > 0) try content.append(allocator, ',');
-        const esc_text = try jsonEscape(allocator, if (routed != null) final_text else chat_mod.trimLeakedToolMarkup(final_text));
+        const esc_text = try jsonEscape(allocator, if (routed != null) final_text else think_tags.trimLeakedToolMarkup(final_text));
         defer allocator.free(esc_text);
         const text_block = try std.fmt.allocPrint(allocator,
             \\{{"type":"text","text":{s}}}
@@ -1381,7 +1383,7 @@ fn handleAnthropicStreaming(
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
     // think block is open and unclosed (47.99 us/token at 113 KB).
-    var think_scan: chat_mod.ThinkScan = .{};
+    var think_scan: think_tags.ThinkScan = .{};
     // Gate through streamThinkGateScan only, and reset the scan wherever the buffer is cleared.
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
@@ -1464,7 +1466,7 @@ fn handleAnthropicStreaming(
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
             const undelivered = buf[text_delivered..];
-            const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
+            const maybe_tool = think_tags.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
                 // Shared gate with the chat-completions stream (the two paths
@@ -1473,12 +1475,12 @@ fn handleAnthropicStreaming(
                 // streamed as visible text_deltas and a raw `</think>` leaked
                 // into Claude Code transcripts). Hermetically pinned per
                 // recorded model family by the corpus streaming-gate test.
-                switch (chat_mod.streamThinkGateScan(buf, enable_thinking, think_closed, prompt_opened_think, &think_scan)) {
+                switch (think_tags.streamThinkGateScan(buf, enable_thinking, think_closed, prompt_opened_think, &think_scan)) {
                     .hold_thinking => {
                         // Safe to stream: the tool gate just returned false, so these bytes
                         // are reasoning. Each iteration is one token, so the budget counts them.
                         if (!budget_exhausted) if (heldThoughtSoFar(buf, opens_think, think_closed)) |settled| {
-                            if (chat_mod.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
+                            if (think_tags.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
                                 try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, fresh);
                                 reasoning_streamed = settled.len;
                                 think_tokens += 1;
@@ -1493,11 +1495,11 @@ fn handleAnthropicStreaming(
                         // Complete think block — split once: thinking block
                         // first, then the visible remainder as text. Reasoning
                         // ships regardless of the request's thinking flag.
-                        const split = chat_mod.splitThinkBlock(undelivered, true, opens_think);
+                        const split = think_tags.splitThinkBlock(undelivered, true, opens_think);
                         if (!budget_exhausted) if (split.reasoning_content) |rc| {
                             const capped = try reasoningWithinBudget(allocator, tok, rc, reasoning_budget);
                             defer if (capped.owned) allocator.free(capped.text);
-                            if (chat_mod.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
+                            if (think_tags.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
                                 try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, rest);
                             }
                         };
@@ -1526,10 +1528,10 @@ fn handleAnthropicStreaming(
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
                             // Skip bare think/channel tags that leak without a block
-                            if (chat_mod.isChannelMarkerToken(tt)) {
+                            if (think_tags.isChannelMarkerToken(tt)) {
                                 continue;
                             }
-                            const vis = chat_mod.streamContentLead(tt, content_started);
+                            const vis = think_tags.streamContentLead(tt, content_started);
                             if (vis.len == 0) continue;
                             content_started = true;
                             if (!text_block_open) {
@@ -1555,8 +1557,8 @@ fn handleAnthropicStreaming(
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
 
-            if (!skipped_think_open and (think_buf.items.len >= 7 or !chat_mod.thinkOpenerPossible(think_buf.items))) {
-                if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
+            if (!skipped_think_open and (think_buf.items.len >= 7 or !think_tags.thinkOpenerPossible(think_buf.items))) {
+                if (think_tags.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     var skip: usize = olen;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
@@ -1575,7 +1577,7 @@ fn handleAnthropicStreaming(
                     skipped_think_open = true;
                 } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
                     // Partial prefix of `<|channel>thought` — wait for more tokens.
-                } else if (think_buf.items.len < 32 and chat_mod.endsWithPartialThinkOpen(think_buf.items)) {
+                } else if (think_buf.items.len < 32 and think_tags.endsWithPartialThinkOpen(think_buf.items)) {
                     // Still a growing opener (`…<thi`) — wait.
                 } else {
                     // No opener in the model's output — template injected one.
@@ -1594,7 +1596,7 @@ fn handleAnthropicStreaming(
             }
 
             // Check for the close tag — accept whichever appears first.
-            const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
+            const think_match = think_tags.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
                 if (think_match == null and channel_pos == null) break :blk null;
@@ -1605,7 +1607,7 @@ fn handleAnthropicStreaming(
             };
 
             if (close_match) |m| {
-                const last = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                const last = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 thought_shipped = false;
                 if (!budget_exhausted and last.len > 0) {
                     try emitAnthropicThinkingOpening(allocator, stream, block_index, &thinking_block_open, last);
@@ -1638,7 +1640,7 @@ fn handleAnthropicStreaming(
             } else if (skipped_think_open) {
                 // Flush what the closed thought will certainly deliver: a partial
                 // close tag, a trailing "\n " run and a split code point wait.
-                const flush = chat_mod.openThoughtFlush(think_buf.items, thought_shipped);
+                const flush = think_tags.openThoughtFlush(think_buf.items, thought_shipped);
                 const safe_len = flush.skip + flush.ship;
                 if (safe_len > 0) {
                     if (!budget_exhausted and flush.ship > 0) try emitAnthropicThinkingOpening(allocator, stream, block_index, &thinking_block_open, think_buf.items[flush.skip..safe_len]);
@@ -1654,18 +1656,18 @@ fn handleAnthropicStreaming(
             defer allocator.free(token_text);
             // A think block the MODEL opens: seeded like a template-injected one.
             // Checked before the marker skip, which would swallow a bare `<think>`.
-            if (!content_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+            if (!content_started) if (think_tags.modelThinkOpener(channel_armed, token_text)) |opener| {
                 channel_armed = false;
                 in_think_block = true;
                 try think_buf.appendSlice(allocator, opener);
                 continue;
             };
-            if (chat_mod.isChannelMarkerToken(token_text)) {
+            if (think_tags.isChannelMarkerToken(token_text)) {
                 channel_armed = !content_started and std.mem.eql(u8, token_text, "<|channel>");
                 continue;
             }
             channel_armed = false;
-            const vis_token = chat_mod.streamContentLead(token_text, content_started);
+            const vis_token = think_tags.streamContentLead(token_text, content_started);
             if (vis_token.len == 0) continue;
             content_started = true;
             if (!text_block_open) {
@@ -1699,7 +1701,7 @@ fn handleAnthropicStreaming(
     }
 
     // Flush remaining think buffer
-    const think_tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
+    const think_tail = think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
     if (!client_gone and !budget_exhausted and think_tail.len > 0) {
         try emitAnthropicThinkingOpening(allocator, stream, block_index, &thinking_block_open, think_tail);
     }
@@ -1720,7 +1722,7 @@ fn handleAnthropicStreaming(
         // Merge re-opened mid-text thought channels into the leading block so
         // the split/parse below never leaks raw tags (Gemma 12B re-opens
         // channels mid-turn — observed live via Claude Code on this surface).
-        const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
+        const norm_owned = try think_tags.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
         const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
@@ -1738,11 +1740,11 @@ fn handleAnthropicStreaming(
             // already emitted it, the remaining buffer has no template-opened
             // semantics — passing `opens_think` unguarded would misfile the
             // visible tail as reasoning.
-            const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
+            const think_split = think_tags.splitThinkBlock(gen_text, true, opens_think and !think_closed);
             if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
                 const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                 defer if (capped.owned) allocator.free(capped.text);
-                if (chat_mod.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
+                if (think_tags.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
                     try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, rest);
                 }
             };
@@ -1787,14 +1789,14 @@ fn handleAnthropicStreaming(
                 var full_text = std.ArrayList(u8).empty;
                 defer full_text.deinit(allocator);
                 for (token_texts.items) |t| try full_text.appendSlice(allocator, t);
-                const flush_norm = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
+                const flush_norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
-                const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
                 if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
-                    if (chat_mod.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
+                    if (think_tags.unstreamedReasoning(capped.text, reasoning_streamed)) |rest| {
                         try emitAnthropicThinkingAfterText(allocator, stream, &block_index, &text_block_open, &thinking_block_open, rest);
                     }
                 };
@@ -1933,9 +1935,9 @@ fn emitAnthropicThinkingAfterText(allocator: std.mem.Allocator, stream: *Conn, i
 /// the same prefix while open as once closed, so its deltas add up to the closed thought.
 fn heldThoughtSoFar(buf: []const u8, opens_think: bool, think_closed: bool) ?[]const u8 {
     const prompt_opened = opens_think and !think_closed;
-    if (!prompt_opened and chat_mod.thinkOpenTagLenAt(buf) == null) return null;
-    const reasoning = chat_mod.splitThinkBlock(buf, true, prompt_opened).reasoning_content orelse return null;
-    return chat_mod.settledReasoning(reasoning);
+    if (!prompt_opened and think_tags.thinkOpenTagLenAt(buf) == null) return null;
+    const reasoning = think_tags.splitThinkBlock(buf, true, prompt_opened).reasoning_content orelse return null;
+    return think_tags.settledReasoning(reasoning);
 }
 
 test "anthropicStopReason: a matched client stop sequence reports stop_sequence, truncation stays honest" {

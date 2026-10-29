@@ -10,6 +10,9 @@ const mtp_mod = @import("mtp.zig");
 const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const chat_mod = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
+const tool_calls_mod = @import("tool_calls.zig");
+const tool_schema = @import("tool_schema.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
@@ -843,7 +846,7 @@ pub fn promptOpensThink(
     const n = @min(prompt_ids.len, 8);
     const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - n ..]) catch return false;
     defer allocator.free(tail);
-    return chat_mod.promptTailOpensThink(tail);
+    return think_tags.promptTailOpensThink(tail);
 }
 
 /// One token id for `text`, or null when the tokenizer spells it in pieces.
@@ -873,11 +876,11 @@ pub fn loopCloseBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 
 fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: u32, announce: bool) ?mtp_plan.ThinkBound {
     if (!enable_thinking or lm.transformer == null) return null;
-    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
+    const closer = atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER) orelse {
         if (announce) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
         return null;
     };
-    const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
+    const opener = atomicTokenId(allocator, tok, think_tags.BARE_THINK_OPENER);
     const opened = promptOpensThink(allocator, tok, prompt_ids);
     if (opener == null and !opened) return null;
 
@@ -915,7 +918,7 @@ pub fn armCallForce(
     chat_config: *const chat_mod.ChatConfig,
     prompt_ids: []const u32,
     enable_thinking: bool,
-    choice: chat_mod.ToolChoice,
+    choice: tool_calls_mod.ToolChoice,
     tools_json: ?[]const u8,
 ) ?generate_mod.CallForce {
     const name: ?[]const u8 = switch (choice) {
@@ -929,8 +932,8 @@ pub fn armCallForce(
         return null;
     };
     defer text.deinit(allocator);
-    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
-    const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
+    const closer = atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER);
+    const opener = atomicTokenId(allocator, tok, think_tags.BARE_THINK_OPENER);
     const phase: generate_mod.CallForce.Phase = if (promptOpensThink(allocator, tok, prompt_ids)) blk: {
         if (closer == null) {
             log.info("  [tool-choice] forced call is prompt-only: the think closer is not one token\n", .{});
@@ -995,7 +998,7 @@ fn nameIds(allocator: std.mem.Allocator, tok: *const Tokenizer, tools_json: []co
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const declared = try chat_mod.declaredToolNames(arena, tools_json);
+    const declared = try tool_calls_mod.declaredToolNames(arena, tools_json);
     const per_name = try arena.alloc([]u32, declared.len);
     var total: usize = 0;
     for (declared, per_name) |n, *ids| {
@@ -1023,7 +1026,7 @@ fn templateThinkOpener(template: []const u8) ?[]const u8 {
     var found: ?[]const u8 = null;
     var offset: usize = 0;
     while (std.mem.indexOfPos(u8, template, offset, "<think")) |start| {
-        const len = chat_mod.thinkOpenTagLenAt(template[start..]) orelse return null;
+        const len = think_tags.thinkOpenTagLenAt(template[start..]) orelse return null;
         const tag = template[start..][0..len];
         if (found) |previous| {
             if (!std.mem.eql(u8, previous, tag)) return null;
@@ -1063,10 +1066,10 @@ pub fn resolveReasoningProtocol(
         proto.configureChannels();
         if (!proto.startFromPrompt(tail)) return false;
     } else {
-        switch (chat_mod.promptThinkTailClass(trimmed)) {
+        switch (think_tags.promptThinkTailClass(trimmed)) {
             .bare => {
                 proto.kind = .bare_think;
-                if (!proto.setCloser(chat_mod.BARE_THINK_CLOSER)) return false;
+                if (!proto.setCloser(think_tags.BARE_THINK_CLOSER)) return false;
             },
             .none => {
                 const opener = templateThinkOpener(template) orelse return false;
@@ -1242,17 +1245,17 @@ pub fn parseToolCallsForRequest(
     /// first result). Deliberately NOT gated by --no-tool-autocorrect:
     /// client-requested behavior, not a repair heuristic.
     allow_parallel: bool,
-) !?[]chat_mod.ParsedToolCall {
-    var parsed_calls = try chat_mod.parseToolCalls(allocator, text);
+) !?[]tool_schema.ParsedToolCall {
+    var parsed_calls = try tool_calls_mod.parseToolCalls(allocator, text);
     // Heuristically-inferred raw-JSON calls must name a DECLARED tool — a
     // truncated data object ({"name": "George Washington", …}) is not a call.
     // Deliberately NOT gated on g_tool_autocorrect: this corrects our own
     // heuristic's false positive, not the model's output.
     if (parsed_calls) |c| {
-        if (tools_json) |tj| parsed_calls = try chat_mod.filterInferredBySchema(allocator, c, tj);
+        if (tools_json) |tj| parsed_calls = try tool_schema.filterInferredBySchema(allocator, c, tj);
     }
     var calls = parsed_calls orelse
-        (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
+        (if (tools_json) |tj| try tool_schema.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;
     if (!allow_parallel and calls.len > 1) {
         log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
@@ -1262,7 +1265,7 @@ pub fn parseToolCallsForRequest(
         }
         const kept = calls[0];
         allocator.free(calls);
-        const one = try allocator.alloc(chat_mod.ParsedToolCall, 1);
+        const one = try allocator.alloc(tool_schema.ParsedToolCall, 1);
         one[0] = kept;
         calls = one;
     }
@@ -1271,8 +1274,8 @@ pub fn parseToolCallsForRequest(
             // Order matters: put a buried required param back where the schema
             // says it lives BEFORE coercing types, so the hoisted value is
             // type-checked like any other top-level arg.
-            try chat_mod.hoistMisplacedRequiredParams(allocator, calls, tj);
-            try chat_mod.coerceToolArgsToSchema(allocator, calls, tj);
+            try tool_schema.hoistMisplacedRequiredParams(allocator, calls, tj);
+            try tool_schema.coerceToolArgsToSchema(allocator, calls, tj);
         }
     }
     return calls;
@@ -7358,7 +7361,7 @@ pub fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) Escaped
 fn continueFinalMessageRequested(root: std.json.ObjectMap, messages: []const chat_mod.Message) bool {
     const v = root.get("continue_final_message") orelse return false;
     if (v != .bool or !v.bool) return false;
-    return chat_mod.continuationRequested(messages);
+    return think_tags.continuationRequested(messages);
 }
 
 const JoinedText = struct { text: []const u8, owned: bool };
@@ -7559,7 +7562,7 @@ pub fn handleChatCompletions(
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
     var has_tools = root.get("tools") != null;
-    const tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
+    const tool_choice = tool_calls_mod.parseToolChoice(root.get("tool_choice"));
     if (tool_choice == .none) has_tools = false;
     const tool_choice_instruction: ?[]const u8 = if (has_tools) try tool_choice.instruction(allocator) else null;
     defer if (tool_choice_instruction) |tci| allocator.free(tci);
@@ -7576,7 +7579,7 @@ pub fn handleChatCompletions(
         if (extractJsonField(body, "tools")) |tools_str| {
             tools_json = tools_str;
         }
-        if (chat_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
+        if (tool_calls_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
             log.warn("POST /v1/chat/completions -> 400 (tool_choice names an undeclared function)\n", .{});
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
             return;
@@ -9889,7 +9892,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     const path = parsed.value.object.get("path") orelse return error.PathNotHoisted;
     try std.testing.expectEqualStrings("us_presidents/generate_site.sh", path.string);
     try std.testing.expect(parsed.value.object.get("edits").?.array.items[0].object.get("path") == null);
-    try std.testing.expect(chat_mod.toolCallConformsToSchema(allocator, calls[0], tools));
+    try std.testing.expect(tool_schema.toolCallConformsToSchema(allocator, calls[0], tools));
 
     // The escape hatch covers this correction too: it repairs the MODEL's output
     // (unlike the inferred-name filter, which corrects our own heuristic).
@@ -13019,7 +13022,7 @@ pub fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []con
 
     const parsed = try std.json.parseFromSlice(std.json.Value, a, tool_choice_json, .{});
     defer parsed.deinit();
-    const choice = chat_mod.parseToolChoice(parsed.value);
+    const choice = tool_calls_mod.parseToolChoice(parsed.value);
     const instruction = try choice.instruction(a);
     defer if (instruction) |i| a.free(i);
 
