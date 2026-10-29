@@ -168,6 +168,7 @@ test {
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
+    _ = @import("mtp_tick.zig");
     _ = @import("slot_admission.zig");
     _ = @import("vision_queue.zig");
     _ = @import("model_load.zig");
