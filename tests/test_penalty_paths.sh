@@ -15,6 +15,8 @@ set -u
 . "$(dirname "$0")/lib/boot.sh"
 sushi_attach
 sushi_require mtp
+# DeepSeek speculates with DSpark rounds; the MTP-engagement checks below do not apply to it.
+[ "$SUSHI_ARCH" != deepseek_v41 ] || { echo "SKIP $(basename "$0"): deepseek_v41 speculates with DSpark, not MTP"; exit 3; }
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 

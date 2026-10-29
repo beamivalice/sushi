@@ -174,7 +174,8 @@ prefill_cancel_section() {
         # Genuinely mid-prefill: the forwarded-prefix commit is REQUIRED.
         check "mid-prefill kill reuses forwarded prefix (cached_tokens=$cached)" \
             "$([[ "${cached:-0}" -ge 256 ]] && echo 1 || echo 0)"
-        log_after "$mark" | grep -q "from a cancelled prefill" && ok=1 || ok=0
+        # GLM's commit path logs its own line, without the cancelled-prefill wording.
+        log_after "$mark" | grep -qE "from a cancelled prefill|committed [0-9]+/[0-9]+ GLM tokens" && ok=1 || ok=0
         check "server log shows the cancelled-prefill commit" "$ok"
     fi
 

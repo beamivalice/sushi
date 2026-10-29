@@ -28,7 +28,8 @@ command -v jq >/dev/null || { echo "needs jq"; exit 1; }
 grep -q '\[glm\] prefix cache' "$SUSHI_LOG" || { echo "fail: the GLM prefix cache did not arm"; exit 1; }
 
 words() { python3 -c "import random,sys; r=random.Random($1); w='agent tool file cache ring window layer prompt reply token session restore commit budget chunk kernel latent pool state'.split(); print(' '.join(r.choice(w) for _ in range($2)))"; }
-SYSTEM="$SUSHI_NONCE You are a careful engineer. Notes: $(words 1 2200)"
+# Checkpoints are kept at multiples of 8192 tokens, so the shared system prompt must pass one.
+SYSTEM="$SUSHI_NONCE You are a careful engineer. Notes: $(words 1 9000)"
 Q1="Task: $(words 2 400). Summarise the notes in two sentences."
 Q1_EDIT="Task: $(words 3 400). Name three words the notes repeat most."
 REPLY="The notes repeat a handful of systems words in random order."
