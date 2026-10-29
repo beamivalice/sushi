@@ -215,6 +215,7 @@ test "GLM packed NAX bills every pending layer" {
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(2048, 2));
 }
 test "GLM packed NAX invalid gather cannot poison output with masked nonfinite key zero" {
+    try mlx.requireGpu();
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     var data: [4 * 512]u16 = @splat(0);
@@ -239,6 +240,7 @@ test "GLM packed NAX invalid gather cannot poison output with masked nonfinite k
     }
 }
 test "GLM packed NAX preserves head order real-row selection and final ragged slot" {
+    try mlx.requireGpu();
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     var data: [4 * 512]u16 = @splat(0);

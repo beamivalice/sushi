@@ -159,6 +159,7 @@ fn normal(ops: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype, seed: u64) !Arr
 }
 
 test "GLM latent overlay branch outputs index state and commit match full append" {
+    try mlx.requireGpu();
     const attention = @import("glm5_attention.zig");
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -219,6 +220,7 @@ test "GLM latent overlay branch outputs index state and commit match full append
 }
 
 test "GLM kv8 and kv6 latent overlay reads round-tripped tails exactly as the committed append" {
+    try mlx.requireGpu();
     for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try overlayTailCase(bits);
 }
 
@@ -266,6 +268,7 @@ fn overlayTailCase(bits: u8) !void {
 }
 
 test "GLM overlay branch completing a pool reads a reserved pooled buffer without copying it" {
+    try mlx.requireGpu();
     const attention = @import("glm5_attention.zig");
     const s = mlx.gpuStream();
     for ([_]u8{ 0, latent_store.kv8_bits, 6 }) |bits| {

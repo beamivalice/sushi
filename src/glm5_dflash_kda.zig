@@ -127,6 +127,7 @@ fn recurrentImpl(input: primitive.KdaInputs, parents: []const i32, stream: mlx.m
 }
 
 test "GLM DFlash KDA tree follows per-channel parent state exactly" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     inline for (.{ .{ 5, 2, 4 }, .{ 16, 64, 128 } }) |geometry| {
         const R = geometry[0];
@@ -365,6 +366,7 @@ pub fn finish(layer: KdaLayer, ops: *Ops, y_bf: Arr, gate: Arr, cfg: *const @imp
 }
 
 test "GLM DFlash KDA layer tree and replay equal serial ancestor forwards" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     for ([_]u32{ 1, 64 }) |heads| {
@@ -493,6 +495,7 @@ fn equalArray(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
 }
 
 test "GLM DFlash KDA replay keeps raw BF16 one-token history bits" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var ops = Ops{ .s = s };
     defer ops.deinit();
@@ -534,6 +537,7 @@ test "GLM DFlash KDA replay keeps raw BF16 one-token history bits" {
 }
 
 test "GLM DFlash dense rows preserve integrated serial outputs" {
+    try mlx.requireGpu();
     const dense = @import("glm5_dflash_dense_rows.zig");
     // 128 and 64 serve KDA's FA/GA/beta, 32 the MLA index weights.
     for ([_]c_int{ 128, 64, 32 }) |width| for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |rows| {

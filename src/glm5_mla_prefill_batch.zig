@@ -91,6 +91,7 @@ fn widen(bits: u16) f64 {
 }
 
 test "GLM MLA head batch runs BF16 banks as stored and stays within one BF16 ulp of an FP64 oracle, as the staged chain does" {
+    try mlx.requireGpu();
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     const rows: c_int = 192;
     for ([_]Direction{ .query, .value }) |dir| {

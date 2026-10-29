@@ -349,7 +349,7 @@ fn assertReference(actual: Arr, expected: Arr, stream: mlx.mlx_stream) !void {
 }
 
 test "GLM vision tiny matches original HF tower across query chunks and video groups" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var weights = try tinyWeights(&tmp);

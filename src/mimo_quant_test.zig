@@ -146,7 +146,7 @@ test "mimo MXFP4 host reference covers E2M1 and E8M0 special values" {
 }
 
 test "mimo MXFP4 native scale zero and NaN semantics" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
 
     const stream = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(stream);
@@ -159,7 +159,7 @@ test "mimo MXFP4 native scale zero and NaN semantics" {
 }
 
 test "mimo MXFP4 native quantized_matmul matches independent bf16 dequant" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
 
     const M = 3;
     const N = 5;
@@ -232,7 +232,7 @@ test "mimo MXFP4 native quantized_matmul matches independent bf16 dequant" {
 }
 
 test "mimo MXFP4 native gather_qmm matches expert selector permutations" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
 
     const E = 3;
     const R = 5;

@@ -518,6 +518,7 @@ test "sushi coder layouts refuse malformed missing mixed and unsupported groups"
 }
 
 test "sushi coder GPU two groups equal independently routed uniform banks" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var banks: [2]Bank = undefined;

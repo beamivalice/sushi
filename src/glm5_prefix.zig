@@ -440,6 +440,7 @@ pub fn expectSameLogicalState(a: *forward.Request, b: *forward.Request) !void {
 }
 
 test "GLM prefix restore at a chunk-aligned checkpoint continues exactly like a cold prefill, BF16 and kv8" {
+    try mlx.requireGpu();
     var weights = model.Weights.init(testing.allocator);
     defer weights.deinit();
     const cfg = try forward.nonzeroDecodeFixture(&weights);
@@ -476,6 +477,7 @@ test "GLM prefix restore at a chunk-aligned checkpoint continues exactly like a 
 }
 
 test "GLM prefix rows bill exactly their rows and trim to a pool boundary" {
+    try mlx.requireGpu();
     var weights = model.Weights.init(testing.allocator);
     defer weights.deinit();
     const cfg = try forward.nonzeroDecodeFixture(&weights);
@@ -516,6 +518,7 @@ test "GLM prefix rows bill exactly their rows and trim to a pool boundary" {
 }
 
 test "GLM live rows for the SSD flush share the request's buffers and outlive its reset" {
+    try mlx.requireGpu();
     var weights = model.Weights.init(testing.allocator);
     defer weights.deinit();
     const cfg = try forward.nonzeroDecodeFixture(&weights);
@@ -556,6 +559,7 @@ test "GLM live rows for the SSD flush share the request's buffers and outlive it
 }
 
 test "a commit sheds the checkpoints above the rows it keeps" {
+    try mlx.requireGpu();
     var weights = model.Weights.init(testing.allocator);
     defer weights.deinit();
     const cfg = try forward.nonzeroDecodeFixture(&weights);

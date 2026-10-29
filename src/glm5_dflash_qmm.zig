@@ -194,6 +194,7 @@ fn tiles(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
 }
 
 test "GLM DFlash affine row tiles preserve serial qmv bits" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const Shape = struct { n: c_int, k: c_int };
     for ([_]c_int{ 8, 6, 5 }) |bits| for ([_]Shape{ .{ .n = 32, .k = if (bits == 5) 512 else 256 }, .{ .n = 1536, .k = 4096 }, .{ .n = 8192, .k = 4096 }, .{ .n = 4096, .k = 8192 } }) |shape| {

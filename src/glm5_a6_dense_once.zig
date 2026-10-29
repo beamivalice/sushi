@@ -105,6 +105,7 @@ test "GLM A6 dense once transient bill covers pending four projection layers" {
 }
 
 test "GLM A6 dense once Linear keeps native bits and declines decode rows" {
+    try mlx.requireGpu();
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     for (shapes, 0..) |kn, shape| {

@@ -174,7 +174,7 @@ fn prefixes(a: *const attention.State, b: *const attention.State, ops: *Ops) !vo
 }
 
 test "GLM reserve preserves cache bits and subsequent append and attention on BF16 and FP32" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     mlx.installErrorHandler();
     const stream = mlx.gpuStream();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| for ([_]usize{ 1023, 2047 }) |n| {
@@ -242,7 +242,7 @@ test "GLM reserve preserves cache bits and subsequent append and attention on BF
 }
 
 test "GLM reserve grows kv8 and kv6 codes scales and biases together and bills 544 and 416-byte rows" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     for ([_]u8{ 8, 6 }) |bits| try reserveQuantizedCase(bits);
 }
 

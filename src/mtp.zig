@@ -1597,7 +1597,7 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
     // concerned; convicting on the id would be judging our output against our
     // output's ordering. Id equality is still demanded wherever the reference's
     // OWN margin says the winner is unique.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -1717,7 +1717,7 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
     // caller passing `buildRerankCoarse` an explicit width, which both the
     // qwen4 and MiMo arms do. Packed geometry implies K, so a mismatched
     // width does not degrade gracefully: it reads a different vocab entirely.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -1807,7 +1807,7 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
 }
 
 test "mtp: batched rerank ids equal N solo rerankSelect" {
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xBA7C);
     defer fx.deinit();
@@ -1847,7 +1847,7 @@ test "mtp: rerankSelect declines without a coarse head, and the full readout is 
     // and a mid-chain shortlist failure all land here, and the answer must
     // still be a legal draft — the full-vocab argmax, which is what the qwen4
     // head did before this change.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -1880,7 +1880,7 @@ test "mtp: a suppressed id is never drafted, through the coarse shortlist or the
     // that never enters the shortlist cannot be re-scored back into the draft.
     // Both paths are checked because a rerank build refusal silently routes
     // every draft through the other one.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -2054,7 +2054,7 @@ test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
 }
 
 test "mtp: row-axis coarse logits equal each solo readout" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 2560, 8, 64, 0x3B17);
     defer fx.deinit();

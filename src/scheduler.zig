@@ -11423,6 +11423,7 @@ test "a penalised MTP slot never joins a plain batched tick, which samples no pe
 }
 
 test "single MTP slot reaches the round entry through runDecodeTick" {
+    try mlx.requireGpu();
     var xfm: Transformer = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
     model.transformer = null;
@@ -12459,7 +12460,7 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
 }
 
 test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
@@ -13123,7 +13124,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
 }
 
 test "the live KV bill counts ring restore points and nets out a donated checkout the hot cache bills" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var sch: Scheduler = undefined;
     sch.io = testing.io;
@@ -13510,6 +13511,7 @@ test "an encode refused for headroom after the restore names the bill of what it
 }
 
 test "a failed cold load drops the MLX error it latched and keeps one latched before it" {
+    try mlx.requireGpu();
     mlx.installErrorHandler();
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
     defer reg.deinit();
@@ -13699,7 +13701,7 @@ test "a DSpark round that finished the slot leaves the thought point to the comm
 }
 
 test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const a = testing.allocator;
     const dir = try dsv41_model.fixtureDir();

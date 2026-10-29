@@ -111,10 +111,12 @@ fn runOracle(dense_prefill: bool) !void {
 }
 
 test "GLM MLA full source oracle covers prefill serial and cached irregular chunks" {
+    try mlx.requireGpu();
     try runOracle(false);
 }
 
 test "GLM MLA dense prefill source oracle covers causal cached chunks" {
+    try mlx.requireGpu();
     try runOracle(true);
 }
 
@@ -143,6 +145,7 @@ fn putRandom(weights: *model.Weights, ops: *base.Ops, name: []const u8, shape: [
 }
 
 test "GLM BF16 MLA layer takes the head-batched projections after the dense window and tracks the staged chain" {
+    try mlx.requireGpu();
     if (!base.naxArms()) return error.SkipZigTest;
     const batch = @import("glm5_mla_prefill_batch.zig");
     var weights = model.Weights.init(std.testing.allocator);

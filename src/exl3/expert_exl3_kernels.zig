@@ -10229,6 +10229,7 @@ test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and
 }
 
 test "exl3 GLM lane, one-row and fused middle-down kernels keep the cooperative bytes under PAIR1" {
+    try mlx.requireGpu();
     setDecodeParams(PAIR1_W16);
     defer setDecodeParams(.mul1);
     for ([_]u32{ 24, 32, 36, 42, 64 }) |n| for ([_]usize{ 1, 3 }) |rows| {
@@ -11476,7 +11477,7 @@ test "exl3 NAX GEMM body writes the reference body's bytes at MiMo and Flash-Nex
 }
 
 test "exl3 shared reduction preserves the routed output rounding before addition" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(1701);
@@ -11523,7 +11524,7 @@ test "exl3 shared reduction preserves the routed output rounding before addition
 }
 
 test "exl3 gated shared reduction equals MLX sigmoid, multiply and add for every bf16 gate logit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(1702);
@@ -11641,6 +11642,7 @@ fn clampedSortedReference(
 }
 
 test "exl3 clamped routing takes the lane kernels and preserves staged bytes at every admitted rate" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     const dim = 256;
@@ -11703,6 +11705,7 @@ test "exl3 clamped routing takes the lane kernels and preserves staged bytes at 
 }
 
 test "exl3 clamped routing preserves GLM production width bytes" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer setDecodeParams(.mul1);
     for ([_]exl3.Window{ .w12, .w14 }) |window| for ([_]usize{ 1, 2, 4, 8, 16, 17 }) |rows| {
@@ -11745,6 +11748,7 @@ test "exl3 clamped routing preserves GLM production width bytes" {
 }
 
 test "exl3 unsorted paired prepare preserves distinct scale planes at GLM widths" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     const experts = 288;
@@ -11796,6 +11800,7 @@ test "exl3 unsorted paired prepare preserves distinct scale planes at GLM widths
 }
 
 test "exl3 GLM GPU windows match host metadata with zero padded windows" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     const experts = 288;
@@ -11898,6 +11903,7 @@ fn clampedWindowBytes(hidden: usize, inter: usize, n: u32, aligned: bool) !void 
 }
 
 test "exl3 GLM GPU windows preserve 288 expert bytes at every admitted rate" {
+    try mlx.requireGpu();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     var n: u32 = exl3.Rate.min_n;
@@ -11905,12 +11911,14 @@ test "exl3 GLM GPU windows preserve 288 expert bytes at every admitted rate" {
 }
 
 test "exl3 GLM GPU windows preserve 288 expert production width bytes" {
+    try mlx.requireGpu();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     try clampedGpuWindowBytes(4096, 2048, 36);
 }
 
 test "exl3 paired cooperative projections preserve separate F16 bytes" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const stream = mlx.gpuStream();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
@@ -11960,6 +11968,7 @@ test "exl3 paired cooperative projections preserve separate F16 bytes" {
 }
 
 test "exl3 paired cooperative projections preserve GLM width and mixed rate fallback" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
@@ -12012,6 +12021,7 @@ test "exl3 paired cooperative projections preserve GLM width and mixed rate fall
 }
 
 test "exl3 GLM sorted finish retains stride fallback bytes" {
+    try mlx.requireGpu();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     try clampedWindowBytes(128, 128, 36, false);
@@ -12125,6 +12135,7 @@ fn clampedMiddleDownCase(hidden: usize, inter: usize, rows: usize, rate: u32, ti
 }
 
 test "exl3 clamped middle down cooperative fusion preserves F16 bytes" {
+    try mlx.requireGpu();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     for (0..17) |i| for ([_]c_int{ 4, 8 }) |tiles| try clampedMiddleDownCase(256, 128, 1, @intCast(32 + 2 * i), tiles);
@@ -12171,6 +12182,7 @@ fn lanePairCase(hidden: usize, inter: usize, rows: usize, rate: u32) !void {
     for (expected, one) |want, got| try std.testing.expectEqualSlices(u8, try gemvOutBytes(want), try gemvOutBytes(got));
 }
 test "exl3 GLM lane half4 pair exact bytes" {
+    try mlx.requireGpu();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     for (0..17) |i| try lanePairCase(256, 128, 3, @intCast(32 + 2 * i));
@@ -12573,6 +12585,7 @@ fn downLaneArm(a: DownLaneArgs, arm: usize) !mlx.mlx_array {
     return if (arm >= 2) try downLaneCoopWith(a.s, mid, a.v[2], a.v[7], arm == 3) else try indexedGemvCoopF16(a.s, mid, a.v[2], a.v[7]);
 }
 test "exl3 GLM down lane exact staged and fused bytes" {
+    try mlx.requireGpu();
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     for (0..17) |i| try downLaneCase(256, 128, 3, @intCast(32 + 2 * i), 8);
@@ -12583,6 +12596,7 @@ test "exl3 GLM down lane exact staged and fused bytes" {
 }
 
 test "exl3 clamped decode adds the shared expert in the finish reduce to the byte" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer setDecodeParams(.mul1);
     const dec = exl3.Decode{ .codebook = .mcg, .window = .w14 };
@@ -12807,6 +12821,7 @@ fn f32Bytes(a: mlx.mlx_array) ![]const u8 {
 }
 
 test "exl3 STQ shared expert at DeepSeek's shape: a one-row chain gives row 0 of a wider chain the same bytes" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer setDecodeParams(.mul1);
     const dec = exl3.Decode.tabled(.spec1, .w15);
@@ -12851,6 +12866,7 @@ test "exl3 STQ shared expert at DeepSeek's shape: a one-row chain gives row 0 of
 }
 
 test "exl3 GLM one-row decode chain equals the lane chain to the byte and engages on one row only" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer setDecodeParams(.mul1);
     defer one_row_coop_off = false;

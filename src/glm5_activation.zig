@@ -58,6 +58,7 @@ pub fn apply(s: mlx.mlx_stream, gate: Arr, up: Arr, limit: f32) !?Arr {
 }
 
 test "GLM fused dense activation exhaustive BF16 gates and clamp boundaries" {
+    try mlx.requireGpu();
     const Ops = @import("glm5_model.zig").Ops;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
@@ -105,6 +106,7 @@ test "GLM fused dense activation rejects unsupported input shapes and dtypes" {
 }
 
 test "GLM fused dense activation packs transposed inputs without changing values" {
+    try mlx.requireGpu();
     const Ops = @import("glm5_model.zig").Ops;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();

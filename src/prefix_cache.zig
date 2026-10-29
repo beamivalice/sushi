@@ -4755,7 +4755,7 @@ fn ringRowBytes(arr: mlx.mlx_array) u64 {
 }
 
 test "a hot entry holds a ringed layer's retained rows, not the ring buffer's capacity" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
@@ -4831,7 +4831,7 @@ fn ringTurn(live: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, promp
 }
 
 test "a ringed entry restores at its prompt-end checkpoint when the next turn diverges past the ring" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
@@ -4897,7 +4897,7 @@ test "a ringed entry restores at its prompt-end checkpoint when the next turn di
 }
 
 test "a ring checkpoint restore below the floor cold-prefills" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -4930,7 +4930,7 @@ test "a ring checkpoint restore below the floor cold-prefills" {
 }
 
 test "a restore declined at the ring clamp leaves its entry's recency alone" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -4965,7 +4965,7 @@ test "a restore declined at the ring clamp leaves its entry's recency alone" {
 }
 
 test "ringed candidates rank by restorable position, not raw match" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5118,7 +5118,7 @@ test "a slot's ring restore points are freed by the slot and by a commit that ca
 }
 
 test "a new session sharing only another's preamble restores at the message mark that prefill took" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5181,7 +5181,7 @@ test "a new session sharing only another's preamble restores at the message mark
 }
 
 test "a slot holding every ring restore point it may bills SLOT_RING_CHECKPOINTS checkpoints" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5209,7 +5209,7 @@ test "a slot holding every ring restore point it may bills SLOT_RING_CHECKPOINTS
 }
 
 test "an entry extended in place keeps its older ring checkpoints" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5274,7 +5274,7 @@ fn ringExpectSameNext(ref: *KVCache, restored: *KVCache, s: mlx.mlx_stream, n_la
 }
 
 test "an oversized ringed entry trims to its end: the ring is a constant, not a per-token price" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
@@ -5318,7 +5318,7 @@ test "an oversized ringed entry trims to its end: the ring is a constant, not a 
 }
 
 test "an oversized ringed entry trims to the highest ring checkpoint that fits, and declines below every one" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5375,7 +5375,7 @@ test "an oversized ringed entry trims to the highest ring checkpoint that fits, 
 }
 
 test "a replacement over the budget sheds its lowest ring checkpoints before the entry" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5419,7 +5419,7 @@ test "a replacement over the budget sheds its lowest ring checkpoints before the
 }
 
 test "a ring checkpoint taken at the restore keeps the fork when the donor is evicted before the commit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5479,7 +5479,7 @@ test "a ring checkpoint taken at the restore keeps the fork when the donor is ev
 }
 
 test "a fork entry keeps its donor's ring checkpoint, so evicting the donor still restores at the fork" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5572,7 +5572,7 @@ fn expectRingContinuesCold(restored: *KVCache, s: mlx.mlx_stream, n_layers: u32,
 }
 
 test "a ringed entry persists to the SSD tier and restores only at a ring checkpoint after a restart" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -5644,7 +5644,7 @@ fn persistRingTurn(io: std.Io, base: []const u8, fp: []const u8, toks: []const u
 }
 
 test "a ringed SSD entry bills its ring files, and a truncated one is salvaged away at scan" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -5707,7 +5707,7 @@ test "a ringed SSD entry bills its ring files, and a truncated one is salvaged a
 }
 
 test "an SSD entry without ring rows is never restored into a ringed cache" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7038,7 +7038,7 @@ test "HotPrefixCache: a fork's SSD entry keeps the checkpoints its donor holds i
 }
 
 test "a fork's SSD entry keeps its donor's ring checkpoint, so a restart restores there with the donor gone" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7134,7 +7134,7 @@ fn ringCpSteps(hc: *const HotPrefixCache, entry: usize, out: *[RING_CHECKPOINT_M
 }
 
 test "RAM and SSD: a flushed ringed entry keeps its newest two ring checkpoints, and an older point restores its exact rows from SSD" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7197,7 +7197,7 @@ test "RAM and SSD: a flushed ringed entry keeps its newest two ring checkpoints,
 }
 
 test "RAM tier without an SSD tier keeps every ring checkpoint" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -7215,7 +7215,7 @@ test "RAM tier without an SSD tier keeps every ring checkpoint" {
 }
 
 test "RAM and SSD: a ring checkpoint whose write failed stays in RAM" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7243,7 +7243,7 @@ test "RAM and SSD: a ring checkpoint whose write failed stays in RAM" {
 }
 
 test "a ring file past the rows its entry persisted is not a held restore point" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7273,7 +7273,7 @@ test "a ring file past the rows its entry persisted is not a held restore point"
 }
 
 test "RAM and SSD: a fork inherits the donor's newest checkpoints, and the donor's older points stay on its SSD entry" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -8839,7 +8839,7 @@ fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: u
 }
 
 test "HotPrefixCache: restored QSA history values match a cold feed at every position" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const hd: c_int = 8;
     const P: usize = 80;
@@ -9220,7 +9220,7 @@ fn pcCaptureFed(
 }
 
 test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const P: usize = 20;
     const hd: c_int = 8;
@@ -9299,7 +9299,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
 }
 
 test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const P: usize = 48;
     const prompt_len: usize = P - 1;
@@ -9354,7 +9354,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
 }
 
 test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at every residue" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const hd: c_int = 8;
     const ratio: c_int = 4;
@@ -9447,7 +9447,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
 }
 
 test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const hd: c_int = 8;
     const P: usize = 48;
@@ -9583,7 +9583,7 @@ test "HotPrefixCache: a verbatim re-send restores at prompt_len-1" {
 }
 
 test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     restore_move_override = true;
     defer restore_move_override = null;
@@ -11550,7 +11550,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
     // the first `writeAtOffset` cannot donate: `copy_gpu` privatised the whole prefix (5.13 GB /
     // ~110 ms at 393k, 45% of the warm TTFT). The observable is allocation, not address: under
     // suite-wide pressure the buffer pool recycles addresses.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -11644,7 +11644,7 @@ fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void 
 }
 
 test "a one-token prompt that hits its own entry prefills cold: a restore leaves a token to forward" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const tokens = [_]u32{42};
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -11662,7 +11662,7 @@ test "a one-token prompt that hits its own entry prefills cold: a restore leaves
 
 test "restore by move ON DEMAND: a share that does not fit is taken over, off SSD-first" {
     // The admission pass converts a full-entry hit into a checkout; a partial hit and a second call decline.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     restore_move_override = true;
     defer restore_move_override = null;
@@ -12239,7 +12239,7 @@ fn testCheckedOutRetentionCap(max_entries: u32, max_bytes: u64) !void {
 }
 
 test "a restore names its entry, and a commit that extends it in place keeps the id" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tokens: [64]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -12264,7 +12264,7 @@ test "a restore names its entry, and a commit that extends it in place keeps the
 }
 
 test "a donated checkout names the bytes its slot now holds; a share names none" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -12358,7 +12358,7 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
 }
 
 test "SSD-only ring checkpoints survive restart without idle RAM" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = testing.io;
     const s = mlx.gpuStream();
@@ -12484,6 +12484,7 @@ const GlmNet = struct {
 };
 
 test "GLM hot cache restores the highest checkpoint under the match and continues like a cold prefill" {
+    try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
     defer fx.deinit();
@@ -12520,6 +12521,7 @@ test "GLM hot cache restores the highest checkpoint under the match and continue
 }
 
 test "GLM hot cache trims an entry over the byte budget to a checkpoint and bills what it keeps" {
+    try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
     defer fx.deinit();
@@ -12558,6 +12560,7 @@ test "GLM hot cache trims an entry over the byte budget to a checkpoint and bill
 }
 
 test "GLM hot cache evicts by count, invalidates, and a miss leaves the request cold" {
+    try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
     defer fx.deinit();
@@ -12580,6 +12583,7 @@ test "GLM hot cache evicts by count, invalidates, and a miss leaves the request 
 }
 
 test "GLM hot cache gives entries back LRU first to admit a long prefill, sparing the one it restored from" {
+    try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
     defer fx.deinit();
@@ -12611,6 +12615,7 @@ test "GLM hot cache gives entries back LRU first to admit a long prefill, sparin
 }
 
 test "GLM hot cache shares across media keys only below the first block the request lacks" {
+    try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
     defer fx.deinit();
@@ -12628,6 +12633,7 @@ test "GLM hot cache shares across media keys only below the first block the requ
 }
 
 test "GLM hot cache checkout hands the MLA rows to the slot so its first append donates" {
+    try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
     defer fx.deinit();
@@ -12656,7 +12662,7 @@ test "GLM hot cache checkout hands the MLA rows to the slot so its first append 
 }
 
 test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continues like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -12710,7 +12716,7 @@ test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continue
 }
 
 test "GLM SSD tier: one fingerprint dir serves each latent width its own entry, and a lookup at another width misses" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var fx: GlmNet = undefined;
@@ -12748,7 +12754,7 @@ test "GLM SSD tier: one fingerprint dir serves each latent width its own entry, 
 }
 
 test "GLM entries carry the assistant window, and a restore hands back its rows below the checkpoint, RAM and SSD" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -12807,7 +12813,7 @@ fn glmSsdOnlyCache(io: std.Io, base: []const u8, fp: []const u8, max_bytes: u64,
 }
 
 test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart restores it like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -12871,7 +12877,7 @@ test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart 
 }
 
 test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps, and the longer tier restores" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13012,7 +13018,7 @@ fn expectGlmRestoreLikeCold(hc: *HotPrefixCache, net: *const glm5_forward.Model,
 }
 
 test "GLM SSD-only: a prefill keeps at most two checkpoint states in RAM, and a restore at a released one reads SSD like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13055,7 +13061,7 @@ test "GLM SSD-only: a prefill keeps at most two checkpoint states in RAM, and a 
 }
 
 test "GLM RAM tier beside an SSD tier judges the byte budget by the two checkpoints that stay" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -13090,7 +13096,7 @@ test "GLM RAM tier beside an SSD tier judges the byte budget by the two checkpoi
 }
 
 test "GLM SSD-only: past the checkpoint cap the loop-end checkpoint still reaches disk" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13126,7 +13132,7 @@ test "GLM SSD-only: past the checkpoint cap the loop-end checkpoint still reache
 }
 
 test "GLM SSD-only: a restore at an 8192 grid point reads SSD like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13224,7 +13230,7 @@ test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD
 }
 
 test "GLM SSD-only: a checkpoint whose write failed is not a restore point" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13259,7 +13265,7 @@ test "GLM SSD-only: a checkpoint whose write failed is not a restore point" {
 }
 
 test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkpoints, the SSD tier all of them" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13302,7 +13308,7 @@ test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkp
 }
 
 test "GLM SSD-only: two commits before one flush (two cancels culled in one pass) both reach disk" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13335,7 +13341,7 @@ test "GLM SSD-only: two commits before one flush (two cancels culled in one pass
 }
 
 test "GLM SSD-only without the writer: one flush finishes the whole entry before its source goes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13396,7 +13402,7 @@ test "a GLM commit hands the SSD tier every row through its newest checkpoint, p
 }
 
 test "GLM SSD-only: the disk budget evicts the least recently used conversation" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13495,7 +13501,7 @@ test "a GLM commit copies only the rows its destination tier keeps, chosen befor
 }
 
 test "a GLM commit whose retention snapshot fails still destroys every transferred checkpoint once" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
     for (cps, 0..) |*cp, i| {
         const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 2);
@@ -13524,7 +13530,7 @@ test "a GLM commit whose retention snapshot fails still destroys every transferr
 }
 
 test "a GLM replace commit that fails at any allocation leaks nothing and leaves the cache consistent" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const Stub = struct {
         fn cps(pos: usize) ![]SSMCheckpoint {
             const out = try testing.allocator.alloc(SSMCheckpoint, 1);
@@ -13567,7 +13573,7 @@ fn mediaTurnTokens(comptime n: usize) [n]u32 {
 }
 
 test "an image turn persists its WHOLE turn to the SSD tier, image rows included" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(3072);
@@ -13678,7 +13684,7 @@ test "truncatedMediaKey: a record claims exactly the media blocks its rows cover
 test "the prefill write-through persists an image turn, keyed by the media it has forwarded" {
     // Step 4: a media turn's chunks were skipped outright, so a long image conversation banked
     // nothing until its end-of-request commit. Each chunk record now claims the blocks inside it.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(2048);
@@ -13713,7 +13719,7 @@ test "SSD: a record holding the request's first image restores up to the new one
     // The disk half of the chain rule (`crossKeyBoundary`), which only the RAM tier could serve
     // before: an agent turn that appends a second screenshot to a conversation already holding
     // one reuses the persisted record through the FIRST image's rows, and stops at the new block.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(3072);
@@ -13763,7 +13769,7 @@ test "SSD: a record holding the request's first image restores up to the new one
 }
 
 test "an image turn's speculative snapshots ride its whole SSD record" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(1200);
@@ -13797,7 +13803,7 @@ test "an image turn's speculative snapshots ride its whole SSD record" {
 }
 
 test "an image turn on a ringed cache persists whole and restores at its ring point under its own key" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const window: u32 = 8;
@@ -13850,7 +13856,7 @@ test "an image turn on a ringed cache persists whole and restores at its ring po
 }
 
 test "an image turn on a QSA hybrid persists the indexer history its checkpoint needs" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13895,7 +13901,7 @@ test "an image turn on a QSA hybrid persists the indexer history its checkpoint 
 }
 
 test "GLM image turn persists its whole turn, and a foreign key restarts like a cold prefill below its item" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -13993,7 +13999,7 @@ fn dsv41LookupMedia(hc: *HotPrefixCache, net: *Dsv41Net, prompt: []const u32, vi
 }
 
 test "DeepSeek hot cache: an image prompt restores whole for its own images and only up to the image for others (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
     defer net.deinit();
@@ -14024,7 +14030,7 @@ test "DeepSeek hot cache: an image prompt restores whole for its own images and 
 }
 
 test "DeepSeek hot cache restores the highest checkpoint under the match and continues like a cold prefill (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
     defer net.deinit();
@@ -14090,7 +14096,7 @@ test "DeepSeek hot cache restores the highest checkpoint under the match and con
 }
 
 test "DeepSeek hot cache bills the held checkpoints in its residency and gives them back on eviction (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
     defer net.deinit();
@@ -14121,7 +14127,7 @@ test "DeepSeek hot cache bills the held checkpoints in its residency and gives t
 }
 
 test "DeepSeek hot cache over its byte budget keeps the entry with fewer checkpoints, billed exactly (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
     defer net.deinit();
@@ -14191,7 +14197,7 @@ fn dsv41LongPrompt(net: *const Dsv41Net, buf: []u32, shared_with: ?[]const u32, 
 }
 
 test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same bytes, and a restart restores it like a cold prefill (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -14261,7 +14267,7 @@ test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same byt
 }
 
 test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as they are taken and restore the same bytes (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -14349,7 +14355,7 @@ fn dsv41SplitCache(io: std.Io, base: []const u8, fp: []const u8, net: *const Dsv
 }
 
 test "DeepSeek SSD tier split: the layers the tier treats as rows are the arrays a capture holds as rows (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
     defer net.deinit();
@@ -14380,7 +14386,7 @@ test "DeepSeek SSD tier split: the layers the tier treats as rows are the arrays
 }
 
 test "DeepSeek SSD tier split: every restore point on the grid reads back the bytes a full capture holds, and a restore between two points prefills like cold (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -14454,7 +14460,7 @@ test "DeepSeek SSD tier split: every restore point on the grid reads back the by
 }
 
 test "DeepSeek SSD tier split: a write-through prefill stages each point with only the rows past the store, and reports the bytes it staged (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -14505,7 +14511,7 @@ test "DeepSeek SSD tier split: a write-through prefill stages each point with on
 }
 
 test "DeepSeek decode point: a restore point taken mid-decode serves the next turn from RAM and from an SSD file, like cold on the same grid (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -14614,7 +14620,7 @@ test "DeepSeek decode point: a restore point taken mid-decode serves the next tu
 }
 
 test "DeepSeek live rollback: the state rolled back to each kept point is a full capture of that point, byte for byte (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var net: Dsv41Net = undefined;
     try net.load();
@@ -14665,7 +14671,7 @@ test "DeepSeek live rollback: the state rolled back to each kept point is a full
 }
 
 test "DeepSeek live rollback: only a state still standing for the same history serves, at a point the prompt shares (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var net: Dsv41Net = undefined;
     try net.load();
@@ -14699,7 +14705,7 @@ test "DeepSeek live rollback: only a state still standing for the same history s
 }
 
 test "DeepSeek live rollback: a turn that diverges inside the last turn's generation rolls back to its deepest kept point and continues like an SSD restore (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -14797,7 +14803,7 @@ test "DeepSeek live rollback: a turn that diverges inside the last turn's genera
 }
 
 test "DeepSeek live rollback: another conversation, a replaced state or a point behind a stored one takes the normal path (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -14865,7 +14871,7 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
 // A cancelled request publishes its live record when the scheduler culls it, before the next exclusive request is
 // admitted (`cullDecodingWith`); its tokens are never paired with that request's state, whatever happens to it.
 test "DeepSeek live rollback: a cancelled request's record, published at the cull, never serves a request that continues it from the next one's state (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var net: Dsv41Net = undefined;
     try net.load();
@@ -14908,7 +14914,7 @@ test "DeepSeek live rollback: a cancelled request's record, published at the cul
 }
 
 test "DeepSeek SSD tier: the namespace names the layout, and another layout's entries are never read (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const dir = try dsv41_model.fixtureDir();
     var cfg = try model_mod.parseConfig(io, testing.allocator, dir);
@@ -14964,7 +14970,7 @@ test "DeepSeek SSD tier: the namespace names the layout, and another layout's en
 }
 
 test "DeepSeek with both tiers: the RAM entry serves the active session and, once it is gone, the SSD entry does (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -15010,7 +15016,7 @@ test "DeepSeek with both tiers: the RAM entry serves the active session and, onc
 }
 
 test "DeepSeek SSD tier under the engine's default KV scheme, which every slot cache carries: commit, restart, restore (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });

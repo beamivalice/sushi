@@ -2387,6 +2387,7 @@ fn appendAffine8(a: std.mem.Allocator, out: *std.ArrayList(TinyTensor), t: TinyT
 }
 
 test "kld: a resident mimo_v2 load takes the source trunk and its logits follow the routed experts" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2436,6 +2437,7 @@ test "kld: every served architecture prefills a prompt in its serving start widt
 }
 
 test "kld: a prompt longer than the chunk is forwarded chunk by chunk, a shorter one in one forward" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2479,6 +2481,7 @@ test "kld: a prompt longer than the chunk is forwarded chunk by chunk, a shorter
 }
 
 test "kld: an imatrix capture records every mimo_v2 o_proj input and the lm_head input the forward read" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2548,6 +2551,7 @@ fn bf16At(bytes: []const u8, i: usize) f32 {
 }
 
 test "kld: a hidden capture appends every block boundary of each prompt and leaves the teacher bit-identical" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2665,6 +2669,7 @@ test "kld: a hidden capture appends every block boundary of each prompt and leav
 }
 
 test "kld: a pack storing o_proj, lm_head and embed_tokens affine serves them packed beside its bf16 twin" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2762,6 +2767,7 @@ fn jsonNumber(value: std.json.Value) !f64 {
 }
 
 test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and compare scores kv8 against it" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2841,6 +2847,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
 }
 
 test "kld: GLM full-stream hidden capture retains chunked boundaries and native logits" {
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = testing.io;
     const glm = @import("glm5_forward.zig");

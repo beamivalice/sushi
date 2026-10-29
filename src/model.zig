@@ -6071,7 +6071,7 @@ test "a shard loads only when one of its tensors survives the filter" {
 }
 
 test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned bytes return" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const start = owned_bytes.load(.monotonic);
     const refused = refused_imports.load(.monotonic);
     const spans_start = ownedRegionCount();

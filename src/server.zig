@@ -11564,7 +11564,7 @@ test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP he
     // logprobs / grammar disable every spec mode, dflash included.
     r = requestSpecModes(true, true, true, true, plain, 3);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
-    var dummy: generate_mod.Constraint = undefined;
+    var dummy: generate_mod.Constraint = .{ .grammar = undefined, .token_bytes = undefined, .mask_buf = &.{} };
     r = requestSpecModes(true, true, true, true, .{ .constraint = &dummy }, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
     // Nothing loaded -> regular decode.
@@ -27622,7 +27622,7 @@ test "reasoning usage tokenization ignores SSE boundaries" {
 }
 
 test "dsv41 bills: a prefill holds its restore points beside the state with a RAM tier, and only the writer's in-flight bytes SSD-first (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try @import("dsv41_model.zig").fixtureDir();
     const t = std.testing;
     const io = std.Io.Threaded.global_single_threaded.io();

@@ -622,6 +622,7 @@ fn gpuExl3Bank(arrays: [9]@import("mlx.zig").mlx_array) @import("sushi_exl3").Ba
 
 test "EXL3 streaming GPU slab matches resident decode prefill hits misses and union" {
     const mlx = @import("mlx.zig");
+    try mlx.requireGpu();
     const exl3 = @import("sushi_exl3");
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;
@@ -743,6 +744,7 @@ test "EXL3 streaming GPU slab matches resident decode prefill hits misses and un
 
 test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank across hits misses and union" {
     const mlx = @import("mlx.zig");
+    try mlx.requireGpu();
     const exl3 = @import("sushi_exl3");
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;

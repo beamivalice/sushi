@@ -3719,6 +3719,7 @@ test "bf16 ngram store gathers rows across safetensors shards" {
 }
 
 test "expert stream slab operand preserves direct gather output" {
+    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{});
@@ -4279,6 +4280,7 @@ fn bf16Of(bits: u16) f32 {
 }
 
 test "expert stream bf16 kernels read the imported slab operand" {
+    try mlx.requireGpu();
     const t = std.testing;
     var fixture = try TinyEngine.open(2, 4);
     defer fixture.close();
@@ -4667,7 +4669,7 @@ test "expert stream MXFP4 header spans and fills preserve native bytes" {
 
 test "expert stream original MiMo source warms exact MXFP4 bytes" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const raw = try quant.writeTinyMxfp4IndividualCheckpoint(t.allocator, tmp.dir, 2, 32, 32);
@@ -4698,7 +4700,7 @@ test "expert stream original MiMo source warms exact MXFP4 bytes" {
 
 test "expert stream MXFP4 keeps nine component ids but imports and leases only six" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const raw = try writeTinyMxfp4Checkpoint(t.allocator, tmp.dir, 2, 32, 32);
@@ -5229,6 +5231,7 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
 }
 
 test "GLM BF16 stream imports split expert slabs and preserves bytes across cache and union" {
+    try mlx.requireGpu();
     const t = std.testing;
     const fixture = @import("glm_stream_fixture.zig");
     var tmp = t.tmpDir(.{});

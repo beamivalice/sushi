@@ -1484,7 +1484,7 @@ fn tinyTower() !Weights {
 }
 
 test "qwen vision: requantized tower holds affine 8-bit codes, frees the bf16 copies and tracks the bf16 tower" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var wq = try tinyTower();
     defer wq.deinit();
@@ -1533,7 +1533,7 @@ test "qwen vision: requantized tower holds affine 8-bit codes, frees the bf16 co
 }
 
 test "qwen vision: --vision-bf16 keeps bf16 matrices and matches the bf16 arm byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var wk = try tinyTower();
     defer wk.deinit();
@@ -1574,7 +1574,7 @@ fn gapLine(name: []const u8, g: common.Gap) void {
 }
 
 test "qwen vision: the requantized tower stays within bf16's drift of the bf16 tower on house.jpeg at 640 tokens" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const io = std.testing.io;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;

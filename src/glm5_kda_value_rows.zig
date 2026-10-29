@@ -149,6 +149,7 @@ fn exact(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
 }
 
 test "GLM KDA value-row candidate keeps native bits with nonzero state" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |beta_dtype| {
         for ([_]c_int{ 2, 3, 17, 128 }) |tokens| {
@@ -168,6 +169,7 @@ test "GLM KDA value-row candidate keeps native bits with nonzero state" {
 }
 
 test "GLM KDA value-row candidate keeps production state and irregular continuation" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| for ([_]c_int{ 512, 2048 }) |tokens| {
         var ops = Ops{ .s = s };

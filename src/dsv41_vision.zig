@@ -725,7 +725,7 @@ test "dsv41 vision: the processor's patches equal the reference's, bf16 for bf16
 }
 
 test "dsv41 vision: tower, aligner and span match the reference" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var fx = try loadFile((try fixtureFile(&buf, "fixture.safetensors")).ptr);
     defer fx.deinit();
@@ -859,7 +859,7 @@ fn tinyConfig() model.ModelConfig {
 }
 
 test "dsv41 vision: requantized tower holds affine 8-bit g128 codes, frees the bf16 copies and tracks the bf16 tower" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var wq = try tinyTower();
     defer wq.deinit();
     var wb = try tinyTower();
@@ -907,7 +907,7 @@ test "dsv41 vision: requantized tower holds affine 8-bit g128 codes, frees the b
 }
 
 test "dsv41 vision: --vision-bf16 keeps bf16 linears and matches the bf16 arm byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var wk = try tinyTower();
     defer wk.deinit();
     var wb = try tinyTower();
@@ -942,7 +942,7 @@ test "dsv41 vision: --vision-bf16 keeps bf16 linears and matches the bf16 arm by
 // ── The requantized tower against the bf16 tower on a real image (the pack's tower, SUSHI_MODELS_DIR) ──
 
 test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 tower on house.jpeg at 642 tokens" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tower_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tower_path = try fixtureFile(&tower_buf, "tower.safetensors");

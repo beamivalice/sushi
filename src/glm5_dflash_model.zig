@@ -589,18 +589,22 @@ fn expectArrayBits(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
 }
 
 test "GLM latent overlay three-node verifier commits independent serial ancestry" {
+    try mlx.requireGpu();
     try verifierCommitCase(0, 3);
 }
 
 test "GLM kv8 latent overlay verifier commits independent serial ancestry" {
+    try mlx.requireGpu();
     try verifierCommitCase(8, 3);
 }
 
 test "GLM kv6 latent overlay verifier commits independent serial ancestry" {
+    try mlx.requireGpu();
     try verifierCommitCase(6, 3);
 }
 
 test "GLM overlay verifier past the sparse threshold on a reserved request commits serial ancestry" {
+    try mlx.requireGpu();
     // 2050 committed rows: the tree's later rows select pools, and their paths complete pool 512.
     try verifierCommitCase(0, 2050);
     try verifierCommitCase(8, 2050);
@@ -673,18 +677,22 @@ fn verifierCommitCase(latent_bits: u8, prompt: usize) !void {
 }
 
 test "GLM consuming commit appends MLA rows in place with the copying commit's bits" {
+    try mlx.requireGpu();
     try consumingCommitCase(0, false);
 }
 
 test "GLM consuming commit appends kv8 MLA rows in place with the copying commit's bits" {
+    try mlx.requireGpu();
     try consumingCommitCase(8, false);
 }
 
 test "GLM consuming commit appends kv6 MLA rows in place with the copying commit's bits" {
+    try mlx.requireGpu();
     try consumingCommitCase(6, false);
 }
 
 test "GLM consuming commit appends in place while a command buffer still reads the old rows" {
+    try mlx.requireGpu();
     try consumingCommitCase(0, true);
     try consumingCommitCase(8, true);
     try consumingCommitCase(6, true);
@@ -790,6 +798,7 @@ fn randomizedFixture(weights: *@import("model.zig").Weights, s: mlx.mlx_stream) 
 }
 
 test "GLM grouped verification gives every request exactly what it gets alone" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);
@@ -844,6 +853,7 @@ test "GLM grouped verification gives every request exactly what it gets alone" {
 }
 
 test "GLM one verified row and its commit equal a serial decode step" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);
@@ -887,6 +897,7 @@ test "GLM one verified row and its commit equal a serial decode step" {
 }
 
 test "GLM plain rows of several requests advance each exactly as its serial decode" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);
@@ -949,6 +960,7 @@ fn distinctRowsFixture(weights: *@import("model.zig").Weights, s: mlx.mlx_stream
 }
 
 test "GLM verify decides biased tree rows as serial decode under the same bias, per request" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     const Bias = @import("logit_bias.zig").Bias;
@@ -1054,6 +1066,7 @@ test "GLM default verification schedule selects only three NAX rows" {
 }
 
 test "GLM a round cut to a shorter budget commits the uncut path's prefix, ends on the serial state of those tokens, and leaves the uncut path's next token pending" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);

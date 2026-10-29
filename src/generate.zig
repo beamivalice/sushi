@@ -14237,7 +14237,7 @@ fn proposalTestRead(allocator: std.mem.Allocator, arr: mlx.mlx_array, n: usize, 
 test "shortlistProposal: q is zero off the shortlist, sums to 1, and peaks on the best candidate" {
     // Bar: q is a normalized density over the 32 candidates only, and the
     // draft is one of them.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     const V: c_int = 4096;
@@ -14296,7 +14296,7 @@ test "shortlistProposalRows: every row's q belongs to that row's own shortlist" 
     // The axis-bug class: one batched filter + one categorical over [K, 32] must
     // stay row-independent. Three rows with DISJOINT candidate ids and different
     // logits, so a cross-row leak or a flattened reduction is visible.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     const V: c_int = 4096;
@@ -15690,7 +15690,7 @@ test "greedy tail: each depth's verify q is the density its draft came from" {
     // proposals: a shortlist density with the draft in its support, then a
     // one-hot at the argmax, so accept_q = [q0(d0), 1] and a reject at depth 1
     // can never re-draw d1.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     const V: c_int = 4096;
@@ -16122,7 +16122,7 @@ fn arraysBitEqual(x: mlx.mlx_array, y: mlx.mlx_array, s: mlx.mlx_stream) !bool {
 
 test "mimo ring marks leave the prefill's logits, cache and greedy tokens unchanged (MIMO_V2_MODEL)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
@@ -16171,7 +16171,7 @@ test "mimo ring marks leave the prefill's logits, cache and greedy tokens unchan
 
 test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first round included (MIMO_V2_MODEL)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = std.mem.span(model_dir);
@@ -16318,7 +16318,7 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     // reporting the MODEL's raw distribution — the suppressed id still ranks
     // where the model put it, because the field reports the model while the
     // mask is sampling policy.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -16363,7 +16363,7 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
 }
 
 test "computeLogprobs: bf16 logits report the exact log-probability" {
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const raw = [_]f32{ 5, 5, 5, -20 };
     const a32 = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 4 }, 2, .float32);
@@ -16384,7 +16384,7 @@ test "computeLogprobs: rank 1 is the argmax and ranks descend, under a tie-satur
     // everywhere — measured 0/5 positions where rank 1 was the chosen token on
     // a trivial prompt. The observable contract: with greedy sampling the
     // chosen token IS the argmax, so rank 1 must equal it.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -16415,7 +16415,7 @@ test "sampleToken: reported logprobs are the model's, not the client's temperatu
     // Same prompt, same chosen token, three temperatures used to report three
     // different logprobs (-0.2129 / -0.0607 / -2.1566 at 0 / 0.6 / 2.0). The
     // value belongs to the model, so it must not move with a sampling knob.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -16468,7 +16468,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     // happened to be first after a load. `qwen4BuildDraftRerank` is that
     // build as a standalone LOAD-time step: no Generator, no chain, no
     // request. Afterwards `canRerankDrafts()` is a pure read.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var fx = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
@@ -17080,7 +17080,7 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
 
 test "a warm prefill grows its restored layers to the reservation before the first chunk writes" {
     // seq <= C < R: left to the decode, the first step past C grows every layer inside one forward.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const KVC = transformer_mod.KVCache;
@@ -17421,7 +17421,7 @@ const MtpChainTestSlot = struct {
 
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const predraft = Generator.mtp_predraft_enabled;
     const bounds_before = depth_bounds.active;
     const planner = group_planner.enabled_override;
@@ -17568,7 +17568,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
 
 test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, every later depth a one-hot at its draft (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const predraft = Generator.mtp_predraft_enabled;
     const bounds_before = depth_bounds.active;
     const planner = group_planner.enabled_override;
@@ -17677,7 +17677,7 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
 
 test "acceptance failure restores every unfinished row after verify returns" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
@@ -17948,7 +17948,7 @@ const L11PlainReplay = struct {
 
 test "plain to prime resumes the same MTP history and next draft as legacy hidden capture" {
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));
@@ -18046,7 +18046,7 @@ test "cold grouped MTP head seeds the solo position and preserves valid origins"
 
 test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));
@@ -18260,6 +18260,7 @@ test "sampler ranks break ties by the lowest original index" {
 }
 
 test "applyTopP keeps the exact nucleus on a bf16 vocab row" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const v: usize = 248320;
@@ -18821,7 +18822,7 @@ test "the lookup gate prices the MTP chain at the width its rounds draft, not th
 }
 
 test "upstream bugfix: constrained logprobs describe the returned token before masking" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const s = mlx.gpuStream();
     // Each call is the final allowed token, so no model forward is needed.
@@ -19030,7 +19031,7 @@ test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {
 }
 
 test "GLM short prompts and odd chunk widths still checkpoint only on pool boundaries" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -19055,7 +19056,7 @@ test "GLM short prompts and odd chunk widths still checkpoint only on pool bound
 }
 
 test "an empty prompt is a typed error at the generator, never an index" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -19074,7 +19075,7 @@ fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {
 }
 
 test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefills its suffix exactly like cold" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -19162,7 +19163,7 @@ test "a GLM prefill without checkpoints chunks like any other prefill" {
 }
 
 test "the GLM prefill holds as many checkpoints as its schedule says, and ends on the newest" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -19206,7 +19207,7 @@ const GlmReleasing = struct {
 };
 
 test "a GLM prefill whose hook releases landed checkpoints holds at most two states and lists every restore point" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -19258,7 +19259,7 @@ const GlmStepDown = struct {
 };
 
 test "GLM checkpoints stay on the grid when a request steps its chunk down, and a restore there with the same widths matches cold" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -19501,7 +19502,7 @@ test "MTP depth bounds: a lookup draft is never wider than an explicit max" {
 }
 
 test "dsv41 generator: DSpark rounds through the Generator keep the budget, the stats and the first token (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -19682,7 +19683,7 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
 }
 
 test "dsv41 generator: with exact DSpark rounds greedy text is the same at every round-width mix (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -19746,7 +19747,7 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
 }
 
 test "dsv41 generator: a seeded sampled request verifies at one width whatever the cost model says (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -19824,7 +19825,7 @@ test "dsv41 generator: a seeded sampled request verifies at one width whatever t
 }
 
 test "dsv41 generator: a DSpark round ends right behind the id it is told to, at any verify width, with the state standing there (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -19892,7 +19893,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
 }
 
 test "dsv41 generator: the restore point behind a thought's closer, written mid-decode, restores from an SSD file to the live state's continuation bit for bit (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const prefix_cache = @import("prefix_cache.zig");
     const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -20053,7 +20054,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
 }
 
 test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -20091,7 +20092,7 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
 }
 
 test "dsv41 generator: serial decode serves sampling, penalties and logprobs, one request after another (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -20148,7 +20149,7 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
 }
 
 test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its closer and decodes the rest serially (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -20317,7 +20318,7 @@ fn thinkBoundRun(
 }
 
 fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv(env) orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -20411,7 +20412,7 @@ test "dspark eligibility: sampled, penalized and thinking-bound requests draft, 
 }
 
 test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restore at one prefills its suffix exactly like cold (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -20475,7 +20476,7 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
 }
 
 test "dsv41 generator: under a write-through every restore point the tier takes is gone before the next forward, and the tokens do not move (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const floor = @import("kv_disk_cache.zig").MIN_PERSIST_TOKENS;
     const dir = try dsv41_model.fixtureDir();
@@ -20550,7 +20551,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
 }
 
 test "dsv41 generator: a chunked prefill tells the model the tokens after each chunk, and the next pass takes their Engram rows (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -20599,7 +20600,7 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
 }
 
 test "dsv41 generator: after a DSpark request the slot cache marks its rows and snapshots like the scheduler's commit (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
@@ -20696,7 +20697,7 @@ const TinyDsparkNet = struct {
 };
 
 test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var st = try TinyDsparkNet.init(a, io);
@@ -20729,7 +20730,7 @@ test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV4
 }
 
 test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since only a prompt may carry one (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var st = try TinyDsparkNet.init(a, io);
@@ -20894,7 +20895,7 @@ fn expectAnswer(a: std.mem.Allocator, out: GrammarOutcome) !void {
 }
 
 test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens, behind a reasoning boundary and from the first token (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -21062,7 +21063,7 @@ fn commitTestRound(gen: *Generator, tokens: []const u32) !void {
 }
 
 test "GLM thought point: the round that carries the closer is cut to a pool boundary, its state is the newest checkpoint, and a restore from it is the live state" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -21131,7 +21132,7 @@ test "GLM thought point: the round that carries the closer is cut to a pool boun
 
 test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncut rounds do, and the state behind the closer is the newest checkpoint (MTP_TEST_MODEL)" {
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));

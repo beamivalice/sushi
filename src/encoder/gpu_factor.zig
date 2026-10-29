@@ -443,6 +443,7 @@ const Bank = struct {
 };
 
 test "gpu_factor: float32 matches the float64 factor on a bank of SPD Hessians" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 256;
     var bank = try Bank.init(t.allocator, 11, 3, n, 24, 0);
@@ -506,6 +507,7 @@ fn reconstructionResidual(allocator: std.mem.Allocator, h: []const f32, l: []con
 }
 
 test "gpu_factor: the float32 factor reconstructs H as (I+L) D (I+L)^T" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 512;
     var bank = try Bank.init(t.allocator, 12, 2, n, 24, 0.5);
@@ -541,6 +543,7 @@ fn bankWithBadPivot(allocator: std.mem.Allocator, scale: f32) !Bank {
 }
 
 test "gpu_factor: a failed float32 pivot is retried with the CPU path's bump and lands on its factor" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 64;
     var bank = try bankWithBadPivot(t.allocator, -0.1);
@@ -558,6 +561,7 @@ test "gpu_factor: a failed float32 pivot is retried with the CPU path's bump and
 }
 
 test "gpu_factor: past the GPU retries a matrix falls back to the float64 factor, byte for byte" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 64;
     var bank = try bankWithBadPivot(t.allocator, -0.1);
@@ -572,6 +576,7 @@ test "gpu_factor: past the GPU retries a matrix falls back to the float64 factor
 }
 
 test "gpu_factor: a Hessian no bump repairs fails like the float64 path" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 64;
     var bank = try bankWithBadPivot(t.allocator, -1000);
@@ -583,6 +588,7 @@ test "gpu_factor: a Hessian no bump repairs fails like the float64 path" {
 }
 
 test "gpu_factor: the chunk size does not change a byte" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 128;
     var bank = try Bank.init(t.allocator, 31, 5, n, 16, 0);
@@ -597,6 +603,7 @@ test "gpu_factor: the chunk size does not change a byte" {
 }
 
 test "gpu_factor: a pipeline limit below the launch size lowers the threadgroup and not a byte of the factor" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 128;
     const s = mlx.gpuStream();
@@ -627,6 +634,7 @@ test "gpu_factor: shapes and geometry are refused by name" {
 }
 
 test "gpu_factor: a Flash-Next sized bank stays within the float32 bound of the float64 factor" {
+    try mlx.requireGpu();
     const t = std.testing;
     const n = 2560;
     var bank = try Bank.init(t.allocator, 41, 2, n, 64, 0.5);

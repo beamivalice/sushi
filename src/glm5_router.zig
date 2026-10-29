@@ -242,6 +242,7 @@ pub fn routeBatch(s: mlx.mlx_stream, x: Arr, weight: Arr, bias: Arr, top: c_int,
 }
 
 test "GLM batched router preserves every serial index and score bit" {
+    try mlx.requireGpu();
     const Ops = @import("glm5_model.zig").Ops;
     const stream = mlx.gpuStream();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| {
@@ -285,6 +286,7 @@ test "GLM batched router preserves every serial index and score bit" {
 }
 
 test "GLM batched router stable ties and single-row contract" {
+    try mlx.requireGpu();
     const Ops = @import("glm5_model.zig").Ops;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();

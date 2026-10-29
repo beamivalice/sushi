@@ -1003,6 +1003,7 @@ fn replaceFixtureTensor(weights: *model.Weights, key: []const u8, value: Arr) !v
 }
 
 test "GLM complete forward advances and resets request state" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var weights = model.Weights.init(a);
     defer weights.deinit();
@@ -1097,6 +1098,7 @@ test "GLM MLA loader refuses invalid projection and norm geometry" {
 }
 
 test "GLM MLA stored affine kv rows preserve both projection orientations" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var weights = model.Weights.init(std.testing.allocator);
     defer weights.deinit();
@@ -1183,6 +1185,7 @@ fn expectRequestBits(a: *Request, b: *Request) !void {
 }
 
 test "GLM async decode preserves nonzero logits and every cache state" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = model.Weights.init(a);
@@ -1224,6 +1227,7 @@ test "GLM async decode preserves nonzero logits and every cache state" {
 }
 
 test "GLM async decode settles graphs" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = model.Weights.init(a);
@@ -1249,6 +1253,7 @@ test "GLM async decode settles graphs" {
 }
 
 test "GLM two-layer prefill schedule preserves every nonzero cache bit" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = model.Weights.init(a);
@@ -1280,6 +1285,7 @@ test "GLM two-layer prefill schedule preserves every nonzero cache bit" {
 }
 
 test "GLM post-layer capture and shared draft projections retain their contracts" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const stream = mlx.gpuStream();
     var weights = model.Weights.init(a);
@@ -1322,6 +1328,7 @@ test "GLM post-layer capture and shared draft projections retain their contracts
 }
 
 test "GLM fused router matches FP32 scores and selected order at production width" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const stream = mlx.gpuStream();
     var random = std.Random.DefaultPrng.init(58289);
@@ -1357,6 +1364,7 @@ test "GLM fused router matches FP32 scores and selected order at production widt
 }
 
 test "GLM HC prefill policy preserves nonzero small model logits and every cache bit" {
+    try mlx.requireGpu();
     const hc_prefill = @import("glm5_hc_prefill.zig");
     defer base.reference_numerics = false;
     var weights = model.Weights.init(std.testing.allocator);
@@ -1387,6 +1395,7 @@ test "GLM HC prefill policy preserves nonzero small model logits and every cache
 }
 
 test "GLM DFlash asynchronous schedules preserve nonzero tapes captures and committed state" {
+    try mlx.requireGpu();
     const verifier = @import("glm5_dflash_model.zig");
     var weights = model.Weights.init(std.testing.allocator);
     defer weights.deinit();
@@ -1470,6 +1479,7 @@ test "GLM DFlash asynchronous schedules preserve nonzero tapes captures and comm
 }
 
 test "GLM bounded prefill schedules preserve cache bits and reject invalid intervals" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = model.Weights.init(a);
@@ -1517,6 +1527,7 @@ test "GLM bounded prefill schedules preserve cache bits and reject invalid inter
 }
 
 test "GLM MLA A6 stored affine kv rows preserve both projection orientations" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var weights = model.Weights.init(std.testing.allocator);
     defer weights.deinit();
@@ -1544,6 +1555,7 @@ test "GLM MLA A6 stored affine kv rows preserve both projection orientations" {
 }
 
 test "GLM stream GPU native forward binds BF16 experts and releases request admission" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var weights = model.Weights.init(a);
     defer weights.deinit();
@@ -1598,6 +1610,7 @@ test "GLM stream GPU native forward binds BF16 experts and releases request admi
 }
 
 test "GLM kv8 and kv6 dense prefill expands the stored latent exactly as BF16 over the round-tripped rows" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const latent_store = @import("glm5_latent.zig");
     const attention = @import("glm5_attention.zig");
@@ -1643,6 +1656,7 @@ test "GLM request picks its latent storage before the first token and keeps the 
 }
 
 test "GLM frozen FFN prefix recomposes native layers and releases independent-window state" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var weights = model.Weights.init(a);
     defer weights.deinit();

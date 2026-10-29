@@ -393,6 +393,7 @@ fn mismatches(a: Arr, b: Arr) !usize {
 }
 
 test "GLM row-streaming projections equal serial qmv on every row, width and input magnitude" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const Shape = struct { n: c_int, k: c_int };
     resetDispatchCount();
@@ -441,6 +442,7 @@ test "GLM row-streaming projections equal serial qmv on every row, width and inp
 }
 
 test "GLM row-streaming projections decline what they were not proven on" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var ops = Ops{ .s = s };
     defer ops.deinit();

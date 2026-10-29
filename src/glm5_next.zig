@@ -212,6 +212,7 @@ fn hcSplitSinkhorn(mixes: []const f32, hc_scale: []const f32, hc_base: []const f
 }
 
 test "GLM mHC collapse and expand agree with scalar Sinkhorn" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const rows = 3;
     const dim = 32;
@@ -260,6 +261,7 @@ test "GLM mHC collapse and expand agree with scalar Sinkhorn" {
 }
 
 test "GLM EXL3 clamp supports 2 to 4 bpw in decode and prefill" {
+    try mlx.requireGpu();
     const api = @import("sushi_exl3");
     const fmt = api.format;
     const a = std.testing.allocator;
@@ -415,6 +417,7 @@ pub fn kda(in: KdaInputs, s: mlx.mlx_stream) !KdaResult {
 }
 
 test "GLM KDA per-channel decay preserves FP32 state and agrees with a scalar reference" {
+    try mlx.requireGpu();
     const t = std.testing;
     const B = 2;
     const T = 3;
@@ -512,6 +515,7 @@ fn timeSlice(a: mlx.mlx_array, pos: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
 }
 
 test "GLM KDA chunked and serial execution preserve identical outputs and FP32 states" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const shape = [_]c_int{ 2, 3, 2, 128 };
@@ -569,6 +573,7 @@ test "GLM KDA chunked and serial execution preserve identical outputs and FP32 s
 }
 
 test "GLM HC expansion rounds residual contraction before branch addition" {
+    try mlx.requireGpu();
     const stream = mlx.gpuStream();
     const residual_data = [_]f32{ 0.041748046875, 2.828125, 0.07666015625, -1.265625 };
     const coefficients = [_]f32{ 0.3550497889518738, 0.7479683756828308, 0.7366215586662292, 0.0021052767988294363 };

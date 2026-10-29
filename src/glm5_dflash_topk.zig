@@ -185,7 +185,7 @@ fn expectSame(s: mlx.mlx_stream, logits: Arr, k: u32) !void {
 }
 
 test "GLM draft top-k equals argpartition's last entries on ties, signed zeros, infinities and NaN" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const vocab = 154880;
     const rows = 2;

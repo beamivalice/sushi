@@ -471,7 +471,7 @@ test "qmv8 gs128 shared rows retain every serial qmv output bit" {
 }
 
 fn testSharedRows(gs: c_int) !void {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = std.testing.allocator;
     var random = std.Random.DefaultPrng.init(0x8a57a);
@@ -536,7 +536,7 @@ fn testSharedRows(gs: c_int) !void {
 }
 
 test "f32 gemv rows retain every serial MLX gemv output bit on a transposed weight" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = std.testing.allocator;
     var random = std.Random.DefaultPrng.init(0x7a11e);

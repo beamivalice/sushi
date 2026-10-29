@@ -1934,7 +1934,7 @@ test "expert io safetensors header preserves U8 element width and byte span" {
 
 test "expert io import aliases a page slab and sees the bytes written while filling" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const elements: usize = 512;
     const slab = try PageSlab.create(t.allocator, elements * 2);
     defer slab.destroy();
@@ -1971,7 +1971,7 @@ test "expert io import aliases a page slab and sees the bytes written while fill
 
 test "expert io import counts a fallback copy and still yields the bytes" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const elements: usize = 256;
     const slab = try PageSlab.create(t.allocator, 4096 + elements * 2);
     defer slab.destroy();
@@ -2007,7 +2007,7 @@ test "expert io import counts a fallback copy and still yields the bytes" {
 
 test "expert io import runs the payload release callback exactly once" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const elements: usize = 128;
     const slab = try PageSlab.create(t.allocator, elements * 2);
     defer slab.destroy();
@@ -2026,7 +2026,7 @@ test "expert io import runs the payload release callback exactly once" {
 
 test "expert io import active memory counts an aliased slab once" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const bytes: usize = 4 * 1024 * 1024;
     const slab = try PageSlab.create(t.allocator, bytes);
     defer slab.destroy();

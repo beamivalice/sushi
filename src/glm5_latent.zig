@@ -239,6 +239,7 @@ fn expectBits(a: Arr, b: Arr) !void {
 }
 
 test "GLM kv8 and kv6 latent kernel helper matches MLX affine dequantization bit for bit" {
+    try mlx.requireGpu();
     for ([_]u8{ 8, 6 }) |bits| try kernelHelperCase(bits);
 }
 
@@ -292,6 +293,7 @@ fn storedHash(q: kv_quant.QuantizedKV) !u64 {
 }
 
 test "GLM kv8 latent storage bytes are pinned" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const rows = try randomRows(64, 512, 9, s);
     defer _ = mlx.mlx_array_free(rows);

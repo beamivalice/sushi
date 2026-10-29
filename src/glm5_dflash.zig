@@ -328,6 +328,7 @@ fn fixtureLinear(ops: *Ops, input: c_int, output: c_int) !draft.DflashLinear {
 }
 
 test "GLM DFlash actual branch oracle and commit match independent serial states" {
+    try mlx.requireGpu();
     const allocator = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(allocator);
@@ -507,6 +508,7 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
 }
 
 test "GLM DFlash bounds proposal depth by budget and remaining context before verify" {
+    try mlx.requireGpu();
     const allocator = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(allocator);

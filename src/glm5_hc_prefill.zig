@@ -231,6 +231,7 @@ fn expectBits(a: Arr, b: Arr) !void {
 }
 
 test "GLM HC multi-output dot preserves original FP32 reduction bits" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const alloc = std.testing.allocator;
     var random = std.Random.DefaultPrng.init(71357);
@@ -267,6 +268,7 @@ test "GLM HC multi-output dot preserves original FP32 reduction bits" {
 }
 
 test "GLM HC multi-output keeps cancellation and magnitude behavior unchanged" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const alloc = std.testing.allocator;
     const width = 16384;
@@ -316,6 +318,7 @@ fn staged(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32) !Arr {
 }
 
 test "GLM HC multi-output RMS preserves staged bits and rejects small rows" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = std.testing.allocator;
     const weights = try a.alloc(f32, 24 * 16384);
@@ -358,6 +361,7 @@ test "GLM HC multi-output RMS preserves staged bits and rejects small rows" {
 }
 
 test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();

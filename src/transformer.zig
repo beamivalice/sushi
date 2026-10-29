@@ -9206,7 +9206,7 @@ test "a PLE rollback leaves no freed-but-non-null QSA handle behind" {
 }
 
 test "splitSpecCaptures: spec_ple_input row view is the rollback shape" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const N: c_int = 2;
@@ -9251,7 +9251,7 @@ test "splitSpecCaptures: spec_ple_input row view is the rollback shape" {
 }
 
 test "ssmRollbackFromCapture: padded verify_len keeps PLE tokens inside the real prefix" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var e: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
@@ -9345,7 +9345,7 @@ const SsmTickSlot = struct {
 };
 
 test "persistent group: N=4 stable ticks issue zero merge/split ops after the first" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9465,7 +9465,7 @@ fn ssmTickKinds(alloc: std.mem.Allocator, n_linear: usize) ![]SsmMergeKind {
 }
 
 test "persistent group: join leave cancel capture snapshot rollback restore match the old path" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9581,7 +9581,7 @@ test "persistent group: join leave cancel capture snapshot rollback restore matc
 }
 
 test "persistent group: merge/split op counts at N=2/4/8 after the first tick are zero" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9619,7 +9619,7 @@ test "persistent group: merge/split op counts at N=2/4/8 after the first tick ar
 }
 
 test "persistent group: drop a member does not free kinds the adopt still reads" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9679,7 +9679,7 @@ fn ssmTickBind(
 }
 
 test "persistent group: a solo tick after N=2 batched ticks matches the old path" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9721,7 +9721,7 @@ test "persistent group: a solo tick after N=2 batched ticks matches the old path
 }
 
 test "persistent group: PLE-only rollback patches the group window" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9764,7 +9764,7 @@ test "persistent group: PLE-only rollback patches the group window" {
 }
 
 test "persistent group: single-capture rollback does not write a stale sibling" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9813,7 +9813,7 @@ test "persistent group: single-capture rollback does not write a stale sibling" 
 }
 
 test "persistent group: snapshot is an owned row and survives departure" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9854,7 +9854,7 @@ test "persistent group: snapshot is an owned row and survives departure" {
 }
 
 test "persistent group: allocator failure before a replacement descriptor keeps the old group" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9882,7 +9882,7 @@ test "persistent group: allocator failure before a replacement descriptor keeps 
 }
 
 test "persistent group: cancel keeps the row until the next membership freeze" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9925,7 +9925,7 @@ test "persistent group: cancel keeps the row until the next membership freeze" {
 }
 
 test "persistent group: unload then slot-address reuse does not match the dead group" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -9975,7 +9975,7 @@ fn ssmTickResetLikePrefixCache(entries: []SSMCacheEntry, s: mlx.mlx_stream, seed
 }
 
 test "persistent group: resetSsmEntries departure is not resurrected from the merged buffer" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -10012,7 +10012,7 @@ test "persistent group: resetSsmEntries departure is not resurrected from the me
 }
 
 test "persistent group: export then a failed repack invalidates matches" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -10037,7 +10037,7 @@ test "persistent group: export then a failed repack invalidates matches" {
 }
 
 test "persistent group: drop failure exports survivor rows" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -10066,7 +10066,7 @@ test "persistent group: drop failure exports survivor rows" {
 }
 
 test "persistent group: a full-width group repacks when a member leaves" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -10089,7 +10089,7 @@ test "persistent group: a full-width group repacks when a member leaves" {
 }
 
 test "persistent group: forwardWith releases a bound member between batched ticks" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -10142,7 +10142,7 @@ test "persistent group: forwardWith releases a bound member between batched tick
 }
 
 test "persistent group: a row remap between bind and rollback matches the old path" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -10191,7 +10191,7 @@ test "persistent group: a row remap between bind and rollback matches the old pa
 }
 
 test "QSA key history advances by S not 1" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -10208,7 +10208,7 @@ test "QSA key history advances by S not 1" {
 }
 
 test "ssmEntryBytes bills each QSA capacity buffer once, never the view beside it" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const zeros = struct {
         fn make(shape: []const c_int, st: mlx.mlx_stream) mlx.mlx_array {
@@ -10245,7 +10245,7 @@ test "ssmEntryBytes bills each QSA capacity buffer once, never the view beside i
 }
 
 test "qsa raw-key ring is O(RING_ROWS) at N rows" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -10340,7 +10340,7 @@ pub fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.ml
 }
 
 test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identically to a full bank" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -10428,7 +10428,7 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
 }
 
 test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to keep" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -10540,7 +10540,7 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
 }
 
 test "qsa rollback: a rollback that reaches past the ring is a named error, not a negative slice" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const hd: c_int = 16;
@@ -10562,7 +10562,7 @@ test "qsa rollback: a rollback that reaches past the ring is a named error, not 
 }
 
 test "qwen4 MTP head: two explicit states with different origins and stash lengths round-trip" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     var xfm: Transformer = undefined;
     xfm.s = mlx.gpuStream();
@@ -10617,7 +10617,7 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
 test "qwen4 MTP head: two requests keep their own state through activate/release" {
     // Bar: after A appends and B activates, A's rows are not on the module; A re-activating
     // sees them again; releasing hands the module its own copy back.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     var xfm: Transformer = undefined;
     xfm.s = mlx.gpuStream();
@@ -10664,7 +10664,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "a streamed expert engine whose imatrix collector fails is deinit'd, not only freed" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -10690,7 +10690,7 @@ test "a streamed expert engine whose imatrix collector fails is deinit'd, not on
 
 test "qwen4 MTP head: a load that fails at any allocation frees what it took (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -10713,7 +10713,7 @@ test "qwen4 MTP head: a load that fails at any allocation frees what it took (QW
 
 test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at depths 1/2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const allocator = t.allocator;
     const s = mlx.gpuStream();
@@ -10854,7 +10854,7 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
 
 test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const allocator = t.allocator;
     const s = mlx.gpuStream();
@@ -11047,7 +11047,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
 }
 
 test "batched decode mask at verify width: row j of slot n sees its own causal prefix only" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     var xfm: Transformer = undefined;
     xfm.s = mlx.gpuStream();
@@ -11073,7 +11073,7 @@ test "batched decode mask at verify width: row j of slot n sees its own causal p
 }
 
 test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied history" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -11144,7 +11144,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
 }
 
 test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at the trunk's checkpoint" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -11245,7 +11245,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
 }
 
 test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept leftover is not resliced" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
@@ -11528,7 +11528,7 @@ pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array
 }
 
 test "materializedOwnedCopy: -0.0 survives bit-for-bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const data = [_]f32{ -0.0, 0.0, 1.5, -2.5 };
     const x = mlx.mlx_array_new_data(@ptrCast(&data), &[_]c_int{4}, 1, .float32);
@@ -27064,6 +27064,7 @@ fn qkvPackedParityCase(comptime cand_fn: anytype, rnd: std.Random, h_q: c_int, h
 }
 
 test "qkv matmul2d kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs the fp32 truth" {
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x3D2D_0192);
     const rnd = prng.random();
@@ -27074,6 +27075,7 @@ test "qkv matmul2d kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs 
 }
 
 test "qkv matmul2d kernel parity: many splits, and the narrower gqa 4 and 24/4 hd 256 shapes" {
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x3D2D_5117);
     const rnd = prng.random();
@@ -27089,7 +27091,7 @@ test "qkv matmul2d kernel parity: many splits, and the narrower gqa 4 and 24/4 h
 }
 
 test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs the fp32 truth, no matrix units" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const saved_nax = vqmm_nax_probe_override;
     vqmm_nax_probe_override = false;
     defer vqmm_nax_probe_override = saved_nax;
@@ -27489,7 +27491,7 @@ fn mimoSlidingRowsCase(config: KVQuantConfig, prefix: c_int, width: c_int, gain:
 }
 
 test "mimo sliding verify rows run in one dispatch, each row bit-identical to its own sdpa" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         for ([_]c_int{ 128, 129, 700 }) |prefix| {
             for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |width| {
@@ -27500,7 +27502,7 @@ test "mimo sliding verify rows run in one dispatch, each row bit-identical to it
 }
 
 test "mimo sliding verify rows keep the per-row path while a row still sees the whole history" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const q = try qkvIdentityArray(s, 64, 3, 192, 0.3, .bfloat16);
     defer _ = mlx.mlx_array_free(q);
@@ -27517,7 +27519,7 @@ test "mimo sliding verify rows keep the per-row path while a row still sees the 
 }
 
 test "mimo verify rows attend with each serial decode tick's arithmetic (dense, kv8, window edge, ring, packed global)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         for ([_]bool{ false, true }) |is_global| {
             for ([_]c_int{ 1, 60, 125, 126, 700 }) |prefix| {
@@ -27909,7 +27911,7 @@ test "KVCache: a donated restore appends in place, at the entry's own capacity" 
 test "KVCache.growToReservation: the attention reads the same rows, and the decode never grows" {
     // A warm restore holding the prompt (C = 1024) but not the reservation (R = 2048): grown
     // before the prefill, or left to the decode step past C, every view must be bit-identical.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |cfg| {
         for ([_]bool{ true, false }) |donate| {
@@ -28080,7 +28082,7 @@ fn kvAppendDummyAttn(cache: *KVCache, s: mlx.mlx_stream) !mlx.mlx_array {
 }
 
 fn batchedAppendMatchesSolo(bits: u8) !void {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const cfg = kv_quant.KVQuantConfig.affine(bits);
@@ -28133,7 +28135,7 @@ test "batched KV append: affine-6 N=2/4/8 matches N solo updates at production g
 }
 
 test "batched KV append: caches of different widths append per slot, byte-equal to solo updates" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const mixes = [_][3]u8{ .{ 6, 8, 0 }, .{ 8, 6, 0 }, .{ 8, 8, 6 }, .{ 6, 6, 4 } };
@@ -28167,7 +28169,7 @@ test "batched KV append: caches of different widths append per slot, byte-equal 
 }
 
 test "batched KV append: two restored siblings append and truncate independently; the snapshot stays byte-identical" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const cfg = kv_quant.KVQuantConfig.affine(8);
@@ -28222,7 +28224,7 @@ test "batched KV append: two restored siblings append and truncate independently
 }
 
 fn batchedAppendOpCount(bits: u8) !void {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const cfg = kv_quant.KVQuantConfig.affine(bits);
@@ -28274,7 +28276,7 @@ test "batched KV append: per-layer op count is quantize-once plus per-slot write
 }
 
 test "batched KV append: dense and affine-4 stay on the per-slot path" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const schemes = [_]kv_quant.KVQuantConfig{
@@ -28556,7 +28558,7 @@ test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
 
 // Bar: after the conv, freeing the chunk input leaves only the tail resident.
 test "conv1dWithCache tail drops the prefill chunk parent" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const batch: c_int = 1;
     const seq: c_int = 4096;
@@ -28570,7 +28572,7 @@ test "conv1dWithCache tail drops the prefill chunk parent" {
 
 // Bar: same as above with a strided batch-2 parent.
 test "conv1dWithCache tail drops a batch-2 strided prefill parent" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const batch: c_int = 2;
     const seq: c_int = 4096;
@@ -28650,7 +28652,7 @@ fn conv1dExpectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !
 
 // Bar: output and stored state byte-equal with the copy on and off.
 test "conv1dWithCache compact conv_state is bit-identical on and off" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const kernel: c_int = 4;
     const cdim: c_int = 32;
@@ -28682,7 +28684,7 @@ test "conv1dWithCache compact conv_state is bit-identical on and off" {
 
 // Bar: below the chunk bar the tail stays a view (no copy kernel per decode step).
 test "conv1dWithCache decode width does not copy the tail" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const saved = compact_conv_state_override;
@@ -28706,7 +28708,7 @@ test "conv1dWithCache decode width does not copy the tail" {
 
 // Bar: the compacted state prepended to the next chunk gives byte-equal results.
 test "conv1dWithCache compact conv_state is bit-identical across two chunks" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const off = try conv1dTwoChunk(1, 64, 64, 32, 4, false, s);
     defer {
@@ -29015,7 +29017,7 @@ test "attachQsaHistoryToLatest is one copy; applyQsaHistoryAt slices to pos" {
 
 test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer — zero allocation, sliced to pos, bytes equal to the copy arm" {
     // The handoff hands the dying slot's buffer to the entry: same rows, same bytes, no allocation.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var t: Transformer = undefined;
     t.s = s;
@@ -29068,7 +29070,7 @@ test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer
 
 test "handoffQsaHistoryToLatest materializes when the buffer's slack past the snap exceeds QSA_HANDOFF_MAX_SLACK_ROWS" {
     // Past the slack bar the handoff pays the copy.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var t: Transformer = undefined;
     t.s = s;
@@ -29099,7 +29101,7 @@ test "handoffQsaHistoryToLatest materializes when the buffer's slack past the sn
 test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the trim's slice is a real copy" {
     // Restore: the slot appends into qsa_pooled_buf via seedCapBuf, so a view of the entry is not written through.
     // Trim: the inherit slice must own its rows; a view would pin the donor's full bank.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const n: c_int = 32;
     const aux_shape = [_]c_int{ 1, n, 8 };
@@ -29497,6 +29499,7 @@ fn routerRefRow(keys: []const f64, k: usize, out_ids: []usize) void {
 }
 
 test "fused MoE router reproduces the softmax routing chain's top-K and beats its weights" {
+    try mlx.requireGpu();
     // Selection is discrete: a different expert set is a different model, so
     // the ids are asserted EXACTLY against an fp64 host reference. The weights
     // follow the kernel rule — no worse than the fp64 reference, never
@@ -29603,6 +29606,7 @@ test "fused MoE router reproduces the softmax routing chain's top-K and beats it
 }
 
 test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512/8/4/8 geometry" {
+    try mlx.requireGpu();
     // Bit equality with the composed chain is the bar, not "close enough": the
     // first live A/B of the plain fused router computed a cleaner softmax and
     // diverged at token ~80 (the INT4 near-tie class,
@@ -29735,6 +29739,7 @@ test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512
 }
 
 test "fused MoE router reproduces the sigmoid+bias routing chain" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5EED2026);
@@ -29835,6 +29840,7 @@ test "fused MoE router reproduces the sigmoid+bias routing chain" {
 }
 
 test "fused MoE router reproduces the mimo_v2 sigmoid+bias routing chain in f32" {
+    try mlx.requireGpu();
     // The pairing mimo_v2 SHIPS: ungrouped `.sigmoid_bias` with an f32 output and
     // f32 router inputs (the router is widened once at load). The arm above
     // proves the same kernel at a bf16 output, which absorbs a last-ulp
@@ -29934,6 +29940,7 @@ test "fused MoE router reproduces the mimo_v2 sigmoid+bias routing chain in f32"
 }
 
 test "fused MoE router breaks ties on the lowest expert id at every width and mode" {
+    try mlx.requireGpu();
     // Duplicated keys put ties inside the top-K, across lanes and within one
     // lane's strided slice; the pick must stay lowest-index-first.
     const s = mlx.gpuStream();
@@ -29983,6 +29990,7 @@ test "fused MoE router breaks ties on the lowest expert id at every width and mo
 }
 
 test "fused softmax router folds the shared-expert gate dot bit-identically to the matmul it replaces" {
+    try mlx.requireGpu();
     // The dot rides the router's idle simdgroups in MLX's own `dot_product` order; the cancelling
     // +-2^16 terms make any other summation order change the bf16 result.
     const s = mlx.gpuStream();
@@ -30099,6 +30107,7 @@ test "the router declines the gate fold when it has no idle simdgroups or the do
 }
 
 test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
+    try mlx.requireGpu();
     // The reason this kernel exists instead of extending mlx_compile to the
     // silu arm: the compiled fusion is NOT bit-identical (greedy diverged at
     // token ~55 on a 40-layer MoE). Assert what the compiled path could not.
@@ -30164,6 +30173,7 @@ test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
 }
 
 test "fused SwiGLU config cache keys on the SHAPE, not the element count (restore crash)" {
+    try mlx.requireGpu();
     // Live 2026-07-29: a 16-token hot-cache-restore suffix prefill on a MoE
     // killed the server with "[matmul] (1,16,512) vs (8192,2048)". A MoE
     // layer's SwiGLU at 16 tokens is (1,16,512) = 8192 elements — the SAME
@@ -30198,6 +30208,7 @@ test "fused SwiGLU config cache keys on the SHAPE, not the element count (restor
 }
 
 test "fused residual+RMSNorm is bit-identical to mlx_add + mlx_fast_rms_norm" {
+    try mlx.requireGpu();
     // Same bar as the other fusions, and the same reason it is reachable: the
     // kernel keeps MLX's launch geometry, so the reduction is the same TREE and
     // not merely the same sum. Widths chosen to hit the aligned path (2048,
@@ -30376,6 +30387,7 @@ test "fused hyper-connection read keeps one config set per row count, inject and
 }
 
 test "fused hyper-connection read matches the op chain per element" {
+    try mlx.requireGpu();
     // Reference = the unfused hcRead chain spelled in raw ops (grouped rms
     // norm with a ones weight, ×w, down qmm, silu, up qmm, sigmoid·n4 mean;
     // inject matvec, 2·sigmoid). Accumulation order differs, so the bar is
@@ -30667,6 +30679,7 @@ test "fused hyper-connection read matches the op chain per element" {
 }
 
 test "fused gate+up+SwiGLU expert kernel is bit-identical to the split gatherQmv path" {
+    try mlx.requireGpu();
     // The split path is `gatherQmv(gate)` + `gatherQmv(up)` + `fusedSwiGLU`.
     // Fusing them may not change a single rounding: each accumulator is still
     // rounded to T before the activation, and the activation is still the
@@ -30813,6 +30826,7 @@ test "moe decode dispatch: rows vs sorted vs gatherQmv" {
 }
 
 test "gatherQmvGateUpRows accepts N=8 K=10" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     moe_rows_fused_override = true;
     defer moe_rows_fused_override = null;
@@ -30858,6 +30872,7 @@ test "gatherQmvGateUpRows accepts N=8 K=10" {
 }
 
 test "moe rows fused: N=1 is byte-identical to the single-row kernel" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x51F0);
     const rnd = prng.random();
@@ -30921,6 +30936,7 @@ test "moe rows fused: N=1 is byte-identical to the single-row kernel" {
 }
 
 test "moe rows fused: N=8 K=10 gate/up and down/reduce match N solo calls" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xC0DE);
     const rnd = prng.random();
@@ -30942,7 +30958,7 @@ test "moe rows fused: N=8 K=10 gate/up and down/reduce match N solo calls" {
 }
 
 test "moe verify rows retain serial expert arithmetic through grouped widths" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x165e71a1);
     const saved_rows = moe_rows_fused_override;
@@ -31011,6 +31027,7 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
 }
 
 test "fused SwiGLU matches the chain on EVERY finite bf16 gate value" {
+    try mlx.requireGpu();
     // Random sampling said bit-identical while the live model diverged at
     // token ~55, so the sigmoid is swept exhaustively instead: all 65536 bf16
     // bit patterns, which is the whole domain of the activation.
@@ -31341,7 +31358,7 @@ test "verify vocabulary projections preserve solo logits across request widths (
 }
 
 test "qmatmulBits uses canonical arithmetic for plain batched projections" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const saved_kernel = sushi_qmv_rows_kernel;
     sushi_qmv_rows_kernel = null;
@@ -31406,7 +31423,7 @@ test "qmatmulBits uses canonical arithmetic for plain batched projections" {
 }
 
 test "sushi_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x51500A01);
     const rnd = prng.random();
@@ -31491,6 +31508,7 @@ test "moeRouterThreadGroup keeps a full simdgroup and caps at 256" {
 }
 
 test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefill shapes)" {
+    try mlx.requireGpu();
     // Centerpiece TDD gate for fully-dense bf16 MoE. Proves the dense gather_mm
     // path (gatherExpertMm with null scales + generalized transposeBf16Weight)
     // computes the same per-expert matmul as (a) an independent fp32 ground truth
@@ -31819,6 +31837,7 @@ fn gqmvMaxAbsErr(a: mlx.mlx_array, ref: mlx.mlx_array, str: mlx.mlx_stream) !f32
 }
 
 test "gatherQmv is no worse than stock gather_qmm vs fp32 dequant ground truth" {
+    try mlx.requireGpu();
     // Per the kernel-testing rule: assert NO-WORSE-THAN-REFERENCE against fp32
     // dequant ground truth, never kernel-vs-kernel agreement (both round to
     // bf16 in different orders, so exact agreement is not a real invariant).
@@ -32266,7 +32285,7 @@ test "ropeAtPositions YaRN: cos/sin carry mscale on the rotated slice" {
     // Power-of-two mscale so the rotated slice is an exact doubling of the
     // mscale-1.0 arm (same yarn_inv_freq, yarnActive stays on). The pass-through
     // tail must not move: those dims never enter the rotation.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var c = ModelConfig{};
@@ -32334,7 +32353,7 @@ test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
     // slice only. NOT applyMrope — that path already carries mscale via
     // fillCosSin. A 256-wide yarnScaleQK table would silently scale the
     // pass-through tail (or crash on a shape mismatch).
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
@@ -32532,12 +32551,12 @@ fn swaRingWalk(kv_cfg: KVQuantConfig) !void {
 }
 
 test "a ringed sliding layer serves the same view as a full-length cache" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     try swaRingWalk(KVQuantConfig.dense);
 }
 
 test "a ringed sliding layer serves the same view under kv-quant" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     try swaRingWalk(.{ .scheme = .affine, .bits = 8, .group_size = 32 });
     try swaRingWalk(.{ .scheme = .affine, .bits = 4, .group_size = 32 });
 }
@@ -32595,7 +32614,7 @@ fn swaRingChunkResidue(kv_cfg: KVQuantConfig, layers: u32, chunk: c_int) !usize 
 test "a ringed layer keeps only its ring once the chunk that compacted it is evaluated" {
     // The ring bill (`ModelConfig.swaRingBytes`) holds `ringCap` rows per sliding layer across
     // chunks; the pre-compaction buffer is billed only for the width of the forward.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const layers: u32 = 6;
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |cfg| {
         const residue = try swaRingChunkResidue(cfg, layers, 2048);
@@ -32609,7 +32628,7 @@ test "a ringed layer keeps only its ring once the chunk that compacted it is eva
 }
 
 test "a ring rewinds inside its retained window and declines below it" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     const window: u32 = 8;
@@ -32645,7 +32664,7 @@ test "a ring rewinds inside its retained window and declines below it" {
 }
 
 test "KVCache resident bytes are the buffers it owns, never a restored donor's" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
@@ -32664,7 +32683,7 @@ test "KVCache resident bytes are the buffers it owns, never a restored donor's" 
 }
 
 test "a ringed layer's resident bytes are its ring, not the history it has seen" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     var c = try KVCache.init(testing.allocator, 1);
@@ -32746,7 +32765,7 @@ fn ringCheckpointRestore(kv_cfg: KVQuantConfig) !void {
 }
 
 test "a trim below the ring takes the ringed rows from a checkpoint at the trim point" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     const window: u32 = 8;
@@ -32782,13 +32801,13 @@ test "a trim below the ring takes the ringed rows from a checkpoint at the trim 
 }
 
 test "a ring checkpoint serves the clamp the ring's end state declines" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     try ringCheckpointRestore(KVQuantConfig.dense);
     try ringCheckpointRestore(.{ .scheme = .affine, .bits = 8, .group_size = 32 });
 }
 
 test "a ring restored from a checkpoint below its position still checkpoints a short tail's end" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     const window: u32 = 8;
@@ -32905,7 +32924,7 @@ fn ringMarksCapture(kv_cfg: KVQuantConfig) !void {
 }
 
 test "a ring mark holds the checkpoint at its position, taken as the writes pass it, and changes no view" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     try ringMarksCapture(KVQuantConfig.dense);
     try ringMarksCapture(.{ .scheme = .affine, .bits = 8, .group_size = 32 });
 }
@@ -33061,6 +33080,7 @@ fn gdnTestRunSerial(comptime vec: bool, q: mlx.mlx_array, k: mlx.mlx_array, v: m
 }
 
 test "GDN verify recurrence matches serial state rounding at every position" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const B: c_int = 1;
     const T: c_int = 4;
@@ -33171,6 +33191,7 @@ test "GDN verify recurrence matches serial state rounding at every position" {
 }
 
 test "GDN vectorized-gate kernel: a per-channel gate that is UNIFORM per head equals the scalar kernel" {
+    try mlx.requireGpu();
     // KDA gates each state element by its own key channel. The invariant that
     // pins the indexing: broadcast a per-head decay across that head's Dk
     // channels and the `_vec` kernel must reproduce the scalar kernel BIT FOR
@@ -33638,6 +33659,7 @@ test "GDN pipelined route: NAX Qwen default, eligibility" {
 }
 
 test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     // T deliberately hits non-multiples of every supported TB (16/32/48);
     // Hk<Hv exercises GQA head mapping; Dv 32..128 exercises 1..4 DB blocks.
@@ -33664,10 +33686,12 @@ test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground t
 }
 
 test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full run)" {
+    try mlx.requireGpu();
     try gdnChunkContinuity(.blocked, 48, .bfloat16);
 }
 
 test "GDN pipelined kernel: chunk-boundary state continuity (split run == full run)" {
+    try mlx.requireGpu();
     for ([_]c_int{ 48, 49 }) |split| {
         for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |state_dtype| {
             try gdnChunkContinuity(.pipelined, split, state_dtype);
@@ -34101,6 +34125,7 @@ test "verifyQmmParityVerdict: reduction-order noise passes, a gross or systemati
 }
 
 test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
+    try mlx.requireGpu();
     // The split-K and msg tiles were 4-bit specializations by construction, so
     // every non-4-bit pack fell through to stock on the whole M1-M4 line — the
     // Qwen3.8-27B 6-bit pack (95.0% top-1 against bf16 vs the 4-bit pack's
@@ -34231,6 +34256,7 @@ test "mixedPlainShapeEnabled: adoption is what was MEASURED, per width and per s
 }
 
 test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit affine)" {
+    try mlx.requireGpu();
     // The spec-verify fast path: stock MLX qmm is tuned for M=1 (qmv) and
     // large M (steel); the 2..8-row verify shapes fall in a dead zone.
     // Port of MTPLX's split-K verify kernel family (verify_kernels.py,
@@ -36274,6 +36300,7 @@ fn attn256Cosine(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 }
 
 test "fusedSdpaPrefill: causal parity vs composed SDPA (GQA, ragged shapes, chunk offset)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -36372,6 +36399,7 @@ fn attnPd192CausalCase(seed: u64, hq: c_int, hkv: c_int, q_len: c_int, kv_len: c
 }
 
 test "fusedSdpaPrefill: qk 192 / v 128 causal parity vs fp32 truth (MiMo global geometry)" {
+    try mlx.requireGpu();
     fused256_override = true;
     defer fused256_override = null;
     for (0..ATTN_PD_PARITY_SEEDS) |i| {
@@ -36385,6 +36413,7 @@ test "fusedSdpaPrefill: qk 192 / v 128 causal parity vs fp32 truth (MiMo global 
 }
 
 test "fusedSdpaPrefill: qk 192 / v 128 kv chunking carries the narrower value width" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -36485,6 +36514,7 @@ const TestQuantView = struct {
 };
 
 test "fusedSdpaPrefillKv: a quantized cache is read per dispatch, never rebuilt whole" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -36533,6 +36563,7 @@ test "fusedSdpaPrefillKv: a quantized cache is read per dispatch, never rebuilt 
 }
 
 test "fusedSdpaPrefillKv: a kv6 cache is read per dispatch and matches the dense arm over its rebuild" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -36562,6 +36593,7 @@ test "fusedSdpaPrefillKv: a kv6 cache is read per dispatch and matches the dense
 }
 
 test "fusedSdpaPrefillKv: an unquantized cache view takes the dense arm unchanged" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -36850,14 +36882,14 @@ fn swaSinkParityWalk(kv_cfg: KVQuantConfig, seed: u64, schedule: []const c_int) 
 const SWA_SINK_SCHEDULE = [_]c_int{ 100, 512, 512, 16, 2048, 37 };
 
 test "sliding band + sink prefill matches fp64 truth over a ringed dense cache" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     fused256_override = true;
     defer fused256_override = null;
     for (0..ATTN_PD_PARITY_SEEDS) |i| try swaSinkParityWalk(KVQuantConfig.dense, 0x5a1c + i, &SWA_SINK_SCHEDULE);
 }
 
 test "sliding band + sink prefill matches fp64 truth over a ringed kv8 cache" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     fused256_override = true;
     defer fused256_override = null;
     for (0..ATTN_PD_PARITY_SEEDS) |i| try swaSinkParityWalk(KVQuantConfig.affine(8), 0x5a2c + i, &SWA_SINK_SCHEDULE);
@@ -36961,7 +36993,7 @@ fn attnPdGlobalCase(seed: u64, hq: c_int, hkv: c_int, q_len: c_int, kv_len: c_in
 }
 
 test "sushi_attn_pd every arm: qk 192 / v 128 causal vs fp64 truth (ragged, carries, peaked, kv8)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     fused256_override = true;
     defer fused256_override = null;
     for (0..ATTN_PD_PARITY_SEEDS) |i| {
@@ -36979,7 +37011,7 @@ test "sushi_attn_pd every arm: qk 192 / v 128 causal vs fp64 truth (ragged, carr
 }
 
 test "sushi_attn_pd every arm: a chunked dispatch chain is bit-identical to one dispatch" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -37550,7 +37582,7 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
 }
 
 test "the sliding arm engages exactly where slidingPrefillFused says it does" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const cfg = swaSinkTestConfig();
     fused256_override = true;
@@ -37661,6 +37693,7 @@ fn attn256QsaMask(rnd: std.Random, qL: c_int, kL: c_int) !mlx.mlx_array {
 }
 
 test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ragged tiles, kv chunking)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -37714,6 +37747,7 @@ fn attn256Contiguous(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
 }
 
 test "fusedSdpa256Masked: an unaligned last-axis slice declines and the fallback reads exactly; aligned is bit-identical to a contiguous copy" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -37763,6 +37797,7 @@ test "fusedSdpa256Masked: an unaligned last-axis slice declines and the fallback
 }
 
 test "gatherQsa256: an unaligned last-axis slice declines and the fallback reads exactly; aligned is bit-identical to a contiguous copy" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     qsa_gather_override = true;
     defer qsa_gather_override = null;
@@ -38154,6 +38189,7 @@ test "qsaNaxEligible: kernel predicate names gqa 12, hd 256, q_len>=16, bf16, NA
 }
 
 test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     qsa_nax_override = true;
@@ -38194,6 +38230,7 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
 }
 
 test "gatherQsa256 NAX: max error vs f32 gather-softmax is no worse than stock" {
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     qsa_nax_override = true;
@@ -38223,6 +38260,7 @@ test "gatherQsa256 NAX: max error vs f32 gather-softmax is no worse than stock" 
 }
 
 test "gatherQsa256 NAX: online softmax rescale across 32-key tiles vs f32 gather-softmax" {
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     qsa_nax_override = true;
@@ -38253,6 +38291,7 @@ test "gatherQsa256 NAX: online softmax rescale across 32-key tiles vs f32 gather
 }
 
 test "gatherQsa256 NAX: top-512 selection and partial causal tail vs f32 gather-softmax" {
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable() or !qsaNaxOsOk()) return error.SkipZigTest;
     const saved_nax = qsa_nax_override;
     qsa_nax_override = true;
@@ -38281,7 +38320,7 @@ test "gatherQsa256 NAX: top-512 selection and partial causal tail vs f32 gather-
 }
 
 test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the stock arm" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     qsa_gather_override = true;
@@ -38322,7 +38361,7 @@ test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the 
 }
 
 test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -38369,7 +38408,7 @@ test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
 }
 
 test "gatherQsa256 NAX: a packed probe mismatch at 8 or at 6 bits latches the stock gather" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     const saved_nax = qsa_nax_override;
@@ -38392,7 +38431,7 @@ test "gatherQsa256 NAX: a packed probe mismatch at 8 or at 6 bits latches the st
 }
 
 test "gatherQsa256 NAX: probe passes on this machine" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     const saved_nax = qsa_nax_override;
@@ -38427,7 +38466,7 @@ test "gatherQsa256 NAX: latch is consulted before NAX kernel construction" {
     try std.testing.expect(qsaNaxProbeFailed());
     try std.testing.expect(!qsaNaxEnabled());
     const builds = qsaNaxKernelBuilds();
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     qsa_gather_override = true;
     defer qsa_gather_override = null;
@@ -38474,6 +38513,7 @@ test "gatherQsa256: declines a non-GPU stream before kernel selection" {
 }
 
 test "gatherQsa256: stock then NAX each fire one engaged line" {
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -38527,6 +38567,7 @@ test "naxArchSupportedFrom: desktop gen>=17, phone gen>=18" {
 }
 
 test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask (gqa 12, sentinel rows)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     qsa_gather_override = true;
     defer qsa_gather_override = null;
@@ -38731,7 +38772,7 @@ test "qsa decode gather: subset SDPA matches masked full SDPA at decode width" {
 }
 
 test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slot solos" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     qsa_decode_gather_override = true;
@@ -38796,7 +38837,7 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
 }
 
 test "qsa batched gather mixed group: a mask-only slot matches its solo masked SDPA" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     qsa_decode_gather_override = true;
@@ -38856,7 +38897,7 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
 }
 
 test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 matches per-slot solos" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     qsa_verify_gather_override = true;
@@ -38923,7 +38964,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
 }
 
 test "qsaBatchedAttn: the kill switch refuses the gather arm" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
     const xfm: *Transformer = @ptrCast(&xfm_bytes);
     xfm.allocator = std.testing.allocator;
@@ -38945,7 +38986,7 @@ test "qsaBatchedAttn: the kill switch refuses the gather arm" {
 }
 
 test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const prev_d = qsa_decode_gather_override;
@@ -39496,7 +39537,7 @@ fn qsaAttnCacheFixture(
 test "qsa sparse attn: dense and affine strided caches retain the reference error bar" {
     // The bar is two bf16 ulps at the reference's own scale (an ulp is relative, so a constant
     // bar only works at one output scale), plus cosine against a wrong key set.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -39590,7 +39631,7 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
 }
 
 test "qsa sparse attn: packed caches serve widths past 15 within the error bar of today's dense-rebuild route" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -39679,7 +39720,7 @@ fn attn256ReferenceRows(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, sc
 }
 
 test "qsa packed gather: prefill widths read the packed cache as precisely as the gather over its dense rebuild" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -39747,7 +39788,7 @@ test "qsa packed gather: prefill widths read the packed cache as precisely as th
 test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 64)" {
     // Splitting a row's key range and recombining the per-split online-softmax states must be
     // exact: a wrong merge would move the answer with NSPLIT. NSPLIT = 1 is the control.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -39855,7 +39896,7 @@ test "qsa dispatch: dense and quantized decode and verify share the same row bod
 test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q heads equals 12 serving one each" {
     // The kernel dequantizes each K/V element once per threadgroup and feeds it to all `gqa`
     // rows: gqa 12 (tile reuse) vs gqa 1 (12 identical kv heads) must agree exactly.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -39909,7 +39950,7 @@ test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q 
 }
 
 test "qsa sparse attn: loader simdgroups leave every output bit unchanged" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -40015,7 +40056,7 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
 
 test "qsa sparse attn: one fused dispatch replaces the arm's op chain (>= 100 ops over 12 layers)" {
     // A dispatch-count bar: twelve calls stand in for qwen4's twelve full-attention layers.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -40066,7 +40107,7 @@ test "qsa sparse attn: one fused dispatch replaces the arm's op chain (>= 100 op
 }
 
 test "qsa sparse attn: the width gate, the kill switch and the quant preconditions all decline cleanly" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -40162,7 +40203,7 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
 test "qsa sparse attn: the config key is kv- and kb-INDEPENDENT (one build per width)" {
     // Nothing in the config reads kv or kb (the kernel takes them at runtime), and kv grows
     // every decode round: same width, any kv, any kb => exactly one build.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -40395,6 +40436,7 @@ test "splitMaskedSdpa256: verify-width array-mask rows split through the vector 
 }
 
 test "fusedSdpaPrefill: sliding-band parity vs composed 'array' mask (sliding layers)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -40487,6 +40529,7 @@ test "fusedSdpaPrefill: declines cleanly outside its envelope" {
 }
 
 test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4A7E);
     const rnd = prng.random();
@@ -40546,6 +40589,7 @@ test "fused256KvChunkLen: BK alignment, one-block floor, kl cap, budget-off" {
 }
 
 test "fusedSdpaPrefill: budgeted kv chunking engages and is exact vs single dispatch" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -40596,6 +40640,7 @@ test "fusedSdpaPrefill: budgeted kv chunking engages and is exact vs single disp
 }
 
 test "fusedSdpaPrefill: band arm never chunks (single dispatch under a tiny budget)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -40649,6 +40694,7 @@ test "fusedSdpaPrefill: band arm never chunks (single dispatch under a tiny budg
 }
 
 test "fusedSdpaPrefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64-row tile)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -40704,7 +40750,7 @@ fn attn256FiniteMaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !
 }
 
 test "causal verify attention rows are bit-identical to decode at Qwen3.8 geometry" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         for ([_]c_int{ 37, 253, 1022, 2045, 8190 }) |prefix| {
@@ -41036,6 +41082,7 @@ test "dtypeTraceArm latches one trace per forward path" {
 }
 
 test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 truth" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xD09E);
     const rnd = prng.random();
@@ -41273,6 +41320,7 @@ fn qkComposedRef(
 }
 
 test "qk norm rope fused: bit-identical at the qwen geometry (rd=32, strided post-split q)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x40FD);
     const rnd = prng.random();
@@ -41344,6 +41392,7 @@ fn gdnGateExpectClose(got: mlx.mlx_array, want: mlx.mlx_array, gate_dt: mlx.mlx_
 }
 
 test "gdn packed prework: bit-identical to the composed chain at decode and prefill widths incl. gate/beta + folded layout" {
+    try mlx.requireGpu();
     try gdnPreworkCase(.bfloat16);
     try gdnPreworkCase(.float32);
 }
@@ -41692,6 +41741,7 @@ fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
 }
 
 test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row" {
+    try mlx.requireGpu();
     try gdnPreworkBatchedCase(.bfloat16);
     try gdnPreworkBatchedCase(.float32);
 }
@@ -41928,6 +41978,7 @@ fn gdnPreworkBatchedCase(gate_dt: mlx.mlx_dtype) !void {
 }
 
 test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and prefill widths, z at a folded offset" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     gdn_prefill_fused_override = true;
     defer gdn_prefill_fused_override = null;
@@ -42247,6 +42298,7 @@ fn gdnRecurRowsAxis0(x: mlx.mlx_array, i: c_int, s: mlx.mlx_stream) !mlx.mlx_arr
 }
 
 test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 1..8; every captured row is serial decode" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     gdn_prework_override = true;
     defer gdn_prework_override = null;
@@ -42329,6 +42381,7 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
 }
 
 test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and verify widths; rollback to every row is serial decode" {
+    try mlx.requireGpu();
     try gdnRecurLayerCase(false);
     try gdnRecurLayerCase(true);
 }
@@ -42474,6 +42527,7 @@ fn gdnRecurLayerCase(wide: bool) !void {
 }
 
 test "gdn state f32: prefill, decode, a restored bf16 state and verify capture all store f32; rollback is serial decode" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -42663,6 +42717,7 @@ fn gdnDecayRun(xfm: *Transformer, la: *const LinearAttnWeights, route: GdnDecayR
 }
 
 test "gdn decay: at an f32 state and gate every route forgets at the exact rate; at --qwen-gdn 16 the routes agree" {
+    try mlx.requireGpu();
     try gdnDecayCase(true);
     try gdnDecayCase(false);
 }
@@ -42781,6 +42836,7 @@ fn gdnDecayCase(state_f32: bool) !void {
 }
 
 test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 incl. strided q" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x256A);
     const rnd = prng.random();
@@ -42842,6 +42898,7 @@ test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 in
 }
 
 test "qk norm rope fused: bit-identical to the composed chain (sliding, rd=128)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x40FE);
     const rnd = prng.random();
@@ -42884,6 +42941,7 @@ test "qk norm rope fused: bit-identical to the composed chain (sliding, rd=128)"
 }
 
 test "qk norm rope fused: bit-identical incl. YaRN freqs + mscale (rd=64)" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x40FF);
     const rnd = prng.random();
@@ -42946,7 +43004,7 @@ test "qk norm rope fused: bit-identical incl. YaRN freqs + mscale (rd=64)" {
 // every successful call leaked one array per decode tick, each pinning its `MTLSharedEvent`,
 // until the process wedged at the 65,535 cap. Settled residency is the observable.
 test "ropeAngleRows hands back every array it builds, success path included" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -43207,7 +43265,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
     const qwen_vision = @import("qwen_vision.zig");
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     const fixture_path = std.c.getenv("QWEN4_FIXTURE_VISION") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -43505,7 +43563,7 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
     // random model), against a bf16 reference the streams agree to 0.9998.
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     const fixture_path = std.c.getenv("QWEN4_FIXTURE_BF16") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -43709,7 +43767,7 @@ fn qwen4StreamedResidentFixtureParity(allocator: std.mem.Allocator, io: std.Io, 
 test "qwen4 fixture bf16 streamed experts are bit-identical to resident experts" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     const source_dir = std.c.getenv("QWEN4_TEST_HF_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     try qwen4StreamedResidentFixtureParity(std.testing.allocator, std.testing.io, std.mem.span(model_dir), std.mem.span(source_dir));
 }
 
@@ -43889,7 +43947,7 @@ fn qwen4Rows(arr: mlx.mlx_array) c_int {
 
 test "qwen4 hc_mean capture is the mean of the four HC streams at the layer output (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -43946,7 +44004,7 @@ test "qwen4 hc_mean capture is the mean of the four HC streams at the layer outp
 test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks (GDN + PLE history + QSA keys/mask)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     const fixture_path = std.c.getenv("QWEN4_FIXTURE") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -44078,7 +44136,7 @@ fn qwen4BitsEqual(alloc: std.mem.Allocator, a: mlx.mlx_array, b: mlx.mlx_array, 
 // and leaving, one M-RoPE slot. `QWEN4_ROWS_OLD=1` drives the padded batch instead (the red probe).
 test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/leave, M-RoPE)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const old_path = diagEnvOn("QWEN4_ROWS_OLD");
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -44192,7 +44250,7 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
 
 test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direct forward (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     // The profiler's synchronizing lap fills the leaf inside the build, so a
     // deferral test has nothing left to observe under it.
     if (diagEnvOn("QWEN4_PROFILE_FWD")) return error.SkipZigTest;
@@ -44376,7 +44434,7 @@ fn captureMismatch(a: []const f32, b: []const f32, width: usize, label: []const 
 
 test "qwen4 deferred PLE: the captured hidden the MTP head reads matches the eager capture (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -44460,7 +44518,7 @@ test "qwen4 deferred PLE: the captured hidden the MTP head reads matches the eag
 
 test "qwen4 grow to the reservation before the prefill keeps greedy logits bit-identical (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -44525,7 +44583,7 @@ test "qwen4 grow to the reservation before the prefill keeps greedy logits bit-i
 
 test "qwen4 MTP verify token values equal serial ticks without near-tie acquittals (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const stream = mlx.gpuStream();
@@ -44697,7 +44755,7 @@ fn qwen4BatchedPleForward(
 
 test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -44788,7 +44846,7 @@ test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
 test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget match the HF reference" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     const fixture_path = std.c.getenv("QWEN4_FIXTURE") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -45332,7 +45390,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
     // head proposes, and the trunk's verify forward decides every byte that
     // ships, so a last-ulp difference can move acceptance and never output.
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -45442,7 +45500,7 @@ test "qwen4 MTP head KV stays dense under the engine-default trunk scheme unless
 
 test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -45711,7 +45769,7 @@ test "mlx check fault injection: the ownership shape releases its array on every
     // leaked handle holds real Metal bytes and the active-memory oracle can
     // see it. The `leaky` arm is the NEGATIVE CONTROL: the same shape minus
     // the one errdefer must trip the oracle, or a green sweep means nothing.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -45845,7 +45903,7 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
     // free half is unconditional at every k: it aborts this binary rather
     // than failing an assertion.
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -45980,6 +46038,7 @@ test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity 
 }
 
 test "gdn gate at f32: compiled closure, graph chain and prework kernel agree far inside a bf16 step and carry the f32 width" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -46138,7 +46197,7 @@ test "reserveQsaHistory: the MTP head entry is reserved at the same length" {
 test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#353 follow-up)" {
     // These buffers walked the +25% ladder beside a KV cache that had been sized once; the loop
     // below allocated ~30 times before `qsa_reserve_rows`.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5E5E_4E5E);
@@ -46183,7 +46242,7 @@ test "qsa key append plan: a reservation raises the FIRST grow and nothing else"
 test "qsa key history: capacity-buffer append equals the concatenated reference, across a growth boundary" {
     // The published `aux_state` must stay byte-for-byte the old `concatenate`, including across
     // reallocations and after a restore re-seeds the accelerator.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
@@ -46281,7 +46340,7 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
 
 test "qsa pooled bank: capacity append equals the concat, and the f32 score operand is rebuilt only when a block completes" {
     // The bf16 bank must stay byte-for-byte the old `concatenate`; 12 layers of one forward reuse one f32 build.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
@@ -46358,7 +46417,7 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
 }
 
 test "qsa score bank: incremental column append matches a from-scratch rebuild" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
@@ -46412,7 +46471,7 @@ test "qsa score bank: incremental column append matches a from-scratch rebuild" 
 
 test "qsa pooled rope: one cos/sin build per forward, not one per full-attention layer" {
     // The tables are a property of the forward, not of the layer.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
@@ -46486,7 +46545,7 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
 }
 
 test "qsa pooled rope: a mark from another thread is observed by the next lookup" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
@@ -46655,7 +46714,7 @@ const QsaPoolTestTrunk = struct {
 
 // Bar: bit-identical at every block count, rope position, table and key range the indexer hands it.
 test "qsa pooled keys: the fused kernel is bit-identical to the composed chain at the served geometry" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x1D8_0BE5);
     const rnd = prng.random();
@@ -46686,7 +46745,7 @@ test "qsa pooled keys: the fused kernel is bit-identical to the composed chain a
 
 // Bar: a strided view of the indexer projection (the live k_raw slice) reads the same bits as a packed array.
 test "qsa pooled keys: the fused kernel reads a strided raw-key view bit-identically" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
     tr.init(s, true);
@@ -46708,7 +46767,7 @@ test "qsa pooled keys: the fused kernel reads a strided raw-key view bit-identic
 
 // Bar: the kernel sums rows 0..R-1 in order, MLX's order while R <= 8; past 8 it declines.
 test "qsa pooled keys: order-sensitive block sums match at ratios 1..8, and larger ratios decline" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
     tr.init(s, true);
@@ -46737,7 +46796,7 @@ test "qsa pooled keys: order-sensitive block sums match at ratios 1..8, and larg
 
 // Bar: only the shapes and dtypes the kernel mirrors engage; everything else keeps the chain.
 test "qsa pooled keys: f16 and f32 operands, other head and rope widths, and a CPU stream decline" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
     tr.init(s, true);
@@ -46791,7 +46850,7 @@ test "qsa pooled keys: f16 and f32 operands, other head and rope widths, and a C
 
 // Bar: the block count is a runtime input, so decode (1), verify (2) and prefill (512) share ONE pipeline.
 test "qsa pooled keys: block counts 1, 2, 7 and 512 share one fused pipeline" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
     tr.init(s, true);
@@ -46813,7 +46872,7 @@ test "qsa pooled keys: block counts 1, 2, 7 and 512 share one fused pipeline" {
 // Bar: the indexer's own upkeep (ring tails joined to the new rows, block-aligned strided views,
 // rope bases at `pos_base + nb_cached*ratio`) leaves the same pooled bank with the kernel on or off.
 test "qsa pooled keys: the pooled bank after prefill, decode and verify is bit-identical with the kernel on and off" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer qwen4_qsa.qsa_pool_rope_fused_override = null;
     var tr: QsaPoolTestTrunk = undefined;
@@ -46898,7 +46957,7 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
     // is always true, so every generated token past kv = (block_topk + 1) * ratio crashed.
     // Bar: where the predicate claims all-visible, the real sheet is all-true and the null-sheet
     // arm produces the same mask.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ratio: c_int = 4;
     const batch: c_int = 1;
@@ -46952,7 +47011,7 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
 test "qsa selection: the mask arm and the gather path use ONE tie rule" {
     // Two selection paths with two different tie rules would let two slots with identical
     // scores attend different blocks. The signal: the mask arm now dispatches the select kernel.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;
@@ -47033,7 +47092,7 @@ test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRS
 test "qsa visibility skip: bit-identical selection where it is an identity, and a REAL difference where it is not" {
     // Where every block is visible the two arms must agree bit for bit; where they are not,
     // the arms must differ (else a blanket "always skip" would pass).
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
@@ -47137,7 +47196,7 @@ test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95
 
 test "qsa block constants: one build per nb, not one per full-attention layer" {
     // Twelve full-attention layers asked for the same nb-keyed aranges; `builds` is the meter.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var qc: QsaBlockConsts = .{};
     defer qc.deinit();
@@ -47273,7 +47332,7 @@ test "qsa select kernel: the fused radix-select IS the exact top-k with the spli
     // query widths it runs at and three visibility regimes. Scores are exact binary fractions
     // k/16 in [0, 0.5] plus forced zeros: the regime where the chain's bias is also exact, so
     // both arms can be held to the same bar.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const prev_split = qsa_select_split_override;
     defer qsa_select_split_override = prev_split;
     qsa_select_split_override = false;
@@ -47379,7 +47438,7 @@ test "qsa select kernel: past the bias's f32 resolution the chain's tie rule is 
     const big: f32 = 625.0;
     try testing.expectEqual(big - 1369 * eps, big - 1370 * eps);
 
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const ratio: c_int = 4;
@@ -47445,7 +47504,7 @@ test "qsa select kernel: past the bias's f32 resolution the chain's tie rule is 
 test "qsa select kernel: on a near-tie the exact rule and the bias trick DISAGREE, and the kernel takes the exact one" {
     // The bias is exact only on exact ties: at nb = 262144 it spans 0.026, so a genuinely higher
     // score loses to a lower-indexed rival. torch.topk and the kernel take the higher score.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const nb: c_int = 262144;
@@ -47496,7 +47555,7 @@ test "qsa select kernel: on a near-tie the exact rule and the bias trick DISAGRE
 }
 
 test "qsa select kernel: the config is cached per FULL shape and rebuilt when rows or nb change" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const k: c_int = 8;
@@ -47574,7 +47633,7 @@ fn qsaSelectMakeSheet(kind: u8, buf: []f32, rnd: std.Random) void {
 }
 
 test "qsa select split: ids are identical to the single-threadgroup kernel" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const k: c_int = 512;
@@ -47658,7 +47717,7 @@ test "qsa select split: declines above the width floor and below the nb floor" {
     try testing.expect(qsaSelectSplitServes(15, 65536, k));
     try testing.expect(qsaSelectSplitServes(7, 215000, k));
 
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const prev = qsa_select_split_override;
@@ -47693,7 +47752,7 @@ test "qsa select split: declines above the width floor and below the nb floor" {
 }
 
 test "qsa select split: kill switch off uses the single-threadgroup kernel" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const prev = qsa_select_split_override;
@@ -47728,7 +47787,7 @@ test "qsa select split: kill switch off uses the single-threadgroup kernel" {
 }
 
 test "qsa select split: the config is cached per FULL shape and rebuilt when rows change" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const prev = qsa_select_split_override;
@@ -47784,7 +47843,7 @@ test "qsa select: the digit scheme is a pure function of rows" {
     try testing.expectEqual(@as(c_int, 11), qsaSelectDigitBits(1));
     qwen4_qsa.qsa_select_digits_override = null;
 
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const prev_split = qsa_select_split_override;
@@ -47826,7 +47885,7 @@ test "qsa select: the digit scheme is a pure function of rows" {
 }
 
 test "qsa select: 8-bit digits are the exact top-k" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const saved_digits = qwen4_qsa.qsa_select_digits_override;
@@ -47928,7 +47987,7 @@ test "qsa select: 8-bit digits are the exact top-k" {
 }
 
 test "qsa score kernel: fused score sheet is bit-identical to the composed chain" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     qsa_score_fused_override = true;
@@ -48071,7 +48130,7 @@ test "qsa score kernel: fused score sheet is bit-identical to the composed chain
 }
 
 test "qsa score kernel: block ids through qsaSelectTopBlocks are identical on both arms" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
@@ -48130,7 +48189,7 @@ test "qsa score kernel: never built without NAX" {
 }
 
 test "qsa score fused: a probe mismatch latches the composed arm" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -48163,7 +48222,7 @@ test "qsa score fused: a probe mismatch latches the composed arm" {
 }
 
 test "qsa score fused: probe passes on this machine" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -48190,7 +48249,7 @@ test "qsa score fused: default on engages, the override declines" {
     try testing.expect(qsaScoreFusedEnabled());
     qsa_score_fused_override = false;
     try testing.expect(!qsaScoreFusedEnabled());
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xDEF0);
     const q = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 4, 2, 128 }, s);
@@ -48300,7 +48359,7 @@ test "qsa score fused: sizing policy" {
 }
 
 test "qsa score fused: the argpartition decline arm consumes the fused sheet" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
@@ -48340,7 +48399,7 @@ test "qsa score fused: the argpartition decline arm consumes the fused sheet" {
 }
 
 test "qsa score fused: no bank is built under the fused arm" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
     xfm.s = s;
@@ -48381,7 +48440,7 @@ test "qsa score fused: no bank is built under the fused arm" {
 }
 
 test "qsa score fused: unsupported indexer geometry falls back to the composed chain" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
     xfm.s = s;
@@ -48500,7 +48559,7 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
 }
 
 test "qsa score fused: dump hook writes a parseable line" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -48719,7 +48778,7 @@ test "ssm retention: the span-preserving thin keeps both ends and spreads the su
 test "qsa history: a restore-shaped re-seed lands AT the reservation, so the append never grows" {
     // A restore republishes `aux_state` but leaves the append accelerator empty, and the
     // re-seed used to produce a tight buffer that grew one line later (~81 ms at 384k).
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5EED_5EED);
@@ -48944,7 +49003,7 @@ fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.mlx_ar
 
 test "row-axis verify: every row of a group verify is byte-identical to its solo verify" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -49095,7 +49154,7 @@ fn expectSlotStateEqual(alloc: std.mem.Allocator, s: mlx.mlx_stream, a: *Qwen4Te
 
 test "per-row rollback: different accept counts across rows restore exactly the solo states" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -49197,7 +49256,7 @@ test "per-row rollback: different accept counts across rows restore exactly the 
 
 test "deferred PLE at N rows: a failed row abandons every row's claim and leaves the slots usable" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -49366,7 +49425,7 @@ test "deferred PLE at N rows: every row's capacity is checked against its OWN wi
 test "group round: a row's own argmax and budget decide it, and nothing else does" {
     const gen_mod = @import("generate.zig");
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -49518,6 +49577,7 @@ test "row kernel declines scales and biases with another dtype" {
 }
 
 test "row kernel cache reuses alternating full-shape configurations" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var fx = try @import("mtp.zig").RerankFixture.init(s, 512, 2560, 8, 64, 11);
     defer fx.deinit();
@@ -49535,7 +49595,7 @@ test "row kernel cache reuses alternating full-shape configurations" {
 
 test "N=4 rollback: rejects, partial accepts and full accept restore solo states" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -49755,7 +49815,7 @@ fn verifyRollbackKvCase(config: KVQuantConfig, prefix_len: usize, force_growth: 
 }
 
 test "offset rollback preserves dense affine growth and cold initialization" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     inline for (.{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         try verifyRollbackKvCase(config, 8, false);
         try verifyRollbackKvCase(config, 8, true);
@@ -49765,7 +49825,7 @@ test "offset rollback preserves dense affine growth and cold initialization" {
 
 test "verify MoE rows preserve every value with fewer graph operations" {
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const stream = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -50224,7 +50284,7 @@ fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_a
 
 test "single-stream verify optimizations preserve native outputs and captures (QWEN4_TEST_MODEL)" {
     const path = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const old_features = single_verify_test_features;
@@ -50310,7 +50370,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
 }
 
 test "hc prefill: pending write, normalized streams, native inject reduction and BF16 mix across shapes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const hp = @import("hc_prefill.zig");
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
@@ -50399,7 +50459,7 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
 }
 
 test "hc prefill: incompatible read writes immediately" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -50656,6 +50716,7 @@ test "streamed expert kernel arm is no worse than the composite arm against fp32
 }
 
 test "streamed expert composite arm keeps the pre-change bytes" {
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     const hidden: c_int = 64;
@@ -51145,6 +51206,7 @@ const SqArm = struct {
 };
 
 test "a streamed quantized slab matches the resident bank through the same kernels" {
+    try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     const experts: u16 = 6;
@@ -51422,7 +51484,7 @@ test "qwen4 verify history row and cache identity (QWEN4_TEST_MODEL)" {
 test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
     const cases_path = std.c.getenv("QWEN4_VERIFY_BENCH") orelse return error.SkipZigTest;
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     if (diagEnvOn("QWEN4_PROFILE_FWD")) return error.ProfilerChangesReplay;
     const dense = @import("mtp_dense_rows.zig");
     const old = dense.override;
@@ -51604,7 +51666,7 @@ fn denseVerifyReplay(xfm: *Transformer, slot: *Qwen4TestSlot, tokens: []const i3
 
 fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_int, prefix: usize, row_index: c_int) !void {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.gpuStream();
@@ -51759,7 +51821,7 @@ test "affine8 projections are row-identical gs128" {
 }
 
 fn testAffine8ProjectionRows(gs: u32) !void {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x8dec0de);
     for ([_]mlx.mlx_dtype{ .bfloat16, .float16, .float32 }) |dtype| {
@@ -51797,7 +51859,7 @@ fn testAffine8ProjectionRows(gs: u32) !void {
 }
 
 test "dense projections are row-identical to serial matmul" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xded8);
     for ([_]mlx.mlx_dtype{ .bfloat16, .float16, .float32 }) |dtype| {
@@ -51835,7 +51897,7 @@ test "dense projections are row-identical to serial matmul" {
 
 test "qwen4 checkpoint affine8 and dense projections are row-identical (QWEN4_TEST_MODEL)" {
     const path = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.gpuStream();
@@ -51892,7 +51954,7 @@ test "qwen4 checkpoint affine8 and dense projections are row-identical (QWEN4_TE
 }
 
 test "hc write compilation preserves the serial pending-write rounding" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
     xfm.s = s;
@@ -51935,7 +51997,7 @@ fn qsaIdentityServingArm(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const Dense
 }
 
 test "QSA verify rows are bit-identical to decode at both KV tile sizes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = testing.allocator;
     const old_kernel = qsa_attn_kernel_override;
@@ -52000,7 +52062,7 @@ test "QSA verify rows are bit-identical to decode at both KV tile sizes" {
 }
 
 test "QSA verify preserves serial arithmetic across the sparse budget boundary" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = testing.allocator;
     const budget: c_int = 64;
@@ -52052,7 +52114,7 @@ test "QSA verify preserves serial arithmetic across the sparse budget boundary" 
 }
 
 test "mimo v2 fused qkv split keeps asymmetric value rows" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     const q_rows: usize = 4 * 3;
@@ -52114,7 +52176,7 @@ fn testExpectSameBits(want: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream
 }
 
 test "mimo decode qkv prep: bit-identical to partial rope + kv8 and kv6 quantize at every verify width" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x4D69);
@@ -52248,7 +52310,7 @@ pub fn stackMimoFixtureExperts(weights: *Weights, config: ModelConfig, s: mlx.ml
 
 test "mimo v2 raw per-expert load failure releases partial construction" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
 
@@ -52266,7 +52328,7 @@ test "mimo v2 raw per-expert load failure releases partial construction" {
 test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_MODEL + MIMO_V2_FIXTURE)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
     const fixture_path = std.c.getenv("MIMO_V2_FIXTURE") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -52446,7 +52508,7 @@ fn mimoVerifyOrTicks(alloc: std.mem.Allocator, xfm: *Transformer, ids: []const i
 
 test "mimo v2 verify rows equal serial decode ticks bit for bit across the sliding window (MIMO_V2_MODEL)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -52510,7 +52572,7 @@ fn mimoBatchTestPrefill(xfm: *Transformer, slot: *MimoBatchTestSlot, ids: []cons
 
 test "mimo batched decode rows equal each slot's own decode tick bit for bit (MIMO_V2_MODEL)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -52610,7 +52672,7 @@ test "mimo batched decode rows equal each slot's own decode tick bit for bit (MI
 
 test "mimo spec warm-up runs every verify row count on its own slot (MIMO_V2_MODEL)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -52633,7 +52695,7 @@ test "mimo spec warm-up runs every verify row count on its own slot (MIMO_V2_MOD
 
 test "mimo v2 mixed-precision streamed and resident forwards agree" {
     const raw = std.c.getenv("MIMO_STREAM_FIXTURE") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = testing.io;
     const path = std.mem.span(raw);
@@ -52761,7 +52823,7 @@ test "upstream bugfix: KVCache affine quant keeps its dtype through growth" {
 
 
 test "gdn verify fold: output and every rollback state remain bit-identical" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     mlx.installErrorHandler();
     const s = mlx.gpuStream();
     gdn_prework_override = true;
@@ -52779,7 +52841,7 @@ test "gdn verify fold: output and every rollback state remain bit-identical" {
 
 
 test "gdn verify fold: unsupported threadgroup declines without poisoning later work" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     mlx.installErrorHandler();
     const s = mlx.gpuStream();
     gdn_prework_override = true;
@@ -53015,7 +53077,7 @@ test "qwen4 decode ladder: stride resolution keeps an explicit off and leaves ot
 }
 
 test "qwen4 decode ladder: serial decode keeps the default off; an explicit stride fills host ids first, skips lazy ones" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     qwen4_forward.qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
     defer qwen4_forward.qwen4_standin_override = null;
     var rig: Qwen4LadderRig = undefined;
@@ -53066,7 +53128,7 @@ test "qwen4 decode ladder: serial decode keeps the default off; an explicit stri
 }
 
 test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits and per-slot history bit-identical to off" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     qwen4_forward.qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
     defer qwen4_forward.qwen4_standin_override = null;
     var rig: Qwen4LadderRig = undefined;
@@ -53253,6 +53315,7 @@ test "sushi coder GPU a loaded grouped layer keeps its stored bytes resident onc
 }
 
 test "sushi coder GPU grouped layer matches the original uniform bank" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -53357,7 +53420,7 @@ test "argmax-only shortlist rows hold the exact logits at their ids and argmax t
 }
 
 test "a MiMo argmax-only readout holds the full head's bit-exact logits at its top-32, one row or four" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     // K 512 and a vocab that is a multiple of 8 keep both reads on the served head's qmv kernel.
     var fx = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 512, 8, 64, 0x1A4D);
@@ -53573,7 +53636,7 @@ fn streamDeferredCheckpoint(dir: std.Io.Dir, pack: *const expert_stream_mod.Tiny
 }
 
 test "streamed deferred verification preserves outputs states and accounting on hits misses and workspace" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -53762,7 +53825,7 @@ test "the GPU expert pick declines a shape its threadgroup cannot hold" {
 }
 
 test "GLM serving dispatch matches native forward across prefill decode and reset" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var weights = Weights.init(a);
     defer weights.deinit();
@@ -53814,7 +53877,7 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
 }
 
 test "GLM forward contexts carry their own request: interleaved streams equal each stream alone" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var weights = Weights.init(a);
     defer weights.deinit();
@@ -53868,7 +53931,7 @@ test "GLM forward contexts carry their own request: interleaved streams equal ea
 }
 
 test "a GLM prefill interleaved with another stream's decode builds the solo prefill's cache bits" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var weights = Weights.init(a);
     defer weights.deinit();
@@ -53930,7 +53993,7 @@ test "a streamed GLM load keeps its one teacher stream exclusive" {
 }
 
 test "GLM serving stores the latent its slot cache names and refuses kv4 by name" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var weights = Weights.init(a);
     defer weights.deinit();
@@ -54027,7 +54090,7 @@ test "GLM serving streams std1 EXL3 experts bit-identical to resident" {
 }
 
 fn glmStreamedExl3MatchesResident(dec: expert_exl3.Decode) !void {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var weights = Weights.init(a);
     defer weights.deinit();
@@ -54081,7 +54144,7 @@ fn glmStreamedExl3MatchesResident(dec: expert_exl3.Decode) !void {
 }
 
 test "GLM serving streams BF16 source experts through the engine the native capture uses" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var trunk = Weights.init(a);
     defer trunk.deinit();
@@ -54119,7 +54182,7 @@ test "GLM serving streams BF16 source experts through the engine the native capt
 }
 
 test "GLM serving streams FP8 source experts through eviction and the union, the bits of an all-resident cache" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var trunk = Weights.init(a);
     defer trunk.deinit();
@@ -54161,7 +54224,7 @@ test "GLM serving streams FP8 source experts through eviction and the union, the
 }
 
 test "GLM vision native serving splices media before HC expansion and preserves layer capture" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     var weights = Weights.init(a);
     defer weights.deinit();

@@ -586,6 +586,7 @@ pub fn tmpPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []co
 }
 
 test "driver: a tiny Qwen source becomes a complete pack, and a second run into it is refused" {
+    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var work = t.tmpDir(.{});
@@ -635,6 +636,7 @@ test "driver: a tiny Qwen source becomes a complete pack, and a second run into 
 }
 
 test "driver: a run that fails after layer 0 resumes at layer 1, and a changed policy refuses to resume" {
+    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var work = t.tmpDir(.{});
@@ -682,6 +684,7 @@ test "driver: a run that fails after layer 0 resumes at layer 1, and a changed p
 }
 
 test "driver: the layer kinds a calibrator reads from Info outlive the call that prepared it" {
+    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var work = t.tmpDir(.{});
@@ -742,6 +745,7 @@ test "driver: a finished layer shard over 1 GiB counts as complete on resume" {
 }
 
 test "driver: a resume into a finished pack stops, whether or not its progress file or capture is left" {
+    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var work = t.tmpDir(.{});

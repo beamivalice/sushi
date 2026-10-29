@@ -1160,7 +1160,7 @@ const TinyCapture = struct {
 };
 
 test "GLM native teacher refuses a budget above Metal's recommended working set" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1172,7 +1172,7 @@ test "GLM native teacher refuses a budget above Metal's recommended working set"
 }
 
 test "GLM layer-major capture writes window-major's fixture and boundaries byte for byte, across batches and a resume" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1231,7 +1231,7 @@ fn expectImatrixMatches(tiny: *TinyCapture, cfg: *const model.ModelConfig, token
 }
 
 test "GLM capture writes an imatrix whose counts reconcile, that batches leave alone and that moves no forward byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1253,7 +1253,7 @@ test "GLM capture writes an imatrix whose counts reconcile, that batches leave a
 }
 
 test "GLM layer-major resume carries the imatrix across an interruption and a new batch size" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1276,7 +1276,7 @@ test "GLM layer-major resume carries the imatrix across an interruption and a ne
 }
 
 test "GLM layer-major imatrix covers only the first N windows, across batches and a resume" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1308,7 +1308,7 @@ test "GLM layer-major imatrix covers only the first N windows, across batches an
 }
 
 test "GLM layer-major resume refuses an imatrix capture whose committed sums are gone" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1322,7 +1322,7 @@ test "GLM layer-major resume refuses an imatrix capture whose committed sums are
 }
 
 test "GLM capture identity records whether the NAX arms were on and what each dispatched" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1339,7 +1339,7 @@ test "GLM capture identity records whether the NAX arms were on and what each di
 }
 
 test "GLM layer-major resume refuses a changed committed window or a different run" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1358,7 +1358,7 @@ test "GLM layer-major resume refuses a changed committed window or a different r
 }
 
 test "GLM layer-major resume refuses a mutated, deleted or truncated committed token file" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1387,7 +1387,7 @@ test "GLM layer-major resume refuses a mutated, deleted or truncated committed t
 }
 
 test "GLM layer-major capture interrupted inside its first batch resumes to the uninterrupted bytes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1402,7 +1402,7 @@ test "GLM layer-major capture interrupted inside its first batch resumes to the 
 }
 
 test "GLM layer-major capture refuses a hidden directory that already holds rows, and keeps refusing" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();
@@ -1413,7 +1413,7 @@ test "GLM layer-major capture refuses a hidden directory that already holds rows
 }
 
 test "GLM layer-major capture idles on its pause file and continues when it is removed" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var tiny = try TinyCapture.init(a);
     defer tiny.deinit();

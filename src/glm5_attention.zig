@@ -1037,6 +1037,7 @@ test "GLM IndexPool append matches scalar pooling across irregular chunks" {
 }
 
 test "GLM latent attention matches scalar causal attention at pool boundaries" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     for ([_]usize{ 1, 3, 4, 5, 2048, 2049 }) |n| {
         const a = std.testing.allocator;
@@ -1073,6 +1074,7 @@ test "GLM latent attention matches scalar causal attention at pool boundaries" {
 }
 
 test "GLM sparse pool selection excludes future pools and appends tail exactly once" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = std.testing.allocator;
     const n = 2055;
@@ -1152,6 +1154,7 @@ test "GLM sparse pool selection excludes future pools and appends tail exactly o
 }
 
 test "GLM latent BF16 attention covers width512 and prefill chunk continuation" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const n = 5;
     const d = 512;
@@ -1192,6 +1195,7 @@ fn bf16Round(x: f32) f32 {
 }
 
 test "GLM index score matches rounded per-head scalar math with negative weights" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const rows = 2;
     const heads = 32;
@@ -1272,6 +1276,7 @@ fn simdSumScores(scope: *Scope, pooled: Arr, index_q: Arr, weights: Arr, offset:
 }
 
 test "GLM tree index scorer equals the SIMD-sum scorer bit for bit at real magnitudes and long key counts" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const Case = struct { rows: c_int, pools: c_int, back: c_int, heads: c_int = 32, dim: c_int = 128, dtype: mlx.mlx_dtype = .bfloat16 };
     // Causal edges land inside and at the end of eight-pool blocks; 17 rows leave a partial row group.
@@ -1321,6 +1326,7 @@ test "GLM tree index scorer equals the SIMD-sum scorer bit for bit at real magni
 }
 
 test "GLM verifier rows select exactly what each row selects alone, at every tail length and pool boundary" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
     defer scope.deinit();
@@ -1358,6 +1364,7 @@ test "GLM verifier rows select exactly what each row selects alone, at every tai
 }
 
 test "GLM attention rejects invalid append without advancing request state" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
     defer scope.deinit();
@@ -1380,6 +1387,7 @@ test "GLM attention rejects invalid append without advancing request state" {
 }
 
 test "GLM native decode falls back for unsupported tiny attention bits" {
+    try mlx.requireGpu();
     const native = @import("glm5_attention_decode_batch.zig");
     const s = mlx.gpuStream();
     const latent = array(&.{ 0.25, -0.5, 1, 2 }, &.{ 2, 2 });
@@ -1413,6 +1421,7 @@ test "GLM native decode falls back for unsupported tiny attention bits" {
 }
 
 test "GLM ranked top-512 equals argpartition's stable order on ties, -inf and causal edges" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     // `future` pools at the end are -inf: 600/200 cuts inside the -inf ties, 1000 inside the zeros.
     const Case = struct { rows: c_int, pools: c_int, bits: u8, future: usize = 1 };
@@ -1464,6 +1473,7 @@ test "GLM ranked top-512 equals argpartition's stable order on ties, -inf and ca
 }
 
 test "GLM packed prefill keeps 32-row tiles at long history and equals 16-row tiles bit for bit" {
+    try mlx.requireGpu();
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
@@ -1487,6 +1497,7 @@ test "GLM packed prefill keeps 32-row tiles at long history and equals 16-row ti
 }
 
 test "GLM a 32-row selection equals two 16-row selections at tree and NAX index scoring" {
+    try mlx.requireGpu();
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
@@ -1544,6 +1555,7 @@ fn attendPackedSerial(state: *const State, q: Arr, iq: Arr, weights: Arr, offset
 }
 
 test "GLM in-flight packed tiles equal serial tiles bit for bit at every tile count and remainder" {
+    try mlx.requireGpu();
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
@@ -1643,6 +1655,7 @@ fn appendOnceCase(bits: u8) !void {
 }
 
 test "GLM kv8 and kv6 scalar latent attention matches BF16 attention over the round-tripped rows" {
+    try mlx.requireGpu();
     for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try scalarAttentionCase(bits);
 }
 
@@ -1666,6 +1679,7 @@ fn scalarAttentionCase(bits: u8) !void {
 }
 
 test "GLM kv8 and kv6 native decode and packed prefill attention match BF16 over the round-tripped rows" {
+    try mlx.requireGpu();
     for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try nativeDecodeCase(bits);
 }
 
@@ -1693,6 +1707,7 @@ fn nativeDecodeCase(bits: u8) !void {
 }
 
 test "GLM serial decode row equals the B1 tail-tape path bit for bit on kv8, kv6 and BF16 latents" {
+    try mlx.requireGpu();
     for ([_]u8{ latent_store.kv8_bits, 6 }) |bits| try serialRowCase(bits);
 }
 
@@ -1788,6 +1803,7 @@ fn fp32GemmExact(s: mlx.mlx_stream) !bool {
 }
 
 test "GLM decode attention: the FP32 composite B3 is three B1, held to an FP64 oracle on every GPU" {
+    try mlx.requireGpu();
     const transformer = @import("transformer.zig");
     const saved = transformer.vqmm_nax_probe_override;
     defer transformer.vqmm_nax_probe_override = saved;
@@ -1857,6 +1873,7 @@ fn decodeCompositeCase(fraction: ?f64) !void {
 }
 
 test "GLM sparse prefill without NAX takes the FP32 composite, no worse than the scalar arm" {
+    try mlx.requireGpu();
     const transformer = @import("transformer.zig");
     const saved = transformer.vqmm_nax_probe_override;
     defer transformer.vqmm_nax_probe_override = saved;

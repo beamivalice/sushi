@@ -413,6 +413,7 @@ fn cooperativeProjectionsCase(production: bool, rate: c_int, counts: []const c_i
 }
 
 test "GLM group2 cooperative projections preserve F16 bits at all rates and ballot boundaries" {
+    try mlx.requireGpu();
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer base.setDecodeParams(.mul1);
     for (@import("expert_exl3.zig").ADMITTED_SAMPLE) |n| {
@@ -422,6 +423,7 @@ test "GLM group2 cooperative projections preserve F16 bits at all rates and ball
 }
 
 test "GLM group2 singleton and all-shared routes preserve strided input bits" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer base.setDecodeParams(.mul1);
@@ -532,6 +534,7 @@ fn half4CompositionCase(production: bool, rate: c_int, counts: []const c_int) !v
 }
 
 test "GLM group2 half4 composition preserves all-rate cooperative projection bits" {
+    try mlx.requireGpu();
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer base.setDecodeParams(.mul1);
     for (@import("expert_exl3.zig").ADMITTED_SAMPLE) |n| {
@@ -541,6 +544,7 @@ test "GLM group2 half4 composition preserves all-rate cooperative projection bit
 }
 
 test "GLM group2 serves every admitted rate, exact to the cooperative reader" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer base.setDecodeParams(.mul1);
@@ -563,6 +567,7 @@ test "GLM group2 serves every admitted rate, exact to the cooperative reader" {
 }
 
 test "GLM group2 keeps the cooperative reader's bytes under PAIR1" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     base.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
     defer base.setDecodeParams(.mul1);
@@ -592,6 +597,7 @@ test "GLM group2 keeps the cooperative reader's bytes under PAIR1" {
 
 // Group2 needs two rows; DFlash verify sends three or four.
 test "GLM serves spec1 and std1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer base.setDecodeParams(.mul1);
     defer base.unfolded_for_test = false;
@@ -633,6 +639,7 @@ test "GLM serves spec1 and std1 on group2's routed chain with the unfolded oracl
 }
 
 test "GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer base.setDecodeParams(.mul1);
     defer base.unfolded_for_test = false;
@@ -674,6 +681,7 @@ test "GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes
 }
 
 test "GLM group2 shared expert joined in the reduce equals the separate BF16 add" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const dec: @import("expert_exl3.zig").Decode = .{ .codebook = .mcg, .window = .w14 };
     defer base.setDecodeParams(.mul1);

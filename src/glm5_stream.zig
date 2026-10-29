@@ -375,6 +375,7 @@ fn gather(ops: *Ops, x: Arr, w: Arr, ids: Arr) !Arr {
 }
 
 test "GLM stream GPU BF16 routed output matches resident through eviction union and retained output" {
+    try mlx.requireGpu();
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();

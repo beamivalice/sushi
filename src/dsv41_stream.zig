@@ -259,7 +259,7 @@ pub const StqStream = struct {
 const testing = std.testing;
 
 test "dsv41 stream: slab-gathered experts give the resident experts' logits, with a cache that holds every expert and one that does not (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try model.fixtureDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -299,7 +299,7 @@ test "dsv41 stream: slab-gathered experts give the resident experts' logits, wit
 }
 
 test "dsv41 stream: decode steps through the fused kernels over leased slabs give the resident banks' logits bit for bit (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try model.fixtureDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -338,7 +338,7 @@ test "dsv41 stream: decode steps through the fused kernels over leased slabs giv
 }
 
 test "dsv41 shell: the transformer serves the streamed model's logits through forward (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try model.fixtureDir();
     const model_mod = @import("model.zig");
@@ -794,7 +794,7 @@ fn traceOf(sc: *Scope, tr: *const model.Trace, name: []const u8) ![]f32 {
 }
 
 test "dsv41 stq: the served STQ pack (trunk banks, affine embedding, streamed rate-grouped experts) follows its dense twin (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -905,7 +905,7 @@ test "dsv41 stq: the served STQ pack (trunk banks, affine embedding, streamed ra
 }
 
 test "dsv41 stq: the STQ pack's K4 trunk and affine embedding keep the FP4 model's first attention (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var pbuf: [1024]u8 = undefined;
     const src = try sourceOf(&pbuf, dir);
@@ -961,7 +961,7 @@ test "dsv41 drop: greedy DSpark rounds over the STQ pack with experts dropped em
 }
 
 fn dsparkMatchesSerial(drop: ?*const expert_usage.Drop) !void {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1054,7 +1054,7 @@ fn dsparkMatchesSerial(drop: ?*const expert_usage.Drop) !void {
 }
 
 test "dsv41 stq: verify rows that decode each distinct expert once give the per-row chain's bytes, through hits, misses and the union (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1096,7 +1096,7 @@ test "dsv41 stq: verify rows that decode each distinct expert once give the per-
 }
 
 test "dsv41 stq: tile-major pools give the pack-order pools' bytes, through hits, misses, the union and prefill rows (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1134,7 +1134,7 @@ test "dsv41 stq: tile-major pools give the pack-order pools' bytes, through hits
 }
 
 test "dsv41 stq: the submitted decode schedule gives the drained schedule's bytes, through hits, misses and the union (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1193,7 +1193,7 @@ fn expectSameBits(sc: *Scope, a: A, b: A) !void {
 }
 
 test "dsv41 stq: queueing the routed chains from the cache map gives the drained and the waiting schedules' bytes, through hits, misses, the union and rebuilt layers (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1252,7 +1252,7 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
 }
 
 test "dsv41 stq: queued routed chains leave a verify round's kept rows, the DSpark windows and the open groups as the drained schedule does (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1316,7 +1316,7 @@ fn enablePrefetch(served: *StqServed, lead_rows: u8, n: u8, m: u8) !void {
 }
 
 test "dsv41 prefetch: experts read ahead leave the pool, the map and the slab bytes as a route to them does, and the route then hits (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     const s = mlx.gpuStream();
     var ahead: StqServed = undefined;
@@ -1357,7 +1357,7 @@ test "dsv41 prefetch: experts read ahead leave the pool, the map and the slab by
 }
 
 test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead give the bytes of a model that reads nothing ahead, through hits, misses and rebuilt layers (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1410,7 +1410,7 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
 }
 
 test "dsv41 prefetch: one-row decode steps ask for nothing and keep the bytes (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1439,7 +1439,7 @@ test "dsv41 prefetch: one-row decode steps ask for nothing and keep the bytes (D
 }
 
 test "dsv41 drop: the STQ pack with experts dropped gives the logits of the full pools under the same router mask, bit for bit, and never reads or caches a dropped expert (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1531,7 +1531,7 @@ fn usageDir(tmp: *testing.TmpDir, fixture: []const u8, layers: usize, experts: u
 }
 
 test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller expert set and serves the masked logits (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("model.zig");
@@ -1633,7 +1633,7 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
 }
 
 test "dsv41 stq shell: the transformer loads an STQ pack through the one loader and serves the model's logits (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("model.zig");
@@ -1682,7 +1682,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
 }
 
 test "dsv41 borrow: a released pool gives MLX its bytes back, its routes read the union with the same bytes out, and a restore reads its experts back (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1765,7 +1765,7 @@ const BorrowProbe = struct {
 };
 
 test "dsv41 borrow: a prefill short of memory releases the latest decoder pools, serves the same bytes, and decode reads them back (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     // A streamed pack, and a resident one whose first release also pays for the union workspace.
     for ([_]u64{ 3 * 8 * 256 * 128 * 3 * 64 / 128, 64 << 20 }) |cache_bytes| try borrowCase(cache_bytes);
 }
@@ -1853,7 +1853,7 @@ fn expectSameStep(sc: *Scope, a: *model.Model, b: *model.Model, ids: []const u32
 }
 
 test "dsv41 resident: a budget that holds every expert reads them all at load, makes no union workspace, and serves the streamed bytes with no route read (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1902,7 +1902,7 @@ test "dsv41 resident: a budget that holds every expert reads them all at load, m
 }
 
 test "dsv41 drop: a budget that holds the kept experts alone serves them resident, and a dropped id is in no pool and no map (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1968,7 +1968,7 @@ test "dsv41 drop: a budget that holds the kept experts alone serves them residen
 }
 
 test "dsv41 lossy pick: on rate-grouped layers a missed expert takes the best pooled one within the tolerance, from any group, and nothing at 0 (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -2057,7 +2057,7 @@ const F16_ULP: f64 = 0x1p-10;
 const NO_WORSE_F16_ULPS = 0.25;
 
 test "dsv41 stq: the served path is no farther from the f32 CPU truth than the GPU twin, layers 0 to 4 (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -2153,7 +2153,7 @@ fn roundsTo(m: *model.Model, prompt: []const u32, end: usize) !void {
 }
 
 test "dsv41 kernels: after the load's warm, prompts of any length, every verify width and a growing context compile no Metal library on the STQ pack, streamed and resident, DSpark on and off (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -2184,7 +2184,7 @@ test "dsv41 kernels: after the load's warm, prompts of any length, every verify 
 }
 
 test "dsv41 kernels: the load's warm leaves no state, and the served logits are the unwarmed model's bit for bit (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -2219,7 +2219,7 @@ test "dsv41 kernels: the load's warm leaves no state, and the served logits are 
 }
 
 test "dsv41 DSpark exact: a one-row round gives the bytes of row 0 of a wider verify at every position, and leaves the state the wider round leaves (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();

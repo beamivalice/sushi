@@ -214,6 +214,7 @@ fn f32At(raw: []const u8, i: usize) f32 {
 }
 
 test "GLM HC SIMD32 primitive hook exact T1-T8 specials and original fallback" {
+    try mlx.requireGpu();
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     var values: [192]f32 = undefined;
@@ -245,6 +246,7 @@ test "GLM HC SIMD32 primitive hook exact T1-T8 specials and original fallback" {
 }
 
 test "GLM HC SIMD32 exact on the captured layer's coefficients at T1-T4" {
+    try mlx.requireGpu();
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     const input = try fixtureTensor("hc.input");

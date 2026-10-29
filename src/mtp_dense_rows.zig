@@ -135,7 +135,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_a
 }
 
 test "dense rows, serial decode included, preserve MLX's bits on the transposed router and singleton gate" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xd3e5e);

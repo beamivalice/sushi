@@ -3620,7 +3620,7 @@ pub fn tokens(sc: *Scope, fx: *model_mod.Weights) ![]u32 {
 const TINY_S = 40;
 
 test "dsv41 fixture: prefill matches DeepSeek's reference in f32 with the QAT round trips off, whole and in chunks (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3679,7 +3679,7 @@ test "dsv41 fixture: prefill matches DeepSeek's reference in f32 with the QAT ro
 }
 
 test "dsv41 fixture: decode one token at a time after a prefill matches the reference (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3711,7 +3711,7 @@ test "dsv41 fixture: decode one token at a time after a prefill matches the refe
 }
 
 test "dsv41 fixture: with the QAT round trips on, the layers up to the first rounding flip match the reference (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture.safetensors");
     defer fx.deinit();
@@ -3799,7 +3799,7 @@ fn expectTracesAgree(sc: *Scope, got: *const Trace, want: *const Trace, tol: f32
 }
 
 test "dsv41 fused: decode with the kernels follows the composed path on the GPU in f32 (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3828,7 +3828,7 @@ test "dsv41 fused: decode with the kernels follows the composed path on the GPU 
 }
 
 test "dsv41 fused: prefill with the kernels follows the composed path on the GPU in f32 (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3864,7 +3864,7 @@ test "dsv41 fused: prefill with the kernels follows the composed path on the GPU
 }
 
 test "dsv41 loader: the composed diagnostic turns the fused kernels off and says so (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const m = try tinyModel(try fixtureDir(), .{ .act = .float32, .qat = false }, mlx.gpuStream());
     defer m.deinit();
     try testing.expect(m.fused);
@@ -3875,7 +3875,7 @@ test "dsv41 loader: the composed diagnostic turns the fused kernels off and says
 }
 
 test "dsv41 fused: the f16 attention arm gives the f32 chain's first-layer heads to bf16 ulps (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3921,7 +3921,7 @@ fn argmaxRow(row: []const f32) u32 {
 }
 
 test "dsv41 DSpark: the drafted block, its Markov bias and its confidence match DeepSeek's reference, QAT off (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3972,7 +3972,7 @@ test "dsv41 DSpark: the drafted block, its Markov bias and its confidence match 
 }
 
 test "dsv41 DSpark: with the QAT round trips on, the stages draft the reference's block from the reference's main rows (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture.safetensors");
     defer fx.deinit();
@@ -4027,7 +4027,7 @@ fn prefilledTiny(dir: []const u8, ids: []const u32, n: usize, s: S, last: *[]f32
 }
 
 test "dsv41 DSpark: a verify round keeps exactly its accepted prefix, whatever the count, and the next steps follow serial decode (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4098,7 +4098,7 @@ test "dsv41 DSpark: a verify round keeps exactly its accepted prefix, whatever t
 }
 
 test "dsv41 DSpark: after a rollback the next draft is the serial model's draft (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4161,7 +4161,7 @@ fn settleRings(m: *Model) !void {
 }
 
 test "dsv41 DSpark: a one-row verify round is the serial step, opens no verify and leaves the rings for the next pass (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4202,7 +4202,7 @@ test "dsv41 DSpark: a one-row verify round is the serial step, opens no verify a
 }
 
 test "dsv41 DSpark: plain rounds whose commit is left lazy give the drafts and verify rows of the eager commit, where the drafter re-engages (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4286,7 +4286,7 @@ fn dsparkHeldBytes(m: *const Model) u64 {
 }
 
 test "dsv41 DSpark bills: the load's resident bytes and the state's windows are what the model holds (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     const io = std.Io.Threaded.global_single_threaded.io();
     const cpu = mlx.mlx_default_cpu_stream_new();
@@ -4306,7 +4306,7 @@ test "dsv41 DSpark bills: the load's resident bytes and the state's windows are 
 }
 
 test "dsv41 index stream: a prefill whose index top-k streams over key tiles gives the whole scores' logits bit for bit, packed keys, the candidate masks and decode after it (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4342,7 +4342,7 @@ test "dsv41 index stream: a prefill whose index top-k streams over key tiles giv
 }
 
 test "dsv41 packed KV: compressed rows and index keys kept as FP4 give the bf16 rows' logits bit for bit, through decode, a verify and its rollback (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4449,7 +4449,7 @@ fn expectSlotsBits(sc: *Scope, want: []const Slot, got: []const Slot) !void {
 }
 
 test "dsv41 restore point: a state restored at a position continues bit for bit like the cold run, through prefill, decode and a verify round (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4492,7 +4492,7 @@ test "dsv41 restore point: a state restored at a position continues bit for bit 
 }
 
 test "dsv41 restore point: a checkpoint of another position or shape is refused and leaves the state reset (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4561,7 +4561,7 @@ fn cedArm(m: *Model, sc: *Scope, ids: []const u32, chunks: []const usize, steps:
 }
 
 test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are the full forward's bits, and the same prompt in other chunks gives the same state and logits (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
 
 
     const dir = try fixtureDir();
@@ -4611,7 +4611,7 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
 }
 
 test "dsv41 Engram: each table keeps a row cache of exactly the bytes the load bills (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
     defer m.deinit();
@@ -4625,7 +4625,7 @@ test "dsv41 Engram: each table keeps a row cache of exactly the bytes the load b
 }
 
 test "dsv41 Engram: a chunk's rows read ahead on a thread give the bytes of the rows read at the layer, wide and decode (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4724,7 +4724,7 @@ fn expectAheadArms(m: *Model, sc: *Scope, ids: []const u32, from: usize, chunks:
 }
 
 test "dsv41 Engram: a prefill that reads each chunk's successor ahead gives the logits and state of one that does not (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4866,7 +4866,7 @@ fn maxRelErr(got: []const f32, want: []const f32) f64 {
 const NO_WORSE_F32_ULPS = 128;
 
 test "dsv41 fused attention: the one-pass kernel is no further from the f32 truth than the composed core (release span shapes)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const gpu = mlx.gpuStream();
     if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, gpu);
@@ -4942,7 +4942,7 @@ fn expectSameInts(want: A, got: A) !void {
 }
 
 test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order and ties included, and its block maxima the candidate mask's (release shapes)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const gpu = mlx.gpuStream();
     if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, gpu);
@@ -5366,7 +5366,7 @@ fn expectStoredRouterExact(dir: []const u8) !void {
 }
 
 test "dsv41 router: a bf16 router stays bf16 once loaded and routes bit for bit as its f32 widening (DSV41_TINY, DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var ran = false;
     for ([_][:0]const u8{ "DSV41_TINY", "DSV41_STQ_TINY" }) |env| {
         const raw = std.c.getenv(env) orelse continue;
@@ -5393,7 +5393,7 @@ test "dsv41 drop: the router with experts masked picks the top-k of the kept exp
 }
 
 test "dsv41 drop: the fused router kernel masks the same experts and weights the picks within the kernel's rounding (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try fixtureDir();
     const s = mlx.gpuStream();
     const full = try tinyModel(dir, .{ .act = .float32, .experts = false }, s);
@@ -5639,7 +5639,7 @@ fn stqFixtureDir() ![]const u8 {
 }
 
 test "dsv41 owned: every weight array of an STQ load with DSpark lies in a sushi-owned region (DSV41_STQ_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const dir = try stqFixtureDir();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);

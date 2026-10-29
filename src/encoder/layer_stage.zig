@@ -414,6 +414,7 @@ fn fixtureStage(fx: *const StageFixture, layer: u32, kind: Kind, experts: Stage.
 }
 
 test "layer_stage: one layer of a pack becomes a one-layer model whose names, index and config say so" {
+    try host.mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var fx = try StageFixture.init(t.allocator);

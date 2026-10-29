@@ -552,6 +552,7 @@ pub fn post(s: mlx.mlx_stream, y: Arr, gate: Arr, norm: Arr, epsilon: f32) !?Arr
 }
 
 test "GLM KDA fused post preserves staged BF16 output at prefill widths" {
+    try mlx.requireGpu();
     const Ops = @import("glm5_model.zig").Ops;
     const stream = mlx.gpuStream();
     for ([_]c_int{ 1, 17, 512 }) |rows| {
@@ -588,6 +589,7 @@ fn stagedPost(ops: *@import("glm5_model.zig").Ops, input: Arr, gate: Arr, norm: 
 }
 
 test "GLM KDA fused post validates guards and FP32 norm weights" {
+    try mlx.requireGpu();
     const Ops = @import("glm5_model.zig").Ops;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
@@ -619,6 +621,7 @@ test "GLM KDA post geometry guards every uint32 shader offset" {
 }
 
 test "GLM SIMD KDA, prework and router arms serve GPUs without NAX" {
+    try mlx.requireGpu();
     const transformer = @import("transformer.zig");
     const saved = transformer.vqmm_nax_probe_override;
     defer transformer.vqmm_nax_probe_override = saved;

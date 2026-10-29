@@ -2190,7 +2190,7 @@ test "dflash2: a sidecar's softcap + output_multiplier parse and transform the d
     try testing.expectApproxEqAbs(@as(f32, 20.0), cfg.logit_softcap, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.19611613), cfg.output_multiplier, 1e-6);
 
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     // Reference compute_logits: l*mult, then tanh(l/cap)*cap. Hand-computed.
     const vals = [_]f32{ 0.0, 51.0, -102.0, 300.0 };
@@ -2820,7 +2820,7 @@ test "dflash: load-time quantization packs every matmul weight and tracks the de
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -2861,7 +2861,7 @@ test "dflash: a sidecar shipping packed weights loads at its own declared width"
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
 
     var tmp_dense = std.testing.tmpDir(.{});
     defer tmp_dense.cleanup();
@@ -2936,7 +2936,7 @@ test "dflash2: loader picks up selector + dyn convs; v1 assistant loads with nei
 }
 
 test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
 
@@ -2977,7 +2977,7 @@ test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
 }
 
 test "dflash2: convPrepare taps base_kernel[0], convFinish taps [1], kernels from the INPUT" {
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
 
@@ -3030,7 +3030,7 @@ test "dflash2: convPrepare taps base_kernel[0], convFinish taps [1], kernels fro
 }
 
 test "dflash2: selectPath traces the pairwise-scored path, edges outvote unary logits" {
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
 
@@ -3251,7 +3251,7 @@ fn parityVs(got: mlx.mlx_array, want: []const f32, allocator: std.mem.Allocator,
 test "dflash fixture parity: encoder + two draft rounds vs transformers reference" {
     const fixtures_path = std.c.getenv("DFLASH_FIXTURES") orelse return;
     const assistant_dir = std.c.getenv("DFLASH_ASSISTANT_DIR") orelse return;
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -3352,7 +3352,7 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     // a pure-math question.
     const fixtures_path = std.c.getenv("DFLASH2_FIXTURES") orelse return;
     const assistant_dir = std.c.getenv("DFLASH2_ASSISTANT_DIR") orelse return;
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -3487,7 +3487,7 @@ test "GLM assistant cached sliding mask equals the mask built at any absolute po
 }
 
 test "GLM serving DFlash2 trims physical window and preserves absolute append positions" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var ops = @import("glm5_model.zig").Ops{ .s = s };
@@ -3559,7 +3559,7 @@ test "DFlash block tail engages only for the native GLM drafter" {
 }
 
 test "dflash2: prefix outputs preserve full block attention and causal convolution" {
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();

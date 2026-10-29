@@ -130,6 +130,7 @@ fn bank(ops: *Ops, hidden: c_int, intermediate: c_int, rate: c_int, down_rate: c
 }
 
 test "GLM DFlash clamped experts keep serial row bits at all supported rates" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     for (0..18) |case| {
         const production = case == 17;
@@ -170,6 +171,7 @@ test "GLM DFlash clamped experts keep serial row bits at all supported rates" {
 }
 
 test "GLM DFlash FFN batch matches each target FFN row" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);
@@ -254,16 +256,19 @@ fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_in
 }
 
 test "GLM DFlash FFN integrates production-width batched routing at every group-two rate" {
+    try mlx.requireGpu();
     var n: c_int = 32;
     while (n <= 64) : (n += 2) try expectGroup2Rows(std.testing.allocator, n, n);
     for ([_][2]c_int{ .{ 40, 36 }, .{ 36, 40 }, .{ 48, 32 }, .{ 32, 64 } }) |mixed| try expectGroup2Rows(std.testing.allocator, mixed[0], mixed[1]);
 }
 
 test "GLM DFlash FFN batches expert rows at every pack window" {
+    try mlx.requireGpu();
     for ([_]api.format.Window{ .w14, .w16 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, .{ .codebook = .mcg, .window = window });
 }
 
 test "GLM serves std1 and spec1 on DFlash FFN batched expert rows" {
+    try mlx.requireGpu();
     for ([_]api.format.Window{ .w14, .w15 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, api.format.Decode.tabled(.std1, window));
     try expectGroup2RowsAt(std.testing.allocator, 40, 36, api.format.Decode.tabled(.std1, .w15));
     try expectGroup2RowsAt(std.testing.allocator, 36, 36, api.format.Decode.tabled(.spec1, .w15));

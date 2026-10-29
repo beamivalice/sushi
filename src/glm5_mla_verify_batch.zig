@@ -39,6 +39,7 @@ fn fixture(ops: *Ops, dir: Direction, rows: c_int, bits: c_int) !Input {
 }
 
 test "GLM MLA verify batch matches each serial row projection" {
+    try mlx.requireGpu();
     for ([_]c_int{ 6, 5 }) |bits| for ([_]Direction{ .query, .value }) |dir| for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |rows| {
         var ops = Ops{ .s = mlx.gpuStream() };
         defer ops.deinit();

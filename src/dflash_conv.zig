@@ -93,7 +93,7 @@ fn run(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size: u32,
 }
 
 test "DFlash fused convolution preserves BF16 boundaries and strided tap sets" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const Ops = @import("glm5_model.zig").Ops;
     const fixture = @import("dflash.zig").TinyFix;
     for ([_]c_int{ 128, 4096 }) |width| for ([_]c_int{ 1, 2, 3, 8 }) |len| {

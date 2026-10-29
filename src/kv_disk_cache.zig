@@ -7814,6 +7814,7 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
 }
 
 test "DiskTier: a head snap with no raw-history tensor drops the head half and arms no MLX latch" {
+    try mlx.requireGpu();
     // Bar: a pooled-only head (qsa_rows > 0, empty `aux_state`) writes no `h.aux` and leaves the latch clear.
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -7881,6 +7882,7 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
 }
 
 test "DiskTier: a swallowed commit failure drops the latch it raised and keeps a foreign one" {
+    try mlx.requireGpu();
     // Bar: the appendCommit funnel's errdefer removes only the error THIS call raised.
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -10365,6 +10367,7 @@ test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" 
 }
 
 test "DiskTier: a failed restore drops the latch it raised and keeps a foreign one" {
+    try mlx.requireGpu();
     // The caller's cold-prefill fallback must not inherit this restore's MLX error.
     mlx.installErrorHandler();
     const io = std.testing.io;

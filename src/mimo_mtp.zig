@@ -809,7 +809,7 @@ fn expectRowClose(label: []const u8, k: usize, q: usize, ours: mlx.mlx_array, re
 
 test "mimo mtp heads warm up every head on a throwaway state (MIMO_V2_MODEL)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -840,7 +840,7 @@ test "mimo mtp drafts through a 2-bit coarse readout unless the env names anothe
 test "mimo mtp state keeps its hidden ring, not the prefill chunk it was cut from" {
     // `State.billedBytes` holds RING_ROWS hiddens (twice); a slice view of a whole chunk's
     // hiddens held the chunk instead, until the first round replaced it.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const width: c_int = 1024;
     const rows: usize = 4096;
@@ -874,7 +874,7 @@ test "mimo mtp state keeps its hidden ring, not the prefill chunk it was cut fro
 test "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across rounds, drafts and rollbacks (MIMO_V2_MODEL + MIMO_V2_MTP_FIXTURE)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
     const fixture_path = std.c.getenv("MIMO_V2_MTP_FIXTURE") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();

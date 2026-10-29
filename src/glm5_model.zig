@@ -836,6 +836,7 @@ fn expectLayerReference(actual: Arr, expected: Arr, abs: f32, rel: f32) !void {
 }
 
 test "GLM reference full KDA apply matches oMLX serial and irregular chunks" {
+    try mlx.requireGpu();
     var fixture = try loadLayerFixture();
     defer fixture.deinit();
     const cfg = model.ModelConfig{ .hidden_size = 128, .linear_key_head_dim = 128, .linear_num_value_heads = 1, .linear_conv_kernel_dim = 4, .kda_gate_lower_bound = -5, .rms_norm_eps = 1e-5 };
@@ -870,6 +871,7 @@ test "GLM reference full KDA apply matches oMLX serial and irregular chunks" {
 }
 
 test "GLM reference mHC assembled collapse and expand match oMLX" {
+    try mlx.requireGpu();
     var fixture = try loadLayerFixture();
     defer fixture.deinit();
     var ops = Ops{ .s = mlx.gpuStream() };
@@ -888,6 +890,7 @@ test "GLM reference mHC assembled collapse and expand match oMLX" {
 }
 
 test "GLM reference SiLU preserves source BF16 convolution and dense FFN rounding" {
+    try mlx.requireGpu();
     var fixture = try loadLayerFixture();
     defer fixture.deinit();
     var ops = Ops{ .s = mlx.gpuStream() };
@@ -902,6 +905,7 @@ test "GLM reference SiLU preserves source BF16 convolution and dense FFN roundin
 }
 
 test "GLM prepared KDA constants preserve results and have idempotent ownership" {
+    try mlx.requireGpu();
     var fixture = try loadLayerFixture();
     defer fixture.deinit();
     const cfg = model.ModelConfig{ .hidden_size = 128, .linear_key_head_dim = 128, .linear_num_value_heads = 1, .linear_conv_kernel_dim = 4, .kda_gate_lower_bound = -5, .rms_norm_eps = 1e-5 };
@@ -954,6 +958,7 @@ fn expectLayerBits(actual: Arr, expected: Arr) !void {
 }
 
 test "GLM fused KDA decode preserves output and FP32 state exactly" {
+    try mlx.requireGpu();
     for ([_]u32{ 1, 3, 64 }) |heads| {
         var fixture = try loadLayerFixture();
         defer fixture.deinit();
@@ -1034,6 +1039,7 @@ test "GLM fused KDA decode preserves output and FP32 state exactly" {
 }
 
 test "GLM KDA prework integration preserves whole layer and state bits" {
+    try mlx.requireGpu();
     const prework = @import("glm5_kda_prework.zig");
     defer prework.forceReferenceForTest(false);
     var fixture = try loadLayerFixture();
@@ -1085,6 +1091,7 @@ test "GLM KDA prework integration preserves whole layer and state bits" {
 }
 
 test "GLM KDA prefill chunk reads the projections in place with the staged path's bits" {
+    try mlx.requireGpu();
     const prework = @import("glm5_kda_prework.zig");
     defer prework.forceReferenceForTest(false);
     const s = mlx.gpuStream();
@@ -1149,6 +1156,7 @@ test "GLM KDA prefill chunk reads the projections in place with the staged path'
 }
 
 test "GLM model A6 stored projection transpose and embedding rows preserve geometry" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     const stream = mlx.gpuStream();
     var weights = model.Weights.init(a);
@@ -1198,6 +1206,7 @@ test "GLM model A6 stored projection transpose and embedding rows preserve geome
 }
 
 test "GLM model A5 stored projection dequantizes to its codes and applies through the generic quantized matmul" {
+    try mlx.requireGpu();
     const a = std.testing.allocator;
     var weights = model.Weights.init(a);
     defer weights.deinit();
@@ -1270,6 +1279,7 @@ test "GLM FP8 projection follows MiMo source arithmetic at decode and prefill wi
 }
 
 test "GLM NAX arms and their bills follow the one NAX gate" {
+    try mlx.requireGpu();
     const transformer = @import("transformer.zig");
     const saved = transformer.vqmm_nax_probe_override;
     defer transformer.vqmm_nax_probe_override = saved;

@@ -168,7 +168,7 @@ fn windowMajor(net: *const forward.Model, request: *forward.Request, windows: []
 }
 
 test "GLM layer-major prefill writes window-major's logits and every boundary byte for byte at any batch size" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const base = @import("glm5_model.zig");
     base.reference_numerics = true;

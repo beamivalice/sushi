@@ -245,7 +245,7 @@ fn expectSameBytes(want: A, got: A) !void {
 }
 
 test "dsv41 owned: the owned ragged bank is exl3.Ragged.init's storage, meta, views and offsets" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     var rng = std.Random.DefaultPrng.init(7);
@@ -304,7 +304,7 @@ test "dsv41 owned: the owned ragged bank is exl3.Ragged.init's storage, meta, vi
 }
 
 test "dsv41 owned: the stacks are mlx_concatenate_axis's bytes on each axis" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     const min = model.import_min_bytes;
@@ -340,7 +340,7 @@ test "dsv41 owned: the stacks are mlx_concatenate_axis's bytes on each axis" {
 }
 
 test "dsv41 owned: a bf16 tensor widens to MLX's astype f32 bits, NaN, Inf and denormals included" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     const min = model.import_min_bytes;
