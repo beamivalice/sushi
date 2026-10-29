@@ -52,13 +52,21 @@ MODEL_ID="$(curl -s "$BASE/v1/models" | python3 -c 'import json,sys; print(json.
 # A prompt whose only stable continuation is the same short cycle: the
 # period-1..8 tier convicts it within ~130 tokens, so the whole script is fast.
 LOOP_PROMPT="$SUSHI_NONCE Output the exact line 'ping pong ping pong' over and over, hundreds of times, with no other text and no ending."
+LOOP_MSGS="[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}]"
+LOOP_CONT=
+if [ "${SUSHI_ARCH:-}" = glm5_next ]; then
+    # GLM answers this prompt with a refusal, so the cycle is seeded as the start of its own reply.
+    PREFILL=$(python3 -c 'print("ping pong ping pong\\n" * 12, end="")')
+    LOOP_MSGS="[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"},{\"role\":\"assistant\",\"content\":\"$PREFILL\"}]"
+    LOOP_CONT=',"continue_final_message":true'
+fi
 
 echo "Loop-stop wire contract on $MODEL_ID"
 
 # ── 1. chat, non-streaming: signal AND trim ──────────────────────────────
 echo "[1/5] /v1/chat/completions non-streaming"
 BODY=$(curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,$NOTHINK}")
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":$LOOP_MSGS,\"max_tokens\":3000,\"temperature\":0,$NOTHINK$LOOP_CONT}")
 echo "$BODY" | python3 -c '
 import json,sys
 d=json.load(sys.stdin); ch=d["choices"][0]
@@ -92,7 +100,7 @@ grep -q "^verdict trimmed$" "$LOG.trim"; check "the degenerate tail is cut from 
 # EXACTLY one chunk, and the usage chunk carries an empty choices array.
 echo "[2/5] /v1/chat/completions streaming"
 curl -sN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,$NOTHINK,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":$LOOP_MSGS,\"max_tokens\":3000,\"temperature\":0,$NOTHINK$LOOP_CONT,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
   > "$LOG.rawstream"
 grep -c '"finish_details":{"type":"repetition_loop"}' "$LOG.rawstream" > "$LOG.stream"
 [ "$(cat "$LOG.stream")" -ge 1 ]; check "the final chunk carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
