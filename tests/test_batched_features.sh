@@ -30,12 +30,17 @@ N="$SUSHI_NONCE"
 TOOLS='[{"type":"function","function":{"name":"save_note","parameters":{"type":"object","properties":{"text":{"type":"string"},"tag":{"type":"string"}},"required":["text","tag"]}}}]'
 SCHEMA='{"type":"json_schema","json_schema":{"name":"p","strict":true,"schema":{"type":"object","properties":{"animal":{"type":"string","enum":["cat","dog","owl"]},"legs":{"type":"integer"}},"required":["animal","legs"],"additionalProperties":false}}}'
 LONG="$N Write a 250-word essay about the ocean."
+# GLM's template has no thinking-off mode: low effort and a cap that leaves room for content after the thought.
+case "$SUSHI_ARCH" in
+    glm5_next) LP_THINK='"reasoning_effort":"low"'; LP_MAX=600 ;;
+    *) LP_THINK='"enable_thinking":false'; LP_MAX=60 ;;
+esac
 
 echo "=== burst: six contracts in one group ==="
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Save a note with tag $CODE and text 'batched'. Use the save_note tool now.\"}],\"tools\":$TOOLS,\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/tools.sse" & P1=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Describe an owl.\"}],\"response_format\":$SCHEMA,\"max_tokens\":80,\"temperature\":0}" > "$WORK/schema.json" & P2=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N What is 12*12? Answer briefly.\"}],\"enable_thinking\":true,\"stream\":true,\"max_tokens\":400,\"temperature\":0}" > "$WORK/think.sse" & P3=$!
-post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"logprobs\":true,\"top_logprobs\":3,\"enable_thinking\":false,\"max_tokens\":60,\"temperature\":0}" > "$WORK/logprobs.json" & P4=$!
+post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"logprobs\":true,\"top_logprobs\":3,$LP_THINK,\"max_tokens\":$LP_MAX,\"temperature\":0}" > "$WORK/logprobs.json" & P4=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Count from one to twenty in words, comma separated.\"}],\"stop\":[\"seven\"],\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/stop.sse" & P5=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"max_tokens\":5,\"temperature\":0.7}" > "$WORK/cap5.json" & P6=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"max_tokens\":300,\"temperature\":0}" > "$WORK/cap300.json" & P7=$!
@@ -43,8 +48,13 @@ wait $P1 $P2 $P3 $P4 $P5 $P6 $P7
 
 # engagement: the group really formed
 # Engagement lines are logged once per process, so an earlier script on this boot may have logged it: read the whole log.
-SLOTS=$(grep -oE "\[batched\] .*engaged \(slots=[0-9]+" "$SUSHI_LOG" | grep -oE "[0-9]+$" | sort -n | tail -1)
-[[ -n "$SLOTS" && "$SLOTS" -ge 2 ]] && ok "batched decode engaged (max slots=$SLOTS)" || bad "batched decode engaged" "no [batched] engaged line with slots>=2"
+if [ "$SUSHI_ARCH" = glm5_next ]; then
+    # GLM logs no engagement line; its batched path ends a request with `path=batch`.
+    SLOTS=$(grep -c "path=batch" "$SUSHI_LOG")
+else
+    SLOTS=$(grep -oE "\[batched\] .*engaged \(slots=[0-9]+" "$SUSHI_LOG" | grep -oE "[0-9]+$" | sort -n | tail -1)
+fi
+[[ -n "$SLOTS" && "$SLOTS" -ge 2 ]] && ok "batched decode engaged ($SLOTS)" || bad "batched decode engaged" "no [batched] engaged line with slots>=2"
 
 # tools (stream): the call carries its own code, args valid JSON
 ARGS=$(grep '^data: {' "$WORK/tools.sse" | sed 's/^data: //' | python3 -c '
