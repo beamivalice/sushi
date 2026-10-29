@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Integration test: /v1/models advertises capabilities, input_modalities, and
 # uses the loaded model's full name (directory basename) as the `id`.
 #
@@ -16,55 +16,15 @@
 
 set -u
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8099}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+BASE=$SUSHI_URL
+[ -n "${SUSHI_PACK:-}" ] || { echo "SUSHI_PACK is unset: run through tests/run.sh, or set it to the served pack"; exit 1; }
 PASS=0
 FAIL=0
 TOTAL=0
 
-if [ ! -d "$MODEL_DIR" ]; then
-    echo "SKIP: Model not found at $MODEL_DIR"
-    exit 0
-fi
-
-if [ ! -x "./zig-out/bin/sushi" ]; then
-    echo "FAIL: sushi not built — run 'zig build -Doptimize=ReleaseFast' first"
-    exit 1
-fi
-
 echo "=== /v1/models capabilities test ==="
-echo "Model: $MODEL_DIR"
 echo ""
-
-echo "Starting server..."
-./zig-out/bin/sushi \
-    --model "$MODEL_DIR" --serve --port $PORT --log-level info \
-    >/tmp/sushi-models-test.log 2>&1 &
-SERVER_PID=$!
-sleep 2
-
-for i in $(seq 1 30); do
-    if curl -sf "$BASE/health" > /dev/null 2>&1; then
-        echo "Server ready (PID $SERVER_PID)"
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        echo "FAIL: Server did not start within 30s"
-        kill $SERVER_PID 2>/dev/null
-        exit 1
-    fi
-    sleep 1
-done
-echo ""
-
-cleanup() {
-    echo ""
-    echo "Stopping server (PID $SERVER_PID)..."
-    kill $SERVER_PID 2>/dev/null
-    wait $SERVER_PID 2>/dev/null
-}
-trap cleanup EXIT
 
 run_test() {
     local name="$1"
@@ -80,7 +40,7 @@ run_test() {
     fi
 }
 
-EXPECTED_ID=$(basename "$MODEL_DIR")
+EXPECTED_ID=$(basename "$SUSHI_PACK")
 RESULT=$(curl -sf "$BASE/v1/models")
 echo "raw: $RESULT"
 echo ""
