@@ -222,6 +222,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   MEASURED it.
 - MLX's mean over a NON-last axis sums a column in row order only while that axis is <= 8 (`col_reduce_small`,
   threadgroup_y = min(8, R)); longer columns pre-sum at stride 8 or in trees, so a serial mirror declines past 8.
+- On an M5 (NAX) MLX's f32 `matmul` is TF32-class: both operands keep their top 10 mantissa bits (truncated, not
+  rounded), the products are exact, and a K = 4 sum is `(p0 + p1) + (p2 + p3)`. A kernel that reproduces such a matmul
+  truncates the operands the same way and is bit-identical (DeepSeek's `hcExpand`, `dsv41_hc_expand`); a fma chain, a
+  sequential sum or round-to-nearest operands differ in 9% of bf16 and every f32 element. A true-f32 GPU (M1) does not
+  match, so the fused arm is gated by a load probe against the chain.
 - `mlx_fast_rope` is not the composed rope: it keeps cos/sin in f32 and rounds once; the chain rounds the bf16 table,
   each product and the sum.
 

@@ -1774,6 +1774,48 @@ pub fn hcNorm(sc: *Scope, z: A, x: A, cpre: A, norm_w: A, iters: usize, eps: A) 
     return .{ .sp = .{ .pre = o[0], .post = o[1], .comb = o[2] }, .h = o[3] };
 }
 
+/// Whether `hcExpandFused` reproduces this GPU's `hcExpandOps` byte for byte; set by `probeHc`.
+var hc_expand_tf32 = false;
+
+pub fn hcExpandProbed() bool {
+    return hc_expand_tf32;
+}
+
+pub fn hcExpandServes(x: A) bool {
+    return hc_expand_tf32 and dim(x, 1) == 4;
+}
+
+/// `hcExpand`'s op chain as one pass: `out[k] = post[k] * y + sum_j comb[j, k] * x[j]`. The chain's f32 matmul is
+/// TF32-class on a NAX GPU: both operands keep their top 10 mantissa bits (truncated), the four products are exact, and
+/// the sum is `(p0 + p1) + (p2 + p3)`; a GPU whose matmul is true f32 fails the probe and keeps the chain.
+const HC_EXPAND_SOURCE =
+    \\#pragma clang fp contract(off)
+    \\const int d = int(thread_position_in_grid.x), l = int(thread_position_in_grid.y);
+    \\const int D = x_shape[2];
+    \\if (d >= D) return;
+    \\const size_t xo = size_t(l) * HC * D + d;
+    \\float xv[HC];
+    \\for (int j = 0; j < HC; ++j) xv[j] = as_type<float>(as_type<uint>(float(x[xo + size_t(j) * D])) & 0xFFFFE000u);
+    \\const float yv = float(y[size_t(l) * D + d]);
+    \\for (int k = 0; k < HC; ++k) {
+    \\  float p[HC];
+    \\  for (int j = 0; j < HC; ++j) p[j] = as_type<float>(as_type<uint>(comb[l * HC * HC + j * HC + k]) & 0xFFFFE000u) * xv[j];
+    \\  out[xo + size_t(k) * D] = T(post[l * HC + k] * yv + ((p[0] + p[1]) + (p[2] + p[3])));
+    \\}
+;
+
+var hc_expand_def = Def{ .name = "dsv41_hc_expand", .ins = &.{ "x", "y", "post", "comb" }, .outs = &.{"out"}, .source = HC_EXPAND_SOURCE };
+
+/// `hcExpand` of four copies in one kernel, in `x`'s dtype; valid only where `hcExpandServes`.
+pub fn hcExpandFused(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
+    const L = dim(x, 0);
+    const D = dim(x, 2);
+    const dt = mlx.mlx_array_dtype(x);
+    var o: [1]A = undefined;
+    try launch(sc, &hc_expand_def, &.{ x, y, post, comb }, &.{.{ .shape = mlx.getShape(x), .dt = dt }}, .{ (D + 255) / 256 * 256, L, 1 }, .{ 256, 1, 1 }, &.{.{ .name = "HC", .v = 4 }}, &.{.{ .name = "T", .dt = dt }}, &o);
+    return o[0];
+}
+
 /// Launches the top-k kernels (one threadgroup a row, and chunked) at `topk_tg` threads, halving it until they run.
 pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
     while (true) {
@@ -1796,7 +1838,7 @@ fn probeTopkOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
 }
 
 /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1, M2): launches every hyper-connection
-/// kernel once at `hc_tg` threads and halves it until they run.
+/// kernel once at `hc_tg` threads and halves it until they run, then checks `hcExpandFused` against the chain.
 pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !void {
     while (true) {
         probeHcOnce(gpa, s, hc, D, iters) catch |e| {
@@ -1804,8 +1846,34 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
             hc_tg /= 2;
             continue;
         };
-        return;
+        break;
     }
+    hc_expand_tf32 = hc == 4 and probeHcExpand(gpa, s, D);
+}
+
+/// The fused expand against the chain on random streams of both dtypes at a wide and a narrow row count.
+fn probeHcExpand(gpa: std.mem.Allocator, s: mlx.mlx_stream, D: usize) bool {
+    var sc = Scope.init(gpa, s);
+    defer sc.deinit();
+    return probeHcExpandIn(&sc, D) catch blk: {
+        var buf: [512]u8 = undefined;
+        _ = mlx.takeError(&buf);
+        break :blk false;
+    };
+}
+
+fn probeHcExpandIn(sc: *Scope, D: usize) !bool {
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5, 48 }) |L| {
+        const d: c_int = ci(D);
+        const x = try sc.astype(try randn(sc, &.{ L, 4, d }, .float32, 171, 1.5), dt);
+        const y = try sc.astype(try randn(sc, &.{ L, d }, .float32, 172, 1.0), dt);
+        const post = try randn(sc, &.{ L, 4 }, .float32, 173, 0.7);
+        const comb = try randn(sc, &.{ L, 4, 4 }, .float32, 174, 0.5);
+        const want = try sc_mod.hostF32(try sc.astype(try model.hcExpandOps(sc, x, y, post, comb), .float32));
+        const got = try sc_mod.hostF32(try sc.astype(try hcExpandFused(sc, x, y, post, comb), .float32));
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) return false;
+    };
+    return true;
 }
 
 fn probeHcOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !void {
@@ -2063,7 +2131,7 @@ fn composedFfn(sc: *Scope, f: *const FfnData, dt: mlx.mlx_dtype) !A {
     const u = try (model.Lin{ .w = f.sh.up.w, .s = f.sh.up.s }).apply(sc, f.x);
     const sy = try (model.Lin{ .w = f.sh.down.w, .s = f.sh.down.s }).apply(sc, try sc.astype(try model.clampedSwiglu(sc, g, u, f.c.limit), dt));
     const y = try sc.astype(try sc.add(routed, try sc.astype(sy, .float32)), dt);
-    return model.hcExpand(sc, f.res, y, f.post, f.comb);
+    return model.hcExpandOps(sc, f.res, y, f.post, f.comb);
 }
 
 /// The FFN in f64 from the exact dequantized weights and the same inputs, no rounding between stages.
@@ -2806,7 +2874,7 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     try expectNoWorse("stage z", relErr(try hostOf(&sc, st.z), z_truth), relErr(try hostOf(&sc, ref.z), z_truth));
     try expectNoWorse("stage h", relErr(try hostOf(&sc, st.h), h_truth), relErr(try hostOf(&sc, ref.h), h_truth));
     // the expanded stream: the chain's `hcExpand`, then the same two outputs of its mixes
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const x1_ref = try model.hcExpandOps(&sc, d.x, d.y, d.prev.post, d.prev.comb);
     const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     const xh = try hostOf(&sc, d.x);
     const yh = try hostOf(&sc, d.y);
@@ -2831,7 +2899,7 @@ test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and ex
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const d = try hcData(&sc, 1, .bfloat16);
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const x1_ref = try model.hcExpandOps(&sc, d.x, d.y, d.prev.post, d.prev.comb);
     const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     try expectLe("bf16 expanded stream", relErrF(try hostOf(&sc, sx.x1), try hostOf(&sc, x1_ref)), 1.0 / 128.0);
     const ref = try composedHc(&sc, &d, x1_ref);
@@ -2892,6 +2960,42 @@ test "dsv41 hc wide: the mix and norm kernels give the decode stage's mixes, spl
         try expectBitEqual("hc norm post", try sc_mod.hostF32(wide.sp.post), try sc_mod.hostF32(sp.post));
         try expectBitEqual("hc norm comb", try sc_mod.hostF32(wide.sp.comb), try sc_mod.hostF32(sp.comb));
     }
+}
+
+test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    try probeHc(sc.a, sc.s, 4, 5120, 20);
+    // The kernel reproduces a TF32-class matmul; where the GPU's is true f32 (relative error under 1e-5 of a stream
+    // element) the load keeps the chain and there is nothing to compare.
+    const tf32_class = blk: {
+        const x = try sc.astype(try randn(&sc, &.{ 1, 4, 64 }, .float32, 185, 1.5), .float32);
+        const comb = try randn(&sc, &.{ 1, 4, 4 }, .float32, 186, 0.5);
+        const got = try hostOf(&sc, try model.hcExpandOps(&sc, x, try sc.zeros(&.{ 1, 64 }, .float32), try sc.zeros(&.{ 1, 4 }, .float32), comb));
+        const xs = try hostOf(&sc, x);
+        const cs = try hostOf(&sc, comb);
+        var worst: f64 = 0;
+        for (0..4) |k| for (0..64) |c| {
+            var t: f64 = 0;
+            for (0..4) |j| t += @as(f64, cs[j * 4 + k]) * xs[j * 64 + c];
+            worst = @max(worst, @abs(got[k * 64 + c] - t) / @max(@abs(t), 1e-3));
+        };
+        break :blk worst > 1e-5;
+    };
+    if (!tf32_class) return;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5120, 4096, 1000, 40 }) |D| for ([_]c_int{ 1, 3, 16, 17, 33, 100, 1000, 2048, 4096 }) |L| {
+        var cs = Scope.init(testing.allocator, mlx.gpuStream());
+        defer cs.deinit();
+        const x = try cs.astype(try randn(&cs, &.{ L, 4, D }, .float32, 181, 1.5), dt);
+        const y = try cs.astype(try randn(&cs, &.{ L, D }, .float32, 182, 1.0), dt);
+        const post = try randn(&cs, &.{ L, 4 }, .float32, 183, 0.7);
+        const comb = try randn(&cs, &.{ L, 4, 4 }, .float32, 184, 0.5);
+        const want = try hostOf(&cs, try model.hcExpandOps(&cs, x, y, post, comb));
+        const got = try hostOf(&cs, try hcExpandFused(&cs, x, y, post, comb));
+        try expectBitEqual("hc expand", got, want);
+    };
+    try testing.expect(hc_expand_tf32);
 }
 
 test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {

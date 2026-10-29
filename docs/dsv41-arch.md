@@ -124,7 +124,15 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   tok/s at 4.7k against 47.8, the same 600 greedy tokens: a tie that removes 40 dispatches; one boot, GPU lock, QUIET,
   fans max, die 48 C, taskpolicy -a). The FFN-side split and expand stay: the FFN output's `hcExpand` is the MLX op chain,
   whose f32 matmul is TF32-class (rms error 7.6e-4 against the f64 truth, the `_x` kernel's arithmetic 4.6e-8; 9% of bf16
-  and every f32 element differ), so folding it into the next stage changes output bytes and needs the KLD gate.
+  and every f32 element differ), so folding it into the next stage's decode kernel changes output bytes and needs the KLD
+  gate. A wide block instead runs the chain's own arithmetic in one pass (`dsv41_hc_expand`: operands truncated to 10
+  mantissa bits, exact products, `(p0 + p1) + (p2 + p3)`, bit-identical), which is why it is not a KLD matter.
+  Measured on c5fec957 plus this change (kernel bench, quiet box, AC, `taskpolicy -a`, 9 rounds): the expand of 2048 rows 3.4 ms to 0.6, the
+  FFN stage (expand + mix + norm) 5.1 to 2.2; at 512 rows 2.1 to 0.4 and 1.7 to 0.7. End to end, resident 32K stage profile
+  (`--drop-expert 128 --ssd-budget-gb 94`, one boot each, A c5fec957, B the same plus this change, GPU lock, QUIET, fans
+  max): the 2048 chunk ending at 30,720 ran `hc_ffn` 132.7 + 10.4 (encoder + decoder) to 50.1 + 6.6 ms and `expand` 95.2 + 8.6
+  to 12.4 + 4.2, total 2,000.6 to 1,854.2 ms; the 32,768-token prefill 1,015.6 to 1,107.7 tok/s. What is left of the stage
+  (mix and norm, 1.6 ms of the 2.2 per layer) keeps its reduction order, so it is not fused further.
 
 ### QAT round trips
 
@@ -305,11 +313,13 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_index_scores`, `dsv41_index_scores_fp4`, `dsv41_index_tile` | the indexer's relu-weighted scores over key tiles, with the unseen groups at -inf | scalar up to 16 rows (`_fp4` reads the packed keys), matrix tiles when 8 divides the heads and the width | scalar and tile no further from the f64 truth than the chain; `_fp4` the unpacked keys' scores bit for bit; a tile scored at its key offset the whole list's columns bit for bit |
 | `dsv41_hc_stage`, `dsv41_hc_stage_x`, `dsv41_hc_stage_z`, `dsv41_hc_split` | `hcMixes`, the previous-mix collapse and rms norm, and (`_x`) the `hcExpand` that feeds the FFN stage; the Sinkhorn split on one simdgroup; `_z` takes the attention's mixes and splits them in every threadgroup (no `dsv41_hc_split` dispatch after the attention stage) | up to 16 rows | mixes and normed collapse no further from the f64 truth than the chain; the expanded stream likewise; the split to 2e-6 of the thread-per-row split; `_z` bit for bit the split kernel plus `_x` (1, 3, 16 rows, bf16 and f32) |
 | `dsv41_hc_mix`, `dsv41_hc_norm` | the same for a wide block (a tile of rows and mixes a threadgroup; split + collapse + norm) | more than 16 rows | bit for bit the stage's z, split and normed collapse |
+| `dsv41_hc_expand` | `hcExpand`'s op chain (post x y + comb^T x) on a wide block: the stream in one pass | any rows, GPU stream, 4 copies, where `probeHc` finds the GPU's f32 matmul TF32-class and the kernel equal to the chain | bit for bit the chain (bf16 and f32; 1 to 4096 rows; D 40 to 5120) |
 | `dsv41_engram` | the Engram gate chain after `wkv` | up to 16 rows | bit for bit (MLX's row-reduction order) |
 
 `SUSHI_DSV41_COMPOSED=1` (a diagnostic, read at load) runs the op chains instead and the load logs
 `[dsv41] fused kernels on|off`: the teacher arm of the KLD A/B. The hyper-connection kernels run at 1024 threads a
-threadgroup and halve it at load where the GPU caps them lower (`probeHc`).
+threadgroup and halve it at load where the GPU caps them lower (`probeHc`), which also compares `dsv41_hc_expand` with the
+chain on random streams and leaves it off where they differ.
 
 The f32 matmul and `quantized_matmul` of MLX carry noise the kernels do not (about 3e-5 of the peak on a decode FFN), so
 "closer to the f64 truth than the chain" is the bar wherever the sum order differs; a kernel that changes f32 sums

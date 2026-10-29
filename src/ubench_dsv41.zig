@@ -559,3 +559,73 @@ fn runTopk(run: *report.Run) anyerror!void {
         }
     }
 }
+
+// ── dsv41.hc_expand ─────────────────────────────────────────────────────
+
+pub const hc_expand: report.Bench = .{
+    .name = "dsv41.hc_expand",
+    .scope = .dsv41,
+    .what = "the hyper-connection expand of a wide chunk (hc 4 x 5120, bf16 stream): the op chain against the fused kernel, alone (the layer tail) and followed by the stage's mix and norm kernels (the FFN stage)",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{
+        .{ .name = "rows", .values = &.{ "512", "2048" } },
+        .{ .name = "stage", .values = &.{ "expand", "ffn" }, .numeric = false },
+    },
+    .arms = &.{ "chain", "fused" },
+    .ref = "chain",
+    .run = runHcExpand,
+};
+
+const HcExpandData = struct { x: A, y: A, post: A, comb: A, cpre: A, w: A, hw: kernels.HcWeights, eps: A };
+
+const HcExpandSample = struct { gpu: mlx.mlx_stream, d: HcExpandData, ffn: bool };
+
+fn sampleHcExpand(s: *HcExpandSample, arm: usize) anyerror!f64 {
+    const d = s.d;
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    var sw = io_util.Stopwatch.init(io());
+    const x1 = if (arm == 0) try model.hcExpandOps(&sc, d.x, d.y, d.post, d.comb) else try kernels.hcExpandFused(&sc, d.x, d.y, d.post, d.comb);
+    var ev: [2]A = .{ x1, x1 };
+    if (s.ffn) {
+        const n = try kernels.hcNorm(&sc, try kernels.hcMix(&sc, x1, d.hw, d.eps), x1, d.cpre, d.w, 20, d.eps);
+        ev[1] = n.h;
+    }
+    try evalAll(&ev);
+    return @floatFromInt(sw.read());
+}
+
+fn runHcExpand(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const D = 5120;
+    const mix = 24;
+    try kernels.probeHc(alloc, gpu, 4, D, 20);
+    var rows_buf: [8]usize = undefined;
+    for (try axisInts(run, "rows", &rows_buf)) |L| {
+        var sc = Scope.init(alloc, gpu);
+        defer sc.deinit();
+        const l: c_int = ci(L);
+        const f32t = mlx.mlx_dtype.float32;
+        const d: HcExpandData = .{
+            .x = try sc.astype(try kernels.randn(&sc, &.{ l, 4, D }, f32t, 201, 1.5), .bfloat16),
+            .y = try sc.astype(try kernels.randn(&sc, &.{ l, D }, f32t, 202, 1.0), .bfloat16),
+            .post = try kernels.randn(&sc, &.{ l, 4 }, f32t, 203, 0.7),
+            .comb = try kernels.randn(&sc, &.{ l, 4, 4 }, f32t, 204, 0.5),
+            .cpre = try sc.op1(mlx.mlx_abs, try kernels.randn(&sc, &.{ l, 4 }, f32t, 205, 0.6)),
+            .w = try sc.astype(try sc.add(try kernels.randn(&sc, &.{D}, f32t, 206, 0.2), try sc.f(1.0)), .bfloat16),
+            .hw = .{ .fn_w = try kernels.randn(&sc, &.{ mix, 4 * D }, f32t, 207, 0.02), .scale = try sc.floats(&.{ 0.3, 0.5, 0.7 }, &.{3}), .base = try kernels.randn(&sc, &.{mix}, f32t, 208, 0.5) },
+            .eps = try kernels.hcEps(&sc, 1e-6, 1e-6),
+        };
+        try evalAll(&.{ d.x, d.y, d.post, d.comb, d.cpre, d.w, d.hw.fn_w, d.hw.scale, d.hw.base, d.eps });
+        const want = try sc_mod.hostF32(try sc.astype(try model.hcExpandOps(&sc, d.x, d.y, d.post, d.comb), f32t));
+        const got = try sc_mod.hostF32(try sc.astype(try kernels.hcExpandFused(&sc, d.x, d.y, d.post, d.comb), f32t));
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) run.invalid("the fused expand's bytes differ from the chain's");
+        for ([_][]const u8{ "expand", "ffn" }) |stage| {
+            if (!listed(run.axis("stage"), stage)) continue;
+            var s: HcExpandSample = .{ .gpu = gpu, .d = d, .ffn = std.mem.eql(u8, stage, "ffn") };
+            const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ stage, L });
+            try run.interleave(label, &s, sampleHcExpand);
+        }
+    }
+}

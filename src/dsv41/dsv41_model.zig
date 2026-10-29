@@ -1291,8 +1291,14 @@ pub fn hcCollapse(sc: *Scope, x: A, pre: A) !A {
     return sc.astype(try sc.reshape(y, &.{ ci(dim(x, 0)), ci(dim(x, 2)) }), mlx.mlx_array_dtype(x));
 }
 
+/// `hcExpandOps` as one kernel where this GPU's f32 matmul is the one the kernel reproduces, else the chain.
+fn hcExpand(sc: *Scope, m: *const Model, x: A, y: A, post: A, comb: A) !A {
+    if (fusedOn(sc, m) and kernels.hcExpandServes(x)) return kernels.hcExpandFused(sc, x, y, post, comb);
+    return hcExpandOps(sc, x, y, post, comb);
+}
+
 /// `out[k] = post[k] * y + sum_j comb[j, k] * x[j]` — the new stream.
-pub fn hcExpand(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
+pub fn hcExpandOps(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
     const xf = try sc.astype(x, .float32);
     const branch = try sc.mul(try sc.expand(post, 2), try sc.expand(try sc.astype(y, .float32), 1));
     const resid = try sc.matmul(try sc.transpose(comb, &.{ 0, 2, 1 }), xf);
@@ -2281,12 +2287,12 @@ fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?HcPrev, cpre: A, hc: *const Hc,
             return .{ .mix = .{ .z = st.z }, .h = st.h, .x1 = st.x1 };
         }
         const sp = if (ex) |e| try e.prev.split(sc, m) else null;
-        const x1 = if (ex) |e| try hcExpand(sc, x, e.y, sp.?.post, sp.?.comb) else x;
+        const x1 = if (ex) |e| try hcExpand(sc, m, x, e.y, sp.?.post, sp.?.comb) else x;
         const n = try kernels.hcNorm(sc, try kernels.hcMix(sc, x1, hw, eps), x1, if (sp) |s| s.pre else cpre, norm_w, c.hc_iters, eps);
         return .{ .mix = .{ .sp = .{ .pre = n.sp.pre, .post = n.sp.post, .comb = n.sp.comb } }, .h = n.h, .x1 = x1 };
     }
     const sp = if (ex) |e| try e.prev.split(sc, m) else null;
-    const x1 = if (ex) |e| try hcExpand(sc, x, e.y, sp.?.post, sp.?.comb) else x;
+    const x1 = if (ex) |e| try hcExpand(sc, m, x, e.y, sp.?.post, sp.?.comb) else x;
     return .{ .mix = .{ .sp = try hcMixes(sc, m, x1, hc) }, .h = try sc.rms(try hcCollapse(sc, x1, if (sp) |s| s.pre else cpre), norm_w, c.eps), .x1 = x1 };
 }
 
@@ -2335,7 +2341,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         u.pre = sc.out(sf.pre);
     }
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
-    return .{ .x = sc.out(try hcExpand(sc, x1, y, sf.post, sf.comb)), .pre = sc.out(sf.pre) };
+    return .{ .x = sc.out(try hcExpand(sc, m, x1, y, sf.post, sf.comb)), .pre = sc.out(sf.pre) };
 }
 
 // ── the forward ──────────────────────────────────────────────────────────
@@ -2613,7 +2619,7 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
 /// Sets the kernels off (the diagnostic `SUSHI_DSV41_COMPOSED`, the KLD A/B's teacher arm) or on, and says which.
 pub fn setFused(m: *Model, composed: bool) void {
     m.fused = !composed;
-    log.info("[dsv41] fused kernels {s}{s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "" });
+    log.info("[dsv41] fused kernels {s}{s}, hc expand kernel {s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "", if (m.fused and kernels.hcExpandProbed()) "on" else "off" });
 }
 
 pub fn setDsparkExact(m: *Model, on: bool) void {
@@ -2958,7 +2964,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
     if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });
     if (sum == null) return null;
-    return sc.out(try hcExpand(&sc, u.x1, try sc.astype(sum.?, m.act), u.post, u.comb));
+    return sc.out(try hcExpand(&sc, m, u.x1, try sc.astype(sum.?, m.act), u.post, u.comb));
 }
 
 /// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
