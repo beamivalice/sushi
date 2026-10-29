@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sushi-test: tier=live boot=own pack=default boots=2
 # One EXL3 or STQ pack (rate-grouped Flash-Next layers included) booted resident, then streamed under
-# `--ssd-budget-gb` (SUSHI_TEST_STREAM_BUDGET_GB, default 60). The same requests run on both boots:
+# `--ssd-budget-gb` (SUSHI_TEST_STREAM_BUDGET_GB, default 24: below the pack's 42 GB of experts, or the cache is resident and nothing streams). The same requests run on both boots:
 #   * serial (`enable_mtp:false`) greedy replies plus top-20 logprobs: identical across two passes and identical
 #     between the resident and the streamed boot;
 #   * streaming engagement lines (`[expert-stream] ssd budget`, a warm cache with fallback_imports=0), and none on the
@@ -12,7 +12,7 @@ set -euo pipefail
 . "$(dirname "$0")/lib/boot.sh"
 
 PACK=$(sushi_pack qwen4) || exit $?
-BUDGET=${SUSHI_TEST_STREAM_BUDGET_GB:-60}
+BUDGET=${SUSHI_TEST_STREAM_BUDGET_GB:-24}
 RUN=$(mktemp -d)
 trap 'rm -rf "$RUN"' EXIT
 
