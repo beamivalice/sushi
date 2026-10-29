@@ -71,6 +71,7 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("qwen4/qwen4_exp.zig");
+    _ = @import("qwen4/qwen4_generate_test.zig");
     _ = @import("tokenizer.zig");
     _ = @import("dsv41/tokenizer_deepseek.zig");
     _ = @import("tokenize_cache.zig");
