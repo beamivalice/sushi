@@ -1,71 +1,24 @@
 #!/bin/bash
-. "$(dirname "$0")/../../private_cache.sh"
-# DFlash block-drafter integration test — env-gated on a local target +
-# assistant pair (GLM-5.3-Flash Sushi pack + its DFlash2 drafter today):
+# sushi-test: tier=live boot=api
+# DFlash2 block-drafter integration on the GLM api boot (the pack ships its drafter in dflash2/).
 #
-#   DFLASH_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw \
-#   DFLASH_TEST_DRAFTER=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw/dflash2 \
-#       ./tests/glm5/test_dflash.sh
-#
-# Pins the live contract: the sidecar probe classifies the assistant as
-# DFlash (boot log), rounds ENGAGE (`[spec-stats] mode=dflash attempts>0` —
-# engagement COUNTS, never output shape), greedy dflash-on equals greedy
-# dflash-off over reasoning+content (byte-for-byte at 8-bit or wider),
-# per-request enable_drafter:false opts out, and tool calls still parse with
-# the drafter engaged.
+# Pins the live contract: the sidecar probe classifies the assistant as DFlash (boot log), rounds ENGAGE
+# (`[spec-stats] mode=dflash attempts>0` - engagement COUNTS, never output shape), greedy dflash-on equals
+# greedy dflash-off over reasoning+content (byte-for-byte at 8-bit or wider), per-request enable_drafter:false
+# opts out, and tool calls still parse with the drafter engaged. Boot-time lines (probe, block size, weights)
+# are read over the whole log; per-request lines over this script's slice. The disk-restart arm moved to
+# test_prefix_cache_restart.sh.
 
 set -euo pipefail
-
-MODEL="${DFLASH_TEST_MODEL:-}"
-DRAFTER="${DFLASH_TEST_DRAFTER:-}"
-if [ -z "$MODEL" ] || [ -z "$DRAFTER" ]; then
-    echo "SKIP: DFLASH_TEST_MODEL / DFLASH_TEST_DRAFTER not set"
-    exit 0
-fi
-for d in "$MODEL" "$DRAFTER"; do
-    if [ ! -f "$d/config.json" ]; then
-        echo "FAIL: $d/config.json not found"; exit 1
-    fi
-done
-
-PORT="${DFLASH_TEST_PORT:-11353}"
-BASE="http://127.0.0.1:$PORT"
-BIN="$(dirname "$0")/../../zig-out/bin/sushi"
-LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
-
-# --no-mtp: a loaded DFlash sidecar outranks an in-checkpoint MTP head
-# (Qwen3.8 packs) since 26.9.2, so this is belt and braces — it keeps the
-# MTP head out of the boot lines and pins the arm on older builds too.
-# --prefix-cache-mem: the RAM tier is opt-in (SSD-only by default), and [11] needs it.
-"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-mem 1GB --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
-SERVER_PID=$!
-cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
-trap cleanup EXIT
-
-echo "waiting for server..."
-for _ in $(seq 1 120); do
-    curl -s -m 2 "$BASE/health" > /dev/null 2>&1 && break
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
-    fi
-    sleep 3
-done
-# /health answers as soon as the socket binds — the model is still loading
-# behind it (a 17 GB checkpoint takes minutes). Wait for the load itself via
-# the server's own ready line, timeout scaled to the checkpoint size.
-MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
-READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
-echo "waiting for model load (up to ${READY_SECS}s)..."
-for _ in $(seq 1 $((READY_SECS / 3))); do
-    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
-    fi
-    sleep 3
-done
-if ! grep -q "Model ready (loaded on inference thread)" "$LOG"; then
-    echo "FAIL: model did not finish loading in ${READY_SECS}s"; tail -20 "$LOG"; exit 1
-fi
+. "$(dirname "$0")/../lib/boot.sh"
+sushi_attach
+sushi_require spec
+BASE="$SUSHI_URL"
+LOG="$SUSHI_LOG"
+DRAFTER="$SUSHI_PACK/dflash2"
+[ -f "$DRAFTER/config.json" ] || { echo "SKIP $(basename "$0"): $DRAFTER/config.json not found"; exit 3; }
+# Per-request log lines of this script only.
+slice() { sushi_log_since; }
 
 pass=0; fail=0
 ok()   { echo "PASS $1"; pass=$((pass+1)); }
@@ -89,7 +42,7 @@ fi
 gen() { # prompt, max_tokens, extra_json_fragment
     curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
         \"model\": \"sushi\",
-        \"messages\": [{\"role\": \"user\", \"content\": \"$1\"}],
+        \"messages\": [{\"role\": \"user\", \"content\": \"$SUSHI_NONCE $1\"}],
         \"temperature\": 0.0,
         \"max_tokens\": $2
         $3
@@ -122,12 +75,12 @@ gen "Describe how a refrigerator keeps food cold, in one short paragraph." 40 ""
 DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
 
 # [4] Engagement COUNTS: at least one dflash round ran, with accepts.
-STATS=$(grep "mode=dflash" "$LOG" | tail -1)
+STATS=$(slice | grep "mode=dflash" | tail -1)
 ATTEMPTS=$(echo "$STATS" | sed -n 's/.*attempts=\([0-9]*\).*/\1/p')
 if [ -n "$ATTEMPTS" ] && [ "$ATTEMPTS" -gt 0 ]; then
     ok "spec-stats mode=dflash attempts=$ATTEMPTS ($STATS)"
 else
-    bad "spec-stats mode=dflash attempts>0" "$(grep spec-stats "$LOG" | tail -3)"
+    bad "spec-stats mode=dflash attempts>0" "$(slice | grep spec-stats | tail -3)"
 fi
 if GATE_STATE=$(python3 - "$STATS" <<'PY'
 import re, sys
@@ -214,7 +167,7 @@ esac
 # that had dflash ENABLED, and none for the opt-outs. Counted rather than
 # hardcoded — the equivalence arm above issues a different number of requests
 # depending on the checkpoint's quantization width.
-N_STATS=$(grep -c "mode=dflash" "$LOG")
+N_STATS=$(slice | grep -c "mode=dflash" || true)
 if [ "$N_STATS" -eq "$DFLASH_ON_REQS" ]; then
     ok "enable_drafter:false opted out ($N_STATS dflash stats lines for $DFLASH_ON_REQS dflash-enabled requests)"
 else
@@ -226,7 +179,7 @@ fi
 # generated_ids, trunk KV and assistant context to the same exact boundary.
 CAP=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
     "model": "sushi",
-    "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
+    "messages": [{"role": "user", "content": "'"$SUSHI_NONCE"' Write a long numbered list with one short item per line."}],
     "temperature": 0.0,
     "max_tokens": 17,
     "enable_drafter": true
@@ -244,7 +197,7 @@ fi
 
 CAP_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
     "model": "sushi",
-    "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
+    "messages": [{"role": "user", "content": "'"$SUSHI_NONCE"' Write a long numbered list with one short item per line."}],
     "temperature": 0.0,
     "max_tokens": 17,
     "enable_drafter": true,
@@ -284,7 +237,7 @@ fi
 # [8] Tools still parse with the drafter engaged.
 TOOLS=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
     "model": "sushi",
-    "messages": [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}],
+    "messages": [{"role": "user", "content": "'"$SUSHI_NONCE"' What is the weather in Paris right now? Use the tool."}],
     "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
     "temperature": 0.0,
     "max_tokens": 400,
@@ -341,11 +294,12 @@ fi
 # BOTH turns must report the same per-draft rate.
 CTX_PROMPT="Repeat this sentence exactly, word for word: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea state and the ships that had passed by the point before dawn."
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
-RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
-RESTORES_COLD=$(grep -c "dflash context restored" "$LOG" || true)
+RATE_COLD=$(slice | grep -o 'per_draft_pct=[0-9.]*' | tail -1)
+RESTORES_COLD=$(slice | grep -c "dflash context restored" || true)
+sleep 3 # the api boot keeps no RAM tier: the entry reaches the SSD tier in the background
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
-RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
-RESTORES_HIT=$(grep -c "dflash context restored" "$LOG" || true)
+RATE_HIT=$(slice | grep -o 'per_draft_pct=[0-9.]*' | tail -1)
+RESTORES_HIT=$(slice | grep -c "dflash context restored" || true)
 if [ "$RESTORES_HIT" -gt "$RESTORES_COLD" ] && [ "$RATE_COLD" = "$RATE_HIT" ]; then
     ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"
 else
@@ -372,7 +326,7 @@ if grep -q "GLM-5.3-Flash decodes with DFlash2" "$LOG"; then
             bad "GLM greedy adaptive rows == serial" "--- on ---" "$(echo "$G_ON" | head -c 300)" "--- off ---" "$(echo "$G_OFF" | head -c 300)"
         fi
     done
-    GLM_BODY='{"model":"sushi","messages":[{"role":"user","content":"Count from 1 to 120, one number per line, with no other output."}],"temperature":0.0,"max_tokens":200,"enable_drafter":true'
+    GLM_BODY='{"model":"sushi","messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Count from 1 to 120, one number per line, with no other output."}],"temperature":0.0,"max_tokens":200,"enable_drafter":true'
     GLM_WHOLE=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$GLM_BODY}")
     GLM_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$GLM_BODY,\"stream\":true}")
     DFLASH_ON_REQS=$((DFLASH_ON_REQS + 2))
@@ -395,77 +349,13 @@ PY
     else
         bad "GLM adaptive rows: stream == non-stream" "$(echo "$GLM_STREAM" | tail -c 400)"
     fi
-    GLM_STATS_BEFORE=$(grep -c "mode=dflash" "$LOG")
+    GLM_STATS_BEFORE=$(slice | grep -c "mode=dflash" || true)
     gen "Say hello in five words." 20 ", \"enable_drafter\": false" > /dev/null
-    if [ "$(grep -c "mode=dflash" "$LOG")" -eq "$GLM_STATS_BEFORE" ]; then
+    if [ "$(slice | grep -c "mode=dflash" || true)" -eq "$GLM_STATS_BEFORE" ]; then
         ok "GLM enable_drafter:false runs no round"
     else
         bad "GLM enable_drafter:false runs no round"
     fi
-fi
-
-# [12] The assistant context also survives the SSD tier (v4 spec sidecar):
-# same prompt across a SERVER RESTART with --prefix-cache-disk must restore
-# the trunk from disk AND the dflash context beside it — a disk hit used to
-# draft blind (the same 92.6% -> 66.5% class [11] pins for the RAM tier).
-# Isolated HOME so the real kv-cache is never touched. Opt out with
-# DFLASH_SKIP_DISK=1 (two extra boots of the target).
-if [ "${DFLASH_SKIP_DISK:-0}" != "1" ]; then
-    cleanup
-    trap - EXIT
-    DISK_HOME=$(mktemp -d /tmp/dflash_disk_home.XXXXXX)
-    DISK_PROMPT="Repeat this sentence exactly, word for word: the harbor master counted the lanterns twice and noted the tide tables in the margin before the ferry cast off for the northern islands at first light. $(python3 -c 'print(" ".join(f"filler{i}" for i in range(400)))')"
-    disk_boot() { # $1 = logfile
-        HOME="$DISK_HOME" "$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-disk 2GB \
-            --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$1" 2>&1 &
-        SERVER_PID=$!
-        trap cleanup EXIT
-        for _ in $(seq 1 $((READY_SECS / 3)) ); do
-            grep -q "Model ready (loaded on inference thread)" "$1" && return 0
-            kill -0 "$SERVER_PID" 2>/dev/null || break
-            sleep 3
-        done
-        return 1
-    }
-    LOG_D1=$(mktemp /tmp/dflash_disk1.XXXXXX)
-    LOG_D2=$(mktemp /tmp/dflash_disk2.XXXXXX)
-    if disk_boot "$LOG_D1"; then
-        gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
-        DISK_RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D1" | tail -1)
-        sleep 2 # let the post-response disk flush land
-        cleanup
-        trap - EXIT
-        if disk_boot "$LOG_D2"; then
-            gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
-            DISK_RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D2" | tail -1)
-            # Rate equality is tolerant (5pp): a HYBRID trunk's prefix restore
-            # is legitimately not bit-identical (re-run recurrence block size),
-            # so near-tie flips can nudge the generation. The blind-draft
-            # collapse this pins is ~26pp.
-            RATES_CLOSE=$(python3 -c "
-import sys
-try:
-    c = float('${DISK_RATE_COLD#per_draft_pct=}' or 'nan')
-    h = float('${DISK_RATE_HIT#per_draft_pct=}' or 'nan')
-    print('yes' if abs(c - h) <= 5.0 else 'no')
-except ValueError:
-    print('no')
-")
-            if grep -q "\[disk-cache\] restored" "$LOG_D2" && grep -q "dflash context restored" "$LOG_D2" \
-                && [ -n "$DISK_RATE_HIT" ] && [ "$RATES_CLOSE" = "yes" ]; then
-                ok "assistant context restored from the SSD tier across a restart (cold==hit $DISK_RATE_HIT)"
-            else
-                bad "assistant context restored from the SSD tier across a restart" \
-                    "cold=$DISK_RATE_COLD hit=$DISK_RATE_HIT" \
-                    "disk-restores=$(grep -c '\[disk-cache\] restored' "$LOG_D2") dflash-restores=$(grep -c 'dflash context restored' "$LOG_D2")"
-            fi
-        else
-            bad "disk-tier arm: second boot did not become ready" "$(tail -5 "$LOG_D2")"
-        fi
-    else
-        bad "disk-tier arm: first boot did not become ready" "$(tail -5 "$LOG_D1")"
-    fi
-    rm -rf "$DISK_HOME"
 fi
 
 echo
