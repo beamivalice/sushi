@@ -13,7 +13,7 @@
 #     correctness. A hybrid whose single checkpoint outweighs the whole budget legitimately declines
 #     (`skipped oversized entry`): that arm WARNs instead.
 #
-# Tunables (env): SHORT_BUDGET_MB (64), N_REQ (5), PROMPT_REPEATS (200), GROW_TURNS (5), GROW_WORDS (2000).
+# Tunables (env): SHORT_BUDGET_MB (256), N_REQ (5), PROMPT_REPEATS (200), GROW_TURNS (5), GROW_WORDS (2000).
 
 set -e
 . "$(dirname "$0")/lib/boot.sh"
@@ -22,7 +22,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-SHORT_BUDGET_MB="${SHORT_BUDGET_MB:-64}"
+# A hybrid's single SSM checkpoint is ~100 MB, so the budget must exceed one entry for anything to stay resident.
+SHORT_BUDGET_MB="${SHORT_BUDGET_MB:-256}"
 N_REQ="${N_REQ:-5}"
 PROMPT_REPEATS="${PROMPT_REPEATS:-200}"
 GROW_TURNS="${GROW_TURNS:-5}"
@@ -60,6 +61,7 @@ print(json.dumps({
     'max_tokens': 24,
     'temperature': 0.0,
     'stream': False,
+    'enable_thinking': False,
 }))
 " "$prompt")
     local resp
@@ -90,7 +92,7 @@ echo
 echo "== verifying log =="
 RESIDENT_LINES=$(grep -E '\[hot-cache\] resident=.* MB' "$LOGFILE" || true)
 if [ -z "$RESIDENT_LINES" ]; then
-    echo -e "${RED}FAIL${NC} no `[hot-cache] resident=…` lines emitted"
+    echo -e "${RED}FAIL${NC} no [hot-cache] resident=... lines emitted"
     tail -50 "$LOGFILE"
     exit 1
 fi
