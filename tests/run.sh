@@ -302,10 +302,13 @@ run_boot_group() {
     t0=$(date +%s)
     echo " boot $pass-$profile"
     export SUSHI_PROFILE="$profile"
+    SUSHI_BOOT_SETTINGS=$(sushi_profile_settings "$profile" "$pack" "$OUT/$pass-$profile.settings.json")
+    export SUSHI_BOOT_SETTINGS
     # shellcheck disable=SC2086
     if ! sushi_boot "$pass-$profile" "$pack" $flags; then
         while IFS=$'\t' read -r _ rel _; do record FAIL "$pass" "$rel" 0; done < "$list"
         echo "    the boot failed; scripts not run"
+        unset SUSHI_BOOT_SETTINGS
         return 1
     fi
     while IFS=$'\t' read -r phase rel tier _ _ _ needs <&3; do
@@ -322,6 +325,7 @@ run_boot_group() {
         fi
     done 3< "$list"
     sushi_stop 0
+    unset SUSHI_BOOT_SETTINGS
     printf '%s\t%s\t%s\n' "$pass" "$profile" "$(($(date +%s) - t0))" >> "$OUT/boots.tsv"
 }
 

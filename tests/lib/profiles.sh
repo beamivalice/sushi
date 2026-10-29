@@ -28,7 +28,17 @@ sushi_profile_flags() {
             echo "$common $slots --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off$depth"
             ;;
         ram) echo "$common $slots --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off" ;;
-        knobs) echo "$common --think medium --reasoning-budget 1 --think-penalty ${SUSHI_TEST_THINK_PENALTY:-2}" ;;
+        knobs) echo "$common --think medium --reasoning-budget 1 --think-penalty ${SUSHI_TEST_THINK_PENALTY:-2} --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off" ;;
         *) echo "sushi_profile_flags: unknown profile '$profile'" >&2; return 1 ;;
     esac
+}
+
+# Writes the model-settings.json a profile boots with to $3 and prints the path; prints nothing for a profile
+# without one. The knobs boot names the logit-bias file the way a user does, keyed by the pack path.
+sushi_profile_settings() {
+    local profile="${1:?sushi_profile_settings <profile> <pack> <out>}" pack="${2:?}" out="${3:?}" bias
+    [ "$profile" = knobs ] || return 0
+    bias="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/knobs-bias.json"
+    python3 -I -c 'import json, sys; print(json.dumps({sys.argv[1]: {"logit_bias_file": sys.argv[2]}}))' "$pack" "$bias" > "$out"
+    echo "$out"
 }

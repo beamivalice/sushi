@@ -1,0 +1,5 @@
+{"entries": [
+  {"word": "Wait", "delta": -1, "scope": "reasoning"},
+  {"word": "actually", "delta": -0.5, "scope": "answer"},
+  {"token": "A", "delta": 0.25, "scope": "all"}
+]}

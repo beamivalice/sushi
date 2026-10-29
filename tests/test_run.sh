@@ -139,7 +139,7 @@ P_SHARED='pass shared
   hermetic test_node.cjs needs=node
   host test_host.sh
   pack test_pack.sh
-  boot knobs: --metrics --log-level debug --think medium --reasoning-budget 1 --think-penalty 2
+  boot knobs: --metrics --log-level debug --think medium --reasoning-budget 1 --think-penalty 2 --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off
     test_knobs.sh
   own test_own_def.sh pack=default boots=1
   own test_own_glm.sh pack=glm5 boots=2
@@ -429,6 +429,11 @@ eq "profile exact accepts an arch name" "$(/bin/bash "$PROF" exact mimo_v2)" "$(
 eq "SUSHI_TEST_DSV41_BUDGET sets the streamed budget" "$(SUSHI_TEST_DSV41_BUDGET=64 /bin/bash "$PROF" ram dsv41)" "--metrics --log-level debug --ssd-budget-gb 64 --max-concurrent 1 --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off"
 /bin/bash "$PROF" api nope > /dev/null 2>&1
 eq "an unknown model is an error" "$?" "1"
+printf '. "%s/lib/profiles.sh"\nsushi_profile_settings "$@"\n' "$TESTS" > "$WORK/settings.sh"
+eq "profile knobs writes a settings file keyed by the pack and naming the bias file" \
+    "$(/bin/bash "$WORK/settings.sh" knobs /pack/q "$WORK/knobs.json" > /dev/null; python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(list(d), d["/pack/q"]["logit_bias_file"].endswith("/lib/knobs-bias.json"))' "$WORK/knobs.json")" \
+    "['/pack/q'] True"
+eq "a profile without settings writes nothing" "$(/bin/bash "$WORK/settings.sh" api /pack/q "$WORK/api.json"; ls "$WORK/api.json" 2> /dev/null)" ""
 
 echo "[4/4] a run"
 RFX="$WORK/rfx"
