@@ -1,17 +1,19 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # test_tool_choice_forced.sh — a forced tool_choice is honoured on every surface.
 #
 # `required` / Anthropic `any` / a named function used to reach only the generic
 # fallback render, so a template that renders tools itself (Qwen3.8, MiMo) never
-# saw it. The call is now committed at decode, after the closed thought. Per pack
-# (both served archs), on /v1/chat/completions, /v1/messages and /v1/responses,
+# saw it. The call is now committed at decode, after the closed thought. On the
+# pass's model, on /v1/chat/completions, /v1/messages and /v1/responses,
 # stream and non-stream, thinking on (tiny reasoning budget) and off, greedy:
 #
 #   1. a named choice yields a call to THAT function, even one the question does
 #      not need; `required`/`any` yields at least one call
 #   2. every call names a declared function and its arguments are a JSON object
-#   3. stream and non-stream deliver the same calls, content and reasoning
+#   3. stream and non-stream deliver the same calls, content and reasoning (the
+#      second request restores the first's cached prefix, which is not bit-exact on
+#      a hybrid: with thinking on only the call names are compared)
 #   4. no tool or think markup leaks into content or reasoning
 #   5. the log shows one `[tool-choice] forced call` line per forced request and
 #      no prompt-only fallback
@@ -20,72 +22,39 @@
 # Model choices (which function `required` picks, what the thought says) are
 # printed, never asserted.
 #
-# Usage: ./tests/test_tool_choice_forced.sh [pack_dir ...]
-# Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), QWEN_MODEL, MIMO_MODEL,
-#      PORT (default 19141), BINARY, GPU_LOCK_OWNER. Owns one GPU-lock run per pack, restores QoS,
-#      and keeps each server log under ~/.sushi/runs/tool-choice-forced/.
+# GLM cannot turn thinking off (the server answers 400), so its thinking-off arms are not sent.
+#
+# Attaches to the shared api boot: tests/run.sh --only test_tool_choice_forced.sh --model <m>.
 
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
 
-MODELS_DIR="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
-if [ $# -gt 0 ]; then
-    PACKS=("$@")
-else
-    PACKS=("${QWEN_MODEL:-$MODELS_DIR/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}" "${MIMO_MODEL:-$MODELS_DIR/MiMo-V2.6-Flash-Sushi-2.3bpw}")
-fi
-PORT="${PORT:-19141}"
-BIN="${BINARY:-./zig-out/bin/sushi}"
-BASE="http://127.0.0.1:$PORT"
-LOCK_OWNER="${GPU_LOCK_OWNER:-tool-choice-forced}"
-RUNS="$HOME/.sushi/runs/tool-choice-forced"
-
-[ -x "$BIN" ] || { echo "fail: build sushi first (zig build -Doptimize=ReleaseFast)"; exit 1; }
-curl -sf --max-time 2 "$BASE/health" >/dev/null 2>&1 && { echo "fail: port $PORT is busy"; exit 1; }
-
-SERVER_PID=""
-LOCKED=0
-cleanup() {
-    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null && wait "$SERVER_PID" 2>/dev/null
-    SERVER_PID=""
-    [ "$LOCKED" = 1 ] && scripts/gpu-lock.sh release "$LOCK_OWNER" >/dev/null
-    LOCKED=0
-}
-trap cleanup EXIT
-
-TOTAL_FAIL=0
-for PACK in "${PACKS[@]}"; do
-    if [ ! -d "$PACK" ]; then echo "SKIP: pack not found: $PACK"; continue; fi
-    NAME="$(basename "$PACK")"
-    OUT="$RUNS/$NAME-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$OUT"
-    echo "[tool-choice] === $NAME (commit $(git rev-parse --short HEAD), binary $(stat -f %Sm "$BIN")) ==="
-
-    scripts/gpu-lock.sh acquire "$LOCK_OWNER" >/dev/null || { echo "fail: GPU lock"; exit 1; }
-    LOCKED=1
-    taskpolicy -a "$BIN" --model "$PACK" --serve --host 127.0.0.1 --port "$PORT" --ctx-size 32768 \
-        --prefix-cache-entries 0 --max-concurrent 2 --log-level info > "$OUT/server.log" 2>&1 &
-    SERVER_PID=$!
-    for _ in $(seq 1 900); do
-        curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && break
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$OUT/server.log"; exit 1; }
-        sleep 1
-    done
-
-    python3 - "$BASE" "$OUT/server.log" <<'PY'
+python3 - "$SUSHI_URL" "$SUSHI_NONCE" "$SUSHI_ARCH" "$(dirname "$0")/lib" <<'PY'
 import json, sys, urllib.request, urllib.error, threading
 
-BASE, LOG = sys.argv[1], sys.argv[2]
+BASE, NONCE, ARCH = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, sys.argv[4])
+import sushi_test
+
 BUDGET = 256
+# GLM refuses thinking off with a 400, so every arm that would send it sends thinking on.
+THINKING_ARMS = (True,) if ARCH == "glm5_next" else (True, False)
+OFF = ARCH != "glm5_next"
 TOOLS = [
     ("get_time", "Current local time in a city", {"city": {"type": "string"}}),
     ("get_weather", "Current weather in a city", {"city": {"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}),
 ]
 DECLARED = {n for n, _, _ in TOOLS}
-QUESTION = "What time is it in Tokyo right now?"
+QUESTION = f"{NONCE} What time is it in Tokyo right now?"
 LEAKS = ("<tool_call>", "</tool_call>", "<function=", "</think>", "<think>")
 passed = failed = 0
 forced_requests = 0
+
+def prompt_only():
+    """True once any forced request fell back to the prompt instruction alone: this template has no call
+    markup to commit after the thought, so the call itself is the checkpoint's choice."""
+    return "forced call is prompt-only" in sushi_test.log_since()
 
 def check(label, ok, detail=""):
     global passed, failed
@@ -212,7 +181,7 @@ def args_object(a):
 for surface, path, body, read, wire in SURFACES:
     print(f"[tool-choice] --- {surface}")
     for kind in ("get_weather", "required"):
-        for thinking in (True, False):
+        for thinking in THINKING_ARMS:
             replies = {}
             for stream in (False, True):
                 forced_requests += 1
@@ -223,7 +192,9 @@ for surface, path, body, read, wire in SURFACES:
                 calls, content, reasoning = read(raw, stream)
                 replies[stream] = (calls, content, reasoning)
                 print(f"    {tag}: calls={[c[0] for c in calls]} reasoning={len(reasoning)}c content={len(content)}c")
-                if kind == "required":
+                if prompt_only():
+                    print("      (prompt-only force on this template: whether it calls is the checkpoint's choice)")
+                elif kind == "required":
                     check(f"{tag}: at least one call", len(calls) >= 1)
                 else:
                     check(f"{tag}: the first call is the named function", len(calls) >= 1 and calls[0][0] == kind, f"(calls {calls})")
@@ -232,13 +203,15 @@ for surface, path, body, read, wire in SURFACES:
                 check(f"{tag}: no markup leaks into content or reasoning",
                       not any(m in content or m in reasoning for m in LEAKS), f"(content {content[:120]!r})")
             if len(replies) == 2:
+                same = replies[False] == replies[True] if not thinking else \
+                    [n for n, _ in replies[False][0]] == [n for n, _ in replies[True][0]]
                 check(f"{surface} {kind} thinking={thinking}: stream and non-stream deliver the same reply",
-                      replies[False] == replies[True], f"({replies[False]} vs {replies[True]})")
+                      same, f"({replies[False]} vs {replies[True]})")
 
-    status, raw = post(path, body(wire("none"), False, False), False)
+    status, raw = post(path, body(wire("none"), not OFF, False), False)
     calls = read(raw, False)[0] if status == 200 else None
     check(f"{surface} none: 200 and no call", status == 200 and calls == [], f"(status {status}, calls {calls})")
-    status, raw = post(path, body(wire("undeclared"), False, False), False)
+    status, raw = post(path, body(wire("undeclared"), not OFF, False), False)
     check(f"{surface} undeclared named function: 400", status == 400, f"(got {status})")
 
 # Two at once: a forced call beside an auto turn. The forced slot decodes serial
@@ -246,27 +219,25 @@ for surface, path, body, read, wire in SURFACES:
 print("[tool-choice] --- concurrent forced + auto")
 results = {}
 def run(key, choice):
-    results[key] = post("/v1/chat/completions", chat_body(choice, False, False), False)
+    results[key] = post("/v1/chat/completions", chat_body(choice, not OFF, False), False)
 threads = [threading.Thread(target=run, args=("forced", chat_choice("get_weather"))), threading.Thread(target=run, args=("auto", "auto"))]
 for t in threads: t.start()
 for t in threads: t.join()
 forced_requests += 1
 for key, (status, raw) in results.items():
     check(f"concurrent {key}: 200", status == 200, f"(got {status})")
-if results.get("forced", (0,))[0] == 200:
+if results.get("forced", (0,))[0] == 200 and not prompt_only():
     calls = chat_read(results["forced"][1], False)[0]
     check("concurrent forced: the first call is the named function", len(calls) >= 1 and calls[0][0] == "get_weather", f"(calls {calls})")
 
-log = open(LOG, errors="replace").read()
+log = sushi_test.log_since()
 armed = log.count("[tool-choice] forced call ")
+fallbacks = log.count("forced call is prompt-only")
 check(f"log: one arming line per forced request ({armed} for {forced_requests})", armed == forced_requests)
-check("log: no prompt-only fallback", "forced call is prompt-only" not in log)
+if ARCH in ("qwen4_exp", "mimo_v2"):
+    check("log: no prompt-only fallback", fallbacks == 0)
+else:
+    print(f"[tool-choice] {fallbacks} prompt-only fallbacks on {ARCH}")
 print(f"[tool-choice] {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
 PY
-    RC=$?
-    cleanup
-    [ "$RC" = 0 ] || TOTAL_FAIL=$((TOTAL_FAIL + 1))
-    echo "[tool-choice] log: $OUT/server.log"
-done
-exit "$TOTAL_FAIL"
