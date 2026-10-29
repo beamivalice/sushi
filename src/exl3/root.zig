@@ -459,6 +459,7 @@ test "exl3 a layer may pack below the rate the config bills, never above it" {
 test {
     _ = format;
     _ = kernels;
+    _ = @import("kernel_source.zig");
     _ = codebook_tables;
 }
 

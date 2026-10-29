@@ -8,6 +8,7 @@ const log = @import("mlx_host").log;
 const exl3 = @import("expert_exl3.zig");
 const codebook_tables = @import("codebook_tables.zig");
 const kernels = @import("expert_exl3_kernels.zig");
+const kernel_src = @import("kernel_source.zig");
 const group_layout = @import("layout.zig");
 const root = @import("root.zig");
 const fuse = @import("fuse.zig");
@@ -584,7 +585,7 @@ var kernel_cache: std.ArrayList(KernelEntry) = .empty;
 fn header(dec: exl3.Decode) ![:0]const u8 {
     return switch (dec.codebook) {
         inline else => |cb| switch (dec.window) {
-            inline else => |win| kernels.withTableRows(cb, comptime kernels.codebookHelpers(cb, win)),
+            inline else => |win| kernel_src.withTableRows(cb, comptime kernel_src.codebookHelpers(cb, win)),
         },
     };
 }
@@ -627,7 +628,7 @@ fn mixedKernel(kind: Kind, classes: []const RateClass, limit: c_int, group: c_in
 }
 
 const DecodeKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, down: bool, layout: kernels.GemvLayout, group: c_int = 0 };
-var decode_cfgs: kernels.CfgCache(DecodeKey, 16) = .{};
+var decode_cfgs: kernel_src.CfgCache(DecodeKey, 16) = .{};
 
 /// The pair or down GEMV's launch: tiles of `layout.tiles` outputs across, a slot a row, a K split deep.
 fn decodeLaunch(alloc: std.mem.Allocator, key: DecodeKey) !fuse.Launch {
@@ -707,7 +708,7 @@ fn pairPreparedMixed(s: mlx.mlx_stream, prep: mlx.mlx_array, rb: *const Ragged, 
 }
 
 const MidKey = struct { dim: c_int, nslots: c_int, nsplit: c_int };
-var mid_cfgs: kernels.CfgCache(MidKey, 16) = .{};
+var mid_cfgs: kernel_src.CfgCache(MidKey, 16) = .{};
 var mid_kernels: [4]struct { limit: c_int = -1, kernel: ?mlx.mlx_fast_metal_kernel = null } = @splat(.{});
 
 /// The SwiGLU mid and the down input's Hadamard once per slot, `[nslots, inter]` f16: what the fused-mid down
@@ -790,7 +791,7 @@ const FusedStage = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast
 var fused_stages: std.AutoHashMapUnmanaged(FuseKey, FusedStage) = .empty;
 var fused_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const ReduceKey = struct { hidden: c_int, rows: c_int, topk: c_int };
-var fused_reduce_cfgs: kernels.CfgCache(ReduceKey, 8) = .{};
+var fused_reduce_cfgs: kernel_src.CfgCache(ReduceKey, 8) = .{};
 /// Test and bench arm: which part's threadgroups the fused grid lists first.
 pub var fused_shared_first: bool = false;
 

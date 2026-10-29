@@ -4,6 +4,7 @@ const log = @import("mlx_host").log;
 const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
 const codebook_tables = @import("codebook_tables.zig");
+const kernel_src = @import("kernel_source.zig");
 
 var stage_profile_env: ?bool = null;
 var pair_splits_force: ?u32 = null;
@@ -86,7 +87,7 @@ pub fn logGroupedEngaged(group: c_int) void {
     log.info("[exl3-decode] expert-grouped rows engaged group={d}\n", .{group});
 }
 
-const GroupedSlots = [GROUP_BUCKETS.len]KernelSlots;
+const GroupedSlots = [GROUP_BUCKETS.len]kernel_src.KernelSlots;
 
 /// A bucket wider than a pair keeps its members' accumulators in registers: one output tile per threadgroup.
 pub fn groupedLayout(layout: GemvLayout, group: c_int) GemvLayout {
@@ -95,7 +96,7 @@ pub fn groupedLayout(layout: GemvLayout, group: c_int) GemvLayout {
 
 fn groupedKernel(slots: *GroupedSlots, comptime base: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, comptime source: fn (comptime u32) [:0]const u8, group: c_int) !mlx.mlx_fast_metal_kernel {
     inline for (GROUP_BUCKETS, 0..) |bucket, i| {
-        if (group == bucket) return codebookKernel(&slots[i], base ++ std.fmt.comptimePrint("_g{d}", .{bucket}), ins, outs, comptime source(@intCast(bucket)));
+        if (group == bucket) return kernel_src.codebookKernel(&slots[i], base ++ std.fmt.comptimePrint("_g{d}", .{bucket}), ins, outs, comptime source(@intCast(bucket)));
     }
     return error.BadExl3Group;
 }
@@ -481,13 +482,13 @@ const GEMM_SIMDMAT_SOURCE: [:0]const u8 =
     \\row = run_end;
     \\}
 ;
-const GEMM_NAX_INCLUDES: [:0]const u8 =
+pub const GEMM_NAX_INCLUDES: [:0]const u8 =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
     \\using namespace metal;
     \\using namespace mpp::tensor_ops;
     \\
 ;
-const GEMM_NAX_FRAGS: [:0]const u8 =
+pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\using nfrag = vec<half, 8>;
     \\static inline nfrag nax_wfrag(const device uint *words, uint lane) {
     \\  constexpr uint N = 64u;
@@ -768,7 +769,7 @@ const GEMM_SORTED_TM_SOURCE: [:0]const u8 = metalReplaceFound(
 
 /// Test and GEMM-bench seam: dispatch GEMM_NAX_REFERENCE_SOURCE instead.
 pub var nax_reference_override: bool = false;
-var gemm_nax_ref_kernel: KernelSlots = no_kernels;
+var gemm_nax_ref_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 const TOKEN_PREPARE_SOURCE: [:0]const u8 =
     \\uint block = uint(threadgroup_position_in_grid.x);
@@ -966,11 +967,11 @@ const FINISH_SOURCE: [:0]const u8 =
     \\y[xb + lane + 96u] = OutT((s1 - s3) * sc * float(svh[sb + lane + 96u]));
 ;
 
-var gemm_sorted_kernel: KernelSlots = no_kernels;
-var gemm_simdmat_kernel: KernelSlots = no_kernels;
-var gemm_sorted_tm_kernel: KernelSlots = no_kernels;
-var gemm_simdmat_tm_kernel: KernelSlots = no_kernels;
-var gemm_nax_tm_kernel: KernelSlots = no_kernels;
+var gemm_sorted_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var gemm_simdmat_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var gemm_sorted_tm_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var gemm_simdmat_tm_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var gemm_nax_tm_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 /// Test and bench seam: false sends a non-NAX GEMM to the scalar SIMD body.
 pub var gemm_simdmat_force: ?bool = null;
 var gemm_simdmat_engaged: bool = false;
@@ -981,7 +982,7 @@ var finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// A weight kernel is built per (codebook, window), so the slots below are
 /// indexed by both; the model's own pair is asserted at each dispatch entry,
 /// since several packs can be resident.
-var active_decode: exl3.Decode = .mul1;
+pub var active_decode: exl3.Decode = .mul1;
 pub fn setDecodeParams(dec: exl3.Decode) void {
     active_decode = dec;
 }
@@ -991,350 +992,6 @@ pub fn activeDecode() exl3.Decode {
 /// Test seam: a hash-mask or PAIR1 codebook's weight kernels decode the scale into every weight and store
 /// their sums as they are (the converter's form), built into slot row `N_CB + cbIndex(cb)`.
 pub var unfolded_for_test: bool = false;
-const N_CB = exl3.Codebook.count;
-const N_WIN = exl3.Window.count;
-const N_TABLES = codebook_tables.tables.len;
-const TABLED_ROW0 = 2 * N_CB;
-/// A SPEC1 kernel carries its table's rows, so each (table, folded or unfolded) pair has its own row after the codebooks'.
-pub const SLOT_ROWS = TABLED_ROW0 + 2 * N_TABLES;
-const KernelSlots = [SLOT_ROWS][N_WIN]?mlx.mlx_fast_metal_kernel;
-const no_kernels: KernelSlots = @splat(@splat(null));
-fn cbIndex(cb: exl3.Codebook) usize {
-    return @backingInt(cb);
-}
-fn tableOf(dec: exl3.Decode) usize {
-    return dec.table.?;
-}
-/// The slot row of codebook `cb` under `active_decode`, `unfolded` for the test seam's scale-in-weights variant.
-pub fn slotRow(cb: exl3.Codebook, unfolded: bool) usize {
-    if (cb.tabledHashMask()) return TABLED_ROW0 + 2 * tableOf(active_decode) + @intFromBool(unfolded);
-    const row: usize = if (unfolded) N_CB else 0;
-    return row + cbIndex(cb);
-}
-fn winSuffix(comptime win: exl3.Window) [:0]const u8 {
-    return comptime if (win == .w16) "" else std.fmt.comptimePrint("_w{d}", .{win.bits()});
-}
-fn cbSuffix(comptime cb: exl3.Codebook) [:0]const u8 {
-    return switch (cb) {
-        .mul1 => "",
-        .mcg => "_mcg",
-        .spec1 => "_spec1",
-        .std1 => "_std1",
-        .pair1 => "_pair1",
-    };
-}
-
-/// The power of two `exl3_decode2` leaves out of a codebook's weights: a hash-mask codebook's
-/// scale, restored by `exl3_out` once per stored sum instead of once per decoded pair.
-fn foldScale(comptime cb: exl3.Codebook) u32 {
-    return if (cb.tabledHashMask()) exl3.hash_mask_scale else if (cb == .pair1) PAIR1_SCALE else 1;
-}
-
-/// Every PAIR1 row's scale; `pair1Helpers` refuses a row that differs.
-const PAIR1_SCALE: u32 = 4096;
-
-/// The one decode every weight kernel calls, two codewords to two halves. A
-/// pack whose search hashed a narrower window masks the sliding window down to
-/// it first; w16 masks nothing and emits the source it always did.
-/// `exl3_pairh` is the weight itself, an MMA operand. `exl3_decode1`/`exl3_decode2` are the weight
-/// over `foldScale`, and a kernel that reads them passes every f32 sum it stores through
-/// `exl3_out`: a power of two, so its sums and stored bytes are the unfolded ones.
-pub fn codebookHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]const u8 {
-    return decodeHelpers(cb, win, foldScale(cb));
-}
-
-const HELPERS_TAIL: [:0]const u8 =
-    \\// Eight weights span N/2 whole bits, so weight j of an eight-weight group
-    \\// ends exl3_end(N, j) bits past the group's first bit.
-    \\static inline constexpr uint exl3_end(uint N, uint j) { return ((j + 1u) * N) >> 4u; }
-    \\// The 64 stream bits ending at bit `end` of a tile of `nwords` words (the tile
-    \\// wraps). Two words carry only the last 32 + end % 32 of them; `full` reads a third.
-    \\static inline ulong exl3_window(const device uint *words, uint end, uint nwords, bool full) {
-    \\  const uint last = (end - 1u) >> 5u;
-    \\  const uint prev = last == 0u ? nwords - 1u : last - 1u;
-    \\  const uint s = (0u - end) & 31u;
-    \\  ulong bits = (((ulong)words[prev] << 32u) | (ulong)words[last]) >> s;
-    \\  if (full) bits |= ((ulong)words[prev == 0u ? nwords - 1u : prev - 1u] << 32u) << (32u - s);
-    \\  return bits;
-    \\}
-    \\// Lane l reads weights 8l..8l+7 from the bits ending at its group's last bit; weight
-    \\// j's codeword ends exl3_lane_sh(N, j) bits before that. The least nonzero end % 32 is
-    \\// W's lowest set bit, so a longer first codeword takes the third word.
-    \\static inline constexpr uint exl3_lane_sh(uint N, uint j) { return N / 2u - exl3_end(N, j); }
-    \\// The first codeword a codebook decodes: a pair codec that reads only odd weights skips weight 0's.
-    \\#ifndef EXL3_LANE_FIRST
-    \\#define EXL3_LANE_FIRST 0u
-    \\#endif
-    \\template<bool Wide, bool Funnel = false> struct exl3_lane_type {
-    \\  using type = ulong;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
-    \\    return exl3_window(words, end, W, full);
-    \\  }
-    \\};
-    \\// exl3_window's bits with a third word, built as two 32-bit funnels of adjacent words
-    \\// (s < 32): OR-ing the third word into a 64-bit shift costs the ALU-bound decode GEMV far more.
-    \\template<> struct exl3_lane_type<false, true> {
-    \\  using type = ulong;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
-    \\    const uint last = (end - 1u) >> 5u;
-    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
-    \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
-    \\    const uint s = (0u - end) & 31u;
-    \\    const uint a = words[last];
-    \\    const uint b = words[prev];
-    \\    const uint c = words[third];
-    \\    return as_type<ulong>(uint2(uint((((ulong)b << 32u) | (ulong)a) >> s), uint((((ulong)c << 32u) | (ulong)b) >> s)));
-    \\  }
-    \\};
-    \\template<> struct exl3_lane_type<true> {
-    \\  using type = ulong2;
-    \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
-    \\    return ulong2(exl3_window(words, end, W, full), exl3_window(words, end - 32u, W, true));
-    \\  }
-    \\};
-    \\template<uint N> using exl3_lane_bits = typename exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u)>::type;
-    \\static inline uint exl3_lane_word(ulong bits, uint sh) { return uint(bits >> sh); }
-    \\static inline uint exl3_lane_word(ulong2 bits, uint sh) {
-    \\  return sh <= 48u ? uint(bits.x >> sh) : uint(bits.y >> (sh - 32u));
-    \\}
-    \\template<uint N>
-    \\static inline exl3_lane_bits<N> exl3_lane(const device uint *words, uint lane) {
-    \\  constexpr uint W = N / 2u;
-    \\  constexpr uint low = W & (0u - W);
-    \\  constexpr bool wide = exl3_lane_sh(N, 0u) + 16u > 64u;
-    \\  constexpr bool full = exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 32u + (low < 32u ? low : 32u);
-    \\  const uint end = W * lane + W;
-    \\  return exl3_lane_type<wide, !wide && full>::read(words, end, W, full);
-    \\}
-    \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
-    \\// K = N/16; the pair (t0, t0+1) shares one 32-bit funnel read.
-    \\struct exl3_win { uint i0; uint i1; uint sh; uint fresh; };
-    \\static inline exl3_win exl3_pair_window(uint t0, uint N) {
-    \\  const uint e0 = ((t0 + 1u) * N) >> 4u;
-    \\  const uint e1 = ((t0 + 2u) * N) >> 4u;
-    \\  const uint b0 = e0 + 16u * N - 16u;
-    \\  const uint b2 = e1 + 16u * N;
-    \\  const uint j0 = b0 >> 5u;
-    \\  const uint j1 = (b2 - 1u) >> 5u;
-    \\  exl3_win w;
-    \\  w.i0 = j0 % (N >> 1u);
-    \\  w.i1 = j1 % (N >> 1u);
-    \\  w.sh = (j1 + 1u) * 32u - b2;
-    \\  w.fresh = e1 - e0;
-    \\  return w;
-    \\}
-    \\
-;
-
-fn decodeHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime fold: u32) [:0]const u8 {
-    if (cb == .pair1) return comptime pair1Helpers(win, fold) ++ HELPERS_TAIL;
-    if (cb.tabledHashMask()) return comptime tabledHelpers(win, fold) ++ HELPERS_TAIL;
-    const body: [:0]const u8 = comptime switch (cb) {
-        .mul1 =>
-        \\  const uint2 mixed = cw * uint2(0x83DCD12Du);
-        \\  const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
-        \\  const uint2 byte_sum = uint2(0x6400u) + (pair_sums & uint2(0xFFFFu)) + (pair_sums >> uint2(16u));
-        \\  const half2 h = as_type<half2>(ushort2(byte_sum & uint2(0xFFFFu)));
-        \\  return fma(h, as_type<half2>(ushort2(0x1EEEu)), as_type<half2>(ushort2(0xC931u)));
-        ,
-        .mcg =>
-        \\  const uint2 r = ((cw * uint2(0xCBAC1FEDu)) & uint2(0x8FFF8FFFu)) ^ uint2(0x3B603B60u);
-        \\  const half4 h = as_type<half4>(r);
-        \\  return half2(h.x + h.y, h.z + h.w);
-        ,
-        else => unreachable,
-    };
-    return comptime helpersWithBody(body, win);
-}
-
-fn helpersWithBody(comptime body: [:0]const u8, comptime win: exl3.Window) [:0]const u8 {
-    const mask: [:0]const u8 = comptime if (win == .w16) "" else std.fmt.comptimePrint("  cw &= uint2(0x{X}u);\n", .{win.mask()});
-    return comptime "static inline half2 exl3_pairh(uint2 cw) {\n" ++ mask ++ body ++ "\n}\n" ++
-        \\static inline float2 exl3_decode2(uint2 cw) { return float2(exl3_pairh(cw)); }
-        \\static inline float exl3_out(float v) { return v; }
-        \\static inline float exl3_decode1(uint cw) { return exl3_decode2(uint2(cw, 0u)).x; }
-        \\// A generic reader's weight `slot` of a tile's unpacked codewords.
-        \\static inline float exl3_slot(thread const ushort *cw, uint slot) { return exl3_decode1(uint(cw[slot])); }
-        \\
-    ++ HELPERS_TAIL;
-}
-
-/// What the row-driven codebooks (SPEC1, PAIR1) build over their `exl3_unscaled_n<N>`: the weight, the decode that
-/// leaves `scale` out or keeps it, `slot` (a generic reader's weight), and the macros that hand every kernel's rate
-/// `N` to them, so each row constant is a compile-time immediate of its own kernel instance.
-fn rowedHelpers(comptime fold: u32, comptime scale: u32, comptime slot: [:0]const u8) [:0]const u8 {
-    const out: [:0]const u8 = comptime if (fold == 1)
-        "template<uint N> static inline float2 exl3_decode2_n(uint2 cw) { return float2(exl3_pairh_n<N>(cw)); }\n" ++
-            "static inline float exl3_out(float v) { return v; }\n"
-    else if (fold == scale)
-        "template<uint N> static inline float2 exl3_decode2_n(uint2 cw) { return float2(exl3_unscaled_n<N>(cw)); }\n" ++
-            std.fmt.comptimePrint("static inline float exl3_out(float v) {{ return v * {d}.0f; }}\n", .{fold})
-    else
-        @compileError("a fold is the codebook's scale or none");
-    return comptime std.fmt.comptimePrint("template<uint N> static inline half2 exl3_pairh_n(uint2 cw) {{ return exl3_unscaled_n<N>(cw) * half2({d}.0h); }}\n", .{scale}) ++
-        out ++ slot ++
-        "#define exl3_pairh(cw) exl3_pairh_n<N>((cw))\n" ++
-        "#define exl3_decode2(cw) exl3_decode2_n<N>((cw))\n" ++
-        "#define exl3_slot(cw, slot) exl3_slot_n<N>((cw), (slot))\n";
-}
-
-fn windowMask(comptime win: exl3.Window) [:0]const u8 {
-    return if (win == .w16) "" else std.fmt.comptimePrint("  cw &= uint2(0x{X}u);\n", .{win.mask()});
-}
-
-/// PAIR1's pair decode: weights 2j and 2j+1 both come from the window of weight 2j+1 (`cw.y`; `cw.x` is
-/// never read). A bank's rate is the kernel's `N`, which the macros of `rowedHelpers` look the constants up by in
-/// `exl3_pair_row_at`; the row table is generated from `exl3.pair1Pair`, the one definition the host decodes with.
-fn pair1Helpers(comptime win: exl3.Window, comptime fold: u32) [:0]const u8 {
-    comptime {
-        @setEvalBranchQuota(2_000_000);
-        var rows: [:0]const u8 = "";
-        var n: u32 = exl3.Rate.min_n;
-        while (n <= exl3.Rate.max_n) : (n += 2) {
-            const p = exl3.pair1Pair(.{ .n = n }) orelse continue;
-            if (p.scale != PAIR1_SCALE) @compileError("a PAIR1 row scales by 4096");
-            rows = rows ++ std.fmt.comptimePrint("    case {d}u: return {{0x{X}u, {d}u, 0x{X}u, 0x{X}u}};\n", .{ n, p.mult, p.rot, p.mask0, p.mask1 });
-        }
-        return "#define EXL3_LANE_FIRST 1u\nstruct exl3_pair_row { uint mult; uint rot; uint mask0; uint mask1; };\n" ++
-            "static inline constexpr exl3_pair_row exl3_pair_row_at(uint n) {\n  switch (n) {\n" ++ rows ++
-            "  }\n  return {0u, 0u, 0u, 0u};\n}\n" ++
-            "template<uint N> static inline half2 exl3_unscaled_n(uint2 cw) {\n" ++
-            "  constexpr exl3_pair_row r = exl3_pair_row_at(N);\n" ++
-            "  static_assert(r.mult != 0u, \"PAIR1 has no pair row at this rate\");\n" ++ windowMask(win) ++
-            "  const uint p = cw.y * r.mult;\n" ++
-            "  const half4 h = as_type<half4>(uint2(p & r.mask0, rotate(p, r.rot) & r.mask1));\n" ++
-            "  return half2(h.x + h.y, h.z + h.w);\n}\n" ++
-            rowedHelpers(fold, PAIR1_SCALE,
-                "template<uint N> static inline float exl3_slot_n(thread const ushort *cw, uint slot) {\n" ++
-                    "  const float2 w = exl3_decode2_n<N>(uint2(0u, uint(cw[slot | 1u])));\n" ++
-                    "  return (slot & 1u) != 0u ? w.y : w.x;\n}\n");
-    }
-}
-
-/// SPEC1's hash-mask decode with the (multiplier, mask) of the bank's rate: `exl3_hash_row_at(N)` is the table's row
-/// lookup, which `withTableRows` puts ahead of this text because the rows are the pack's data, not the kernel's.
-fn tabledHelpers(comptime win: exl3.Window, comptime fold: u32) [:0]const u8 {
-    return comptime "template<uint N> static inline half2 exl3_unscaled_n(uint2 cw) {\n" ++
-        "  constexpr exl3_hash_row r = exl3_hash_row_at(N);\n" ++
-        "  static_assert(r.mult != 0u, \"the codebook table has no row at this rate\");\n" ++ windowMask(win) ++
-        "  const half4 h = as_type<half4>((cw * uint2(r.mult)) & uint2(r.mask));\n" ++
-        "  return half2(h.x + h.y, h.z + h.w);\n}\n" ++
-        rowedHelpers(fold, exl3.hash_mask_scale,
-            "template<uint N> static inline float exl3_slot_n(thread const ushort *cw, uint slot) { return exl3_decode2_n<N>(uint2(uint(cw[slot]), 0u)).x; }\n");
-}
-
-/// The row lookup `tabledHelpers` reads, generated from SPEC1 table `which`.
-fn tableRowsText(alloc: std.mem.Allocator, which: u8) ![:0]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    const table = &codebook_tables.tables[which];
-    try out.print(alloc, "struct exl3_hash_row {{ uint mult; uint mask; }};\nstatic inline constexpr exl3_hash_row exl3_hash_row_at(uint n) {{\n  switch (n) {{\n", .{});
-    for (table.rows, 0..) |r, i| try out.print(alloc, "    case {d}u: return {{0x{X}u, 0x{X}u}};\n", .{ table.rateOf(i).n, r[0], r[1] });
-    try out.print(alloc, "  }}\n  return {{0u, 0u}};\n}}\n", .{});
-    return out.toOwnedSliceSentinel(alloc, 0);
-}
-
-/// `header` as a kernel of `cb` under `active_decode` needs it: SPEC1's gets its table's rows ahead of the helpers.
-/// Allocated for the life of the process, so call it only where a kernel is built.
-pub fn withTableRows(comptime cb: exl3.Codebook, header: [:0]const u8) ![:0]const u8 {
-    if (!cb.tabledHashMask()) return header;
-    const alloc = std.heap.page_allocator;
-    const rows = try tableRowsText(alloc, active_decode.table.?);
-    defer alloc.free(rows);
-    return std.mem.concatWithSentinel(alloc, u8, &.{ rows, header }, 0);
-}
-
-/// `getNamedKernel` for a kernel of codebook `cb` under `active_decode`: a SPEC1 kernel carries its table's rows and
-/// spells the table in its name, since MLX keys a library by name.
-fn tableKernel(slot: *?mlx.mlx_fast_metal_kernel, comptime cb: exl3.Codebook, comptime name: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, comptime header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
-    if (slot.*) |k| return k;
-    return getNamedKernel(slot, (try tableKernelName(cb, name)).ptr, ins, outs, source, try withTableRows(cb, header));
-}
-
-/// MLX keys a kernel library by name, so a SPEC1 kernel's name spells its table.
-fn tableKernelName(comptime cb: exl3.Codebook, comptime name: [:0]const u8) ![:0]const u8 {
-    if (!cb.tabledHashMask()) return name;
-    return std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}_t{s}", .{ name, codebook_tables.tables[tableOf(active_decode)].digest }, 0);
-}
-
-fn naxHeader(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]const u8 {
-    return comptime GEMM_NAX_INCLUDES ++ codebookHelpers(cb, win) ++ GEMM_NAX_FRAGS;
-}
-
-/// A weight kernel under the active decode parameters: its own slot, name and
-/// header.
-fn codebookKernel(slots: *KernelSlots, comptime base: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
-    return codebookKernelWith(slots, base, ins, outs, source, "");
-}
-
-/// `codebookKernel` with helpers of its own appended to the codebook header.
-fn codebookKernelWith(slots: *KernelSlots, comptime base: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, comptime frags: [:0]const u8) !mlx.mlx_fast_metal_kernel {
-    switch (active_decode.codebook) {
-        inline else => |cb| switch (active_decode.window) {
-            inline else => |win| {
-                if (@import("builtin").is_test and foldScale(cb) != 1 and unfolded_for_test) return tableKernel(
-                    &slots[slotRow(cb, true)][win.index()],
-                    cb,
-                    comptime base ++ cbSuffix(cb) ++ "_unfolded" ++ winSuffix(win),
-                    ins,
-                    outs,
-                    source,
-                    comptime decodeHelpers(cb, win, 1) ++ frags,
-                );
-                return tableKernel(
-                    &slots[slotRow(cb, false)][win.index()],
-                    cb,
-                    comptime base ++ cbSuffix(cb) ++ winSuffix(win),
-                    ins,
-                    outs,
-                    source,
-                    comptime codebookHelpers(cb, win) ++ frags,
-                );
-            },
-        },
-    }
-}
-
-pub fn CfgCache(comptime Key: type, comptime CAP: usize) type {
-    return struct {
-        const Self = @This();
-        keys: [CAP]Key = @splat(std.mem.zeroes(Key)),
-        cfgs: [CAP]?mlx.mlx_fast_metal_kernel_config = @splat(null),
-        used: [CAP]u64 = @splat(0),
-        tick: u64 = 0,
-
-        pub fn get(self: *Self, key: Key) ?mlx.mlx_fast_metal_kernel_config {
-            for (self.cfgs, 0..) |c, i| {
-                if (c != null and std.meta.eql(self.keys[i], key)) {
-                    self.tick += 1;
-                    self.used[i] = self.tick;
-                    return c.?;
-                }
-            }
-            return null;
-        }
-
-        pub fn put(self: *Self, key: Key, cfg: mlx.mlx_fast_metal_kernel_config) void {
-            var victim: usize = 0;
-            var oldest: u64 = std.math.maxInt(u64);
-            for (self.cfgs, 0..) |c, i| {
-                if (c == null) {
-                    victim = i;
-                    break;
-                }
-                if (self.used[i] < oldest) {
-                    oldest = self.used[i];
-                    victim = i;
-                }
-            }
-            if (self.cfgs[victim]) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
-            self.cfgs[victim] = cfg;
-            self.keys[victim] = key;
-            self.tick += 1;
-            self.used[victim] = self.tick;
-        }
-    };
-}
 
 const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int, n: u32 };
 const UnaryKey = struct { dim: c_int, topk: c_int };
@@ -1379,14 +1036,14 @@ pub fn gemmWindowAligned() bool {
     gemm_align_cached = on;
     return on;
 }
-var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
-var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
+var indexed_coop_cfgs: kernel_src.CfgCache(IndexedKey, 8) = .{};
+var prepare_cfgs: kernel_src.CfgCache(UnaryKey, 8) = .{};
 const FinishKey = struct { dim: c_int, topk: c_int, out_dt: mlx.mlx_dtype };
-var finish_cfgs: CfgCache(FinishKey, 8) = .{};
-var gemm_sorted_cfgs: CfgCache(GemmSortedKey, 8) = .{};
-var gemm_simdmat_cfgs: CfgCache(GemmSortedKey, 8) = .{};
-var gemm_nax_cfgs: CfgCache(GemmSortedKey, 8) = .{};
-var gemm_nax_kernel: KernelSlots = no_kernels;
+var finish_cfgs: kernel_src.CfgCache(FinishKey, 8) = .{};
+var gemm_sorted_cfgs: kernel_src.CfgCache(GemmSortedKey, 8) = .{};
+var gemm_simdmat_cfgs: kernel_src.CfgCache(GemmSortedKey, 8) = .{};
+var gemm_nax_cfgs: kernel_src.CfgCache(GemmSortedKey, 8) = .{};
+var gemm_nax_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 pub var gemm_nax_failed: bool = false;
 var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
@@ -1395,15 +1052,15 @@ const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nspl
 const MidKey = struct { dim: c_int, nslots: c_int, limit: c_int = 0 };
 const ReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int };
 const DecodeReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int, dtype: mlx.mlx_dtype };
-var pair_gemv_cfgs: CfgCache(PairGemvKey, 8) = .{};
-var mid_cfgs: CfgCache(MidKey, 8) = .{};
-var reduce_cfgs: CfgCache(DecodeReduceKey, 8) = .{};
-var down_fused_cfgs: CfgCache(DownFusedKey, 8) = .{};
-var token_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
-var token_pair_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
-var token_reduce_cfgs: CfgCache(ReduceKey, 8) = .{};
+var pair_gemv_cfgs: kernel_src.CfgCache(PairGemvKey, 8) = .{};
+var mid_cfgs: kernel_src.CfgCache(MidKey, 8) = .{};
+var reduce_cfgs: kernel_src.CfgCache(DecodeReduceKey, 8) = .{};
+var down_fused_cfgs: kernel_src.CfgCache(DownFusedKey, 8) = .{};
+var token_prep_cfgs: kernel_src.CfgCache(PairPrepKey, 8) = .{};
+var token_pair_prep_cfgs: kernel_src.CfgCache(PairPrepKey, 8) = .{};
+var token_reduce_cfgs: kernel_src.CfgCache(ReduceKey, 8) = .{};
 const ScatterKey = struct { dim: c_int, nslots: c_int };
-var token_scatter_cfgs: CfgCache(ScatterKey, 8) = .{};
+var token_scatter_cfgs: kernel_src.CfgCache(ScatterKey, 8) = .{};
 var token_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_pair_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_pair_unsorted_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -1493,15 +1150,15 @@ fn getGemmNaxKernelFor(order: TileOrder) !mlx.mlx_fast_metal_kernel {
     switch (active_decode.codebook) {
         inline else => |cb| switch (active_decode.window) {
             inline else => |win| {
-                const slot = &slots[slotRow(cb, false)][win.index()];
+                const slot = &slots[kernel_src.slotRow(cb, false)][win.index()];
                 if (slot.*) |k| return k;
-                const header = try withTableRows(cb, naxHeader(cb, win));
+                const header = try kernel_src.withTableRows(cb, kernel_src.naxHeader(cb, win));
                 const kernel = (if (ref)
-                    buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ cbSuffix(cb) ++ winSuffix(win))).ptr)
+                    buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr)
                 else if (order == .tile_major)
-                    buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ cbSuffix(cb) ++ winSuffix(win))).ptr)
+                    buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr)
                 else
-                    buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax" ++ cbSuffix(cb) ++ winSuffix(win))).ptr)) orelse {
+                    buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr)) orelse {
                     gemm_nax_failed = true;
                     log.info("[exl3-gemm] NAX arm declined (kernel probe failed); the sorted GEMM serves prefill\n", .{});
                     return error.MetalKernelCompileFailed;
@@ -1577,8 +1234,8 @@ fn getGemmSortedKernel(order: TileOrder) !mlx.mlx_fast_metal_kernel {
     const ins = [_][*:0]const u8{ "x", "trellis", "eids", "wstarts", "wnlive" };
     const outs = [_][*:0]const u8{"y"};
     return switch (order) {
-        .pack => codebookKernel(&gemm_sorted_kernel, "sushi_exl3_k4_gemm_sorted", &ins, &outs, GEMM_SORTED_SOURCE),
-        .tile_major => codebookKernel(&gemm_sorted_tm_kernel, "sushi_exl3_k4_gemm_sorted_tm", &ins, &outs, GEMM_SORTED_TM_SOURCE),
+        .pack => kernel_src.codebookKernel(&gemm_sorted_kernel, "sushi_exl3_k4_gemm_sorted", &ins, &outs, GEMM_SORTED_SOURCE),
+        .tile_major => kernel_src.codebookKernel(&gemm_sorted_tm_kernel, "sushi_exl3_k4_gemm_sorted_tm", &ins, &outs, GEMM_SORTED_TM_SOURCE),
     };
 }
 
@@ -1586,12 +1243,12 @@ fn getGemmSimdmatKernel(order: TileOrder) !mlx.mlx_fast_metal_kernel {
     const ins = [_][*:0]const u8{ "x", "trellis", "eids", "wstarts", "wnlive" };
     const outs = [_][*:0]const u8{"y"};
     return switch (order) {
-        .pack => codebookKernelWith(&gemm_simdmat_kernel, "sushi_exl3_k4_gemm_simdmat", &ins, &outs, GEMM_SIMDMAT_SOURCE, GEMM_SIMDMAT_FRAGS),
-        .tile_major => codebookKernelWith(&gemm_simdmat_tm_kernel, "sushi_exl3_k4_gemm_simdmat_tm", &ins, &outs, GEMM_SIMDMAT_TM_SOURCE, GEMM_SIMDMAT_FRAGS),
+        .pack => kernel_src.codebookKernelWith(&gemm_simdmat_kernel, "sushi_exl3_k4_gemm_simdmat", &ins, &outs, GEMM_SIMDMAT_SOURCE, GEMM_SIMDMAT_FRAGS),
+        .tile_major => kernel_src.codebookKernelWith(&gemm_simdmat_tm_kernel, "sushi_exl3_k4_gemm_simdmat_tm", &ins, &outs, GEMM_SIMDMAT_TM_SOURCE, GEMM_SIMDMAT_FRAGS),
     };
 }
 
-fn sortedGemmCfg(cache: *CfgCache(GemmSortedKey, 8), key: GemmSortedKey) !mlx.mlx_fast_metal_kernel_config {
+fn sortedGemmCfg(cache: *kernel_src.CfgCache(GemmSortedKey, 8), key: GemmSortedKey) !mlx.mlx_fast_metal_kernel_config {
     if (cache.get(key)) |c| return c;
     const c = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -2081,12 +1738,12 @@ const INDEXED_COOP_SOURCE: [:0]const u8 =
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
 ;
 
-var indexed_coop_kernel: KernelSlots = no_kernels;
+var indexed_coop_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 fn getIndexedCoopKernel() !mlx.mlx_fast_metal_kernel {
     const ins = [_][*:0]const u8{ "x", "trellis", "slots" };
     const outs = [_][*:0]const u8{"y"};
-    return codebookKernel(&indexed_coop_kernel, "sushi_exl3_k4_mul1_gemv_indexed", &ins, &outs, INDEXED_COOP_SOURCE);
+    return kernel_src.codebookKernel(&indexed_coop_kernel, "sushi_exl3_k4_mul1_gemv_indexed", &ins, &outs, INDEXED_COOP_SOURCE);
 }
 
 const INDEXED_PAIR_COOP_SOURCE: [:0]const u8 = blk: {
@@ -2103,8 +1760,8 @@ const INDEXED_PAIR_COOP_SOURCE: [:0]const u8 = blk: {
     // and four-simdgroup reduction exactly as the standalone kernel.
     break :blk pointers ++ INDEXED_COOP_SOURCE[0..at] ++ "uint split = 0u;" ++ INDEXED_COOP_SOURCE[at + split.len ..];
 };
-var indexed_pair_coop_kernel: KernelSlots = no_kernels;
-var indexed_pair_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
+var indexed_pair_coop_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var indexed_pair_coop_cfgs: kernel_src.CfgCache(IndexedKey, 8) = .{};
 var indexed_pair_coop_engaged: bool = false;
 
 fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array) !?[2]mlx.mlx_array {
@@ -2135,7 +1792,7 @@ fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, t
         indexed_pair_coop_cfgs.put(key, c);
         break :blk c;
     };
-    const kernel = try codebookKernel(&indexed_pair_coop_kernel, "sushi_exl3_indexed_pair_coop", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, INDEXED_PAIR_COOP_SOURCE);
+    const kernel = try kernel_src.codebookKernel(&indexed_pair_coop_kernel, "sushi_exl3_indexed_pair_coop", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, INDEXED_PAIR_COOP_SOURCE);
     const outputs = try applyOuts(s, kernel, &.{ xg, xu, tg, tu, slots }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(outputs);
     var result = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
@@ -2430,7 +2087,7 @@ pub fn downGemvFusedMid(
     };
     const ins = [_][*:0]const u8{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" };
     const outs = [_][*:0]const u8{"y"};
-    const kernel = try codebookKernel(&down_fused_kernel, "sushi_exl3_k4_down_fused", &ins, &outs, DOWN_FUSED_SOURCE);
+    const kernel = try kernel_src.codebookKernel(&down_fused_kernel, "sushi_exl3_k4_down_fused", &ins, &outs, DOWN_FUSED_SOURCE);
     const ov = try applyOuts(s, kernel, &.{ ig, iu, trellis, svhg, svhu, suhd, slots }, cfg, 1);
     logFunnel(layout.funnel, rate.n, .fused_mid_down, mlx.mlx_array_dtype(ig));
     defer _ = mlx.mlx_vector_array_free(ov);
@@ -2759,17 +2416,17 @@ const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, 
 const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom };
 const RowsFinishKey = struct { out_dim: c_int, rows: c_int, groups: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int };
 /// DeepSeek's trunk alone holds a dozen shapes at each of a decode and a verify width, so a smaller cache thrashes.
-var rows_cfgs: CfgCache(RowsKey, 64) = .{};
-var rows_finish_cfgs: CfgCache(RowsFinishKey, 64) = .{};
-var rows_kernel: KernelSlots = no_kernels;
-var rows_nax_kernel: KernelSlots = no_kernels;
+var rows_cfgs: kernel_src.CfgCache(RowsKey, 64) = .{};
+var rows_finish_cfgs: kernel_src.CfgCache(RowsFinishKey, 64) = .{};
+var rows_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var rows_nax_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 var rows_finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const ROWS_INS = [_][*:0]const u8{ "x", "trellis", "suh", "svh" };
 const ROWS_NAX_FRAGS: [:0]const u8 = GEMM_NAX_INCLUDES ++ GEMM_NAX_FRAGS ++ ROWS_HELPERS;
 
 fn rowsKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
-    if (g.nax) return codebookKernelWith(&rows_nax_kernel, "sushi_exl3_rows_nax", &ROWS_INS, &.{"y"}, ROWS_NAX_SOURCE, ROWS_NAX_FRAGS);
-    return codebookKernelWith(&rows_kernel, "sushi_exl3_rows", &ROWS_INS, &.{"y"}, ROWS_SOURCE, ROWS_HELPERS);
+    if (g.nax) return kernel_src.codebookKernelWith(&rows_nax_kernel, "sushi_exl3_rows_nax", &ROWS_INS, &.{"y"}, ROWS_NAX_SOURCE, ROWS_NAX_FRAGS);
+    return kernel_src.codebookKernelWith(&rows_kernel, "sushi_exl3_rows", &ROWS_INS, &.{"y"}, ROWS_SOURCE, ROWS_HELPERS);
 }
 
 fn rowsFolds(g: RowsGeom) bool {
@@ -3294,14 +2951,14 @@ fn logFunnel(on: bool, n: u32, arm: FunnelArm, dtype: mlx.mlx_dtype) void {
     log.info("[exl3] n{d} funnel engaged arm={s} codebook={s} dtype={s} window={d}\n", .{ n, @tagName(arm), @tagName(active_decode.codebook), @tagName(dtype), active_decode.window.bits() });
 }
 
-var pair_gemv_kernel: KernelSlots = no_kernels;
-var pair_gemv_grouped_kernel: GroupedSlots = @splat(no_kernels);
+var pair_gemv_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var pair_gemv_grouped_kernel: GroupedSlots = @splat(kernel_src.no_kernels);
 var mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_shared_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_shared_lead_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_gated_shared_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var down_fused_kernel: KernelSlots = no_kernels;
+var down_fused_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 pub fn getNamedKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
     if (slot.*) |k| return k;
@@ -3371,7 +3028,7 @@ pub fn pairGemv(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: 
     const kernel = if (group > 0)
         try groupedKernel(&pair_gemv_grouped_kernel, "sushi_exl3_pair_gemv_grouped", &ins, &outs, pairGroupedSource, group)
     else
-        try codebookKernel(&pair_gemv_kernel, "sushi_exl3_pair_gemv", &ins, &outs, PAIR_GEMV_SOURCE);
+        try kernel_src.codebookKernel(&pair_gemv_kernel, "sushi_exl3_pair_gemv", &ins, &outs, PAIR_GEMV_SOURCE);
     logGroupedEngaged(group);
     const ov = try applyOuts(s, kernel, &.{ x, suhg, suhu, tg, tu, slots }, cfg, 2);
     logFunnel(layout.funnel, rate.n, .pair, mlx.mlx_array_dtype(x));
@@ -4998,7 +4655,7 @@ test "exl3 a NAX GEMM source the Metal toolchain rejects is declined at the prob
     gemm_nax_failed = true;
     try t.expect(gemmNaxAvailable());
     try t.expect(!gemmNaxOn());
-    const real = buildNaxGemmKernel(GEMM_NAX_SOURCE, naxHeader(.mul1, .w16), "sushi_exl3_k4_gemm_nax") orelse return error.TestUnexpectedResult;
+    const real = buildNaxGemmKernel(GEMM_NAX_SOURCE, kernel_src.naxHeader(.mul1, .w16), "sushi_exl3_k4_gemm_nax") orelse return error.TestUnexpectedResult;
     _ = mlx.mlx_fast_metal_kernel_free(real);
     try t.expect(!mlx.errorPending());
 }
@@ -7132,12 +6789,12 @@ const FallbackEnv = struct {
 /// The multi-row kernels preparing each row from the next row's activations: the defect the
 /// multi-row parity bar must convict.
 const ROWS_ROW_MUTANT = .{ "x + (size_t)r * uint(IDIM) + k;", "x + (size_t)((r + 1u) % uint(ROWS)) * uint(IDIM) + k;" };
-var rows_mutant_kernel: KernelSlots = no_kernels;
-var rows_nax_mutant_kernel: KernelSlots = no_kernels;
+var rows_mutant_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var rows_nax_mutant_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 fn rowsMutantKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
-    if (g.nax) return codebookKernelWith(&rows_nax_mutant_kernel, "sushi_exl3_rows_nax_row_mutant", &ROWS_INS, &.{"y"}, metalReplaceFound(ROWS_NAX_SOURCE, ROWS_ROW_MUTANT[0], ROWS_ROW_MUTANT[1]), ROWS_NAX_FRAGS);
-    return codebookKernelWith(&rows_mutant_kernel, "sushi_exl3_rows_row_mutant", &ROWS_INS, &.{"y"}, metalReplaceFound(ROWS_SOURCE, ROWS_ROW_MUTANT[0], ROWS_ROW_MUTANT[1]), ROWS_HELPERS);
+    if (g.nax) return kernel_src.codebookKernelWith(&rows_nax_mutant_kernel, "sushi_exl3_rows_nax_row_mutant", &ROWS_INS, &.{"y"}, metalReplaceFound(ROWS_NAX_SOURCE, ROWS_ROW_MUTANT[0], ROWS_ROW_MUTANT[1]), ROWS_NAX_FRAGS);
+    return kernel_src.codebookKernelWith(&rows_mutant_kernel, "sushi_exl3_rows_row_mutant", &ROWS_INS, &.{"y"}, metalReplaceFound(ROWS_SOURCE, ROWS_ROW_MUTANT[0], ROWS_ROW_MUTANT[1]), ROWS_HELPERS);
 }
 
 /// The unnormalized 128-point Walsh-Hadamard transform, in f64.
@@ -7507,10 +7164,10 @@ const ROWS_K_LOOP_BASELINE: []const u8 =
     \\
 ;
 const ROWS_BASELINE_SOURCE: [:0]const u8 = metalReplaceFound(metalReplaceFound(ROWS_BODY, ROWS_K_LOOP, ROWS_K_LOOP_BASELINE), "PREP_SLOT", LANE_ORDER_SLOT);
-var rows_baseline_kernel: KernelSlots = no_kernels;
+var rows_baseline_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 fn rowsBaselineKernel() !mlx.mlx_fast_metal_kernel {
-    return codebookKernelWith(&rows_baseline_kernel, "sushi_exl3_rows_baseline", &ROWS_INS, &.{"y"}, ROWS_BASELINE_SOURCE, ROWS_HELPERS);
+    return kernel_src.codebookKernelWith(&rows_baseline_kernel, "sushi_exl3_rows_baseline", &ROWS_INS, &.{"y"}, ROWS_BASELINE_SOURCE, ROWS_HELPERS);
 }
 
 test "exl3 SIMD multi-row: the split row loops and the launch policy leave every output byte unchanged" {
@@ -7582,21 +7239,13 @@ test "exl3 multi-row projection is one dispatch on an lm_head-wide output and tw
     }
 }
 
-fn n40NaxReaderExact(comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool) !void {
-    return n40WeightReaderExact(cb, win, raw, false);
-}
-
-fn n40WeightReaderExact(comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime lane_reader: bool) !void {
-    return weightReaderExact(40, cb, win, raw, if (lane_reader) .lane else .nax);
-}
-
-fn weightReaderExact(comptime n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm) !void {
+pub fn weightReaderExact(comptime n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm) !void {
     return weightReaderExactAt(n, cb, win, raw, reader, if (cb.tabledHashMask()) exl3.Decode.tabled(cb, .w15).table else null);
 }
 
 const ReaderArm = enum { lane, nax, simdmat };
 
-fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm, table: ?u8) !void {
+pub fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime raw: bool, comptime reader: ReaderArm, table: ?u8) !void {
     const t = std.testing;
     const dec: exl3.Decode = .{ .codebook = cb, .window = win, .table = table };
     setDecodeParams(dec);
@@ -7635,10 +7284,10 @@ fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime win
         \\#define exl3_pairh exl3_raw_pair
         \\
     ;
-    const header = comptime (if (reader == .simdmat) "" else GEMM_NAX_INCLUDES) ++ codebookHelpers(cb, win) ++ (if (raw) identity else "") ++ (if (reader == .simdmat) GEMM_SIMDMAT_FRAGS else GEMM_NAX_FRAGS);
+    const header = comptime (if (reader == .simdmat) "" else GEMM_NAX_INCLUDES) ++ kernel_src.codebookHelpers(cb, win) ++ (if (raw) identity else "") ++ (if (reader == .simdmat) GEMM_SIMDMAT_FRAGS else GEMM_NAX_FRAGS);
     var kernel: ?mlx.mlx_fast_metal_kernel = null;
-    const name = comptime std.fmt.comptimePrint("exl3_n{d}_reader_exact", .{n}) ++ cbSuffix(cb) ++ winSuffix(win) ++ (if (raw) "_raw" else "_weights") ++ "_" ++ @tagName(reader);
-    const k = try getNamedKernel(&kernel, (try tableKernelName(cb, name)).ptr, &.{"trellis"}, &.{"result"}, source, try withTableRows(cb, header));
+    const name = comptime std.fmt.comptimePrint("exl3_n{d}_reader_exact", .{n}) ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win) ++ (if (raw) "_raw" else "_weights") ++ "_" ++ @tagName(reader);
+    const k = try getNamedKernel(&kernel, (try kernel_src.tableKernelName(cb, name)).ptr, &.{"trellis"}, &.{"result"}, source, try kernel_src.withTableRows(cb, header));
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
     var trellis_data: [128 * n]u16 = undefined;
     var prng = std.Random.DefaultPrng.init(430);
@@ -7677,28 +7326,6 @@ fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime win
                     exl3.decodeCodeword(code & win.mask(), cb);
                 try t.expectEqual(want, got[tile * 256 + lane * 8 + j]);
             }
-        }
-    }
-}
-
-test "exl3 n40 NAX codewords and decoded weights are exact" {
-    try n40NaxReaderExact(.mcg, .w12, true);
-    try n40NaxReaderExact(.mcg, .w12, false);
-    try n40NaxReaderExact(.mul1, .w8, false);
-    try n40NaxReaderExact(.mul1, .w16, false);
-}
-
-test "exl3 n42 funnel readers preserve decoded weights at w15 and a narrowed window" {
-    inline for (.{ .lane, .nax, .simdmat }) |reader| {
-        inline for (.{ exl3.Window.w15, exl3.Window.w12 }) |win| try weightReaderExact(42, .mcg, win, false, reader);
-    }
-}
-
-test "exl3 n36 simdgroup reader codewords and decoded weights are exact" {
-    try weightReaderExact(36, .mcg, .w12, true, .simdmat);
-    inline for (.{ exl3.Codebook.mcg, exl3.Codebook.mul1 }) |cb| {
-        inline for (.{ exl3.Window.w8, exl3.Window.w12, exl3.Window.w16 }) |win| {
-            try weightReaderExact(36, cb, win, false, .simdmat);
         }
     }
 }
@@ -7862,7 +7489,7 @@ const MIMO_WINDOW_SOURCE: [:0]const u8 =
 ;
 
 const MimoWindowKey = struct { rows: c_int, win: c_int, experts: c_int };
-var mimo_window_cfgs: CfgCache(MimoWindowKey, 8) = .{};
+var mimo_window_cfgs: kernel_src.CfgCache(MimoWindowKey, 8) = .{};
 var mimo_window_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mimo_window_engaged: bool = false;
 
@@ -7961,7 +7588,7 @@ const MIMO_REDUCE_SOURCE: [:0]const u8 = blk: {
     break :blk REDUCE_SOURCE[0..at] ++ "const size_t xb = (size_t)inverse[slot] * (size_t)(ODIM) + base;" ++ REDUCE_SOURCE[at + old.len ..];
 };
 var mimo_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var mimo_reduce_cfgs: CfgCache(DecodeReduceKey, 8) = .{};
+var mimo_reduce_cfgs: kernel_src.CfgCache(DecodeReduceKey, 8) = .{};
 var mimo_reduce_engaged: bool = false;
 
 pub fn finishMimoSorted(s: mlx.mlx_stream, inner: mlx.mlx_array, inverse: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, dim: c_int, rows: c_int, topk: c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
@@ -8113,12 +7740,6 @@ test "exl3 Flash-Next prefill reads the sorted down plane through the inverse, t
     const b = try evalF16(s, served, &cb);
     const n = c.rows * c.hidden;
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(a[0..n]), std.mem.sliceAsBytes(b[0..n]));
-}
-
-test "exl3 n40 decode lane codewords and decoded weights are exact" {
-    try n40WeightReaderExact(.mcg, .w12, true, true);
-    try n40WeightReaderExact(.mcg, .w12, false, true);
-    try n40WeightReaderExact(.mul1, .w8, false, true);
 }
 
 test "exl3 n40 decode BF16 rows no worse than composite against f32 truth" {
@@ -8612,10 +8233,10 @@ fn pairPreparedGroupedSource(comptime g: u32) [:0]const u8 {
 }
 
 const PairPrepKeyD = struct { in_dim: c_int, nslots: c_int, topk: c_int };
-var pair_prep_cfgs: CfgCache(PairPrepKeyD, 8) = .{};
+var pair_prep_cfgs: kernel_src.CfgCache(PairPrepKeyD, 8) = .{};
 var pair_prep_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var pair_gemv_prepared_kernel: KernelSlots = no_kernels;
-var pair_gemv_prepared_grouped_kernel: GroupedSlots = @splat(no_kernels);
+var pair_gemv_prepared_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var pair_gemv_prepared_grouped_kernel: GroupedSlots = @splat(kernel_src.no_kernels);
 
 /// Each slot's gate and up inputs, Hadamard-prepared once: `[nslots * 2, in_dim]` f16.
 pub fn pairPrepare(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, slots: mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !mlx.mlx_array {
@@ -8654,7 +8275,7 @@ pub fn pairGemvPrepared(s: mlx.mlx_stream, prep: mlx.mlx_array, tg: mlx.mlx_arra
     const kernel = if (group > 0)
         try groupedKernel(&pair_gemv_prepared_grouped_kernel, "sushi_exl3_pair_gemv_prepared_grouped", &ins, &outs, pairPreparedGroupedSource, group)
     else
-        try codebookKernel(&pair_gemv_prepared_kernel, "sushi_exl3_pair_gemv_prepared", &ins, &outs, PAIR_GEMV_PREPARED_SOURCE);
+        try kernel_src.codebookKernel(&pair_gemv_prepared_kernel, "sushi_exl3_pair_gemv_prepared", &ins, &outs, PAIR_GEMV_PREPARED_SOURCE);
     logGroupedEngaged(group);
     const ov = try applyOuts(s, kernel, &.{ prep, tg, tu, slots }, cfg, 2);
     logFunnel(layout.funnel, rate.n, .pair, .float16);
@@ -8669,11 +8290,11 @@ pub fn pairGemvPrepared(s: mlx.mlx_stream, prep: mlx.mlx_array, tg: mlx.mlx_arra
 }
 
 const DecodeMidKey = struct { dim: c_int, nslots: c_int, nsplit: c_int };
-var decode_mid_cfgs: CfgCache(DecodeMidKey, 8) = .{};
+var decode_mid_cfgs: kernel_src.CfgCache(DecodeMidKey, 8) = .{};
 var decode_mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var down_prepared_cfgs: CfgCache(DownFusedKey, 8) = .{};
-var down_prepared_kernel: KernelSlots = no_kernels;
-var down_prepared_grouped_kernel: GroupedSlots = @splat(no_kernels);
+var down_prepared_cfgs: kernel_src.CfgCache(DownFusedKey, 8) = .{};
+var down_prepared_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var down_prepared_grouped_kernel: GroupedSlots = @splat(kernel_src.no_kernels);
 var prepared_mid_engaged: bool = false;
 var grouped_engaged: bool = false;
 
@@ -8727,7 +8348,7 @@ fn downGemvPreparedMid(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, 
     const kernel = if (group > 0)
         try groupedKernel(&down_prepared_grouped_kernel, "sushi_exl3_down_prepared_grouped", &.{ "middle", "trellis", "slots" }, &.{"y"}, downGroupedSource, group)
     else
-        try codebookKernel(&down_prepared_kernel, "sushi_exl3_down_prepared", &.{ "middle", "trellis", "slots" }, &.{"y"}, DOWN_PREPARED_SOURCE);
+        try kernel_src.codebookKernel(&down_prepared_kernel, "sushi_exl3_down_prepared", &.{ "middle", "trellis", "slots" }, &.{"y"}, DOWN_PREPARED_SOURCE);
     logGroupedEngaged(group);
     const outputs = try applyOuts(s, kernel, &.{ middle, trellis, slots }, cfg, 1);
     logFunnel(layout.funnel, rate.n, .prepared_down, mlx.mlx_array_dtype(middle));
@@ -8749,131 +8370,6 @@ test "exl3 prepared mid keys on MiMo geometry, never on the rate, and excludes q
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 9, .bfloat16));
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 1, .float16));
     try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 1, .bfloat16));
-}
-
-// Both helpers, every codeword: the MMA operand `exl3_pairh`, and a GEMV's `exl3_decode2` as its
-// f32 sums carry it (the weight over the fold) and as `exl3_out` stores it, each against the host
-// decode. Spec1's halves are often subnormal and its half sum rounds, alike on both.
-/// The host decode of one codeword at the probe rate n40.
-fn hostWeight(cw: u16, dec: exl3.Decode) u16 {
-    return if (dec.hashMask(.{ .n = 40 })) |hm| exl3.decodeHashMask(cw, hm) else exl3.decodeCodeword(cw, dec.codebook);
-}
-
-test "exl3 MCG, spec1 and std1 decode every codeword at windows 8 through 16, through both decode helpers" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const source =
-        \\constexpr uint N = 40u;
-        \\const uint i = thread_position_in_grid.x;
-        \\const uint2 cw = uint2(codes[i], codes[65535u - i]);
-        \\pairs[i] = as_type<uint>(exl3_pairh(cw));
-        \\const float2 w = exl3_decode2(cw);
-        \\stored[i] = as_type<uint>(half2(half(exl3_out(w.x)), half(exl3_out(w.y))));
-        \\carried[i] = as_type<uint>(w.x);
-    ;
-    const codes = try t.allocator.alloc(u32, 65536);
-    defer t.allocator.free(codes);
-    for (codes, 0..) |*v, i| v.* = @intCast(i);
-    const input = mlx.mlx_array_new_data(codes.ptr, &.{65536}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(input);
-    const inputs = mlx.mlx_vector_array_new_data(&.{input}, 1);
-    defer _ = mlx.mlx_vector_array_free(inputs);
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    for (0..3) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{65536}, 1, .uint32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 65536, 1, 1));
-    inline for (.{ exl3.Codebook.mcg, exl3.Codebook.spec1, exl3.Codebook.std1 }) |cb| inline for (8..17) |bits| for (@as([]const ?u8, if (cb == .spec1) &.{ SPEC1_W15.table, SPEC1_PER_RATE.table } else if (cb == .std1) &.{STD1_W15.table} else &.{null})) |table| {
-        const win = comptime exl3.Window.fromBits(bits).?;
-        const dec: exl3.Decode = .{ .codebook = cb, .window = win, .table = table };
-        setDecodeParams(dec);
-        defer setDecodeParams(.mul1);
-        var slot: ?mlx.mlx_fast_metal_kernel = null;
-        const kernel = try getNamedKernel(&slot, (try tableKernelName(cb, comptime "exl3_half_pairs" ++ cbSuffix(cb) ++ winSuffix(win))).ptr, &.{"codes"}, &.{ "pairs", "stored", "carried" }, source, try withTableRows(cb, comptime codebookHelpers(cb, win)));
-        defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
-        var outputs = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(outputs);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, cfg, s));
-        for (0..3) |o| {
-            var result = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(result);
-            try mlx.check(mlx.mlx_vector_array_get(&result, outputs, o));
-            try mlx.check(mlx.mlx_array_eval(result));
-            const got = mlx.mlx_array_data_uint32(result) orelse return error.U32Unreadable;
-            for (codes, 0..) |cw, i| {
-                const lo = hostWeight(@as(u16, @intCast(cw)) & win.mask(), dec);
-                const hi = hostWeight(@as(u16, @intCast(65535 - cw)) & win.mask(), dec);
-                const want = if (o < 2)
-                    @as(u32, lo) | (@as(u32, hi) << 16)
-                else
-                    @as(u32, @bitCast(exl3.f16BitsToF32(lo) / @as(f32, @floatFromInt(foldScale(cb)))));
-                try t.expectEqual(want, got[i]);
-            }
-        }
-    };
-}
-
-// PAIR1 at every row of the pack contract: the odd weight's window alone decodes both weights, through the
-// MMA operand and through a GEMV's folded sums, bit-identical to the host's `decodePair`.
-test "exl3 PAIR1 decodes every codeword at every rate through both decode helpers" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const source =
-        \\const uint i = thread_position_in_grid.x;
-        \\const uint2 cw = uint2(codes[i], codes[65535u - i]);
-        \\pairs[i] = as_type<uint>(exl3_pairh(cw));
-        \\const float2 w = exl3_decode2(cw);
-        \\stored[i] = as_type<uint>(half2(half(exl3_out(w.x)), half(exl3_out(w.y))));
-        \\carried[i] = as_type<uint>(w.x);
-    ;
-    const codes = try t.allocator.alloc(u32, 65536);
-    defer t.allocator.free(codes);
-    for (codes, 0..) |*v, i| v.* = @intCast(i);
-    const input = mlx.mlx_array_new_data(codes.ptr, &.{65536}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(input);
-    const inputs = mlx.mlx_vector_array_new_data(&.{input}, 1);
-    defer _ = mlx.mlx_vector_array_free(inputs);
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    for (0..3) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{65536}, 1, .uint32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 65536, 1, 1));
-    inline for (0..21) |row| {
-        const n = 24 + 2 * row;
-        const pair = exl3.pair1Pair(.{ .n = n }).?;
-        var slot: ?mlx.mlx_fast_metal_kernel = null;
-        const kernel = try getNamedKernel(&slot, comptime std.fmt.comptimePrint("exl3_pair1_pairs_n{d}", .{n}), &.{"codes"}, &.{ "pairs", "stored", "carried" }, comptime std.fmt.comptimePrint("constexpr uint N = {d}u;\n", .{n}) ++ source, comptime codebookHelpers(.pair1, .w16));
-        defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
-        var outputs = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(outputs);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, cfg, s));
-        for (0..3) |o| {
-            var result = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(result);
-            try mlx.check(mlx.mlx_vector_array_get(&result, outputs, o));
-            try mlx.check(mlx.mlx_array_eval(result));
-            const got = mlx.mlx_array_data_uint32(result) orelse return error.U32Unreadable;
-            for (codes, 0..) |_, i| {
-                const w = exl3.decodePair(@intCast(65535 - i), pair);
-                const want = if (o < 2)
-                    @as(u32, w[0]) | (@as(u32, w[1]) << 16)
-                else
-                    @as(u32, @bitCast(exl3.f16BitsToF32(w[0]) / @as(f32, @floatFromInt(foldScale(.pair1)))));
-                try t.expectEqual(want, got[i]);
-            }
-        }
-    }
-}
-
-test "exl3 n48 funnel readers preserve codewords and weights" {
-    inline for ([_]exl3.Codebook{.mcg}) |cb| {
-        inline for ([_]bool{ false, true }) |lane_reader| {
-            try weightReaderExact(48, cb, .w12, true, if (lane_reader) .lane else .nax);
-            inline for (8..17) |bits| try weightReaderExact(48, cb, comptime exl3.Window.fromBits(bits).?, false, if (lane_reader) .lane else .nax);
-        }
-    }
 }
 
 fn n48FunnelCase(cb: exl3.Codebook, rows: usize, seed: u64, decode: bool, prepared: ?bool) !void {
@@ -9126,28 +8622,8 @@ test "exl3 every K1.5 to K2 rate takes the fast arms at every window, bit-identi
     }
 }
 
-// PAIR1's pair reads the odd weight's window alone; every reader hands exl3_pairh a trellis-adjacent
-// (even, odd) pair, so each decodes each rate's weights as the host does.
-test "exl3 PAIR1 weight readers decode every K1.5 to K4 rate exactly" {
-    inline for (12..33) |half| {
-        const n: u32 = 2 * half;
-        if (n != 64) try weightReaderExact(n, .pair1, .w16, false, .lane);
-        inline for (.{ .nax, .simdmat }) |reader| try weightReaderExact(n, .pair1, .w16, false, reader);
-    }
-}
-
 pub const SPEC1_W15 = exl3.Decode.tabled(.spec1, .w15);
-const STD1_W15 = exl3.Decode.tabled(.std1, .w15);
-
-// The NAX fragment, simdgroup-matrix and decode-lane readers decode spec1 and std1 through the same
-// helper as every other codebook; held to the host decode at each K1.5 to K4 rate on w15.
-test "exl3 spec1 and std1 weight readers decode every K1.5 to K4 rate exactly at w15" {
-    inline for (.{ exl3.Codebook.spec1, exl3.Codebook.std1 }) |cb| inline for (12..33) |half| {
-        const n: u32 = 2 * half;
-        if (n != 64) try weightReaderExact(n, cb, .w15, false, .lane);
-        inline for (.{ .nax, .simdmat }) |reader| try weightReaderExact(n, cb, .w15, false, reader);
-    };
-}
+pub const STD1_W15 = exl3.Decode.tabled(.std1, .w15);
 
 const PAIR1_W16: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
 const PAIR1_NS = [_]u32{ 24, 28, 32, 36, 40, 42, 48, 56, 64 };
@@ -9350,18 +8826,11 @@ test "exl3 PAIR1's 2^12 folded into the stores keeps every byte of the decode, v
 
 // A SPEC1 table whose pair differs at every rate, decoded by every reader at the bank's own rate. A reader that
 // took one pair for every bank, or the legacy pair, or another rate's row, fails against the host decode.
-const SPEC1_PER_RATE: exl3.Decode = .{ .codebook = .spec1, .window = .w12, .table = codebook_tables.indexOf("spec1-test-per-rate") };
-const PER_RATE_NS = sampleRates(24, 64, true);
+pub const SPEC1_PER_RATE: exl3.Decode = .{ .codebook = .spec1, .window = .w12, .table = codebook_tables.indexOf("spec1-test-per-rate") };
+pub const PER_RATE_NS = sampleRates(24, 64, true);
 
 fn perRate(win: exl3.Window) exl3.Decode {
     return .{ .codebook = .spec1, .window = win, .table = SPEC1_PER_RATE.table };
-}
-
-test "exl3 SPEC1 per-rate table: every reader decodes every rate with its own row, at any window" {
-    inline for (.{ exl3.Window.w8, exl3.Window.w12, exl3.Window.w15, exl3.Window.w16 }) |win| inline for (PER_RATE_NS) |n| {
-        if (n != 64) try weightReaderExactAt(n, .spec1, win, false, .lane, SPEC1_PER_RATE.table);
-        inline for (.{ .nax, .simdmat }) |reader| try weightReaderExactAt(n, .spec1, win, false, reader, SPEC1_PER_RATE.table);
-    };
 }
 
 test "exl3 SPEC1 per-rate table: the prefill GEMM holds the host-decode parity bar on every body" {
@@ -9420,14 +8889,7 @@ test "exl3 SPEC1 per-rate table: the 2^12 folded into the stores keeps every byt
 
 // The rates beyond the K1.5 to K4 run, K1 to K1.375 and K4.125 to K8, with SPEC1's own table rows and the test
 // table's: each reader, the prefill GEMM, the decode chain and the f32-truth bar, as at the rates above.
-const SPEC1_WIDE_NS = sampleRates(24, 64, false);
-
-test "exl3 SPEC1 below K1.5 and above K4: every reader decodes every rate with its own row" {
-    inline for (.{ SPEC1_W15, SPEC1_PER_RATE }) |dec| inline for (SPEC1_WIDE_NS) |n| {
-        try weightReaderExactAt(n, .spec1, dec.window, false, .lane, dec.table);
-        inline for (.{ .nax, .simdmat }) |reader| try weightReaderExactAt(n, .spec1, dec.window, false, reader, dec.table);
-    };
-}
+pub const SPEC1_WIDE_NS = sampleRates(24, 64, false);
 
 test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and the f32-truth bar hold" {
     defer gemm_simdmat_force = null;
@@ -10696,8 +10158,8 @@ const CLAMPED_MIDDLE_DOWN_SOURCE: [:0]const u8 = blk: {
         "const size_t xb = 0u;" ++ INDEXED_COOP_SOURCE[coop_xb + xb.len ..] ++ "\n}\n";
 };
 const ClampedMiddleKey = struct { input: c_int, output: c_int, slots: c_int, n: u32, limit: c_int, tiles: c_int };
-var clamped_middle_cfgs: CfgCache(ClampedMiddleKey, 8) = .{};
-var clamped_middle_kernels: KernelSlots = no_kernels;
+var clamped_middle_cfgs: kernel_src.CfgCache(ClampedMiddleKey, 8) = .{};
+var clamped_middle_kernels: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 fn clampedMiddleDownCoop(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, down: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, limit: c_int, tiles: c_int) !?mlx.mlx_array {
     const x = mlx.getShape(ig);
@@ -10723,7 +10185,7 @@ fn clampedMiddleDownCoop(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array
         clamped_middle_cfgs.put(key, c);
         break :blk c;
     };
-    const k = try codebookKernel(&clamped_middle_kernels, "sushi_exl3_clamped_middle_down", &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" }, &.{"y"}, CLAMPED_MIDDLE_DOWN_SOURCE);
+    const k = try kernel_src.codebookKernel(&clamped_middle_kernels, "sushi_exl3_clamped_middle_down", &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" }, &.{"y"}, CLAMPED_MIDDLE_DOWN_SOURCE);
     const outputs = try applyOuts(s, k, &.{ ig, iu, down, svhg, svhu, suhd, slots }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(outputs);
     var result = mlx.mlx_array_new();
@@ -10837,11 +10299,11 @@ pub const LANE_PAIR_SOURCE: [:0]const u8 = blk: {
     body = metalReplaceAll(body, "const float in3 = float(x[xb + tk * TILE + row3]);", "const float in3 = in4.w;");
     break :blk body;
 };
-var lane_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
+var lane_prep_cfgs: kernel_src.CfgCache(PairPrepKey, 8) = .{};
 var lane_prep_sorted: ?mlx.mlx_fast_metal_kernel = null;
 var lane_prep_unsorted: ?mlx.mlx_fast_metal_kernel = null;
-var lane_pair_cfgs: CfgCache(IndexedKey, 8) = .{};
-var lane_pair_kernel: KernelSlots = no_kernels;
+var lane_pair_cfgs: kernel_src.CfgCache(IndexedKey, 8) = .{};
+var lane_pair_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 pub fn lanePairPrepare(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, slots: mlx.mlx_array, order: ?mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
     const key = PairPrepKey{ .in_dim = in_dim, .nslots = nslots, .topk = topk };
     const cfg = lane_prep_cfgs.get(key) orelse blk: {
@@ -10912,9 +10374,9 @@ pub fn lanePairCoopWith(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array,
         break :blk c;
     };
     const kernel = if (one_row)
-        try codebookKernel(&lane_pair_one_kernel, "sushi_glm_lane_pair_one", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, ONE_ROW_PAIR_SOURCE)
+        try kernel_src.codebookKernel(&lane_pair_one_kernel, "sushi_glm_lane_pair_one", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, ONE_ROW_PAIR_SOURCE)
     else
-        try codebookKernel(&lane_pair_kernel, "sushi_glm_lane_pair", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_PAIR_SOURCE);
+        try kernel_src.codebookKernel(&lane_pair_kernel, "sushi_glm_lane_pair", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_PAIR_SOURCE);
     if (one_row) countOneRow(rate.n);
     const outputs = try applyOuts(s, kernel, &.{ xg, xu, tg, tu, slots }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(outputs);
@@ -10928,8 +10390,8 @@ pub fn lanePairCoopWith(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array,
 
 // Kernels shared with the DFlash group-of-two expert path in glm_group2.zig.
 pub const Group2Support = struct {
-    pub const Slots = KernelSlots;
-    pub const empty = no_kernels;
+    pub const Slots = kernel_src.KernelSlots;
+    pub const empty = kernel_src.no_kernels;
     pub const cooperative_source = INDEXED_COOP_SOURCE;
     pub const prepare = pairPrepareFromTokens;
     pub const middle = midSwigluPrepWithLimit;
@@ -10937,7 +10399,7 @@ pub const Group2Support = struct {
     pub const lane_down = downLaneCoop;
     pub const fused_middle_down = clampedMiddleDownCoop;
     pub fn makeKernel(storage: *Slots, comptime name: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
-        return codebookKernel(storage, name, ins, outs, source);
+        return kernel_src.codebookKernel(storage, name, ins, outs, source);
     }
 };
 
@@ -10961,7 +10423,7 @@ pub const PrefillGridSupport = struct {
         defer mlx.dropLatchedErrorUnless(had_error);
         switch (dec.codebook) {
             inline else => |cb| switch (dec.window) {
-                inline else => |win| return buildNaxGemmKernel(kernel_source, try withTableRows(cb, naxHeader(cb, win)), (try tableKernelName(cb, comptime "sushi_glm_prefill_grid_transpose" ++ cbSuffix(cb) ++ winSuffix(win))).ptr) orelse error.MetalKernelCompileFailed,
+                inline else => |win| return buildNaxGemmKernel(kernel_source, try kernel_src.withTableRows(cb, kernel_src.naxHeader(cb, win)), (try kernel_src.tableKernelName(cb, comptime "sushi_glm_prefill_grid_transpose" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr) orelse error.MetalKernelCompileFailed,
             },
         }
     }
@@ -10996,12 +10458,12 @@ fn downLaneReads(comptime source: [:0]const u8, comptime space: []const u8) [:0]
 }
 pub const DOWN_LANE_MID_SOURCE = metalReplaceAll(MID_SOURCE, "yd[xb + lane", "yd[xb + " ++ LANE_ORDER_SLOT);
 pub const DOWN_LANE_COOP_SOURCE = downLaneReads(INDEXED_COOP_SOURCE, "device");
-var down_lane_mid_cfgs: CfgCache(MidKey, 8) = .{};
+var down_lane_mid_cfgs: kernel_src.CfgCache(MidKey, 8) = .{};
 var down_lane_mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var down_lane_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
-var down_lane_coop_kernel: KernelSlots = no_kernels;
+var down_lane_coop_cfgs: kernel_src.CfgCache(IndexedKey, 8) = .{};
+var down_lane_coop_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 fn getDownLaneCoopKernel() !mlx.mlx_fast_metal_kernel {
-    return codebookKernel(&down_lane_coop_kernel, "sushi_glm_down_lane_coop", &.{ "x", "trellis", "slots" }, &.{"y"}, DOWN_LANE_COOP_SOURCE);
+    return kernel_src.codebookKernel(&down_lane_coop_kernel, "sushi_glm_down_lane_coop", &.{ "x", "trellis", "slots" }, &.{"y"}, DOWN_LANE_COOP_SOURCE);
 }
 pub fn downLanePrepare(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, dim: c_int, nslots: c_int, limit: c_int) !mlx.mlx_array {
     const key = MidKey{ .dim = dim, .nslots = nslots, .limit = limit };
@@ -11108,10 +10570,10 @@ pub const ONE_ROW_PAIR_SOURCE: [:0]const u8 =
     \\device half* y = upper ? yu : yg;
     \\
 ++ ONE_ROW_COOP_SOURCE;
-var lane_pair_one_cfgs: CfgCache(IndexedKey, 8) = .{};
-var lane_pair_one_kernel: KernelSlots = no_kernels;
-var down_one_cfgs: CfgCache(IndexedKey, 8) = .{};
-var down_one_kernel: KernelSlots = no_kernels;
+var lane_pair_one_cfgs: kernel_src.CfgCache(IndexedKey, 8) = .{};
+var lane_pair_one_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+var down_one_cfgs: kernel_src.CfgCache(IndexedKey, 8) = .{};
+var down_one_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 /// Dispatches of the one-row kernels; a test seam, like the other engagement counters.
 var one_row_coop_dispatches: usize = 0;
 pub var one_row_coop_off: bool = false;
@@ -11160,7 +10622,7 @@ pub fn downLaneCoopWith(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_ar
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     const kernel = if (one_row)
-        try codebookKernel(&down_one_kernel, "sushi_glm_down_one", &.{ "x", "trellis", "slots" }, &.{"y"}, ONE_ROW_COOP_SOURCE)
+        try kernel_src.codebookKernel(&down_one_kernel, "sushi_glm_down_one", &.{ "x", "trellis", "slots" }, &.{"y"}, ONE_ROW_COOP_SOURCE)
     else
         try getDownLaneCoopKernel();
     if (one_row) countOneRow(rate.n);
