@@ -80,3 +80,5 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `glm5.mla_decode_attn` | glm5 | one decode row's MLA attention as a 16-layer dependent chain, cumulative stages, by context |
 | `glm5.mla_chunk_attn` | glm5 | whole sparse attention of a short chunk on a kv8 state: scalar, packed FP32 composite, packed NAX, served |
 | `glm5.mla_chunk_stages` | glm5 | a 2048-row chunk's index scores, top-512 selection and whole attention, by context |
+| `shared.exl3_rate_groups` | shared | one Flash-Next MoE layer as uniform n32, the masked `moeGroups` and the one-dispatch grouped chain: seven rate layouts at decode rows 1 and 4 and three at prefill chunks 512 and 2048, SPEC1 and PAIR1 |
+| `shared.exl3_rate_groups_rows` | shared | a DeepSeek-V4.1 layer (384 experts, four PAIR1 groups) through the grouped prefill chain with every expert routed 1 to 48 rows, as ms per layer, us per expert and TFLOP/s |

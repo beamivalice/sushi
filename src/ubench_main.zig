@@ -23,6 +23,8 @@ const registry = [_]report.Bench{
     dsv41.rows_growth,
     dsv41.attn_span,
     dsv41.topk,
+    exl3.ubench.exl3_rate_groups,
+    exl3.ubench.exl3_rate_groups_rows,
 } ++ glm5.benches;
 
 const exit_bad_args = 2;

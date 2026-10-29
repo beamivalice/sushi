@@ -259,8 +259,9 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   and SPEC1). The pack on disk is unchanged; the DSpark stage's resident bank and every other pack keep the pack order.
   A kernel keyed on a tile-major bank carries a `_tm` name. The non-funnel decode arms and a bank made by `Ragged.init`
   stay in pack order; `moeDecodeClamped` refuses a tile-major bank when the funnel is off (`Exl3TileMajorNeedsFunnel`).
-- Timing: `SUSHI_EXL3_RG_UBENCH=1` (decode) and `SUSHI_EXL3_RG_PREFILL_UBENCH=1` (prefill) on the exl3 test binary;
-  `SUSHI_EXL3_RG_ROWS_UBENCH=1` times a DeepSeek layer with every expert routed the same 1 to 48 rows.
+- Timing: `sushi-ubench run shared.exl3_rate_groups` (decode rows 1 and 4, prefill chunks, against uniform n32 and the
+  masked `moeGroups`); `sushi-ubench run shared.exl3_rate_groups_rows` times a DeepSeek layer with every expert routed the
+  same 1 to 48 rows.
 
 <a id="dense-rows"></a>
 ## Dense multi-row projection

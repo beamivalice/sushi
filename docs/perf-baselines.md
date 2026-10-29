@@ -235,7 +235,7 @@ llmprobe (`--mtp`, six boots) did not resolve the change on battery: prefill, wh
 <a id="exl3-rate-groups"></a>
 ## EXL3 rate-grouped layers: one dispatch over the layer's rate classes
 
-`SUSHI_EXL3_RG_UBENCH=1` (exl3 test binary): one Flash-Next MoE layer per step (2560 -> 640, E=512, top-10, bf16
+`sushi-ubench run shared.exl3_rate_groups --rungs rows=1,4`: one Flash-Next MoE layer per step (2560 -> 640, E=512, top-10, bf16
 rows, the gated shared expert folded at one row and separate at four), 48 dependent steps, arms interleaved in one
 process, median of 9, ratio to uniform n32 as served. Groups split the 512 experts evenly; each slot draws its group
 from the layout's mix. M5 Max 128 GB, AC power, fans at max, `taskpolicy -a`, GPU lock, quiet window, ReleaseFast,
