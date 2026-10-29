@@ -18,6 +18,7 @@
 #   7. Omitted max_tokens: long answer must NOT truncate at the old 256 default
 #   8. /v1/messages stream + tools + thinking: tool_use block, no leak
 #   9-11. Truncated thinking on /v1/messages, /v1/responses and the chat stream
+#   12-14. Thinking streams: split in live chunks, with tools, and after a tool result
 #
 # A thought the token cap cuts open is a legal turn on every row: the rows then assert the split (reasoning kept,
 # nothing in content), never the answer. Thinking rows ask `reasoning_effort: low`, since the split is the subject.
@@ -112,7 +113,7 @@ elif mode == "chat" and not stream:
                calls=[{"name": t["function"]["name"], "args": t["function"]["arguments"]} for t in m.get("tool_calls") or []],
                usage=d.get("usage") or {})
 elif mode == "chat":
-    calls, c, r, fin = {}, "", "", None
+    calls, c, r, fin, cn, rn = {}, "", "", None, 0, 0
     for o in sse(resp):
         if o is None:
             break
@@ -121,13 +122,15 @@ elif mode == "chat":
         dl = ch.get("delta", {})
         c += dl.get("content") or ""
         r += dl.get("reasoning_content") or ""
+        cn += 1 if dl.get("content") else 0
+        rn += 1 if dl.get("reasoning_content") else 0
         for tc in dl.get("tool_calls") or []:
             e = calls.setdefault(tc.get("index", 0), {"name": "", "args": ""})
             f = tc.get("function", {})
             if f.get("name"):
                 e["name"] = f["name"]
             e["args"] += f.get("arguments") or ""
-    out.update(finish=fin, content=c, reasoning=r, calls=[calls[k] for k in sorted(calls)])
+    out.update(finish=fin, content=c, reasoning=r, content_chunks=cn, reasoning_chunks=rn, calls=[calls[k] for k in sorted(calls)])
 elif not stream:
     d = json.load(resp)
     blocks = d.get("content", [])
@@ -186,6 +189,7 @@ PROMPT=$(user 'What is 17*23? Be brief.')
 WRITE_PROMPT=$(user 'Use the write tool to create a file named exactly report_v2.html containing <h1>Report</h1>. Do not ask questions, call the tool now.')
 BASH_TOOL='{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}}'
 WRITE_TOOL='{"type":"function","function":{"name":"write","description":"Write a file to disk","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"content":{"type":"string","description":"File content"}},"required":["path","content"]}}}'
+SHELL_TOOL='{"type":"function","function":{"name":"shell","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}'
 ANTH_WRITE_TOOL='{"name":"write","description":"Write a file to disk","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}'
 THINK='"enable_thinking":true,"reasoning_effort":"low"'
 
@@ -217,7 +221,7 @@ if [ "$THINKS" = 1 ]; then
     R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":3000,\"temperature\":0,$THINK}")
     chk "3. full round: answer (391) in content" "'391' in r['content'] or r['finish']=='length'"
     chk_clean "3. full round: no control-tag leak in content" content
-    chk "3. full round: reasoning separated" "r['reasoning']"
+    chk "3. full round: reasoning separated (more than 50 chars)" "len(r['reasoning'])>50"
     chk "3. full round: usage reasoning_tokens > 0" "r['usage'].get('completion_tokens_details',{}).get('reasoning_tokens',0)>0"
 fi
 
@@ -274,6 +278,36 @@ if [ "$THINKS" = 1 ]; then
     R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":120,\"temperature\":0,$THINK}")
     chk "11. stream truncated thinking: reasoning deltas arrive" "r['reasoning']"
     chk "11. stream truncated thinking: no content deltas when the cap cut the thought" "r['finish']!='length' or not r['content']"
+fi
+
+if [ "$THINKS" = 1 ]; then
+    # ── 12. Stream + thinking, no tools: a turn is EITHER a streamed think block OR a direct answer as content,
+    #      never the whole answer filed as reasoning with empty content ──
+    R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$(user 'What is 17 * 23? Just the number after thinking.')],\"max_tokens\":1500,\"temperature\":0,$THINK}")
+    if [ "$(jget "$R" "1 if r['reasoning'] else 0")" = 1 ]; then
+        chk "12. stream thinking: reasoning_content populated (>50)" "len(r['reasoning'])>50"
+        chk "12. stream thinking: reasoning arrives in more than one chunk (live streaming)" "r['reasoning_chunks']>1"
+    else
+        chk "12. stream no-think turn: answer arrives as CONTENT, reasoning stays empty" "r['content'] and r['reasoning_chunks']==0"
+    fi
+    chk "12. stream thinking: no leaked think tags in reasoning" "not any(t in r['reasoning'] for t in ('<think','</think'))"
+    chk_clean "12. stream thinking: no leaked tags in content" content
+
+    # ── 13. Stream + thinking + tools ──
+    R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$(user 'What time is it? Use the shell tool.')],\"max_tokens\":2000,\"temperature\":0,\"tools\":[$SHELL_TOOL],$THINK}")
+    chk "13. stream thinking+tools: at least one tool_call (or the thought was cut)" "r['calls'] or (r['finish']=='length' and r['reasoning'])"
+    chk_clean "13. stream thinking+tools: no tag or tool-call leak in content" content
+    chk "13. stream thinking+tools: no tag leak in reasoning" "not any(t in r['reasoning'] for t in ('<think','</think'))"
+
+    # ── 14. Tool round-trip with thinking (turn 2 after the tool result): the turn is well-formed and not empty ──
+    RT_TAIL='{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"date\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"Fri Apr 17 08:15:00 PDT 2026"}'
+    RT_BODY="\"model\":\"x\",\"messages\":[$(user 'What time is it? Use the shell tool.'),$RT_TAIL],\"max_tokens\":2000,\"temperature\":0,\"tools\":[$SHELL_TOOL],$THINK"
+    R=$(ask chat 0 "{$RT_BODY}")
+    chk "14. round-trip non-stream: content populated (>5), a further call, or a cut thought" "len(r['content'])>5 or r['calls'] or (r['finish']=='length' and r['reasoning'])"
+    R=$(ask chat 1 "{$RT_BODY}")
+    chk "14. round-trip stream: content populated (>5), a further call, or a cut thought" "len(r['content'])>5 or r['calls'] or (r['finish']=='length' and r['reasoning'])"
+    chk_clean "14. round-trip stream: no tag leak in content" content
+    chk "14. round-trip stream: no tag leak in reasoning" "not any(t in r['reasoning'] for t in ('<think','</think'))"
 fi
 
 echo
