@@ -76,4 +76,4 @@ number), under the GPU lock.
 6. Boot log: `[kv-cache] off (default)`, no `[mtp] depth range` line; `--kv-quant 4` (and `--qwen-gdn 16`, `--mtp-head-kv-quant`) each exit at start with the named error before any weights load; a settings `kv_quant` boots with
    one ignored line. A request with no thinking field returns `reasoning_content`.
 7. Forced tool call: `tool_choice` naming a declared function; expect the `[tool-choice] forced call` line and a parsed call.
-8. `tests/test_dsv41_media.sh`: image input live.
+8. `tests/test_media.sh`: image input live.

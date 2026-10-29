@@ -773,7 +773,7 @@ reference bit for bit, the embedding to cosine 0.999998 and block 0 to 0.99999, 
 0.9957..0.9986 and 0.9984..0.9995 against the reference's bf16 run. That drift is bf16, not the port: the reference's own bf16
 tower sits at cosine 0.9942..0.9982 from its fp32 run and ours at 0.9939..0.9975, and the test asserts ours is within 0.002 of
 the reference's distance. The trunk's splice, routing, Engram and chunking proofs run on the tiny pack
-(`DSV41_TINY`, `-Dtest-filter="dsv41 vision"`); `tests/test_dsv41_media.sh` is the live check.
+(`DSV41_TINY`, `-Dtest-filter="dsv41 vision"`); `tests/test_media.sh` is the live check.
 
 ## Not done
 
