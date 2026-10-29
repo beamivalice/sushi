@@ -1,13 +1,14 @@
 #!/bin/bash
-# Integration tests for the Anthropic Messages API (/v1/messages).
-# Tests both non-streaming and streaming, tool calling, thinking, and error handling.
-# Usage: ./tests/test_anthropic_api.sh [port] [launch_max_tokens]
-# Requires a running sushi server with a loaded model.
-# Pass its --max-tokens value when set; otherwise the default is 0 (unset).
-
-PORT=${1:-8080}
-LAUNCH_MAX_TOKENS=${2:-0}
-BASE="http://127.0.0.1:$PORT"
+# sushi-test: tier=live boot=api
+# Integration tests for the Anthropic Messages API (/v1/messages): non-streaming and streaming, tool calling,
+# error handling, usage and cache reporting. Attaches to the shared api boot. Checks that need visible text send
+# `thinking: disabled`, since every served arch thinks by default; GLM's template cannot turn thinking off (400),
+# so it thinks under a small budget instead. Text is read from the first text block, never content[0].
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+BASE=$SUSHI_URL
+N=$SUSHI_NONCE
+if [ "$SUSHI_ARCH" = glm5_next ]; then THINK='{"type": "enabled", "budget_tokens": 32}'; else THINK='{"type": "disabled"}'; fi
+FIRST_TEXT="next(b for b in json.load(sys.stdin)['content'] if b['type'] == 'text')"
 PASS=0
 FAIL=0
 TOTAL=0
@@ -73,12 +74,6 @@ assert_gt() {
 echo "=== Anthropic Messages API Integration Tests ==="
 echo "Server: $BASE"
 
-# Check server is running
-if ! curl -sf "$BASE/health" > /dev/null 2>&1; then
-    echo "SKIP: Server not running on port $PORT"
-    exit 0
-fi
-
 echo ""
 
 # ── Test 1: Basic non-streaming message ──
@@ -89,9 +84,10 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
     "model": "sushi",
-    "max_tokens": 64,
+    "max_tokens": 256,
+    "thinking": '"$THINK"',
     "messages": [
-      {"role": "user", "content": "Say hello in one word."}
+      {"role": "user", "content": "'"$N"' Say hello in one word."}
     ]
   }')
 
@@ -104,10 +100,10 @@ assert_eq "role is assistant" "assistant" "$ROLE"
 STOP=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['stop_reason'])" 2>/dev/null)
 assert_contains "stop_reason is end_turn or max_tokens" "end_turn\|max_tokens" "$STOP"
 
-CONTENT_TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['content'][0]['type'])" 2>/dev/null)
+CONTENT_TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print($FIRST_TEXT['type'])" 2>/dev/null)
 assert_eq "content block type is text" "text" "$CONTENT_TYPE"
 
-CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['content'][0]['text'])" 2>/dev/null)
+CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print($FIRST_TEXT['text'])" 2>/dev/null)
 assert_gt "content has text" "${#CONTENT}" 0
 
 INPUT_TOKENS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['input_tokens'])" 2>/dev/null)
@@ -127,13 +123,14 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "max_tokens": 64,
+    "max_tokens": 256,
+    "thinking": '"$THINK"',
     "system": "You are a pirate. Every response must include the word arrr.",
     "messages": [
-      {"role": "user", "content": "Greet me."}
+      {"role": "user", "content": "'"$N"' Greet me."}
     ]
   }')
-CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['content'][0]['text'])" 2>/dev/null)
+CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print($FIRST_TEXT['text'])" 2>/dev/null)
 assert_gt "system prompt produces response" "${#CONTENT}" 0
 echo "  content: '${CONTENT:0:100}'"
 echo ""
@@ -145,9 +142,9 @@ sys_tokens() {
     | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['input_tokens'])" 2>/dev/null
 }
 SYS_TEXT="You are a pirate. Every response must include the word arrr."
-BASE_TOKENS=$(sys_tokens '{"model":"sushi","max_tokens":1,"messages":[{"role":"user","content":"Greet me."}]}')
-TOP_TOKENS=$(sys_tokens "{\"model\":\"sushi\",\"max_tokens\":1,\"system\":\"$SYS_TEXT\",\"messages\":[{\"role\":\"user\",\"content\":\"Greet me.\"}]}")
-IN_TOKENS=$(sys_tokens "{\"model\":\"sushi\",\"max_tokens\":1,\"messages\":[{\"role\":\"system\",\"content\":\"$SYS_TEXT\"},{\"role\":\"user\",\"content\":\"Greet me.\"}]}")
+BASE_TOKENS=$(sys_tokens '{"model":"sushi","max_tokens":1,"messages":[{"role":"user","content":"'"$N"' Greet me."}]}')
+TOP_TOKENS=$(sys_tokens "{\"model\":\"sushi\",\"max_tokens\":1,\"system\":\"$SYS_TEXT\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Greet me.\"}]}")
+IN_TOKENS=$(sys_tokens "{\"model\":\"sushi\",\"max_tokens\":1,\"messages\":[{\"role\":\"system\",\"content\":\"$SYS_TEXT\"},{\"role\":\"user\",\"content\":\"$N Greet me.\"}]}")
 echo "  input_tokens: none=$BASE_TOKENS top-level=$TOP_TOKENS in-messages=$IN_TOKENS"
 assert_gt "system in messages is rendered, not dropped" "$IN_TOKENS" "$BASE_TOKENS"
 assert_eq "system in messages costs the same as top-level" "$TOP_TOKENS" "$IN_TOKENS"
@@ -159,10 +156,11 @@ SSE=$(curl -sf "$BASE/v1/messages" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "max_tokens": 32,
+    "max_tokens": 192,
+    "thinking": '"$THINK"',
     "stream": true,
     "messages": [
-      {"role": "user", "content": "Say hi."}
+      {"role": "user", "content": "'"$N"' Say hi."}
     ]
   }')
 
@@ -188,14 +186,15 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "max_tokens": 64,
+    "max_tokens": 256,
+    "thinking": '"$THINK"',
     "messages": [
-      {"role": "user", "content": "My name is Alice."},
+      {"role": "user", "content": "'"$N"' My name is Alice."},
       {"role": "assistant", "content": [{"type": "text", "text": "Nice to meet you, Alice!"}]},
-      {"role": "user", "content": "What is my name?"}
+      {"role": "user", "content": "'"$N"' What is my name?"}
     ]
   }')
-CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['content'][0]['text'])" 2>/dev/null)
+CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; print($FIRST_TEXT['text'])" 2>/dev/null)
 assert_gt "multi-turn produces response" "${#CONTENT}" 0
 echo "  content: '${CONTENT:0:100}'"
 echo ""
@@ -209,7 +208,7 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
     "max_tokens": 256,
     "system": "You have access to tools. When the user asks what time or date it is, always use the shell tool to run the date command. Do not answer from memory.",
     "messages": [
-      {"role": "user", "content": "What is the current date and time? Use the shell tool."}
+      {"role": "user", "content": "'"$N"' What is the current date and time? Use the shell tool."}
     ],
     "tools": [
       {
@@ -280,7 +279,7 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
     "model": "sushi",
     "max_tokens": 128,
     "messages": [
-      {"role": "user", "content": "What day is it?"},
+      {"role": "user", "content": "'"$N"' What day is it?"},
       {"role": "assistant", "content": [
         {"type": "text", "text": "Let me check."},
         {"type": "tool_use", "id": "toolu_test_1", "name": "shell", "input": {"command": "date"}}
@@ -322,7 +321,7 @@ SSE=$(curl -sf "$BASE/v1/messages" \
     "stream": true,
     "system": "Always use the shell tool when asked about time or date.",
     "messages": [
-      {"role": "user", "content": "Run the date command using the shell tool."}
+      {"role": "user", "content": "'"$N"' Run the date command using the shell tool."}
     ],
     "tools": [
       {
@@ -346,28 +345,17 @@ else
 fi
 echo ""
 
-# ── Test 8: Missing max_tokens uses the launch default or refuses ──
+# ── Test 8: Missing max_tokens is refused (the boot sets no --max-tokens launch default) ──
 echo "--- Test 8: Missing max_tokens ---"
 RESULT=$(curl -s "$BASE/v1/messages" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "messages": [{"role": "user", "content": "hi"}]
+    "messages": [{"role": "user", "content": "'"$N"' hi"}]
   }')
-if [ "$LAUNCH_MAX_TOKENS" -gt 0 ]; then
-    TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['type'])" 2>/dev/null)
-    assert_eq "omitted max_tokens accepts the launch default" "message" "$TYPE"
-    WITHIN_BUDGET=$(echo "$RESULT" | python3 -c '
-import json,sys
-n = json.load(sys.stdin)["usage"]["output_tokens"]
-print("yes" if 0 < n <= int(sys.argv[1]) else "no")
-' "$LAUNCH_MAX_TOKENS" 2>/dev/null)
-    assert_eq "output stays within the launch token budget" "yes" "$WITHIN_BUDGET"
-else
-    ERR_TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['error']['type'])" 2>/dev/null)
-    assert_eq "error type is invalid_request_error" "invalid_request_error" "$ERR_TYPE"
-    assert_contains "error mentions max_tokens" "max_tokens" "$RESULT"
-fi
+ERR_TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['error']['type'])" 2>/dev/null)
+assert_eq "error type is invalid_request_error" "invalid_request_error" "$ERR_TYPE"
+assert_contains "error mentions max_tokens" "max_tokens" "$RESULT"
 echo ""
 
 # ── Test 9: Error — missing messages ──
@@ -397,7 +385,7 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -d '{
     "model": "sushi",
     "max_tokens": 16,
-    "messages": [{"role": "user", "content": "hi"}]
+    "messages": [{"role": "user", "content": "'"$N"' hi"}]
   }')
 TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['type'])" 2>/dev/null)
 assert_eq "accepts Anthropic headers" "message" "$TYPE"
@@ -410,7 +398,7 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -d '{
     "model": "sushi",
     "max_tokens": 128,
-    "messages": [{"role": "user", "content": "Count from 1 to 20, one number per line."}],
+    "messages": [{"role": "user", "content": "'"$N"' Count from 1 to 20, one number per line."}],
     "stop_sequences": ["5"]
   }')
 STOP=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['stop_reason'])" 2>/dev/null)
@@ -427,7 +415,7 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -d '{
     "model": "claude-opus-4-6",
     "max_tokens": 16,
-    "messages": [{"role": "user", "content": "hi"}]
+    "messages": [{"role": "user", "content": "'"$N"' hi"}]
   }')
 MODEL=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['model'])" 2>/dev/null)
 assert_eq "model name echoed back" "claude-opus-4-6" "$MODEL"
@@ -441,7 +429,7 @@ SSE=$(curl -sf "$BASE/v1/messages" \
     "model": "sushi",
     "max_tokens": 16,
     "stream": true,
-    "messages": [{"role": "user", "content": "Say one word."}]
+    "messages": [{"role": "user", "content": "'"$N"' Say one word."}]
   }')
 
 # Extract event types in order
@@ -467,21 +455,24 @@ fi
 echo ""
 
 # ── Test: cache_read_input_tokens reported on prefix-cache hits ──
-# Claude Code (and the Anthropic SDK cost displays) read
-# usage.cache_read_input_tokens. The hot prefix cache makes the second
-# identical-prefix request a near-full hit, which must surface in usage on
-# both the non-streaming response and the streaming message_delta.
+# Claude Code (and the Anthropic SDK cost displays) read usage.cache_read_input_tokens. A repeated prompt must
+# surface its prefix hit on both the non-streaming response and the streaming message_delta. The boot keeps
+# the prefix on the SSD tier only, which stores nothing under 512 tokens, so the prompt is padded past that.
 echo "=== Cache usage reporting ==="
-CACHE_PROMPT="You are a careful assistant. Here is a long preamble we will reuse verbatim across requests so the server prefix cache gets a long match. The quick brown fox jumps over the lazy dog, again and again, sentence after sentence, to pad this prefix out to a few hundred tokens. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. Question: what is 1+1? Reply with just the number."
+CACHE_PROMPT="$N You are a careful assistant. Here is a long preamble we will reuse verbatim across requests so the server prefix cache gets a long match. $(printf 'The quick brown fox jumps over the lazy dog. %.0s' $(seq 1 120))Question: what is 1+1? Reply with just the number."
 CACHE_BODY="{\"model\":\"sushi\",\"max_tokens\":8,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$CACHE_PROMPT\"}]}"
-# warm the cache
-curl -s -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY" > /dev/null
-RESP=$(curl -s -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY")
-CACHE_READ=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('usage',{}).get('cache_read_input_tokens',-1))" 2>/dev/null || echo -1)
+# warm the cache, then repeat: the SSD write lands behind the first request, so a miss gets two more tries
+curl -s -m 120 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY" > /dev/null
+CACHE_READ=-1
+for _ in 1 2 3; do
+    RESP=$(curl -s -m 120 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY")
+    CACHE_READ=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('usage',{}).get('cache_read_input_tokens',-1))" 2>/dev/null || echo -1)
+    [ "$CACHE_READ" -gt 0 ] 2>/dev/null && break
+done
 assert_gt "non-stream usage.cache_read_input_tokens on repeat prompt" "$CACHE_READ" "0"
 
 STREAM_CACHE_BODY=$(echo "$CACHE_BODY" | python3 -c "import sys,json; b=json.load(sys.stdin); b['stream']=True; print(json.dumps(b))")
-EVENTS=$(curl -s -N -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$STREAM_CACHE_BODY")
+EVENTS=$(curl -s -N -m 120 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$STREAM_CACHE_BODY")
 STREAM_CACHE_READ=$(echo "$EVENTS" | python3 -c "
 import sys, json
 val = -1
