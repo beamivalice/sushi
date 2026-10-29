@@ -25,8 +25,8 @@ INT_MAX = np.iinfo(np.int32).max
 BF16_STORE_FLOOR = 2.0e-3
 
 
-def zig_metal(name: str, path: str | None = None) -> str:
-    text = open(path or os.path.join(ROOT, "src/transformer.zig")).read()
+def zig_metal(name: str, path: str) -> str:
+    text = open(path).read()
     start = text.find("const " + name + " =")
     if start < 0:
         raise RuntimeError("missing kernel " + name)
