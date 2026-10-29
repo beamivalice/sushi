@@ -49,9 +49,6 @@ docs/tmp
 
 # Private converter knowledge (sashimi): local-only, never committed (CLAUDE.md, Docs index).
 docs/private/
-tests/pi-results
-tests/validator-results
-tests/pi_integration_run.summary.tsv
 
 
 

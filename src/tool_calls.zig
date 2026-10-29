@@ -4402,7 +4402,7 @@ test "parseToolCalls: self-closing <tool name=... arguments=... />" {
 }
 
 test "parseToolCalls: DSV4 broken-quote self-closing fragment (regression repro)" {
-    // Verbatim capture from the failing turn in test_agent_stop_repro.py.
+    // Verbatim capture from a failing agent turn.
     // The model opened arguments with `"`, closed with `'`, embedded
     // unescaped `"` inside the JSON, and finished with `'/>`. The parser
     // must still recover the JSON object and produce a single tool call.
