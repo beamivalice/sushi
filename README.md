@@ -86,6 +86,16 @@ N plus the context must fit under the GPU limit.
 | 96 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 80 | 93,000 | 1M | 45 code / 45 prose |
 | 128 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose |
 
+## Serve on your network
+
+```bash
+export SUSHI_KEY=<pick a secret>
+sushi serve <pack> --host 0.0.0.0 --api-key-env SUSHI_KEY
+```
+
+Other computers then reach `http://<your-mac-ip>:12345/v1` (`ipconfig getifaddr en0` prints the IP) and send the key
+as `Authorization: Bearer <key>`. If `SUSHI_KEY` is unset or empty, the server runs with no key.
+
 ## Benchmarks
 
 ### Sushi bench (Speed)
