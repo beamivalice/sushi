@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=exact
 # Batched-decode transition consistency test.
 #
 # Regression for the legacy→batched decode-tick transition bug: a slot that
@@ -21,38 +21,18 @@
 #      (fresh-from-prefill batch join), 2 rounds
 # and asserts every captured stream equals the baseline byte-for-byte.
 #
-# Requires:
-#   - A built sushi binary (zig build -Doptimize=ReleaseFast)
-#   - BATCH_TEST_MODEL or ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw
-#
-# Usage:
-#   ./tests/test_batched_transition.sh [port]
-
 set -e
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+sushi_require batching
 
-PORT=${1:-8099}
-BASE="http://127.0.0.1:$PORT"
+BASE="$SUSHI_URL"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${BATCH_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-
-if [ ! -d "$MODEL" ]; then
-    echo -e "${YELLOW}SKIP${NC} test_batched_transition: model directory not found."
-    echo "  Set BATCH_TEST_MODEL or place a checkpoint at ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
-    exit 0
-fi
-
-BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-if [ ! -x "$BINARY" ]; then
-    echo -e "${RED}FAIL${NC} $BINARY not found. Build with 'zig build -Doptimize=ReleaseFast'."
-    exit 1
-fi
-
-PROMPT="Count from 1 to 30, separated by single spaces. Output only the numbers."
-OTHER_PROMPT="Name the largest ocean on Earth. Reply with just the name."
+PROMPT="$SUSHI_NONCE Count from 1 to 30, separated by single spaces. Output only the numbers."
+OTHER_PROMPT="$SUSHI_NONCE Name the largest ocean on Earth. Reply with just the name."
 
 STREAM_BODY=$(python3 -c "
 import json
@@ -102,23 +82,6 @@ stream_request() {
     curl -s -N -m 120 -X POST -H "Content-Type: application/json" \
         -d "$STREAM_BODY" "$BASE/v1/chat/completions" | sse_concat_content
 }
-
-LOGFILE=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" > "$LOGFILE" 2>&1 &
-SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null || true; }
-trap cleanup EXIT
-
-up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
-if [ "$up" != "1" ]; then
-    echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
-    tail -20 "$LOGFILE"
-    exit 1
-fi
 
 echo "1) Solo streaming baseline..."
 BASELINE=$(stream_request)
@@ -170,7 +133,6 @@ for round in 1 2; do
     rm -f "$TMP_A" "$TMP_B"
 done
 
-rm -f "$LOGFILE"
 if [ "$FAILURES" -gt 0 ]; then
     echo -e "${RED}FAIL${NC} $FAILURES stream(s) diverged from solo baseline"
     exit 1

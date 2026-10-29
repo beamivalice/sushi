@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=exact
 # test_batched_features.sh — heterogeneous requests in ONE batched decode group.
 # Every per-request feature is tested alone somewhere; none of them is tested
 # beside the others in the same tick. Six requests with different contracts
@@ -9,30 +9,13 @@
 # short/long caps finish by their own max_tokens. The log must show the group
 # actually formed (`[batched] ... engaged (slots=N)`, N >= 2) or the run
 # proves nothing.
-#
-#   BATCH_FEAT_MODEL=<qwen3_5 pack> ./tests/test_batched_features.sh [port]
 set -uo pipefail
-cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+sushi_require batching
 
-MODEL="${BATCH_FEAT_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${1:-11513}"
-BASE="http://127.0.0.1:$PORT"
-BINARY="${BINARY:-./zig-out/bin/sushi}"
-[[ -d "$MODEL" ]] || { echo "SKIP: model dir not found: $MODEL"; exit 0; }
-[[ -x "$BINARY" ]] || { echo "SKIP: $BINARY missing"; exit 0; }
-
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-WORK=$(mktemp -d "$HOME/.sushi/runs/batched-feat.XXXXXX" 2>/dev/null || mktemp -d)
-mkdir -p "$WORK/home"
-HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" \
-    --log-level debug --max-concurrent 8 --prefix-cache-entries 0 > "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null' EXIT
-for i in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null || { echo "FAIL: server did not start"; tail -20 "$WORK/server.log"; exit 1; }
+BASE="$SUSHI_URL"
+WORK=$(mktemp -d)
 # warm the load so the group forms on the first tick of the burst
 curl -s -m 300 "$BASE/v1/chat/completions" -d '{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":3}' >/dev/null
 
@@ -43,22 +26,23 @@ J() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)" 2>/dev/nul
 post() { curl -s -m 600 -N "$BASE$1" -H 'Content-Type: application/json' --data-binary "$2"; }
 
 CODE="ZQ7K$RANDOM"
+N="$SUSHI_NONCE"
 TOOLS='[{"type":"function","function":{"name":"save_note","parameters":{"type":"object","properties":{"text":{"type":"string"},"tag":{"type":"string"}},"required":["text","tag"]}}}]'
 SCHEMA='{"type":"json_schema","json_schema":{"name":"p","strict":true,"schema":{"type":"object","properties":{"animal":{"type":"string","enum":["cat","dog","owl"]},"legs":{"type":"integer"}},"required":["animal","legs"],"additionalProperties":false}}}'
-LONG='Write a 250-word essay about the ocean.'
+LONG="$N Write a 250-word essay about the ocean."
 
 echo "=== burst: six contracts in one group ==="
-post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Save a note with tag $CODE and text 'batched'. Use the save_note tool now.\"}],\"tools\":$TOOLS,\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/tools.sse" & P1=$!
-post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Describe an owl.\"}],\"response_format\":$SCHEMA,\"max_tokens\":80,\"temperature\":0}" > "$WORK/schema.json" & P2=$!
-post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 12*12? Answer briefly.\"}],\"enable_thinking\":true,\"stream\":true,\"max_tokens\":400,\"temperature\":0}" > "$WORK/think.sse" & P3=$!
+post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Save a note with tag $CODE and text 'batched'. Use the save_note tool now.\"}],\"tools\":$TOOLS,\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/tools.sse" & P1=$!
+post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Describe an owl.\"}],\"response_format\":$SCHEMA,\"max_tokens\":80,\"temperature\":0}" > "$WORK/schema.json" & P2=$!
+post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N What is 12*12? Answer briefly.\"}],\"enable_thinking\":true,\"stream\":true,\"max_tokens\":400,\"temperature\":0}" > "$WORK/think.sse" & P3=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"logprobs\":true,\"top_logprobs\":3,\"max_tokens\":60,\"temperature\":0}" > "$WORK/logprobs.json" & P4=$!
-post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Count from one to twenty in words, comma separated.\"}],\"stop\":[\"seven\"],\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/stop.sse" & P5=$!
+post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Count from one to twenty in words, comma separated.\"}],\"stop\":[\"seven\"],\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/stop.sse" & P5=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"max_tokens\":5,\"temperature\":0.7}" > "$WORK/cap5.json" & P6=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"max_tokens\":300,\"temperature\":0}" > "$WORK/cap300.json" & P7=$!
 wait $P1 $P2 $P3 $P4 $P5 $P6 $P7
 
 # engagement: the group really formed
-SLOTS=$(grep -oE "\[batched\] .*engaged \(slots=[0-9]+" "$WORK/server.log" | grep -oE "[0-9]+$" | sort -n | tail -1)
+SLOTS=$(sushi_log_since | grep -oE "\[batched\] .*engaged \(slots=[0-9]+" | grep -oE "[0-9]+$" | sort -n | tail -1)
 [[ -n "$SLOTS" && "$SLOTS" -ge 2 ]] && ok "batched decode engaged (max slots=$SLOTS)" || bad "batched decode engaged" "no [batched] engaged line with slots>=2"
 
 # tools (stream): the call carries its own code, args valid JSON
@@ -124,7 +108,7 @@ N300=$(J 'd["usage"]["completion_tokens"]' < "$WORK/cap300.json")
 
 echo "=== after: alive, no error ==="
 curl -sf -m 5 "$BASE/health" >/dev/null && ok "server alive" || bad "server alive"
-grep -qE "\[mlx\] error|panic|Segmentation" "$WORK/server.log" && bad "no MLX error / crash line" || ok "no MLX error / crash line"
+grep -qE "\[mlx\] error|panic|Segmentation" <<< "$(sushi_log_since)" && bad "no MLX error / crash line" || ok "no MLX error / crash line"
 
 echo
 echo "batched-features: $PASS passed, $FAIL failed  (artifacts: $WORK)"
