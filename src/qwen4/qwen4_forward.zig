@@ -1338,7 +1338,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
 /// caches the refusal too) and infallible — false keeps the full-vocab
 /// draft projection.
 ///
-/// Called at LOAD (`scheduler.doLoadOnInferenceThread`, the site both the
+/// Called at LOAD (`model_load.doLoadOnInferenceThread`, the site both the
 /// boot load and the `/v1/load` cold load route through), the sidecar
 /// arm's `maybeBuildDraftRerank`-at-bind twin: a full `requantizeRows` of
 /// the trunk lm_head plus a synchronous eval of its ~240 MB is a LOAD

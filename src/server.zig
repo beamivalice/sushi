@@ -205,7 +205,7 @@ pub var g_api_key_strict: bool = false;
 
 /// Tool-call ARGUMENT auto-correct. When true (default), parsed tool-call
 /// arguments are coerced to the types the request's tool schema declares
-/// (`chat.coerceToolArgsToSchema` — e.g. Python's `False` → JSON `false`, an
+/// (`tool_schema.coerceToolArgsToSchema` — e.g. Python's `False` → JSON `false`, an
 /// `edits` array shipped as a string → a real array). `--no-tool-autocorrect`
 /// turns it OFF: arguments pass through exactly as the model emitted them (still
 /// valid JSON — the parse-repair + safety net always run; this gates ONLY the
@@ -827,7 +827,7 @@ fn messageReasoningFromObj(obj: std.json.ObjectMap) ?[]const u8 {
 /// think block (Qwen 3.5/3.6 render `…assistant\n<think>\n` when thinking is
 /// on). Decodes the last few prompt tokens — cheap, engine-agnostic, and
 /// independent of the tokenize cache. Drives the unclosed-think split policy
-/// in `chat.splitThinkBlock` so a length-truncated thought never leaks into
+/// in `think_tags.splitThinkBlock` so a length-truncated thought never leaks into
 /// visible content.
 pub fn promptOpensThink(
     allocator: std.mem.Allocator,
@@ -1154,7 +1154,7 @@ pub fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
 /// Finish reason for a response whose generated text yielded tool calls.
 /// A TRUNCATED generation ("length": max_tokens or the request timeout) must
 /// keep reporting "length" even when the cut-off text salvaged a partial tool
-/// call (the truncated-opener recovery in chat.parseToolCalls) — clients key
+/// call (the truncated-opener recovery in tool_calls.parseToolCalls) — clients key
 /// their truncation recovery on it (the app's chunk-and-retry nudge fires on
 /// finish_reason "length" + tool calls present). Overriding to "tool_calls"
 /// hides the cut: the client executes a half-argument call, blames the model
@@ -2854,7 +2854,7 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
-/// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
+/// `prefill_plan.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
 pub const PREFILL_CHUNK_LADDER = [_]u32{ 8192, 4096, 2048, 1024, 512 };
 
@@ -2958,7 +2958,7 @@ pub fn explicitPrefillChunk() u32 {
 }
 
 /// The chunk this model is billed at, and therefore runs at. `chunk_override` (0 = none)
-/// mirrors `generate.effectivePrefillChunk`'s precedence.
+/// mirrors `prefill_plan.effectivePrefillChunk`'s precedence.
 pub fn billedPrefillChunk(
     config: *const model_mod.ModelConfig,
     kv_bits: u64,
@@ -3165,7 +3165,7 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
 /// Must run BEFORE the auto-context sizer: the sizer bills this chunk's
 /// transient reserve, and `checkAttentionMemory` and
-/// `generate.effectivePrefillChunk` then read the same frozen value, so the
+/// `prefill_plan.effectivePrefillChunk` then read the same frozen value, so the
 /// bill and the forward cannot drift.
 pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
@@ -5810,7 +5810,7 @@ fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
 /// working-set ceiling. Exceeding it throws an uncatchable C++ exception on a
 /// Metal completion-handler thread and kills the process, so PREVENTION is the
 /// only lever — this guard must track what the prefill actually allocates
-/// (prefillMemoryNeeded above; chunk choice from generate.effectivePrefillChunk).
+/// (prefillMemoryNeeded above; chunk choice from prefill_plan.effectivePrefillChunk).
 /// `kv_override` is the per-request `kv_quant` body field where the surface
 /// parses one (chat/messages/responses); null falls back to the process default.
 /// Per-token bytes of the arch's out-of-cache request state as billed: the QSA indexer history
@@ -6255,7 +6255,7 @@ test "a refusal names the credit it COMPARED, never the residency it cannot take
 
 /// Everything the admission guard bills for one request at one prefill width, so the
 /// per-request chunk chooser prices a rung with the same function that admits it. `chunk` is
-/// the width the forward will run, already through `generate.effectivePrefillChunk`.
+/// the width the forward will run, already through `prefill_plan.effectivePrefillChunk`.
 pub fn prefillNeededAtChunk(
     config: *const model_mod.ModelConfig,
     seq: u64,
@@ -10057,7 +10057,7 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
 test "parseToolCallsForRequest: MiniCPM5 V3 XML through the real server chokepoint" {
     // Exercises the EXACT function every HTTP dispatch site in this file calls,
     // proving the new dialect is wired all the way through — not just reachable
-    // from chat.parseToolCalls in isolation. Uses the Agent shell tool's real
+    // from tool_calls.parseToolCalls in isolation. Uses the Agent shell tool's real
     // declared schema shape.
     const allocator = std.testing.allocator;
     const tools =
@@ -11938,7 +11938,7 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
 test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
-    // The allocator side of the reservation is gated (`generate.reservedPrefillTokens`); the
+    // The allocator side of the reservation is gated (`prefill_plan.reservedPrefillTokens`); the
     // guard side was not, so off qwen4_exp the bill charged headroom never reserved.
     const t = std.testing;
     const seq: u64 = 200_000; // well past RESERVE_MIN_TOKENS

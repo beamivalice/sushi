@@ -1363,7 +1363,7 @@ fn handleAnthropicStreaming(
     var content_started = false;
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
-    var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
+    var thought_shipped = false; // this thought has streamed a delta (`think_tags.openThoughtFlush`)
     var think_close_tag: []const u8 = "</think>";
     var skipped_think_open = false;
     var think_tokens: i32 = 0;
@@ -1455,7 +1455,7 @@ fn handleAnthropicStreaming(
 
         if (gated_stream) {
             // Buffer for tool detection. Detection rules live in
-            // `chat.streamShouldBufferForTools` — the SAME predicate as the
+            // `think_tags.streamShouldBufferForTools` — the SAME predicate as the
             // chat-completions stream (this path once carried its own inline
             // subset, which drifted: the class the think gate was unified for).
             try token_texts.append(allocator, token_text);

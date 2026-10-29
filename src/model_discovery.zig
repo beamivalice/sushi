@@ -716,7 +716,7 @@ fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
 
 /// Pure: extract `StubMeta` from raw config.json bytes. `has_chat_template` is
 /// supplied by the caller (the template lives outside config.json), and
-/// determines chat/tool capabilities. Mirrors the loaded-path capability rules in `server.renderModelEntry`
+/// determines chat/tool capabilities. Mirrors the loaded-path capability rules in `models_api.renderModelEntry`
 /// (chat-template presence ⇒ chat/tool_use/streaming/json_schema). Returns
 /// `.found=false` on any parse failure.
 pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_chat_template: bool) StubMeta {
@@ -1127,7 +1127,7 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
 
     // HF hub-cache snapshot shape: every file is a symlink into ../../blobs.
     // bytes_on_disk feeds /v1/models, the app's RAM column AND
-    // scheduler.gateEstimateBytes — all of which saw ~0 for a 121 GB model.
+    // model_load.gateEstimateBytes — all of which saw ~0 for a 121 GB model.
     try tmp.dir.createDirPath(io, "blobs");
     try tmp.dir.writeFile(io, .{ .sub_path = "blobs/cfg", .data = "{\"model_type\":\"mimo_v2\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "blobs/w1", .data = "0123456789" });

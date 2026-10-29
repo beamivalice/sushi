@@ -237,7 +237,7 @@ fn trailingCycleStart(tokens: []const u32, p: usize) usize {
 }
 
 /// Convict a degenerate tail and say where it starts. Tier order matches
-/// `scheduler.loopStopReason`: the exact tiers speak first, and the fuzzy
+/// `slot_outcome.loopStopReason`: the exact tiers speak first, and the fuzzy
 /// near-repeat tier only ever judges spans they have already declined.
 pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
     if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, degenerate_loop_reps, degenerate_loop_min_span)) |p| {

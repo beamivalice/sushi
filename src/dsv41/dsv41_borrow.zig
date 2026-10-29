@@ -80,7 +80,7 @@ pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const C
     return moveCap(rowsCap(rows, config), config, ops);
 }
 
-/// An image encode of `bill` bytes (`server.visionEncodeBill`) starts: its allocations are capped at it. No bill, no cap.
+/// An image encode of `bill` bytes (`request_media.visionEncodeBill`) starts: its allocations are capped at it. No bill, no cap.
 pub fn enterVision(bill: u64, config: *const ModelConfig, ops: PoolOps) void {
     if (pool_ram_cap == 0 or bill == 0 or !config.isDsv41()) return;
     setTransient(phaseLimit(bill, config), ops);

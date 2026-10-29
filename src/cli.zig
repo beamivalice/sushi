@@ -1176,7 +1176,7 @@ fn writeEffortOptions(w: *std.Io.Writer, accepted: []const model.Effort) !void {
     for (list, 0..) |e, i| try w.print("{s}{s}", .{ if (i > 0) ", " else "", @tagName(e) });
 }
 
-/// Same text as the server's 400 (`server.effortRefusal`).
+/// Same text as the server's 400 (`request_policy.effortRefusal`).
 pub fn writeEffortRefusal(w: *std.Io.Writer, word: []const u8, model_id: []const u8, accepted: []const model.Effort) !void {
     try w.print("reasoning effort '{s}' is not supported by {s}; use one of: ", .{ word, model_id });
     try writeEffortOptions(w, accepted);

@@ -312,13 +312,13 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 /// Logs the numbers the estimator compared on a refusal.
 pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) ?model_registry_mod.MemoryContextRefusal = null;
 
-/// GPU bytes a vision encode may still take, read live (`server.visionEncodeAvailable`). Null skips the recheck.
+/// GPU bytes a vision encode may still take, read live (`request_media.visionEncodeAvailable`). Null skips the recheck.
 pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 = null;
 
-/// `server.decodeEncodedImage`: an `undecoded` image's file to the pixels its tower reads. Null cannot decode.
+/// `request_media.decodeEncodedImage`: an `undecoded` image's file to the pixels its tower reads. Null cannot decode.
 pub var vision_image_decode: ?*const fn (std.mem.Allocator, []const u8, *const model_mod.ModelConfig) ?chat_mod.ImageData = null;
 
-/// `server.visionEncodeBill`: the GPU bytes an encode of these blocks peaks at.
+/// `request_media.visionEncodeBill`: the GPU bytes an encode of these blocks peaks at.
 pub var vision_encode_bill: ?*const fn (*const model_mod.ModelConfig, []const chat_mod.ImageData, []const chat_mod.VideoData, usize) u64 = null;
 
 /// `server.towerFitFault`: the refusal text when `available` bytes do not hold the encode, written into `out`.

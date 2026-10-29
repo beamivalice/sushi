@@ -250,7 +250,7 @@ pub const prefill_width: u32 = 2048;
 /// Added to every cap: twice the 0.12 GiB of small tensors and tables a decode forward was measured to hold.
 const cap_slack_bytes: u64 = 256 << 20;
 const score_copies: u64 = 3;
-/// `generate.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
+/// `prefill_plan.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
 pub const tail_merge_rows: u64 = 511;
 /// Peak bytes a prefill forward row holds per hidden channel: measured on the 5120-wide release as 2.3 MiB a row from
 /// 256 to 2048 rows (2.8 MiB for one 363-row chunk, its state rows included), rounded up.

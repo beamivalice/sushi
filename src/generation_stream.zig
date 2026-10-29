@@ -584,7 +584,7 @@ pub fn handleNonStreamingGeneration(
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
     // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
     // never paid-for-and-dropped — thinking-off is enforced on the PROMPT side
-    // (chat.noThinkTailSuffix commits the channel), so any reasoning that
+    // (think_tags.noThinkTailSuffix commits the channel), so any reasoning that
     // still shows up here is real work the client gets to see.
     const opens_think = promptOpensThink(allocator, tok, prompt_ids);
 
@@ -1226,7 +1226,7 @@ pub fn handleStreamingGeneration(
     // Starts true when thinking is enabled (model outputs <think> first) OR
     // the prompt itself opened a think block: generated reasoning is always
     // DELIVERED as reasoning_content, never paid-for-and-dropped. Thinking-off
-    // is enforced prompt-side (chat.noThinkTailSuffix commits the channel).
+    // is enforced prompt-side (think_tags.noThinkTailSuffix commits the channel).
     // A stream starts inside a think block only when the RENDERED PROMPT ends
     // inside one — never because the request asked for thinking. Qwen/Gemma
     // templates render the opener when thinking is on, so `promptOpensThink`
@@ -1249,10 +1249,10 @@ pub fn handleStreamingGeneration(
     var think_closed = false; // a complete think block was already split+emitted this stream
     // Leading whitespace is suppressed until the first visible byte, so the
     // stream reaches the same content bytes as splitThinkBlock's own
-    // trimStart (chat.streamContentLead).
+    // trimStart (think_tags.streamContentLead).
     var content_started = false;
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
-    var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
+    var thought_shipped = false; // this thought has streamed a delta (`think_tags.openThoughtFlush`)
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>"; // will be updated if Gemma 4 format detected
     var skipped_think_open = false; // track if we've skipped the initial think tag
@@ -1343,7 +1343,7 @@ pub fn handleStreamingGeneration(
 
         if (gated_stream) {
             // Stream tokens until we detect a tool call pattern starting, then buffer.
-            // Detection rules live in `chat.streamShouldBufferForTools` — it
+            // Detection rules live in `think_tags.streamShouldBufferForTools` — it
             // covers the full `<tool…>` family (including bare DSV4 `<tool>`),
             // Gemma 4 `<|tool_call`, raw JSON, plus partial-prefix growth from
             // a single `<` all the way to `<|tool_cal`. Without the partial
@@ -1358,7 +1358,7 @@ pub fn handleStreamingGeneration(
             const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
-                // No tool call pattern — ask the shared gate (chat.streamThinkGate,
+                // No tool call pattern — ask the shared gate (think_tags.streamThinkGate,
                 // also used by /v1/messages) whether the buffer is thinking that
                 // must be held, a completed think block to split, or visible
                 // prose to flush. Hermetically pinned per recorded model family

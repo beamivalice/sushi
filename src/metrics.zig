@@ -549,7 +549,7 @@ fn writeHistogramJson(w: *std.Io.Writer, name: []const u8, hist: anytype, scale:
 
 /// Monotonically increasing lock-free counter.
 /// Safe to add from any thread; use load() to snapshot.
-/// Label per `scheduler.BatchVerdict` tag; `.ok` is not a serial reason and renders nothing.
+/// Label per `slot_admission.BatchVerdict` tag; `.ok` is not a serial reason and renders nothing.
 pub const SERIAL_REASONS = blk: {
     const V = @import("scheduler.zig").BatchVerdict;
     const fields = @typeInfo(V).@"enum".field_names;

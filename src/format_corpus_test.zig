@@ -2,7 +2,7 @@
 //!
 //! A table of REAL captured model outputs (plus a few minimal synthetic
 //! variants of real failures) run through the pure post-processing layer:
-//! `chat.splitThinkBlock` / `chat.parseToolCalls` —
+//! `think_tags.splitThinkBlock` / `tool_calls.parseToolCalls` —
 //! and back through the INPUT layer (`chat.serializeMessagesJson`), since
 //! every output re-enters the next request's history.
 //! No model weights, no server — runs in CI on every `zig build test`.
@@ -251,7 +251,7 @@ const Expect = struct {
     last_tool_arg_value: ?[]const u8 = null,
     /// The tools the request declared (OpenAI shape, exactly what server.zig
     /// threads to the parse sites as `tools_json`). When set, the corpus runs
-    /// `chat.coerceToolArgsToSchema` and enforces the universal
+    /// `tool_schema.coerceToolArgsToSchema` and enforces the universal
     /// declared-type invariant below.
     tools_json: ?[]const u8 = null,
     /// Expected BOOLEAN-typed argument in the first call (schema entries only).
@@ -1024,7 +1024,7 @@ const corpus = [_]Expect{
     // Class: the tag formats carry NO type information, so the parser infers it
     // from the value's SPELLING (`isJsonLiteral`) — and guesses wrong in both
     // directions. Only the tool schema disambiguates, so every entry with a
-    // `tools_json` is coerced (chat.coerceToolArgsToSchema) and then checked by
+    // `tools_json` is coerced (tool_schema.coerceToolArgsToSchema) and then checked by
     // the universal declared-type invariant below. Reverting the coercion turns
     // both entries red.
     .{
@@ -1734,7 +1734,7 @@ const leak_tags = [_][]const u8{
 };
 
 /// Tool-call wrapper openers that must never appear in reasoning_content
-/// either. Mirrors `chat.tool_markup_openers` (the cut list) — kept spelled
+/// either. Mirrors `think_tags.tool_markup_openers` (the cut list) — kept spelled
 /// out here so the guard fails if the cut list is narrowed.
 const reasoning_leak_tags = [_][]const u8{
     "<｜DSML｜",
@@ -1904,7 +1904,7 @@ test "format corpus: recorded model outputs across families" {
         // ── Visible content / reasoning split (server's no-tool-call path). ──
         // ONE path for both thinking flags: the server always splits and
         // DELIVERS whatever reasoning the model generated (thinking-off is
-        // enforced prompt-side via chat.noThinkTailSuffix, never by dropping
+        // enforced prompt-side via think_tags.noThinkTailSuffix, never by dropping
         // generated tokens). `entry.thinking` documents the original request.
         const split: chat.ThinkSplit = chat.splitThinkBlock(raw, true, entry.opened_by_template);
         // When tool calls parsed, the server emits NO content from this text.
@@ -1963,7 +1963,7 @@ test "format corpus: recorded model outputs across families" {
 
 test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     // Replay every recorded output byte-by-byte through the shared streaming
-    // gate (chat.streamThinkGate — used by both the chat-completions and
+    // gate (think_tags.streamThinkGate — used by both the chat-completions and
     // /v1/messages SSE handlers with tools present). Invariants:
     //   1. With thinking enabled, NOTHING flushes as visible text before the
     //      think close tag has fully arrived — the 2026-06-10 Claude Code

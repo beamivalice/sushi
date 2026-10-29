@@ -1279,7 +1279,7 @@ test "qwen encodeScratchBytes covers each measured peak by >= 25% without the N^
 // 1920x1080 screenshot and the engine's 1536^2 cap (random pixels; numerics are
 // the parity test's job), with and without the per-block eval, arms interleaved;
 // then per video, its peak from the pixel upload to the evaluated output against
-// `server.visionEncodeBill`:
+// `request_media.visionEncodeBill`:
 //   QWEN_VISION_TEST_MODEL=<pack> SUSHI_QWEN_VISION_UBENCH=<reps> \
 //   zig build test -Doptimize=ReleaseFast -Dtest-filter="qwen vision ubench"
 test "qwen vision ubench: encode time and scratch peak per image and video" {
@@ -1372,7 +1372,7 @@ test "qwen vision ubench: encode time and scratch peak per image and video" {
             _ = mlx.mlx_get_active_memory(&before);
             _ = mlx.mlx_reset_peak_memory();
             const t0 = std.Io.Timestamp.now(io, .boot);
-            // As `scheduler.encodeVideoBlock`: the upload is a copy the encode owns.
+            // As `vision_queue.encodeVideoBlock`: the upload is a copy the encode owns.
             const pixels = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
             const out = tower.forwardVideo(pixels, v[0], v[1], v[2]);
             _ = mlx.mlx_array_free(pixels);

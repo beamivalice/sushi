@@ -151,7 +151,7 @@ fn extractCompletedStatus(allocator: std.mem.Allocator, data: []const u8) ?[]u8 
 
 /// Tracks how long a streaming connection has been SILENT so the token loops
 /// can emit a protocol-level keepalive before a client's idle-body timeout
-/// fires. The mirror image of `generate.StallClock`: that one protects the
+/// fires. The mirror image of `degenerate.StallClock`: that one protects the
 /// server from a wedged model, this one protects the client from a wedged-
 /// looking socket.
 ///

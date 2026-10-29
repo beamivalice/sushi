@@ -240,7 +240,7 @@ var sliding_block_trim_logged: bool = false; // one-shot log guard
 pub var row_axis_verify_logged: bool = false;
 pub var verify_fail_after_flush: ?usize = null;
 pub var deferred_ple_group_syncs: u64 = 0;
-/// Slots one batched forward carries (twin of `scheduler.MAX_BATCH_GROUP`).
+/// Slots one batched forward carries (twin of `slot_admission.MAX_BATCH_GROUP`).
 pub const MAX_BATCH_ROWS = 32;
 pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) SlidingView {
     const span: u32 = if (cfg.has_sliding_window)

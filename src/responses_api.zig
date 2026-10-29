@@ -988,7 +988,7 @@ fn handleResponsesInner(
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
-        var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
+        var thought_shipped = false; // this thought has streamed a delta (`think_tags.openThoughtFlush`)
         var skipped_think_open = false;
         var live_output_index: u32 = 0;
 
@@ -1270,7 +1270,7 @@ fn handleResponsesInner(
 
     // ── split thinking & tool calls ──
     // Reasoning the model actually generated is always delivered — the
-    // request's thinking flag shaped the PROMPT (chat.noThinkTailSuffix),
+    // request's thinking flag shaped the PROMPT (think_tags.noThinkTailSuffix),
     // never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);

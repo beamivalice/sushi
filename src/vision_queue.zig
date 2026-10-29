@@ -226,7 +226,7 @@ pub const VisionEncodeRequest = struct {
     /// placeholders.
     n_vision_tokens: usize = 0,
     n_video_tokens: usize = 0,
-    /// `server.visionEncodeBill` of this request; the inference thread refuses the encode when
+    /// `request_media.visionEncodeBill` of this request; the inference thread refuses the encode when
     /// the GPU has less left when its turn comes. 0 = unbilled.
     bill_bytes: u64 = 0,
     /// Output: what the GPU had left when `vision_headroom_error` refused the encode.
