@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=live boot=api
 # Integration test: chat completions emit a llama.cpp-style `timings` block
 # alongside `usage`, on both the non-stream JSON body and the final SSE chunk
 # of a streaming response (when stream_options.include_usage is set).
@@ -7,30 +8,24 @@
 #   prompt_n, prompt_ms, prompt_per_second,
 #   predicted_n, predicted_ms, predicted_per_second
 #
-# Run against a live server:
-#   ./tests/test_timings.sh [port]
+# Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_timings.sh
 
-set -u
-PORT=${1:-8080}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+BASE=$SUSHI_URL
 FAIL=0
 
 echo "=== Chat-completions timings field ==="
-echo "Server: $BASE"
-
-if ! curl -sf "$BASE/health" > /dev/null 2>&1; then
-    echo "SKIP: Server not running on port $PORT"
-    exit 0
-fi
+echo "Server: $BASE ($SUSHI_ARCH)"
 
 # ── Test 1: non-streaming chat completion ──────────────────────────────────
 echo
 echo "--- Test 1: non-stream chat.completion carries a top-level 'timings' object ---"
-RESULT=$(curl -sf "$BASE/v1/chat/completions" \
+RESULT=$(curl -sf -m 600 "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "messages": [{"role":"user","content":"Say hi in five words."}],
+    "messages": [{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in five words."}],
     "max_tokens": 16,
     "temperature": 0.0,
     "stream": false
@@ -40,9 +35,9 @@ if [ -z "$RESULT" ]; then
     exit 1
 fi
 
-python3 - <<PY
+python3 -I - "$RESULT" <<'PY'
 import json, sys
-r = json.loads('''$RESULT''')
+r = json.loads(sys.argv[1])
 t = r.get("timings")
 if not isinstance(t, dict):
     print(f"  FAIL: no 'timings' object in response. keys={list(r.keys())}")
@@ -81,11 +76,11 @@ RC=$?
 # ── Test 2: streaming chat completion ──────────────────────────────────────
 echo
 echo "--- Test 2: streaming final SSE chunk carries 'timings' alongside 'usage' ---"
-STREAM=$(curl -sN "$BASE/v1/chat/completions" \
+STREAM=$(curl -sN -m 600 "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "messages": [{"role":"user","content":"Say hi in five words."}],
+    "messages": [{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in five words."}],
     "max_tokens": 16,
     "temperature": 0.0,
     "stream": true,
@@ -96,9 +91,9 @@ if [ -z "$STREAM" ]; then
     exit 1
 fi
 
-python3 - <<PY
+python3 -I - "$STREAM" <<'PY'
 import json, sys
-raw = '''$STREAM'''
+raw = sys.argv[1]
 chunks = []
 for line in raw.splitlines():
     if not line.startswith("data: "):
