@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # Qwen3.8-Flash-Next + DFlash2 drafter: engagement and byte-equality with serial decoding.
 #
 # Contract pinned here (one pack per run; the owner's gate is all three Sushi Qwen packs):

@@ -113,7 +113,7 @@ native tree.
   drafter's context grows by the committed taps only.
 - **Verify**: ONE batched forward of `[t1, drafts]` with per-position GDN capture; a partial accept rolls GDN, PLE and
   QSA state back through `ssmRollbackFromCapture`, shared with the MTP verify (rows are decode-identical up to 9).
-  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/test_dflash2_qwen.sh`: seven prompts incl. an image, stream ==
+  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/qwen4/test_dflash2_qwen.sh`: seven prompts incl. an image, stream ==
   non-stream, opt-out, a sampled bank at T1.0 / top_p 0.95 / top_k 20, and that a drafter beside the pack is ignored; run on Sushi-2bpw, 2.6bpw, 4bpw and an STQ SPEC1
   pack, and streamed at `--ssd-budget-gb 32` on 2.6bpw).
 - **Rows**: a verify row is bytes, not dispatches (about 3.3 ms per row on Sushi-2.6bpw). The drafter drafts a block of
@@ -140,7 +140,7 @@ native tree.
 
 ## Oracle and fixtures
 
-- `tests/dump_qwen4_exp_fixtures.py` is the oracle dumper. HF `hidden_states[i]` is the INPUT of layer i: compare
+- `tests/qwen4/dump_qwen4_exp_fixtures.py` is the oracle dumper. HF `hidden_states[i]` is the INPUT of layer i: compare
   layer-i output with stream_{i+1}.
 - The converters, allocators and imatrix drivers live in the private converter repo; the format they owe us is
   [pack-format](pack-format.md).

@@ -169,7 +169,7 @@ pub const Hash = struct {
     }
 };
 
-/// V4.1's token map (`tests/dump_dsv41_token_map.py`): one bit per token id, set where the token opens
+/// V4.1's token map (`tests/dsv41/dump_dsv41_token_map.py`): one bit per token id, set where the token opens
 /// the next compressed id, then every other token's id as a u32.
 const v41_token_map = @embedFile("../fixtures/dsv41_engram_token_map.bin");
 

@@ -319,5 +319,5 @@ tokens x top-k exactly on every layer; the two load-time warmup forwards add a f
 
 A dense qwen4_exp checkpoint with a complete streaming index registers as a streaming stub
 (`streamingStubMarker`); `/v1/models` carries `streaming`, `streaming_required`, `ssd_budget_gb` at top level and
-`input_modalities: ["text"]` when it must stream. Guards: `tests/test_bf16_streaming.sh`,
+`input_modalities: ["text"]` when it must stream. Guards: `tests/qwen4/test_bf16_streaming.sh`,
 `tests/test_model_settings.sh` [5].

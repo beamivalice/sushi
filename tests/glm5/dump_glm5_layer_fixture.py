@@ -1,6 +1,6 @@
 """Capture small deterministic GLM layer oracles; no model checkpoint is required.
 
-Run with an oMLX environment: python tests/dump_glm5_layer_fixture.py --omlx REPO.
+Run with an oMLX environment: python tests/glm5/dump_glm5_layer_fixture.py --omlx REPO.
 """
 import argparse
 import hashlib

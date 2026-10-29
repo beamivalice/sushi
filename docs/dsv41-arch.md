@@ -72,7 +72,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   (`ForwardCtx.ahead_ids`) and reads the next chunk's rows while it runs (`aheadEngram`, one chunk of host rows, ~13 KB a token, unbilled);
   the next pass takes them when its row ids are the same, else reads its own. The n-gram hash and the compressed-vocabulary map
   are the reference's (`engram.py`); the map ships embedded (`src/fixtures/dsv41_engram_token_map.bin`) and a pack's own
-  `engram_token_map.json` outranks it. `tests/dump_dsv41_token_map.py --check` re-derives it from `tokenizer.json`.
+  `engram_token_map.json` outranks it. `tests/dsv41/dump_dsv41_token_map.py --check` re-derives it from `tokenizer.json`.
 - **Forward** (`src/dsv41/dsv41_model.zig`): bf16 activations, f32 where the reference is f32 (head, compressor, hyper-connection
   mixes, attention scores and sink, router). Prefill runs in spans of 256 rows; the window is a ring, the compressed and
   index rows grow by a sixteenth (`rows_grow_div`); decode is the one-row case of the same code.
@@ -264,7 +264,7 @@ After CED and the fused gather-attention (budget 96, chunk 1024, synced stage pr
 <a id="oracle"></a>
 ## Oracle and what is proven
 
-`tests/dump_dsv41_fixtures.py` runs the release's `inference/model.py` on the CPU in f32 over a TINY random model (8
+`tests/dsv41/dump_dsv41_fixtures.py` runs the release's `inference/model.py` on the CPU in f32 over a TINY random model (8
 layers, hidden 128, ratios 0,0,2,2,2,1,1,1, 8 experts top-3, window 8, Engram at layers 1 and 2) written in the
 ORIGINAL checkpoint layout, and dumps logits, per-layer streams and sub-module captures (`fixture.safetensors`, QAT on;
 `fixture_noqat.safetensors`, off). The reference's GPU kernels are stubbed on the CPU. `DSV41_TINY=<dir>` points the Zig
@@ -765,7 +765,7 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   `streamingResidentSplit`), a request's encode is billed by `visionEncodeBill`, and a load with the tower keeps
   `largestImageEncodeBytes` beside the budget ([engine-memory-admission](engine-memory-admission.md)).
 
-Proof: `python3 tests/dump_dsv41_vision_fixtures.py --ref-dir <release>/inference --pack <pack>` runs the release's
+Proof: `python3 tests/dsv41/dump_dsv41_vision_fixtures.py --ref-dir <release>/inference --pack <pack>` runs the release's
 `image_processor.py` and `vision.py` on CPU in bf16 (its default dtype) on two fixed images, with the pack's tensors,
 and writes the patches, tower, aligner and span (and an fp32 run of the same tower) under
 `$SUSHI_MODELS_DIR/kld-teacher/dsv41-vision`. `zig build test -Dtest-filter="dsv41 vision"` holds the patches to the

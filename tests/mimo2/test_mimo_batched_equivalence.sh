@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # test_mimo_batched_equivalence.sh — MiMo decodes concurrent plain slots as rows of one forward
 # (`forwardMimoBatchedDecode`), and every row must be that slot's own decode tick. STRICT: each
 # answer of a concurrent group equals the same request answered alone, byte for byte (greedy,

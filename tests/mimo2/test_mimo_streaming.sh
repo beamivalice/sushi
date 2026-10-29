@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MODEL=${MIMO_STREAM_MODEL:-}
 PORT=${1:-}
 BUDGET=${MIMO_SSD_BUDGET_GB:-60}

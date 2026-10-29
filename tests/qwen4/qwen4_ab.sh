@@ -1,9 +1,9 @@
 #!/bin/zsh
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # Same-boot qwen4_exp A/B harness (M4 Max numbers in docs/gotchas/engine-mlx.md;
 # the M5 box re-measures with the same script).
-#   tests/qwen4_ab.sh mtp <tag> [server flags...]     MTP vs serial per prompt, 3 reps interleaved, then MTP + plain concurrent
-#   tests/qwen4_ab.sh batched <tag> [server flags...] serial 3 reps per prompt, then 2-/4-stream prose + 2-stream 8.5k aggregate
+#   tests/qwen4/qwen4_ab.sh mtp <tag> [server flags...]     MTP vs serial per prompt, 3 reps interleaved, then MTP + plain concurrent
+#   tests/qwen4/qwen4_ab.sh batched <tag> [server flags...] serial 3 reps per prompt, then 2-/4-stream prose + 2-stream 8.5k aggregate
 # Env: QWEN4_MODEL (pack), SUSHI_BIN, QWEN4_AB_OUT (default ~/.sushi/runs/qwen4-ab), QWEN4_AB_PORT.
 # Engine env (SUSHI_MTP_TRACE, ...) passes through to the server; depth flags (--mtp-min-depth/--mtp-max-depth) ride the server flags.
 setopt nonomatch

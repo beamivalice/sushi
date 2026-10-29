@@ -12,9 +12,9 @@ Two phases, run from the torch venv (transformers main carries the arch):
      full-prefill logits and a stepwise-decode logits block past the QSA
      budget, plus the per-layer residual stream for bisecting.
 
-  venv/bin/python tests/dump_qwen4_exp_fixtures.py build --out ~/.sushi/runs/qwen4-tiny/hf
+  venv/bin/python tests/qwen4/dump_qwen4_exp_fixtures.py build --out ~/.sushi/runs/qwen4-tiny/hf
   # convert ~/.sushi/runs/qwen4-tiny/hf to ~/.sushi/runs/qwen4-tiny/pack with sashimi
-  venv/bin/python tests/dump_qwen4_exp_fixtures.py dump --hf ~/.sushi/runs/qwen4-tiny/hf \
+  venv/bin/python tests/qwen4/dump_qwen4_exp_fixtures.py dump --hf ~/.sushi/runs/qwen4-tiny/hf \
       --pack ~/.sushi/runs/qwen4-tiny/pack --out ~/.sushi/runs/qwen4-tiny/fixture.safetensors
   QWEN4_TEST_MODEL=~/.sushi/runs/qwen4-tiny/pack QWEN4_FIXTURE=~/.sushi/runs/qwen4-tiny/fixture.safetensors \
       zig build test -Dtest-filter="qwen4 fixture"

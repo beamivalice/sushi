@@ -15,7 +15,7 @@ returns x), the Engram rows stay fp32, and the head returns every position. The 
 the attention and compressor run with `inplace=True` stay on, and `fixture_noqat.safetensors` is the
 same run with them off (plain math, the tight bar).
 
-  python -I tests/dump_dsv41_fixtures.py --reference <DeepSeek-V4.1-Flash>/inference --out <dir> [--geometry stq]
+  python -I tests/dsv41/dump_dsv41_fixtures.py --reference <DeepSeek-V4.1-Flash>/inference --out <dir> [--geometry stq]
   DSV41_TINY=<dir> zig build test -Doptimize=ReleaseFast -Dtest-filter="dsv41"
 
 Writes under <dir>: the pack (config.json, model-*.safetensors, model.safetensors.index.json),

@@ -73,7 +73,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_RAW_DUMP_FILE` | `server.zig:11999, server.zig:17261` | `<abs path>` appends the full pre-parse buffer of every tools request (corpus harvest) | per tool request | yes: server-tool-calling |
 | `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` | `exl3/expert_exl3_kernels.zig` | prefill GEMM window rows (default 32) and `0` unaligns it; the window-geometry parity tests drive both | once | yes: engine-exl3-experts |
 | `SUSHI_MTP_COST_TABLE` | `generate.zig:7548` | `0` uses the prior only, no measured round costs; `tests/test_mtp_equivalence.sh` needs it for a seeded sampled byte comparison | once | yes: engine-mtp, tests/CLAUDE |
-| `SUSHI_MTP_HEAD_PERSIST` | `generate.zig:505` | default on: Qwen4 MTP head history rides the prefix cache; `0` turns it off for `tests/test_qwen4_mtp_head_persist.sh` | once | yes: tests/CLAUDE |
+| `SUSHI_MTP_HEAD_PERSIST` | `generate.zig:505` | default on: Qwen4 MTP head history rides the prefix cache; `0` turns it off for `tests/qwen4/test_qwen4_mtp_head_persist.sh` | once | yes: tests/CLAUDE |
 | `SUSHI_PREFILL_INTERLEAVE` | `scheduler.zig:6630` | default on: a cold prefill yields to decode streams; `0` is the byte-identity reference of `tests/test_prefill_interleave.sh` | once | yes: server-lifecycle, tests/CLAUDE |
 | `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
 | `SUSHI_VISION_CHUNKED` | `prefill_plan.zig:328` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |

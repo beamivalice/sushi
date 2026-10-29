@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # DFlash block-drafter integration test — env-gated on a local target +
 # assistant pair (GLM-5.3-Flash Sushi pack + its DFlash2 drafter today):
 #
@@ -30,7 +30,7 @@ done
 
 PORT="${DFLASH_TEST_PORT:-11353}"
 BASE="http://127.0.0.1:$PORT"
-BIN="$(dirname "$0")/../zig-out/bin/sushi"
+BIN="$(dirname "$0")/../../zig-out/bin/sushi"
 LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
 
 # --no-mtp: a loaded DFlash sidecar outranks an in-checkpoint MTP head

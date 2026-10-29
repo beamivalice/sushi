@@ -44,7 +44,7 @@ MiMo's three MTP heads, split out of [engine-mtp](engine-mtp.md); everything sha
     more page, fully masked, which adds exact zeros. Otherwise the rows go one by one.
   - Byte-identical to decode ticks; -5% to -7% per verify forward at 128k keys
     ([perf-baselines](mimo2-perf.md#mimo-verify-global-rows)).
-- Oracle: `tests/dump_mimo_v2_mtp_fixtures.py` renders the heads from the HF reference's own modules on the tiny
+- Oracle: `tests/mimo2/dump_mimo_v2_mtp_fixtures.py` renders the heads from the HF reference's own modules on the tiny
   fixture model; `mimo mtp heads track the torch rendering…` replays history, rounds, wrong drafts and rollbacks.
 - **A MiMo verify row reads its own 8 routed experts**, so it costs a large share of a forward and depth pays only
   on predictable text (code, lists, JSON; prose loses). Greedy MTP is byte-identical to serial (18/18 pairs at 256

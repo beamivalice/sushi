@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract tests for tests/dump_mimo_v2_fixtures.py (the mimo_v2 oracle).
+"""Contract tests for tests/mimo2/dump_mimo_v2_fixtures.py (the mimo_v2 oracle).
 
 Hermetic half (stdlib only): the fixture SCHEMA the Zig parity test will be
 written against, and the torch-missing SKIP path.  E2E half (torch +
@@ -10,9 +10,9 @@ and prove the self-verify accepts its own output and REJECTS a corrupted one.
 A passing run prints NOTHING on either stream (repo rule); failure detail goes
 to stderr, and MIMO_V2_FIXTURE_DEBUG=1 streams diagnostics (incl. skips).
 
-    python3 tests/test_dump_mimo_v2_fixtures.py
+    python3 tests/mimo2/test_dump_mimo_v2_fixtures.py
     uv run --with torch --with transformers --with numpy --with safetensors \
-        tests/test_dump_mimo_v2_fixtures.py
+        tests/mimo2/test_dump_mimo_v2_fixtures.py
 """
 import hashlib
 import importlib.util

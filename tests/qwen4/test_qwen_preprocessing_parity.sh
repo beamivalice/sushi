@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CPU-only Qwen preprocessing parity against the pinned mlx-vlm processor.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 IMAGE="${1:-tests/fixtures/house.jpeg}"
 FIXTURE="${QWEN_PREPROCESS_FIXTURE:-/tmp/qwen_preprocess_fixture}"
@@ -18,7 +18,7 @@ run_parity() {
   local min_pixels="$2"
   local max_pixels="$3"
 
-  "$PYTHON" tests/build_qwen_preprocess_fixture.py \
+  "$PYTHON" tests/qwen4/build_qwen_preprocess_fixture.py \
     --image "$IMAGE" \
     --out "$fixture" \
     --min-pixels "$min_pixels" \

@@ -226,7 +226,7 @@ chain/group paths still capture per row. `dflash_policy.ladder()` is that table 
 - **Head KV**: dense by default; `--mtp-head-kv-quant` opts qwen4's into `--kv-quant` (billed at its effective width
   either way, `mtpHeadKvBytesPerToken`; MiMo's heads keep their dense window and the boot log says the flag does
   nothing there, `server.mtpHeadKvLine`); a spec sidecar under another scheme is declined at restore and rewritten
-  on the next commit. Head persistence with its QSA half: `tests/test_qwen4_mtp_head_persist.sh`.
+  on the next commit. Head persistence with its QSA half: `tests/qwen4/test_qwen4_mtp_head_persist.sh`.
 - Acceptance modes `exact|typical|tokenv3` (`mtp_acceptance.zig`, per-model `mtp_acceptance`).
   Only sampled decoding reads the mode: temperature < 0.01 (`sampler.isGreedyTemperature`, shared with serial sampling) always takes the argmax check (`mtpAcceptRowGreedy`), so
   greedy output is identical under every mode. Sushi-4bpw at T=1.0 / top_k 20 / top_p 0.95, 16 fixture prompts x 512,

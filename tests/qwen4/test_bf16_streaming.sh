@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CHECKPOINT=${QWEN4_BF16_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen/Qwen3.8-Flash-Next}
 FIXTURE=${QWEN4_TEACHER_FIXTURE:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/kld-teacher/mlx-serve-bf16-60x64}
 PORT=${1:-}

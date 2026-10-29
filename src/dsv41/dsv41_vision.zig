@@ -578,7 +578,7 @@ const release_vision: Processor = .{ .patch = 14, .downsample = 3, .max_tokens =
 
 test "dsv41 vision: the resize plan and letterbox match the release's image processor" {
     // Rows of the release's `plan_image_grid` and Pillow's `ImageOps.pad` box at the release config
-    // (tests/dump_dsv41_vision_fixtures.py writes them from the reference as plan.json).
+    // (tests/dsv41/dump_dsv41_vision_fixtures.py writes them from the reference as plan.json).
     const cases = [_]struct { w: u32, h: u32, bw: u32, bh: u32, lh: u32, lw: u32, rw: u32, rh: u32, x: u32, y: u32 }{
         .{ .w = 730, .h = 487, .bw = 742, .bh = 490, .lh = 12, .lw = 18, .rw = 734, .rh = 490, .x = 4, .y = 0 },
         .{ .w = 97, .h = 61, .bw = 686, .bh = 434, .lh = 11, .lw = 17, .rw = 686, .rh = 431, .x = 0, .y = 2 },
@@ -651,7 +651,7 @@ test "dsv41 vision: the encode bill grows with the patches and stays under 2 GB 
     try testing.expect(cap < 2 * (1 << 30));
 }
 
-// ── Parity against the release's reference (tests/dump_dsv41_vision_fixtures.py) ──
+// ── Parity against the release's reference (tests/dsv41/dump_dsv41_vision_fixtures.py) ──
 //
 // The fixture holds the reference's bf16 processor patches and tower/aligner outputs on two images, and the
 // pack's own tower tensors; both sit under `kld-teacher/dsv41-vision` in the models root. The tests skip

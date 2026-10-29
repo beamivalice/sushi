@@ -783,7 +783,7 @@ fn tinyConfig() model_mod.ModelConfig {
     return c;
 }
 
-/// The committed tiny fixture's weights as a Weights map (tests/dump_mimo_vision_fixtures.py tiny).
+/// The committed tiny fixture's weights as a Weights map (tests/mimo2/dump_mimo_vision_fixtures.py tiny).
 fn loadTinyFixture(tmp: *std.testing.TmpDir) !Weights {
     const io = testing.io;
     try tmp.dir.writeFile(io, .{ .sub_path = "tiny.safetensors", .data = @embedFile("../fixtures/mimo_vision_tiny.safetensors") });
@@ -835,7 +835,7 @@ test "VisionEncoder serves a MiMo config through the MiMo-ViT" {
 }
 
 // Real-weight parity against the reference run on the CPU in f32
-// (tests/dump_mimo_vision_fixtures.py real):
+// (tests/mimo2/dump_mimo_vision_fixtures.py real):
 //   MIMO_V2_SOURCE=<checkpoint> MIMO_VISION_ORACLE=<real.safetensors> \
 //   zig build test -Doptimize=ReleaseFast -Dtest-filter="mimo vision real"
 test "mimo vision real: preprocessing and the bf16 tower match the f32 reference" {

@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # Issue #390: a 1-token-tail commit that inherits checkpoints from a shared
 # prefix must not poison later restores with QsaHistoryGap.
 #

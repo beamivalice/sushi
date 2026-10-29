@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # test_mimo_ring_fork_ssd.sh — MiMo's sliding layers keep a ring, so an entry restores only at its
 # end or at a ring checkpoint. A client that sends a side request per turn (the whole conversation
 # plus an appended <system-reminder>) used to leave the next main turn nothing to restore once the
@@ -25,7 +25,7 @@ MODEL="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Su
 PORT="${PORT:-18931}"
 BIN="${BINARY:-./zig-out/bin/sushi}"
 BASE="http://127.0.0.1:$PORT"
-LOCK="$(cd "$(dirname "$0")/.." && pwd)/scripts/gpu-lock.sh"
+LOCK="$(cd "$(dirname "$0")/../.." && pwd)/scripts/gpu-lock.sh"
 OWNER="${GPU_LOCK_OWNER:-test_mimo_ring_fork_ssd}"
 
 [ -d "$MODEL" ] || { echo "SKIP: model dir not found: $MODEL"; exit 0; }

@@ -15,7 +15,7 @@ Head k's row p pairs the trunk's FINAL-NORMED hidden at position p with token
 p+k+1 at rope position p (SGLang multi-layer EAGLE: every head reads the
 target's hidden, only the token shifts), and predicts token p+k+2.
 
-Run AFTER tests/dump_mimo_v2_fixtures.py OUT_DIR (same --seed): rebuilds the
+Run AFTER tests/mimo2/dump_mimo_v2_fixtures.py OUT_DIR (same --seed): rebuilds the
 same tiny trunk, adds three random heads to OUT_DIR as `model_mtp.safetensors`
 (index updated; fused qkv stored [q | k | v]) and writes `mtp_fixture.safetensors`:
   input_ids [T] i32, target_hidden [T, H], mtp{k}_out [T-1-k, H] (final-normed),
@@ -137,7 +137,7 @@ def run(out_dir, seed, ref, cache_dir, offline):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("out_dir", help="a tests/dump_mimo_v2_fixtures.py dump of the same seed")
+    ap.add_argument("out_dir", help="a tests/mimo2/dump_mimo_v2_fixtures.py dump of the same seed")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--ref", default=None)
     ap.add_argument("--cache-dir", default=str(base.DEFAULT_CACHE))

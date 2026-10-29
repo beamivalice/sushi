@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # qwen4_exp: the in-checkpoint MTP head's committed history rides the prefix cache. The head
 # is not KV-only (it owns a QSA key history), so a cache hit used to draft from an empty head.
 # Asserts the invariant: the second turn is a hot-cache hit AND the head is restored, the

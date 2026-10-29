@@ -3,7 +3,7 @@
 `encoding/encoding.py` renders the shapes the server sends, and the Zig test renders the same
 cases through jinja.cpp.
 
-  python3 -I tests/dump_dsv41_template_cases.py --encoding <DeepSeek-V4.1-Flash>/encoding \
+  python3 -I tests/dsv41/dump_dsv41_template_cases.py --encoding <DeepSeek-V4.1-Flash>/encoding \
       [--dump src/fixtures/dsv41_template_cases.json]
 
 The server hands the template tool-call `arguments` as objects, omits `reasoning_content` when

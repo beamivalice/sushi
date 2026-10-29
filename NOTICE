@@ -93,9 +93,9 @@ implemented in Zig against mlx-c with SSD-streamed expert banks.
 `src/fixtures/dsv41_chat_template.jinja` is a Jinja transcription of the
 release's `encoding/encoding.py`, and `src/fixtures/dsv41_template_cases.json`
 and `src/fixtures/dsv41_engram_token_map.bin` are generated from that encoder and
-the release's tokenizer. tests/dump_dsv41_fixtures.py,
-tests/dump_dsv41_template_cases.py, tests/dump_dsv41_token_map.py and
-tests/dump_dsv41_vision_fixtures.py run the unmodified reference externally to
+the release's tokenizer. tests/dsv41/dump_dsv41_fixtures.py,
+tests/dsv41/dump_dsv41_template_cases.py, tests/dsv41/dump_dsv41_token_map.py and
+tests/dsv41/dump_dsv41_vision_fixtures.py run the unmodified reference externally to
 generate independent numerical fixtures.
 
 ================================================================================
@@ -112,7 +112,7 @@ Licensed under the Apache License, Version 2.0.
 The MiMo attention and routing implementation in src/transformer.zig follows
 the reference's partial rotary embedding, asymmetric K/V, attention-sink,
 value-scaling and sigmoid-routing contracts. It is implemented in Zig against
-mlx-c with SSD-streamed expert banks. tests/dump_mimo_v2_fixtures.py loads the
+mlx-c with SSD-streamed expert banks. tests/mimo2/dump_mimo_v2_fixtures.py loads the
 unmodified reference externally to generate independent numerical fixtures.
 
 The TP-aware FP8 QKV reconstruction in `src/mimo2/mimo_source.zig` follows
@@ -124,7 +124,7 @@ preprocessing follows the vendor serving processors (`smart_resize`, bilinear
 resampling, ImageNet normalization). The three MTP heads in `src/mimo2/mimo_mtp.zig`
 follow the MiMo-V2 MTP layer as XiaomiMiMo's vLLM and SGLang integrations
 compose it (Apache-2.0). Both are reimplemented in Zig against mlx-c;
-tests/dump_mimo_vision_fixtures.py and tests/dump_mimo_v2_mtp_fixtures.py
+tests/mimo2/dump_mimo_vision_fixtures.py and tests/mimo2/dump_mimo_v2_mtp_fixtures.py
 render their fixtures from the unmodified reference modules.
 
 `src/fixtures/mimo_v26_chat_template.jinja` is the checkpoint's

@@ -4,7 +4,7 @@
 Run with torch, torchvision, safetensors and a transformers version containing
 models.glm5_next. The fixture records the HF source hash for reproducibility.
 No MPS/GPU operations are used. Regenerate:
-  python tests/dump_glm5_vision_fixture.py src/fixtures/glm5_vision_tiny.safetensors
+  python tests/glm5/dump_glm5_vision_fixture.py src/fixtures/glm5_vision_tiny.safetensors
 """
 import hashlib
 import inspect

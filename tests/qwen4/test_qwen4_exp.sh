@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # Qwen3.8-Flash-Next (qwen4_exp) live end-to-end on the converted pack.
 # Boots the pack, then: architecture advertised, a short greedy answer, a tool
 # call + round-trip, streaming delta cleanliness, and a prompt past the QSA
@@ -105,7 +105,7 @@ apr=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1 | sed -E 's/.*avg_per_round=
 echo "  avg accepted per round: $apr"
 check "acceptance floor 0.5/round" "$(python3 -c "print(1 if float('${apr:-0}')>=0.5 else 0)")" "1"
 echo "[7] image turn (vision tower + M-RoPE)"
-IMAGE="$(dirname "$0")/fixtures/house.jpeg"
+IMAGE="$(dirname "$0")/../fixtures/house.jpeg"
 img=""
 if [ -f "$IMAGE" ]; then
   B64=$(base64 -i "$IMAGE")

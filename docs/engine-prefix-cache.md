@@ -463,6 +463,6 @@ Moved to [glm5-prefix-cache](glm5-prefix-cache.md).
 ## Guards
 
 `tests/test_prefix_cache_*.sh` (budget revisit, disk, hot, mem, workloads), `tests/test_hybrid_reuse_equivalence.sh`,
-`tests/test_mimo_ring_reuse.sh`, `tests/test_mimo_ring_fork_ssd.sh`, `tests/test_qwen4_mtp_head_persist.sh`,
-`tests/test_glm_prefix_reuse.sh`, `tests/test_prefix_cache_tiers.sh`. Grep the log for `[cache]`, `[hot-cache]`,
+`tests/mimo2/test_mimo_ring_reuse.sh`, `tests/mimo2/test_mimo_ring_fork_ssd.sh`, `tests/qwen4/test_qwen4_mtp_head_persist.sh`,
+`tests/glm5/test_glm_prefix_reuse.sh`, `tests/test_prefix_cache_tiers.sh`. Grep the log for `[cache]`, `[hot-cache]`,
 `[disk-cache]`.

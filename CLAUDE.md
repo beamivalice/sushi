@@ -149,7 +149,7 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 
 Tests follow [testsuite](docs/testsuite.md); `zig build test-host` runs the MLX-free tier beside a live server.
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live:
-`tests/test_qwen4_exp.sh`, `tests/test_bf16_streaming.sh`, `tests/test_mtp_equivalence.sh`,
+`tests/qwen4/test_qwen4_exp.sh`, `tests/qwen4/test_bf16_streaming.sh`, `tests/test_mtp_equivalence.sh`,
 `tests/test_prefix_cache_*.sh`, `tests/test_smoke_matrix.sh`. Matrix: `tests/CLAUDE.md`.
 
 - **A test never writes to stdout** (stderr only): under `zig build test` fd 1 is the build runner's protocol pipe;

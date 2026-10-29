@@ -3585,7 +3585,7 @@ fn initDspark(m: *Model, w: *model_mod.Weights) !void {
     }
 }
 
-// ── tests: DeepSeek's reference on a tiny checkpoint (tests/dump_dsv41_fixtures.py) ──
+// ── tests: DeepSeek's reference on a tiny checkpoint (tests/dsv41/dump_dsv41_fixtures.py) ──
 
 const testing = std.testing;
 

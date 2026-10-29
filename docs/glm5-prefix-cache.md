@@ -27,7 +27,7 @@ pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   holds at the 2048 default. The suffix runs the same absolute chunks, tail merge, backoff and final span.
   - A request stepped down to narrower tail chunks near 1M matches only a cold run that steps down the same way.
   - Guards: the generator fixture tests (including a mid-request step-down), the hot-cache fixture tests, and
-    `tests/test_glm_prefix_reuse.sh`.
+    `tests/glm5/test_glm_prefix_reuse.sh`.
 - **A thinking request with tools takes one more point mid-decode, at the pool position at or below its `</think>`**
   ([engine-prefix-cache](engine-prefix-cache.md#thought-points)): the DFlash2 round carrying the closer commits only up to
   that multiple of 4 (no file-format change), the KDA state there is the newest checkpoint and the commit's rows run

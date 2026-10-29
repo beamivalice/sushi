@@ -539,7 +539,7 @@ const QWEN4_YARN = Yarn{
 };
 
 /// `_compute_yarn_parameters` output for QWEN4_YARN, produced by the reference
-/// (tests/dump_qwen4_yarn_fixtures.py, transformers 5.9) — and independently by
+/// (tests/qwen4/dump_qwen4_yarn_fixtures.py, transformers 5.9) — and independently by
 /// a transcription of vLLM's `YaRNScalingRotaryEmbedding._compute_inv_freq`,
 /// which agrees with HF bit-for-bit here. f64: the references compute in f32,
 /// which is 1e-7 sloppier than these.
@@ -754,7 +754,7 @@ test "qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)" {
     // `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS["yarn"]`, cross-checked
     // inside the dumper against a transcription of vLLM's
     // `YaRNScalingRotaryEmbedding` — for THIS checkpoint's own geometry, dumped by
-    // `tests/dump_qwen4_yarn_fixtures.py`. Dormant in normal CI:
+    // `tests/qwen4/dump_qwen4_yarn_fixtures.py`. Dormant in normal CI:
     //
     //     QWEN4_YARN_FIXTURES=/tmp/qwen4_yarn.json \
     //         zig build test -Dtest-filter="qwen4 yarn parity"

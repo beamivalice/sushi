@@ -203,7 +203,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   row i attends and appends on slot i's own cache at its own position through the solo core (`mimoAttnCore`,
   `ForwardCtx.batch_rows`), so ring compaction and marks happen per slot as in a solo tick, and each row is read out
   as its tick reads it (the shortlist under `argmax_only`). Byte-identical to the solo ticks (`mimo batched decode
-  rows` on the real pack; `tests/test_mimo_batched_equivalence.sh`).
+  rows` on the real pack; `tests/mimo2/test_mimo_batched_equivalence.sh`).
 - A group holds at most four slots (`batchGroupCap`, independently of the MTP verify width); the rest decode serial by name
   (`row_cap`). Nothing pads: rows never share a key tensor. Groups of three or four eligible MTP slots take
   plain batched ticks and retain each row's hidden state so solo rounds can resume; smaller groups keep solo MTP.
@@ -294,7 +294,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Evidence
 
-- `tests/dump_mimo_v2_fixtures.py` supplies the independent HF oracle; `MIMO_V2_SOURCE` tests the downloaded Flash
+- `tests/mimo2/dump_mimo_v2_fixtures.py` supplies the independent HF oracle; `MIMO_V2_SOURCE` tests the downloaded Flash
   config/template. Native-byte preservation, forward parity, and live serving are separate gates; a header audit
   proves neither numerical parity nor generation. Test commands: [tests/CLAUDE.md](../tests/CLAUDE.md).
 - Quality: KLD through EOS on the 16x512 teacher, recorded in [quality-kld](mimo2-kld.md#mimo).

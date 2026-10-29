@@ -1019,8 +1019,8 @@ test "qwen preprocessing parity vs reference pixel_values (QWEN_PREPROCESS_FIXTU
 // Live parity vs the mlx-vlm reference vision tower. Feeds the REFERENCE's own
 // pixel_values straight into QwenVision (isolating the ViT math from the
 // preprocessing), then compares post-merger embeddings. Build the fixture first:
-//   python3 tests/build_qwen_vision_fixture.py --model <dir> --image <img> --out <fix>
-// then run via tests/test_qwen_vision_parity.sh (sets the env vars below).
+//   python3 tests/qwen4/build_qwen_vision_fixture.py --model <dir> --image <img> --out <fix>
+// then run via tests/qwen4/test_qwen_vision_parity.sh (sets the env vars below).
 test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     const model_raw = std.c.getenv("QWEN_VISION_TEST_MODEL") orelse return error.SkipZigTest;
     const fix_raw = std.c.getenv("QWEN_VISION_FIXTURE") orelse return error.SkipZigTest;

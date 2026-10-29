@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+. "$(dirname "$0")/../../private_cache.sh"
 # test_mimo_ring_reuse.sh — MiMo's sliding layers keep a ring, and a reply
 # longer than the ring compacts it past the prompt end. The next turn diverges
 # there (the template re-renders the reply), so without a restore point every

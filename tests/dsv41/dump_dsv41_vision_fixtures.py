@@ -5,7 +5,7 @@ with the pack's bf16 vision tensors. Only those tensors are read; peak RAM is ab
 
 Needs torch, numpy, Pillow and safetensors. Run
 
-  python tests/dump_dsv41_vision_fixtures.py --ref-dir <release>/inference --pack <pack dir> [--out <dir>]
+  python tests/dsv41/dump_dsv41_vision_fixtures.py --ref-dir <release>/inference --pack <pack dir> [--out <dir>]
 
 `--out` defaults to ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/kld-teacher/dsv41-vision. It writes
 

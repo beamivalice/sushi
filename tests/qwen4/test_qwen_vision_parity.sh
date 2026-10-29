@@ -8,11 +8,11 @@
 # tolerated — same discipline as the diffusion/MTP live parity tests).
 #
 # Usage:
-#   tests/test_qwen_vision_parity.sh [model_dir] [image]
+#   tests/qwen4/test_qwen_vision_parity.sh [model_dir] [image]
 # Defaults to the Flash-Next EXL3 pack + house.jpeg. Skips
 # cleanly (exit 0) when the model is absent.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
 IMAGE="${2:-tests/fixtures/house.jpeg}"
@@ -24,7 +24,7 @@ if [ ! -f "$MODEL/config.json" ]; then
 fi
 
 echo "==> Building reference fixture ($IMAGE)"
-python3 tests/build_qwen_vision_fixture.py --model "$MODEL" --image "$IMAGE" --out "$FIX"
+python3 tests/qwen4/build_qwen_vision_fixture.py --model "$MODEL" --image "$IMAGE" --out "$FIX"
 
 # Pull the full patch grid (t, gh, gw) from the manifest.
 read -r GH GW < <(python3 -c "import json;m=json.load(open('$FIX/manifest.json'));print(m['grid_thw'][1], m['grid_thw'][2])")

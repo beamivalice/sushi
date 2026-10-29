@@ -6,14 +6,14 @@ Runs the mlx-vlm reference vision tower on a fixture image and dumps:
   - ref_embeds.bin     float32 [N_merged, out_hidden]  (post-merger embeddings)
   - manifest.json      shapes + grid_thw (full patch grid [t, gh, gw])
 
-The Zig side (tests/test_qwen_vision_parity.sh → a QWEN_VISION_FIXTURE-gated test)
+The Zig side (tests/qwen4/test_qwen_vision_parity.sh → a QWEN_VISION_FIXTURE-gated test)
 loads the same checkpoint, runs QwenVision.forward(pixel_values, gh, gw), and
 asserts max-abs-diff against ref_embeds. Feeding the reference pixel_values
 straight in isolates the ViT math from preprocessing — the same "reference
 intermediate → our impl" pattern used for the Gemma 4 vision and MTP parity tests.
 
 Usage:
-  python3 tests/build_qwen_vision_fixture.py \
+  python3 tests/qwen4/build_qwen_vision_fixture.py \
       --model ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw \
       --image tests/fixtures/house.jpeg \
       --out   /tmp/qwen_vision_fixture

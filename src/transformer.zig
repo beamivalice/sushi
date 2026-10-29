@@ -34719,7 +34719,7 @@ test "sdpa force_fused: hd-256 causal blocks the gate admits match the unforced 
 // ── qwen4_exp fixture parity (env-gated: QWEN4_TEST_MODEL + QWEN4_FIXTURE) ──
 
 test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decode, QSA mask at 3-D block positions (QWEN4_FIXTURE_VISION)" {
-    // `tests/dump_qwen4_exp_fixtures.py build|dump --vision` + the converter's
+    // `tests/qwen4/dump_qwen4_exp_fixtures.py build|dump --vision` + the converter's
     // `--add-vision --src`. Proves, together: the tower on this arch's names,
     // the splice BEFORE the hyper-connection tile, the M-RoPE chunk tables
     // reaching attention AND the QSA indexer, and the indexer's pooled block
@@ -34949,7 +34949,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
 }
 
 test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE_BF16)" {
-    // `tests/dump_qwen4_exp_fixtures.py` with QWEN4_REF_DTYPE=bf16. The shipped
+    // `tests/qwen4/dump_qwen4_exp_fixtures.py` with QWEN4_REF_DTYPE=bf16. The shipped
     // checkpoint runs bf16 residual streams; against the f32 fixture that path
     // reads 0.905 at the logits (bf16 rounding compounds through the tiny
     // random model), against a bf16 reference the streams agree to 0.9998.

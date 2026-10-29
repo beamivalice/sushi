@@ -17,9 +17,9 @@ consistent (prefill-vs-cache margin bound 1e-3) and records the observed
 margins in the fixture metadata.
 
 Usage:
-  tests/dump_mimo_v2_fixtures.py OUT_DIR [--seed N] [--ref PATH]
+  tests/mimo2/dump_mimo_v2_fixtures.py OUT_DIR [--seed N] [--ref PATH]
       [--cache-dir PATH] [--offline]
-  tests/dump_mimo_v2_fixtures.py --verify OUT_DIR
+  tests/mimo2/dump_mimo_v2_fixtures.py --verify OUT_DIR
 
 OUT_DIR receives (schema v1; see fixture_schema()/weight_schema()):
   config.json                    the tiny MiMoV2Config (model_type mimo_v2)
