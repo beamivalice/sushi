@@ -390,8 +390,9 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
             var after: usize = 0;
             _ = mlx.mlx_get_active_memory(&after);
             // What the prefill still holds is the tier's row markers (a byte a token for keys and for values) and the point's
-            // fixed arrays kept for the next turn's rollback, not the state.
-            try testing.expect(after <= before + 2 * at + hc.live_dsv41.bytes());
+            // fixed arrays kept for the next turn's rollback, not the state. Metal rounds a small buffer up to the next
+            // power of two, so a kept array may occupy twice its bytes.
+            try testing.expect(after <= before + 2 * at + 2 * hc.live_dsv41.bytes());
         }
         cache.step = first.len;
         try dsv41_prefix.markRows(&cache);
