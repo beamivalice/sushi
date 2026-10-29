@@ -1,33 +1,22 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
-# Wave 1.B — `--prefix-cache-mem` memory budget enforcement.
+# sushi-test: tier=live boot=own pack=default boots=1
+# `--prefix-cache-mem` memory budget enforcement.
 #
-# Starts the server with a deliberately tiny prefix-cache memory budget and
-# fires several long-prompt requests in sequence. Asserts:
-#   * `[hot-cache] resident=X.XX / Y.YY MB` log lines appear and X.XX never
-#     exceeds Y.YY.
-#   * At least one `[hot-cache] evicted LRU entry (byte budget; …)` log line
-#     fires once the resident bytes would exceed the budget.
+# Boots with a deliberately tiny prefix-cache memory budget and fires several long-prompt requests in sequence. Asserts:
+#   * `[hot-cache] resident=X.XX / Y.YY MB` log lines appear and X.XX never exceeds Y.YY.
+#   * At least one `[hot-cache] evicted LRU entry (byte budget; ...)` line fires once the resident bytes would exceed
+#     the budget.
 #   * The server stays healthy through all requests.
-#   * (#330) ONE growing conversation crossing the budget gets TRIMMED, not
-#     flat-declined — a `trimmed oversized entry to N/…` line appears and a
-#     later turn logs `reused M/…` with M >= N. From the outside a trim that
-#     silently stops engaging looks exactly like a legit decline, so only the
-#     log can pin it; the unit tests own the trim's correctness. A hybrid
-#     whose single checkpoint outweighs the whole budget legitimately
-#     declines (`skipped oversized entry`) — that arm WARNs instead.
+#   * (#330) ONE growing conversation crossing the budget gets TRIMMED, not flat-declined: a `trimmed oversized entry
+#     to N/...` line appears and a later turn logs `reused M/...` with M >= N. From the outside a trim that silently
+#     stops engaging looks exactly like a legit decline, so only the log pins it; the unit tests own the trim's
+#     correctness. A hybrid whose single checkpoint outweighs the whole budget legitimately declines
+#     (`skipped oversized entry`): that arm WARNs instead.
 #
-# Tunables (env): SHORT_BUDGET_MB (default 64), N_REQ (default 5),
-#                 PROMPT_REPEATS (default 200), GROW_TURNS (default 5),
-#                 GROW_WORDS (default 2000).
-#
-# Usage: ./tests/test_prefix_cache_mem.sh [/path/to/model] [port]
+# Tunables (env): SHORT_BUDGET_MB (64), N_REQ (5), PROMPT_REPEATS (200), GROW_TURNS (5), GROW_WORDS (2000).
 
 set -e
-
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${2:-8094}"
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -39,44 +28,11 @@ PROMPT_REPEATS="${PROMPT_REPEATS:-200}"
 GROW_TURNS="${GROW_TURNS:-5}"
 GROW_WORDS="${GROW_WORDS:-2000}"
 
-if [ ! -d "$MODEL" ]; then
-    echo -e "${YELLOW}SKIP${NC} test_prefix_cache_mem: $MODEL not found."
-    exit 0
-fi
-if [ ! -f "$MODEL/config.json" ]; then
-    echo -e "${RED}FAIL${NC} $MODEL/config.json missing — not a valid model directory."
-    exit 1
-fi
-BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-if [ ! -x "$BINARY" ]; then
-    echo -e "${RED}FAIL${NC} $BINARY not found. Build first."
-    exit 1
-fi
-
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-
-LOGFILE=$(mktemp)
+MODEL=$(sushi_pack qwen4) || exit $?
 echo "  starting server (--prefix-cache-entries 8 --prefix-cache-mem ${SHORT_BUDGET_MB}MB)..."
-"$BINARY" --model "$MODEL" --serve --port "$PORT" \
-    --prefix-cache-entries 8 --prefix-cache-mem "${SHORT_BUDGET_MB}MB" --prefix-cache-disk off \
-    ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
-SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; rm -f "$LOGFILE"; }
-trap cleanup EXIT
-
-up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
-if [ "$up" != "1" ]; then
-    echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
-    tail -30 "$LOGFILE"
-    exit 1
-fi
+sushi_boot cachemem "$MODEL" --prefix-cache-entries 8 --prefix-cache-mem "${SHORT_BUDGET_MB}MB" --prefix-cache-disk off || exit $?
+BASE="$SUSHI_URL"
+LOGFILE="$SUSHI_LOG"
 
 # Build a long-ish prompt so the resulting KV footprint is non-trivial. We
 # vary the prompt slightly per-request so each one creates a fresh cache
