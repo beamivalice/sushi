@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/../../private_cache.sh"
+# sushi-test: tier=live boot=ram
 # test_glm_prefix_reuse.sh — GLM-5.3-Flash prefix reuse: KDA checkpoints on the prefill chunk grid
 # and at the prompt end, MLA rows below them (docs/glm5-prefix-cache.md#glm). Pins, greedy, one
 # hot entry:
@@ -13,41 +13,21 @@
 #  4. A BF16-latent request never restores a kv8 entry.
 #  5. A stream cancelled mid-decode still commits its prompt for the next request.
 #
-# Every cold arm starts from a cache holding nothing it shares: an unrelated raw completion
-# evicts the one entry first.
-#
-# Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), GLM_MODEL, PORT (default 19091), BINARY.
+# Every cold arm starts from a cache holding nothing it shares: unrelated raw completions past the
+# ram boot's four entries evict it first.
 
 set -uo pipefail
 
-MODEL="${GLM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2.4bpw}"
-PORT="${PORT:-19091}"
-BIN="${BINARY:-./zig-out/bin/sushi}"
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/../lib/boot.sh"
+sushi_attach
+BASE="$SUSHI_URL"
 BOUND="${GLM_RESTORE_BOUND_NATS:-0.5}"
-
-[ -d "$MODEL" ] || { echo "SKIP: model dir not found: $MODEL"; exit 0; }
-[ -x "$BIN" ]   || { echo "fail: build sushi first"; exit 1; }
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
-curl -sf --max-time 2 "$BASE/health" >/dev/null 2>&1 && { echo "fail: port $PORT is busy"; exit 1; }
-
-LOG="${GLM_REUSE_LOG:-$(mktemp)}"
-SERVER_PID=""
-trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; [ -z "${GLM_REUSE_LOG:-}" ] && rm -f "$LOG"; true' EXIT
-
-"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-    --prefix-cache-entries 1 --prefix-cache-mem 1GB --prefix-cache-disk off --log-level info > "$LOG" 2>&1 &
-SERVER_PID=$!
-
-for _ in $(seq 1 900); do
-    curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && break
-    kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; exit 1; }
-    sleep 1
-done
-grep -q '\[glm\] prefix cache' "$LOG" || { echo "fail: the GLM prefix cache did not arm"; grep -E '\[glm\]|prefix' "$LOG" | head; exit 1; }
+# Logged once at load, before this script attached.
+grep -q '\[glm\] prefix cache' "$SUSHI_LOG" || { echo "fail: the GLM prefix cache did not arm"; exit 1; }
 
 words() { python3 -c "import random,sys; r=random.Random($1); w='agent tool file cache ring window layer prompt reply token session restore commit budget chunk kernel latent pool state'.split(); print(' '.join(r.choice(w) for _ in range($2)))"; }
-SYSTEM="You are a careful engineer. Notes: $(words 1 2200)"
+SYSTEM="$SUSHI_NONCE You are a careful engineer. Notes: $(words 1 2200)"
 Q1="Task: $(words 2 400). Summarise the notes in two sentences."
 Q1_EDIT="Task: $(words 3 400). Name three words the notes repeat most."
 REPLY="The notes repeat a handful of systems words in random order."
@@ -66,8 +46,14 @@ chat() {
         + (if $lp then {logprobs:true,top_logprobs:1} else {} end)
         + (if $kv == "" then {} else {kv_quant:($kv|tonumber)} end)'
 }
-unrelated() { curl -sf --max-time 600 -X POST "$BASE/v1/completions" -H 'Content-Type: application/json' \
-    -d '{"prompt":"Lorem ipsum dolor sit amet, consectetur adipiscing elit.","max_tokens":4,"temperature":0}' >/dev/null; }
+# Five distinct entries push the target past the ram boot's four.
+unrelated() {
+    local i
+    for i in 1 2 3 4 5; do
+        curl -sf --max-time 600 -X POST "$BASE/v1/completions" -H 'Content-Type: application/json' \
+            -d "{\"prompt\":\"$SUSHI_NONCE-$i Lorem ipsum dolor sit amet, consectetur adipiscing elit.\",\"max_tokens\":4,\"temperature\":0}" >/dev/null || return 1
+    done
+}
 text() { echo "$1" | jq -r '(.choices[0].message.reasoning_content // "") + "\u0001" + (.choices[0].message.content // "")'; }
 field() { echo "$1" | jq -r "$2"; }
 drift() {
@@ -84,7 +70,7 @@ PY
 
 EC=0
 fail() { echo "FAIL: $*"; EC=1; }
-need() { [ -n "$1" ] || { echo "fail: $2"; tail -30 "$LOG"; exit 1; }; }
+need() { [ -n "$1" ] || { echo "fail: $2"; sushi_log_since | tail -30; exit 1; }; }
 
 # Cold references first, each behind an eviction.
 T2_COLD=$(ask "$(chat "$Q1" "$REPLY" "$Q2" true)"); need "$T2_COLD" "cold turn 2"
@@ -142,11 +128,11 @@ read -r AGREE TOTAL WORST <<< "$(drift "$T2_COLD" "$T2_WARM")"
 echo "appended turn cold vs warm: tokens agree for $AGREE of $TOTAL; max |dlogprob| $WORST nats"
 [ "$TOTAL" -gt 0 ] || fail "the appended turn returned no answer tokens to compare"
 python3 -c "import sys; sys.exit(0 if float('$WORST') <= $BOUND else 1)" || fail "restored turn 2 drifts past $BOUND nats"
-python3 -c "import sys; sys.exit(0 if $(field "$T2_WARM" .timings.prompt_ms) < 0.5 * $(field "$T2_COLD" .timings.prompt_ms) else 1)" \
-    || fail "warm turn 2 prefill not under 0.5x cold"
+# The restore lands at turn 1's prompt-end checkpoint, so it covers at least what the identical re-issue did.
+[ "$(field "$T2_WARM" .timings.cached_n)" -ge "$(field "$T1_WARM" .timings.cached_n)" ] || fail "appended turn restored short of turn 1's prompt end"
 [ "$(field "$BF16" .timings.cached_n)" = 0 ] || fail "a BF16 request restored a kv8 entry"
 [ "$(field "$CANCELLED_AGAIN" .timings.cached_n)" -gt 2047 ] || fail "a stream cancelled mid-decode did not commit its prompt"
 
-grep -E '\[hot-cache\]|\[spec-stats\] (accept|glm)' "$LOG" | head -40
+sushi_log_since | grep -E '\[hot-cache\]|\[spec-stats\] (accept|glm)' | head -40
 [ $EC = 0 ] && echo "PASS"
 exit $EC

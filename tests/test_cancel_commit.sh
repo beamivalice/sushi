@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=ram
 # test_cancel_commit.sh — cancelled requests preserve their committed KV.
 #
 # Two contracts, one per cancellation phase:
@@ -13,29 +13,25 @@
 #     commit the FORWARDED PREFIX (chunk-aligned). Hybrids ride the
 #     Cancelled-checkpoint salvage: `initWithOptions` hands its captured
 #     SSM stride checkpoints to the slot on abort, so the commit carries
-#     them and the re-issue restores at the last checkpoint ≤ matched (the
-#     boot pins --prefill-chunk at 512 so the
-#     cancelled window always spans checkpoint boundaries — the effective
-#     stride otherwise coarsens to the prefill chunk and a short window may
-#     salvage nothing).
+#     them and the re-issue restores at the last checkpoint ≤ matched.
 #     The killed stream's captured body tells us which phase we were in:
 #     no content/reasoning chunks ⇒ still prefilling (the strict
 #     "committed N/M prompt tokens from a cancelled prefill" log line is
 #     then REQUIRED); content chunks ⇒ prefill had finished and the
 #     decode-cancel contract of [1] covers it (section skipped, not failed).
 #
-# Usage: ./tests/test_cancel_commit.sh [model_dir] [port]
-#   Starts its own server. Default model: the Flash-Next EXL3 pack.
+# Attaches to the ram boot; the prefix cache is on, so each section's prompt carries the nonce and its own text.
 
 set -u
-
-MODEL="${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}"
-PORT="${2:-11272}"
-BASE="http://127.0.0.1:$PORT"
-BINARY="${BINARY:-./zig-out/bin/sushi}"
-LOG=/tmp/test_cancel_commit.log
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+BASE="$SUSHI_URL"
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
 PASS=0
 FAIL=0
+# kv4 rides the request on the archs that serve it (GLM refuses kv4, DeepSeek has no KV cache).
+case "$SUSHI_ARCH" in qwen4_exp | mimo_v2) KVQ=4 ;; *) KVQ=null ;; esac
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -50,59 +46,33 @@ check() {
     fi
 }
 
-[[ -x "$BINARY" ]] || { echo "Build first (zig build -Doptimize=ReleaseFast)" >&2; exit 1; }
-[[ -d "$MODEL" ]] || { echo "Model not found: $MODEL (SKIP)" >&2; exit 0; }
-
 # Long system prompt (well past the ~40-token template prologue and the
 # 256-token cancelled-prefill floor) so a cache hit is unambiguous.
-SYSTEM_PROMPT="You are an expert software engineer assistant. You provide concise, technically correct answers. You explain trade-offs when relevant. You always cite specific function names, file paths, or line numbers when discussing code. You prefer concrete examples over abstract advice. You do not pad your answers with hedges or apologies. You assume the user is also a software engineer. You write in Markdown when formatting helps. You keep code blocks small and self-contained. You ask clarifying questions only when truly necessary. You favor depth over breadth in your explanations. You show your reasoning when it would help the reader. You never invent APIs. You state uncertainty explicitly when you are unsure."
+SYSTEM_PROMPT="$SUSHI_NONCE You are an expert software engineer assistant. You provide concise, technically correct answers. You explain trade-offs when relevant. You always cite specific function names, file paths, or line numbers when discussing code. You prefer concrete examples over abstract advice. You do not pad your answers with hedges or apologies. You assume the user is also a software engineer. You write in Markdown when formatting helps. You keep code blocks small and self-contained. You ask clarifying questions only when truly necessary. You favor depth over breadth in your explanations. You show your reasoning when it would help the reader. You never invent APIs. You state uncertainty explicitly when you are unsure."
 
-# A much longer one (~5-6k tokens) so prefill takes long enough for a
-# mid-prefill kill to land inside it even on fast small models.
+# A much longer one (~15k tokens) so prefill takes long enough for a
+# mid-prefill kill to land inside it even on a fast box.
 LONG_SYSTEM=""
-for i in $(seq 1 60); do
+for i in $(seq 1 150); do
     LONG_SYSTEM="$LONG_SYSTEM Chapter $i. $SYSTEM_PROMPT"
 done
 
-boot_server() {
-    rm -f "$LOG"
-    "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-        --ctx-size 16384 --prefill-chunk 512 \
-        --kv-quant 4 --prefix-cache-entries 4 --prefix-cache-mem 2GB \
-        > "$LOG" 2>&1 &
-    SERVER_PID=$!
-    for _ in $(seq 1 120); do
-        curl -sf "$BASE/health" >/dev/null 2>&1 && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "ERR: server died" >&2; return 1; }
-        sleep 1
-    done
-    echo "ERR: server never became healthy" >&2; return 1
-}
-
-# Model load is lazy on a headless boot: warm it with a tiny UNRELATED
-# request (different prompt ⇒ different cache key ⇒ no interference) before
-# timing anything. Generous timeout — the first request pays the full
-# multi-GB checkpoint load.
+# The shared server is already loaded, but a first request may still pay one-time warmup.
 warmup_model() {
     curl -sf --max-time 600 -X POST "$BASE/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d '{"model":"x","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"temperature":0.0}' \
+        -d "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE hi\"}],\"max_tokens\":1,\"temperature\":0.0}" \
         >/dev/null 2>&1
 }
 
-stop_server() {
-    [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
-    wait "$SERVER_PID" 2>/dev/null
-    SERVER_PID=""
-}
-
-trap 'stop_server; true' EXIT
+# The log since $1 bytes into this script's slice.
+log_after() { sushi_log_since | tail -c +"$(($1 + 1))"; }
 
 body_chat() {
     local sys="$1" stream="$2" maxtok="$3"
     jq -nc --arg s "$sys" \
-        '{model:"x",messages:[{role:"system",content:$s},{role:"user",content:"Tell me about cache invalidation."}],max_tokens:$mt,temperature:0.0,stream:$st,enable_thinking:false}' \
-        --argjson mt "$maxtok" --argjson st "$stream"
+        '{model:"x",messages:[{role:"system",content:$s},{role:"user",content:"Tell me about cache invalidation."}],max_tokens:$mt,temperature:0.0,stream:$st,enable_thinking:false,kv_quant:$kvq}' \
+        --argjson mt "$maxtok" --argjson st "$stream" --argjson kvq "$KVQ"
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -110,8 +80,9 @@ body_chat() {
 # ─────────────────────────────────────────────────────────────────────────
 decode_cancel_section() {
     echo "== [1] decode-phase cancel =="
-    boot_server || return 1
     warmup_model
+    local mark
+    mark=$(sushi_log_since | wc -c)
 
     # Fire a streaming generation and kill the client mid-decode. The short
     # prompt prefills in well under a second on any model, and a thinking-off
@@ -119,20 +90,20 @@ decode_cancel_section() {
     # early.
     local body
     body="$(body_chat "$SYSTEM_PROMPT" true 2000)"
-    curl -sN --max-time 3 -o /tmp/test_cancel_partial.sse \
+    curl -sN --max-time 3 -o "$T/partial.sse" \
         -X POST "$BASE/v1/chat/completions" \
         -H 'Content-Type: application/json' -d "$body" 2>/dev/null
     local curl_rc=$?
     # 28 = timeout kill (what we want); 18/56/55 also fine (partial/close).
     if [ "$curl_rc" -eq 0 ]; then
         check "killed stream actually got cut early (rc=$curl_rc, needed >0)" 0
-        stop_server; return 1
+        return 1
     fi
     # Some decode tokens must have flown before the kill, else this is not a
     # decode-phase cancel. grep for content chunks (choices with delta).
-    if ! grep -qE '"(content|reasoning_content)":"[^"]' /tmp/test_cancel_partial.sse 2>/dev/null; then
+    if ! grep -qE '"(content|reasoning_content)":"[^"]' "$T/partial.sse" 2>/dev/null; then
         check "decode tokens observed before the kill (mid-decode cancel)" 0
-        stop_server; return 1
+        return 1
     fi
 
     # Give the server a moment to notice the dead socket, cancel the slot
@@ -148,10 +119,9 @@ decode_cancel_section() {
     check "identical re-issue after decode-cancel reuses cached KV (cached_tokens=$cached)" \
         "$([[ "${cached:-0}" -ge 100 ]] && echo 1 || echo 0)"
 
-    grep -q "\[hot-cache\] reused" "$LOG" && ok=1 || ok=0
+    log_after "$mark" | grep -q "\[hot-cache\] reused" && ok=1 || ok=0
     check "server log shows [hot-cache] reused" "$ok"
 
-    stop_server
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -160,8 +130,9 @@ decode_cancel_section() {
 prefill_cancel_section() {
     echo "== [2] prefill-phase cancel =="
 
-    boot_server || return 1
     warmup_model
+    local mark
+    mark=$(sushi_log_since | wc -c)
 
     # ~8k-token prompt. Kill at 8s: the conn thread only notices the dead
     # socket at its next keepalive probe (5s of stream silence), so an 8s
@@ -171,10 +142,10 @@ prefill_cancel_section() {
     # races the first chunk on slow models (step=0, salvage empty); the
     # chunk loop only polls the cancel flag at chunk boundaries, so the
     # chunk must also be small enough to complete inside the window
-    # (--prefill-chunk 512, the boot flag — 1024 needs 8.9s at 115 tok/s).
+    # (the shared boot keeps the auto chunk).
     local body
     body="$(body_chat "$LONG_SYSTEM" true 2000)"
-    curl -sN --max-time 8 -o /tmp/test_cancel_prefill.sse \
+    curl -sN --max-time 8 -o "$T/prefill.sse" \
         -X POST "$BASE/v1/chat/completions" \
         -H 'Content-Type: application/json' -d "$body" 2>/dev/null
     local curl_rc=$?
@@ -190,8 +161,8 @@ prefill_cancel_section() {
     # A prefill that finishes inside the 5 s keepalive silence window is
     # only seen as disconnected at the first token write: no content in the
     # stream, yet the cache holds a FULL entry (e4b prefills 8k in ~3 s).
-    if grep -qE '"(content|reasoning_content)":"[^"]' /tmp/test_cancel_prefill.sse 2>/dev/null \
-       || grep -q "\[hot-cache\] full reuse" "$LOG"; then
+    if grep -qE '"(content|reasoning_content)":"[^"]' "$T/prefill.sse" 2>/dev/null \
+       || log_after "$mark" | grep -q "\[hot-cache\] full reuse"; then
         # Prefill completed before the kill landed — the cancel hit decode
         # phase; not this section's contract (and [1] covers it).
         echo "NOTE: kill landed in decode phase (prompt prefilled too fast) — cached_tokens=$cached reported for information"
@@ -201,11 +172,10 @@ prefill_cancel_section() {
         # Genuinely mid-prefill: the forwarded-prefix commit is REQUIRED.
         check "mid-prefill kill reuses forwarded prefix (cached_tokens=$cached)" \
             "$([[ "${cached:-0}" -ge 256 ]] && echo 1 || echo 0)"
-        grep -q "from a cancelled prefill" "$LOG" && ok=1 || ok=0
+        log_after "$mark" | grep -q "from a cancelled prefill" && ok=1 || ok=0
         check "server log shows the cancelled-prefill commit" "$ok"
     fi
 
-    stop_server
 }
 
 decode_cancel_section
