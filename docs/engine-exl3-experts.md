@@ -62,7 +62,7 @@ kernel on supported hardware.
   (codebook + window) before each dispatch because several EXL3 packs can be resident at once; every weight kernel
   inlines `exl3_pairh` from `codebookHelpers`, built per (codebook, window). A codebook name this build does not decode is refused at load
   ([pack-format](pack-format.md#configjson)). A/B lever:
-  `SUSHI_EXL3_CODEBOOK_AB=1` on the `codebook A/B` test.
+  `sushi-ubench run shared.exl3_moe_layer` (every codebook on one layer, and MLX's affine-4 `gather_qmm` as the reference).
 - **`std1` and `spec1` decode through a (multiplier, mask) row of the pack's table** (`Decode.table`;
   [pack-format](pack-format.md#stq)). The kernels take the row as `exl3_hash_row_at(N)`, a constexpr lookup on the
   kernel's rate `N` placed ahead of the helpers, so each row is an immediate of its own pipeline and a new table needs
@@ -212,9 +212,10 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   (the 48k prefill cliff). Owned-copy hidden captures at the chunk boundary; kernel configs dropped on their error
   paths.
 - **Levers**: `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` (window geometry A/B); diagnostics
-  `SUSHI_EXL3_LAYER_UBENCH`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_EXL3_SWIGLU_MAXABS`, `SUSHI_EXL3_GEMM_ARMS` (served vs
-  reference NAX body, interleaved, at MiMo geometry; `SUSHI_EXL3_GEMM_COUNTS` replays the per-layer `[exl3-counts]`
-  lines `SUSHI_EXL3_UNION_HIST` logs on a prefill).
+  `SUSHI_EXL3_STAGE_PROFILE`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_EXL3_SWIGLU_MAXABS`. `sushi-ubench run
+  shared.exl3_prefill_gemm` times the served GEMM body against the reference body, a rate against n32 and n64, at
+  Flash-Next and MiMo shapes; `--opt counts=<file>` replays the per-layer `[exl3-counts]` lines `SUSHI_EXL3_UNION_HIST`
+  logs on a prefill, and `--opt nax=off` times the non-NAX bodies on a NAX chip.
 
 <a id="rate-groups"></a>
 ## Rate-grouped layers (`.gN`)

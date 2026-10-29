@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 159 vars. By kind: tradeoff levers 14, diagnostics 48, microbenches 44, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 157 vars. By kind: tradeoff levers 14, diagnostics 49, microbenches 41, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `transformer.zig:5868` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (48)
+## Diagnostics (49)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -55,6 +55,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DFLASH_TRACE` | `generate.zig:8862` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `transformer.zig:24530` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_DUMP_RESTORE` | `restore_dump.zig:31` | `<dir>` dumps prefix-restore tensors | once | no |
+| `SUSHI_EXL3_STAGE_PROFILE` | `exl3/expert_exl3_kernels.zig:103` | syncs and times each stage of a routed MoE layer (pair GEMV, down, reduce, sort, token prepare, GEMMs), logged as `[exl3-stage]` | once | yes: engine-exl3-experts |
 | `SUSHI_EXL3_SWIGLU_MAXABS` | `exl3/expert_exl3_kernels.zig:104` | dumps SwiGLU activation maxima (f16 overflow hunt) | once | yes: engine-exl3-experts |
 | `SUSHI_EXL3_UNION_HIST` | `exl3/expert_exl3_kernels.zig:164` | logs per-layer expert-count histograms (`[exl3-counts]`) on prefill | once | yes: engine-exl3-experts, qwen4-perf |
 | `SUSHI_EXPERT_DEFER_SYNC` | `qwen4_forward.zig:1970` | `1` forces synchronous expert verification for an exact schedule comparison | once | yes: engine-expert-streaming |
@@ -77,7 +78,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
 | `SUSHI_VISION_CHUNKED` | `generate.zig:1533` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
-## Microbenches (44)
+## Microbenches (41)
 
 In-process meters. Load-time meters run on the served binary; the rest are tests that skip when unset.
 
@@ -88,13 +89,12 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_DECODE_FWD_UBENCH_S`, `SUSHI_DECODE_FWD_UBENCH_KV` | `scheduler.zig` | `<rows>[,...]` verify widths to time; `<tokens>` prefill before timing | load | yes: perf-baselines |
 | `SUSHI_DECODE_FWD_UBENCH_PROFILE` | `scheduler.zig` | one extra profiled pass per width | load | no |
 | `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:89, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
-| `SUSHI_EXL3_CODEBOOK_AB`, `SUSHI_EXL3_GEMM_ARMS`, `SUSHI_EXL3_GEMM_COUNTS` | `exl3/expert_exl3_kernels.zig` | EXL3 codebook A/B, served-vs-reference GEMM arms; `_COUNTS=<file>` replays per-layer expert counts into the arms meter | test | yes: engine-exl3-experts, mimo2-perf |
 | `SUSHI_DSV41_STQ_UBENCH`, `SUSHI_UBENCH_STEPS`, `SUSHI_UBENCH_ROUNDS` | `exl3/linear.zig`, `exl3/bench_util.zig` | DeepSeek-V4.1 STQ trunk linears (`=<shape filter>` or `1`) as chains of dependent calls; steps per chain and rounds | test | yes: engine-exl3-experts, perf-baselines |
 | `SUSHI_EXL3_ROWS_SWEEP` | `exl3/expert_exl3_kernels.zig` | the multi-row kernel's launch geometries per trunk shape, chained and independent (`qwen4`, `glm5`, `dsv41`) | test | yes: engine-exl3-experts |
 | `SUSHI_DSV41_TRUNK_UBENCH`, `SUSHI_DSV41_TRUNK_UBENCH_ROWS` | `exl3/expert_exl3_kernels.zig` | DeepSeek trunk linears at the real shapes by width under the served geometry, with a streaming memory floor (`=<shape filter>` or `1`; `_ROWS=1,2,..`) | test | yes: engine-exl3-experts |
 | `SUSHI_EXL3_ROWS_SIMD_UBENCH` | `exl3/expert_exl3_kernels.zig` | the SIMD multi-row kernel on DeepSeek's trunk linears and Qwen's lm_head at 1 to 8 rows, chained, against the pre-split loop (run with `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` where NAX exists) | test | yes: engine-exl3-experts |
 | `SUSHI_GLM_T1_UBENCH` | `exl3/expert_exl3_kernels.zig` | GLM one-row routed chain meter at E288 4096/2048 n36 and n40 w14: per-phase µs per layer, lane vs one-row GEMVs interleaved | test | yes: glm5-clamped-experts |
-| `SUSHI_EXL3_LAYER_UBENCH` | `exl3/expert_exl3_kernels.zig:82` | prints per-stage EXL3 expert timings (adds syncs) | once | yes: engine-exl3-experts, qwen4-perf |
+| `SUSHI_EXL3_LAYER_UBENCH` | `transformer.zig` | prints the relative RMS in the MiMo EXL3 correctness tests | test | yes: CLAUDE |
 | `SUSHI_FP8_UBENCH`, `SUSHI_FP8_UBENCH_SHAPE`, `SUSHI_FP8_UBENCH_SWEEP` | `fp8_block.zig` | FP8 trunk GEMV meter (`<reps>`, shape filter, `direct` sweep) | test | yes: mimo2-perf |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `scheduler.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
 | `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `scheduler.zig` | `<n>` rounds per width B in 1..4 of plain decode at load, then one request's 1..8-row chain verify (ms, and bit-equality of every row against serial decode) and a routed layer's feed-forward at 1..8 rows; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |

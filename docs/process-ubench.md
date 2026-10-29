@@ -69,6 +69,8 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `dsv41.experts` | dsv41 | the 384-expert PAIR1 grouped chain at the plan's layers 2, 5, 23 and the DSpark stage bank, by rows and routing mode |
 | `shared.exl3_decode_chain` | shared | the EXL3 decode chain at Flash-Next geometry for any rate (n24 to n128, MCG and SPEC1, 1 to 4 rows) against n32, n48 and n64 |
 | `shared.exl3_grouped_decode` | shared | the decode chain at 1 to 8 rows with verify rows sharing expert reads: ungrouped, prepared, pairs, sized member capacity, on Flash-Next and DeepSeek geometry |
+| `shared.exl3_moe_layer` | shared | a Flash-Next MoE layer (E512, K4, top-10) on MUL1, MCG, STD1, SPEC1 and PAIR1 against MLX's affine-4 `gather_qmm` x3, from 1 to 2048 rows |
+| `shared.exl3_prefill_gemm` | shared | the sorted prefill GEMM of one projection at Flash-Next and MiMo shapes: served body against the reference body, a rate against n32 and n64, by slot count |
 | `dsv41.index_decode` | dsv41 | a decode block's indexer stages over packed keys (scores, mask applied, top-512, candidate-source blocks, scores + top-k), by keys and rows |
 | `dsv41.index_peak` | dsv41 | one wide span's indexer, whole scores against the streamed top-k, by context; MLX peak beyond the inputs in MB, reported as the lowest and the highest over the rounds (when freed buffers are released varies from run to run, so the floor and the worst case differ; a bill covers the worst) |
 | `dsv41.index_block_peak` | dsv41 | a 16-row decode block's indexer with and without the candidate mask, by context; peak MB (min and max) |

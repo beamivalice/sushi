@@ -27,6 +27,8 @@ const registry = [_]report.Bench{
     dsv41.topk,
     exl3.ubench.decode_chain,
     exl3.ubench.grouped_decode,
+    exl3.ubench.moe_layer,
+    exl3.ubench.prefill_gemm,
     exl3.ubench.exl3_rate_groups,
     exl3.ubench.exl3_rate_groups_rows,
     encoder.ubench.factor,

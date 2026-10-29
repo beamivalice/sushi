@@ -1,10 +1,10 @@
-//! DeepSeek-V4.1-Flash's STQ routed experts, timed at the pack's own geometry: PAIR1 rate groups over 384 experts
-//! (5120 -> 2304 -> 5120, top-6, clamped SwiGLU) on the decode chain, the verify widths and the prefill GEMMs, and the
-//! DSpark stage's resident 128-expert n32 bank. Each rung gives the time per call on a chain of dependent calls and
-//! the effective read rate over the picked experts' bytes. Run by `sushi-ubench`, never by a test.
+//! The EXL3 kernel microbenches `sushi-ubench` runs, never a test: `dsv41.experts` (DeepSeek's PAIR1 rate groups at the
+//! pack's own geometry) and the shared decode, grouped-decode, MoE-layer and prefill-GEMM benches at Flash-Next, MiMo
+//! and DeepSeek shapes. Each rung gives the time per call on a chain of dependent calls (or a batch of independent ones).
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const report = @import("mlx_host").report;
+const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const rate_groups = @import("rate_groups.zig");
@@ -796,4 +796,353 @@ fn runGroupedDecode(run: *report.Run) anyerror!void {
             }
         }
     }
+}
+
+const LAYER_ROUTES = 8;
+const LAYER_RATE: u32 = 64;
+const AFFINE_GROUP = 64;
+const AFFINE_BITS = 4;
+
+pub const moe_layer: report.Bench = .{
+    .name = "shared.exl3_moe_layer",
+    .scope = .shared,
+    .what = "a Flash-Next MoE layer (E512, 2560 -> 640, top-10, K4) on each codebook, against stock MLX affine-4 gather_qmm x3, decode rows to prefill",
+    .unit = .us,
+    .steps = 8,
+    .axes = &.{.{ .name = "rows", .values = &.{ "1", "2", "3", "4", "16", "512", "2048" } }},
+    .arms = &.{ "mul1", "mcg", "std1", "spec1", "pair1", "affine" },
+    .ref = "mcg",
+    .run = runMoeLayer,
+};
+
+const LAYER_DECODES = [5]exl3.Decode{
+    .mul1,
+    MCG_W15,
+    exl3.Decode.tabled(.std1, .w15),
+    kernels.SPEC1_W15,
+    .{ .codebook = .pair1, .window = .w16 },
+};
+
+const Affine = struct { gate: [3]mlx.mlx_array, down: [3]mlx.mlx_array };
+
+/// A random dense bank quantized to affine-4: MLX's own expert layout at the same shape.
+fn affineBank(s: mlx.mlx_stream, in: c_int, out: c_int) ![3]mlx.mlx_array {
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_random_normal(&dense, &[_]c_int{ @intCast(FLASH_EXPERTS), out, in }, 3, .float16, 0, 1, .{ .ctx = null }, s));
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(AFFINE_GROUP), mlx.mlx_optional_int.some(AFFINE_BITS), "affine", .{ .ctx = null }, s));
+    var parts: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    for (&parts, 0..) |*p, i| try mlx.check(mlx.mlx_vector_array_get(p, triple, i));
+    try mlx.check(mlx.mlx_array_eval(parts[0]));
+    return parts;
+}
+
+fn freeAll(arrays: []const mlx.mlx_array) void {
+    for (arrays) |a| _ = mlx.mlx_array_free(a);
+}
+
+const LayerCtx = struct {
+    s: mlx.mlx_stream,
+    bank: root.Bank,
+    x0: mlx.mlx_array,
+    routes: *const [LAYER_ROUTES]mlx.mlx_array,
+    scores: mlx.mlx_array,
+    steps: usize,
+    rows: usize,
+    affine: ?Affine,
+    xrep: mlx.mlx_array,
+    xmid: mlx.mlx_array,
+    sorted: mlx.mlx_array,
+};
+
+const LayerStep = struct { c: *const LayerCtx, dec: exl3.Decode };
+
+fn layerStep(c: LayerStep, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    return root.moe(s, x, c.c.bank, c.c.routes[i % LAYER_ROUTES], c.c.scores, c.dec, false);
+}
+
+fn gatherAffine(s: mlx.mlx_stream, x: mlx.mlx_array, w: [3]mlx.mlx_array, sorted: mlx.mlx_array, is_sorted: bool) !void {
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_gather_qmm(&q, x, w[0], w[1], w[2], .{ .ctx = null }, sorted, true, mlx.mlx_optional_int.some(AFFINE_GROUP), mlx.mlx_optional_int.some(AFFINE_BITS), "affine", is_sorted, s));
+    try mlx.check(mlx.mlx_array_eval(q));
+}
+
+fn sampleLayer(c: LayerCtx, arm: usize) anyerror!f64 {
+    if (arm == LAYER_DECODES.len) {
+        const aff = c.affine.?;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var sw = io_util.Stopwatch.init(io);
+        for (0..c.steps) |_| {
+            try gatherAffine(c.s, c.xrep, aff.gate, c.sorted, c.rows > kernels.DECODE_ROWS_MAX);
+            try gatherAffine(c.s, c.xrep, aff.gate, c.sorted, c.rows > kernels.DECODE_ROWS_MAX);
+            try gatherAffine(c.s, c.xmid, aff.down, c.sorted, c.rows > kernels.DECODE_ROWS_MAX);
+        }
+        return @as(f64, @floatFromInt(sw.read())) / @as(f64, @floatFromInt(c.steps));
+    }
+    const dec = LAYER_DECODES[arm];
+    kernels.setDecodeParams(dec);
+    const ns = try bench.chainNs(c.s, c.x0, c.steps, LayerStep{ .c = &c, .dec = dec }, layerStep);
+    const floor = try bench.chainNs(c.s, c.x0, c.steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(c.steps));
+}
+
+fn runMoeLayer(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0x1a7e);
+    const rnd = prng.random();
+    for (LAYER_DECODES) |d| try d.requireTable();
+    var bank = try bench.makeBank(rnd, FLASH_HIDDEN, FLASH_INTER, .{ LAYER_RATE, LAYER_RATE, LAYER_RATE }, FLASH_EXPERTS, 0.02, 0.9);
+    defer bench.freeBank(&bank);
+    var affine: ?Affine = null;
+    defer if (affine) |a| {
+        freeAll(&a.gate);
+        freeAll(&a.down);
+    };
+    if (run.hasArm("affine")) affine = .{
+        .gate = try affineBank(s, FLASH_HIDDEN, FLASH_INTER),
+        .down = try affineBank(s, FLASH_INTER, FLASH_HIDDEN),
+    };
+    for (run.axis("rows")) |rows_text| {
+        const rows = try std.fmt.parseInt(usize, rows_text, 10);
+        const slots = rows * FLASH_TOPK;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var routes: [LAYER_ROUTES]mlx.mlx_array = undefined;
+        var first_sorted: []i32 = &.{};
+        for (&routes, 0..) |*r, set| {
+            const ids = try a.alloc(u32, slots);
+            for (0..rows) |row| {
+                const ri = ids[row * FLASH_TOPK ..][0..FLASH_TOPK];
+                var k: usize = 0;
+                while (k < FLASH_TOPK) {
+                    const pick = rnd.uintLessThan(u32, FLASH_EXPERTS);
+                    if (std.mem.indexOfScalar(u32, ri[0..k], pick) != null) continue;
+                    ri[k] = pick;
+                    k += 1;
+                }
+            }
+            r.* = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(rows), FLASH_TOPK }, 3, .uint32);
+            if (set == 0) {
+                first_sorted = try a.alloc(i32, slots);
+                for (first_sorted, ids) |*d, v| d.* = @intCast(v);
+                std.mem.sort(i32, first_sorted, {}, std.sort.asc(i32));
+            }
+        }
+        defer for (routes) |r| {
+            _ = mlx.mlx_array_free(r);
+        };
+        const sc = try a.alloc(f32, slots);
+        @memset(sc, 1.0 / @as(f32, FLASH_TOPK));
+        const scores = mlx.mlx_array_new_data(sc.ptr, &[_]c_int{ 1, @intCast(rows), FLASH_TOPK }, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        const xh = try a.alloc(u16, rows * FLASH_HIDDEN);
+        for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
+        const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ 1, @intCast(rows), FLASH_HIDDEN }, 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(x0);
+        const sorted = mlx.mlx_array_new_data(first_sorted.ptr, &[_]c_int{@intCast(slots)}, 1, .int32);
+        defer _ = mlx.mlx_array_free(sorted);
+        var xrep = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xrep);
+        var xmid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xmid);
+        try mlx.check(mlx.mlx_random_normal(&xrep, &[_]c_int{ @intCast(slots), 1, FLASH_HIDDEN }, 3, .float16, 0, 0.1, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_random_normal(&xmid, &[_]c_int{ @intCast(slots), 1, FLASH_INTER }, 3, .float16, 0, 0.1, .{ .ctx = null }, s));
+        const ctx: LayerCtx = .{ .s = s, .bank = bank, .x0 = x0, .routes = &routes, .scores = scores, .steps = run.steps(if (rows > kernels.DECODE_ROWS_MAX) 3 else 16), .rows = rows, .affine = affine, .xrep = xrep, .xmid = xmid, .sorted = sorted };
+        const label = try std.fmt.allocPrint(run.a, "rows {d}", .{rows});
+        try run.interleave(label, ctx, sampleLayer);
+    }
+}
+
+const GemmShape = struct { name: []const u8, in: c_int, out: c_int, experts: c_int, dec: exl3.Decode };
+const MIMO_W12: exl3.Decode = .{ .codebook = .mcg, .window = .w12 };
+const GEMM_SHAPES = [_]GemmShape{
+    .{ .name = "flash_gate_up", .in = 2560, .out = 640, .experts = 512, .dec = MCG_W15 },
+    .{ .name = "flash_down", .in = 640, .out = 2560, .experts = 512, .dec = MCG_W15 },
+    .{ .name = "mimo_gate_up", .in = 4096, .out = 2048, .experts = 256, .dec = MIMO_W12 },
+    .{ .name = "mimo_down", .in = 2048, .out = 4096, .experts = 256, .dec = MIMO_W12 },
+};
+
+pub const prefill_gemm: report.Bench = .{
+    .name = "shared.exl3_prefill_gemm",
+    .scope = .shared,
+    .what = "the sorted prefill GEMM of one projection: the served body against the reference body (NAX reference, else the scalar body), and a rate against n32 and n64",
+    .unit = .us,
+    .steps = 4,
+    .axes = &.{
+        .{ .name = "shape", .values = &.{ "flash_gate_up", "flash_down", "mimo_gate_up", "mimo_down" }, .numeric = false },
+        .{ .name = "rate", .values = &.{ "24", "32", "36", "40", "42", "48", "64", "80", "96", "128" }, .numeric = false },
+        .{ .name = "slots", .values = &.{ "170", "640", "2050", "5120", "20480" } },
+    },
+    .arms = &.{ "served", "reference", "n32", "n64" },
+    .ref = "served",
+    .opts = &.{
+        .{ .name = "nax", .help = "off times the simdgroup-matrix and scalar bodies on a NAX chip" },
+        .{ .name = "counts", .help = "a file of per-layer expert counts ([exl3-counts] lines): one rung per layer for the mimo shapes in place of slots" },
+    },
+    .run = runPrefillGemm,
+};
+
+const GemmCtx = struct {
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    eids: mlx.mlx_array,
+    tab: kernels.WindowTable,
+    trellis: [4]mlx.mlx_array,
+    dec: exl3.Decode,
+    nax: bool,
+    calls: usize,
+};
+
+/// The reference body is the NAX reference where NAX runs, else the scalar body the simdgroup-matrix body replaced.
+fn setBody(reference: bool, nax: bool) void {
+    kernels.nax_reference_override = reference and nax;
+    kernels.gemm_simdmat_force = if (reference and !nax) false else null;
+}
+
+fn gemmCall(c: GemmCtx, arm: usize) !mlx.mlx_array {
+    setBody(arm == 1, c.nax);
+    kernels.setDecodeParams(c.dec);
+    return kernels.innerGemmSortedTable(c.s, c.x, c.trellis[arm], c.eids, 32, true, c.tab);
+}
+
+fn sampleGemm(c: GemmCtx, arm: usize) anyerror!f64 {
+    const outs = try std.heap.page_allocator.alloc(mlx.mlx_array, c.calls);
+    defer std.heap.page_allocator.free(outs);
+    var made: usize = 0;
+    defer for (outs[0..made]) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (outs) |*o| {
+        o.* = try gemmCall(c, arm);
+        made += 1;
+        _ = mlx.mlx_vector_array_append_value(vec, o.*);
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sw = io_util.Stopwatch.init(io);
+    try mlx.check(mlx.mlx_eval(vec));
+    return @as(f64, @floatFromInt(sw.read())) / @as(f64, @floatFromInt(c.calls));
+}
+
+fn randomTrellis(rnd: std.Random, experts: c_int, in: c_int, out: c_int, n: u32) !mlx.mlx_array {
+    const it = @divExact(in, 16);
+    const ot = @divExact(out, 16);
+    const words = try std.heap.page_allocator.alloc(u16, @as(usize, @intCast(experts * it * ot)) * n);
+    defer std.heap.page_allocator.free(words);
+    bench.randomWords(rnd, words);
+    return mlx.mlx_array_new_data(words.ptr, &[_]c_int{ experts, it, ot, @intCast(n) }, 4, .uint16);
+}
+
+/// Per-layer expert counts from `[exl3-counts]` log lines (`... ] c0,c1,..`, 256 counts a line).
+fn readCounts(a: std.mem.Allocator, path: []const u8) ![]const [256]u32 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+    var out: std.ArrayList([256]u32) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const at = std.mem.indexOf(u8, line, "] ") orelse continue;
+        var c: [256]u32 = @splat(0);
+        var it = std.mem.tokenizeScalar(u8, line[at + 2 ..], ',');
+        var i: usize = 0;
+        while (it.next()) |v| : (i += 1) {
+            if (i == 256) break;
+            c[i] = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r"), 10) catch 0;
+        }
+        try out.append(a, c);
+    }
+    return out.items;
+}
+
+const COUNT_LAYERS = [_]usize{ 0, 10, 23, 35, 46 };
+
+fn runPrefillGemm(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer {
+        kernels.setDecodeParams(.mul1);
+        setBody(false, false);
+        kernels.gemm_nax_failed = false;
+    }
+    if (run.opt("nax")) |v| {
+        if (!std.mem.eql(u8, v, "off")) return error.BadOpt;
+        kernels.gemm_nax_failed = true;
+    }
+    const nax = kernels.gemmNaxOn();
+    var prng = std.Random.DefaultPrng.init(0x6e33);
+    const rnd = prng.random();
+    var counts: []const [256]u32 = &.{};
+    if (run.opt("counts")) |path| counts = try readCounts(run.a, path);
+    for (GEMM_SHAPES) |sh| {
+        if (!listed(run.axis("shape"), sh.name)) continue;
+        try sh.dec.requireTable();
+        const mimo = sh.experts == 256;
+        const bank32 = try randomTrellis(rnd, sh.experts, sh.in, sh.out, 32);
+        defer _ = mlx.mlx_array_free(bank32);
+        const bank64 = try randomTrellis(rnd, sh.experts, sh.in, sh.out, 64);
+        defer _ = mlx.mlx_array_free(bank64);
+        for (run.axis("rate")) |rate_text| {
+            const n = try std.fmt.parseInt(u32, rate_text, 10);
+            const bank = try randomTrellis(rnd, sh.experts, sh.in, sh.out, n);
+            defer _ = mlx.mlx_array_free(bank);
+            const use_counts = mimo and counts.len > 0;
+            const rungs = if (use_counts) COUNT_LAYERS.len else run.axis("slots").len;
+            for (0..rungs) |ri| {
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                const a = arena.allocator();
+                var label: []const u8 = undefined;
+                var ids: []u32 = undefined;
+                if (use_counts) {
+                    const li = COUNT_LAYERS[ri];
+                    if (li >= counts.len) continue;
+                    var total: usize = 0;
+                    for (counts[li]) |c| total += c;
+                    ids = try a.alloc(u32, total);
+                    var at: usize = 0;
+                    for (counts[li], 0..) |c, e| for (0..c) |_| {
+                        ids[at] = @intCast(e);
+                        at += 1;
+                    };
+                    label = try std.fmt.allocPrint(run.a, "{s} n{d} layer {d} ({d} slots)", .{ sh.name, n, li + 1, total });
+                } else {
+                    const slots = try std.fmt.parseInt(usize, run.axis("slots")[ri], 10);
+                    ids = try a.alloc(u32, slots);
+                    for (ids) |*v| v.* = rnd.uintLessThan(u32, @intCast(sh.experts));
+                    std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+                    label = try std.fmt.allocPrint(run.a, "{s} n{d} slots {d}", .{ sh.name, n, slots });
+                }
+                const nslots: c_int = @intCast(ids.len);
+                const eids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{nslots}, 1, .uint32);
+                defer _ = mlx.mlx_array_free(eids);
+                const xh = try a.alloc(u16, ids.len * @as(usize, @intCast(sh.in)));
+                for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.1);
+                const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ nslots, sh.in }, 2, .float16);
+                defer _ = mlx.mlx_array_free(x);
+                const tab = try kernels.gemmWindowTable(s, eids, nslots, 32, true);
+                defer _ = mlx.mlx_array_free(tab.starts);
+                defer _ = mlx.mlx_array_free(tab.nlives);
+                const ctx: GemmCtx = .{ .s = s, .x = x, .eids = eids, .tab = tab, .trellis = .{ bank, bank, bank32, bank64 }, .dec = sh.dec, .nax = nax, .calls = run.steps(4) };
+                if (nax) try checkBodies(run, ctx);
+                try run.interleave(label, ctx, sampleGemm);
+            }
+        }
+    }
+}
+
+/// The NAX reference body writes the served body's bytes; a difference makes the timing meaningless.
+fn checkBodies(run: *report.Run, c: GemmCtx) !void {
+    var bytes: [2][]u16 = undefined;
+    for (&bytes, 0..) |*b, arm| {
+        const y = try gemmCall(c, arm);
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+        const p: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(y) orelse return error.F16Unreadable);
+        b.* = try run.a.dupe(u16, p[0..mlx.mlx_array_size(y)]);
+    }
+    if (!std.mem.eql(u16, bytes[0], bytes[1])) run.invalid("the reference NAX body wrote other bytes than the served body");
 }
