@@ -23,6 +23,7 @@
 #   18. Three tool chats over a three-tool catalog parse to structured calls
 #   19. Multi-line code round trip: a writeFile call and a multi-line tool result
 #   20. /v1/messages stream with thinking + tools (Claude Code's shape): block lifecycle, no tag leak
+#   21. Reasoning usage: billed reasoning tokens equal the delivered reasoning, on seven turn shapes
 #
 # A thought the token cap cuts open is a legal turn on every row: the rows then assert the split (reasoning kept,
 # nothing in content), never the answer. Thinking rows ask `reasoning_effort: low`, since the split is the subject.
@@ -117,11 +118,13 @@ elif mode == "chat" and not stream:
                calls=[{"name": t["function"]["name"], "args": t["function"]["arguments"]} for t in m.get("tool_calls") or []],
                usage=d.get("usage") or {})
 elif mode == "chat":
-    calls, c, r, fin, cn, rn, done = {}, "", "", None, 0, 0, False
+    calls, c, r, fin, cn, rn, done, usage, uchoices = {}, "", "", None, 0, 0, False, {}, None
     for o in sse(resp):
         if o is None:
             done = True
             break
+        if o.get("usage"):
+            usage, uchoices = o["usage"], len(o.get("choices") or [])
         ch = (o.get("choices") or [{}])[0]
         fin = ch.get("finish_reason") or fin
         dl = ch.get("delta", {})
@@ -135,7 +138,7 @@ elif mode == "chat":
             if f.get("name"):
                 e["name"] = f["name"]
             e["args"] += f.get("arguments") or ""
-    out.update(finish=fin, content=c, reasoning=r, content_chunks=cn, reasoning_chunks=rn, done=done, calls=[calls[k] for k in sorted(calls)])
+    out.update(finish=fin, content=c, reasoning=r, content_chunks=cn, reasoning_chunks=rn, done=done, usage=usage, usage_choices=uchoices, calls=[calls[k] for k in sorted(calls)])
 elif not stream:
     d = json.load(resp)
     blocks = d.get("content", [])
@@ -219,6 +222,13 @@ PY
 # chk_clean <desc> <field>: no control tag in that field of $R
 chk_clean() {
     check "$1" "$(no_leak "$(jget "$R" "r['$2']")" && echo 1 || echo 0)"
+}
+
+# ntok <text>: the token count of the server's own tokenizer
+ntok() {
+    python3 -I -c 'import json, sys, urllib.request
+req = urllib.request.Request(sys.argv[1] + "/tokenize", data=json.dumps({"content": sys.argv[2]}).encode(), headers={"Content-Type": "application/json"})
+print(len(json.load(urllib.request.urlopen(req, timeout=60))["tokens"]))' "$SUSHI_URL" "$1"
 }
 
 user() { printf '{"role":"user","content":"%s %s"}' "$SUSHI_NONCE" "$1"; }
@@ -463,6 +473,29 @@ if [ "$THINKS" = 1 ]; then
     R=$(ask messages 1 "{\"model\":\"m\",\"max_tokens\":4000,\"temperature\":0,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2000},\"tools\":$CC_TOOLS,\"messages\":[$(user 'A parser reads Qwen output where reasoning sits between <think> and </think>. For the raw string `<think>plan A</think>Done`, what are the reasoning and the content? Reason it through, quoting the exact tags as you go. In your final answer never write the tags, call them OPEN and CLOSE. Do not use tools.')]}")
     chk "20. thought quoting its own tags: protocol-valid block lifecycle" "r['err'] is None"
     chk "20. thought quoting its own tags: one thought, never reopened after text" "r['n_thinking']==1 and r['thought_after_text']==0"
+fi
+
+# ── 21. Reasoning usage: the delivered reasoning is exactly what usage bills, on every surface a turn can take
+#      (plain, forced tool call, JSON mode, a one-token reasoning budget), stream and not ──
+ANSWER_TOOL='{"type":"function","function":{"name":"answer","description":"Return the integer answer","parameters":{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}}}'
+usage_case() { # usage_case <name> <0|1 stream> [extra request fields, each with a leading comma]
+    local so=""
+    [ "$2" = 1 ] && so=',"stream_options":{"include_usage":true}'
+    R=$(ask chat "$2" "{\"model\":\"x\",\"messages\":[$(user 'Calculate 123 * 456. Return the integer result.')],\"reasoning_effort\":\"xhigh\",\"temperature\":0,\"max_tokens\":256$so${3:-}}")
+    local expected
+    expected=$(ntok "$(jget "$R" "r['reasoning']")")
+    chk "21. $1: usage reasoning_tokens is a non-negative int equal to the tokens of the delivered reasoning (${expected:-?})" "type(r['usage']['completion_tokens_details']['reasoning_tokens']) is int and r['usage']['completion_tokens_details']['reasoning_tokens']==$expected"
+    chk "21. $1: usage totals add up and prompt_tokens_details carries cached_tokens" "r['usage']['total_tokens']==r['usage']['prompt_tokens']+r['usage']['completion_tokens'] and 'cached_tokens' in r['usage']['prompt_tokens_details']"
+    [ "$2" != 1 ] || chk "21. $1: the usage event repeats no choice" "r['usage_choices']==0"
+}
+if [ "$THINKS" = 1 ]; then
+    usage_case stream 1
+    usage_case nonstream 0
+    usage_case tool-stream 1 ",\"tools\":[$ANSWER_TOOL],\"tool_choice\":\"required\""
+    usage_case tool-nonstream 0 ",\"tools\":[$ANSWER_TOOL],\"tool_choice\":\"required\""
+    usage_case json-stream 1 ',"response_format":{"type":"json_object"}'
+    usage_case budget-stream 1 ',"reasoning_budget_tokens":1'
+    usage_case budget-nonstream 0 ',"reasoning_budget_tokens":1'
 fi
 
 echo
