@@ -147,6 +147,7 @@ test {
     _ = @import("glm5/glm5_dflash_cache.zig");
     _ = @import("glm5/glm5_forward.zig");
     _ = @import("glm5/glm5_prefix.zig");
+    _ = @import("glm5/glm5_prefix_cache_test.zig");
     _ = @import("glm5/glm5_generate.zig");
     _ = @import("glm5/glm5_stream.zig");
     _ = @import("glm5/glm5_mla_reference_test.zig");
