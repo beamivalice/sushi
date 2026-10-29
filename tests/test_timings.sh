@@ -8,6 +8,9 @@
 #   prompt_n, prompt_ms, prompt_per_second,
 #   predicted_n, predicted_ms, predicted_per_second
 #
+# `timings.tokenize_ms` rides every API surface (chat completions, Anthropic messages, responses) as a finite,
+# non-negative number. Its size is not asserted: a wall-clock bound flips with the box.
+#
 # Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_timings.sh
 
 . "$(dirname "$0")/lib/boot.sh"
@@ -17,6 +20,8 @@ FAIL=0
 
 echo "=== Chat-completions timings field ==="
 echo "Server: $BASE ($SUSHI_ARCH)"
+
+command -v jq >/dev/null || { echo "SKIP test_timings.sh: jq is required"; exit 3; }
 
 # ── Test 1: non-streaming chat completion ──────────────────────────────────
 echo
@@ -135,6 +140,45 @@ print(f"  PASS  timings={json.dumps(t)}")
 PY
 RC=$?
 [ $RC -ne 0 ] && FAIL=1
+
+# ── Tests 3-5: timings.tokenize_ms on every API surface ────────────────────
+# Pull `.timings.tokenize_ms` from a JSON response and verify it is a finite non-negative number.
+assert_tokenize_ms_in() {
+    local label="$1" body="$2" val
+    val="$(echo "$body" | jq -r '.timings.tokenize_ms // empty')"
+    if [ -z "$val" ]; then
+        echo "  FAIL: $label: timings.tokenize_ms missing"
+        FAIL=1
+        return
+    fi
+    if ! python3 -I -c "import sys, math; v=float(sys.argv[1]); assert v >= 0 and math.isfinite(v)" "$val" 2>/dev/null; then
+        echo "  FAIL: $label: tokenize_ms=$val (not a finite non-negative number)"
+        FAIL=1
+        return
+    fi
+    echo "  PASS  $label: tokenize_ms=${val}ms"
+}
+
+echo
+echo "--- Test 3: /v1/chat/completions carries timings.tokenize_ms ---"
+RESP="$(curl -sf -m 600 -X POST "$BASE/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in one word."}],"max_tokens":5,"temperature":0,"stream":false}')"
+assert_tokenize_ms_in "chat-completions" "$RESP"
+
+echo
+echo "--- Test 4: /v1/messages carries timings.tokenize_ms ---"
+RESP="$(curl -sf -m 600 -X POST "$BASE/v1/messages" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"sushi","messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in one word."}],"max_tokens":5,"temperature":0,"stream":false}')"
+assert_tokenize_ms_in "anthropic-messages" "$RESP"
+
+echo
+echo "--- Test 5: /v1/responses carries timings.tokenize_ms ---"
+RESP="$(curl -sf -m 600 -X POST "$BASE/v1/responses" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"sushi","input":"'"$SUSHI_NONCE"' Say hi in one word.","max_output_tokens":16,"temperature":0,"stream":false}')"
+assert_tokenize_ms_in "responses" "$RESP"
 
 echo
 if [ $FAIL -ne 0 ]; then
