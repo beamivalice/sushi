@@ -15,7 +15,7 @@ PACK=$(sushi_pack qwen4) || exit $?
 
 PASS=0; FAIL=0
 for i in $(seq 1 "$ITERS"); do
-    sushi_boot "shutdown-$i" "$PACK" --log-level warn || exit $?
+    sushi_boot "shutdown-$i" "$PACK" || exit $?
     SVPID=$SUSHI_PID
     # More concurrent connection threads, a better chance one is inside complete() when deinit runs.
     CURLPIDS=()
