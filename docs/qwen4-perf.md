@@ -201,7 +201,7 @@ max with 10 s idle from 64 °C and restored to auto after. CONTENDED box: a syst
 throughout, other workers' builds and tests beside the first meter and live boots.
 
 Decode meter, the chain and the step alternated off / on / on / off per width in one process
-(`SUSHI_DECODE_FWD_UBENCH=40 _S=1,3,5,7,9 _GDN_ARMS=1`, `--prefix-cache-entries 0`), three boots per length, ms per
+(`SUSHI_DECODE_FWD_UBENCH=40 _S=1,3,5,7,9`, `--prefix-cache-entries 0`), three boots per length, ms per
 forward, mean over boots:
 
 | rows | 4096 keys | 32768 keys |
@@ -234,7 +234,7 @@ M5 Max 128 GB, 2026-09-27, Sushi-3bpw, kv8, `--mtp`, `SUSHI_ROUND_COST_PERSIST=0
 followed a KLD run at 90.6 °C) and restored to auto after; load 1.9-3.5 with other workers' builds beside.
 
 Decode meter on B, the composed chain and the kernel alternated A B B A per width in one process
-(`SUSHI_DECODE_FWD_UBENCH=48 _S=1,3,5,1,3,5 _QSA_POOL_ARMS=1`, ctx 131072), one boot per length, two rounds per
+(`SUSHI_DECODE_FWD_UBENCH=48 _S=1,3,5,1,3,5`, ctx 131072), one boot per length, two rounds per
 width; the context grows ~7.3k keys over a boot. ms per forward:
 
 | keys prefilled | rows | chain | kernel | delta | per round | graph ops |
@@ -450,7 +450,7 @@ and 4-8% of a depth-3 verify; a matmul2d QSA prototype (branch `qsa-mpp-proto`) 
 `e79b345002454001b49cf3b1bde86fcc407fb7b3cd7087385de4eaad86926638`), M5 Max 128 GB,
 Sushi-3bpw, `--ctx-size 65536 --kv-quant 8 --prefix-cache-entries 0 --no-mtp`.
 The forward meter prefills 32768 tokens, captures verify state, and runs 40 forwards
-per arm with `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`, widths `1,2,3,5,7,9` and
+per arm, widths `1,2,3,5,7,9` and
 `SUSHI_ROUND_COST_PERSIST=0`. A B B A in one process: A is the existing fused
 recurrence plus norm-gate and convolution concat; B folds both epilogues into it.
 There was no recorded fold-only comparison on this base, so both arms were measured.

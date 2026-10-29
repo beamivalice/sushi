@@ -17,13 +17,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - GDN decode = three fused dispatches (S 1..9 bit-identity is SAMPLING). At B=1,
   decode (S=1) and capturing verify (S 2..8) run two: `gdn_decode.step` (prework + recurrence, mlx-serve #517)
   then the norm-gate, bit-identical to the chain, ~0.4 ms per forward
-  ([perf-baselines](qwen4-perf.md#gdn-decode-recur)). A/B seam: `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
+  ([perf-baselines](qwen4-perf.md#gdn-decode-recur)). A/B'd in one process on the forward meter.
 - Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
   an unsupported threadgroup limit falls back to the existing recurrence and epilogue (an M1 declines S 3..8 and
   folds S=2), so the parity test skips a declined width above two. Parity includes every
   captured state. Wider captures keep the existing path after the S=5 regression
-  in [the width sweep](qwen4-perf.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
+  in [the width sweep](qwen4-perf.md#gdn-verify-fold). Same-process A/B on the forward meter.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
   `gated_delta_step_seq` carries the state at its stored width to the next token, so serial decode and rollback agree;
   Qwen stores f32 by default, so the rule bites at `--qwen-gdn 16` only, where upstream's verbatim verify kernel (it
@@ -101,7 +101,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   - Gate `attnPdNaxServes`: NAX + macOS 26.3 + a one-tile probe of both instantiations (causal, band + sinks)
     against an f32 reference; a failed probe declines to the SIMD kernel by name.
 - At 128k keys its time is ~69% matmul issue, ~18% load instructions (Q reloaded each key block, K/V fragments per
-  simdgroup) and ~12% softmax; K/V memory traffic is ~1% (`SUSHI_ATTN_PD_UBENCH_ABL=1`,
+  simdgroup) and ~12% softmax; K/V memory traffic is ~1% (kernel ablations,
   [perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)).
 - Each fragment row is ONE 8-byte vector load (`SushiNax::load2`); element-wise reads cost ~5% of the kernel
   ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn) has the ruled-out load layouts).

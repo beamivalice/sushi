@@ -8133,8 +8133,8 @@ pub const Generator = struct {
     /// marginal per position in the flat verify region (seq <= 4), ~16.3
     /// ms/pos for positions 4-6, and position 7 nearly free (+3.3 ms —
     /// verify seq 8 rides the same row tile as 5-7), averaged into
-    /// per_pos_hi. ATTRIBUTION (the GDN-vs-qmm µbench in transformer.zig,
-    /// SUSHI_GDN_UBENCH=1): the ladder is ~90% qmm ROW-COUNT cost — the
+    /// per_pos_hi. ATTRIBUTION (a GDN-vs-qmm microbench): the ladder is ~90% qmm
+    /// ROW-COUNT cost — the
     /// GDN recurrence kernel is nearly flat over verify widths (0.13→0.26 ms
     /// per dispatch, T 2→64) and contributes <1 ms/round; the earlier
     /// "GDN sequential width ramp" reading was a mis-attribution.

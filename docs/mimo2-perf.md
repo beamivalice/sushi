@@ -109,7 +109,7 @@ rows); the FP8 direct GEMV loading two chunks ahead (+0.2 ms at 4 rows); the pai
 half2 FMA on the decoded weights (lossy; +5% at 1 row, -4% at 4 rows).
 
 Rope + kv8 quantize in one dispatch (`mimoDecodeQkvPrep`, on top of the levers above, same meter, 30 forwards per pass,
-`_QKV_PREP_ARMS` off/on/on/off twice in one boot): 1 row 21.23 -> 20.95 and 21.51 -> 21.26 ms (-0.27 ms, -1.3%);
+off/on/on/off twice in one boot): 1 row 21.23 -> 20.95 and 21.51 -> 21.26 ms (-0.27 ms, -1.3%);
 4 rows 39.57 -> 39.82 and 42.21 -> 41.35 ms under a 5 ms upward drift across the passes (-0.3 ms mean, not
 resolved). Primitives per forward 3420 -> 3040 at 1 row, 4766 -> 4386 at 4. Two more boots at 16 passes each
 (four off/on/on/off sets): 2 rows -0.45 / -0.20 / -0.38 / -0.40 ms per set (-0.36 ms, -1.3%); 4 rows +0.30 /
@@ -284,7 +284,7 @@ capture.
 <a id="mimo-lmhead-shortlist"></a>
 ### MiMo 2.3bpw: greedy lm_head through the coarse top-32 (on d1408a57, 2026-10-01)
 
-Decode meter (`SUSHI_DECODE_FWD_UBENCH=40`, 4096 keys, `_LMHEAD_ARMS` alternating the full head and the shortlist in
+Decode meter (`SUSHI_DECODE_FWD_UBENCH=40`, 4096 keys, alternating the full head and the shortlist in
 one boot, `--kv-quant 8 --mtp`, `taskpolicy -a`, GPU lock), ms per forward: 1 row 20.89 / 20.10 / 20.07 / 21.27
 (full / shortlist / shortlist / full, about -1.0 ms); 4 verify rows 43.65 / 42.83 / 42.97 / 48.28 (at least -0.8 ms).
 The full affine-8 head reads 0.64 GB; the 2-bit copy ~0.19 GB plus the 32-row re-score.
@@ -488,7 +488,7 @@ differ, both are shown:
   - The dispatch budget is not a lever: 5e8, 1e9 and 2e9 land within ±3% of each other.
 - One sliding layer's band call, ring dequant included, takes 0.42 / 0.57 / 0.90 ms at qL 1024 / 2048 / 4096. Over 39
   layers that is 16 / 22 / 35 ms per chunk.
-- Kernel ablations at 128k keys, qL 2048, on the dense chain (timing-only source edits, `AttnPdNaxAblation`), ms:
+- Kernel ablations at 128k keys, qL 2048, on the dense chain (timing-only source edits), ms:
 
   | variant | ms |
   |---|---|
@@ -548,7 +548,7 @@ Arms: each global layer's verify rows one `sushi_qkv_mpp` decode dispatch at a t
 which runs each group's rows on one page walk (pairs, a last three in one pass). Both arms are byte-identical to the
 decode ticks: unit test at 4k / 64k / 256k keys, 16/1 and 64/4 heads, page and split edges, widths 2-8 and 15, kv8 and kv4.
 
-Attention microbench (`SUSHI_MIMO_ROWS_UBENCH=1`, 9 dependent layers, 64/4 heads, kv8, median of 5, arms interleaved,
+Attention microbench (9 dependent layers, 64/4 heads, kv8, median of 5, arms interleaved,
 `taskpolicy -a`, lock `attn-rows7`, branch perf/mimo-a6-verify-rows at 829187c5), us per layer, per row -> grouped.
 829187c5 runs the landed commit's kernel and its groups for 2-4 rows; the landed commit only adds the groups for
 wider verifies, the warmup order and test cases. Neither run pinned the fans; the arms are interleaved in one process
@@ -564,7 +564,7 @@ or boot.
 - The rows kernel with all four rows in one pass saves only 3-4%: four running outputs cost registers. Two pairs save
   17-20%.
 
-Decode-forward meter (`SUSHI_DECODE_FWD_UBENCH=12`, `_S=2,3,4`, `_KV=131072`, `_GLOBAL_ROWS_ARMS=1` off / on / on /
+Decode-forward meter (`SUSHI_DECODE_FWD_UBENCH=12`, `_S=2,3,4`, `_KV=131072`, arms off / on / on /
 off), MiMo-V2.6-Flash-Sushi-2.3bpw, `--kv-quant 8 --mtp --ctx-size 1048576`, binary from 829187c5 (SHA-256
 `e44e8894`), `taskpolicy -a`, lock `attn-meter128`, 2026-10-01. Results are ms per verify forward at 131k keys:
 

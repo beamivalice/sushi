@@ -192,7 +192,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   fresh quantized rows and `KVCache.appendQuantized` appends them through the usual slice updates, so the ring, its
   compaction and the packed-arm switch are untouched. Bit-identical to the composed rope + `quantizeAffine` (unit test
   at MiMo shapes, both rope bases, 1-8 rows). It removes ~380 primitives from a decode forward;
-  `SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1` is its A/B.
+  A/B'd in one process on the forward meter.
 - A joined `[Q | K]` GEMV output with one rope over both passed its unit tests but moved live logits by ~0.05
   nats at the first token, cause unfound; it is not in the tree.
 

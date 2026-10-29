@@ -71,7 +71,7 @@ separate M-RoPE guard.
 - One effective YaRN mscale on every indexer arm; the indexer ropes with the SAME M-RoPE table as attention.
 - The pooled block keys are ONE kernel (`sushi_qsa_pool_rope`, from mlx-serve #556): block mean, key norm and
   partial RoPE, bit-identical to the MLX chain. It serves text turns, bf16, 128-wide keys and ratios up to 8; M-RoPE
-  turns and other shapes keep the chain. No env lever; `SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS=1` is its A/B
+  turns and other shapes keep the chain. No env lever; A/B'd in one process on the forward meter
   ([perf-baselines](qwen4-perf.md#qsa-pool-rope)).
 
 ## Indexer history
