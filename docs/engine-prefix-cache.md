@@ -50,7 +50,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   scorer boots with the cache off.
 - Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
-  span (`prefill_plan.ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
+  span (`prefill_plan.ssmSnapshotBackoff`). Guard: `tests/test_prefix_reuse.sh`.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
   (`KVCache.ringCheckpoint`, `Entry.ring_cps`, up to `RING_CHECKPOINT_MAX` = 8): each ringed layer's
   window + 30 rows at a position (down to the window when the ring holds no more, as one restored off a checkpoint
@@ -462,7 +462,7 @@ Moved to [glm5-prefix-cache](glm5-prefix-cache.md).
 
 ## Guards
 
-`tests/test_prefix_cache_*.sh` (budget revisit, disk, hot, mem, workloads), `tests/test_hybrid_reuse_equivalence.sh`,
+`tests/test_prefix_cache_*.sh` (budget revisit, disk, hot, mem, workloads), `tests/test_prefix_reuse.sh`,
 `tests/mimo2/test_mimo_ring_reuse.sh`, `tests/mimo2/test_mimo_ring_fork_ssd.sh`, `tests/qwen4/test_qwen4_mtp_head_persist.sh`,
 `tests/glm5/test_glm_prefix_reuse.sh`, `tests/test_prefix_cache_tiers.sh`. Grep the log for `[cache]`, `[hot-cache]`,
 `[disk-cache]`.
