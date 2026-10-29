@@ -213,7 +213,7 @@ text = sys.argv[1]
 tags = ["<think>", "</think>", "<tool_call", "<arg_key>", "<arg_value>", "DSML"]
 for t in tags:
     if t in text:
-        print(f"  leaked tag: {t}", file=sys.stderr)
+        print(f"  leaked tag: {t} in {text[:240]!r}", file=sys.stderr)
         sys.exit(1)
 sys.exit(0)
 PY
