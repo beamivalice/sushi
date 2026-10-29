@@ -35,6 +35,7 @@ test {
     _ = @import("degenerate.zig");
     _ = @import("mtp_plan.zig");
     _ = @import("prefill_plan.zig");
+    _ = @import("sampler.zig");
     _ = @import("transformer.zig");
     _ = @import("vision.zig");
     _ = @import("qwen4/qwen_vision.zig");
