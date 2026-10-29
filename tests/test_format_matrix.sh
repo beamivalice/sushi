@@ -45,7 +45,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-# Only GLM-5.3 refuses thinking off (checkThinkingSupport in src/server.zig): its thinking-off row is the 400.
+# Only GLM-5.3 refuses thinking off (checkThinkingSupport in src/request_policy.zig): its thinking-off row is the 400.
 GLM=0
 [ "${SUSHI_ARCH:-}" = glm5_next ] && GLM=1
 

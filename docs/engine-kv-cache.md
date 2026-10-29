@@ -1,7 +1,7 @@
 # Engine: KV cache and kv-quant
 
 What the KV cache stores, how a quantized cache is read, how it grows, and which settings give byte-stable
-output. Read this before touching `KVCache` in `src/transformer.zig`, `src/kv_quant.zig`, or any attention path that
+output. Read this before touching `KVCache` in `src/kv_cache.zig`, `src/kv_quant.zig`, or any attention path that
 reads cached keys.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engine-prefix-cache.md),

@@ -95,13 +95,13 @@ Box: M5 Max 128 GB, macOS 27.
 |---|---|---|
 | `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld/convert`); pull, `run` REPL | server-lifecycle |
 | `repl_tools.zig` | `run` REPL client-side tools (web, confined files, images; write needs `/edit`) | server-http-apis |
-| `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` | all HTTP: `/v1/*`, `/metrics(.json)`, WS, `--api-key`; Responses store | server-http-apis |
-| `chat.zig` | chat templates (Jinja2 + fallback), thinking tags, tool-call parse/repair/coercion | server-tool-calling |
+| `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` / `http_conn` / `request_policy` / `request_media` / `models_api` / `logprobs` / `generation_stream` / `anthropic` / `completions` / `responses_api` | all HTTP: `/v1/*`, `/metrics(.json)`, WS, `--api-key`; Responses store | server-http-apis |
+| `chat.zig` / `think_tags` / `tool_calls` / `tool_schema` | chat templates (Jinja2 + fallback), thinking tags, tool-call parse/repair/coercion | server-tool-calling |
 | `reasoning_protocol.zig` / `json_schema.zig` / `json_grammar.zig` / `token_mask.zig` / `regex.zig` | constrained decoding | server-http-apis |
 | `launch.zig` | `sushi launch <agent>` configs | server-http-apis |
-| `scheduler.zig` / `generate.zig` / `degenerate.zig` / `mtp_plan.zig` / `prefill_plan.zig` / `sampler.zig` | slots, inference thread, batching, admission; generation, MTP orchestration; stop loop, MTP plan, prefill plan, sampler | server-lifecycle |
+| `scheduler.zig` / `generate.zig` / `degenerate.zig` / `mtp_plan.zig` / `prefill_plan.zig` / `sampler.zig` / `model_load` / `slot_admission` / `mtp_tick` / `slot_outcome` / `vision_queue` | slots, inference thread, batching, admission, load bills; generation, MTP orchestration; stop loop, MTP plan, prefill plan, sampler | server-lifecycle |
 | `model.zig` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, per-model settings, discovery, registry | server-lifecycle |
-| `transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch, quant resolution | arch-*, engine-* |
+| `transformer.zig` / `kv_cache.zig` / `ssm_cache.zig` | shared `Transformer`, `ForwardCtx`, arch dispatch, quant resolution, KV/SSM caches | arch-*, engine-* |
 | `qwen4/qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
 | `mimo2/mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | mimo2-arch |
 | `glm5/glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, decode kernels, prefix state, vision | glm5-* |
@@ -124,7 +124,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
 
-Flags: `sushi --help` lists them all; the ones the docs lean on are named in each doc.
+Flags: `sushi --help` lists them all.
 
 ## Building
 

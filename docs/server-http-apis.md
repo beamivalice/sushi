@@ -2,7 +2,7 @@
 
 What each HTTP surface promises its clients: the OpenAI chat/completions/Responses and Anthropic Messages contracts,
 streaming and usage chunks, logprobs, seeds and sampling, reasoning budgets and constrained JSON, plus the agent
-launcher. Read this before touching `src/server.zig`, `src/responses.zig`, `src/launch.zig` or the sampler.
+launcher. Read this before touching `src/server.zig`, `src/http_conn.zig`, `src/anthropic.zig`, `src/responses_api.zig`, `src/completions.zig`, `src/generation_stream.zig`, `src/request_policy.zig`, `src/responses.zig`, `src/launch.zig` or the sampler.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](server-tool-calling.md),
 [server-lifecycle](server-lifecycle.md), [engine-mtp](engine-mtp.md).

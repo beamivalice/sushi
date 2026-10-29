@@ -2,7 +2,7 @@
 
 How Qwen3.8-Flash-Next attends past 2048 tokens: the QSA indexer, block selection, the gather/split-K arms per query
 width, the indexer history, and the long-context admission and load-time bills. Every mechanism here is gated by ONE
-predicate, `ModelConfig.longCtxGated()`. Read this before touching any `qsa*` function in `src/transformer.zig`.
+predicate, `ModelConfig.longCtxGated()`. Read this before touching any `qsa*` function in `src/qwen4/qwen4_qsa_*.zig` or `src/transformer.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md),
 [engine-kv-cache](engine-kv-cache.md), [engine-memory-admission](engine-memory-admission.md),

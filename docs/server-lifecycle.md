@@ -2,7 +2,7 @@
 
 How a model gets from a path to a serving slot and back: discovery, the arch gate, the one weight-loader decision,
 load and unload on the inference thread, settings precedence, the scheduler's slots and batching, threads, and the
-ownership rules that keep request data alive. Read this before touching `src/scheduler.zig`, `src/model_registry.zig`,
+ownership rules that keep request data alive. Read this before touching `src/scheduler.zig` or its split files below, `src/model_registry.zig`,
 `src/model_settings.zig`, `src/main.zig` or `src/cli.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-http-apis.md),
@@ -148,6 +148,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - `src/scheduler.zig`: slots, inference thread (sole MLX caller), queues, batching, admission, spec wiring, hot-cache
   budget revise.
+- `src/model_load.zig`: load plan, streaming plan, load bills; `src/slot_admission.zig`: slot and memory admission, batching
+  policy; `src/mtp_tick.zig`: grouped MTP tick; `src/slot_outcome.zig`: slot end, finish outcome, loop-stop reasons;
+  `src/vision_queue.zig`: vision encode queue, media deferral.
 - Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A resident
   `qwen4_exp` decodes plain slots as rows of one forward (`forwardQwen4DecodeRows`, up to eight, no padding, no cap):
   each row's recurrence, attention, PLE and KV append run as the slot's solo tick runs them, and the ops that read the
@@ -229,7 +232,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## Request ownership and media
 
 - **`messages.deinit(allocator)` frees the Message array and NOTHING it points at**: request media is owned by ONE
-  `server.RequestMedia`; `Message` BORROWS. Ownership by PROVENANCE (`{slice, owned}` returns), never
+  `request_media.RequestMedia`; `Message` BORROWS. Ownership by PROVENANCE (`{slice, owned}` returns), never
   free-unless-equals-literal.
 - **A media placeholder id occurs in ordinary TEXT**, so a media boundary is gated on the request CARRYING media
   (`firstMediaPlaceholder(has_media)`); media on a tower-less load is refused by NAME (`mediaRejectReason`; a streamed load that left the tower off by default names `--vision`).

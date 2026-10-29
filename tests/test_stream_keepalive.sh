@@ -6,8 +6,8 @@
 # silent for longer than the keepalive interval.
 #
 # The server buffers generated tokens whenever it might be looking at a tool
-# call (`chat.streamShouldBufferForTools`) or an unclosed thinking block
-# (`chat.streamThinkGate` -> .hold_thinking). For a large tool call — an agent
+# call (`think_tags.streamShouldBufferForTools`) or an unclosed thinking block
+# (`think_tags.streamThinkGate` -> .hold_thinking). For a large tool call — an agent
 # one-shotting a whole file into `write_file` — that buffer holds for the
 # ENTIRE generation, and pre-fix the server wrote zero bytes for its whole
 # duration. Clients with an idle-body timeout tear such a connection down

@@ -82,7 +82,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **MTP is ON by default for Qwen and MiMo** (GLM keeps its head off and drafts with DFlash2; DeepSeek drafts with DSpark) (owner policy, `server.defaultEnableMtp` `served`): a request
   that omits `enable_mtp` runs the loaded head. `--no-mtp`, `"mtp": false` in `model-settings.json` or
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
-  `scheduler.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
+  `model_load.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
   head's KV whenever it runs by default (`server.mtpHeadDefaultOn`).
 - **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default;
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis

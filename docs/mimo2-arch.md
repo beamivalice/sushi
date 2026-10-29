@@ -54,7 +54,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **A MiMo EXL3 pack serves RESIDENT**: see [engine-exl3-experts](engine-exl3-experts.md#mimo). The trunk takes
   the source loader (`usesMimoSourceTrunk`), billed as stored by `mimoSourceResidentBytes`.
 - **A load holds ONE 2-bit coarse copy of the lm_head** (`Transformer.lm_head_coarse`, ~0.19 GB, billed with or
-  without MTP, `scheduler.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it,
+  without MTP, `model_load.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it,
   so a greedy argmax is the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)). A streamed load
   keeps it too, billed as trunk in the SSD budget ledger.
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`): a MiMo pack read without its source trunk

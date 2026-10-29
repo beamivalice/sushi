@@ -133,5 +133,5 @@ pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
     thread, the context sizer and the cache clamp bill none, so the advertised context is the cache-off one.
   - The pass evicts RAM entries LRU first, sparing the one it restored from. If the request still does not fit, it
     keeps fewer checkpoints, down to the prompt end and then none, rather than be refused
-    (`scheduler.fewerCheckpointsToAdmit`). With none it commits nothing.
+    (`slot_admission.fewerCheckpointsToAdmit`). With none it commits nothing.
   - The checkpoints yield to the width: the prefill width is chosen as if the request kept none.

@@ -76,7 +76,7 @@ the forward before it) and by `enterVision` around an image encode. The pool cou
 pool on demand and the phase's bytes plus the pool never pass the limit. A request that reaches it fails as
 `TransientCapExceeded` (503) and the server keeps serving. A request's end lifts the cap. There is no flag.
 
-The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `server.visionEncodeBill` for an image.
+The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `request_media.visionEncodeBill` for an image.
 
     prefill-width forward (> 17 rows):  (rows x dim x 480 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
     decode or verify forward (<= 17):   (seq x 16 x 4 x 3 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB

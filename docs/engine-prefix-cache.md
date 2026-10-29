@@ -41,7 +41,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   all, which is what lets a text prompt share a record whole. Overclaiming is safe (an equal key is clamped by
   `kv_len`, a different one falls to the pre-media text) but costs the reuse of the blocks the record does hold.
 - **The media key is a PERSISTED format.** It is `mediaChain`'s Wyhash over each block's preprocessed pixels, grid and
-  position (`server.zig`), stored as hex because a u64 key runs past JSON's i64. Changing what it hashes without
+  position (`request_media.zig`), stored as hex because a u64 key runs past JSON's i64. Changing what it hashes without
   changing the hash would make a stale record match a prompt it does not describe; a changed hash only costs misses.
   The tier fingerprint (model dir + `config.json`) covers the tower's weights, and `ImageData.pixels` is already
   post-preprocessing, so a preprocessing change rolls the key by itself.
@@ -203,7 +203,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   `free disk - 4 GB` or `the flag`), and `Allocating 2.0 GB RAM for the prefix cache (--prefix-cache-mem)` only when RAM
   retention is on.
 - **Each finished turn logs `[disk-cache] usage <used> / <budget> GB, <n> entries`** from the FINISHING model's own
-  tier (`scheduler.logDiskUsage`), and `/props settings.prefix_cache` carries that model's `disk_bytes` (the budget),
+  tier (`slot_outcome.logDiskUsage`), and `/props settings.prefix_cache` carries that model's `disk_bytes` (the budget),
   `disk_used_bytes` and `disk_entries` ([server-http-apis](server-http-apis.md)). `publishDiskStats` writes them onto each
   `LoadedModel.disk_stats` (a sequence-locked snapshot, so the four numbers come from one publish) after every commit,
   load and unload; `/props?model=A` reads A's, whatever model loaded last.
@@ -256,7 +256,7 @@ Prefill saves only the grid and the prompt end, so a tool loop on Qwen (MTP) or 
 reply every turn. A thinking request with tools now takes one more point mid-decode, DeepSeek's
 ([dsv41-arch](dsv41-arch.md#prefix-cache)) on a recurrent state.
 
-- **The closer is what every turn shares** (`replay` tests in `chat.zig`, pack tokenizer and real template): Qwen re-renders
+- **The closer is what every turn shares** (`replay` tests in `tool_calls.zig`, pack tokenizer and real template): Qwen re-renders
   `<think>\n` + trimmed thought + `\n</think>\n\n`, GLM `<think>` + thought + `</think>`, and both repeat the whole reply. A thought
   starting in whitespace or ending in any the template does not write is re-rendered (`mtp_plan.thoughtEdgesSurvive`) and
   its point dropped; a client must send `reasoning_content` back as delivered.
@@ -299,7 +299,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   span-preserving whatever the prompt carries (`prefill_plan.checkpointDropIndex`): a media record persists whole, so
   there is no boundary to protect, and protecting one dropped every checkpoint ABOVE the image — exactly the state
   the next image-bearing turn restores from. The byte-budget trim never lands on a released checkpoint.
-  `transformer.SSM_RESIDENT_MAX` is the number the admission bill counts
+  `ssm_cache.SSM_RESIDENT_MAX` is the number the admission bill counts
   ([engine-memory-admission](engine-memory-admission.md#bill-checkpoints)).
 - **A RAM tier keeps its entry's newest two** (`keepNewestCheckpoints`, on commit, merge and inheritance), after the
   byte-budget trim, and only where the commit's SSD record carries the rest: a checkpoint past the record's text prefix

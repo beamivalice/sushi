@@ -2,7 +2,7 @@
 
 How prompts are rendered and how model output is split into reasoning, content and tool calls: the Jinja render and
 its silent fallback, the tool-call parse chain and its one chokepoint, think-tag handling, loop stops, and the
-replay-pinned invariants. Read this before touching `src/chat.zig`, the tool paths in `src/server.zig`, or
+replay-pinned invariants. Read this before touching `src/chat.zig`, `src/tool_calls.zig`, `src/tool_schema.zig`, `src/think_tags.zig`, the tool paths in `src/server.zig`, or
 `src/format_corpus_test.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-http-apis.md),
@@ -115,7 +115,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 ## tool_choice
 
-- **One parser, every wire shape** (`chat.parseToolChoice`): chat nests the name under `function`, Responses and
+- **One parser, every wire shape** (`tool_calls.parseToolChoice`): chat nests the name under `function`, Responses and
   Anthropic carry it flat, Anthropic spells required `any`; anything else is `auto`, which is unchanged.
 - **`none` withholds the tools, skips the parser, and on chat completions bans the call opener**: a model that sees
   earlier calls in the history writes one anyway, as raw text in the answer. `server.noneCallBan` adds a -100 bias on
@@ -158,18 +158,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   shape, since it rebuilds from the pending tokens only.
 - Thinking-off is enforced in the PROMPT; generated reasoning is ALWAYS delivered (every site splits via
   `splitThinkBlock(text, true, …)`).
-- **A thought is decided at its first byte when no opener can start it** (`chat.thinkOpenerPossible`: every opener
+- **A thought is decided at its first byte when no opener can start it** (`think_tags.thinkOpenerPossible`: every opener
   starts with `<`); otherwise the three stream sites wait for 7 bytes. On the
   surface budget path (`armThinkBound` declined) the budget then counts from that earlier consumption.
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
-  a close tag still arriving wait (`chat.settledReasoning` on the tools path, `chat.openThoughtFlush` /
+  a close tag still arriving wait (`think_tags.settledReasoning` on the tools path, `think_tags.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
 - **A think tag inside an inline code span is text** (`openCodeSpanStart`, read by `indexOfThinkCloseTag` and
   `indexOfThinkOpenTag`, the ONE scan every surface and `normalizeEmbeddedThinkBlocks` use): a model explaining
   its format writes `` `<think>x</think>` `` into a thought or an answer. The verdict reads only the bytes BEFORE the
   tag, so a stream never revises it; `openThoughtFlush` therefore keeps an open span in the buffer. A span ends with
   its line and three backticks are a fence. Tags quoted any other way (plain or double quotes) are still structure.
-- **A thought the length limit cuts ends on what its split delivers** (`chat.cutThoughtDelta`): a lone opener is
+- **A thought the length limit cuts ends on what its split delivers** (`think_tags.cutThoughtDelta`): a lone opener is
   structure, and a thinking block or reasoning item opens at its first delta, so an empty thought streams none.
 
 ## Loop stops

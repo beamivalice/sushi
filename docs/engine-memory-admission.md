@@ -264,7 +264,7 @@ envelope, the 512 MiB floor), and grows with the prompt: 330 MiB at 59k, 600 at 
 ### Checkpoints in the bill
 
 A Qwen request's GDN checkpoints are stored on the SSD tier once their file lands, so the bill counts the states the
-request holds, not the ones it captures (`server.ssmResidentCap`, `transformer.SSM_RESIDENT_MAX`):
+request holds, not the ones it captures (`server.ssmResidentCap`, `ssm_cache.SSM_RESIDENT_MAX`):
 
 | storage | held per request | why |
 |---|---:|---|
@@ -399,7 +399,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   clear, both on `reservesKvCapacity`): the request-end clear runs before the slot is freed, so its KV parked there
   (MiMo: 1.6 GiB after a 128k request, 3.2 after 256k) and the next admission read it as spent.
 - MiMo MTP adds a constant per-request and load-time reserve (`mimo_mtp.State.billedBytes`) for all three sliding head KVs, retained hiddens, and catch-up/concatenation buffers; it is zero with MTP off and never scales with context.
-- **A vision encode is billed before it runs** (`towerFitFault`, `server.visionEncodeBill`), for the blocks the prefix
+- **A vision encode is billed before it runs** (`towerFitFault`, `request_media.visionEncodeBill`), for the blocks the prefix
   restore leaves to encode, never the whole history: the largest block's tower
   scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what

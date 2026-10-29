@@ -22,7 +22,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 ## What streams
 
 One engine (`expert_stream.Engine`) streams every served model, keyed by the checkpoint's routed-expert layout, and
-one plan (`scheduler.planExpertStreaming`) sizes it for `serve`/`run`, the registry's cold-load gate and `sushi kld`.
+one plan (`model_load.planExpertStreaming`) sizes it for `serve`/`run`, the registry's cold-load gate and `sushi kld`.
 Each forward runs its own resident expert kernels on slab-local ids, so a streamed forward is bit-identical to the
 resident one; the ledger bills from the stored headers, a slot sized to the widest layer rate. The trunk (and MiMo's
 coarse lm_head) stays resident; with no budget a pack loads resident.
@@ -46,7 +46,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   the FP32 reduction are untouched, and each layer completes before its slabs are reused.
 - The FP8 release's experts stream as stored: e4m3 codes plus f32 block-128 scales. A layer's routed slots
   dequantize to bf16(code x scale) through `fp8_block` and run the BF16 composite; the copies and gathered codes (at
-  most every expert of one layer, about 21.7 GB) are billed beside the trunk (`scheduler.fp8ExpertScratchBytes`).
+  most every expert of one layer, about 21.7 GB) are billed beside the trunk (`model_load.fp8ExpertScratchBytes`).
   Its capture is refused: the release is a block quantization of the BF16 source, which stays the only teacher.
 - The FP8 release is verified by hermetic tests only, with no live boot, KLD or speed number: the checkpoint is no
   longer on the box.
@@ -74,7 +74,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - **The tower is resident and billed in the ledger** (`vision` term, `resolveStreamedVision`): the expert cache
   shrinks by its weights. A budget that cannot hold it beside two slots per layer is `SsdBudgetBelowVision` (503).
 - **The encode transient is not reserved.** The load proves the largest single image the tower's processor admits
-  (`server.largestImageEncodeBytes`) beside the budget: `budget + planned KV + that encode <= wired limit`, else
+  (`request_media.largestImageEncodeBytes`) beside the budget: `budget + planned KV + that encode <= wired limit`, else
   `SsdBudgetExceedsWiredLimit`. Every request is then billed live like a resident one (`towerFitFault`); its vision
   tokens ride the prompt's admission bill.
 - The forward splices the rows the same way streamed or resident (the embedding step is shared): greedy bytes match.
@@ -104,7 +104,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit
   `--prefill-chunk` only lowers the floor the load proves.
-- **A streamed Flash-Next bills no expert fill peak** (`scheduler.billedFillPeakBytes`); MiMo and GLM keep theirs. The
+- **A streamed Flash-Next bills no expert fill peak** (`model_load.billedFillPeakBytes`); MiMo and GLM keep theirs. The
   fill peak (`fillPeakBytes`: two union workspaces, a cache layer, a batch) rode on top of a budget that already holds
   the union workspace and the bounce. M1 Max, `--ssd-budget-gb 23`, kv8, lean: a cold 8k prompt peaked 1,224 MiB over
   the loaded weights and a 45k 1,683, the resident pack's own peak, against bills of 3,270 and 3,821 that carried it.

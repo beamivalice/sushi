@@ -256,7 +256,7 @@ decodes or requantizes. See README.md.
 ## Fixtures
 
 `src/exl3/fixtures/exl3_*_linear.safetensors` are committed and `@embedFile`d by
-`src/exl3/expert_exl3.zig` (`fixtures`, which `src/transformer.zig` reads). They are produced by the
+`src/exl3/expert_exl3.zig` (`fixtures`, which `src/test_support.zig` reads). They are produced by the
 private converter; regenerate one only to change the format, and keep the one
 searched and decoded at window 12 (`exl3_k2p5_mcg_w12_linear.safetensors`),
 which is what certifies a narrowed window against the converter's own decode
