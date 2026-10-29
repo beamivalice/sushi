@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Concurrent cancellation test (Phase A7).
 #
 # Hammers the server with N cycles of "start a long generation, kill the
@@ -16,58 +16,23 @@
 # the server log to catch silently-stuck slots that accept submits but never
 # complete.
 #
-# Requires:
-#   - A built sushi binary
-#   - A model directory (see PLD_TEST_MODEL fallback chain).
-#
-# Usage:
-#   CANCEL_TEST_MODEL=/path/to/model ./tests/test_concurrent_cancellation.sh [port] [cycles]
+# Attaches to the shared api boot; SKIPs on a pass that cannot batch (the cancels race other slots).
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+sushi_require batching
 
 set -e
 
-PORT=${1:-8094}
-CYCLES=${2:-${CYCLES:-100}}
-BASE="http://127.0.0.1:$PORT"
+CYCLES=${CYCLES:-100}
+BASE="$SUSHI_URL"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${CANCEL_TEST_MODEL:-${PLD_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}}"
-
-if [ ! -d "$MODEL" ]; then
-    echo -e "${YELLOW}SKIP${NC} test_concurrent_cancellation: model directory not found."
-    echo "  Set CANCEL_TEST_MODEL or place an MLX checkpoint at"
-    echo "  ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
-    exit 0
-fi
-
-if [ ! -f "$MODEL/config.json" ]; then
-    echo -e "${RED}FAIL${NC} $MODEL/config.json missing — not a valid model directory."
-    exit 1
-fi
-
-BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-if [ ! -x "$BINARY" ]; then
-    echo -e "${RED}FAIL${NC} $BINARY not found or not executable."
-    exit 1
-fi
-
 # Long-output prompt so each request takes long enough that we can reliably
 # kill it before completion. max_tokens high so the kill races a real decode
 # loop, not just a stalled prefill.
-PROMPT='Write a 500-word story about a robot that learns to paint.'
-
-JSON_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'model': 'sushi',
-    'messages': [{'role': 'user', 'content': '''$PROMPT'''}],
-    'max_tokens': 400,
-    'temperature': 0.0,
-    'stream': True,
-}))
-")
+PROMPT="Write a 500-word story about a robot that learns to paint."
 
 # Final-confirmation payload: short, deterministic. If the queue is leaked
 # this won't return in TIMEOUT seconds.
@@ -75,7 +40,7 @@ FINAL_PAYLOAD=$(python3 -c "
 import json
 print(json.dumps({
     'model': 'sushi',
-    'messages': [{'role': 'user', 'content': 'Reply with just the word OK.'}],
+    'messages': [{'role': 'user', 'content': '$SUSHI_NONCE Reply with just the word OK.'}],
     'max_tokens': 8,
     'temperature': 0.0,
     'stream': False,
@@ -83,34 +48,8 @@ print(json.dumps({
 ")
 
 echo "== concurrent cancellation test =="
-echo "  model: $MODEL"
 echo "  cycles: $CYCLES"
 echo
-
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
-    echo "port $PORT is already in use; stop that server or pass another port" >&2
-    exit 1
-fi
-
-LOGFILE=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --max-concurrent 4 > "$LOGFILE" 2>&1 &
-SERVER_PID=$!
-trap "kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; rm -f $LOGFILE" EXIT INT TERM
-
-echo "  starting server..."
-up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then
-        up=1
-        break
-    fi
-    sleep 1
-done
-if [ "$up" != "1" ]; then
-    echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
-    tail -30 "$LOGFILE"
-    exit 1
-fi
 
 # ── Cancellation cycles ──
 # Per cycle:
@@ -127,7 +66,7 @@ for cycle in $(seq 1 "$CYCLES"); do
 import json
 print(json.dumps({
     'model': 'sushi',
-    'messages': [{'role': 'user', 'content': '[c $cycle] $PROMPT'}],
+    'messages': [{'role': 'user', 'content': '$SUSHI_NONCE [c $cycle] $PROMPT'}],
     'max_tokens': 400,
     'temperature': 0.0,
     'stream': True,
@@ -157,21 +96,21 @@ sleep 2
 echo "  verifying server still responds after cancellation storm..."
 if ! curl -s -f --max-time 10 "$BASE/health" > /dev/null; then
     echo -e "${RED}FAIL${NC} /health unresponsive after $CYCLES cancellations (slot leak suspected)"
-    tail -40 "$LOGFILE" | sed 's/^/    /'
+    sushi_log_since | tail -40 | sed 's/^/    /'
     exit 1
 fi
 
 # Final payload should round-trip cleanly. Use a generous timeout so a
 # slow-but-not-stuck server still passes.
 FINAL_T0=$(python3 -c 'import time; print(time.time())')
-FINAL_RESP=$(echo "$FINAL_PAYLOAD" | curl -s --max-time 30 -X POST \
+FINAL_RESP=$(echo "$FINAL_PAYLOAD" | curl -s --max-time 120 -X POST \
     -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" || echo "")
 FINAL_T1=$(python3 -c 'import time; print(time.time())')
 FINAL_ELAPSED=$(python3 -c "print(round($FINAL_T1 - $FINAL_T0, 2))")
 
 if [ -z "$FINAL_RESP" ]; then
-    echo -e "${RED}FAIL${NC} final request did not return within 30s — slot leak"
-    tail -40 "$LOGFILE" | sed 's/^/    /'
+    echo -e "${RED}FAIL${NC} final request did not return within 120s — slot leak"
+    sushi_log_since | tail -40 | sed 's/^/    /'
     exit 1
 fi
 
@@ -194,10 +133,10 @@ fi
 
 # Sanity check the scheduler logs for stuck-slot indicators. We expect lots
 # of "cancelled" finish reasons but no error or unhandled-exception traces.
-ERR_LINES=$(grep -cE "\[scheduler\] (decode tick failed|prefill failed)" "$LOGFILE" || true)
+ERR_LINES=$(sushi_log_since | grep -cE "\[scheduler\] (decode tick failed|prefill failed)" || true)
 if [ "$ERR_LINES" -gt 0 ]; then
     echo -e "${YELLOW}WARN${NC} found $ERR_LINES scheduler error lines in log:"
-    grep -E "\[scheduler\] (decode tick failed|prefill failed)" "$LOGFILE" | head -5 | sed 's/^/    /'
+    sushi_log_since | grep -E "\[scheduler\] (decode tick failed|prefill failed)" | head -5 | sed 's/^/    /'
     # Not necessarily a fail — some errors during cancellation are expected
     # (e.g. mid-tick cancel), but we surface them for diagnosis.
 fi
