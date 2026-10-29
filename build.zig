@@ -297,8 +297,12 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
     const host_stems = hostStems(b);
     var stems: std.ArrayList([]const u8) = .empty;
     var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
+    // A scoped run names each test of a root file that another model's file name ends with ("model" in
+    // "dsv41_model"), since a filter matches anywhere in a test name.
+    var skipped: std.ArrayList([]const u8) = .empty;
+    var top: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     for (test_dirs) |dir_path| {
-        if (model) |m| if (!std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m))) continue;
+        const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
         var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e });
         defer src.close(io);
         var it = src.iterate();
@@ -307,11 +311,17 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
             const stem = entry.name[0 .. entry.name.len - ".zig".len];
             if (isHostStem(host_stems, stem)) continue;
             if (std.mem.startsWith(u8, stem, "ubench_")) continue;
+            if (out_of_scope) {
+                skipped.append(b.allocator, b.allocator.dupe(u8, stem) catch @panic("OOM")) catch @panic("OOM");
+                continue;
+            }
             stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
             const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
             var lines = std.mem.splitScalar(u8, source, '\n');
             while (lines.next()) |line| {
                 const indent = std.mem.indexOf(u8, line, "test \"") orelse continue;
+                if (indent == 0 and model != null and std.mem.endsWith(u8, line, "\" {"))
+                    top.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt("{s}.test.{s}", .{ stem, line["test \"".len .. line.len - "\" {".len] }) }) catch @panic("OOM");
                 if (indent == 0 or std.mem.trim(u8, line[0..indent], " ").len != 0) continue;
                 if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
                     std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
@@ -350,7 +360,17 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
     var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
     for (0..test_buckets.len + 1) |i| {
         var filters: std.ArrayList([]const u8) = .empty;
-        for (stems.items, bucket) |stem, k| if (k == i) filters.append(b.allocator, stem) catch @panic("OOM");
+        for (stems.items, bucket) |stem, k| if (k == i) {
+            const bare = stem[0 .. stem.len - ".test.".len];
+            const shadowed = for (skipped.items) |sk| {
+                if (std.mem.endsWith(u8, sk, bare)) break true;
+            } else false;
+            if (!shadowed) {
+                filters.append(b.allocator, stem) catch @panic("OOM");
+                continue;
+            }
+            for (top.items) |t| if (std.mem.eql(u8, t.stem, stem)) filters.append(b.allocator, t.filter) catch @panic("OOM");
+        };
         for (nested.items) |n| {
             const owner = for (stems.items, bucket) |stem, k| {
                 if (std.mem.eql(u8, stem, n.stem)) break k;
