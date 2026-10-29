@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/../../private_cache.sh"
+# sushi-test: tier=live boot=own pack=mimo2 boots=2
 # test_mimo_ring_fork_ssd.sh — MiMo's sliding layers keep a ring, so an entry restores only at its
 # end or at a ring checkpoint. A client that sends a side request per turn (the whole conversation
 # plus an appended <system-reminder>) used to leave the next main turn nothing to restore once the
@@ -16,49 +16,21 @@
 #  4. Both main turn 2 restores land past the reply: at the message start the side request's
 #     prefill marked (a ring file at that position after the restart), not at turn 1's prompt end.
 #
-# Each boot takes the GPU lock (scripts/gpu-lock.sh, owner GPU_LOCK_OWNER).
-# Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), MIMO_MODEL, PORT (default 18931), BINARY.
+# The restart is the subject, so the script boots twice: the same label keeps the private HOME and cache root.
 
 set -uo pipefail
 
-MODEL="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
-PORT="${PORT:-18931}"
-BIN="${BINARY:-./zig-out/bin/sushi}"
-BASE="http://127.0.0.1:$PORT"
-LOCK="$(cd "$(dirname "$0")/../.." && pwd)/scripts/gpu-lock.sh"
-OWNER="${GPU_LOCK_OWNER:-test_mimo_ring_fork_ssd}"
-
-[ -d "$MODEL" ] || { echo "SKIP: model dir not found: $MODEL"; exit 0; }
-[ -x "$BIN" ]   || { echo "fail: build sushi first"; exit 1; }
+. "$(dirname "$0")/../lib/boot.sh"
+MODEL=$(sushi_pack mimo2) || exit $?
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
-curl -sf --max-time 2 "$BASE/health" >/dev/null 2>&1 && { echo "fail: port $PORT is busy"; exit 1; }
 
-# The SSD tier lives in the private SUSHI_PREFIX_CACHE_DIR (private_cache.sh); the isolated HOME keeps the rest of the user's untouched.
-DISK_HOME="$(mktemp -d)"
-LOG="$(mktemp)"
-SERVER_PID=""
-LOCKED=0
-stop() {
-    [ -n "$SERVER_PID" ] && { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }
-    SERVER_PID=""
-    [ $LOCKED = 1 ] && { "$LOCK" release "$OWNER" >/dev/null; LOCKED=0; }
-    true
-}
-trap 'stop; rm -rf "$DISK_HOME" "$LOG"' EXIT
-
+LOG=""
 boot() {
-    "$LOCK" acquire "$OWNER" >/dev/null && LOCKED=1
-    : > "$LOG"
-    HOME="$DISK_HOME" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 \
-        --prefix-cache-entries 2 --prefix-cache-mem 8GB --prefix-cache-disk 16GB --log-level info > "$LOG" 2>&1 &
-    SERVER_PID=$!
-    for _ in $(seq 1 900); do
-        curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; exit 1; }
-        sleep 1
-    done
-    echo "fail: server never came up"; exit 1
+    sushi_boot ringfork "$MODEL" --kv-quant 8 --prefix-cache-entries 2 --prefix-cache-mem 8GB --prefix-cache-disk 16GB --log-level info || exit $?
+    LOG="$SUSHI_LOG"
+    BASE="$SUSHI_URL"
 }
+stop() { sushi_stop 0; }
 
 BACKGROUND="$(python3 - <<'PY'
 para = ("The kingdom of Avalon was beset by trials. Each season brought new "
@@ -98,27 +70,27 @@ fail() { echo "FAIL: $*"; EC=1; }
 
 # ── Boot 1: the client's pattern in RAM ──
 boot
-M1=$(ask "$(main1)") || { echo "fail: main turn 1"; tail -20 "$LOG"; exit 1; }
+M1=$(ask "$(main1)") || { echo "fail: main turn 1"; tail -20 "$SUSHI_LOG"; exit 1; }
 GEN=$(field "$M1" '.usage.completion_tokens')
 if [ "$GEN" -lt 600 ]; then
     # The ring keeps 384 to 640 rows; a reply this short may leave the prompt end inside it.
-    echo "SKIP: main turn 1 generated only $GEN tokens; the ring may still hold the prompt end"
-    exit 0
+    echo "SKIP $(basename "$0"): main turn 1 generated only $GEN tokens; the ring may still hold the prompt end"
+    exit 3
 fi
 REPLY=$(field "$M1" '.choices[0].message.content')
 
 RING0=$(count '\[hot-cache\] ring checkpoint @')
-ask "$(after "$REMINDER" 48)" > /dev/null || { echo "fail: side request"; tail -20 "$LOG"; exit 1; }
+ask "$(after "$REMINDER" 48)" > /dev/null || { echo "fail: side request"; tail -20 "$SUSHI_LOG"; exit 1; }
 RING1=$(count '\[hot-cache\] ring checkpoint @')
 [ "$RING1" -gt "$RING0" ] || fail "the side request did not restore from the main entry's ring checkpoint"
 grep -q '\[hot-cache\] inherited ring checkpoints' "$LOG" || fail "the side entry inherited no ring checkpoint"
 
 EVICT0=$(count 'evicted LRU entry (count cap')
-ask "$(title)" > /dev/null || { echo "fail: unrelated request"; tail -20 "$LOG"; exit 1; }
+ask "$(title)" > /dev/null || { echo "fail: unrelated request"; tail -20 "$SUSHI_LOG"; exit 1; }
 [ "$(count 'evicted LRU entry (count cap')" -gt "$EVICT0" ] || fail "the unrelated request evicted nothing"
 
 DECLINE0=$(count 'declined: SlidingRingRewindPastWindow')
-M2=$(ask "$(after "$Q2" 300)") || { echo "fail: main turn 2"; tail -20 "$LOG"; exit 1; }
+M2=$(ask "$(after "$Q2" 300)") || { echo "fail: main turn 2"; tail -20 "$SUSHI_LOG"; exit 1; }
 RING2=$(count '\[hot-cache\] ring checkpoint @')
 [ "$RING2" -gt "$RING1" ] || fail "main turn 2 did not restore from the side entry in RAM"
 [ "$(count 'declined: SlidingRingRewindPastWindow')" = "$DECLINE0" ] || fail "main turn 2 declined its clamp"
@@ -138,14 +110,14 @@ echo "boot 1 persisted $(count '\[disk-cache\] persisted') entries"
 grep '\[hot-cache\]\|\[disk-cache\]' "$LOG" | head -40
 stop
 
-RINGS=$(ls "$SUSHI_PREFIX_CACHE_DIR"/*/e*/r*.safetensors 2>/dev/null | wc -l | tr -d ' ')
+RINGS=$(ls "$SUSHI_RUN_DIR"/ringfork.kv-cache/*/e*/r*.safetensors 2>/dev/null | wc -l | tr -d ' ')
 [ "$RINGS" -gt 0 ] || fail "no ring file on disk"
-grep -lq '"v":9' "$SUSHI_PREFIX_CACHE_DIR"/*/e*/meta.json 2>/dev/null || fail "no v9 manifest on disk"
+grep -lq '"v":9' "$SUSHI_RUN_DIR"/ringfork.kv-cache/*/e*/meta.json 2>/dev/null || fail "no v9 manifest on disk"
 
 # ── Boot 2: a restart restores from the SSD tier ──
 boot
 DISK0=$(count '\[disk-cache\] restored .*ring@')
-M2D=$(ask "$(after "$Q2" 300)") || { echo "fail: main turn 2 after restart"; tail -20 "$LOG"; exit 1; }
+M2D=$(ask "$(after "$Q2" 300)") || { echo "fail: main turn 2 after restart"; tail -20 "$SUSHI_LOG"; exit 1; }
 [ "$(count '\[disk-cache\] restored .*ring@')" -gt "$DISK0" ] || fail "main turn 2 after restart did not restore from SSD"
 [ "$(field "$M2D" .timings.cached_n)" -gt 0 ] || fail "main turn 2 after restart cold-prefilled"
 [ "$(field "$M2D" .timings.cached_n)" -gt "$P1" ] || fail "main turn 2 after restart restored at or below turn 1's prompt end"
@@ -166,7 +138,7 @@ echo "main turn 2 RAM vs SSD restore: tokens agree for $AGREE of $TOTAL; max |dl
 python3 -c "import sys; sys.exit(0 if float('$WORST') <= 0.5 else 1)" || fail "SSD-restored logprobs drift past 0.5 nats"
 
 DISK1=$(count '\[disk-cache\] restored .*ring@')
-M3=$(ask "$(after "$Q3" 64)") || { echo "fail: main turn 3"; tail -20 "$LOG"; exit 1; }
+M3=$(ask "$(after "$Q3" 64)") || { echo "fail: main turn 3"; tail -20 "$SUSHI_LOG"; exit 1; }
 [ "$(count '\[disk-cache\] restored .*ring@')" -gt "$DISK1" ] || [ "$(field "$M3" .timings.cached_n)" -gt 0 ] \
     || fail "a turn diverging at the reminder restored nothing after the restart"
 echo "main turn 3: cached_n=$(field "$M3" .timings.cached_n)"
