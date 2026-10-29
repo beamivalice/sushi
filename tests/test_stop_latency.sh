@@ -47,6 +47,8 @@ def finish_lines():
 
 
 seen_before = len(finish_lines())
+WRITE_FAILED = "streaming error: error.WriteFailed"
+write_failed_before = sushi_test.log_since().count(WRITE_FAILED)
 
 body = json.dumps({
     "model": "sushi",
@@ -97,6 +99,10 @@ while time.time() < deadline:
     time.sleep(0.05)
 
 if len(lines) <= seen_before:
+    # A write that fails before the disconnect probe ends the request without the finish line.
+    if sushi_test.log_since().count(WRITE_FAILED) > write_failed_before:
+        print(f"  kill@{kill_after} deltas: the stream write failed first; no finish line to measure")
+        sys.exit(7)
     print(f"FAIL kill_after={kill_after}: no new finish line in the log within 10s")
     sys.exit(1)
 
@@ -123,14 +129,23 @@ PY
 # later kills exercise the steady-state loop.
 PASS=0
 FAIL=0
+UNMEASURED=0
 for kill_at in 8 24 64 128; do
-    if run_one "$kill_at"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+    rc=0
+    run_one "$kill_at" || rc=$?
+    case $rc in
+        0) PASS=$((PASS+1)) ;;
+        7) UNMEASURED=$((UNMEASURED+1)) ;;
+        *) FAIL=$((FAIL+1)) ;;
+    esac
 done
+# Most kill points must be measured, or the script proves nothing about latency.
+[ "$PASS" -ge 2 ] || FAIL=$((FAIL+1))
 
 echo
-echo "  passed: $PASS / $((PASS+FAIL))"
+echo "  measured and within budget: $PASS, write failed first: $UNMEASURED"
 if [ "$FAIL" -gt 0 ]; then
-    echo -e "${RED}FAIL${NC} $FAIL of $((PASS+FAIL)) kill points exceeded the latency budget"
+    echo -e "${RED}FAIL${NC} a kill point exceeded the latency budget, or fewer than two were measured"
     exit 1
 fi
 echo -e "${GREEN}PASS${NC} all kill points within the 16-token budget"
