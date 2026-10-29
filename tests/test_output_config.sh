@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Guard: Anthropic `output_config` (the 2026 spelling Claude Code sends) is
 # honored on /v1/messages.
 #
@@ -17,36 +17,18 @@
 #     required keys — and it lands in CONTENT, not inside a thinking block
 #     (the model may think first; the JSON payload is still the text block)
 #
-# Greedy throughout. Usage: ./tests/test_output_config.sh [model_dir] [port]
+# Greedy throughout. Needs a model that thinks (SKIPs otherwise).
 
 set -u
 
-MODEL=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8135}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+sushi_require thinking
+BASE=$SUSHI_URL
 PASS=0
 FAIL=0
 TOTAL=0
 
-MODEL=$(eval echo "$MODEL")
-if [ ! -d "$MODEL" ]; then echo "SKIP: model not found at $MODEL"; exit 0; fi
-if [ ! -x "./zig-out/bin/sushi" ]; then
-    echo "FAIL: sushi not built — run 'zig build -Doptimize=ReleaseFast' first"
-    exit 1
-fi
 command -v jq >/dev/null 2>&1 || { echo "FAIL: jq is required"; exit 1; }
-
-./zig-out/bin/sushi serve --port $PORT --host 127.0.0.1 --log-level info \
-    --model "$MODEL" >/tmp/sushi-output-config.log 2>&1 &
-SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
-trap cleanup EXIT
-
-for i in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    if [ "$i" -eq 120 ]; then echo "FAIL: server did not start within 120s"; exit 1; fi
-    sleep 1
-done
 
 run_test() {
     TOTAL=$((TOTAL + 1))
@@ -66,7 +48,7 @@ TYPES=$(msg "{
     \"model\": \"sushi\", \"max_tokens\": 512, \"temperature\": 0, \"stream\": false,
     \"output_config\": {\"effort\": \"none\"},
     \"tools\": $TOOLS,
-    \"messages\": [{\"role\": \"user\", \"content\": \"Why is the sky blue? One sentence, no tools needed.\"}]
+    \"messages\": [{\"role\": \"user\", \"content\": \"$SUSHI_NONCE Why is the sky blue? One sentence, no tools needed.\"}]
 }" | jq -r '[.content[].type] | join(",")')
 if echo "$TYPES" | grep -q "thinking"; then
     run_test "effort none suppresses the thinking block" FAIL "got blocks: $TYPES"
@@ -75,11 +57,11 @@ else
 fi
 
 echo "=== effort \"high\" turns thinking ON ==="
-TYPES=$(msg '{
-    "model": "sushi", "max_tokens": 1024, "temperature": 0, "stream": false,
-    "output_config": {"effort": "high"},
-    "messages": [{"role": "user", "content": "Why is the sky blue? One sentence."}]
-}' | jq -r '[.content[].type] | join(",")')
+TYPES=$(msg "{
+    \"model\": \"sushi\", \"max_tokens\": 1024, \"temperature\": 0, \"stream\": false,
+    \"output_config\": {\"effort\": \"high\"},
+    \"messages\": [{\"role\": \"user\", \"content\": \"$SUSHI_NONCE Why is the sky blue? One sentence.\"}]
+}" | jq -r '[.content[].type] | join(",")')
 if echo "$TYPES" | grep -q "thinking"; then
     run_test "effort high produces a thinking block" PASS ""
 else
@@ -87,14 +69,14 @@ else
 fi
 
 echo "=== format json_schema is ENFORCED, and lands in content ==="
-BODY=$(msg '{
-    "model": "sushi", "max_tokens": 512, "temperature": 0, "stream": false,
-    "output_config": {"effort": "high", "format": {"type": "json_schema", "schema": {
-        "type": "object",
-        "properties": {"title": {"type": "string"}, "summary": {"type": "string"}},
-        "required": ["title", "summary"], "additionalProperties": false}}},
-    "messages": [{"role": "user", "content": "Summarize: The quick brown fox jumps over the lazy dog."}]
-}')
+BODY=$(msg "{
+    \"model\": \"sushi\", \"max_tokens\": 512, \"temperature\": 0, \"stream\": false,
+    \"output_config\": {\"effort\": \"high\", \"format\": {\"type\": \"json_schema\", \"schema\": {
+        \"type\": \"object\",
+        \"properties\": {\"title\": {\"type\": \"string\"}, \"summary\": {\"type\": \"string\"}},
+        \"required\": [\"title\", \"summary\"], \"additionalProperties\": false}}},
+    \"messages\": [{\"role\": \"user\", \"content\": \"$SUSHI_NONCE Summarize: The quick brown fox jumps over the lazy dog.\"}]
+}")
 TEXT=$(echo "$BODY" | jq -r '[.content[]? | select(.type=="text") | .text] | join("")')
 # Both halves in one shot: the text parses as JSON AND carries the required
 # keys. Markdown prose (the pre-fix answer) fails the parse; JSON that leaked
