@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Integration test: `sushi launch <agent>` (issue #188) — configures and
 # launches a third-party coding agent against the local server, ollama-style.
 #
@@ -22,18 +22,13 @@
 
 set -u
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8097}
-BASE="http://127.0.0.1:$PORT"
-BIN=./zig-out/bin/sushi
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+BASE=$SUSHI_URL
+BIN=$SUSHI_BIN
 PASS=0
 FAIL=0
 TOTAL=0
 
-if [ ! -d "$MODEL_DIR" ]; then
-    echo "SKIP: Model not found at $MODEL_DIR"
-    exit 0
-fi
 if [ ! -x "$BIN" ]; then
     echo "FAIL: sushi not built — run 'zig build -Doptimize=ReleaseFast' first"
     exit 1
@@ -61,18 +56,10 @@ else
     run_test "dead server instructs how to start one" FAIL "$OUT"
 fi
 
-echo "Starting server..."
-"$BIN" --model "$MODEL_DIR" --serve --port "$PORT" >/tmp/sushi-launch-test.log 2>&1 &
-SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
-trap cleanup EXIT
-for i in $(seq 1 40); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    [ "$i" -eq 40 ] && { echo "FAIL: server did not start"; exit 1; }
-    sleep 1
-done
-
-MODEL_ID=$(basename "$MODEL_DIR")
+MODEL_ID=$(curl -s "$BASE/v1/models" | python3 -c '
+import sys, json
+print(json.loads(sys.stdin.read())["data"][0]["id"])
+')
 ADV_CTX=$(curl -s "$BASE/v1/models" | python3 -c '
 import sys, json
 r = json.loads(sys.stdin.read())
@@ -158,7 +145,7 @@ case "$WORDS" in BAD*|"") OK=0 ;; esac
 for w in $WORDS; do
     [ "$OK" = 1 ] || break
     CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-        -d "{\"model\":\"x\",\"max_tokens\":1,\"reasoning_effort\":\"$w\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+        -d "{\"model\":\"x\",\"max_tokens\":1,\"reasoning_effort\":\"$w\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE hi\"}]}")
     [ "$CODE" = 200 ] || { OK=0; WORDS="$WORDS ($w -> $CODE)"; }
 done
 if [ "$OK" = 1 ]; then
