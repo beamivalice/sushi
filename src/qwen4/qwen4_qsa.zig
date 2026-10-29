@@ -35,6 +35,7 @@ const getQsaSelectSplitLocalKernel = qwen4_forward.getQsaSelectSplitLocalKernel;
 const getQsaSelectSplitMergeKernel = qwen4_forward.getQsaSelectSplitMergeKernel;
 const log = trf.log;
 const markPosOf = qwen4_forward.markPosOf;
+const QSA_RING_ROWS = trf.QSA_RING_ROWS;
 const qsaAttnKernelEnabled = trf.qsaAttnKernelEnabled;
 const qsaBatchedGatherEnabled = trf.qsaBatchedGatherEnabled;
 const qsaDecodeGatherAttn = trf.qsaDecodeGatherAttn;
@@ -42,6 +43,7 @@ const qsaDecodeGatherEnabled = trf.qsaDecodeGatherEnabled;
 const qsaEntrySatisfiesForward = trf.qsaEntrySatisfiesForward;
 const qsaGatherEnabled = trf.qsaGatherEnabled;
 const qsaGatherMinKv = trf.qsaGatherMinKv;
+const qsaHistoryRows = trf.qsaHistoryRows;
 const qsaMaskFromBlockSel = trf.qsaMaskFromBlockSel;
 const qsaMaskFromBlocks = trf.qsaMaskFromBlocks;
 const qsaNaxEnabled = trf.qsaNaxEnabled;
@@ -61,11 +63,13 @@ const qsaVerifyGatherAttn = trf.qsaVerifyGatherAttn;
 const qsaVerifyGatherEnabled = trf.qsaVerifyGatherEnabled;
 const qsaVerifyGatherMinKvFor = trf.qsaVerifyGatherMinKvFor;
 const qsaWidthBucket = trf.qsaWidthBucket;
+const seedCapBuf = trf.seedCapBuf;
 const qwen4Standin = qwen4_forward.qwen4Standin;
 const sliceAttentionSeq = trf.sliceAttentionSeq;
 const spanPreservingDropIndex = trf.spanPreservingDropIndex;
 const splitMaskedSdpa256 = trf.splitMaskedSdpa256;
 const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
+
 
 pub fn qsaPrefillGatherMinKv() c_int {
     if (qwen4_qsa_gather.qsa_gather_min_kv_override != null) return qsaGatherMinKv();
@@ -1636,6 +1640,148 @@ pub var qsa_pool_rope_fused_override: ?bool = null;
 
 pub fn qsaPoolRopeFusedEnabled() bool {
     return qsa_pool_rope_fused_override orelse true;
+}
+
+pub fn resetQsaPooledRope(self: *Transformer) void {
+    self.qsa_pooled_rope.deinit();
+}
+
+pub fn markQsaPooledRopeStale(self: *Transformer) void {
+    self.qsa_pooled_rope.stale.store(true, .release);
+}
+
+pub fn qsaInstallRing(_: *Transformer, entry: *SSMCacheEntry, src: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    const sh = mlx.getShape(src);
+    const rows = sh[1];
+    const n: c_int = @min(rows, QSA_RING_ROWS);
+    var tmp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tmp);
+    var view = src;
+    if (n < rows) {
+        try mlx.check(mlx.mlx_slice(
+            &tmp,
+            src,
+            &[_]c_int{ 0, rows - n, 0 },
+            3,
+            &[_]c_int{ sh[0], rows, sh[2] },
+            3,
+            &[_]c_int{ 1, 1, 1 },
+            3,
+            s,
+        ));
+        view = tmp;
+    }
+    if (entry.aux_state.ctx != null) _ = mlx.mlx_array_free(entry.aux_state);
+    if (entry.qsa_key_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_key_buf);
+    entry.aux_state = .{ .ctx = null };
+    entry.qsa_key_buf = .{ .ctx = null };
+    entry.qsa_key_rows = 0;
+    entry.qsa_key_buf = try seedCapBuf(s, view, 1, @intCast(QSA_RING_ROWS));
+    entry.qsa_key_rows = n;
+    var start = [_]c_int{ 0, 0, 0 };
+    var stop = [_]c_int{ sh[0], n, sh[2] };
+    entry.aux_state = mlx.mlx_array_new();
+    errdefer {
+        _ = mlx.mlx_array_free(entry.aux_state);
+        entry.aux_state = .{ .ctx = null };
+    }
+    try mlx.check(mlx.mlx_slice(&entry.aux_state, entry.qsa_key_buf, &start, 3, &stop, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+}
+
+/// Append this forward's raw indexer keys `[B, S, hd]` to the layer's QSA ring and
+/// republish `entry.aux_state` as the tight view. `offset` is the authority the accelerator is checked against.
+pub fn qsaAppendKeys(self: *Transformer, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, offset: c_int) !void {
+    const s = self.s;
+    const add = mlx.getShape(k_raw)[1];
+    const held: c_int = if (entry.aux_state.ctx != null) mlx.getShape(entry.aux_state)[1] else 0;
+    const hist = qsaHistoryRows(entry);
+
+    if (!(entry.qsa_key_buf.ctx != null and hist == offset and held == entry.qsa_key_rows)) {
+        if (entry.qsa_key_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_key_buf);
+        entry.qsa_key_buf = .{ .ctx = null };
+        entry.qsa_key_rows = 0;
+        if (held > 0) {
+            entry.qsa_key_buf = try seedCapBuf(s, entry.aux_state, 1, @intCast(QSA_RING_ROWS));
+            entry.qsa_key_rows = held;
+        }
+    }
+
+    const ring_cap: usize = @intCast(QSA_RING_ROWS);
+    if (add >= QSA_RING_ROWS) {
+        try self.qsaInstallRing(entry, k_raw, s);
+    } else if (held + add <= QSA_RING_ROWS) {
+        try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, ring_cap);
+    } else {
+        const keep_old = QSA_RING_ROWS - add;
+        const sh = mlx.getShape(entry.aux_state);
+        var old_tail = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(old_tail);
+        try mlx.check(mlx.mlx_slice(
+            &old_tail,
+            entry.aux_state,
+            &[_]c_int{ 0, held - keep_old, 0 },
+            3,
+            &[_]c_int{ sh[0], held, sh[2] },
+            3,
+            &[_]c_int{ 1, 1, 1 },
+            3,
+            s,
+        ));
+        var cat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cat);
+        const parts = [_]mlx.mlx_array{ old_tail, k_raw };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 1, s));
+        try self.qsaInstallRing(entry, cat, s);
+    }
+    entry.qsa_hist_rows = offset + add;
+}
+
+/// Extend the pooled block-key bank by `new3` and republish `entry.qsa_pooled` as the tight
+/// view, byte-identical to the old `concatenate`. A `nb_cached` mismatch re-seeds.
+pub fn qsaAppendPooled(self: *Transformer, entry: *SSMCacheEntry, new3: mlx.mlx_array, nb_cached: c_int) !void {
+    const s = self.s;
+    if (!(entry.qsa_pooled_buf.ctx != null and entry.qsa_pooled_blocks == nb_cached)) {
+        if (entry.qsa_pooled_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_pooled_buf);
+        entry.qsa_pooled_buf = .{ .ctx = null };
+        entry.qsa_pooled_blocks = 0;
+        if (nb_cached > 0 and entry.qsa_pooled.ctx != null) {
+            const seed_ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
+            entry.qsa_pooled_buf = try seedCapBuf(s, entry.qsa_pooled, 1, entry.qsa_reserve_rows / seed_ratio);
+            entry.qsa_pooled_blocks = nb_cached;
+        }
+    }
+    // One row per completed block: the row reservation divided by the ratio.
+    const ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
+    try capBufAppend(s, &entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, new3, 1, entry.qsa_reserve_rows / ratio);
+}
+
+/// `rms_norm(bf16(mean_f32(kb4, axis 2)), w)` → `[B, nb, D]`.
+pub fn qsaPoolNorm(self: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array) !mlx.mlx_array {
+    var kb_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kb_f32);
+    try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
+    var pooled_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled_f32);
+    try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
+    var pooled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
+    return self.rmsNorm(pooled, norm_w);
+}
+
+/// Scalar partial RoPE of the normed pooled keys `pn [B, nb, D]`, row i at cos/sin row i.
+pub fn qsaPooledRopeComposed(self: *Transformer, pn: mlx.mlx_array, rope_dims: c_int, cosv: mlx.mlx_array, sinv: mlx.mlx_array) !mlx.mlx_array {
+    const sh = mlx.getShape(pn);
+    var pn4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pn4);
+    try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
+    const roped = try self.ropeApplyCosSin(pn4, rope_dims, cosv, sinv);
+    defer _ = mlx.mlx_array_free(roped);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, roped, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, self.s));
+    return out;
 }
 
 test "qsa pooled rope: one cos/sin build per forward, not one per full-attention layer" {

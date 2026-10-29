@@ -30,6 +30,7 @@ const ssmSnapshotDeinit = trf.ssmSnapshotDeinit;
 const ssmUnbindAll = trf.ssmUnbindAll;
 const ssmUnbindEntries = trf.ssmUnbindEntries;
 
+
 var ssm_member_gen_src: std.atomic.Value(u64) = .init(1);
 
 pub fn nextSsmMemberGen() u64 {
@@ -664,6 +665,62 @@ fn ssmTickResetLikePrefixCache(entries: []SSMCacheEntry, s: mlx.mlx_stream, seed
         }
     }
     ssmDetachFromGroup(entries);
+}
+
+/// Concatenate every slot's `[1, …]` GDN state for one layer into a single
+/// `[N, …]` entry. Both halves are concatenated on axis 0 — the batch axis
+/// the recurrence kernel already indexes with `b_idx`.
+pub fn mergeSsmAcrossSlots(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize) !SSMCacheEntry {
+    const lw = &self.moe_layers.?[layer];
+    return ssmMergeLayer(self.s, ctxs, layer, .{ .linear = lw.is_linear, .ple = lw.ple != null });
+}
+
+/// Inverse of `mergeSsmAcrossSlots`: hand row i of the advanced state back
+/// to slot i, replacing what it held.
+///
+/// The rows are handed over as SLICE VIEWS, not copies. mlx arrays are
+/// refcounted, so each view keeps the merged parent alive and the slot
+/// owns a perfectly valid state array — while the copy this used to make
+/// was the single most expensive thing on the batched path: the GDN state
+/// is ~2 MB per layer per slot, so materializing it here cost a full extra
+/// read+write of the whole trunk state (hundreds of MB) every step, for
+/// nothing. Next tick's merge concatenates the views straight back.
+///
+/// Safe because the one consumer that must outlive the parent — the
+/// prefix-cache checkpoint (`captureSsmCheckpoint`) — already takes
+/// `materializedOwnedCopy` + a batched eval of whatever it is handed, so
+/// no view escapes into storage. Do NOT read that guarantee off the
+/// similarly-named `ssmSnapshot`: the PLD-rollback snapshot deliberately
+/// shares the handle (transient, per-decode-step), so a snapshot taken
+/// while these views are live pins the whole merged [N, …] parent until
+/// the rollback window closes. Bounded, but it is the same retention
+/// shape as the 3.4x hot-cache under-count.
+pub fn splitSsmToSlots(self: *Transformer, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize) !void {
+    const lw = &self.moe_layers.?[layer];
+    try ssmSplitLayer(self.s, m, ctxs, layer, .{ .linear = lw.is_linear, .ple = lw.ple != null });
+}
+
+pub fn ssmGroupDrop(self: *Transformer, entries: []SSMCacheEntry) void {
+    ssmGroupDropMember(&self.ssm_group, self.s, entries) catch {};
+}
+
+/// Called at the entry of EVERY non-group forward (serial decode, prefill, the
+/// MTP solo arms): a member's live row goes back to its own entries before the
+/// solo path reads or writes them. A no-op for a slot that is not bound.
+pub fn ssmGroupRelease(self: *Transformer, ctx: *ForwardCtx) !void {
+    try ssmGroupReleaseCtx(&self.ssm_group, self.s, ctx);
+}
+
+pub fn ssmBindBatched(self: *Transformer, ctxs: []const *ForwardCtx, kinds: []const SsmMergeKind) !void {
+    const persist = self.persistent_group_state_override orelse true;
+    const bind = try ssmBindTickState(self.allocator, self.s, &self.ssm_group, ctxs, kinds, persist);
+    if (bind.owned) {
+        defer {
+            for (bind.merged) |*m| ssmFreeMergedLayer(m);
+            self.allocator.free(bind.merged);
+        }
+        try ssmSplitAll(self.s, bind.merged, ctxs, kinds);
+    }
 }
 
 test "persistent group: N=4 stable ticks issue zero merge/split ops after the first" {
