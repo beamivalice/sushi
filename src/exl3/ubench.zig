@@ -7,6 +7,7 @@ const report = @import("mlx_host").report;
 const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
+const project_rows = @import("project_rows.zig");
 const rate_groups = @import("rate_groups.zig");
 const root = @import("root.zig");
 const bench = @import("bench_util.zig");
@@ -1311,9 +1312,9 @@ fn trunkStep(t: Trunk, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!m
     const sh = t.sh;
     switch (t.arm) {
         0, 1, 2 => {
-            const served = t.rows <= @as(usize, @intCast(kernels.PROJECT_ROWS_MAX));
-            kernels.rows_exact = t.arm == 1;
-            defer kernels.rows_exact = false;
+            const served = t.rows <= @as(usize, @intCast(project_rows.PROJECT_ROWS_MAX));
+            project_rows.rows_exact = t.arm == 1;
+            defer project_rows.rows_exact = false;
             root.linear.force_arm = if (t.arm == 2 and served) .gemv else null;
             defer root.linear.force_arm = null;
             if (sh.groups > 1) return root.linear.linearGrouped(s, x, t.stq[c], dec);
@@ -1370,7 +1371,7 @@ fn runTrunkRows(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
     defer {
         kernels.setDecodeParams(.mul1);
-        kernels.rows_exact = false;
+        project_rows.rows_exact = false;
         root.linear.force_arm = null;
     }
     var prng = std.Random.DefaultPrng.init(0x7a);

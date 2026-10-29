@@ -6,6 +6,7 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 pub const format = @import("expert_exl3.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
+pub const project_rows = @import("project_rows.zig");
 pub const glm_group2 = @import("glm_group2.zig");
 pub const glm_fold = @import("glm_fold.zig");
 pub const qwen_riders = @import("qwen_riders.zig");
@@ -460,6 +461,7 @@ test {
     _ = format;
     _ = kernels;
     _ = @import("kernel_source.zig");
+    _ = project_rows;
     _ = codebook_tables;
 }
 

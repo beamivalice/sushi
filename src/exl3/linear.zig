@@ -7,6 +7,7 @@ const mlx = @import("mlx_host").mlx;
 const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
+const project_rows = @import("project_rows.zig");
 const root = @import("root.zig");
 
 /// Tests and the trunk bench: `rows` is the served arm up to `PROJECT_ROWS_MAX`, `gemm` the sorted GEMM at any width,
@@ -41,7 +42,7 @@ pub const SHARED_MAX: usize = 4;
 /// `[S, in]` (one row per linear), `svh` `[1, out]`; linear s owns columns `cols[s]..cols[s + 1]`, each a multiple of 128.
 pub const Shared = struct { p: root.Proj, cols: [SHARED_MAX + 1]c_int, count: usize };
 
-/// `x` [rows, in] (rows <= `kernels.PROJECT_ROWS_MAX`) through every linear of `sh` in one multi-row launch: `outs[s]` is
+/// `x` [rows, in] (rows <= `project_rows.PROJECT_ROWS_MAX`) through every linear of `sh` in one multi-row launch: `outs[s]` is
 /// linear s's [rows, width] in x's dtype (the caller frees each). A row holds the bar of its own linear's launch; the
 /// sum order may differ from it, since the launch splits k for the stacked width.
 pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array) !void {
@@ -52,7 +53,7 @@ pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.D
     const total = sh.cols[sh.count];
     var bounds: [3]c_int = @splat(total);
     for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
-    const flat = try kernels.projectRowsSegmented(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, bounds);
+    const flat = try project_rows.projectRowsSegmented(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, bounds);
     defer _ = mlx.mlx_array_free(flat);
     var made: usize = 0;
     errdefer for (outs[0..made]) |o| {
@@ -78,8 +79,8 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
     const tsh = mlx.getShape(p.trellis);
     if (tsh.len != 4 or tsh[0] != groups) return error.BadExl3Shape;
     kernels.setDecodeParams(dec);
-    if ((force_arm orelse if (rows <= kernels.PROJECT_ROWS_MAX) Arm.rows else Arm.gemm) == .rows)
-        return kernels.projectRows(s, x, p.trellis, p.suh, p.svh);
+    if ((force_arm orelse if (rows <= project_rows.PROJECT_ROWS_MAX) Arm.rows else Arm.gemm) == .rows)
+        return project_rows.projectRows(s, x, p.trellis, p.suh, p.svh);
     const alloc = std.heap.page_allocator;
     const ids = try alloc.alloc(u32, groups * rows);
     defer alloc.free(ids);
@@ -280,7 +281,7 @@ test "exl3 linear: one-bank and grouped trellis linears hold the f32-truth bar o
     const out: usize = 256;
     var failed: usize = 0;
     for (cases) |cs| for ([_]usize{ 1, 2, 8 }) |groups| for ([_]usize{ 1, 3, 8, 70 }) |rows| for ([_]Arm{ .rows, .gemm, .gemv }) |arm| for ([_]mlx.mlx_dtype{ .float16, .bfloat16, .float32 }) |dt| {
-        if ((arm == .gemv and rows > 3) or (arm == .rows and rows > kernels.PROJECT_ROWS_MAX)) continue;
+        if ((arm == .gemv and rows > 3) or (arm == .rows and rows > project_rows.PROJECT_ROWS_MAX)) continue;
         if (groups == 8 and rows > 8) continue;
         force_arm = arm;
         defer force_arm = null;
@@ -494,8 +495,8 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     defer kernels.setDecodeParams(.mul1);
-    kernels.rows_exact = true;
-    defer kernels.rows_exact = false;
+    project_rows.rows_exact = true;
+    defer project_rows.rows_exact = false;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -529,8 +530,8 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
             if (width == 1) {
                 one_row = try alloc.dupe(f32, got);
                 if (sh.out == 129280) {
-                    kernels.rows_exact = false;
-                    defer kernels.rows_exact = true;
+                    project_rows.rows_exact = false;
+                    defer project_rows.rows_exact = true;
                     const serial = try linearGrouped(s, part, h.p, dec);
                     defer _ = mlx.mlx_array_free(serial);
                     var cs = mlx.mlx_array_new();

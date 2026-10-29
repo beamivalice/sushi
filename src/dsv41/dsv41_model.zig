@@ -1370,7 +1370,7 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
         const hd = c.head_dim;
         const xf = try sc.astype(x, .float32);
         var proj: [2]A = undefined;
-        if (cw.shared != null and dim(xf, 0) <= exl3.kernels.PROJECT_ROWS_MAX)
+        if (cw.shared != null and dim(xf, 0) <= exl3.project_rows.PROJECT_ROWS_MAX)
             try sharedApply(sc, cw.shared.?, cw.wkv.stq.?.dec, xf, &proj)
         else
             proj = .{ try denseLin(sc, m, &cw.wkv, xf), try denseLin(sc, m, &cw.wgate.?, xf) };
@@ -1906,7 +1906,7 @@ pub const DsKeys = struct { keys: A, band: A = none, pos: A = none };
 /// The attention input's projections: wq_a, wkv and (none past the stacked bank) a ratio-1 compressor's wkv, from one
 /// launch at decode widths.
 fn attnIn(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
-    if (ly.in_shared) |sh| if (dim(h, 0) <= exl3.kernels.PROJECT_ROWS_MAX) {
+    if (ly.in_shared) |sh| if (dim(h, 0) <= exl3.project_rows.PROJECT_ROWS_MAX) {
         var outs: [3]A = .{ none, none, none };
         try sharedApply(sc, sh, ly.wq_a.stq.?.dec, h, outs[0..sh.count]);
         return outs;
@@ -3431,8 +3431,8 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
 pub fn verify(m: *Model, ids: []const u32) !A {
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
-    exl3.kernels.rows_exact = m.dspark_exact;
-    defer exl3.kernels.rows_exact = false;
+    exl3.project_rows.rows_exact = m.dspark_exact;
+    defer exl3.project_rows.rows_exact = false;
     if (ids.len == 1) return extend(m, ids, .all);
     const nl = m.cfg.layers;
     var v: Verify = .{
