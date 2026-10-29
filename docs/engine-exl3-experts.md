@@ -398,7 +398,7 @@ trunk SPEC1 (`spec1-w15`) n64, head n96, DSpark stage experts PAIR1 n32 resident
 chain's). A pair threadgroup re-derived its K span of x (the Hadamard) and a down threadgroup the whole SwiGLU mid and
 its Hadamard, 72 and 160 times a slot; the chain now runs `pairPrepare` and a mid kernel (`midMixed`, the clamp in it)
 once per slot and the pair and down GEMVs read them through the same rate-class switch. Chain per layer, interleaved
-in one process (`SUSHI_DSV41_EXPERT_UBENCH=1`, QUIET, lock): rows 2/3/4/5/6/16 =
+in one process (`sushi-ubench run dsv41.experts`, QUIET, lock): rows 2/3/4/5/6/16 =
 285/413/544/672/798/2286 us self-preparing, 241/348/456/561/665/1878 prepared (0.82-0.85x) on layers 2, 5 and 23 and
 the DSpark stage bank; about 5 ms off a 6-row verify. Live, interleaved per sweep cycle in one boot (idle box, 180 s fans-max idle, ~1250 rounds), the verify ms are 2 to 7 ms lower at rows 2..8 (1k context: 2-row 53 -> 50, 4-row 75 -> 72, 6-row 103 -> 97; 16k inside noise). A repeated expert costs the same as a new one (the `shared` mode of
 the ubench, every row picks the same six: 273/395/515/734/1065 us at rows 2..6, level with distinct experts), so the slot
@@ -428,8 +428,8 @@ every rate group of layer 2): all against a dense f64 product of the host tile d
 Timing, on a loaded box (best of 40 four-step dependent chains per cell, link floor removed, no GPU lock;
 ratios and orderings are usable, absolute microseconds are not; commit and settings in
 [perf-baselines](perf-baselines.md#dsv41-stq)): `SUSHI_DSV41_STQ_UBENCH=<shape filter|1>` (trunk linears against the
-GEMM, the indexed GEMV, mxfp8 and affine-4) and `SUSHI_DSV41_EXPERT_UBENCH=1` (the grouped chain at the plan's layers 2,
-5, 23 and the stage), both on the exl3 test binary; `SUSHI_UBENCH_STEPS` / `SUSHI_UBENCH_ROUNDS` size the chains.
+GEMM, the indexed GEMV, mxfp8 and affine-4) on the exl3 test binary, `SUSHI_UBENCH_STEPS` / `SUSHI_UBENCH_ROUNDS` sizing
+the chains; and `sushi-ubench run dsv41.experts` (the grouped chain at the plan's layers 2, 5, 23 and the stage).
 
 <a id="dsv41-shared-fused"></a>
 **The shared expert rides the routed chain's launches** (`rate_groups.moeDecodeClampedSharedFused`, 1 to 16 rows, the

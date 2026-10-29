@@ -36,6 +36,8 @@ scripts/gpu-lock.sh acquire <owner>
 scripts/gpu-lock.sh release <owner>
 ```
 
+`sushi-ubench` takes and releases the lock itself ([process-ubench](process-ubench.md)).
+
 - Lock = a full model load (server boot, `kld capture|compare`, live test) or a quiet-box bench or timing whose
   absolute number is recorded. Conversions, pilots, builds and tests run in parallel without it when memory fits:
   a conversion peaks near 20 GB, so it may run beside a Qwen-size load (~50-65 GB) but never beside a MiMo-size one

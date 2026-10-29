@@ -22,7 +22,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
 - A source scan (`@embedFile` + "this text appears"). Test the behaviour, or state the rule in a comment.
 - A struct literal read back, a compile-shape check, a "does not crash" or "is finite" smoke with no oracle.
-- A wall-clock assertion. Timing is a ubench behind its env switch, never in the suite.
+- A wall-clock assertion. Timing is a microbench in `sushi-ubench` ([process-ubench](process-ubench.md)); a test that
+  timed something keeps its exactness half.
 - A test of code no served path reaches. Dead code goes with its tests in the same commit.
 - An assertion that a model must think, answer or call a tool. Assert the invariant, branch on the model's choice.
 - A second copy of a check another test already makes on the same input with as strong an assertion.
@@ -34,7 +35,6 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 | host | touches no MLX array; its file reaches no `mlx.zig` | `zig build test-host`: anywhere, beside a live server, no GPU lock, every PR in CI |
 | gpu | Metal kernels on small synthetic tensors; the first line is `try mlx.requireGpu();` | `zig build test` |
 | pack | needs a fixture or pack named by an env var; skips when it is unset | `zig build test` with the env set |
-| bench | timing behind its env switch; asserts nothing about time | on request only |
 
 - `zig build test-host` builds `src/tests_host.zig`, a root that links no MLX: a file in it that reaches MLX fails the
   link. The build reads that root's imports as the host list, and no MLX bucket may also select a host file's tests.
@@ -45,6 +45,12 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   suite proves nothing there.
 - Model scope is `qwen4`, `mimo2`, `glm5`, `dsv41`, `enc` (the encoder) or `shared` (every model). A test's file says
   its model; a test of one model's code lives in that model's files.
+
+## Microbenches
+
+`sushi-ubench` is not a tier: `zig build test` never builds it, CI only compiles it, and its files hold no `test`
+block (the build refuses one). Its output is ms across rungs, never pass/fail; see [process-ubench](process-ubench.md).
+Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 
 ## Where a test lives
 

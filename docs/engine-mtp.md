@@ -87,8 +87,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default;
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis
   verify) when it prices one cheaper, and `mtpRoundsStaySolo` does not gate it. Only when the planner declines the
-  tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`;
-  `mergedVerifyDeclineReason` names the decline). Four MTP streams on MCG K3
+  tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`). Four MTP streams on MCG K3
   aggregate ~85 tok/s; a linear model of the measured verify-row cost predicts ~95-125 with merged verify at depth
   2-3. Measure before any code.
 - <a id="greedy-shortlist"></a>**A greedy MiMo forward reads the trunk head through the drafts' shortlist**

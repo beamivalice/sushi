@@ -287,7 +287,7 @@ composite.
   can't load a DENSE checkpoint (`getLayerScaleOpt`; every dense contracted
   weight owes `maybeTransposeForBf16`).
 - **A gather-read table may be quantized only where the READER has a
-  quantized-gather path**: LM `embed_tokens` via `gatherQuantizedRows` is a
+  quantized-gather path**: LM `embed_tokens` via `Transformer.rawEmbedding` is a
   SIZE decision (our packs quantize it).
 - A component pack's shared files are immutable: a converter replaces a
   hard-linked file, never modifies it in place.
