@@ -168,6 +168,7 @@ test {
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
+    _ = @import("dsv41/dsv41_thought_point.zig");
     _ = @import("glm5/glm5_rows_tick.zig");
     _ = @import("kld.zig");
     _ = @import("bench.zig");
