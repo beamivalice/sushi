@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
@@ -1698,8 +1699,8 @@ test "qsa decode gather: subset SDPA matches masked full SDPA at decode width" {
     // same selection + tail, ascending order, causal-visible by construction.
     // Remaining deltas are kernel tiling order only.
     const s = mlx.gpuStream();
-    trf.qsa_decode_gather_override = true;
-    defer trf.qsa_decode_gather_override = null;
+    qwen4_qsa_gather.qsa_decode_gather_override = true;
+    defer qwen4_qsa_gather.qsa_decode_gather_override = null;
     var prng = std.Random.DefaultPrng.init(0x60d31);
     const rnd = prng.random();
     const kL: c_int = 50;
@@ -1761,7 +1762,7 @@ test "qsa decode gather: subset SDPA matches masked full SDPA at decode width" {
     try std.testing.expect(diff_dense < 0.01);
 
     // Kill switch + wrong-dtype blocks decline to the mask arm.
-    trf.qsa_decode_gather_override = false;
+    qwen4_qsa_gather.qsa_decode_gather_override = false;
     try std.testing.expect((try qsaDecodeGatherAttn(s, q, &view, fx.blocks, ratio, scale)) == null);
 }
 
@@ -1773,8 +1774,8 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
     defer qsa_verify_gather_override = null;
     qsa_verify_gather_min_kv_override = 16;
     defer qsa_verify_gather_min_kv_override = null;
-    trf.qsa_batched_gather_override = true;
-    defer trf.qsa_batched_gather_override = null;
+    qwen4_qsa_gather.qsa_batched_gather_override = true;
+    defer qwen4_qsa_gather.qsa_batched_gather_override = null;
     var prng = std.Random.DefaultPrng.init(0xc0de);
     const rnd = prng.random();
     const ratio: c_int = 4;
@@ -2995,16 +2996,16 @@ test "QSA verify rows are bit-identical to decode at both KV tile sizes" {
     const s = mlx.gpuStream();
     const a = testing.allocator;
     const old_kernel = qsa_attn_kernel_override;
-    const old_decode = trf.qsa_decode_gather_override;
+    const old_decode = qwen4_qsa_gather.qsa_decode_gather_override;
     const old_verify = qsa_verify_gather_override;
     const old_bk = qsa_attn_bk_override;
     const old_split = qsa_attn_nsplit_override;
     qsa_attn_kernel_override = true;
-    trf.qsa_decode_gather_override = true;
+    qwen4_qsa_gather.qsa_decode_gather_override = true;
     qsa_verify_gather_override = true;
     qsa_attn_nsplit_override = 16;
     defer qsa_attn_kernel_override = old_kernel;
-    defer trf.qsa_decode_gather_override = old_decode;
+    defer qwen4_qsa_gather.qsa_decode_gather_override = old_decode;
     defer qsa_verify_gather_override = old_verify;
     defer qsa_attn_bk_override = old_bk;
     defer qsa_attn_nsplit_override = old_split;

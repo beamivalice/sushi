@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const qwen4_qsa_gather = @import("qwen4/qwen4_qsa_gather.zig");
 const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -17328,8 +17329,8 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the sam
     // Decode/verify widths build the dense mask; prefill widths gather by
     // block and bill the bounded score sheet instead of 4 B x rows x keys.
     try t.expectEqual(@as(u64, 4 * 8 * 25000 * 5 / 4), qsaMaskBytes(&q4, 8, 25000));
-    transformer_mod.qsa_gather_override = true;
-    defer transformer_mod.qsa_gather_override = null;
+    qwen4_qsa_gather.qsa_gather_override = true;
+    defer qwen4_qsa_gather.qsa_gather_override = null;
     const saved_fused = transformer_mod.qsa_score_fused_override;
     const saved_nax = transformer_mod.vqmm_nax_probe_override;
     defer {
@@ -19569,8 +19570,8 @@ test "a QSA arch's kv-quant dequant scratch follows the widest forward that stil
     qwen4_qsa_attn.qsa_attn_kernel_override = false;
     try t.expectEqual(@as(u64, 0), kvDequantScratchBytes(&cfg, seq, 16));
     qwen4_qsa_attn.qsa_attn_kernel_override = null;
-    transformer_mod.qsa_gather_override = false;
-    defer transformer_mod.qsa_gather_override = null;
+    qwen4_qsa_gather.qsa_gather_override = false;
+    defer qwen4_qsa_gather.qsa_gather_override = null;
     try t.expectEqual(@as(u64, 0), kvDequantScratchBytes(&cfg, seq, 16));
 }
 

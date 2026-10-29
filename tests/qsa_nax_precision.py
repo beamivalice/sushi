@@ -70,7 +70,7 @@ def kernel(kind: str, terms: int = 3, out_f32: bool = True):
             header = header.replace("using PT = half;", "using PT = bfloat;")
         name = f"qsa_nax_t{terms}_{'f32' if out_f32 else 'bf16'}"
     else:
-        src = zig_metal("ATTN_QSA256_KERNEL_SOURCE")
+        src = zig_metal("ATTN_QSA256_KERNEL_SOURCE", os.path.join(ROOT, "src/qwen4/qwen4_qsa_gather.zig"))
         header = zig_metal("ATTN_PD_KERNEL_HEADER") + zig_metal("ATTN_QSA256_KERNEL_HEADER")
         name = f"qsa_stock_{'f32' if out_f32 else 'bf16'}"
     if out_f32:

@@ -60,6 +60,7 @@ test {
     _ = @import("qwen4/gdn_decode.zig");
     _ = @import("qwen4/qwen4_qsa.zig");
     _ = @import("qwen4/qwen4_qsa_attn.zig");
+    _ = @import("qwen4/qwen4_qsa_gather.zig");
     _ = @import("glm5/glm5_vision.zig");
     _ = @import("glm5/glm5_serving.zig");
     _ = @import("dsv41/dsv41_vision.zig");

@@ -1,6 +1,7 @@
 //! Flash-Next quantized sparse attention: block pooling, scoring and top-block selection.
 
 const trf = @import("../transformer.zig");
+const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const Transformer = trf.Transformer;
 const std = @import("std");
 const mlx = @import("../mlx.zig");
@@ -66,7 +67,7 @@ const splitMaskedSdpa256 = trf.splitMaskedSdpa256;
 const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
 
 pub fn qsaPrefillGatherMinKv() c_int {
-    if (trf.qsa_gather_min_kv_override != null) return qsaGatherMinKv();
+    if (qwen4_qsa_gather.qsa_gather_min_kv_override != null) return qsaGatherMinKv();
     const serving = qsaNaxEnabled() and qsaNaxOsOk() and verifyQmmNaxAvailable();
     return qsaPrefillGatherMinKvFrom(FUSED256_MIN_Q_LEN, serving, null);
 }
