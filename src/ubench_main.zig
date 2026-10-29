@@ -26,6 +26,7 @@ const registry = [_]report.Bench{
     dsv41.index_block_peak,
     dsv41.rows_growth,
     dsv41.attn_span,
+    dsv41.picks_span,
     dsv41.topk,
     exl3.ubench.decode_chain,
     exl3.ubench.grouped_decode,

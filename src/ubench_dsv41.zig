@@ -441,6 +441,62 @@ fn runAttnSpan(run: *report.Run) anyerror!void {
     }
 }
 
+// ── dsv41.picks_span ────────────────────────────────────────────────────
+
+pub const picks_span: report.Bench = .{
+    .name = "dsv41.picks_span",
+    .scope = .dsv41,
+    .what = "one prefill span's compressed picks and fused attention at the release geometry: the picked rows unpacked and gathered first, against the kernel decoding them from the packed store; MLX peak beyond the inputs",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{
+        .{ .name = "span", .values = &.{ "256k512", "128k512" }, .numeric = false },
+        .{ .name = "rows", .values = &.{ "8192", "262144" } },
+    },
+    .arms = &.{ "gather", "packed" },
+    .ref = "gather",
+    .run = runPicksSpan,
+};
+
+const PicksSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, rows: *const model.Rows, peak: [2]Range = @splat(.{}) };
+
+fn samplePicks(s: *PicksSample, arm: usize) anyerror!f64 {
+    const scale = 1.0 / @sqrt(@as(f32, 512));
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    const p = Peak.begin(s.gpu);
+    var sw = io_util.Stopwatch.init(io());
+    const picks = try model.packedPicks(&sc, s.rows, s.d.topk, arm == 1);
+    const y = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, s.c.wp, s.c.window, picks, scale, .bfloat16);
+    try mlx.check(mlx.mlx_array_eval(y));
+    const ns = sw.read();
+    s.peak[arm].add(p.end());
+    return @floatFromInt(ns);
+}
+
+fn runPicksSpan(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    var rows_buf: [8]usize = undefined;
+    const Case = struct { name: []const u8, L: usize };
+    for ([_]Case{ .{ .name = "256k512", .L = 256 }, .{ .name = "128k512", .L = 128 } }) |cs| {
+        if (!listed(run.axis("span"), cs.name)) continue;
+        for (try axisInts(run, "rows", &rows_buf)) |nc| {
+            const c: model.AttnCase = .{ .L = cs.L, .wp = 127, .K = 512, .nc = nc, .holes = false };
+            var base = Scope.init(alloc, gpu);
+            defer base.deinit();
+            const d = try model.attnCaseData(&base, c, 0xa77);
+            var store = try model.packedStore(&base, d.comp);
+            defer store.deinit();
+            try evalAll(&.{ d.q, d.keys, d.sink, d.topk, store.buf, store.sbuf });
+            var s: PicksSample = .{ .gpu = gpu, .d = d, .c = c, .rows = &store };
+            const label = try std.fmt.allocPrint(run.a, "span {d} rows {d}", .{ cs.L, nc });
+            try run.interleave(label, &s, samplePicks);
+            try s.peak[0].metrics(run, "gather", "peak");
+            try s.peak[1].metrics(run, "packed", "peak");
+        }
+    }
+}
+
 // ── dsv41.topk ──────────────────────────────────────────────────────────
 
 pub const topk: report.Bench = .{

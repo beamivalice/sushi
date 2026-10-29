@@ -923,7 +923,7 @@ pub fn attnWide(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, 
 /// the output. The softmax is online in f32, seeded by the sink (max = sink, sum = 1, zero value), so rows with
 /// no key leave 0. P reaches the bf16 matrix unit as a high and a low part, which keeps ~16 bits of it.
 /// meta = {wp, window, K, nc}.
-const ATTN_FUSED_SOURCE =
+const ATTN_FUSED_HEAD =
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int l = threadgroup_position_in_grid.y, h0 = threadgroup_position_in_grid.x * HB;
     \\const int wp = meta[0], window = meta[1], K = meta[2], nc = meta[3];
@@ -963,6 +963,10 @@ const ATTN_FUSED_SOURCE =
     \\  bool any = false;
     \\  for (int j = 0; j < KT; ++j) any = any || rsrc[j] != -1;
     \\  if (!any) continue;
+;
+
+/// The picked rows' tile load: `comp` holds them as bf16 rows, `topk` indexing its first `nc`.
+const ATTN_FUSED_LOAD_ROWS =
     \\  for (int i = int(tid); i < KT * (D / 8); i += NT) {
     \\    const int j = i / (D / 8), cc = i % (D / 8), src = rsrc[j];
     \\    metal::uint4 v = metal::uint4(0);
@@ -970,6 +974,33 @@ const ATTN_FUSED_SOURCE =
     \\    else if (src != -1) v = ((const device metal::uint4*)(comp + size_t(-2 - src) * D))[cc];
     \\    ((threadgroup metal::uint4*)kt)[i] = v;
     \\  }
+;
+
+/// The same tile load from the compressed store as it is kept (`ccodes` `[rows, D / 2]`, `cscales` `[rows, D / G]`,
+/// `qat_mod.packFp4`'s form): a picked row is decoded as `qat_mod.unpackFp4` does and lands in the tile as T.
+const ATTN_FUSED_LOAD_FP4 =
+    \\  for (int i = int(tid); i < KT * (D / 8); i += NT) {
+    \\    const int j = i / (D / 8), cc = i % (D / 8), src = rsrc[j];
+    \\    if (src < -1) {
+    \\      const size_t row = size_t(-2 - src);
+    \\      const device uchar* cp = ccodes + row * (D / 2) + cc * 4;
+    \\      const float s = scale_of(uint(cscales[row * (D / G) + cc * 8 / G]), MODE);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int e = 0; e < 8; ++e) {
+    \\        const uint byte = uint(cp[e / 2]);
+    \\        const uint code = (e & 1) ? byte >> 4 : byte & 15u;
+    \\        const float v = E2M1[code & 7u] * s;
+    \\        kt[j * D + cc * 8 + e] = static_cast<T>((code & 8u) ? -v : v);
+    \\      }
+    \\    } else {
+    \\      metal::uint4 v = metal::uint4(0);
+    \\      if (src >= 0) v = ((const device metal::uint4*)(keys + size_t(src) * D))[cc];
+    \\      ((threadgroup metal::uint4*)kt)[i] = v;
+    \\    }
+    \\  }
+;
+
+const ATTN_FUSED_TAIL =
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  metal::simdgroup_matrix<float, 8, 8> s[RT][KC];
     \\  #pragma clang loop unroll(full)
@@ -1063,7 +1094,11 @@ const ATTN_FUSED_SOURCE =
     \\}
 ;
 
+const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
+const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
+
 var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE };
+var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = qat_mod.PACK_HEADER };
 
 const fused_hb = 16;
 const fused_nsg = 8;
@@ -1078,20 +1113,46 @@ pub fn attnFusedFits(h: usize, d: usize) bool {
 /// against the window rows `keys_w` (query i sees rows (wp + i - window, wp + i]) and the compressed rows
 /// `comp_rows` it picked (`topk` `[L, K]`), f32 throughout past the bf16 operands.
 pub fn attnFused(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+    const dt = mlx.mlx_array_dtype(q);
+    const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
+    const keys = try sc.astype(keys_w, dt);
+    const comp = if (K > 0) try sc.astype(comp_rows, dt) else keys;
+    const picks = if (K > 0) try sc.astype(topk, .int32) else sc_mod.none;
+    return attnFusedLaunch(sc, &attn_fused_def, sink, q, keys, &.{comp}, wp, window, K, if (K > 0) dim(comp_rows, 0) else 0, picks, scale, out_dt, &.{});
+}
+
+/// `attnFused` with the picked rows read where the compressed store keeps them: `codes` `[rows, D / 2]` and
+/// `scales` `[rows, D / group]` (`qat_mod.packFp4`'s form), `topk` the ids into them. Each row is decoded as
+/// `qat_mod.unpackFp4` does, so the heads are the bytes `attnFused` gives for the unpacked rows.
+pub fn attnFusedPacked(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, codes: A, scales: A, mode: qat_mod.Qat, group: usize, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+    std.debug.assert(group % 8 == 0 and dim(codes, 1) * 2 == dim(q, 2));
+    const keys = try sc.astype(keys_w, mlx.mlx_array_dtype(q));
+    const extra = [_]Tmpl{ .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) } };
+    return attnFusedLaunch(sc, &attn_fused_fp4_def, sink, q, keys, &.{ codes, scales }, wp, window, dim(topk, 1), dim(codes, 0), try sc.astype(topk, .int32), scale, out_dt, &extra);
+}
+
+/// `comp`: the picked rows' arrays, as `def` takes them; `picks`: `topk` as int32, none without picks.
+fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const A, wp: usize, window: usize, K: usize, nc: usize, picks: A, scale: f32, out_dt: mlx.mlx_dtype, extra: []const Tmpl) !A {
     const L = dim(q, 0);
     const H = dim(q, 1);
     const D = dim(q, 2);
-    const dt = mlx.mlx_array_dtype(q);
-    const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
-    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), if (K > 0) ci(dim(comp_rows, 0)) else 0 };
+    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), ci(nc) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
-    const keys = try sc.astype(keys_w, dt);
-    const comp = if (K > 0) try sc.astype(comp_rows, dt) else keys;
-    const picks = if (K > 0) try sc.astype(topk, .int32) else meta;
+    var ins: [8]A = undefined;
+    ins[0] = q;
+    ins[1] = keys;
+    @memcpy(ins[2..][0..comp.len], comp);
+    var n = 2 + comp.len;
+    for ([_]A{ if (picks.ctx != null) picks else meta, sink, meta, try f32Const(sc, &.{scale}) }) |a| {
+        ins[n] = a;
+        n += 1;
+    }
+    var tmpl: [6]Tmpl = undefined;
+    const base = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = fused_hb }, .{ .name = "NSG", .v = fused_nsg }, .{ .name = "KT", .v = fused_kt } };
+    @memcpy(tmpl[0..base.len], &base);
+    @memcpy(tmpl[base.len..][0..extra.len], extra);
     var o: [1]A = undefined;
-    try launch(sc, &attn_fused_def, &.{ q, keys, comp, picks, sink, meta, try f32Const(sc, &.{scale}) }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, &.{
-        .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = fused_hb }, .{ .name = "NSG", .v = fused_nsg }, .{ .name = "KT", .v = fused_kt },
-    }, &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = out_dt } }, &o);
+    try launch(sc, def, ins[0..n], &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
     return o[0];
 }
 

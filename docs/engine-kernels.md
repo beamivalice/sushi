@@ -150,6 +150,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   core 6.3-7.2, wide 2.8-3.2, fused 1.5-1.7; window-only span 256 core 3.6-4.0, wide 2.1, fused 0.7-1.0. Peak bytes beyond
   the inputs a span: core 897 MB, wide 284 MB, fused 16 MB (the output). Four simdgroups were 15% slower than eight.
   The box was shared with other Metal compiles, so the fused arm spread up to 2x between runs; core and wide hold.
+- `dsv41_attn_fused_fp4` reads the picked rows straight from the packed FP4 store (codes and scales, by original row id)
+  and decodes each into the threadgroup tile as `unpackFp4` does, so its heads equal the unpack-and-gather path's byte
+  for byte; it replaces the gather on wide bf16 spans. `sushi-ubench run dsv41.picks_span` (c5fec957 + this kernel, quiet box, AC, 7
+  rounds): span 256 3.4 ms against 6.1 for gather + fused, span 128 1.8 against 3.1; peak beyond the inputs 16 MB
+  against 182 MB. Resident 32K prefill (`--drop-expert 128`, one boot an arm, profiled): 1016.5 to 1078.4 tok/s.
 
 ## Verify lanes
 

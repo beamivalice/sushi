@@ -1724,11 +1724,22 @@ const Shared = struct {
     }
 };
 
-const Picks = struct { comp_rows: A = none, topk: A = none };
+/// `comp_rows`: the picked rows as values, `topk` indexing them. `store`, with `raw`: the compressed store itself, with
+/// `topk` the ids into it.
+pub const Picks = struct {
+    comp_rows: A = none,
+    topk: A = none,
+    store: ?*const Rows = null,
+
+    fn any(self: Picks) bool {
+        return self.comp_rows.ctx != null or self.store != null;
+    }
+};
 
 /// The compressed rows span `si` (chunk rows [a, b)) attends to and the groups it picked: the indexer's top-k
-/// when this layer owns one, else the one a layer above handed down (`sh`).
-fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr: A, p0: usize, a: usize, b: usize, sh: *Shared, si: usize) !Picks {
+/// when this layer owns one, else the one a layer above handed down (`sh`). `raw`: a packed store is handed over
+/// as it is, for the kernel that decodes the picks itself.
+fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr: A, p0: usize, a: usize, b: usize, sh: *Shared, si: usize, raw: bool) !Picks {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const r = ly.ratio;
@@ -1743,8 +1754,13 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
     const src = c.latest(li, Config.isKvSource);
     const comp = &st.layers[src].comp.?;
     if (comp.pack == null) return .{ .topk = sh.topk[si], .comp_rows = try comp.rows(sc, clen) };
-    // Packed rows: only the picks are unpacked, and the picks then index them in order.
-    const topk = sh.topk[si];
+    return packedPicks(sc, comp, sh.topk[si], raw and comp.dtype == .bfloat16);
+}
+
+/// The picks `topk` of the packed store `comp`: handed over as they are when `raw`, else unpacked, and then the ids
+/// index the unpacked rows in order.
+pub fn packedPicks(sc: *Scope, comp: *const Rows, topk: A, raw: bool) !Picks {
+    if (raw) return .{ .topk = topk, .store = comp };
     const K = dim(topk, 1);
     const n = dim(topk, 0) * K;
     const picked = try comp.gather(sc, try sc.reshape(try sc.maximum(topk, try sc.i(0)), &.{ci(n)}));
@@ -1795,7 +1811,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     if (fus and L <= NARROW_ROWS and rd > 0 and kernels.attnDecodeFits(hd) and ls.win.cap >= window + L - 1) {
         // The ring holds this chunk's rows before the kernel reads them; the heads leave inverse-rotated.
         try ls.win.write(kv, p0, sc.s);
-        const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0);
+        const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
         if (pf) |p| try p.mark(.indexer, if (picks.comp_rows.ctx != null) &.{ picks.comp_rows, picks.topk } else &.{ls.win.buf});
         const o = try kernels.attnDecode(sc, .{
             .q = q,
@@ -1814,6 +1830,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         if (pf) |p| try p.mark(.core, &.{o});
         return attnOut(sc, m, ly, o, m.qat_on);
     }
+    const one_pass = fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd);
     const n_spans = (L + span - 1) / span;
     const heads = try sc.a.alloc(A, n_spans);
     defer sc.a.free(heads);
@@ -1840,14 +1857,14 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         const qpos = try ssc.add(try ssc.reshape(try ssc.arange(0, Ls), &.{ ci(Ls), 1 }), try ssc.i(ci(p0 + a)));
         const band = try ssc.op2(mlx.mlx_logical_and, try ssc.op2(mlx.mlx_less_equal, kpos, qpos), try ssc.op2(mlx.mlx_greater, kpos, try ssc.sub(qpos, try ssc.i(ci(window)))));
 
-        const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si);
+        const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
         if (pf) |p| {
             const got = [_]A{ keys_w, picks.comp_rows, picks.topk };
             try p.mark(.indexer, got[0..if (picks.comp_rows.ctx != null) 3 else 1]);
         }
-        const K = if (picks.comp_rows.ctx != null) dim(picks.topk, 1) else 0;
-        const head = if (fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd))
-            try kernels.attnFused(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
+        const K = if (picks.any()) dim(picks.topk, 1) else 0;
+        const head = if (one_pass)
+            try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act)
         else if (m.attn_f16 and fus and (m.act == .bfloat16 or m.act == .float16) and wk + K <= kernels.attn_softmax_max_cols)
             try kernels.attnWide(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
         else
@@ -1866,6 +1883,13 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     const out = try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
     if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
     return out;
+}
+
+/// `kernels.attnFused` over a span's `picks`: a packed store is decoded inside the kernel when `q` is the store's dtype.
+pub fn fusedHeads(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, picks: Picks, scale: f32, out_dt: mlx.mlx_dtype) !A {
+    const rows = picks.store orelse return kernels.attnFused(sc, sink, q, keys_w, wp, window, picks.comp_rows, picks.topk, scale, out_dt);
+    const pk = rows.pack.?;
+    return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf, rows.sbuf, pk.mode, pk.group, picks.topk, scale, out_dt);
 }
 
 /// What a DSpark stage's block attends over: `keys`, its window of committed main rows, then the block's own rows.
@@ -4895,6 +4919,47 @@ test "dsv41 fused attention: the one-pass kernel is no further from the f32 trut
         // Without NAX the composed core's GEMMs are true f32 and sit near the kernel's own accumulation noise.
         try testing.expect(err_fused <= err_core + NO_WORSE_F32_ULPS * 0x1p-23);
         try testing.expect(err_fused < 3e-5);
+    }
+}
+
+/// A packed compressed store holding `comp` (QAT'd to the store's format) in two appends, so rows past `used` exist.
+pub fn packedStore(sc: *Scope, comp: A) !Rows {
+    var rows = Rows{ .width = @intCast(dim(comp, 1)), .dtype = .bfloat16, .pack = .{ .mode = .fp4_e4m3, .group = 16 } };
+    errdefer rows.deinit();
+    const n = dim(comp, 0);
+    const x = try qat_mod.qat(sc, comp, .fp4_e4m3, 16);
+    try rows.append(sc, try sc.slice(x, 0, 0, n / 2));
+    try rows.append(sc, try sc.slice(x, 0, n / 2, n));
+    return rows;
+}
+
+test "dsv41 packed picks: the fused kernel reading the picked rows packed gives the heads of the unpacked and gathered rows, byte for byte (release span shapes)" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const cases = [_]AttnCase{
+        .{ .L = 256, .wp = 127, .K = 512, .nc = 700 },
+        .{ .L = 256, .wp = 127, .K = 512, .nc = 4096, .holes = false },
+        .{ .L = 100, .wp = 63, .K = 512, .nc = 40 },
+        .{ .L = 17, .wp = 5, .K = 512, .nc = 9 },
+        .{ .L = 40, .wp = 3, .K = 24, .nc = 30, .H = 16, .hd = 64, .window = 8 },
+    };
+    for (cases, 0..) |c, ci_| {
+        var sc = Scope.init(testing.allocator, gpu);
+        defer sc.deinit();
+        const d = try attnCaseData(&sc, c, 0xb11 + ci_);
+        var rows = try packedStore(&sc, d.comp);
+        defer rows.deinit();
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
+        var heads: [2][]f32 = undefined;
+        for (&heads, [_]bool{ false, true }) |*h, raw| {
+            const picks = try packedPicks(&sc, &rows, d.topk, raw);
+            try testing.expectEqual(raw, picks.store != null);
+            h.* = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16));
+        }
+        defer for (heads) |h| testing.allocator.free(h);
+        errdefer std.debug.print("case {d}\n", .{ci_});
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(heads[0]), std.mem.sliceAsBytes(heads[1]));
     }
 }
 
