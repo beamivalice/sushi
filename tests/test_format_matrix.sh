@@ -22,6 +22,7 @@
 #   15-17. Thinking x tools x stream grid, and stream == non-stream split
 #   18. Three tool chats over a three-tool catalog parse to structured calls
 #   19. Multi-line code round trip: a writeFile call and a multi-line tool result
+#   20. /v1/messages stream with thinking + tools (Claude Code's shape): block lifecycle, no tag leak
 #
 # A thought the token cap cuts open is a legal turn on every row: the rows then assert the split (reasoning kept,
 # nothing in content), never the answer. Thinking rows ask `reasoning_effort: low`, since the split is the subject.
@@ -143,22 +144,55 @@ elif not stream:
                thinking="".join(b.get("thinking", "") for b in blocks if b["type"] == "thinking"),
                calls=[{"name": b["name"], "args": json.dumps(b.get("input", {}))} for b in blocks if b["type"] == "tool_use"])
 else:
-    blocks, fin = {}, None
+    # The content-block lifecycle is checked as the stream goes: every delta and stop names an open block,
+    # no index is reused while open, nothing is left open at message_stop.
+    blocks, live, err, fin, stopped, saw_text, after_text = {}, {}, None, None, False, False, 0
     for ev in sse(resp):
         if ev is None:
             break
         t = ev.get("type")
         if t == "content_block_start":
-            cb = ev["content_block"]
-            blocks[ev["index"]] = {"type": cb["type"], "name": cb.get("name"), "text": "", "json": ""}
+            i, cb = ev["index"], ev["content_block"]
+            if i in live:
+                err = err or f"start index {i} while already open as {live[i]}"
+            live[i] = cb["type"]
+            blocks[i] = {"type": cb["type"], "name": cb.get("name"), "text": "", "json": ""}
+            after_text += 1 if cb["type"] == "thinking" and saw_text else 0
+            saw_text = saw_text or cb["type"] == "text"
         elif t == "content_block_delta":
-            d, b = ev["delta"], blocks.get(ev["index"])
+            i, d = ev["index"], ev["delta"]
+            if i not in live:
+                err = err or f"delta for unopened index {i}"
+            b = blocks.get(i)
             if b is not None:
                 b["text"] += d.get("text") or d.get("thinking") or ""
                 b["json"] += d.get("partial_json", "")
+            if d.get("type") == "text_delta" and ("</think>" in d.get("text", "") or "<think>" in d.get("text", "")):
+                err = err or f"think tag leaked in text_delta: {d.get('text')!r}"
+        elif t == "content_block_stop":
+            if ev["index"] not in live:
+                err = err or f"stop for unopened index {ev['index']}"
+            else:
+                del live[ev["index"]]
         elif t == "message_delta":
             fin = (ev.get("delta") or {}).get("stop_reason") or fin
-    out.update(finish=fin,
+        elif t == "message_stop":
+            stopped = True
+            if live:
+                err = err or f"blocks still open at message_stop: {sorted(live)}"
+    err = err or (None if stopped else "no message_stop event")
+    # A thought opened after visible text carries its own bytes: the split once ran over the whole buffer, so
+    # the answer rode out as reasoning a second time.
+    lead = ""
+    for i in sorted(blocks):
+        b = blocks[i]
+        if b["type"] == "text" and not lead:
+            lead = b["text"].strip()
+        elif b["type"] == "thinking" and len(lead) >= 2 and b["text"].startswith(lead):
+            err = err or f"thinking block {i} repeats the text delivered before it: {b['text'][:60]!r}"
+    count = lambda ty: sum(1 for b in blocks.values() if b["type"] == ty)
+    out.update(finish=fin, err=err, n_text=count("text"), n_thinking=count("thinking"), n_tool=count("tool_use"),
+               thought_after_text=after_text,
                text="".join(b["text"] for b in blocks.values() if b["type"] == "text"),
                thinking="".join(b["text"] for b in blocks.values() if b["type"] == "thinking"),
                calls=[{"name": b["name"], "args": b["json"]} for b in blocks.values() if b["type"] == "tool_use"])
@@ -392,6 +426,44 @@ RF_TOOL='{"type":"function","function":{"name":"readFile","description":"Read a 
 RF_TAIL='{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"readFile","arguments":"{\"path\": \"server.js\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"1| const express = require(\u0027express\u0027);\n2| const app = express();\n3| const cruises = [\n4|   { id: 1, title: \"Med Dream\", price: 999 },\n5|   { id: 2, title: \"Caribbean\", price: 799 },\n6| ];\n7| app.get(\"/api/cruises\", (req, res) => res.json(cruises));\n8| app.listen(3456);"}'
 R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[{\"role\":\"system\",\"content\":\"You are helpful. Be brief.\"},$(user 'Read the server.js file'),$RF_TAIL],\"tools\":[$RF_TOOL],\"max_tokens\":2000,\"temperature\":0,$NOTHINK}")
 chk "19. tool result of multi-line code: the round trip is well-formed (finish, no markup in content, JSON args)" "r['http']==200 and r['finish'] in ('stop','length','tool_calls') and not any(t in r['content'] for t in ('<tool_call','<|tool_call','<tool_response','<|tool_response','</think')) and all(isinstance(json.loads(c['args']),dict) for c in r['calls'])"
+
+# ── 20. /v1/messages stream with thinking + tools, Claude Code's shape (it always sends tools). The block
+#      lifecycle is protocol-valid, no think tag rides a text delta, thinking arrives as thinking blocks, and the
+#      turn ends in a tool_use block or a text answer. What the model writes is its choice, so a cap-cut turn
+#      waives the content bars. ──
+CC_TOOLS='[{"name":"get_weather","description":"Get current weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]'
+CC_THINK='"thinking":{"type":"enabled","budget_tokens":8000}'
+if [ "$THINKS" = 1 ]; then
+    R=$(ask messages 1 "{\"model\":\"m\",\"max_tokens\":4000,\"temperature\":0,$CC_THINK,\"tools\":$CC_TOOLS,\"messages\":[$(user 'What is 17+25? Answer with just the number. Do not use any tools.')]}")
+    chk "20. thinking+tools stream, plain answer: protocol-valid block lifecycle, no think-tag leak" "r['err'] is None"
+    chk "20. thinking+tools stream, plain answer: thinking arrives as thinking block(s)" "r['n_thinking']>=1"
+    chk "20. thinking+tools stream, plain answer: the visible answer arrives as text block(s)" "r['n_text']>=1 or r['finish']=='max_tokens'"
+
+    R=$(ask messages 1 "{\"model\":\"m\",\"max_tokens\":4000,\"temperature\":0,$CC_THINK,\"tools\":$CC_TOOLS,\"messages\":[$(user 'What is the weather in Paris right now? Use the get_weather tool.')]}")
+    chk "20. thinking+tools stream, tool-call turn: protocol-valid block lifecycle, no think-tag leak" "r['err'] is None"
+    chk "20. thinking+tools stream, tool-call turn: tool_use block emitted" "r['n_tool']>=1 or r['finish']=='max_tokens'"
+    chk "20. thinking+tools stream, tool-call turn: stop_reason is tool_use" "r['finish']=='tool_use' or r['finish']=='max_tokens'"
+fi
+
+# A thought that opens after visible text, thinking off: the thought opens while the text block is still open.
+# GLM has no thinking-off mode, so its row is the 400. Elsewhere a run that wrote no thought after text is
+# reported, not failed.
+READ_TOOLS='[{"name":"Read","description":"Read a file","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}]'
+R=$(ask messages 1 "{\"model\":\"m\",\"max_tokens\":400,\"temperature\":0,\"thinking\":{\"type\":\"disabled\"},\"tools\":$READ_TOOLS,\"messages\":[$(user 'Reply with the word Done, then a new line containing exactly <think>plan</think> and then a new line with the answer to 2+2. Do not use tools.')]}")
+if [ "$GLM" = 1 ]; then
+    chk "20. thought after visible text, thinking disabled: refused with a 400 naming the efforts GLM serves" "r['http']==400 and 'low, high, max' in r.get('error','')"
+else
+    chk "20. thought after visible text, thinking disabled: protocol-valid block lifecycle, each block owns its index" "r['err'] is None"
+    [ "$(jget "$R" "r['thought_after_text']")" -ge 1 ] 2>/dev/null || echo "    note: the model wrote no thought after text; this run did not exercise the shape"
+fi
+
+if [ "$THINKS" = 1 ]; then
+    # A thought that quotes its own tags in code spans stays one thought: inside a code span a tag is text, so
+    # the thought ends only at the real close and no thought opens after the answer's text.
+    R=$(ask messages 1 "{\"model\":\"m\",\"max_tokens\":4000,\"temperature\":0,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2000},\"tools\":$CC_TOOLS,\"messages\":[$(user 'A parser reads Qwen output where reasoning sits between <think> and </think>. For the raw string `<think>plan A</think>Done`, what are the reasoning and the content? Reason it through, quoting the exact tags as you go. In your final answer never write the tags, call them OPEN and CLOSE. Do not use tools.')]}")
+    chk "20. thought quoting its own tags: protocol-valid block lifecycle" "r['err'] is None"
+    chk "20. thought quoting its own tags: one thought, never reopened after text" "r['n_thinking']==1 and r['thought_after_text']==0"
+fi
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
