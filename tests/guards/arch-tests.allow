@@ -33,9 +33,6 @@ GLM assistant cached sliding mask equals the mask built at any absolute position
 GLM billed checkpoint peak equals the checkpoints its prefill captures, whatever stride is configured
 GLM bills two KDA states, not eight, while its prefill moves each to SSD and frees the RAM copy
 GLM clamped EXL3 rejects malformed banks before kernel dispatch
-GLM config maps compressed MLA and FP32 recurrent state without Qwen assumptions
-GLM config preserves optional shared expert counts
-GLM config refuses unsupported semantics and invalid geometry
 GLM group2 cooperative projections preserve F16 bits at all rates and ballot boundaries
 GLM group2 half4 composition preserves all-rate cooperative projection bits
 GLM group2 keeps the cooperative reader's bytes under PAIR1
@@ -51,7 +48,6 @@ GLM prefill grid declines guards before dispatch
 GLM prefill grid serves W14 packs with the sorted chain's bytes
 GLM prefill grid serves every admitted rate, mixed projections included, with the sorted chain's bytes
 GLM prefill transient bill follows the latent width: kv6 sheds 128 bytes per latent row against kv8
-GLM raw FP8 config identifies source storage without changing native KV
 GLM raw FP8 honors the declared wired limit with the same reserve as MiMo
 GLM raw FP8 scratch bills all pending projections only beyond direct decode
 GLM release defaults advertise the full context at the widest prefill chunk that keeps it
@@ -67,7 +63,6 @@ GLM serving accepts native effort levels and thinks by default
 GLM serving memory bills one latent at the request's KV width and pooled index per token
 GLM serving template receives low high max without a derived reasoning budget
 GLM trunk cov collector sums X^T X per projection across calls
-GLM vision config rejects unsupported tower geometry and accepts a text-only checkpoint
 GLM vision serving processor carries image and video token budgets without M-RoPE
 GLM-5.3 template renders a tool round-trip itself, never the generic fallback
 GLM-5.3 template: a tool result given as a list of outputs, text parts or tool references renders in place
@@ -78,7 +73,6 @@ MiMo EXL3 streaming CPU slab capacities preserve resident kernel arms
 MiMo EXL3 streaming imported slabs warm and reuse different layer rates
 MiMo MTP state bill is constant and follows retained storage
 MiMo honors the declared wired limit streamed or resident, without enabling long-context paths
-ModelConfig parses mimo_v2 hybrid geometry and sigmoid routing
 ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only
 Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD, holding two states, and a grid point restores its state
 Qwen SSD-only: a prefill holds at most two checkpoint states, lists every position, and any of them restores from SSD exactly
@@ -113,7 +107,6 @@ deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort
 deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check
-defaultEnableThinking: mimo_v2 thinks by default, with and without tools
 dflash: GLM rows default to 2..8 and the flags move either end inside them
 dflash: Qwen rows default to 2..block and are bounded by the drafter block and the verify path
 driver: a tiny Qwen source becomes a complete pack, and a second run into it is refused
@@ -155,7 +148,6 @@ exl3 rate groups: the shared expert riding the decode launches at DeepSeek's geo
 exl3 the served grouping stays the MiMo pair: prepared multi-row blocks only
 exl3 unsorted paired prepare preserves distinct scale planes at GLM widths
 expert stream original MiMo source warms exact MXFP4 bytes
-expert streaming is a capability of every qwen4 pack and required only by the dense one
 expert streaming is qwen4_exp only: the same switch_mlp pack is no candidate under another model_type
 expertPoolBytes: only DeepSeek-V4.1 takes a ledger pool, within the RAM-wide cap
 format corpus: GLM-5.3 gives a reasoning-less assistant turn an empty think, never the earlier turn's thought
@@ -189,25 +181,15 @@ mimo_v2 EXL3 prefill rows match the fused decode arm on every GEMM arm
 mimo_v2 EXL3 prefill rows match the host SwiGLU oracle past one GEMM window
 mimo_v2 EXL3 resident MoE decode rows match the host SwiGLU oracle at K2.5 MCG
 mimo_v2 EXL3 resident MoE prefill rows match the host SwiGLU oracle at K2.5 MCG
-mimo_v2 EXL3 routed banks stream on request and take the source trunk loader
 mimo_v2 EXL3 stacked experts resolve as a layout and keep the dense prefix
 mimo_v2 admission credits the hot cache: a gap the cache covers is an evict, not a refusal
 mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the band sheet
-mimo_v2 bills per-layer KV geometry and the sliding window once per slot
-mimo_v2 config reads the MiMo-ViT geometry and the processor's own pixel bounds
-mimo_v2 config refuses a MiMo-ViT whose block tables disagree with its depth
-mimo_v2 config rejects unsupported routing and malformed layer geometry
 mimo_v2 is the only additional expert streaming architecture
-mimo_v2 original MXFP4 experts require streaming despite their quantized width
-mimo_v2 original config selects split QKV and native expert quantization
 mimo_v2 original source discovery validates individual MXFP4 tensors
-mimo_v2 original streaming retains resident names and excludes experts and MTP
 mimo_v2 prefill bill carries the FP8 trunk's dequant scratch past the GEMV width
 mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sheets
 mimo_v2 prefills at the widest width its request bill admits, not at the load-time pin
-mimo_v2 refuses a config asking to quantize trunk linears at load
 mimo_v2 streaming discovery validates MXFP4 headers without a PLE table
-mimo_v2 streaming leaves trunk keys intact and excludes only routed banks
 mimo_v2 template preserves reasoning and XML tool history
 mimo_v2 template renders a late system turn in place
 mimo_v2 template renders a tools request as the reference does
@@ -226,11 +208,6 @@ pack: the Qwen trunk is renamed, affine-quantized by rule, and the experts and n
 pack: the Qwen trunk stores norm weights as one plus the source, conv kernels as [C,K,1] and the patch embedding channels-last
 pack: the trunk plan names every tensor of a served Qwen pack and quantizes the same ones
 parseConfig prefers processor_config and fills missing Qwen bounds from preprocessor_config
-parseConfigFromJson accepts dense qwen4 as an expert streaming architecture
-parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connection, PLE, QSA and text-config eos fields
-parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048576
-parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower, M-RoPE and vision token ids
-parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched
 parseStubMeta mimo_v2 reports routed count and image input without video
 parseToolCalls Qwen MoE double-nested name
 parseToolCalls Qwen3.6 MoE nested-name garbage (real capture)
@@ -258,30 +235,16 @@ qwen smart_resize matches reference table
 qwen xml: the live <function=…>/<parameter=…> capture (package.json class)
 qwen xml: truncated mid-parameter ships NAME + the completed params only
 qwen4 MTP head persist: the head's row count IS its cache step, so a committed history adopts
-qwen4 PLE placement: the layer loop must install exactly one PLE, at the configured layer
-qwen4 convolution transform rejects a non-unit channel axis
 qwen4 expert streaming targets only the trunk bank
 qwen4 replay: what the next prompt shares with a generated turn (Flash-Next tokenizer.json, real template)
 qwen4 streaming index completeness requires every target bank and PLE shard
-qwen4 streaming loader canonicalizes resident keys and excludes disk tensors
-qwen4 streaming loader materializes only transformed resident tensors
-qwen4 streaming resident byte estimate excludes experts PLE and vision
 qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)
 qwen4ExpOomConfig does not leak qsa_score_fused_override
 qwen4MtpResetOwned: a non-MTP request leaves the head untouched
-qwen4PleInstalledAt accepts the MTP head's deliberate -1 and still refuses a stray PLE
 qwen4RequestTestConfig does not leak qsa_score_fused_override
-qwen4_exp config: a geometry the forward divides by or indexes with is a named error
-qwen4_exp config: a wrong-typed or negative bound is a refusal, never a silent default
-qwen4_exp config: an armed QSA indexer must carry a usable budget and ratio
-qwen4_exp config: an n-gram bound past the fixed arrays is a named load error
-qwen4_exp config: the PLE layer id must name exactly one layer that exists
 qwen: a checkpoint's 16.7 Mpx bound is clamped to what the ViT can attend
 qwenGdnLine: --qwen-gdn 16 is reported per arch, and has no effect where there is no GDN arm
 real Qwen pack loaded through ChatConfig keeps late notes in place
-real mimo_v2 Flash config agrees with source geometry
-real mimo_v2 bill carries the bf16 vision tower exactly when it is loaded
-real mimo_v2 original and converted packs bill the same resident trunk
 real mimo_v2 original checkpoint discovers complete streamed expert headers
 real mimo_v2 template is the committed fixture
 real qwen checkpoint is a complete streaming discovery candidate
