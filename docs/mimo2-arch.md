@@ -4,7 +4,7 @@ How the engine serves MiMo-V2.6-Flash (the served pack is quantized from the MOP
 layout): the source checkpoint's layout, the resident trunk, the MXFP4 and EXL3
 expert paths, the hybrid global/sliding attention with its ring, the vision tower, and the bills that follow the
 storage. MiMo serves text and image input; the supported product is the MCG EXL3 pack. Read this before touching
-`src/mimo_source.zig`, `src/mimo_vision.zig`, `src/mimo_forward.zig` (forward, attention arms, MoE dispatch), the shared `src/transformer.zig`, or anything that bills MiMo's KV.
+`src/mimo2/mimo_source.zig`, `src/mimo2/mimo_vision.zig`, `src/mimo2/mimo_forward.zig` (forward, attention arms, MoE dispatch), the shared `src/transformer.zig`, or anything that bills MiMo's KV.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-expert-streaming](engine-expert-streaming.md), [engine-kv-cache](engine-kv-cache.md),
@@ -219,7 +219,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 <a id="vision"></a>
 ## Vision (MiMo-ViT)
 
-- **Tower** (`src/mimo_vision.zig`, port of the checkpoint's `MiMoVisionTransformer`): Conv3d patch embed (2x16x16,
+- **Tower** (`src/mimo2/mimo_vision.zig`, port of the checkpoint's `MiMoVisionTransformer`): Conv3d patch embed (2x16x16,
   served as its [1280, 1536] Linear), 28 blocks of RMSNorm + GQA attention (32 q / 8 kv heads, head 64, qkv and proj
   biases) + SwiGLU (4608, biases), 2-D rotary positions as Qwen2-VL, then LayerNorm + 5120 -> 5120 -> GELU -> 4096
   over each 2x2 merge unit. The checkpoint ships the merger WITHOUT biases (the modeling code declares them): zero.

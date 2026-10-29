@@ -7,7 +7,7 @@ GLM-5.3 prefix cache, restore and spec state, split out of [engine-prefix-cache]
 ## GLM-5.3 (`glm5_next`)
 
 GLM's state lives in its slot's `glm5_forward.Request`, not a `KVCache`: 34 FP32 KDA states, 11 MLA latents and a
-pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
+pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
 
 - **A restore point is a pool boundary** (a multiple of 4), where the IndexPool tail is empty. The state there is:
   - the KDA conv and recurrence of every linear layer, an `SSMCheckpoint` of 147,619,840 bytes;

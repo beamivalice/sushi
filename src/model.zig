@@ -21,12 +21,12 @@ pub var drop_expert: u16 = 0;
 
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
-const dsv41_config = @import("dsv41_config.zig");
+const dsv41_config = @import("dsv41/dsv41_config.zig");
 const expert_io = @import("expert_io.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
 const tokenizer_mod = @import("tokenizer.zig");
-const qwen4_exp = @import("qwen4_exp.zig");
+const qwen4_exp = @import("qwen4/qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
@@ -533,7 +533,7 @@ pub const ModelConfig = struct {
     /// The width a per-request arch's prefill starts at; only a chunk that no longer fits beside its
     /// KV steps down. GLM's native prefill paths are built for 2048 rows.
     pub fn prefillStartWidth(self: *const ModelConfig) u32 {
-        if (self.isGlm5()) return @import("glm5_forward.zig").prefill_chunk;
+        if (self.isGlm5()) return @import("glm5/glm5_forward.zig").prefill_chunk;
         if (self.isDsv41()) return dsv41_config.prefill_width;
         if (self.longCtxGated()) return 4096;
         if (self.swaRingTokens() > 0) return 2048;
@@ -717,7 +717,7 @@ pub const ModelConfig = struct {
     /// is no GDN state. A restored state of the other width would be cast, and one written under a bf16
     /// gate continues differently, so neither is restored.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
-        if (self.isDsv41()) return @import("dsv41_prefix.zig").namespaceTag(self.dsparkOn());
+        if (self.isDsv41()) return @import("dsv41/dsv41_prefix.zig").namespaceTag(self.dsparkOn());
         if (self.linear_num_value_heads == 0 or self.isGlm5()) return null;
         return if (self.gdnStateDtype() == .float32) "gdn-f32-state-v1" else "gdn-gate-f32-v1";
     }
@@ -811,7 +811,7 @@ pub const ModelConfig = struct {
     }
 
     /// What `--drop-expert` asks of this model's pack.
-    pub fn expertDropRequest(self: *const ModelConfig) @import("expert_usage.zig").Request {
+    pub fn expertDropRequest(self: *const ModelConfig) @import("dsv41/expert_usage.zig").Request {
         return .{
             .n = self.drop_expert,
             .layers = self.expertLayerCount(),
@@ -2435,7 +2435,7 @@ pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_d
 /// with the tower apart.
 pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !ResidentSplit {
     if (config.isDsv41()) {
-        const source = @import("dsv41_source.zig");
+        const source = @import("dsv41/dsv41_source.zig");
         return .{
             .trunk = try source.residentBytes(io, allocator, model_dir),
             .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir) else 0,
@@ -2443,11 +2443,11 @@ pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_di
         };
     }
     if (config.isGlm5())
-        return @import("glm5_diagnostic.zig").streamedSplit(io, allocator, model_dir, config.num_hidden_layers);
+        return @import("glm5/glm5_diagnostic.zig").streamedSplit(io, allocator, model_dir, config.num_hidden_layers);
     if (config.usesMimoSourceTrunk()) {
         var streamed = config.*;
         streamed.expert_streaming = true;
-        const mimo_source = @import("mimo_source.zig");
+        const mimo_source = @import("mimo2/mimo_source.zig");
         return .{
             .trunk = try mimo_source.residentBytesWithConfig(io, allocator, model_dir, &streamed),
             .mtp = 0,
@@ -2512,7 +2512,7 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
             };
             // The Qwen tower's matrices are requantized at load (`qwen_vision.QwenVision.init`): billed as the codes.
             if (is_vision and !@import("vision_common.zig").vision_bf16) if (@import("vision_common.zig").headerMatrix(tensor.value_ptr.object)) |m| {
-                if (@import("qwen_vision.zig").quantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
+                if (@import("qwen4/qwen_vision.zig").quantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
                     size = @import("vision_common.zig").quantizedBytes(m.dims[0], m.dims[1], group);
             };
             const bucket = if (is_mtp) &mtp else if (is_vision) &tower else &total;
@@ -2540,7 +2540,7 @@ fn logMimoSourceLoad(config: *const ModelConfig, vision: bool) void {
 /// MiMo's trunk is FP8 on disk under either routed-expert layout, so both take
 /// the source loader; an EXL3 pack's routed banks come resident beside it.
 pub fn loadWeightsMimoSource(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool) !Weights {
-    const mimo_source = @import("mimo_source.zig");
+    const mimo_source = @import("mimo2/mimo_source.zig");
     var config = try parseConfig(io, allocator, model_dir);
     defer config.deinit(allocator);
     logMimoSourceLoad(&config, vision);
@@ -2554,14 +2554,14 @@ pub fn loadWeightsMimoSource(io: std.Io, allocator: std.mem.Allocator, model_dir
 /// served (FP8 codes + scale grids, bf16 rest) plus any resident routed banks,
 /// plus the vision tower as stored when it is loaded.
 pub fn mimoSourceResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool) !u64 {
-    const mimo_source = @import("mimo_source.zig");
+    const mimo_source = @import("mimo2/mimo_source.zig");
     const trunk = try mimo_source.residentBytes(io, allocator, model_dir);
     return if (vision) trunk + try mimo_source.visionResidentBytes(io, allocator, model_dir) else trunk;
 }
 
 /// Resident bytes of a MiMo checkpoint's MTP heads as `mimo_source` uploads them.
 pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !u64 {
-    return @import("mimo_source.zig").mtpResidentBytes(io, allocator, model_dir);
+    return @import("mimo2/mimo_source.zig").mtpResidentBytes(io, allocator, model_dir);
 }
 
 /// The architectures this build serves. Every other `model_type` is refused
@@ -2728,17 +2728,17 @@ pub fn loadWeightsForConfig(
         return error.ArchitectureUnsupported;
     }
     if (config.isDsv41()) return loadWeightsDsv41(io, allocator, model_dir, config, load_vision);
-    if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
+    if (config.expert_layout == .exl3_k4) try @import("mimo2/mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
-        const glm = @import("glm5_diagnostic.zig");
+        const glm = @import("glm5/glm5_diagnostic.zig");
         return glm.loadWeightsBoundedWithVision(io, allocator, model_dir, mlx.gpuStream(), config.expert_streaming, std.math.maxInt(u64), load_vision and config.glm5_vision);
     }
     if (config.expert_streaming and config.usesMimoSourceTrunk()) {
         const vision = load_vision and config.mimo_vision;
         logMimoSourceLoad(config, vision);
-        var weights = try @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
+        var weights = try @import("mimo2/mimo_source.zig").loadWeights(io, allocator, model_dir, config);
         errdefer weights.deinit();
-        if (vision) try @import("mimo_source.zig").loadVisionWeightsInto(&weights, io, allocator, model_dir);
+        if (vision) try @import("mimo2/mimo_source.zig").loadVisionWeightsInto(&weights, io, allocator, model_dir);
         return weights;
     }
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision, config.stream_mtp_head);
@@ -2756,7 +2756,7 @@ fn loadWeightsDsv41(io: std.Io, allocator: std.mem.Allocator, model_dir: []const
         log.err("deepseek_v41: model.safetensors.index.json does not list every routed expert (layout {s}); the download is incomplete\n", .{@tagName(config.expert_layout)});
         return error.ExpertLayoutUnsupported;
     }
-    return @import("dsv41_source.zig").loadResident(io, allocator, model_dir, .{ .dspark = config.dsparkOn(), .vision = load_vision and config.has_vision });
+    return @import("dsv41/dsv41_source.zig").loadResident(io, allocator, model_dir, .{ .dspark = config.dsparkOn(), .vision = load_vision and config.has_vision });
 }
 
 pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout, vision: bool, keep_mtp: bool) !Weights {

@@ -2,7 +2,7 @@
 
 How the engine serves Qwen3.8-Flash-Next: the three blocks it adds around the qwen3_5 GDN+MoE trunk, which
 module state is shared, where the oracle lives, and the facts a change to this arch must respect. Read this before
-touching `forwardQwen4With`, `src/qwen4_exp.zig` or `src/hc_prefill.zig`.
+touching `forwardQwen4With`, `src/qwen4/qwen4_exp.zig` or `src/hc_prefill.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-expert-streaming](engine-expert-streaming.md), [engine-mtp](engine-mtp.md),
@@ -19,9 +19,9 @@ hidden 2560, expert intermediate 640.
 
 | File | Role |
 |---|---|
-| `src/qwen4_forward.zig` / `src/qwen4_hc.zig` / `src/qwen4_qsa.zig` | Flash Next trunk = `forwardQwen4With` (attention, GDN, native MTP, decode/verify rows) / hyper-connections + PLE / QSA mask and block selection |
+| `src/qwen4/qwen4_forward.zig` / `src/qwen4/qwen4_hc.zig` / `src/qwen4/qwen4_qsa.zig` | Flash Next trunk = `forwardQwen4With` (attention, GDN, native MTP, decode/verify rows) / hyper-connections + PLE / QSA mask and block selection |
 | `src/transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3` |
-| `src/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
+| `src/qwen4/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
 | `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, see [engine-mtp](engine-mtp.md) |
 
@@ -40,7 +40,7 @@ hidden 2560, expert intermediate 640.
   A host token read inside the graph build serialized the build with the GPU.
 - **Decode kernels**: the fused hc read is LATENCY-bound (`hcWrite` DEFERS into the next
   read); HC + GDN prefill fusions take the chunk WIDTH as a scalar input. Each of the 36 GDN layers decodes and
-  verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/gdn_decode.zig`), then the norm-gate. Details in
+  verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/qwen4/gdn_decode.zig`), then the norm-gate. Details in
   [engine-kernels](engine-kernels.md).
 - **A GDN trunk's `KVCache.step` is 0 forever**: see [engine-kv-cache](engine-kv-cache.md#gdn).
 

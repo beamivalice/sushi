@@ -2,7 +2,7 @@
 
 How the native MTP heads draft and verify: Qwen3.8-Flash-Next's one head and MiMo-V2.6's three, their inputs, the
 spec-verify invariant, draft re-scoring, the measured round-cost table, head KV and norms. Read this before touching
-`src/mtp.zig`, `src/mtp_*.zig`, `src/mimo_mtp.zig`, `src/round_cost.zig` or the MTP orchestration in
+`src/mtp.zig`, `src/mtp_*.zig`, `src/mimo2/mimo_mtp.zig`, `src/round_cost.zig` or the MTP orchestration in
 `src/generate.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md),
@@ -17,7 +17,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 | `src/mtp_acceptance.zig` | acceptance modes `exact|typical|tokenv3` |
 | `src/mtp_group_planner.zig` / `src/mtp_group_cost.zig` | grouped verify planner |
 | `src/mtp_qmv.zig` | M=1-exact qmv rows |
-| `src/mimo_mtp.zig` | MiMo's three trained heads (`model.mtp.layers.{0,1,2}`), per-request row state |
+| `src/mimo2/mimo_mtp.zig` | MiMo's three trained heads (`model.mtp.layers.{0,1,2}`), per-request row state |
 | `src/round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`) |
 | `src/mtp_lookup.zig` | Prompt lookup inside the MTP round: the committed-context index and its gate |
 | `src/generate.zig` | MTP orchestration, `commitForcedTokens` |

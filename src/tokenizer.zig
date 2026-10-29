@@ -2,7 +2,7 @@ const std = @import("std");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const unicode_props = @import("tokenizer_unicode.zig");
-const deepseek_pretok = @import("tokenizer_deepseek.zig");
+const deepseek_pretok = @import("dsv41/tokenizer_deepseek.zig");
 
 const WordRules = enum { legacy, letters, letters_marks };
 

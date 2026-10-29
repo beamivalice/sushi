@@ -898,7 +898,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--drop-expert") and i + 1 < args.len) {
             i += 1;
-            model_mod.drop_expert = @import("expert_usage.zig").parseCount(args[i]) orelse {
+            model_mod.drop_expert = @import("dsv41/expert_usage.zig").parseCount(args[i]) orelse {
                 log.err("--drop-expert: expected a multiple of 8 routed experts per layer (0 = off); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };

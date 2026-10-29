@@ -1,7 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
-const qwen4_forward = @import("qwen4_forward.zig");
+const qwen4_forward = @import("qwen4/qwen4_forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -12,7 +12,7 @@ const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const mtp_mod = @import("mtp.zig");
-const mimo_mtp = @import("mimo_mtp.zig");
+const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_settings = @import("model_settings.zig");
 const round_cost = @import("round_cost.zig");
@@ -35,13 +35,13 @@ const ssmSnapshotDeinit = transformer_mod.ssmSnapshotDeinit;
 const ssmRestore = transformer_mod.ssmRestore;
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
-const glm5_forward = @import("glm5_forward.zig");
-const glm5_prefix = @import("glm5_prefix.zig");
-const dsv41_prefix = @import("dsv41_prefix.zig");
+const glm5_forward = @import("glm5/glm5_forward.zig");
+const glm5_prefix = @import("glm5/glm5_prefix.zig");
+const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
 const kv_disk_cache_mod = @import("kv_disk_cache.zig");
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
-const dspark_rows = @import("dspark_rows.zig");
+const dspark_rows = @import("dsv41/dspark_rows.zig");
 const row_grammar = @import("row_grammar.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
@@ -1273,7 +1273,7 @@ pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
 /// Drafts a sampled DSpark round can verify; the checkpoint's block is 5.
 const dsv41_max_drafts = 16;
 /// The widest verify `dsv41Verify` accepts, a ring slack's rows.
-const dsv41_max_verify_rows: u8 = @intCast(@import("dsv41_config.zig").ring_slack);
+const dsv41_max_verify_rows: u8 = @intCast(@import("dsv41/dsv41_config.zig").ring_slack);
 
 /// Verify rows that end a round at the first `id` among `ids`; the trunk's own token after it is still the pending one.
 fn rowsThroughId(ids: []const u32, id: ?u32) usize {
@@ -1329,11 +1329,11 @@ pub fn dsparkEligible(sampling: SamplingParams, logprobs_n: u32) bool {
 
 /// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
 /// agrees back `mtp_lookup.STRONG_SUFFIX` tokens and the budget holds the whole chain.
-pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@import("glm5_dflash.zig").Proposal {
+pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@import("glm5/glm5_dflash.zig").Proposal {
     const drafts = Generator.glm_lookup_drafts;
     const m = got orelse return null;
     if (m.suffix < mtp_lookup.STRONG_SUFFIX or m.draft.len < drafts or budget <= drafts) return null;
-    var chain = @import("glm5_dflash.zig").Proposal{ .count = drafts + 1 };
+    var chain = @import("glm5/glm5_dflash.zig").Proposal{ .count = drafts + 1 };
     chain.tokens[0] = pending;
     chain.parents[0] = -1;
     for (m.draft[0..drafts], 1..) |token, row| {
@@ -1353,7 +1353,7 @@ fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assis
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const held = request.residentBytes() +| assistant.cache.residentBytes();
     const budget = @import("server.zig").glmDflashReserveBudget(config, request.offset, max_tokens, kv_bits, held);
-    _ = try @import("glm5_dflash_reserve.zig").reserve(request, request.offset + max_tokens + 3, budget, s);
+    _ = try @import("glm5/glm5_dflash_reserve.zig").reserve(request, request.offset + max_tokens + 3, budget, s);
 }
 
 /// Only the synchronous serial sampler (`sampleToken`) applies these penalties. A repeat
@@ -4331,7 +4331,7 @@ pub const Generator = struct {
     fn sampleGlmNode(raw: *anyopaque, row: usize) !u32 {
         const context: *GlmSampleContext = @ptrCast(@alignCast(raw));
         const gen = context.generator;
-        var ops = @import("glm5_model.zig").Ops{ .s = gen.xfm.s };
+        var ops = @import("glm5/glm5_model.zig").Ops{ .s = gen.xfm.s };
         defer ops.deinit();
         const logits = try ops.slice(context.logits, 1, @intCast(row), @intCast(row + 1));
         const sampled = sampleTokenLazy(logits, gen.sampling, gen.xfm.s);
@@ -4343,26 +4343,26 @@ pub const Generator = struct {
         return @intCast(token);
     }
 
-    fn sampledGlmDecisions(raw: *anyopaque, verified: *@import("glm5_dflash_model.zig").Verified, budget: usize, eos: []const u32) !void {
+    fn sampledGlmDecisions(raw: *anyopaque, verified: *@import("glm5/glm5_dflash_model.zig").Verified, budget: usize, eos: []const u32) !void {
         const gen: *Generator = @ptrCast(@alignCast(raw));
         var context = GlmSampleContext{ .generator = gen, .logits = verified.logits };
-        _ = try @import("glm5_dflash_tree.zig").sampledTargets(verified.tokens[0..verified.count], verified.parents[0..verified.count], verified.targets[0..verified.count], budget, eos, &context, sampleGlmNode);
+        _ = try @import("glm5/glm5_dflash_tree.zig").sampledTargets(verified.tokens[0..verified.count], verified.parents[0..verified.count], verified.targets[0..verified.count], budget, eos, &context, sampleGlmNode);
     }
 
     /// Commits this request's row of a grouped GLM tick (`verifyGroups`, one pending token) and
     /// returns the row's logits. A DFlash2 request also appends the row's captures to its
     /// assistant context, so its rounds resume when it decodes alone again.
-    pub fn glmRowCommit(self: *Generator, verified: *const @import("glm5_dflash_model.zig").Verified) !mlx.mlx_array {
+    pub fn glmRowCommit(self: *Generator, verified: *const @import("glm5/glm5_dflash_model.zig").Verified) !mlx.mlx_array {
         const request = self.ctx.glm5_request orelse return error.GlmRequestMissing;
         const s = self.xfm.s;
         if (self.glm_dflash_native) {
             var verification = try verified.prepareCommitConsuming(request, 1, self.eos_token_ids, s);
             defer verification.deinit();
-            _ = @import("glm5_dflash.zig").commitVerified(self.dflash.?, &self.dflash_ctx.?, request, &verification, 1, self.eos_token_ids) catch |err| {
+            _ = @import("glm5/glm5_dflash.zig").commitVerified(self.dflash.?, &self.dflash_ctx.?, request, &verification, 1, self.eos_token_ids) catch |err| {
                 request.failed = true;
                 return err;
             };
-        } else try @import("glm5_dflash_model.zig").commitPlainRow(verified, request, s);
+        } else try @import("glm5/glm5_dflash_model.zig").commitPlainRow(verified, request, s);
         self.ctx.cache.step = request.offset;
         var logits = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(logits);
@@ -4372,7 +4372,7 @@ pub const Generator = struct {
 
     fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (!try self.glmRoundReady()) return null;
-        const schedule = @import("glm5_dflash_model.zig").bindDefaultSchedule();
+        const schedule = @import("glm5/glm5_dflash_model.zig").bindDefaultSchedule();
         defer schedule.restore();
         var timer = io_util.Stopwatch.init(self.timer.io);
         const tick = io_util.Stopwatch.init(self.timer.io);
@@ -4386,9 +4386,9 @@ pub const Generator = struct {
         timer.reset();
         const request = self.ctx.glm5_request.?;
         // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
-        const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = self.glmPenalty() };
-        var verified: [1]@import("glm5_dflash_model.zig").Verified = undefined;
-        try @import("glm5_dflash_model.zig").verifyGroups(self.xfm.glm5.?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
+        const group = @import("glm5/glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = self.glmPenalty() };
+        var verified: [1]@import("glm5/glm5_dflash_model.zig").Verified = undefined;
+        try @import("glm5/glm5_dflash_model.zig").verifyGroups(self.xfm.glm5.?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
         const layerwise = &verified[0];
         defer layerwise.deinit();
         const verify_ns = timer.read();
@@ -4407,8 +4407,8 @@ pub const Generator = struct {
 
     /// The pending token alone: a plain one-row tick that still commits the assistant's taps, so
     /// DFlash2 rounds resume on the next tick.
-    fn glmPlainProposal(self: *const Generator) @import("glm5_dflash.zig").Proposal {
-        var one = @import("glm5_dflash.zig").Proposal{ .count = 1 };
+    fn glmPlainProposal(self: *const Generator) @import("glm5/glm5_dflash.zig").Proposal {
+        var one = @import("glm5/glm5_dflash.zig").Proposal{ .count = 1 };
         one.tokens[0] = self.next_token_id;
         one.parents[0] = -1;
         return one;
@@ -4421,7 +4421,7 @@ pub const Generator = struct {
     /// The context's continuation after the pending token when the output is copying a long
     /// span (`mtp_lookup.STRONG_SUFFIX` tokens of agreement), as a chain in place of the
     /// assistant's tree.
-    fn glmLookupChain(self: *Generator, allocator: std.mem.Allocator) !?@import("glm5_dflash.zig").Proposal {
+    fn glmLookupChain(self: *Generator, allocator: std.mem.Allocator) !?@import("glm5/glm5_dflash.zig").Proposal {
         if (mtp_lookup_disabled or isEosId(self.next_token_id, self.eos_token_ids)) return null;
         const got = (try self.mtpLookupIndex(allocator)).match(self.next_token_id, glm_lookup_drafts);
         const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
@@ -4430,7 +4430,7 @@ pub const Generator = struct {
     }
 
     /// The logit policy this request's DFlash2 tree rows take in the verifier; null = none.
-    pub fn glmPenalty(self: *Generator) ?@import("glm5_dflash_model.zig").Penalty {
+    pub fn glmPenalty(self: *Generator) ?@import("glm5/glm5_dflash_model.zig").Penalty {
         const tp = &self.sampling.think_penalty;
         if (!tp.active()) return null;
         tp.observe(self.generated_ids.items);
@@ -4451,20 +4451,20 @@ pub const Generator = struct {
     }
 
     /// This request's round draft: as many rows as the policy finds worth their verify, within the flags' bounds.
-    fn glmProposeRound(self: *Generator) !@import("glm5_dflash.zig").Proposal {
+    fn glmProposeRound(self: *Generator) !@import("glm5/glm5_dflash.zig").Proposal {
         const costs = dflash_policy.glmLadder();
         const min = dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS;
-        return @import("glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
+        return @import("glm5/glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
     }
 
     /// This request's round draft of at most `max_nodes` nodes.
-    pub fn glmPropose(self: *Generator, max_nodes: usize) !@import("glm5_dflash.zig").Proposal {
-        return @import("glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
+    pub fn glmPropose(self: *Generator, max_nodes: usize) !@import("glm5/glm5_dflash.zig").Proposal {
+        return @import("glm5/glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
     }
 
     /// Decides (sampled requests draw along the visited path), commits and books a verified
     /// round, alone or as one group of a grouped tick.
-    pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *const @import("glm5_dflash.zig").Proposal, layerwise: *@import("glm5_dflash_model.zig").Verified, draft_ns: u64, verify_ns: u64, lookup: bool) !DrafterStepResult {
+    pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *const @import("glm5/glm5_dflash.zig").Proposal, layerwise: *@import("glm5/glm5_dflash_model.zig").Verified, draft_ns: u64, verify_ns: u64, lookup: bool) !DrafterStepResult {
         const budget = self.max_tokens - self.completion_tokens;
         const sampled = !isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
         if (sampled) try sampledGlmDecisions(self, layerwise, budget, self.eos_token_ids);
@@ -4473,12 +4473,12 @@ pub const Generator = struct {
         // already fix the path, so the cut commits a prefix of it with the same pending token.
         var round_budget = budget;
         if (self.thought_point != null) {
-            const full = try @import("glm5_dflash_tree.zig").accept(layerwise.tokens[0..layerwise.count], layerwise.parents[0..layerwise.count], layerwise.targets[0..layerwise.count], budget, self.eos_token_ids);
+            const full = try @import("glm5/glm5_dflash_tree.zig").accept(layerwise.tokens[0..layerwise.count], layerwise.parents[0..layerwise.count], layerwise.targets[0..layerwise.count], budget, self.eos_token_ids);
             var path: [16]u32 = undefined;
             for (full.rows[0..full.count], path[0..full.count]) |row, *t| t.* = layerwise.tokens[row];
             if (self.thoughtRoundCut(path[0..full.count], request.offset)) |keep| round_budget = @min(budget, keep);
         }
-        var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, round_budget, self.eos_token_ids);
+        var round = try @import("glm5/glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, round_budget, self.eos_token_ids);
         round.draft_ns = draft_ns;
         round.verify_ns = verify_ns;
         if (!lookup and proposal.count > 1) self.dflash_calib.observeTree(&proposal.conf, &proposal.parents, proposal.count, round.rows[0..round.count]);
@@ -4576,7 +4576,7 @@ pub const Generator = struct {
         const forced: ?usize = if (think_room != null and think_room.? <= 1) 1 else policy_rows;
         var ids_buf: [dsv41_max_drafts + 1]u32 = undefined;
         var conf_buf: [dsv41_max_drafts]f32 = @splat(0);
-        var block: ?@import("dsv41_model.zig").Draft = null;
+        var block: ?@import("dsv41/dsv41_model.zig").Draft = null;
         defer if (block) |*b| b.deinit();
         var block_len: usize = 1;
         if (forced == null or forced.? > 1) {
@@ -16181,7 +16181,7 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     defer weights.deinit();
     try transformer_mod.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
     model_mod.resolveWeightPrefix(&config, &weights);
-    var mtp_weights = try @import("mimo_source.zig").loadMtpWeights(io, a, dir);
+    var mtp_weights = try @import("mimo2/mimo_source.zig").loadMtpWeights(io, a, dir);
     defer mtp_weights.deinit();
     var head = (try mimo_mtp.Head.load(a, mlx.gpuStream(), &config, &mtp_weights)) orelse return error.SkipZigTest;
     defer head.deinit();
@@ -19500,13 +19500,13 @@ test "MTP depth bounds: a lookup draft is never wider than an explicit max" {
 
 test "dsv41 generator: DSpark rounds through the Generator keep the budget, the stats and the first token (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -19514,7 +19514,7 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -19681,13 +19681,13 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
 
 test "dsv41 generator: with exact DSpark rounds greedy text is the same at every round-width mix (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -19745,13 +19745,13 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
 
 test "dsv41 generator: a seeded sampled request verifies at one width whatever the cost model says (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -19823,13 +19823,13 @@ test "dsv41 generator: a seeded sampled request verifies at one width whatever t
 
 test "dsv41 generator: a DSpark round ends right behind the id it is told to, at any verify width, with the state standing there (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -19837,7 +19837,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -19891,7 +19891,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
 
 test "dsv41 generator: the restore point behind a thought's closer, written mid-decode, restores from an SSD file to the live state's continuation bit for bit (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const prefix_cache = @import("prefix_cache.zig");
     const kv_disk_cache = @import("kv_disk_cache.zig");
     const dir = try dsv41_model.fixtureDir();
@@ -19899,7 +19899,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -19907,7 +19907,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -20052,13 +20052,13 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
 
 test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20066,7 +20066,7 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -20090,13 +20090,13 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
 
 test "dsv41 generator: serial decode serves sampling, penalties and logprobs, one request after another (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20104,7 +20104,7 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -20147,13 +20147,13 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
 
 test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its closer and decodes the rest serially (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20161,7 +20161,7 @@ test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -20316,13 +20316,13 @@ fn thinkBoundRun(
 
 fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv(env) orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20330,7 +20330,7 @@ fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = if (stq) 64 << 20 else 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = if (stq) 64 << 20 else 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -20410,13 +20410,13 @@ test "dspark eligibility: sampled, penalized and thinking-bound requests draft, 
 
 test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restore at one prefills its suffix exactly like cold (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20424,7 +20424,7 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -20474,14 +20474,14 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
 
 test "dsv41 generator: under a write-through every restore point the tier takes is gone before the next forward, and the tokens do not move (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const floor = @import("kv_disk_cache.zig").MIN_PERSIST_TOKENS;
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20489,7 +20489,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -20549,13 +20549,13 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
 
 test "dsv41 generator: a chunked prefill tells the model the tokens after each chunk, and the next pass takes their Engram rows (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20563,7 +20563,7 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -20598,13 +20598,13 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
 
 test "dsv41 generator: after a DSpark request the slot cache marks its rows and snapshots like the scheduler's commit (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -20612,7 +20612,7 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
-    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
@@ -20668,18 +20668,18 @@ const TinyDsparkNet = struct {
     weights: model_mod.Weights,
 
     fn init(a: std.mem.Allocator, io: std.Io) !TinyDsparkNet {
-        const dsv41_model = @import("dsv41_model.zig");
+        const dsv41_model = @import("dsv41/dsv41_model.zig");
         const dir = try dsv41_model.fixtureDir();
         var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
         errdefer fx.deinit();
-        var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+        var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
         defer sc.deinit();
         const ids = try dsv41_model.tokens(&sc, &fx);
         errdefer a.free(ids);
         var config = try model_mod.parseConfig(io, a, dir);
         config.expert_streaming = true;
         config.stream_mtp_head = true;
-        config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+        config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41/dsv41_stream.zig").expertBytes(&config.dsv41.?);
         config.expert_source_dir = try a.dupe(u8, dir);
         const weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
         return .{ .fx = fx, .ids = ids, .config = config, .weights = weights };
@@ -20893,13 +20893,13 @@ fn expectAnswer(a: std.mem.Allocator, out: GrammarOutcome) !void {
 
 test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens, behind a reasoning boundary and from the first token (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);

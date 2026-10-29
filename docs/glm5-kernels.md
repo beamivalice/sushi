@@ -2,7 +2,7 @@
 
 What the native `glm5_next` forward runs in prefill, decode and DFlash2 verification, the arithmetic contract of each
 path, and the alternatives that lost. Every path here is always on for its eligible shape; anything else falls back to
-the staged MLX chain. Read this before touching `src/glm5_*.zig`. Architecture, bills and numbers:
+the staged MLX chain. Read this before touching `src/glm5/glm5_*.zig`. Architecture, bills and numbers:
 [glm5-arch](glm5-arch.md); routed experts: [engine-exl3-experts](glm5-clamped-experts.md#glm).
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-kernels.md),

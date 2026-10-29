@@ -4,7 +4,7 @@ const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const mtp_mod = @import("mtp.zig");
-const mimo_mtp = @import("mimo_mtp.zig");
+const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const chat_mod = @import("chat.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
@@ -13,15 +13,15 @@ const token_mask = @import("token_mask.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const fp8_block = @import("fp8_block.zig");
 const model_mod = @import("model.zig");
-const dsv41_config = @import("dsv41_config.zig");
-const qwen_vision = @import("qwen_vision.zig");
+const dsv41_config = @import("dsv41/dsv41_config.zig");
+const qwen_vision = @import("qwen4/qwen_vision.zig");
 const vision_common = @import("vision_common.zig");
-const mimo_vision = @import("mimo_vision.zig");
-const glm5_vision = @import("glm5_vision.zig");
-const dsv41_vision = @import("dsv41_vision.zig");
-const glm5_prefix = @import("glm5_prefix.zig");
-const dsv41_prefix = @import("dsv41_prefix.zig");
-const dsv41_borrow = @import("dsv41_borrow.zig");
+const mimo_vision = @import("mimo2/mimo_vision.zig");
+const glm5_vision = @import("glm5/glm5_vision.zig");
+const dsv41_vision = @import("dsv41/dsv41_vision.zig");
+const glm5_prefix = @import("glm5/glm5_prefix.zig");
+const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
+const dsv41_borrow = @import("dsv41/dsv41_borrow.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -38,7 +38,7 @@ const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
-const qwen4_mod = @import("qwen4_exp.zig");
+const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const update_mod = @import("update.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -3483,7 +3483,7 @@ pub fn resolvePrefillChunk(
     ctx_kv_bytes: u64,
     hot_cache_ask: u64,
 ) u32 {
-    if (config.isGlm5()) return contextNeutralChunk(config, kv_bits, ceiling, active_mem, @import("glm5_forward.zig").prefill_chunk);
+    if (config.isGlm5()) return contextNeutralChunk(config, kv_bits, ceiling, active_mem, @import("glm5/glm5_forward.zig").prefill_chunk);
     if (config.isDsv41()) return contextNeutralChunk(config, kv_bits, ceiling, active_mem, dsv41_config.prefill_width);
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
@@ -4043,7 +4043,7 @@ pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pin
         return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, dsv41_config.prefill_width }) catch null;
     }
     if (pinned >= launch) return null;
-    if (config.isGlm5() and pinned == @import("glm5_forward.zig").prefill_chunk)
+    if (config.isGlm5() and pinned == @import("glm5/glm5_forward.zig").prefill_chunk)
         return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (GLM's numerics width; --prefill-chunk overrides)\n", .{pinned}) catch null;
     return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ pinned, launch }) catch null;
 }
@@ -7010,16 +7010,16 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
     const pending = 2; // glm5_forward.Request.prefill_sync_layers
     const mla_pending = glmMlaLayersPending(config, pending);
     const n = std.math.cast(usize, rows) orelse return std.math.maxInt(u64);
-    const quant_scratch: u64 = if (kv_bits < 16) @import("glm5_latent.zig").scratchBytes(config.mla_kv_lora_rank, n, mla_pending, @intCast(kv_bits)) else 0;
-    const native = (@import("glm5_a6_dense_once.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_mla_prefill_batch.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_attention_nax_packed.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_attention.zig").packedCadenceTransientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_indexpool_nax.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
+    const quant_scratch: u64 = if (kv_bits < 16) @import("glm5/glm5_latent.zig").scratchBytes(config.mla_kv_lora_rank, n, mla_pending, @intCast(kv_bits)) else 0;
+    const native = (@import("glm5/glm5_a6_dense_once.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5/glm5_mla_prefill_batch.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5/glm5_attention_nax_packed.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5/glm5_attention.zig").packedCadenceTransientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5/glm5_indexpool_nax.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5/glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5/glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
     const dflash = if (config.dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
-    const attention = @import("glm5_attention.zig");
+    const attention = @import("glm5/glm5_attention.zig");
     const history = std.math.cast(usize, seq) orelse return std.math.maxInt(u64);
     const selection = @max(attention.score_scratch_bytes, attention.selectionScratchBytes(history) catch return std.math.maxInt(u64));
     return rows *| per_row +| grow +| quant_scratch +| slotRingBytes(config, 16) +| native +| dflash +| glmFp8DequantScratchBytes(config, rows, pending) +|
@@ -7046,7 +7046,7 @@ pub fn glmDflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u
     return config.dflash_window_bytes *| 4 +|
         config.dflash_capture_bytes_per_token *| chunk +|
         config.ssmCheckpointBytes() *| 3 +|
-        @import("glm5_dflash_memory.zig").limit_bytes +| 64 * 1024 * 1024;
+        @import("glm5/glm5_dflash_memory.zig").limit_bytes +| 64 * 1024 * 1024;
 }
 
 /// The sliding DFlash2 assistant's per-request bytes on a non-GLM target: the physical window and
@@ -26736,7 +26736,7 @@ test "a Qwen or MiMo request owes no growth after admission, its reserved capaci
 
 test "GLM prefill bills the packed selection planes of its history" {
     const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    const attention = @import("glm5_attention.zig");
+    const attention = @import("glm5/glm5_attention.zig");
     const short: u64 = 1 << 19;
     const long: u64 = 1 << 20;
     // Beyond selection planes, only the growing kv8 latent (544) and pooled index (64) scale with history.
@@ -26947,7 +26947,7 @@ test "the concurrency verdict: a resident GLM and qwen4 batch, an exclusive mode
 }
 
 test "GLM DFlash2 reserve at prefill end fits the admission bill at every request shape" {
-    const reserve = @import("glm5_dflash_reserve.zig");
+    const reserve = @import("glm5/glm5_dflash_reserve.zig");
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     cfg.dflash_loaded = true;
     const mla_layers: usize = cfg.num_hidden_layers / cfg.full_attention_interval;
@@ -26956,7 +26956,7 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
     for ([_]u32{ 1024, 8192, 65536, 1048576 }) |ctx| {
         cfg.pinned_context = ctx;
         for ([_]u64{ 16, 8, 6 }) |kv_bits| {
-            const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(kv_bits));
+            const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5/glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(kv_bits));
             for (shapes) |shape| {
                 const seq: usize = @intCast(shape[0]);
                 if (seq >= ctx) continue;
@@ -26982,7 +26982,7 @@ test "GLM prefill transient bill follows the latent width: kv6 sheds 128 bytes p
 }
 
 test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context" {
-    const reserve = @import("glm5_dflash_reserve.zig");
+    const reserve = @import("glm5/glm5_dflash_reserve.zig");
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     cfg.dflash_loaded = true;
     var mla_layers: usize = 0;
@@ -26990,7 +26990,7 @@ test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the adve
     const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
     for ([_]struct { bits: u64, ctx: u32 }{ .{ .bits = 8, .ctx = 1048576 }, .{ .bits = 6, .ctx = 1048576 }, .{ .bits = 16, .ctx = 524288 } }) |arm| {
         cfg.pinned_context = arm.ctx;
-        const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(arm.bits));
+        const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5/glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(arm.bits));
         for ([_]usize{ 16, 2008, 100000 }) |seq| {
             const max_tokens: u32 = @intCast(arm.ctx - seq);
             const lc = try reserve.capacity(seq);
@@ -27622,7 +27622,7 @@ test "reasoning usage tokenization ignores SSE boundaries" {
 
 test "dsv41 bills: a prefill holds its restore points beside the state with a RAM tier, and only the writer's in-flight bytes SSD-first (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dir = try @import("dsv41_model.zig").fixtureDir();
+    const dir = try @import("dsv41/dsv41_model.zig").fixtureDir();
     const t = std.testing;
     const io = std.Io.Threaded.global_single_threaded.io();
     var cfg = try model_mod.parseConfig(io, t.allocator, dir);

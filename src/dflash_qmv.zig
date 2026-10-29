@@ -209,7 +209,7 @@ pub fn gateUpAct(s: mlx.mlx_stream, x: mlx.mlx_array, gate: [3]mlx.mlx_array, up
 
 test "DFlash A4 fused gate, up and SiLU equal two MLX quantized matmuls and the staged activation" {
     if (mlx.noGpuBackend() or !@import("transformer.zig").verifySharedHardware()) return error.SkipZigTest;
-    const Ops = @import("glm5_model.zig").Ops;
+    const Ops = @import("glm5/glm5_model.zig").Ops;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     var weights: [2][3]mlx.mlx_array = undefined;
@@ -254,7 +254,7 @@ test "DFlash A4 fused gate, up and SiLU equal two MLX quantized matmuls and the 
 
 test "DFlash A4 eight-row FFN projection matches MLX exactly" {
     if (mlx.noGpuBackend() or !@import("transformer.zig").verifySharedHardware()) return error.SkipZigTest;
-    const Ops = @import("glm5_model.zig").Ops;
+    const Ops = @import("glm5/glm5_model.zig").Ops;
     const fixture = @import("dflash.zig").TinyFix;
     for ([_][2]c_int{ .{ 4096, 12288 }, .{ 12288, 4096 } }) |nk| {
         const k = nk[0];

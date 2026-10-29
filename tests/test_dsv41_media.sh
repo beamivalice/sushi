@@ -1,7 +1,7 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
 # DeepSeek-V4.1-Flash image input, live on the served pack (streamed: the tower loads by default). The tower's
-# numerics are pinned by the fixture tests in src/dsv41_vision.zig; this checks what only a running
+# numerics are pinned by the fixture tests in src/dsv41/dsv41_vision.zig; this checks what only a running
 # server shows:
 #   [1] the tower loads with no flag, bills the ssd budget's `vision` term and /v1/models advertises images;
 #   [2] the answer reads what only the pixels hold (quadrant colors), on chat/completions and /v1/messages;

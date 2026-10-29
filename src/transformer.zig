@@ -1,12 +1,12 @@
 const std = @import("std");
-const glm5_mod = @import("glm5_forward.zig");
-const dsv41_model = @import("dsv41_model.zig");
-const dsv41_stream = @import("dsv41_stream.zig");
-const dsv41_borrow = @import("dsv41_borrow.zig");
+const glm5_mod = @import("glm5/glm5_forward.zig");
+const dsv41_model = @import("dsv41/dsv41_model.zig");
+const dsv41_stream = @import("dsv41/dsv41_stream.zig");
+const dsv41_borrow = @import("dsv41/dsv41_borrow.zig");
 const GlmRequest = glm5_mod.Request;
-const qwen4_mod = @import("qwen4_exp.zig");
+const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("dsv41/expert_usage.zig");
 const expert_bf16 = @import("expert_bf16_kernels.zig");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -14,7 +14,7 @@ const expert_exl3_kernels = sushi_exl3.kernels;
 const expert_exl3 = sushi_exl3.format;
 const expert_quant_mod = @import("expert_quant.zig");
 const fp8_block = @import("fp8_block.zig");
-const gdn_decode = @import("gdn_decode.zig");
+const gdn_decode = @import("qwen4/gdn_decode.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
 // so has no head-shaped state of its own. mtp.zig imports this file back for
@@ -24,10 +24,10 @@ const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
 
-const mimo_forward = @import("mimo_forward.zig");
-const qwen4_forward = @import("qwen4_forward.zig");
-const qwen4_qsa = @import("qwen4_qsa.zig");
-const qwen4_hc = @import("qwen4_hc.zig");
+const mimo_forward = @import("mimo2/mimo_forward.zig");
+const qwen4_forward = @import("qwen4/qwen4_forward.zig");
+const qwen4_qsa = @import("qwen4/qwen4_qsa.zig");
+const qwen4_hc = @import("qwen4/qwen4_hc.zig");
 pub const HcPending = qwen4_hc.HcPending;
 pub const MIMO_VERIFY_ROWS_MAX = mimo_forward.MIMO_VERIFY_ROWS_MAX;
 const MimoAttnArm = mimo_forward.MimoAttnArm;
@@ -18458,7 +18458,7 @@ pub const Transformer = struct {
             const fold_shared = shared != null and moeDumpDir() == null;
             const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
             if (tail_shared and moeDumpDir() == null) {
-                if (try @import("qwen4_shared.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), routed.gate_logit)) |folded| return folded;
+                if (try @import("qwen4/qwen4_shared.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), routed.gate_logit)) |folded| return folded;
                 const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
                 defer _ = mlx.mlx_array_free(down);
                 const own_logit = routed.gate_logit.ctx == null;
@@ -26285,7 +26285,7 @@ fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
     };
     const mdl = try allocator.create(glm5_mod.Model);
     errdefer allocator.destroy(mdl);
-    mdl.* = try glm5_mod.Model.loadStreamed(allocator, config, weights, s, if (engine) |e| @import("glm5_stream.zig").Stream.serving(e, &config) else null);
+    mdl.* = try glm5_mod.Model.loadStreamed(allocator, config, weights, s, if (engine) |e| @import("glm5/glm5_stream.zig").Stream.serving(e, &config) else null);
     errdefer mdl.deinit();
     var request = try glm5_mod.Request.initServing(allocator, config.num_hidden_layers);
     errdefer request.deinit();
@@ -41715,7 +41715,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
     // the splice BEFORE the hyper-connection tile, the M-RoPE chunk tables
     // reaching attention AND the QSA indexer, and the indexer's pooled block
     // keys roped at 3-D block-start positions (the layer-3 mask is EXACT).
-    const qwen_vision = @import("qwen_vision.zig");
+    const qwen_vision = @import("qwen4/qwen_vision.zig");
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     const fixture_path = std.c.getenv("QWEN4_FIXTURE_VISION") orelse return error.SkipZigTest;
     try mlx.requireGpu();
@@ -52264,7 +52264,7 @@ test "a streamed GLM load keeps its one teacher stream exclusive" {
     t.glm5 = &glm;
     try testing.expect(!t.ownsModuleDecodeState());
     try testing.expect(t.moduleSpecWiring());
-    glm.expert_stream = @ptrFromInt(@alignOf(@import("glm5_stream.zig").Stream));
+    glm.expert_stream = @ptrFromInt(@alignOf(@import("glm5/glm5_stream.zig").Stream));
     try testing.expect(t.ownsModuleDecodeState());
 }
 
@@ -52428,7 +52428,7 @@ test "GLM serving streams BF16 source experts through the engine the native capt
     try trunk.dropPrefix(glm5_mod.ROUTED_BANK_PREFIX);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try @import("glm_stream_fixture.zig").writeSized(a, tmp.dir, .none, 128, 128);
+    try @import("glm5/glm_stream_fixture.zig").writeSized(a, tmp.dir, .none, 128, 128);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
     var streamed_cfg = cfg;
@@ -52466,7 +52466,7 @@ test "GLM serving streams FP8 source experts through eviction and the union, the
     try trunk.dropPrefix(glm5_mod.ROUTED_BANK_PREFIX);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try @import("glm_stream_fixture.zig").writeStorage(a, tmp.dir, .none, 128, 128, .fp8);
+    try @import("glm5/glm_stream_fixture.zig").writeStorage(a, tmp.dir, .none, 128, 128, .fp8);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
     const per_expert = try expert_stream_mod.expertBytesFor(a, path, cfg.expertGeometry(), .fp8_individual);

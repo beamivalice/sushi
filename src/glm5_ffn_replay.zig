@@ -4,9 +4,9 @@ pub const mlx = @import("mlx.zig");
 pub const log = @import("log.zig");
 pub const io_util = @import("io_util.zig");
 const model = @import("model.zig");
-const forward = @import("glm5_forward.zig");
-const base = @import("glm5_model.zig");
-const native = @import("glm5_diagnostic.zig");
+const forward = @import("glm5/glm5_forward.zig");
+const base = @import("glm5/glm5_model.zig");
+const native = @import("glm5/glm5_diagnostic.zig");
 
 fn append(fd: std.c.fd_t, array: mlx.mlx_array, stream: mlx.mlx_stream) !void {
     var contiguous = mlx.mlx_array_new();

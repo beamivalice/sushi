@@ -10,7 +10,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
 [qwen4-arch](qwen4-arch.md), [mimo2-arch](mimo2-arch.md).
 
 Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
-(`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),
+(`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo2/mimo_source.zig` (`validateShardStamps`),
 `src/model.zig` (weight loading).
 
 ## Routed-expert tensors

@@ -16,8 +16,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`), its default budget (`resolveDiskBudget`) and startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
-| `src/glm5_prefix.zig` | GLM restore points: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
-| `src/dsv41_prefix.zig` | DeepSeek-V4.1 restore points: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
+| `src/glm5/glm5_prefix.zig` | GLM restore points: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
+| `src/dsv41/dsv41_prefix.zig` | DeepSeek-V4.1 restore points: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
 
 ## Basics
 

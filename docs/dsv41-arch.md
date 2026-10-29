@@ -39,13 +39,13 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
 
 ## What loads
 
-- **Resident trunk** (`src/dsv41_source.zig`, ONE decision in `model.loadWeightsForConfig`): every tensor but the experts,
+- **Resident trunk** (`src/dsv41/dsv41_source.zig`, ONE decision in `model.loadWeightsForConfig`): every tensor but the experts,
   the Engram rows, the MTP/DSpark tensors and (under `--no-vision`) the vision/aligner/image tensors and `bias_vl`, read by name from the shard headers. FP8
   linears become MLX `mxfp8`: the u8 codes viewed as u32 and each 32-row scale row repeated down its 32 rows. FP4 experts
   are MLX `mxfp4` exactly (the int8 viewed as u32, low nibble first; proven bit for bit against a numpy decode of a real
   expert). The head is widened to f32; a dense embedding stays bf16. An affine embedding (an STQ pack's 4-bit g64 triple, `embed.weight/scales/biases`) is [read from the shard by row](#embed-ssd), not loaded.
 <a id="embed-ssd"></a>
-- **Token embedding on SSD** (`src/dsv41_embed.zig`): a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`)
+- **Token embedding on SSD** (`src/dsv41/dsv41_embed.zig`): a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`)
   is left out of the resident load and of the trunk term (`dsv41_source.embedOnSsd`, the one test for both), 0.37 GB on the
   STQ pack. A forward `pread`s the rows of its token ids (`Ssd.read`: each distinct id once, 16 rows a thread, `F_RDADVISE`
   first, page cache on, read-ahead off) and `Embed.rows` dequantizes them with the resident call, over the same stored bytes
@@ -58,11 +58,11 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   `[dsv41] token embedding on SSD (0.37 GB freed to the expert cache)`. Live (873b0fd4 vs 09977e23, budget 108, AC, fans
   max, one A then one B): +1 slot a layer (270 -> 271 serial, 260 -> 261 DSpark), 512-token decode byte-identical at
   46.8 / 46.9 tok/s serial and 52.0 / 52.2 DSpark, cold 32,888-token prefill 792.7 / 790.4 tok/s.
-- **Routed experts** (`src/dsv41_stream.zig`): the shared expert cache reads each layer's picked experts from the shards
+- **Routed experts** (`src/dsv41/dsv41_stream.zig`): the shared expert cache reads each layer's picked experts from the shards
   into slabs (layout `mxfp4_w123`, `layers.L.ffn.experts.E.w1|w3|w2.{weight,scale}`; w1 gate, w3 up, w2 down) and the
   layer gathers them as `mxfp4`. The slab path gives the resident path's logits bit for bit on a tiny pack, with a cache
   that holds every expert and one that does not.
-- **Engram tables** (`src/dsv41_engram.zig`): never resident. Each lookup `pread`s its rows from the shard that holds the
+- **Engram tables** (`src/dsv41/dsv41_engram.zig`): never resident. Each lookup `pread`s its rows from the shard that holds the
   table (page cache on, read-ahead off, `F_RDADVISE` first so a batch costs about one SSD latency) and dequantizes them
   as `mxfp8`. A row cache per table (`RowCache`, 8-way set-associative, least recent out) keeps 1M rows; on 1M
   tokens of documents in turn it serves 31% of reads at 64k rows, 42% at 1M and 47% at 4M
@@ -73,7 +73,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   the next pass takes them when its row ids are the same, else reads its own. The n-gram hash and the compressed-vocabulary map
   are the reference's (`engram.py`); the map ships embedded (`src/fixtures/dsv41_engram_token_map.bin`) and a pack's own
   `engram_token_map.json` outranks it. `tests/dump_dsv41_token_map.py --check` re-derives it from `tokenizer.json`.
-- **Forward** (`src/dsv41_model.zig`): bf16 activations, f32 where the reference is f32 (head, compressor, hyper-connection
+- **Forward** (`src/dsv41/dsv41_model.zig`): bf16 activations, f32 where the reference is f32 (head, compressor, hyper-connection
   mixes, attention scores and sink, router). Prefill runs in spans of 256 rows; the window is a ring, the compressed and
   index rows grow by a sixteenth (`rows_grow_div`); decode is the one-row case of the same code.
 - **Indexer top-k, streamed** (`indexStream`): a wide span (more than 16 rows) with more index keys than one tile
@@ -128,7 +128,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
 
 ### QAT round trips
 
-The reference fake-quantizes at five places and the forward applies each (`src/dsv41_qat.zig`, Metal, round-half-even,
+The reference fake-quantizes at five places and the forward applies each (`src/dsv41/dsv41_qat.zig`, Metal, round-half-even,
 the reference's f32 reciprocal constants): the window KV after rope (FP8, ue8m0, 32), the compressed latent (FP4, e4m3
 scale, 16), the indexer key and query (FP4, ue8m0, 32) and the attention output (FP8, ue8m0, 32). They are bit-exact
 against the reference's own kernels on a midpoint-rich fixture.
@@ -136,7 +136,7 @@ against the reference's own kernels on a midpoint-rich fixture.
 ## Tokenizer
 
 The release's pre-tokenizer is a `Sequence` of three isolating Splits (`\p{N}{1,3}`, a CJK class, a punctuation grammar)
-and a ByteLevel that does not split. `src/tokenizer_deepseek.zig` runs it exactly, each Split on the pieces the one before
+and a ByteLevel that does not split. `src/dsv41/tokenizer_deepseek.zig` runs it exactly, each Split on the pieces the one before
 left, so a whitespace run at a piece's edge stays whole; it is selected only when the tokenizer.json spells those three
 regexes verbatim. It needs `\p{P}` and `\p{S}`, which `scripts/gen-tokenizer-unicode.py` now emits beside letters, marks and
 numbers. Pinned to HF `tokenizers` by `deepseek pre-tokenizer` (21 inputs, hermetic) and by the real-pack parity in
@@ -280,7 +280,7 @@ Serving is bf16, where neither matters.
 <a id="fused"></a>
 ## Fused kernels
 
-`src/dsv41_kernels.zig` holds Metal kernels, each replacing a chain of MLX ops of `dsv41_model.zig`; the chain stays as
+`src/dsv41/dsv41_kernels.zig` holds Metal kernels, each replacing a chain of MLX ops of `dsv41_model.zig`; the chain stays as
 the reference of its test and as the arm for a scope off the GPU stream or `Model.fused = false`. They are ported from
 mlx-serve's `deepseek_v41.zig` (49bb6be0) and adapted to the original layout: experts are separate `mxfp4` gate, up and
 down banks (upstream fuses affine ones), the shared expert and trunk are `mxfp8`, rotary takes sushi's `freqs` and the
@@ -577,7 +577,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
 
 - **A restore point is the whole state at one position** (`dsv41_model.captureState`): each layer's window ring and open
   pooling group, the compressed and index rows through the position, the DSpark stage windows. The Engram history is
-  rebuilt from the prompt's token ids. It is stored as an `SSMCheckpoint` (`src/dsv41_prefix.zig`): each slot's four
+  rebuilt from the prompt's token ids. It is stored as an `SSMCheckpoint` (`src/dsv41/dsv41_prefix.zig`): each slot's four
   arrays ride two snapshot layers' conv and ssm fields (the aux and pooled fields mean a QSA history to the cache, so
   they stay empty; an absent array is a one-byte placeholder), so the cache's checkpoint list, thinning, merge, byte bill
   and the SSD tier's `s<pos>.safetensors` files serve it unchanged. A restore shares the checkpoint's arrays and never
@@ -713,7 +713,7 @@ whose streamed loads leave it off. `--no-vision` (or `vision: false` in model-se
 and an image without it is a 400; an explicit flag outranks the setting, which outranks the default. One image is `[start] + ([n_w aligner rows] +
 [newline]) * n_h + [end]`, every position of which is `image_token_id` (`<｜deepseek_image｜>`) in the prompt.
 
-- **Processor** (`src/dsv41_vision.zig`, the release's `inference/image_processor.py`): `planGrid` picks the canvas
+- **Processor** (`src/dsv41/dsv41_vision.zig`, the release's `inference/image_processor.py`): `planGrid` picks the canvas
   (14 px patches, 3x3 aligner cells, at most `max_image_tokens` 1024 span tokens, scaled up to `min_pixels`), `letterbox`
   is Pillow's `ImageOps.pad` (bicubic `contain`, gray 127, half-to-even margin; `vision_common.resizeRgbU8` is
   Pillow's two-pass uint8 resize), pixels are `(x/255 - 0.5)/0.5` in f32 in `(c, py, px)` order. Equal to the

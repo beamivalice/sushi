@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference oracle for the MiMo-ViT tower (src/mimo_vision.zig).
+"""Reference oracle for the MiMo-ViT tower (src/mimo2/mimo_vision.zig).
 
 Runs the checkpoint's OWN `MiMoVisionTransformer` (modeling_mimo_v2.py) on the
 CPU in f32 and writes what the Zig tests compare against.

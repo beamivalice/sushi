@@ -10,7 +10,7 @@ test {
     _ = @import("token_mask.zig");
     _ = @import("regex.zig");
     _ = @import("tokenizer.zig");
-    _ = @import("tokenizer_deepseek.zig");
+    _ = @import("dsv41/tokenizer_deepseek.zig");
     _ = @import("stop_sequences.zig");
     _ = @import("row_grammar.zig");
     _ = @import("logit_bias.zig");
@@ -18,8 +18,8 @@ test {
     _ = @import("test_models.zig");
     _ = @import("test_expect.zig");
     _ = @import("io_util.zig");
-    _ = @import("dspark_rows.zig");
-    _ = @import("expert_usage.zig");
+    _ = @import("dsv41/dspark_rows.zig");
+    _ = @import("dsv41/expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("mtp_acceptance.zig");
     _ = @import("mtp_depth_bounds.zig");

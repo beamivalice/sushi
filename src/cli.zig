@@ -3211,7 +3211,7 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     try tmp.dir.createDir(io, "pack", .default_dir);
     var pack = try tmp.dir.openDir(io, "pack", .{});
     defer pack.close(io);
-    try @import("glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
+    try @import("glm5/glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);

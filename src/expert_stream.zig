@@ -5,7 +5,7 @@ const io_mod = @import("expert_io.zig");
 const kernels = @import("expert_bf16_kernels.zig");
 pub const quant = @import("expert_quant.zig");
 const sushi_exl3 = @import("sushi_exl3");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("dsv41/expert_usage.zig");
 const Ragged = sushi_exl3.Ragged;
 
 pub const Span = struct {
@@ -5233,7 +5233,7 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
 test "GLM BF16 stream imports split expert slabs and preserves bytes across cache and union" {
     try mlx.requireGpu();
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try fixture.write(t.allocator, tmp.dir, .none);

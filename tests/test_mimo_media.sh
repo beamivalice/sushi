@@ -1,7 +1,7 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
 # MiMo-V2.6-Flash image input, live on the served pack. The tower's numerics
-# are pinned by the hermetic and real-weight tests in src/mimo_vision.zig; this
+# are pinned by the hermetic and real-weight tests in src/mimo2/mimo_vision.zig; this
 # checks what only a running server shows:
 #   [1] the load line + /v1/models advertise images (and not video);
 #   [2] the answer reads what only the pixels hold (quadrant colors, sign text),

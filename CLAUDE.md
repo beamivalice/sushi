@@ -102,13 +102,13 @@ Box: M5 Max 128 GB, macOS 27.
 | `scheduler.zig` / `generate.zig` | slots, inference thread, batching, admission; generation, sampling, MTP orchestration | server-lifecycle |
 | `model.zig` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, per-model settings, discovery, registry | server-lifecycle |
 | `transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch, quant resolution | arch-*, engine-* |
-| `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
-| `mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | mimo2-arch |
-| `glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, decode kernels, prefix state, vision | glm5-* |
-| `dsv41_*.zig` / `dspark_rows.zig` / `expert_usage.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1: config, resident loader, forward, QAT, Engram, expert-stream hooks, prefill borrow, prefix state, vision tower; DSpark verify width; `--drop-expert` usage list; pre-tokenizer | dsv41-arch, dsv41-memory |
-| `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | qwen4-arch |
-| `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
-| `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, shard-stamp check | mimo2-arch |
+| `qwen4/qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
+| `mimo2/mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | mimo2-arch |
+| `glm5/glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, decode kernels, prefix state, vision | glm5-* |
+| `dsv41/dsv41_*.zig` / `dspark_rows.zig` / `expert_usage.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1: config, resident loader, forward, QAT, Engram, expert-stream hooks, prefill borrow, prefix state, vision tower; DSpark verify width; `--drop-expert` usage list; pre-tokenizer | dsv41-arch, dsv41-memory |
+| `qwen4/qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | qwen4-arch |
+| `qwen4/gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
+| `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, shard-stamp check | mimo2-arch |
 | `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3/STQ decoders and kernels, rate groups, dense trellis linears (`exl3/linear.zig`) | engine-exl3-experts |
 | `encoder/` | `sushi convert exl3`: Metal and CPU trellis search, source readers, trunk and shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
@@ -117,7 +117,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier | engine-prefix-cache |
 | `mlx_kernel_keys.zig` | custom-kernel library keys behind `mlx.zig`'s kernel wrappers (`SUSHI_KERNEL_BUILD_LOG`) | engine-mlx-gotchas |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
-| `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: shared preprocessing, Qwen3-VL + M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
+| `vision.zig` / `vision_common.zig` / `qwen4/qwen_vision.zig` / `mimo2/mimo_vision.zig` / `glm5/glm5_vision.zig` / `mrope.zig` | media INPUT: shared preprocessing, Qwen3-VL + M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |
 | `bench.zig` / `bench_box.zig` | `sushi bench`: the release bench's HTTP client (corpus, ladder, report); fans, cooldown, power | process-measurement |
 | `ubench_main.zig` / `ubench_report.zig` / `exl3/ubench.zig` | `sushi-ubench` (`zig build ubench`): microbenches, never tests | process-ubench |

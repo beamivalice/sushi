@@ -1,6 +1,6 @@
 const std = @import("std");
 const io_mod = @import("expert_io.zig");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("dsv41/expert_usage.zig");
 pub const expert_exl3 = @import("sushi_exl3").format;
 
 /// The per-expert rate and offset table a rate-grouped layer keeps beside its stored banks. A group's gate trellis
@@ -2192,7 +2192,7 @@ test "GLM BF16 individual index recognizes separate gate up down experts" {
 
 test "GLM BF16 individual source preserves shard bytes and leaves dense prefix and MTP unopened" {
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try fixture.write(t.allocator, tmp.dir, .none);
@@ -2225,7 +2225,7 @@ test "GLM BF16 individual source preserves shard bytes and leaves dense prefix a
 
 test "GLM FP8 individual source resolves its layout and keeps e4m3 codes and block scales as stored" {
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try fixture.writeStorage(t.allocator, tmp.dir, .none, 128, 128, .fp8);
@@ -2260,7 +2260,7 @@ test "GLM FP8 individual source resolves its layout and keeps e4m3 codes and blo
 
 test "GLM BF16 individual source rejects incomplete quantized or malformed banks" {
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     for ([_]fixture.Fault{ .missing, .fp16, .wrong_shape, .truncated, .dense_prefix, .mixed, .fp8_scale }) |fault| {
         var tmp = t.tmpDir(.{});
         defer tmp.cleanup();

@@ -2,10 +2,10 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
-const qwen_vision = @import("qwen_vision.zig");
-const mimo_vision = @import("mimo_vision.zig");
-const glm5_vision = @import("glm5_vision.zig");
-const dsv41_vision = @import("dsv41_vision.zig");
+const qwen_vision = @import("qwen4/qwen_vision.zig");
+const mimo_vision = @import("mimo2/mimo_vision.zig");
+const glm5_vision = @import("glm5/glm5_vision.zig");
+const dsv41_vision = @import("dsv41/dsv41_vision.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;

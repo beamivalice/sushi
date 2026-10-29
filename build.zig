@@ -278,28 +278,33 @@ const test_buckets = [_][]const []const u8{
     &.{ "server", "responses" },
 };
 
+/// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
+const test_dirs = [_][]const u8{ "src", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
+
 fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
     const io = b.graph.io;
     const host_stems = hostStems(b);
     var stems: std.ArrayList([]const u8) = .empty;
     var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
-    var src = buildRootHandle(b).openDir(io, "src", .{ .iterate = true }) catch |e| std.debug.panic("src/: {t}", .{e});
-    defer src.close(io);
-    var it = src.iterate();
-    while (it.next(io) catch |e| std.debug.panic("src/: {t}", .{e})) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        const stem = entry.name[0 .. entry.name.len - ".zig".len];
-        if (isHostStem(host_stems, stem)) continue;
-        if (std.mem.startsWith(u8, stem, "ubench_")) continue;
-        stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
-        const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
-        var lines = std.mem.splitScalar(u8, source, '\n');
-        while (lines.next()) |line| {
-            const indent = std.mem.indexOf(u8, line, "test \"") orelse continue;
-            if (indent == 0 or std.mem.trim(u8, line[0..indent], " ").len != 0) continue;
-            if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
-                std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
-            nested.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt(".test.{s}", .{line[indent + "test \"".len .. line.len - "\" {".len]}) }) catch @panic("OOM");
+    for (test_dirs) |dir_path| {
+        var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e });
+        defer src.close(io);
+        var it = src.iterate();
+        while (it.next(io) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e })) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+            const stem = entry.name[0 .. entry.name.len - ".zig".len];
+            if (isHostStem(host_stems, stem)) continue;
+            if (std.mem.startsWith(u8, stem, "ubench_")) continue;
+            stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
+            const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
+            var lines = std.mem.splitScalar(u8, source, '\n');
+            while (lines.next()) |line| {
+                const indent = std.mem.indexOf(u8, line, "test \"") orelse continue;
+                if (indent == 0 or std.mem.trim(u8, line[0..indent], " ").len != 0) continue;
+                if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
+                    std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
+                nested.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt(".test.{s}", .{line[indent + "test \"".len .. line.len - "\" {".len]}) }) catch @panic("OOM");
+            }
         }
     }
     // Directory order varies; the filters key the compile step's cache.
@@ -356,7 +361,8 @@ fn hostStems(b: *std.Build) []const []const u8 {
         const head = "    _ = @import(\"";
         const tail = ".zig\");";
         if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) continue;
-        stems.append(b.allocator, line[head.len .. line.len - tail.len]) catch @panic("OOM");
+        const path = line[head.len .. line.len - tail.len];
+        stems.append(b.allocator, path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..]) catch @panic("OOM");
     }
     return stems.items;
 }

@@ -22,12 +22,12 @@ mlx-serve src/assets/codex_model_instructions.md (https://github.com/ddalcu/mlx-
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; the tool list is
 adjusted to what codex-cli 0.154 declares.
 
-The DeepSeek-V4.1 image plan, letterbox box and aligner unfold in src/dsv41_vision.zig
+The DeepSeek-V4.1 image plan, letterbox box and aligner unfold in src/dsv41/dsv41_vision.zig
 follow mlx-serve src/dsv41_vision.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE; their numbers are
 re-derived against the release's inference/image_processor.py and vision.py.
 
-The lattice and best-first draft tree in src/glm5_dflash_tree.zig are adapted
+The lattice and best-first draft tree in src/glm5/glm5_dflash_tree.zig are adapted
 from mlx-serve src/dflash.zig (https://github.com/ddalcu/mlx-serve),
 Copyright (c) 2026 David Dalcu, under the MIT terms in LICENSE. Its tree policy
 was ported from TensorFold (https://github.com/ashhart/TensorFold):
@@ -82,12 +82,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-The DeepSeek-V4.1 forward in src/dsv41_model.zig follows the release's
+The DeepSeek-V4.1 forward in src/dsv41/dsv41_model.zig follows the release's
 `inference/model.py` (attention, compressor and indexer, hyper-connections,
 router, Engram and DSpark stages), the fake-quantization round trips in
-src/dsv41_qat.zig follow `act_quant` and `fp4_act_quant` in `inference/kernel.py`,
-the n-gram hash and compressed vocabulary map in src/dsv41_engram.zig follow
-`inference/engram.py`, and the image processor and tower in src/dsv41_vision.zig
+src/dsv41/dsv41_qat.zig follow `act_quant` and `fp4_act_quant` in `inference/kernel.py`,
+the n-gram hash and compressed vocabulary map in src/dsv41/dsv41_engram.zig follow
+`inference/engram.py`, and the image processor and tower in src/dsv41/dsv41_vision.zig
 follow `inference/image_processor.py` and `inference/vision.py`. All are
 implemented in Zig against mlx-c with SSD-streamed expert banks.
 `src/fixtures/dsv41_chat_template.jinja` is a Jinja transcription of the
@@ -115,13 +115,13 @@ value-scaling and sigmoid-routing contracts. It is implemented in Zig against
 mlx-c with SSD-streamed expert banks. tests/dump_mimo_v2_fixtures.py loads the
 unmodified reference externally to generate independent numerical fixtures.
 
-The TP-aware FP8 QKV reconstruction in `src/mimo_source.zig` follows
+The TP-aware FP8 QKV reconstruction in `src/mimo2/mimo_source.zig` follows
 `conversion/mimo.py`, reimplemented in Zig.
 
-The MiMo-ViT vision tower in `src/mimo_vision.zig` is a port of the
+The MiMo-ViT vision tower in `src/mimo2/mimo_vision.zig` is a port of the
 reference's `MiMoVisionTransformer` (`modeling_mimo_v2.py`), and its image
 preprocessing follows the vendor serving processors (`smart_resize`, bilinear
-resampling, ImageNet normalization). The three MTP heads in `src/mimo_mtp.zig`
+resampling, ImageNet normalization). The three MTP heads in `src/mimo2/mimo_mtp.zig`
 follow the MiMo-V2 MTP layer as XiaomiMiMo's vLLM and SGLang integrations
 compose it (Apache-2.0). Both are reimplemented in Zig against mlx-c;
 tests/dump_mimo_vision_fixtures.py and tests/dump_mimo_v2_mtp_fixtures.py
@@ -204,14 +204,14 @@ oMLX, by jundot
 Copyright oMLX contributors
 Licensed under the Apache License, Version 2.0.
 
-Used in sushi (`src/glm5_hc_prefill.zig`):
+Used in sushi (`src/glm5/glm5_hc_prefill.zig`):
 
   * The HC RMS reduction maps virtual MLX normalization threads
     as in `hc_mix1` from `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py`
     at 6745c39c. The following projection retains Sushi's own four-SIMD-group
     reduction order. The MLX-derived normalization arithmetic is MIT licensed.
 
-Used in sushi (`src/glm5_decode.zig`):
+Used in sushi (`src/glm5/glm5_decode.zig`):
 
   * The copy-free three-bank affine QKV dispatch adapts `multi_qmv` from
     `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py` at 6745c39c.
@@ -219,14 +219,14 @@ Used in sushi (`src/glm5_decode.zig`):
     each bank keeps its original packed weights, scales and biases.
     Its MLX-derived qmv-fast arithmetic retains the MIT attribution below.
 
-The affine row tile in `src/glm5_dflash_qmm.zig` adapts that arithmetic to
+The affine row tile in `src/glm5/glm5_dflash_qmm.zig` adapts that arithmetic to
 reuse each weight group across up to four verification rows, retaining the
 per-row dot, scale/bias update and SIMD reduction order. Its 5- and 6-bit paths,
-and the coefficient hoist in `src/glm5_dflash_a6_hoist.zig`, also adapt MLX
+and the coefficient hoist in `src/glm5/glm5_dflash_a6_hoist.zig`, also adapt MLX
 `load_vector` and `qdot` from `quantized.h`, including grouped activation sums
 and split-byte products, under the MIT attribution below.
 
-Used in sushi (`src/glm5_kda_fused.zig`):
+Used in sushi (`src/glm5/glm5_kda_fused.zig`):
 
   * The one-token KDA body adapts `_KDA_SOURCE` from the same 6745c39c
     GLM decode-kernel module. It uses externally projected BF16 gates,
@@ -234,7 +234,7 @@ Used in sushi (`src/glm5_kda_fused.zig`):
     retaining FP32 recurrent state. The sigmoid expressions derive from
     MLX's MIT-licensed elementwise functors.
 
-Used in sushi (`src/glm5_kda_prework.zig`):
+Used in sushi (`src/glm5/glm5_kda_prework.zig`):
 
   * Parallel token/head prework adapts the KDA decode arithmetic above and
     `_PREWORK_SOURCE` in `omlx/patches/glm53_kda_prework.py` at 6745c39c.
@@ -242,7 +242,7 @@ Used in sushi (`src/glm5_kda_prework.zig`):
     adds vector decay and beta outputs, and preserves the compact tail's
     existing bit semantics. MLX-derived sigmoid expressions remain MIT licensed.
 
-Used in sushi (`src/glm5_router.zig`):
+Used in sushi (`src/glm5/glm5_router.zig`):
 
   * The FP32 router GEMV/sigmoid and stable top-k selection adapt
     `_ROUTER_LOGITS_SOURCE` and `_ROUTER_SELECT_SOURCE` from the same
@@ -319,14 +319,14 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     capped at 8, the qwen4 head only, both rounds priced from sushi's own MTP
     cost source, an ordinary match must agree past the start of a line, and
     no lookup under a forced MTP depth.
-  * The fused GatedDeltaNet decode step (`src/gdn_decode.zig`): the GDN
+  * The fused GatedDeltaNet decode step (`src/qwen4/gdn_decode.zig`): the GDN
     prework and recurrence in one dispatch, David Dalcu's K1 kernel (mlx-serve
     27407892 and 89eeb249), and its verify-width variant with the host plumbing
     from mlx-serve #517 by Samuel Reed (@STRML). Modifications: the kernels emit
     the bf16 output, state and capture buffers of sushi's own chain and carry
     each stored capture state to the next token as sushi's capture kernel does;
     the Hadamard norm-gate-rotate kernel is not ported.
-  * GDN verify norm-gate and rollback-history folding (`src/gdn_decode.zig`,
+  * GDN verify norm-gate and rollback-history folding (`src/qwen4/gdn_decode.zig`,
     `src/transformer.zig`, `src/mlx.zig`), from mlx-serve #558 by Samuel Reed
     (@STRML). Modifications: bf16-only with sushi's per-token state rounding;
     the pipeline probe uses independent dummy inputs to preserve deferred PLE,
@@ -391,7 +391,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     Modifications: scoped to the common prelude, the qwen4_exp branch and
     discovery; qwen4_exp adds a geometry refusal, and the fixtures are the
     served packs' configs.
-  * The DeepSeek-V4.1-Flash arm (`src/dsv41_{borrow,config,engram,kernels,model,prefix,qat,scope,source,stream,vision}.zig`,
+  * The DeepSeek-V4.1-Flash arm (`src/dsv41/dsv41_{borrow,config,engram,kernels,model,prefix,qat,scope,source,stream,vision}.zig`,
     `src/fixtures/dsv41_chat_template.jinja`,
     `src/fixtures/dsv41_engram_token_map.bin`, the spaced DSML tags in `src/chat.zig`), from
     mlx-serve's `deepseek_v41.zig`, `src/dsv41_engram.zig` and `src/chat.zig` at f1c3276f
@@ -400,13 +400,13 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     release's `inference/model.py` and pinned to it by a tiny-model oracle, the expert
     stream rides sushi's shared expert cache, and the template
     cases are regenerated from the release's encoder. The fused Metal kernels
-    (`src/dsv41_kernels.zig`) are the `dsv41_*` kernels of the same file at 49bb6be0, with
+    (`src/dsv41/dsv41_kernels.zig`) are the `dsv41_*` kernels of the same file at 49bb6be0, with
     the expert dots rewritten for the release's mxfp4 banks (upstream's are affine repacks),
     MLX's own exp, cos and sin, and the rotary, hyper-connection and Engram indexing adapted
     to the original checkpoint layout. The release itself is MIT, Copyright (c) 2023
     DeepSeek.
   * The DSpark speculative decoder of that arm (`dspark`, `draft`, `verify` and `finishVerify`
-    in `src/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `deepseek_v41.zig`
+    in `src/dsv41/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `deepseek_v41.zig`
     at 49bb6be0 (`dsparkDraft`, `dsparkBeginWith`, `dsparkFinish` and their rollback of a
     verify chunk) by David Dalcu. Modifications: the stages and heads load from the original
     `mtp.*` tensors with resident mxfp4 experts, the draft attention and the attention-output
@@ -454,12 +454,12 @@ from MLX `backend/metal/kernels/quantized.h`. They specialize the A4
 group-64 FFN geometries and share decoded weights across the input rows
 while retaining MLX's subchunk accumulation and lane-shuffle reduction order.
 
-The HC RMS kernel in `src/glm5_hc_prefill.zig` adapts the four-value-per-thread
+The HC RMS kernel in `src/glm5/glm5_hc_prefill.zig` adapts the four-value-per-thread
 `rms_looped` reduction from MLX `backend/metal/kernels/rms_norm.metal`
 (Copyright 2024 Apple Inc.), also reflected in oMLX's HC normalization helper.
 It reads BF16 residuals directly and retains FP32 normalization before the mix.
 
-The affine QKV kernel in `src/glm5_decode.zig` also adapts `qmv_fast_impl`,
+The affine QKV kernel in `src/glm5/glm5_decode.zig` also adapts `qmv_fast_impl`,
 `load_vector` and `qdot` from MLX quantized.h through oMLX's multi_qmv wrapper.
 It preserves each independent row's arithmetic while selecting three banks
 inside one dispatch; no concatenated weight buffer is created.

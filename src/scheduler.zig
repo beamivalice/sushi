@@ -40,15 +40,15 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
-const dspark_rows = @import("dspark_rows.zig");
-const mimo_mtp = @import("mimo_mtp.zig");
+const dspark_rows = @import("dsv41/dspark_rows.zig");
+const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
-const dsv41_prefix = @import("dsv41_prefix.zig");
-const glm5_prefix = @import("glm5_prefix.zig");
+const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
+const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -72,11 +72,11 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const dflash_mod = @import("dflash.zig");
-const glm5_forward_mod = @import("glm5_forward.zig");
+const glm5_forward_mod = @import("glm5/glm5_forward.zig");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const expert_stream_mod = @import("expert_stream.zig");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("dsv41/expert_usage.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -2848,7 +2848,7 @@ fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_confi
 
 /// MiMo's MTP heads from the checkpoint's own shard, bound to the trunk they share.
 fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelConfig, xfm: *Transformer) !?*mimo_mtp.Head {
-    var weights = try @import("mimo_source.zig").loadMtpWeights(sch.io, sch.allocator, model_dir);
+    var weights = try @import("mimo2/mimo_source.zig").loadMtpWeights(sch.io, sch.allocator, model_dir);
     defer weights.deinit();
     var head = (try mimo_mtp.Head.load(sch.allocator, mlx.gpuStream(), config, &weights)) orelse return null;
     errdefer head.deinit();
@@ -2875,7 +2875,7 @@ fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: bool) e
 fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
     const geometry = config.expertGeometry();
     const layout = expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer) catch return false;
-    if (config.isDsv41() and !@import("dsv41_source.zig").shipsDspark(io, allocator, model_dir)) return false;
+    if (config.isDsv41() and !@import("dsv41/dsv41_source.zig").shipsDspark(io, allocator, model_dir)) return false;
     return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), layout);
 }
 
@@ -3095,7 +3095,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
     }
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
     split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry) +| assistant_bytes +|
-        (if (streamed.dsv41) |c| @import("dsv41_engram.zig").cacheBytes(c.engram) else 0);
+        (if (streamed.dsv41) |c| @import("dsv41/dsv41_engram.zig").cacheBytes(c.engram) else 0);
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
     const bill = expert_stream_mod.expertBillFor(allocator, model_dir, geometry, streamed.expert_layout) catch |err| {
@@ -3189,7 +3189,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
     config.expert_bounce_bytes = plan.cache.bounce_bytes;
     config.expert_fill_peak_bytes = billedFillPeakBytes(config, plan.cache.prefill_peak_bytes);
-    config.expert_borrow_bytes = if (config.dsv41) |c| @import("dsv41_borrow.zig").plannedBytes(&c, plan.layout == .exl3_k4, plan.cache.cache_bytes) else 0;
+    config.expert_borrow_bytes = if (config.dsv41) |c| @import("dsv41/dsv41_borrow.zig").plannedBytes(&c, plan.layout == .exl3_k4, plan.cache.cache_bytes) else 0;
     config.expert_vision_tower_bytes = plan.split.vision;
     config.expert_vision_encode_bytes = if (plan.vision.on) plan.vision.encode_bytes else 0;
 }
@@ -3545,7 +3545,7 @@ test "a resident MiMo cold load reserves its load preflight's requirement" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var fixture = try @import("mimo_source.zig").makeTinySourceFixture(io, a, &tmp);
+    var fixture = try @import("mimo2/mimo_source.zig").makeTinySourceFixture(io, a, &tmp);
     defer fixture.deinit();
     fixture.config.expert_layout = .mxfp4_individual;
     const weights = try mimoResidentLoadBytes(io, a, fixture.path, &fixture.config, false, false);
@@ -4076,17 +4076,17 @@ fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelCo
         error.DflashTargetMismatch => error.GlmDraftTargetMismatch,
         else => err,
     };
-    const runtime_cache = @import("glm5_dflash_cache.zig");
+    const runtime_cache = @import("glm5/glm5_dflash_cache.zig");
     return if (runtime_cache.isShippedSource(directory, model_dir))
         try runtime_cache.plannedResidentBytes(io, allocator, directory)
     else
-        try @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
+        try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
 }
 
 fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, load_vision: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
     const drafter = LoadDrafterDir.resolve(io, allocator, config, no_drafter, drafter_dir, model_dir);
     defer drafter.deinit(allocator);
-    const weights = try @import("glm5_diagnostic.zig").residentBytesWithVision(io, allocator, model_dir, config.num_hidden_layers, load_vision and config.glm5_vision);
+    const weights = try @import("glm5/glm5_diagnostic.zig").residentBytesWithVision(io, allocator, model_dir, config.num_hidden_layers, load_vision and config.glm5_vision);
     return loadRequirementBytes(config, weights +| try glmDflashLoadBytes(io, allocator, config, model_dir, drafter.dir), false, 0);
 }
 
@@ -4148,7 +4148,7 @@ test "the drafter is billed at its quantized resident bytes and its load transie
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
 
-    const stored = try @import("glm5_diagnostic.zig").assistantResidentBytes(io, a, dir);
+    const stored = try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(io, a, dir);
     const billed = try sushiAssistantLoadBytes(io, a, dir);
     try testing.expect(billed < stored);
     try testing.expectEqual((try dflash_mod.assistantLoadBytes(io, a, dir, dflash_mod.quantBitsFromEnv())).resident, billed);
@@ -4370,7 +4370,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         streaming_resident_bytes = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
     } else if (params.config.isGlm5()) {
-        streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, load_vision and params.config.glm5_vision);
+        streaming_resident_bytes = try @import("glm5/glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, load_vision and params.config.glm5_vision);
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
         streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     } else if (params.config.usesMimoSourceTrunk()) {
@@ -4476,12 +4476,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-    if (params.config.isGlm5() and @import("glm5_dflash_cache.zig").isShippedSource(drafter_dir, params.model_dir)) {
-        const prepared = try @import("glm5_dflash_cache.zig").prepare(sch.io, sch.allocator, drafter_dir, mlx.gpuStream());
+    if (params.config.isGlm5() and @import("glm5/glm5_dflash_cache.zig").isShippedSource(drafter_dir, params.model_dir)) {
+        const prepared = try @import("glm5/glm5_dflash_cache.zig").prepare(sch.io, sch.allocator, drafter_dir, mlx.gpuStream());
         prepared_drafter_path = prepared.path;
         if (prepared.fallback) {
-            const cached_bytes = try @import("glm5_dflash_cache.zig").plannedResidentBytes(sch.io, sch.allocator, drafter_dir);
-            const bf16_bytes = try @import("glm5_diagnostic.zig").assistantResidentBytes(sch.io, sch.allocator, prepared.path);
+            const cached_bytes = try @import("glm5/glm5_dflash_cache.zig").plannedResidentBytes(sch.io, sch.allocator, drafter_dir);
+            const bf16_bytes = try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(sch.io, sch.allocator, prepared.path);
             streaming_resident_bytes = streaming_resident_bytes.? -| cached_bytes +| bf16_bytes;
             if (!skip_mem_preflight) {
                 const available = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
@@ -4564,16 +4564,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth{s})\n", .{ range.min_rows, range.max_rows, if (range.clamped) "; a depth past the block clamps to it" else "" });
             }
         } else {
-            const why: []const u8 = if (c.dspark.block == 0 or !@import("dsv41_source.zig").shipsDspark(sch.io, sch.allocator, params.model_dir)) "no DSpark stages in this checkpoint" else "--no-mtp or model-settings mtp:false";
+            const why: []const u8 = if (c.dspark.block == 0 or !@import("dsv41/dsv41_source.zig").shipsDspark(sch.io, sch.allocator, params.model_dir)) "no DSpark stages in this checkpoint" else "--no-mtp or model-settings mtp:false";
             log.info("[spec] DeepSeek-V4.1-Flash decodes with plain ticks ({s})\n", .{why});
         }
     }
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
-        log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
+        log.info("[glm] NAX arms {s}\n", .{if (@import("glm5/glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
-        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
+        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
     }
     if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
         const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
@@ -4847,7 +4847,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var dflash_ptr: ?*DflashModel = null;
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
         const d = try sch.allocator.create(DflashModel);
-        d.* = (if (params.config.isGlm5()) @import("glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
+        d.* = (if (params.config.isGlm5()) @import("glm5/glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
             sch.allocator.destroy(d);
             log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
             return err;
@@ -5114,13 +5114,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .oldest;
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isDsv41())
-                @import("dsv41_prefix.zig").disk_checkpoint_cap
+                @import("dsv41/dsv41_prefix.zig").disk_checkpoint_cap
             else if (params.config.isGlm5() or params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
             if (params.config.dsv41) |c| {
-                const dsv41_pfx = @import("dsv41_prefix.zig");
+                const dsv41_pfx = @import("dsv41/dsv41_prefix.zig");
                 const divs = try dsv41_pfx.rowDivisors(sch.allocator, &c, params.config.dsparkOn());
                 defer sch.allocator.free(divs);
                 try entry.prefix_cache.?.disk.?.setGrownSpec(dsv41_pfx.row_span, divs, c.stateBytesPerToken());
@@ -5144,9 +5144,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         const cp_max = if (params.config.isGlm5())
-            @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
+            @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
         else if (params.config.isDsv41())
-            @import("dsv41_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
+            @import("dsv41/dsv41_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
         else
             params.ssm_checkpoint_max;
         entry.ssm_checkpoint_max = cp_max;
@@ -5530,7 +5530,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
-            if (s.model.config) |c| @import("dsv41_borrow.zig").endRequestMlx(c);
+            if (s.model.config) |c| @import("dsv41/dsv41_borrow.zig").endRequestMlx(c);
         }
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
         destroyAbandoned(abandoned);
@@ -5861,7 +5861,7 @@ fn slotStateBytes(s: *const Slot) u64 {
 /// rings, compressed and index rows, DSpark windows, and the live restore points the request keeps.
 fn dsv41StateBytes(s: *const Slot) u64 {
     const dsv = (s.model.transformer orelse return 0).dsv41 orelse return 0;
-    var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
+    var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41/dsv41_model.zig").stateBytes(st) else 0;
     if (s.model.prefix_cache) |*hc| bytes += hc.live_dsv41.bytes();
     return bytes;
 }
@@ -6027,8 +6027,8 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         }
     };
 
-    if (req.model.config) |cfg| @import("dsv41_borrow.zig").enterVisionMlx(req.bill_bytes, cfg);
-    defer if (req.model.config) |cfg| @import("dsv41_borrow.zig").leaveVisionMlx(cfg);
+    if (req.model.config) |cfg| @import("dsv41/dsv41_borrow.zig").enterVisionMlx(req.bill_bytes, cfg);
+    defer if (req.model.config) |cfg| @import("dsv41/dsv41_borrow.zig").leaveVisionMlx(cfg);
 
     // Encode all soft tokens into `emb_parts`: images and videos in prompt
     // `order`, then audio, so the single splice channel scatters them in the
@@ -6158,7 +6158,7 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
         victim.unloadResident();
-        if (victim.config) |c| @import("dsv41_borrow.zig").unloadModelMlx(c);
+        if (victim.config) |c| @import("dsv41/dsv41_borrow.zig").unloadModelMlx(c);
         evicted_bytes +|= victim_bytes;
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -6234,7 +6234,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     });
     const wired_before = status.getWiredMemBytes();
     entry.unloadResident();
-    if (entry.config) |c| @import("dsv41_borrow.zig").unloadModelMlx(c);
+    if (entry.config) |c| @import("dsv41/dsv41_borrow.zig").unloadModelMlx(c);
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
     // of the load→generate→unload flow).
@@ -6338,7 +6338,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // generated this turn. The cache reflects exactly this state — Generator
     // forwarded each emitted token into slot.cache as it was sampled.
     const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
-    if (slot.model.transformer) |t| if (t.dsv41 != null) @import("dsv41_prefix.zig").markRows(&slot.cache) catch |err| {
+    if (slot.model.transformer) |t| if (t.dsv41 != null) @import("dsv41/dsv41_prefix.zig").markRows(&slot.cache) catch |err| {
         log.warn("[hot-cache] DeepSeek row marker failed: {s} — not committed\n", .{@errorName(err)});
         return;
     };
@@ -6539,7 +6539,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         return;
     };
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
-    if (is_dsv41) @import("dsv41_prefix.zig").markRows(&slot.cache) catch return;
+    if (is_dsv41) @import("dsv41/dsv41_prefix.zig").markRows(&slot.cache) catch return;
     // Pass the media boundary RAW: when the cancelled prefill forwarded less
     // than the media position, the cache re-keys the pure-text entry to the
     // null vision key (a kept pixel key with no boundary is the
@@ -6888,7 +6888,7 @@ fn deinitSlotsReturningPool(slots: []const *Slot) void {
 
 /// DIAGNOSTIC (SUSHI_GLM_ROWS_UBENCH=N): `glm5_rows_ubench.run` per `_CTX=<tokens>[,<tokens>...]`
 /// (default 1024) over `_TEXT=<abs path>`.
-fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, latent_bits: u8, tok: *Tokenizer) void {
+fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5/glm5_forward.zig").Model, latent_bits: u8, tok: *Tokenizer) void {
     const tio = std.Io.Threaded.global_single_threaded.io();
     const rounds = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_GLM_ROWS_UBENCH").?, 0), 10) catch 8);
     const ctxs: []const u8 = if (std.c.getenv("SUSHI_GLM_ROWS_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "1024";
@@ -6902,13 +6902,13 @@ fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").
     var it = std.mem.tokenizeScalar(u8, ctxs, ',');
     while (it.next()) |field| {
         const ctx = std.fmt.parseInt(usize, field, 10) catch continue;
-        @import("glm5_rows_ubench.zig").run(alloc, target, latent_bits, ids, ctx, rounds) catch |err| log.warn("[glm-rows-ubench] failed: {s}\n", .{@errorName(err)});
+        @import("glm5/glm5_rows_ubench.zig").run(alloc, target, latent_bits, ids, ctx, rounds) catch |err| log.warn("[glm-rows-ubench] failed: {s}\n", .{@errorName(err)});
     }
 }
 
 /// DIAGNOSTIC (SUSHI_GLM_ROUND_UBENCH=N): `glm5_round_ubench.run` per `_CTX=<tokens>[,<tokens>...]`
 /// (default 8192) over `_TEXT=<abs path>`.
-fn glmRoundUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, assistant: *DflashModel, latent_bits: u8, tok: *Tokenizer) void {
+fn glmRoundUbench(alloc: std.mem.Allocator, target: *@import("glm5/glm5_forward.zig").Model, assistant: *DflashModel, latent_bits: u8, tok: *Tokenizer) void {
     const tio = std.Io.Threaded.global_single_threaded.io();
     const rounds = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_GLM_ROUND_UBENCH").?, 0), 10) catch 64);
     const ctxs: []const u8 = if (std.c.getenv("SUSHI_GLM_ROUND_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "8192";
@@ -6922,7 +6922,7 @@ fn glmRoundUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig")
     var it = std.mem.tokenizeScalar(u8, ctxs, ',');
     while (it.next()) |field| {
         const ctx = std.fmt.parseInt(usize, field, 10) catch continue;
-        @import("glm5_round_ubench.zig").run(alloc, target, assistant, latent_bits, ids, ctx, rounds) catch |err| log.warn("[glm-round-ubench] failed: {s}\n", .{@errorName(err)});
+        @import("glm5/glm5_round_ubench.zig").run(alloc, target, assistant, latent_bits, ids, ctx, rounds) catch |err| log.warn("[glm-round-ubench] failed: {s}\n", .{@errorName(err)});
     }
 }
 
@@ -9698,7 +9698,7 @@ var glm_tree_logged = false;
 /// rows to the best drafter's DFlash2 tree: that slot's round is published here and it leaves
 /// `batch`. Returns the plain rows' logits in the order of the shortened `batch`.
 fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transformer, batch: *[]*Slot, tokens: []const u32) ![]mlx.mlx_array {
-    const verifier = @import("glm5_dflash_model.zig");
+    const verifier = @import("glm5/glm5_dflash_model.zig");
     const target = xfm.glm5.?;
     target.s = xfm.s;
     target.suppress_mask = xfm.suppress_mask;
@@ -9707,7 +9707,7 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
     var timer = io_util.Stopwatch.init(sch.io);
     // The drafter with the best landing rate; its tree takes the rows the plain slots leave.
     var tree_at: ?usize = null;
-    var proposal: @import("glm5_dflash.zig").Proposal = undefined;
+    var proposal: @import("glm5/glm5_dflash.zig").Proposal = undefined;
     for (batch.*, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
         if (!gen.glm_dflash_native or gen.dflash_ctx == null) continue;
@@ -9753,11 +9753,11 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
 
 /// The grouped tick's production side of `glmRowsSettle`.
 const GlmRows = struct {
-    const verifier = @import("glm5_dflash_model.zig");
+    const verifier = @import("glm5/glm5_dflash_model.zig");
     sch: *Scheduler,
-    target: *const @import("glm5_forward.zig").Model,
+    target: *const @import("glm5/glm5_forward.zig").Model,
     taps: []const u32,
-    proposal: *const @import("glm5_dflash.zig").Proposal,
+    proposal: *const @import("glm5/glm5_dflash.zig").Proposal,
     draft_ns: u64,
     timer: io_util.Stopwatch,
     verify_ns: u64 = 0,
@@ -13531,7 +13531,7 @@ test "a cancelled DeepSeek slot commits when it is culled and not again at the c
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm: Transformer = undefined;
-    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41/dsv41_model.zig").Model));
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
@@ -13558,7 +13558,7 @@ test "a finished DeepSeek slot is not committed again by the cull" {
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm: Transformer = undefined;
-    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41/dsv41_model.zig").Model));
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
@@ -13595,12 +13595,12 @@ test "a DSpark round that finished the slot leaves the thought point to the comm
 
 test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points (DSV41_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
     const a = testing.allocator;
     const dir = try dsv41_model.fixtureDir();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41/dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);

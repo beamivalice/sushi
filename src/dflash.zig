@@ -170,7 +170,7 @@ pub fn resolveInDirDrafter(io: std.Io, allocator: std.mem.Allocator, model_dir: 
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
     for ([_][]const u8{ DFLASH2_IN_DIR_SUBDIR, IN_DIR_SUBDIR, SHIPPED_GLM_SUBDIR }) |subdir| {
         const path = std.fs.path.join(allocator, &.{ model_dir, subdir }) catch return null;
-        if (probeIsDflash(io, allocator, path) and (!std.mem.eql(u8, subdir, DFLASH2_IN_DIR_SUBDIR) or @import("glm5_dflash_cache.zig").cacheValid(io, allocator, model_dir, path))) return path;
+        if (probeIsDflash(io, allocator, path) and (!std.mem.eql(u8, subdir, DFLASH2_IN_DIR_SUBDIR) or @import("glm5/glm5_dflash_cache.zig").cacheValid(io, allocator, model_dir, path))) return path;
         allocator.free(path);
     }
     return null;
@@ -1791,7 +1791,7 @@ pub fn trimGlmServingContext(model: *const DflashModel, ctx: *DflashCtx) !void {
     const keep = @as(usize, model.config.sliding_window) - 1;
     if (ctx.cache.step <= keep) return;
     const drop = ctx.cache.step - keep;
-    var ops = @import("glm5_model.zig").Ops{ .s = model.s };
+    var ops = @import("glm5/glm5_model.zig").Ops{ .s = model.s };
     defer ops.deinit();
     const arrays = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(arrays);
@@ -1933,7 +1933,7 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
 
     for (model.layers, 0..) |*lw, li| {
         const rows: c_int = if (li + 1 == model.layers.len) @intCast(output_rows) else q_len_c;
-        var tail_ops = @import("glm5_model.zig").Ops{ .s = s };
+        var tail_ops = @import("glm5/glm5_model.zig").Ops{ .s = s };
         defer tail_ops.deinit();
         const normed = try rmsNormFn(x, lw.input_norm, cfg.rms_norm_eps, s);
         defer _ = mlx.mlx_array_free(normed);
@@ -3490,7 +3490,7 @@ test "GLM serving DFlash2 trims physical window and preserves absolute append po
     try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
-    var ops = @import("glm5_model.zig").Ops{ .s = s };
+    var ops = @import("glm5/glm5_model.zig").Ops{ .s = s };
     defer ops.deinit();
     var layer: DflashLayer = undefined;
     layer.layer_type = .sliding_attention;

@@ -2,7 +2,7 @@
 
 How a checkpoint whose routed experts do not fit in memory is served from SSD: the budget ledger, the per-layer LRU,
 the zero-copy slab I/O and the correctness bars. Read this before touching `src/expert_stream.zig`,
-`src/expert_io.zig` or `src/glm5_stream.zig`.
+`src/expert_io.zig` or `src/glm5/glm5_stream.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-memory-admission](engine-memory-admission.md), [qwen4-arch](qwen4-arch.md),
@@ -15,7 +15,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 | `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `GroupedLayer` (a rate-grouped layer's pools), `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
 | `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab |
-| `src/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
+| `src/glm5/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
 | `src/imatrix.zig` | imatrix capture on the streamed forward |
 | `src/hidden_capture.zig` | block-boundary residual capture under `kld capture` |
 

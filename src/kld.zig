@@ -168,7 +168,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
                 .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
-                .drop_expert => o.drop_expert = @import("expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
+                .drop_expert => o.drop_expert = @import("dsv41/expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
@@ -1592,7 +1592,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (opts.command == .capture) if (@import("imatrix.zig").envPath()) |path| {
         opts.imatrix_out = path;
     };
-    if (try @import("glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
+    if (try @import("glm5/glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.wired_margin_bytes > 0) server_mod.wired_limit_margin_bytes = opts.wired_margin_bytes;
@@ -2756,7 +2756,7 @@ test "kld standard4 bundled texts identifiers and limits" {
 }
 
 test {
-    _ = @import("glm5_kld_capture.zig");
+    _ = @import("glm5/glm5_kld_capture.zig");
 }
 
 fn jsonNumber(value: std.json.Value) !f64 {
@@ -2774,7 +2774,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
     var metal: bool = false;
     mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;
     if (!metal) return error.SkipZigTest;
-    const glm = @import("glm5_forward.zig");
+    const glm = @import("glm5/glm5_forward.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2851,7 +2851,7 @@ test "kld: GLM full-stream hidden capture retains chunked boundaries and native 
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = testing.io;
-    const glm = @import("glm5_forward.zig");
+    const glm = @import("glm5/glm5_forward.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(a);
@@ -2933,7 +2933,7 @@ test "kld: deepseek_v41 refuses by name what its module-owned state cannot honor
 }
 
 test "kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)" {
-    const dir = try @import("dsv41_model.zig").fixtureDir();
+    const dir = try @import("dsv41/dsv41_model.zig").fixtureDir();
     const io = std.Io.Threaded.global_single_threaded.io();
     try testing.expectError(error.ExpertStreamingRequired, loadModel(io, testing.allocator, .{ .model_dir = dir }));
     try testing.expectError(error.Dsv41KvQuantUnsupported, loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
@@ -2942,8 +2942,8 @@ test "kld: a deepseek_v41 load names the missing streaming budget before touchin
 test "kld: a deepseek_v41 teacher captures and compare reads it back, fused against composed included (DSV41_TINY)" {
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const dsv41_model = @import("dsv41_model.zig");
-    const dsv41_stream = @import("dsv41_stream.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
+    const dsv41_stream = @import("dsv41/dsv41_stream.zig");
     const dir = try dsv41_model.fixtureDir();
     var metal: bool = false;
     mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;

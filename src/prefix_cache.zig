@@ -22,10 +22,10 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
-const glm5_forward = @import("glm5_forward.zig");
-const glm5_prefix = @import("glm5_prefix.zig");
-const dsv41_model = @import("dsv41_model.zig");
-const dsv41_prefix = @import("dsv41_prefix.zig");
+const glm5_forward = @import("glm5/glm5_forward.zig");
+const glm5_prefix = @import("glm5/glm5_prefix.zig");
+const dsv41_model = @import("dsv41/dsv41_model.zig");
+const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -13960,7 +13960,7 @@ const Dsv41Net = struct {
         const dir = try dsv41_model.fixtureDir();
         self.fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
         errdefer self.fx.deinit();
-        var sc = @import("dsv41_scope.zig").Scope.init(testing.allocator, mlx.gpuStream());
+        var sc = @import("dsv41/dsv41_scope.zig").Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
         self.ids = try dsv41_model.tokens(&sc, &self.fx);
         errdefer testing.allocator.free(self.ids);
