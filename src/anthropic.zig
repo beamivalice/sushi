@@ -13,6 +13,8 @@ const responses_mod = @import("responses.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
+const slot_admission = @import("slot_admission.zig");
+const vision_queue = @import("vision_queue.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -430,7 +432,7 @@ pub fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type:
 }
 
 /// The Anthropic surface's idle event: its ping, preceded by the queue comment while the request waits.
-fn sendAnthropicIdle(stream: *Conn, queued: ?scheduler_mod.QueueWait) !void {
+fn sendAnthropicIdle(stream: *Conn, queued: ?slot_admission.QueueWait) !void {
     if (queued) |w| try sendStreamIdle(stream, w);
     try sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}");
 }
@@ -990,7 +992,7 @@ fn handleAnthropicNonStreaming(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    deferred_media: ?*scheduler_mod.DeferredMedia,
+    deferred_media: ?*vision_queue.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -1017,7 +1019,7 @@ fn handleAnthropicNonStreaming(
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
     // the slot.
-    const slot_ve: ?*scheduler_mod.DeferredMedia = blk: {
+    const slot_ve: ?*vision_queue.DeferredMedia = blk: {
         const v = ve_local;
         ve_local = null;
         break :blk v;
@@ -1247,7 +1249,7 @@ fn handleAnthropicStreaming(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    deferred_media: ?*scheduler_mod.DeferredMedia,
+    deferred_media: ?*vision_queue.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -1412,7 +1414,7 @@ fn handleAnthropicStreaming(
                     client_gone = true;
                     break;
                 }
-                sendAnthropicIdle(stream, scheduler_mod.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
+                sendAnthropicIdle(stream, slot_admission.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
@@ -2141,7 +2143,7 @@ test "formatAnthropicUsage: input_tokens leaves out the cache read a client adds
 
 test "an Anthropic stream waiting in the queue gets the queue comment before each ping, and a plain ping otherwise" {
     const t = std.testing;
-    const wait = scheduler_mod.QueueWait{ .ahead = 1, .running_prompt = 3000, .running_generated = 8000, .running_max = 32768, .tps = 0 };
+    const wait = slot_admission.QueueWait{ .ahead = 1, .running_prompt = 3000, .running_generated = 8000, .running_max = 32768, .tps = 0 };
     var sv: [2]std.posix.fd_t = undefined;
     try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
     defer _ = std.c.close(sv[1]);

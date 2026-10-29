@@ -36,6 +36,9 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
+const model_load = @import("model_load.zig");
+const slot_admission = @import("slot_admission.zig");
+const vision_queue = @import("vision_queue.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const model_settings = @import("model_settings.zig");
@@ -376,9 +379,9 @@ var configured_mtp: ?bool = null;
 
 /// THIS model's MTP decision and its source, the answer the load log and `/props` read.
 pub fn mtpChoiceFor(config: *const model_mod.ModelConfig) model_settings.MtpChoice {
-    if (global_scheduler) |sch| return scheduler_mod.mtpChoiceFor(sch.mtp_enabled, sch.mtp_explicit, config);
+    if (global_scheduler) |sch| return model_load.mtpChoiceFor(sch.mtp_enabled, sch.mtp_explicit, config);
     const flag: ?bool = configured_mtp orelse (if (server_config.default_force_mtp) @as(?bool, true) else null);
-    return scheduler_mod.mtpChoiceFor(flag orelse true, flag != null, config);
+    return model_load.mtpChoiceFor(flag orelse true, flag != null, config);
 }
 
 ///
@@ -1287,7 +1290,7 @@ pub fn serve(
     /// caller (main.zig) is responsible only for CPU-side setup (config parse,
     /// tokenizer load, EOS resolution, chat-template load); everything that
     /// touches mlx is done by `Scheduler.init` before this fn proceeds.
-    load_params: scheduler_mod.LoadParams,
+    load_params: model_load.LoadParams,
     config: *const model_mod.ModelConfig,
     host: []const u8,
     port: u16,
@@ -2637,11 +2640,11 @@ pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_byte
     const ceiling = currentGpuMemoryCeiling(config, active_mem);
     if (!expertStreamingConfigFits(config, ceiling, active_mem, resident_bytes)) {
         log.err("the streamed load bills {d} MB (active {d}, resident {d}, cache {d}, workspace and bounce {d}, serving {d}) against {d} MB; lower --ssd-budget-gb\n", .{
-            (active_mem + resident_bytes + config.expert_cache_bytes + config.expert_bounce_bytes + scheduler_mod.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes) + @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes)) >> 20,
+            (active_mem + resident_bytes + config.expert_cache_bytes + config.expert_bounce_bytes + model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes) + @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes)) >> 20,
             active_mem >> 20,
             resident_bytes >> 20,
             config.expert_cache_bytes >> 20,
-            (config.expert_bounce_bytes + scheduler_mod.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes)) >> 20,
+            (config.expert_bounce_bytes + model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes)) >> 20,
             @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes) >> 20,
             ceiling >> 20,
         });
@@ -2656,7 +2659,7 @@ fn expertStreamingConfigFits(config: *const model_mod.ModelConfig, ceiling: u64,
         resident_bytes,
         config.expert_cache_bytes,
         config.expert_bounce_bytes,
-        scheduler_mod.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes),
+        model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes),
         @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes),
     );
 }
@@ -3038,7 +3041,7 @@ pub fn memoryContextRefusalMessage(buf: []u8, refusal: model_registry_mod.Memory
     }) catch "The requested context does not fit in available GPU memory.";
 }
 
-pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?scheduler_mod.LoadServingBill {
+pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?model_load.LoadServingBill {
     if (!model_mod.usesSushiQuantMemoryBill(config)) return null;
     const context = manualContext(config);
     if (context == 0) return null;
@@ -3158,10 +3161,10 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     try std.testing.expectEqual(@as(u32, 8192), loadServingBill(&cfg, budget).?.requested_context);
     try std.testing.expectEqual(@as(u64, 8), loadServingBill(&cfg, budget).?.kv_bits);
     cfg.expert_layout = .mxfp4_individual;
-    try std.testing.expectEqual(@as(?scheduler_mod.LoadServingBill, null), loadServingBill(&cfg, budget));
+    try std.testing.expectEqual(@as(?model_load.LoadServingBill, null), loadServingBill(&cfg, budget));
     cfg.expert_layout = .exl3_k4;
     cfg.expert_streaming = true;
-    try std.testing.expectEqual(@as(?scheduler_mod.LoadServingBill, null), loadServingBill(&cfg, budget));
+    try std.testing.expectEqual(@as(?model_load.LoadServingBill, null), loadServingBill(&cfg, budget));
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -3940,7 +3943,7 @@ test "DeepSeek's streamed request bill brackets the prefill peaks measured on th
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.max_position_embeddings = 1_048_576;
-    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
     // No decoder pool to lend: the bill is the working set's, as measured.
     config.expert_borrow_bytes = 0;
     try std.testing.expectEqual(prefill_plan.TAIL_MERGE_MAX - 1, dsv41_config.tail_merge_rows);
@@ -3972,7 +3975,7 @@ test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
-    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
     // No decoder pool to lend: the bill is the working set's, as measured.
     config.expert_borrow_bytes = 0;
     const MB: u64 = 1 << 20;
@@ -4000,7 +4003,7 @@ test "DeepSeek advertises the longest context its own request bill admits" {
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
-    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
     // No decoder pool to lend: the bill is the working set's, as measured.
     config.expert_borrow_bytes = 0;
     const GB: u64 = 1_000_000_000;
@@ -4025,7 +4028,7 @@ test "a streamed DeepSeek bills its workspace at load and no fill peak at load o
     config.expert_cache_bytes = 93_993 << 20;
     config.expert_bounce_bytes = 512 << 20;
     config.expert_workspace_bytes = 3_525 << 20;
-    config.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&config, 9_911 << 20);
+    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
     const mib: u64 = 1 << 20;
     // No decoder pool to lend: the bill is the working set's, as measured.
     config.expert_borrow_bytes = 0;
@@ -4515,7 +4518,7 @@ test "Flash-Next's streamed request bill brackets the streamed peaks measured on
     server_config.max_context_size = 49152;
     var cfg = qwen4MeasuredTestConfig();
     cfg.expert_streaming = true;
-    cfg.expert_fill_peak_bytes = scheduler_mod.billedFillPeakBytes(&cfg, 1_848_000_000);
+    cfg.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&cfg, 1_848_000_000);
     // Live `peak_bytes - active_bytes` after one cold prompt per width, `--ssd-budget-gb 23`, kv8, no MTP, SSD tier on.
     const measured = [_]struct { tokens: u64, chunk: u64, peak_mib: u64 }{
         .{ .tokens = 7987, .chunk = 1024, .peak_mib = 1224 },
@@ -5359,12 +5362,12 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     const roomy: u64 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, widthForRung(&cfg, seq, 4096), .{});
     const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expect(reasked > admitted);
-    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked).width);
+    try t.expectEqual(reasked, slot_admission.postEvictionPrefillChunk(admitted, reasked).width);
 
-    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted).width);
+    try t.expectEqual(admitted, slot_admission.postEvictionPrefillChunk(0, admitted).width);
 
     // The reverse reading (memory moved between the asks) runs at the floor.
-    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(reasked, admitted).width);
+    try t.expectEqual(admitted, slot_admission.postEvictionPrefillChunk(reasked, admitted).width);
 
     // A non-qwen4 arch is untouched end to end.
     var other = qwen4RequestTestConfig();
@@ -5373,13 +5376,13 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expectEqual(pin, other_pre);
     try t.expectEqual(pin, other_post);
-    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post).width);
+    try t.expectEqual(pin, slot_admission.postEvictionPrefillChunk(other_pre, other_post).width);
 
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
     const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
     const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
-    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post).width);
+    try t.expectEqual(pin, slot_admission.postEvictionPrefillChunk(off_pre, off_post).width);
 }
 
 test "admissionLogLevel: free on the first request after a load and at the edge, quiet in the middle" {
@@ -5556,7 +5559,7 @@ pub fn batchedDecodeRowsBytes(config: *const model_mod.ModelConfig) u64 {
     while (li < config.num_hidden_layers) : (li += 1) {
         if (config.isKvPerTokenLayer(li)) widest = @max(widest, config.layerKvBytes(li));
     }
-    return @as(u64, scheduler_mod.batchGroupCap(config) - 1) *| keys *| widest;
+    return @as(u64, slot_admission.batchGroupCap(config) - 1) *| keys *| widest;
 }
 
 /// The chunk-independent floor every prefill pays: MLX runtime scratch, the
@@ -6134,7 +6137,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
 
 // Numeric slot diagnostics cross to error mapping only on this connection's thread.
 pub threadlocal var slot_memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
-pub threadlocal var slot_media_refusal: ?scheduler_mod.MediaRefusal = null;
+pub threadlocal var slot_media_refusal: ?vision_queue.MediaRefusal = null;
 
 /// The message `error.GenerationOutOfMemory` sends on every surface and both paths.
 pub const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
@@ -6727,7 +6730,7 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 }
 
 /// The cold bill, live memory re-read, for the scheduler's sibling hold.
-pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) scheduler_mod.MemoryBill {
+pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits) };
@@ -7146,19 +7149,19 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
 
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
-pub fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
+pub fn batchVerdictFor(entry: *const LoadedModel) slot_admission.BatchVerdict {
     const exclusive = if (entry.transformer) |t| t.ownsModuleDecodeState() else false;
     return batchVerdictOf(entry.config, exclusive);
 }
 
-pub fn batchVerdictOf(cfg: ?*const model_mod.ModelConfig, exclusive: bool) scheduler_mod.BatchVerdict {
+pub fn batchVerdictOf(cfg: ?*const model_mod.ModelConfig, exclusive: bool) slot_admission.BatchVerdict {
     if (exclusive) return .exclusive;
     const c = cfg orelse return .arch;
-    return if (scheduler_mod.configBatchesDecode(c)) .ok else .arch;
+    return if (slot_admission.configBatchesDecode(c)) .ok else .arch;
 }
 
 /// The boot line's account of concurrent requests, from the verdict `/props` reports.
-pub fn concurrencyClause(verdict: scheduler_mod.BatchVerdict) []const u8 {
+pub fn concurrencyClause(verdict: slot_admission.BatchVerdict) []const u8 {
     return switch (verdict) {
         .ok => "batched decode on",
         .exclusive => "batched decode off; concurrent requests queue, one at a time",
@@ -11382,7 +11385,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
 
     var other = qwen4RequestTestConfig();
     other.model_type = "not_a_served_arch";
-    const adaptive = scheduler_mod.adaptiveChunkWidthFor(&other);
+    const adaptive = slot_admission.adaptiveChunkWidthFor(&other);
     try t.expect(!adaptive);
     try t.expect(hook_installed != adaptive);
 
@@ -11397,14 +11400,14 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     adaptive_chunk_override = true;
     defer adaptive_chunk_override = null;
     const unpinned = explicitPrefillChunk() == 0;
-    try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    try t.expectEqual(unpinned, slot_admission.adaptiveChunkWidthFor(&cfg));
     if (unpinned) {
-        try t.expectEqual(@as(usize, 64), prefill_plan.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
-        try t.expectEqual(@as(usize, 512), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 64), prefill_plan.tailMergeMaxFor(512, slot_admission.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 512), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, slot_admission.adaptiveChunkWidthFor(&cfg)));
     }
-    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(null));
+    try t.expect(!slot_admission.adaptiveChunkWidthFor(null));
     scheduler_mod.prefill_chunk_adaptive_enabled = null;
-    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    try t.expect(!slot_admission.adaptiveChunkWidthFor(&cfg));
     try t.expect(scheduler_mod.prefill_chunk_adapt != null); // ...with the hook still installed
 }
 
@@ -12481,8 +12484,8 @@ test "a MiMo slot bills the decode rebuilds the other rows of its batched decode
     // One global layer's dense K/V below the packed arms' floor, for every other row of a full group.
     const rebuild = transformer_mod.mimoGlobalDecodeRebuildMaxKeys() * cfg.layerKvBytes(0);
     try t.expect(rebuild > 0);
-    try t.expectEqual(@as(u64, @intCast(scheduler_mod.batchGroupCap(&cfg) - 1)) * rebuild, batchedDecodeRowsBytes(&cfg));
-    try t.expectEqual(@as(usize, 4), scheduler_mod.batchGroupCap(&cfg));
+    try t.expectEqual(@as(u64, @intCast(slot_admission.batchGroupCap(&cfg) - 1)) * rebuild, batchedDecodeRowsBytes(&cfg));
+    try t.expectEqual(@as(usize, 4), slot_admission.batchGroupCap(&cfg));
     // A streamed load decodes serial and bills nothing for it.
     cfg.expert_streaming = true;
     try t.expectEqual(@as(u64, 0), batchedDecodeRowsBytes(&cfg));
@@ -12827,7 +12830,7 @@ test "mimo_v2 admission credits the hot cache: a gap the cache covers is an evic
     const q4 = qwen4RequestTestConfig();
     for ([_]*const model_mod.ModelConfig{ &cfg, &other, &q4 }) |c| {
         const b = creditedAdmissionBill(c, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096);
-        try t.expectEqual(scheduler_mod.admissionPassArmed(c), b.evictionCredit() > 0);
+        try t.expectEqual(slot_admission.admissionPassArmed(c), b.evictionCredit() > 0);
     }
     try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(creditedAdmissionBill(&other, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096)));
 }
@@ -13319,9 +13322,9 @@ test "a second GLM admission leaves free the cache growth the first was admitted
         try std.testing.expect(commit > bill.needed / 2 and commit <= bill.needed);
         // Headroom that admits A alone and, a tick later with A's growth unallocated, B.
         const headroom = bill.needed + gib;
-        const b = scheduler_mod.MemoryBill{ .needed = bill.needed, .available = headroom };
-        try std.testing.expectEqual(@as(usize, 1), scheduler_mod.admitsWithinMemory(&.{b}, true, 0));
-        try std.testing.expectEqual(@as(usize, 0), scheduler_mod.admitsWithinMemory(&.{b}, true, commit));
+        const b = slot_admission.MemoryBill{ .needed = bill.needed, .available = headroom };
+        try std.testing.expectEqual(@as(usize, 1), slot_admission.admitsWithinMemory(&.{b}, true, 0));
+        try std.testing.expectEqual(@as(usize, 0), slot_admission.admitsWithinMemory(&.{b}, true, commit));
     }
     // kv8 audit shape: one request's eventual state is 6.669 GiB.
     const kv8 = admissionCommitBytes(&cfg, prompt, max_tokens, 8);
@@ -13497,11 +13500,11 @@ test "the concurrency verdict: a resident GLM and qwen4 batch, an exclusive mode
     const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .full_attention_interval = 4, .num_experts = 8, .num_experts_per_tok = 2 };
     const moe = model_mod.ModelConfig{ .model_type = "qwen3_moe", .num_experts = 8, .num_experts_per_tok = 2 };
-    try std.testing.expectEqual(scheduler_mod.BatchVerdict.ok, batchVerdictOf(&glm, false));
-    try std.testing.expectEqual(scheduler_mod.BatchVerdict.arch, batchVerdictOf(&moe, false));
-    try std.testing.expectEqual(scheduler_mod.BatchVerdict.exclusive, batchVerdictOf(&glm, true));
-    try std.testing.expectEqual(scheduler_mod.BatchVerdict.ok, batchVerdictOf(&qwen4, false));
-    try std.testing.expectEqual(scheduler_mod.BatchVerdict.arch, batchVerdictOf(null, false));
+    try std.testing.expectEqual(slot_admission.BatchVerdict.ok, batchVerdictOf(&glm, false));
+    try std.testing.expectEqual(slot_admission.BatchVerdict.arch, batchVerdictOf(&moe, false));
+    try std.testing.expectEqual(slot_admission.BatchVerdict.exclusive, batchVerdictOf(&glm, true));
+    try std.testing.expectEqual(slot_admission.BatchVerdict.ok, batchVerdictOf(&qwen4, false));
+    try std.testing.expectEqual(slot_admission.BatchVerdict.arch, batchVerdictOf(null, false));
     try std.testing.expectEqualStrings("batched decode off; concurrent requests interleave serially", concurrencyClause(.arch));
     try std.testing.expectEqualStrings("batched decode off; concurrent requests queue, one at a time", concurrencyClause(.exclusive));
     try std.testing.expectEqualStrings("batched decode on", concurrencyClause(.ok));
@@ -13825,14 +13828,14 @@ test "GLM near the top of its context keeps fewer checkpoints at the start width
     var probe = Fits{ .cfg = &cfg, .seq = seq, .width = width, .available = prefillNeededAtChunk(&cfg, seq, 2048, 8, width, .{ .checkpoints = 1 }) };
     const cap = glm5_prefix.checkpointMax(16);
     try std.testing.expect(prefillNeededAtChunk(&cfg, seq, 2048, 8, width, .{ .checkpoints = cap }) > probe.available);
-    try std.testing.expectEqual(@as(?u32, 1), scheduler_mod.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
+    try std.testing.expectEqual(@as(?u32, 1), slot_admission.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
     // The checkpoints yield to the width: the prefill still starts at the start width.
     try std.testing.expectEqual(@as(u32, @intCast(width)), chooseRequestPrefillChunk(&cfg, seq, 2048, 8, probe.available, cfg.pinned_prefill_chunk, 0, .{ .checkpoints = cap }));
     // Room for the prompt alone keeps none; less than that is refused for the prompt, not the hold.
     probe.available = prefillNeededAtChunk(&cfg, seq, 2048, 8, width, .{ .checkpoints = 0 });
-    try std.testing.expectEqual(@as(?u32, 0), scheduler_mod.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
+    try std.testing.expectEqual(@as(?u32, 0), slot_admission.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
     probe.available -= 1;
-    try std.testing.expectEqual(@as(?u32, null), scheduler_mod.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
+    try std.testing.expectEqual(@as(?u32, null), slot_admission.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
 }
 
 test "GLM admission credits the hot cache, so an eviction lets a long prefill in" {

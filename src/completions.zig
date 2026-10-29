@@ -6,6 +6,7 @@ const expert_stream_mod = @import("expert_stream.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const scheduler_mod = @import("scheduler.zig");
+const slot_admission = @import("slot_admission.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -535,7 +536,7 @@ fn handleStreamingCompletion(
                     client_gone = true;
                     break;
                 }
-                sendStreamIdle(stream, scheduler_mod.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
+                sendStreamIdle(stream, slot_admission.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;

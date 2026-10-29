@@ -8,6 +8,8 @@ const model_mod = @import("model.zig");
 const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
 const scheduler_mod = @import("scheduler.zig");
+const slot_admission = @import("slot_admission.zig");
+const model_load = @import("model_load.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const model_settings = @import("model_settings.zig");
@@ -654,7 +656,7 @@ fn renderPropsBody(
 
 /// The /props "batching" object: whether the loaded model rides the batched
 /// decode kernel, and why not when it does not.
-fn batchingPropsJson(allocator: std.mem.Allocator, why: scheduler_mod.BatchVerdict, max_group: usize) ![]u8 {
+fn batchingPropsJson(allocator: std.mem.Allocator, why: slot_admission.BatchVerdict, max_group: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, ",\"batching\":{{\"supported\":{s},\"reason\":\"{s}\",\"max_group\":{d}}}", .{
         if (why == .ok) "true" else "false",
         @tagName(why),
@@ -739,7 +741,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefix_cache_disk_entries = disk.entries,
         .vision = .{
             .loaded = lm.vision_encoder != null,
-            .source = scheduler_mod.visionChoiceFor(config, config.expert_streaming).sourceName(),
+            .source = model_load.visionChoiceFor(config, config.expert_streaming).sourceName(),
             .tower_bytes = config.expert_vision_tower_bytes,
             .encode_bytes = config.expert_vision_encode_bytes,
         },
@@ -801,7 +803,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     // whenever no table is warming, so the object is absent off qwen4_exp.
     const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
     defer allocator.free(ngram_json);
-    const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm), if (lm.config) |c| scheduler_mod.batchGroupCap(c) else scheduler_mod.MAX_BATCH_GROUP);
+    const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm), if (lm.config) |c| slot_admission.batchGroupCap(c) else slot_admission.MAX_BATCH_GROUP);
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
@@ -835,7 +837,7 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     defer allocator.free(update_json);
     const body = try std.fmt.allocPrint(allocator,
         \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
-    , .{ active_mem, peak_mem, available_mem, scheduler_mod.MAX_BATCH_GROUP, update_json });
+    , .{ active_mem, peak_mem, available_mem, slot_admission.MAX_BATCH_GROUP, update_json });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

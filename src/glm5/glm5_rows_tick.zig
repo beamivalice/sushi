@@ -23,18 +23,21 @@ const mtp_plan = @import("../mtp_plan.zig");
 const sampler = @import("../sampler.zig");
 const testing = std.testing;
 const scheduler_mod = @import("../scheduler.zig");
+const slot_admission = @import("../slot_admission.zig");
+const model_load = @import("../model_load.zig");
+const slot_outcome = @import("../slot_outcome.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
-const batchGroupCap = scheduler_mod.batchGroupCap;
-const configBatchesDecode = scheduler_mod.configBatchesDecode;
+const batchGroupCap = slot_admission.batchGroupCap;
+const configBatchesDecode = slot_admission.configBatchesDecode;
 const cullDecoding = scheduler_mod.cullDecoding;
 const cullDecodingWith = scheduler_mod.cullDecodingWith;
 const expectError = scheduler_mod.expectError;
 const expectOutcomes = scheduler_mod.expectOutcomes;
-const glmStreamedDrafterOff = scheduler_mod.glmStreamedDrafterOff;
+const glmStreamedDrafterOff = model_load.glmStreamedDrafterOff;
 const postPrefillTerminal = scheduler_mod.postPrefillTerminal;
 const publishSpeculativeBlock = scheduler_mod.publishSpeculativeBlock;
-const recordSlotCleanup = scheduler_mod.recordSlotCleanup;
+const recordSlotCleanup = slot_outcome.recordSlotCleanup;
 const specTickMode = scheduler_mod.specTickMode;
 
 test "a streamed GLM load leaves a found assistant unloaded and refuses an asked-for one" {

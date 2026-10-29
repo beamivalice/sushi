@@ -7,7 +7,7 @@ const token_mask = @import("token_mask.zig");
 const io_util = @import("io_util.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
-const scheduler_mod = @import("scheduler.zig");
+const slot_admission = @import("slot_admission.zig");
 const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
@@ -849,7 +849,7 @@ fn logitsAsNV(logits: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !mlx.mlx_array
 }
 
 fn sampleRowsLazyConcat(row_logits: []const mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
-    var parts: [scheduler_mod.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var parts: [slot_admission.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
     const n = row_logits.len;
     if (n > parts.len) return error.BatchTooWide;
     var n_parts: usize = 0;

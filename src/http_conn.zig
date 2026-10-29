@@ -4,7 +4,7 @@ const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
-const scheduler_mod = @import("scheduler.zig");
+const slot_admission = @import("slot_admission.zig");
 const model_registry_mod = @import("model_registry.zig");
 const instr = @import("metrics.zig");
 const update_mod = @import("update.zig");
@@ -1798,7 +1798,7 @@ test "a queued stream gets SSE comments while it waits and its events are the sa
         "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
         "data: [DONE]\n\n",
     };
-    const wait = scheduler_mod.QueueWait{ .ahead = 2, .running_prompt = 3000, .running_generated = 8012, .running_max = 32768, .tps = 0 };
+    const wait = slot_admission.QueueWait{ .ahead = 2, .running_prompt = 3000, .running_generated = 8012, .running_max = 32768, .tps = 0 };
     var outs: [2][]u8 = undefined;
     var raws: [2][]u8 = undefined;
     for ([_]bool{ true, false }, 0..) |queued, i| {

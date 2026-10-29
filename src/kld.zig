@@ -6,7 +6,7 @@ const chat_mod = @import("chat.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const expert_stream_mod = @import("expert_stream.zig");
-const scheduler_mod = @import("scheduler.zig");
+const model_load = @import("model_load.zig");
 const model_settings_mod = @import("model_settings.zig");
 const server_mod = @import("server.zig");
 const hidden_capture = @import("hidden_capture.zig");
@@ -930,10 +930,10 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
     }
-    scheduler_mod.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
+    model_load.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
     self.config.ctx_override = model_settings_mod.contextPick(opts.ctx_size, self.config.ctx_override).value;
 
-    const kld_budget = scheduler_mod.resolveSsdBudget(opts.ssd_budget_bytes, self.config.ssd_budget_gb_override, self.config.supportsExpertStreaming());
+    const kld_budget = model_load.resolveSsdBudget(opts.ssd_budget_bytes, self.config.ssd_budget_gb_override, self.config.supportsExpertStreaming());
     if (expert_stream_mod.expertStreamingEngaged(
         self.config.supportsExpertStreaming(),
         self.config.expertStreamingRequired(),
@@ -953,8 +953,8 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
             },
             .drop_default, .off => {},
         }
-        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, budget.bytes, false);
-        scheduler_mod.applyStreamingPlan(&self.config, plan, budget.bytes);
+        const plan = try model_load.planExpertStreaming(io, allocator, &self.config, opts.model_dir, budget.bytes, false);
+        model_load.applyStreamingPlan(&self.config, plan, budget.bytes);
         if (self.config.expert_source_dir == null) self.config.expert_source_dir = try allocator.dupe(u8, opts.model_dir);
         log.info("[kld] expert streaming: cache {d:.2} GB, {d} slots/layer\n", .{
             @as(f64, @floatFromInt(plan.cache.cache_bytes)) / 1e9,

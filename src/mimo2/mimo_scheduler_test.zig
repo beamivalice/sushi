@@ -11,11 +11,13 @@ const Generator = generate_mod.Generator;
 const expert_stream_mod = @import("../expert_stream.zig");
 const testing = std.testing;
 const scheduler_mod = @import("../scheduler.zig");
+const mtp_tick = @import("../mtp_tick.zig");
+const model_load = @import("../model_load.zig");
 const Slot = scheduler_mod.Slot;
-const anyPenalised = scheduler_mod.anyPenalised;
-const mimoCoarseHeadBytes = scheduler_mod.mimoCoarseHeadBytes;
-const mimoVerifyWarmWanted = scheduler_mod.mimoVerifyWarmWanted;
-const resolveExpertCache = scheduler_mod.resolveExpertCache;
+const anyPenalised = mtp_tick.anyPenalised;
+const mimoCoarseHeadBytes = model_load.mimoCoarseHeadBytes;
+const mimoVerifyWarmWanted = model_load.mimoVerifyWarmWanted;
+const resolveExpertCache = model_load.resolveExpertCache;
 const slotMimoMtpCrowdable = scheduler_mod.slotMimoMtpCrowdable;
 
 test "a resident MiMo warms its verify rows without its heads; a streamed one and another arch do not" {

@@ -9,6 +9,8 @@ const expert_stream_mod = @import("expert_stream.zig");
 const log = @import("log.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
+const vision_queue = @import("vision_queue.zig");
+const slot_admission = @import("slot_admission.zig");
 const model_registry_mod = @import("model_registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
@@ -364,7 +366,7 @@ pub fn nonStreamingViaScheduler(
     enable_mtp: bool,
     allow_batch_mtp: bool,
     timeout_ns: u64,
-    deferred_media: ?*scheduler_mod.DeferredMedia,
+    deferred_media: ?*vision_queue.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -519,7 +521,7 @@ pub fn handleNonStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    deferred_media: ?*scheduler_mod.DeferredMedia,
+    deferred_media: ?*vision_queue.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -548,7 +550,7 @@ pub fn handleNonStreamingGeneration(
     const use_drafter = spec.use_drafter;
 
     // Transfer vision ownership into the slot via the scheduler.
-    const slot_ve: ?*scheduler_mod.DeferredMedia = blk: {
+    const slot_ve: ?*vision_queue.DeferredMedia = blk: {
         const v = ve_local;
         ve_local = null;
         break :blk v;
@@ -1100,7 +1102,7 @@ pub fn handleStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    deferred_media: ?*scheduler_mod.DeferredMedia,
+    deferred_media: ?*vision_queue.DeferredMedia,
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
@@ -1296,7 +1298,7 @@ pub fn handleStreamingGeneration(
                     client_gone = true;
                     break;
                 }
-                sendStreamIdle(stream, scheduler_mod.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
+                sendStreamIdle(stream, slot_admission.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
@@ -2248,11 +2250,11 @@ fn sendStreamKeepalive(stream: *Conn) !void {
 
 /// The keepalive of a stream still waiting for its first token: while the request is queued
 /// behind another, the comment says so. It is a comment, so no client reads it as content.
-pub fn sendStreamIdle(stream: *Conn, queued: ?scheduler_mod.QueueWait) !void {
+pub fn sendStreamIdle(stream: *Conn, queued: ?slot_admission.QueueWait) !void {
     const w = queued orelse return sendStreamKeepalive(stream);
     if (stream.ws_mode != null) return;
     var buf: [196]u8 = undefined;
-    const line = scheduler_mod.queueWaitText(buf[0..192], w, false);
+    const line = slot_admission.queueWaitText(buf[0..192], w, false);
     buf[line.len] = '\n';
     buf[line.len + 1] = '\n';
     try stream.writeAll(buf[0 .. line.len + 2]);

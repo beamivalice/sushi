@@ -14,7 +14,8 @@ const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
-const scheduler_mod = @import("scheduler.zig");
+const vision_queue = @import("vision_queue.zig");
+const model_load = @import("model_load.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const stb = @import("stb");
@@ -218,7 +219,7 @@ test "an undecoded image's chain key is the key its decoded pixels always had" {
     for ([_]*const model_mod.ModelConfig{ &dsv, &qwen }) |config| {
         const vp = visionPreprocFromConfig(config);
         // More images than one decode window, so the key crosses a refill.
-        const n = 2 * scheduler_mod.decode_workers + 3;
+        const n = 2 * vision_queue.decode_workers + 3;
         var eager: [n]chat_mod.ImageData = undefined;
         var held: [n]chat_mod.ImageData = undefined;
         var placed: [n]PlacedMedia = undefined;
@@ -270,14 +271,14 @@ test "a request whose image will not decode is refused naming it when it is keye
 
 test "a media encode refused after the restore reaches the client with the text and status it was given" {
     var buf: [320]u8 = undefined;
-    const fit = scheduler_mod.MediaRefusal{ .server_error = false, .buf = undefined, .len = 0 };
+    const fit = vision_queue.MediaRefusal{ .server_error = false, .buf = undefined, .len = 0 };
     var refused = fit;
     refused.len = (std.fmt.bufPrint(&refused.buf, "needs ~9 MB, ~1 MB is available", .{}) catch unreachable).len;
     server.slot_media_refusal = refused;
     const wire = mapGenerationError(error.MediaRefused, &buf);
     try std.testing.expectEqual(@as(u32, 400), wire.code);
     try std.testing.expectEqualStrings("needs ~9 MB, ~1 MB is available", wire.message);
-    try std.testing.expectEqual(@as(?scheduler_mod.MediaRefusal, null), server.slot_media_refusal);
+    try std.testing.expectEqual(@as(?vision_queue.MediaRefusal, null), server.slot_media_refusal);
     refused.server_error = true;
     server.slot_media_refusal = refused;
     try std.testing.expectEqual(@as(u32, 500), mapGenerationError(error.MediaRefused, &buf).code);
@@ -289,7 +290,7 @@ test "a media encode refused after the restore reaches the client with the text 
 /// model answered the text alone (a 200 with a hallucinated "Sky" for a house).
 /// A streamed load left its tower off only because nothing asked for it (not `--no-vision`).
 fn streamedTowerOffByDefault(config: *const model_mod.ModelConfig) bool {
-    const choice = scheduler_mod.visionChoiceFor(config, true);
+    const choice = model_load.visionChoiceFor(config, true);
     return config.expert_streaming and config.has_vision and !choice.on and choice.source == .default;
 }
 
@@ -619,7 +620,7 @@ fn mediaChain(
     placed: []const PlacedMedia,
     images: []const chat_mod.ImageData,
     videos: []const chat_mod.VideoData,
-    window: ?*scheduler_mod.ImageDecodeWindow,
+    window: ?*vision_queue.ImageDecodeWindow,
 ) ![]prefix_cache_mod.MediaSpan {
     const out = try allocator.alloc(prefix_cache_mod.MediaSpan, placed.len);
     errdefer allocator.free(out);
@@ -634,7 +635,7 @@ fn mediaChain(
                 // An undecoded image is keyed by the pixels its decode makes, a window of them at a time.
                 const im = images[next_image];
                 const at = next_image;
-                const px: scheduler_mod.VisionImagePixels = if (window) |w|
+                const px: vision_queue.VisionImagePixels = if (window) |w|
                     w.view(at) orelse return error.ImageUndecodable
                 else
                     .{ .pixels = im.pixels, .width = im.width, .height = im.height, .grid_h = im.grid_h, .grid_w = im.grid_w };
@@ -672,7 +673,7 @@ fn keyMedia(
     videos: []const chat_mod.VideoData,
     bad_image: *usize,
 ) ![]prefix_cache_mod.MediaSpan {
-    const views = try allocator.alloc(scheduler_mod.VisionImagePixels, images.len);
+    const views = try allocator.alloc(vision_queue.VisionImagePixels, images.len);
     defer allocator.free(views);
     var any_undecoded = false;
     for (images, views) |im, *v| {
@@ -680,7 +681,7 @@ fn keyMedia(
         any_undecoded = any_undecoded or im.undecoded;
     }
     if (!any_undecoded) return mediaChain(allocator, placed, images, videos, null);
-    var window = scheduler_mod.ImageDecodeWindow{ .allocator = allocator, .config = config, .decode = &decodeEncodedImage, .images = views };
+    var window = vision_queue.ImageDecodeWindow{ .allocator = allocator, .config = config, .decode = &decodeEncodedImage, .images = views };
     defer window.deinit();
     defer media_decode_ns += window.decode_ns;
     return mediaChain(allocator, placed, images, videos, &window) catch |err| {
@@ -692,7 +693,7 @@ fn keyMedia(
 /// What a request's media hands its slot. Whatever the slot has not taken is
 /// freed by `deinit`.
 pub const PreparedMedia = struct {
-    deferred: ?*scheduler_mod.DeferredMedia = null,
+    deferred: ?*vision_queue.DeferredMedia = null,
     chain: []const prefix_cache_mod.MediaSpan = &.{},
     mrope: MropeData = .{},
 
@@ -758,10 +759,10 @@ pub fn prepareRequestMedia(
     errdefer allocator.free(images);
     const videos = try allocator.dupe(chat_mod.VideoData, flat.videos);
     errdefer allocator.free(videos);
-    const blocks = try allocator.alloc(scheduler_mod.MediaBlock, placed.items.len);
+    const blocks = try allocator.alloc(vision_queue.MediaBlock, placed.items.len);
     errdefer allocator.free(blocks);
     for (placed.items, blocks) |p, *blk| blk.* = .{ .kind = p.kind, .rows = p.rows };
-    const deferred = try allocator.create(scheduler_mod.DeferredMedia);
+    const deferred = try allocator.create(vision_queue.DeferredMedia);
     deferred.* = .{ .allocator = allocator, .images = images, .videos = videos, .blocks = blocks, .decode_ns = takeMediaDecodeNs() };
     ready.deferred = deferred;
     ready.mrope = computeQwenMrope(allocator, placed.ids, flat.images, flat.videos, config) catch MropeData{};

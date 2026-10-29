@@ -23,6 +23,7 @@ const dflash_mod = @import("dflash.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const model_load = @import("model_load.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
@@ -1217,7 +1218,7 @@ pub fn main(init: std.process.Init) !void {
     };
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
-    scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
+    model_load.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
     if (effort_mod.think_effort_flag) |e| if (effort_mod.effortArms(config.model_type)) |arms| {
         var choices: [std.enums.values(effort_mod.Effort).len]effort_mod.Effort = undefined;
         for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
@@ -1396,7 +1397,7 @@ pub fn main(init: std.process.Init) !void {
             chat_config_owned_by_registry = true;
         };
 
-        const params = scheduler_mod.LoadParams{
+        const params = model_load.LoadParams{
             .registry = registry,
             .entry = entry,
             .config = config,
@@ -1458,7 +1459,7 @@ pub fn main(init: std.process.Init) !void {
         // Transformer's own legacy cache to match.
         const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_config, kv_quant_explicit);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
-        const mtp_choice = scheduler_mod.mtpChoiceFor(enable_mtp, mtp_explicit, config);
+        const mtp_choice = model_load.mtpChoiceFor(enable_mtp, mtp_explicit, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });
         if (kv_cache.config.scheme != .off) {
             try xfm.cache.reinit(config.num_hidden_layers, kv_cache.config);
@@ -1622,8 +1623,8 @@ fn runHeadlessServe(
     log.info("sushi {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
 
-    var stub = try scheduler_mod.headlessStubCpuState(allocator);
-    defer scheduler_mod.freeCpuState(allocator, &stub);
+    var stub = try model_load.headlessStubCpuState(allocator);
+    defer model_load.freeCpuState(allocator, &stub);
 
     const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
     if (effective_max_resident_mem > 0) {
@@ -1671,7 +1672,7 @@ fn runHeadlessServe(
         break :blk &placeholder;
     };
 
-    const params = scheduler_mod.LoadParams{
+    const params = model_load.LoadParams{
         .registry = registry,
         .entry = carrier,
         .config = stub.config,

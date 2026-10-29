@@ -17,6 +17,7 @@
 //! snapshot — fine for metrics. No mutex anywhere on the write path.
 
 const std = @import("std");
+const slot_admission = @import("slot_admission.zig");
 
 // ---------------------------------------------------------------------------
 // Histogram bounds (comptime constants shared by Metrics.init)
@@ -551,7 +552,7 @@ fn writeHistogramJson(w: *std.Io.Writer, name: []const u8, hist: anytype, scale:
 /// Safe to add from any thread; use load() to snapshot.
 /// Label per `slot_admission.BatchVerdict` tag; `.ok` is not a serial reason and renders nothing.
 pub const SERIAL_REASONS = blk: {
-    const V = @import("scheduler.zig").BatchVerdict;
+    const V = slot_admission.BatchVerdict;
     const fields = @typeInfo(V).@"enum".field_names;
     var names: [fields.len][]const u8 = undefined;
     for (fields, 0..) |f, i| names[i] = if (std.mem.eql(u8, f, "ok")) "" else f;
@@ -968,7 +969,7 @@ test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
 test "decode_serial_total carries one labelled series per serial reason, never ok" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.decode_serial_total[@intFromEnum(@import("scheduler.zig").BatchVerdict.spec_active)].add(3);
+    m.decode_serial_total[@intFromEnum(slot_admission.BatchVerdict.spec_active)].add(3);
     m.batched_group_size.set(2);
 
     var buf: [64 * 1024]u8 = undefined;

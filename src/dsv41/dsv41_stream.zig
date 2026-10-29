@@ -1535,7 +1535,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
-    const scheduler_mod = @import("../scheduler.zig");
+    const model_load = @import("../model_load.zig");
     const Transformer = @import("../transformer.zig").Transformer;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1556,14 +1556,14 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     config.drop_expert = 3;
     try testing.expectEqual(@as(u32, 5), config.keptExperts());
     // The plan counts the dropped experts out of the union workspace and of the budget's fixed bill.
-    const full_plan = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &plain, root, 2 << 30, false, 0);
-    const cut_plan = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 2 << 30, false, 0);
+    const full_plan = try model_load.planExpertStreamingWith(io, testing.allocator, &plain, root, 2 << 30, false, 0);
+    const cut_plan = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 2 << 30, false, 0);
     // The tiny pack fits the budget whole, so the bill is the resident one: every kept expert and its meta table.
     try testing.expect(full_plan.cache.resident and cut_plan.cache.resident);
     try testing.expect(cut_plan.cache.cache_bytes < full_plan.cache.cache_bytes);
     try testing.expect(cut_plan.resolved.ledger.?.cache_bytes < full_plan.resolved.ledger.?.cache_bytes);
     // A pack without the list refuses before any weight loads.
-    try testing.expectError(error.ExpertDropRefused, scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, dir, 2 << 30, false, 0));
+    try testing.expectError(error.ExpertDropRefused, model_load.planExpertStreamingWith(io, testing.allocator, &config, dir, 2 << 30, false, 0));
 
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;
@@ -1602,7 +1602,7 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
     const pack = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_PACK") orelse return error.SkipZigTest);
     const usage = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_USAGE") orelse return error.SkipZigTest);
     const model_mod = @import("../model.zig");
-    const scheduler_mod = @import("../scheduler.zig");
+    const model_load = @import("../model_load.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try linkPack(&tmp, pack);
@@ -1612,10 +1612,10 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
     defer testing.allocator.free(root);
     var config = try model_mod.parseConfig(io, testing.allocator, pack);
     defer config.deinit(testing.allocator);
-    const whole = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
+    const whole = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
     for ([_]u16{ 8, 16 }) |n| {
         config.drop_expert = n;
-        const cut = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
+        const cut = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
         const freed = if (whole.cache.resident) whole.cache.cache_bytes - cut.cache.cache_bytes else whole.cache.workspace_bytes - cut.cache.workspace_bytes;
         if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 drop {d}: resident {} -> {}, union workspace {d:.3} -> {d:.3} GB, expert cache {d:.3} -> {d:.3} GB, {d} -> {d} slots/layer\n", .{
             n,
