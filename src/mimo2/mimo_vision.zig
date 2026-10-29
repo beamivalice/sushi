@@ -15,6 +15,9 @@ const reshape = vision_common.reshape;
 const cosineSim = vision_common.cosineSim;
 const rmsRatio = vision_common.rmsRatio;
 const log = @import("../log.zig");
+const chat_mod = @import("../chat.zig");
+const request_media = @import("../request_media.zig");
+const parseImageUrlContent = request_media.parseImageUrlContent;
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -938,4 +941,25 @@ test "mimo vision bill: encode scratch stays within encodeScratchBytes per image
         }
         try testing.expect(encodeScratchBytes(&config, @intCast(n)) >= peak_over);
     }
+}
+
+test "a MiMo image is resized and normalized the vendor way, in Qwen2-VL patch order" {
+    // 36x20 PNG, four flat quadrants: red, green / blue, yellow.
+    const url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACQAAAAUCAIAAABqGAhiAAAALUlEQVR42mM4ISdHBpIjSxvDqGWjlo1aNswsI0/fhw8iZKBRy0YtG7VsmFkGAGi0hC5b6HVfAAAAAElFTkSuQmCC";
+    const vp = chat_mod.VisionPreproc{ .mode = .mimo, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 8192, .max_pixels = 8388608 };
+    const img = parseImageUrlContent(std.testing.allocator, url, vp) orelse return error.DecodeFailed;
+    defer std.testing.allocator.free(img.pixels);
+    // Vendor smart_resize: 20x36 -> 96x128 -> a 6x8 patch grid.
+    try std.testing.expectEqual(@as(u32, 6), img.grid_h);
+    try std.testing.expectEqual(@as(u32, 8), img.grid_w);
+    const pv = @as([*]const f32, @ptrCast(@alignCast(img.pixels.ptr)))[0 .. img.pixels.len / 4];
+    const feat: usize = 3 * 2 * 16 * 16;
+    try std.testing.expectEqual(@as(usize, 6 * 8) * feat, pv.len);
+    // Token 0's first feature is the red corner through ImageNet mean/std x255.
+    try std.testing.expectApproxEqAbs(@as(f32, (200.0 - 123.675) / 58.395), pv[0], 1e-5);
+    // Its second temporal slot duplicates the frame: [C, T, P, P] features.
+    try std.testing.expectApproxEqAbs(pv[0], pv[16 * 16], 0);
+    // The last token (merge-block order) sits in the yellow corner; its blue channel.
+    const last = pv[(6 * 8 - 1) * feat ..][0..feat];
+    try std.testing.expectApproxEqAbs(@as(f32, (20.0 - 103.53) / 57.375), last[2 * 2 * 16 * 16 + 255], 1e-5);
 }
