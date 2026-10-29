@@ -1052,8 +1052,8 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
-    try testing.expect(std.mem.indexOf(u8, body, "\"n_ctx\":4096") != null); // integration_test.sh
-    try testing.expect(std.mem.indexOf(u8, body, "\"total_slots\":1") != null); // integration_test.sh
+    try testing.expect(std.mem.indexOf(u8, body, "\"n_ctx\":4096") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"total_slots\":1") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"model_info\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"memory\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"active_bytes\":1234") != null); // Swift fetchProps

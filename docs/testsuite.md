@@ -43,6 +43,11 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - The pack tier's envs: `DSV41_TINY`, `DSV41_STQ_TINY` (tiny DeepSeek fixtures), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`. A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green
   suite proves nothing there.
+- Two real-weight runs have no script. The encoder's real-checkpoint capture:
+  `SUSHI_ENCODER_REAL_MODEL=1 SUSHI_MODELS_DIR=<root holding Qwen/Qwen3.8-Flash-Next> zig build test -Doptimize=ReleaseFast -Dmodel=enc`.
+  MTP verify exactness on a real pack: `QWEN4_TEST_MODEL=<pack> zig build test -Doptimize=ReleaseFast -Dmodel=qwen4` with
+  `-Dtest-filter=` `qwen4 checkpoint affine8 and dense projections`, `qwen4 verify history row and cache identity`,
+  `qwen4 MTP verify token values` and `qwen4 deferred PLE: the captured hidden`.
 - Model scope is `qwen4`, `mimo2`, `glm5`, `dsv41`, `enc` (the encoder) or `shared` (every model). A test's file says
   its model; a test of one model's code lives in that model's files.
 

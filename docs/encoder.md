@@ -108,7 +108,7 @@ behind it.
 
 The MTP head's experts use the identity matrix.
 
-Status: `tests/test_encoder_capture_real.sh` converts a real four-layer Qwen3.8-Flash-Next slice layer by layer and compares every hidden boundary, MLP input row, routing id and Hessian with the engine's full forward; they match. The MTP head is not captured yet.
+Status: the pack-tier test `capture (real Qwen checkpoint, ...)` (`SUSHI_ENCODER_REAL_MODEL=1 SUSHI_MODELS_DIR=<root> zig build test -Doptimize=ReleaseFast -Dmodel=enc`) converts a real four-layer Qwen3.8-Flash-Next slice layer by layer and compares every hidden boundary, MLP input row, routing id and Hessian with the engine's full forward; they match. The MTP head is not captured yet.
 
 ## Search
 

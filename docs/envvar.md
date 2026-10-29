@@ -135,7 +135,7 @@ Kept because the launch flag cannot express what the env does.
 
 ## Reads to fix
 
-- *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_PADWASTE_ARM` and `SUSHI_QSA_NAX_PRECISION` are script-side only.
+- *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_QSA_NAX_PRECISION` is script-side only.
 
 ## Removed 2026-10-11
 
@@ -172,13 +172,12 @@ Read by `scripts/` and `tests/` (shell and Python), not by the engine. Engine va
 |---|---|---|
 | `SUSHI_BINARY`, `SUSHI_BIN` | ~50 `tests/*.sh`, bench scripts | the binary under test; a control binary must sit in `zig-out/bin/` for its rpath |
 | `SUSHI_MODELS_DIR` | ~100 scripts, `src/test_models.zig` | pack root, `${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/<pack>`; the engine does not read it |
-| `SUSHI_TEST_MODEL`, `SUSHI_TEST_EXTRA_ARGS` | `integration_test.sh` and ~19 scripts | default model dir; extra server flags appended to every boot |
+| `SUSHI_TEST_EXTRA_ARGS` | `test_mtp_equivalence.sh`, `test_soak_24h.sh`, 2 more | extra server flags appended to every boot |
 | `QWEN4_MODEL`, `QWEN4_EXP_MODEL`, `QWEN_MODEL`, `QWEN_VISION_MODEL`, `MIMO_MODEL`, `MIMO_MEDIA_MODEL`, `MIMO_STREAM_MODEL`, `MIMO_SSD_BUDGET_GB`, `GLM_MODEL`, `MTP_ADAPTIVE_MODEL`, `MTP_BATCHED_MODEL`, `MLX_HYBRID_MODEL`, `DFLASH_TEST_MODEL`, `DFLASH_TEST_DRAFTER` | per-script live tests | a per-script pack override that wins over `SUSHI_MODELS_DIR` |
 | `DFLASH_TEST_PORT`, `DFLASH_ON_REQS`, `QWEN4_AB_PORT`, `QWEN4_AB_OUT`, `BENCH_PORT`, `BENCH_MODEL`, `BENCH_OUT`, `BENCH_LABEL` | `test_dflash.sh`, `qwen4_ab.sh`, bench scripts | ports, labels and output roots |
 | `GPU_LOCK_DIR`, `GPU_LOCK_OWNER`, `GPU_LOCK_POLL_S` | `scripts/gpu-lock.sh`, scripts that take the lock | lock directory, holder name, poll interval |
-| `SUSHI_RUNS_DIR`, `RUNS_DIR`, `RUNS_ROOT`, `RUN_DIR`, `LLMPROBE`, `LLMPROBE_DIR`, `LLMPROBE_MJS` | bench and validator scripts | run output roots and the llmprobe checkout |
+| `SUSHI_RUNS_DIR`, `RUNS_DIR`, `RUNS_ROOT`, `RUN_DIR`, `LLMPROBE`, `LLMPROBE_DIR`, `LLMPROBE_MJS` | bench scripts | run output roots and the llmprobe checkout |
 | `MTP_FORCE_ENABLE`, `MTP_EXPECT_AUTO_DEPTH`, `MTP_EXPECT_AUTO_PROFILE`, `MTP_TEST_OUTPUT_DIR`, `MIMO_BATCH_OUTPUT_DIR`, `SUSHI_PROMPT_MODEL`, `SUSHI_PROMPT_OUTPUT_DIR`, `MIMO_CLI_TEST_HOME`, `MIMO_CLI_TEST_TIMEOUT` | MTP, batched and CLI tests | expected profile/depth pins, output dirs, private HOME |
-| `SUSHI_PADWASTE_ARM` | `test_batched_equivalence.sh` | opt-in pad-waste arm; not read by the engine |
 | `SUSHI_QSA_NAX_PRECISION` | `qsa_nax_precision.py` | verbose mode of the Python precision harness; not read by the engine |
 | `QWEN4_REF_DTYPE`, `QWEN4_TEACHER_FIXTURE`, `MIMO_V2_REF`, `MIMO_V2_FIXTURE_DEBUG`, `HF_HUB_OFFLINE`, `PYTHONPATH`, `KLD_JSON`, `QWEN_PREPROCESS_FIXTURE`-family (`QWEN_PREPROCESS_MIN_PIXELS`, `_MAX_PIXELS`, `_DOWNSCALE_*`) | `tests/dump_*_fixtures.py`, parity scripts | oracle dumpers and preprocessing parity inputs |
 | `MLX_SRC`, `MLX_SHA`, `MLXC_SRC`, `MLXC_SHA`, `MLXC_PATCH`, `MLX_DEPLOYMENT_TARGET`, `MLX_STAGE`, `ZIG`, `ZIG_VERSION`, `GH_REPO` | `scripts/build-mlx.sh`, `fetch-zig.sh`, `release.sh` | pinned build inputs and release plumbing |
