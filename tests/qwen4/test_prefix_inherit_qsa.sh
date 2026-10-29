@@ -93,17 +93,13 @@ echo "$WARM1" | python3 -c "import json,sys; o=json.load(sys.stdin); raise Syste
 echo "$WARM2" | python3 -c "import json,sys; o=json.load(sys.stdin); raise SystemExit(0 if o['code']==200 else 1)" || fail=1
 
 LOGS=$(sushi_log_since)
-if python3 -c "
-import re,sys
-for m in re.finditer(r'reused ([0-9]+)/([0-9]+) tokens', sys.stdin.read()):
-    a,b=int(m.group(1)),int(m.group(2))
-    if b-a==1:
-        raise SystemExit(0)
-raise SystemExit(1)
-" <<< "$LOGS"; then
-    echo -e "${GREEN}PASS${NC} 1-token prefill shape occurred"
+# The restore lands on a checkpoint below the prompt end, so the old one-token tail no longer occurs; what the
+# class needs is every turn after the first restoring an entry (B's two turns and the verbatim pair).
+RESTORES=$(grep -c "reused [0-9]*/[0-9]* tokens" <<< "$LOGS" || true)
+if [ "$RESTORES" -ge 4 ]; then
+    echo -e "${GREEN}PASS${NC} $RESTORES restores from shared-prefix entries"
 else
-    echo -e "${RED}FAIL${NC} never saw a reused N/(N+1) 1-token prefill line"
+    echo -e "${RED}FAIL${NC} expected at least 4 hot-cache restores, saw $RESTORES"
     grep -n "hot-cache" <<< "$LOGS" | head -20
     fail=1
 fi

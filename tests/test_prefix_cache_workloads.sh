@@ -11,7 +11,7 @@
 #
 #   [1] conversation turn 2 is warm (cached_tokens > 1000: the system prompt, not a 2-token BOS match)
 #   [2] six docs with prompt_cache_key:"batch"; turn 3 is still warm
-#   [3] every eviction during that sweep names the ONE batch key
+#   [3] no eviction during that sweep names the anonymous key (one or two keys: the batch, and the conversation's stale entry)
 #   [4] control: six unkeyed, system-less docs (anonymous group); turn 4 still warm
 #   [5] the control sweep evicts key-0 entries (it pays for itself)
 # A turn may evict the conversation's own stale earlier entry, and a tie between
@@ -88,12 +88,12 @@ c3=$(conv_turn "And rule 7?")
 if [ "$c3" -gt 1000 ]; then echo -e "${GREEN}PASS${NC} [2] turn 3 warm after a keyed sweep (cached_tokens=$c3)"; else echo -e "${RED}FAIL${NC} [2] keyed sweep evicted the conversation (cached_tokens=$c3)"; FAIL=1; fi
 
 nkeys=$(echo "$keys" | grep -c . || true)
-if [ "$nkeys" = "1" ] && [ "$keys" != "0" ]; then
-    echo -e "${GREEN}PASS${NC} [3] every eviction names the batch key ($keys)"
+# The conversation's own stale entry may also go (header note), so one or two keys, never the anonymous one.
+if [ "$nkeys" -ge 1 ] && [ "$nkeys" -le 2 ] && ! echo "$keys" | grep -qx 0; then
+    echo -e "${GREEN}PASS${NC} [3] no eviction names the anonymous key ($(echo $keys))"
 else
     echo -e "${RED}FAIL${NC} [3] expected one non-anonymous evicted key, got: $(echo $keys)"; log_after "$mark" | grep 'evicted LRU'; FAIL=1
 fi
-BATCH_KEY="$keys"
 
 mark=$(log_size)
 for i in 7 8 9 10 11 12; do sweep_doc "$i" ''; done
