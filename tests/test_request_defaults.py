@@ -34,7 +34,7 @@ def main():
     nonce = st.attach()
     args.url = st.url()
     args.server_log = Path(os.environ["SUSHI_LOG"])
-    args.output = args.output or Path(tempfile.mkdtemp(prefix="request-defaults-"))
+    args.output = args.output or (Path(os.environ["SUSHI_RUN_DIR"]) / "request-defaults" if os.environ.get("SUSHI_RUN_DIR") else Path(tempfile.mkdtemp(prefix="request-defaults-")))
     args.output.mkdir(parents=True, exist_ok=True)
 
     def post(name, endpoint, body):
