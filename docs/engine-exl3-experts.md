@@ -181,7 +181,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   shared experts recovers only 4-7% of the expert kernels at 3-4 rows.
 - **GLM's one-row decode GEMVs are latency-bound, not ALU-bound**: two tiles per group and two k-tiles per iteration
   took the chain from 179 to 141 µs per layer ([glm5-clamped-experts](glm5-clamped-experts.md#glm)); judge a decode
-  GEMV change on the whole chain meter (`SUSHI_GLM_T1_UBENCH=1`, test binary), not on an instruction count.
+  GEMV change on the whole chain meter (`sushi-ubench run glm5.routed_t1`), not on an instruction count.
 - Dead for the decode GEMVs (microbenched): 4 or 8 tiles per threadgroup, software prefetch, 2 simdgroups, a
   threadgroup LUT decode, a 24-bit multiply split, half2 input reads, bitfield extracts.
 - Dead for the prefill GEMM on the NAX body (MiMo and Flash-Next, outputs bit-identical, all slower): 64-row windows
@@ -279,7 +279,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   162 us chained.
   - Policy: k is split into ranges of at most 512 over at least 320 threadgroups, then one finish dispatch.
   - An output of at least 1024 128-blocks (lm_head) folds the finish into a single dispatch.
-  - Sweep: `SUSHI_EXL3_ROWS_SWEEP=qwen4|glm5|dsv41` (dsv41: SPEC1 n64 at rows 1, 2, 3, 5, 8).
+  - Time the served geometry with `sushi-ubench run shared.exl3_trunk_rows` (SPEC1 n64 at rows 1, 2, 3, 5, 8).
 - The parity bar scores each 128-wide output block in inner space: its error L2 (divided by svh) against the L2 of the
   block's summand magnitudes. The output transform is an orthonormal rotation, so this keeps the inner GEMV bar's
   scale. The composite is `projectIndexed` per row, which shares the bitstream, so it cannot convict a codeword flip;
@@ -322,7 +322,7 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
   (a longer row loop compiles 2-3x slower); from two rows a threadgroup spans two output tile pairs. Its bytes are the
   pre-split kernel's at every width, and a row equals the one-row launch bit for bit; the tests keep the old loop as
   their oracle. Timings: [perf-baselines](perf-baselines.md#simd-rows).
-- DeepSeek shapes at 2 to 8 rows (`SUSHI_EXL3_ROWS_SWEEP=dsv41`, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
+- DeepSeek shapes at 2 to 8 rows (a launch-geometry sweep, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
   two-row cells, by less than the noise. The policy stands.
 
 - **DeepSeek trunk by width** (`SUSHI_DSV41_TRUNK_UBENCH=1 MLX_MAX_OPS_PER_BUFFER=16`, exl3 test binary at `d810c50c`, M5 Max, GPU
@@ -428,9 +428,9 @@ every rate group of layer 2): all against a dense f64 product of the host tile d
 
 Timing, on a loaded box (best of 40 four-step dependent chains per cell, link floor removed, no GPU lock;
 ratios and orderings are usable, absolute microseconds are not; commit and settings in
-[perf-baselines](perf-baselines.md#dsv41-stq)): `SUSHI_DSV41_STQ_UBENCH=<shape filter|1>` (trunk linears against the
-GEMM, the indexed GEMV, mxfp8 and affine-4) on the exl3 test binary, `SUSHI_UBENCH_STEPS` / `SUSHI_UBENCH_ROUNDS` sizing
-the chains; and `sushi-ubench run dsv41.experts` (the grouped chain at the plan's layers 2, 5, 23 and the stage).
+[perf-baselines](perf-baselines.md#dsv41-stq)): `sushi-ubench run shared.exl3_trunk_rows` (trunk linears over distinct banks: the
+served arm, NAX at every width, the indexed GEMV, mxfp8, affine-4 and a streaming floor; `--rungs shape=`, `--steps`,
+`--rounds`); and `sushi-ubench run dsv41.experts` (the grouped chain at the plan's layers 2, 5, 23 and the stage).
 
 <a id="dsv41-shared-fused"></a>
 **The shared expert rides the routed chain's launches** (`rate_groups.moeDecodeClampedSharedFused`, 1 to 16 rows, the

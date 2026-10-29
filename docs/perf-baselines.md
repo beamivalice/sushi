@@ -267,7 +267,8 @@ ReleaseFast, `taskpolicy -a`, M5 Max, NO GPU lock: another job held the GPU. Dep
 long kernels (a one-row chain read 2-3 ms instead of ~250 us), so each cell is the best of 40 chains of 4 calls with the
 chain link removed: orderings and ratios hold, absolute microseconds are upper bounds. Re-take the cells on a quiet box before recording any as a baseline.
 Meters: `SUSHI_DSV41_STQ_UBENCH=1` with `SUSHI_UBENCH_STEPS=4 SUSHI_UBENCH_ROUNDS=40` (exl3 test binary,
-`-Dtest-filter=UBENCH`); the expert chain is now `sushi-ubench run dsv41.experts` ([process-ubench](process-ubench.md)).
+`-Dtest-filter=UBENCH`); the expert chain is now `sushi-ubench run dsv41.experts` and the trunk table
+`sushi-ubench run shared.exl3_trunk_rows` ([process-ubench](process-ubench.md)).
 
 Trunk linears, us per call (and GB/s of trellis read), SPEC1 n64; `gemm` is what the pack used before (the sorted GEMM at
 every width), `rows` the multi-row kernel (SIMD at 1 row, NAX from 2), mxfp8 the release's own trunk:

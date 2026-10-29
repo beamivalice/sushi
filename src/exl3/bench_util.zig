@@ -1,4 +1,4 @@
-//! Timing helpers for the kernel diagnostics (`SUSHI_*_UBENCH`): a chain of dependent calls, so launch latency counts
+//! Timing helpers for the kernel microbenches (`sushi-ubench`): a chain of dependent calls, so launch latency counts
 //! as it does in a forward, and the effective read rate of a weight against the roofline.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
@@ -76,18 +76,6 @@ pub fn fastest(times: []u64) f64 {
 /// GB/s a call reads `bytes` at in `us`.
 pub fn gbps(bytes: f64, us: f64) f64 {
     return bytes / us / 1e3;
-}
-
-pub fn diagOn(name: [*:0]const u8) bool {
-    const v = std.c.getenv(name) orelse return false;
-    return v[0] != 0 and v[0] != '0';
-}
-
-/// A diagnostic's size knob (`SUSHI_UBENCH_STEPS`, `SUSHI_UBENCH_ROUNDS`): short chains and many rounds find the
-/// gaps a shared GPU leaves; long chains over few rounds suit a quiet box.
-pub fn envUsize(name: [*:0]const u8, default: usize) usize {
-    const v = std.c.getenv(name) orelse return default;
-    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
 }
 
 pub fn randomWords(rnd: std.Random, out: []u16) void {
