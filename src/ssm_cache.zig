@@ -440,8 +440,8 @@ pub fn splitSpecCaptures(s: mlx.mlx_stream, m: *const SSMCacheEntry, e: *SSMCach
 /// `accepted` of a length-(1+m) verify run is the exact same float32→bf16
 /// value a length-(1+accepted) run would store as its final state. Likewise
 /// `conv_state` is the same windowed slice of the same conv input. So this
-/// preserves PLD's byte-equivalence guarantee (pinned by
-/// `tests/test_pld_equivalence.sh`).
+/// preserves speculative decoding's byte-equivalence guarantee
+/// (pinned by `tests/test_mtp_equivalence.sh`).
 ///
 /// No-op when the entry holds no capture (non-GDN hybrid layer); the caller
 /// only takes the fast path when capture succeeded.

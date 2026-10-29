@@ -24,7 +24,7 @@ runs:
         python3 -m pip install --quiet pyyaml
         fail=0
         for t in test_release test_release_workflow_gates test_brewfile_covers_build_tools test_build_mlx_pins \
-                 test_private_cache test_gpu_lock; do
+                 test_private_cache test_gpu_lock test_run test_doc_links; do
           echo "::group::$t"
           bash "tests/$t.sh" || { echo "::error::tests/$t.sh failed"; fail=1; }
           echo "::endgroup::"

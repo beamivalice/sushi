@@ -373,7 +373,7 @@ fn handleNonStreamingCompletion(
     defer allocator.free(result.token_ids);
 
     // Text completion is a raw continuation: FIM clients rely on exact
-    // indentation (stream/non-stream parity: tests/test_completions_spec.sh).
+    // indentation (stream and non-stream bytes match).
     const raw_text = try completionText(allocator, tok, result.token_ids, skip_special);
     defer allocator.free(raw_text);
 
