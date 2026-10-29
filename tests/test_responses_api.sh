@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Integration test: /v1/responses (OpenAI Responses API).
 #
 # Covers MVP non-streaming paths from the implementation plan:
@@ -13,51 +13,41 @@
 #
 # Streaming cases (3, 8) emit named SSE events.
 #
-# Usage: ./tests/test_responses_api.sh [model_dir] [port]
+# Attaches to the shared api boot: tests/run.sh --only test_responses_api.sh --model <m>.
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8099}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+BASE=$SUSHI_URL
 PASS=0
 FAIL=0
 TOTAL=0
 
-if [ ! -d "$MODEL_DIR" ]; then
-    echo "SKIP: Model not found at $MODEL_DIR"
-    exit 0
+echo "=== /v1/responses Integration Test ==="
+echo "Server: $BASE ($SUSHI_ARCH)"
+echo ""
+
+# GLM cannot turn thinking off (low is its cheapest word), so it gets low and room for the thought.
+if [ "$SUSHI_ARCH" = glm5_next ]; then
+    EFFORT=low
+    EXTRA=4096
+else
+    EFFORT=none
+    EXTRA=0
 fi
 
-echo "=== /v1/responses Integration Test ==="
-echo "Model: $MODEL_DIR"
-echo "Port: $PORT"
-echo ""
-
-echo "Starting server..."
-./zig-out/bin/sushi --model "$MODEL_DIR" --serve --port $PORT --log-level info 2>/tmp/sushi-test-responses.log &
-SERVER_PID=$!
-sleep 2
-
-for i in $(seq 1 30); do
-    if curl -sf "$BASE/health" > /dev/null 2>&1; then
-        echo "Server ready (PID $SERVER_PID)"
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        echo "FAIL: Server did not start within 30s"
-        kill $SERVER_PID 2>/dev/null
-        exit 1
-    fi
-    sleep 1
-done
-echo ""
-
-cleanup() {
-    echo ""
-    echo "Stopping server (PID $SERVER_PID)..."
-    kill $SERVER_PID 2>/dev/null
-    wait $SERVER_PID 2>/dev/null
+# rpost <json> [curl args]: POSTs a Responses body. "@N" becomes the attach nonce (every prompt starts with it),
+# and the body gets the arch's cheap reasoning effort plus its token headroom unless it names its own.
+rpost() {
+    local body
+    body=$(python3 -I -c 'import json, sys
+d = json.loads(sys.argv[1].replace("@N", sys.argv[2]))
+d.setdefault("reasoning", {"effort": sys.argv[3]})
+if "max_output_tokens" in d:
+    d["max_output_tokens"] += int(sys.argv[4])
+print(json.dumps(d))' "$1" "$SUSHI_NONCE" "$EFFORT" "$EXTRA")
+    shift
+    curl -s "$@" "$BASE/v1/responses" -H "Content-Type: application/json" -d "$body"
 }
-trap cleanup EXIT
 
 run_test() {
     local name="$1"
@@ -75,9 +65,7 @@ run_test() {
 
 # ── Test 1: simple text input ──
 echo "--- Test 1: simple text input ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sushi","input":"Reply with exactly the word OK and nothing else.","max_output_tokens":16,"temperature":0}')
+RESULT=$(rpost '{"model":"sushi","input":"@N Reply with exactly the word OK and nothing else.","max_output_tokens":16,"temperature":0}')
 
 OK=$(echo "$RESULT" | python3 -c "
 import sys, json
@@ -100,39 +88,37 @@ echo "  raw: $(echo "$RESULT" | python3 -c "import sys,json; r=json.load(sys.std
 echo ""
 
 # ── Test 2: instructions ──
+# The reply's style is the checkpoint's choice; the contract is that the instructions reach the prompt and the envelope.
 echo "--- Test 2: instructions field ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sushi","instructions":"You always reply in ALL CAPS.","input":"say hi","max_output_tokens":24,"temperature":0}')
+RESULT=$(rpost '{"model":"sushi","instructions":"You always reply in ALL CAPS.","input":"@N say hi","max_output_tokens":24,"temperature":0}')
+RESULT_PLAIN=$(rpost '{"model":"sushi","input":"@N say hi","max_output_tokens":24,"temperature":0}')
 
-TEXT=$(echo "$RESULT" | python3 -c "
-import sys, json
-r = json.loads(sys.stdin.read())
-msg = next((it for it in r['output'] if it['type'] == 'message'), {})
-parts = msg.get('content') or []
-print(next((p['text'] for p in parts if p['type']=='output_text'), ''))
+OK_INSTR=$(RESULT="$RESULT" RESULT_PLAIN="$RESULT_PLAIN" python3 -I -c "
+import os, json
+try:
+    r = json.loads(os.environ['RESULT'])
+    p = json.loads(os.environ['RESULT_PLAIN'])
+    assert r['instructions'] == 'You always reply in ALL CAPS.', f'instructions={r.get(\"instructions\")}'
+    assert p['instructions'] is None, 'instructions echoed without being sent'
+    assert r['usage']['input_tokens'] > p['usage']['input_tokens'], 'instructions did not reach the prompt'
+    print('ok')
+except Exception as e:
+    print(f'fail:{e}')
 " 2>/dev/null)
-echo "  reply: $TEXT"
-# At least one uppercase letter and no all-lowercase reply (some lenience for punctuation)
-if echo "$TEXT" | grep -qE '[A-Z]' && ! echo "$TEXT" | grep -qE '^[a-z]+'; then
-    run_test "instructions affect reply" "PASS" ""
-else
-    run_test "instructions affect reply" "FAIL" "expected at least one uppercase letter, got: $TEXT"
-fi
+run_test "instructions reach the prompt" "$( [ "$OK_INSTR" = ok ] && echo PASS || echo FAIL )" "$OK_INSTR"
 echo ""
 
 # ── Test 4: function tool ──
 echo "--- Test 4: function tool emits function_call output item ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{
+RESULT=$(rpost '{
     "model":"sushi",
-    "input":"What is the weather in Paris? Use the get_weather tool.",
+    "input":"@N What is the weather in Paris? Use the get_weather tool.",
     "tools":[{"type":"function","name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],
     "tool_choice":"required",
     "max_output_tokens":128,
     "temperature":0
   }')
+TOOL_RESULT="$RESULT"
 
 OK=$(echo "$RESULT" | python3 -c "
 import sys, json
@@ -152,11 +138,9 @@ echo ""
 
 # ── Test 4b: function tool with json_schema still emits function_call ──
 echo "--- Test 4b: function tool with json_schema emits function_call ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{
+RESULT=$(rpost '{
     "model":"sushi",
-    "input":"What is the weather in Miami? Use the get_weather tool.",
+    "input":"@N What is the weather in Miami? Use the get_weather tool.",
     "tools":[{"type":"function","name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],
     "tool_choice":"required",
     "text":{"format":{"type":"json_schema","name":"final_answer","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}},
@@ -182,11 +166,9 @@ echo ""
 
 # ── Test 4c: optional tools with json_schema still format direct answers ──
 echo "--- Test 4c: optional tools with json_schema formats direct answer ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{
+RESULT=$(rpost '{
     "model":"sushi",
-    "input":"Do not call any tools. Reply with a JSON object whose answer is beach.",
+    "input":"@N Do not call any tools. Reply with a JSON object whose answer is beach.",
     "tools":[{"type":"function","name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],
     "text":{"format":{"type":"json_schema","name":"direct_answer","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}},
     "max_output_tokens":96,
@@ -215,16 +197,14 @@ echo ""
 # ── Test 5: previous_response_id + function_call_output round-trip ──
 echo "--- Test 5: function tool result round-trip ---"
 if [ "$OK" = ok ]; then
-    RESP_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
-    CALL_ID=$(echo "$RESULT" | python3 -c "
+    RESP_ID=$(echo "$TOOL_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
+    CALL_ID=$(echo "$TOOL_RESULT" | python3 -c "
 import sys, json
 r = json.loads(sys.stdin.read())
 fc = next((it for it in r['output'] if it['type'] == 'function_call'), {})
 print(fc.get('call_id', ''))
 " 2>/dev/null)
-    ROUNDTRIP=$(curl -sf "$BASE/v1/responses" \
-      -H "Content-Type: application/json" \
-      -d "{
+    ROUNDTRIP=$(rpost "{
         \"model\":\"sushi\",
         \"previous_response_id\":\"$RESP_ID\",
         \"input\":[{\"type\":\"function_call_output\",\"call_id\":\"$CALL_ID\",\"output\":\"The weather in Paris is sunny and 21 C.\"}],
@@ -251,11 +231,9 @@ echo ""
 
 # ── Test 6: text.format.json_schema enforces structure ──
 echo "--- Test 6: text.format.json_schema strict ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{
+RESULT=$(rpost '{
     "model":"sushi",
-    "input":"Make up a person record.",
+    "input":"@N Make up a person record.",
     "text":{"format":{"type":"json_schema","name":"person","schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}}},
     "max_output_tokens":128,
     "temperature":0.7
@@ -281,11 +259,9 @@ echo ""
 
 # ── Test 7: structured output default budget avoids truncation ──
 echo "--- Test 7: json_schema default max_output_tokens ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{
+RESULT=$(rpost '{
     "model":"sushi",
-    "input":"Say hello and ask one short cruise discovery question. Set every profile_update field to null.",
+    "input":"@N Say hello and ask one short cruise discovery question. Set every profile_update field to null.",
     "text":{"format":{"type":"json_schema","name":"cruise_response","schema":{
       "type":"object",
       "properties":{
@@ -334,9 +310,7 @@ echo ""
 
 # ── Test 9: store + GET + DELETE ──
 echo "--- Test 9: store + GET + DELETE round-trip ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sushi","input":"Reply with exactly the word OK and nothing else.","max_output_tokens":16,"temperature":0,"store":true}')
+RESULT=$(rpost '{"model":"sushi","input":"@N Reply with exactly the word OK and nothing else.","max_output_tokens":16,"temperature":0,"store":true}')
 
 RESP_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
 echo "  stored id: $RESP_ID"
@@ -373,9 +347,7 @@ echo ""
 
 # ── Test 10: store=false → GET 404 ──
 echo "--- Test 10: store=false skips persistence ---"
-RESULT=$(curl -sf "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sushi","input":"Hi","max_output_tokens":8,"temperature":0,"store":false}')
+RESULT=$(rpost '{"model":"sushi","input":"@N Hi","max_output_tokens":8,"temperature":0,"store":false}')
 
 RESP_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
 if [ -z "$RESP_ID" ]; then
@@ -392,9 +364,7 @@ echo ""
 
 # ── Test 3: streaming text emits expected events in order ──
 echo "--- Test 3: streaming named events ---"
-EVENTS=$(curl -sf -N "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sushi","input":"Reply with exactly the word OK and nothing else.","max_output_tokens":16,"temperature":0,"stream":true}' 2>/dev/null)
+EVENTS=$(rpost '{"model":"sushi","input":"@N Reply with exactly the word OK and nothing else.","max_output_tokens":16,"temperature":0,"stream":true}' -N 2>/dev/null)
 
 EVENT_ORDER=$(echo "$EVENTS" | grep -E "^event: " | awk '{print $2}' | tr '\n' ',')
 echo "  events: $EVENT_ORDER"
@@ -414,17 +384,15 @@ echo ""
 
 # ── Test 8: streaming function tool emits function_call_arguments events ──
 echo "--- Test 8: streaming function tool events ---"
-EVENTS=$(curl -sf -N "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{
+EVENTS=$(rpost '{
     "model":"sushi",
-    "input":"What is the weather in Tokyo? Use the get_weather tool.",
+    "input":"@N What is the weather in Tokyo? Use the get_weather tool.",
     "tools":[{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],
     "tool_choice":"required",
     "stream":true,
     "max_output_tokens":128,
     "temperature":0
-  }' 2>/dev/null)
+  }' -N 2>/dev/null)
 
 if echo "$EVENTS" | grep -qE "^event: response.function_call_arguments.delta" && \
    echo "$EVENTS" | grep -qE "^event: response.function_call_arguments.done" && \
@@ -438,9 +406,7 @@ echo ""
 
 # ── Test 11: previous_response_id not found ──
 echo "--- Test 11: previous_response_id not found ---"
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/v1/responses" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sushi","input":"hi","previous_response_id":"resp_does_not_exist","max_output_tokens":8}')
+HTTP_CODE=$(rpost '{"model":"sushi","input":"@N hi","previous_response_id":"resp_does_not_exist","max_output_tokens":8}' -o /dev/null -w "%{http_code}")
 if [ "$HTTP_CODE" = "404" ]; then
     run_test "previous_response_id not found returns 404" "PASS" ""
 else
@@ -453,8 +419,8 @@ echo "Passed: $PASS / $TOTAL"
 if [ "$FAIL" -gt 0 ]; then
     echo "Failed: $FAIL"
     echo ""
-    echo "Server log (last 40 lines):"
-    tail -40 /tmp/sushi-test-responses.log
+    echo "Server log (last 40 lines of this script's slice):"
+    sushi_log_since | tail -40
     exit 1
 else
     echo "All tests passed!"
