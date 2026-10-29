@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const verify_qmm = @import("../verify_qmm.zig");
 const kv_cache = @import("../kv_cache.zig");
 const std = @import("std");
 const qwen4_mod = @import("qwen4_exp.zig");
@@ -991,9 +992,9 @@ test "verify vocabulary projections preserve solo logits across request widths (
         const wide = try attn256RandBf16(prng.random(), &.{ 1, 25, k }, s);
         defer _ = mlx.mlx_array_free(wide);
         try testing.expect((try verifyLmHeadProjection(s, wide, w, sc, bi, &.{ 5, 5, 5, 5, 5 })) == null);
-        const old = trf.vqmm_mixed_plain_test_force;
-        trf.vqmm_mixed_plain_test_force = true;
-        defer trf.vqmm_mixed_plain_test_force = old;
+        const old = verify_qmm.vqmm_mixed_plain_test_force;
+        verify_qmm.vqmm_mixed_plain_test_force = true;
+        defer verify_qmm.vqmm_mixed_plain_test_force = old;
         try testing.expect((try verifyLmHeadProjection(s, x, w, sc, bi, &.{ 4, 4 })) == null);
     }
 }
