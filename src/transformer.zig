@@ -10814,7 +10814,6 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
             const id_solo = try H.argmax(allocator, os.logits, s);
             const id_bat = try H.argmax(allocator, bout[0].logits, s);
             try t.expectEqual(id_solo, id_bat);
-            std.debug.print("[mtp mlx_equal N=1] depth={d} step={d} id={d} graphs=1\n", .{ depth, d, id_solo });
             tok_s = id_solo;
             tok_b = id_bat;
             _ = mlx.mlx_array_free(h_s);
@@ -41818,51 +41817,12 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
         ctx.mrope_pos = pos_flat;
         ctx.mrope_total = T;
         ctx.mrope_delta = ri.delta;
-        const n_layers: usize = config.num_hidden_layers;
-        const cap_ids = try allocator.alloc(u32, n_layers);
-        defer allocator.free(cap_ids);
-        const cap_out = try allocator.alloc(mlx.mlx_array, n_layers);
-        defer allocator.free(cap_out);
-        for (0..n_layers) |i| {
-            cap_ids[i] = @intCast(i);
-            cap_out[i] = mlx.mlx_array_new();
-        }
-        defer for (cap_out) |o| {
-            _ = mlx.mlx_array_free(o);
-        };
-        var cap_layers: CaptureLayers = .{ .ids = cap_ids, .out = cap_out };
-        ctx.capture_layers = &cap_layers;
-        var final_all = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(final_all);
-        ctx.capture_hidden_all = &final_all;
         var trace: Transformer.Qwen4Trace = .{};
         defer trace.deinit();
         Transformer.qwen4_trace = &trace;
         defer Transformer.qwen4_trace = null;
         const logits = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
-        for (0..n_layers) |i| {
-            var nb: [32]u8 = undefined;
-            const key = std.fmt.bufPrint(&nb, "stream_{d}", .{i + 1}) catch unreachable;
-            const ref = fx.get(key) orelse continue;
-            if (i + 1 >= n_layers or cap_out[i].ctx == null) continue;
-            const ref_h = try qwen4ReadF32(allocator, ref, s);
-            defer allocator.free(ref_h);
-            const our_h = try qwen4ReadF32(allocator, cap_out[i], s);
-            defer allocator.free(our_h);
-            if (our_h.len != ref_h.len) {
-                std.debug.print("[qwen4 fixture vision] stream_{d}: size {d} vs ref {d}\n", .{ i + 1, our_h.len, ref_h.len });
-                continue;
-            }
-            const w: usize = ref_h.len / T;
-            const rc = qwen4CompareRows(our_h, ref_h, T, w);
-            if (rc.min_cos < 0.999 and i == 3) {
-                for (0..T) |row| {
-                    const rr = qwen4CompareRows(our_h[row * w ..][0..w], ref_h[row * w ..][0..w], 1, w);
-                    std.debug.print("    row {d}: cos {d:.4}\n", .{ row, rr.min_cos });
-                }
-            }
-        }
         // The reference's own cos/sin table [T, rope_dims] vs our chunk build.
         if (fx.get("rope_cos")) |ref_cos_arr| {
             const ref_cos = try qwen4ReadF32(allocator, ref_cos_arr, s);
@@ -41875,24 +41835,9 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
             try testing.expectEqual(ref_cos.len, our_cos.len);
             var max_d: f32 = 0;
             for (ref_cos, our_cos) |a, b| max_d = @max(max_d, @abs(a - b));
-            std.debug.print("[qwen4 fixture vision] M-RoPE cos table vs reference: max |d| {e:.3}\n", .{max_d});
+            errdefer std.debug.print("[qwen4 fixture vision] M-RoPE cos table vs reference: max |d| {e:.3}\n", .{max_d});
             try testing.expect(max_d < 1e-4);
         }
-        if (fx.get("l3_attn_out")) |ref_a| if (trace.attn3_out.ctx != null) {
-            const ref_h = try qwen4ReadF32(allocator, ref_a, s);
-            defer allocator.free(ref_h);
-            const our_h = try qwen4ReadF32(allocator, trace.attn3_out, s);
-            defer allocator.free(our_h);
-            if (our_h.len == ref_h.len) {
-                const w: usize = ref_h.len / T;
-                const rc = qwen4CompareRows(our_h, ref_h, T, w);
-                std.debug.print("[qwen4 fixture vision] l3 attn out: min row cos {d:.5}\n", .{rc.min_cos});
-                if (rc.min_cos < 0.999) for (0..T) |row| {
-                    const rr = qwen4CompareRows(our_h[row * w ..][0..w], ref_h[row * w ..][0..w], 1, w);
-                    std.debug.print("    attn row {d}: cos {d:.4}\n", .{ row, rr.min_cos });
-                };
-            } else std.debug.print("[qwen4 fixture vision] l3 attn out: size {d} vs ref {d}\n", .{ our_h.len, ref_h.len });
-        };
         // The mask is the direct guard for the pooled-key angles: a scalar
         // rope on the image blocks picks different blocks.
         const ref_mask = try qwen4ReadF32(allocator, fx.get("l3_qsa_mask") orelse return error.MissingFixtureTensor, s);
@@ -41915,21 +41860,6 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
         errdefer std.debug.print("[qwen4 fixture vision] layer-3 QSA mask: {d} mismatched over {d} decisive rows ({d} acquitted)\n", .{ mask_bad, T - mask_tied_rows, mask_tied_rows });
         try testing.expect(mask_tied_rows < T / 2);
         try testing.expectEqual(@as(usize, 0), mask_bad);
-        if (fx.get("stream_pre_mixer")) |ref_pm| {
-            const ref_h = try qwen4ReadF32(allocator, ref_pm, s);
-            defer allocator.free(ref_h);
-            const our_h = try qwen4ReadF32(allocator, final_all, s);
-            defer allocator.free(our_h);
-            if (our_h.len == ref_h.len) {
-                const w: usize = ref_h.len / T;
-                const rc = qwen4CompareRows(our_h, ref_h, T, w);
-                std.debug.print("[qwen4 fixture vision] pre-mixer stream: min row cos {d:.5}\n", .{rc.min_cos});
-                if (rc.min_cos < 0.999) for (0..T) |row| {
-                    const rr = qwen4CompareRows(our_h[row * w ..][0..w], ref_h[row * w ..][0..w], 1, w);
-                    std.debug.print("    row {d}: cos {d:.4}\n", .{ row, rr.min_cos });
-                };
-            }
-        }
         const ours = try qwen4ReadF32(allocator, logits, s);
         defer allocator.free(ours);
         try testing.expectEqual(T * v, ours.len);
@@ -42073,20 +42003,6 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
         checked += 1;
     }
     try testing.expect(checked >= n_layers - 2);
-    // Logits are printed, not asserted: a tiny random model's logits are
-    // chaotic between any two bf16 renderings (0.89 vs bf16-torch measured);
-    // the streams above are the bf16 bar.
-    if (fx.get("logits_full")) |ref_arr| {
-        const ref_full = try qwen4ReadF32(allocator, ref_arr, s);
-        defer allocator.free(ref_full);
-        const ours = try qwen4ReadF32(allocator, logits, s);
-        defer allocator.free(ours);
-        const v: usize = @intCast(config.vocab_size);
-        if (ours.len == ref_full.len and ref_full.len == T * v) {
-            const rc = qwen4CompareRows(ours, ref_full, T, v);
-            std.debug.print("[qwen4 fixture bf16] logits (informational): min row cos {d:.4} argmax {d}/{d}\n", .{ rc.min_cos, rc.argmax_agree, T });
-        }
-    }
 }
 
 fn qwen4TransposeExpertBank(source: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -42296,7 +42212,7 @@ const Qwen4Ties = struct {
 const Qwen4TiedCmp = struct { min_cos: f64, agree: usize, decisive: usize, tied: usize };
 
 /// Row-wise compare over `rows` starting at fixture row `row0`: min cos over
-/// non-tied rows, argmax agreement over decisive rows; prints every acquittal.
+/// non-tied rows, argmax agreement over decisive rows.
 fn qwen4CompareTied(tag: []const u8, a: []const f32, b: []const f32, rows: usize, v: usize, row0: usize, ties: Qwen4Ties) Qwen4TiedCmp {
     var out: Qwen4TiedCmp = .{ .min_cos = 1.0, .agree = 0, .decisive = 0, .tied = 0 };
     for (0..rows) |r| {
@@ -42304,15 +42220,11 @@ fn qwen4CompareTied(tag: []const u8, a: []const f32, b: []const f32, rows: usize
         const rc = qwen4CompareRows(a[r * v ..][0..v], ref_row, 1, v);
         if (ties.rowTied(row0 + r)) {
             out.tied += 1;
-            std.debug.print("    {s} row {d}: acquitted (reference selection margin {d:.4}), cos {d:.4}\n", .{ tag, row0 + r, ties.margin(row0 + r), rc.min_cos });
             continue;
         }
         if (rc.min_cos < out.min_cos) out.min_cos = rc.min_cos;
         if (diagEnvOn("QWEN4_FIXTURE_ROWS")) std.debug.print("    {s} row {d}: cos {d:.4} margin {d:.4}\n", .{ tag, row0 + r, rc.min_cos, ties.margin(row0 + r) });
-        if (ties.argmaxTied(row0 + r, ref_row)) {
-            std.debug.print("    {s} row {d}: argmax acquitted (reference top-2 margin {d:.4})\n", .{ tag, row0 + r, ties.logit_margin.?[row0 + r] });
-            continue;
-        }
+        if (ties.argmaxTied(row0 + r, ref_row)) continue;
         out.decisive += 1;
         out.agree += rc.argmax_agree;
     }
@@ -42529,7 +42441,7 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
         try testing.expectEqual(a_s.off, a_b.off);
         try testing.expectEqual(b_s.off, b_b.off);
 
-        inline for (.{ la, lb }, .{ out[0], out[1] }, .{ "A", "B" }) |ser, bat, tag| {
+        inline for (.{ la, lb }, .{ out[0], out[1] }) |ser, bat| {
             const sh = try qwen4ReadF32(allocator, ser, s);
             defer allocator.free(sh);
             const bh = try qwen4ReadF32(allocator, bat, s);
@@ -42550,7 +42462,6 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
                 checked += 1;
                 agreed += rc.argmax_agree;
             }
-            if (rc.min_cos < 0.999) std.debug.print("[qwen4 batched] step {d} slot {s}: cos {d:.5} argmax {d}\n", .{ k, tag, rc.min_cos, rc.argmax_agree });
         }
         // Per-slot state moved identically: PLE history, QSA key rows, pooled blocks.
         for (0..n_layers) |l| {
@@ -43317,7 +43228,6 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     // Red probe: the YaRN fixture against the no-YaRN pack (same weights)
     // fails at the first check (MTP head cos 0.971 vs the 0.995 bar).
     try testing.expectEqual(config.rope_yarn, xfm.yarnActive());
-    if (config.rope_yarn) std.debug.print("[qwen4 fixture] YaRN factor {d:.1} window {d} -> {d}\n", .{ config.yarn_factor, config.yarn_orig_max_pos, config.max_position_embeddings });
     // The fixture renders the reference in f32; run our streams in f32 too so
     // the bar measures the math. The shipped bf16 path is pinned by the
     // `qwen4 fixture bf16` test below (streams vs a bf16 reference) — a tiny
@@ -43351,57 +43261,9 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         const ids = mlx.mlx_array_new_data(@ptrCast(ids_src), &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(ids);
         var ctx = xfm.defaultCtx();
-        // Per-layer residual streams (fixture stream_i = INPUT of layer i —
-        // stream_0 is the tiled embedding — and stream_{n} = the final mixer
-        // output), so our layer-i output is compared with stream_{i+1}.
-        const n_layers: usize = config.num_hidden_layers;
-        const cap_ids = try allocator.alloc(u32, n_layers);
-        defer allocator.free(cap_ids);
-        const cap_out = try allocator.alloc(mlx.mlx_array, n_layers);
-        defer allocator.free(cap_out);
-        for (0..n_layers) |i| {
-            cap_ids[i] = @intCast(i);
-            cap_out[i] = mlx.mlx_array_new();
-        }
-        defer for (cap_out) |o| {
-            _ = mlx.mlx_array_free(o);
-        };
-        var cap_layers: CaptureLayers = .{ .ids = cap_ids, .out = cap_out };
-        ctx.capture_layers = &cap_layers;
-        var final_all = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(final_all);
-        ctx.capture_hidden_all = &final_all;
         var stream_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(stream_all);
         ctx.capture_stream_all = &stream_all;
-        if (fx.get("l1_ngram_ids")) |ref_ids_arr| {
-            const st = xfm.qwen4.?;
-            var f = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(f);
-            try mlx.check(mlx.mlx_astype(&f, ref_ids_arr, .int32, s));
-            try mlx.check(mlx.mlx_array_eval(f));
-            const ref_ids = mlx.mlx_array_data_int32(f) orelse return error.Unreadable;
-            const nh: usize = st.hash.n_heads;
-            const host_ids = try allocator.alloc(u32, T);
-            defer allocator.free(host_ids);
-            for (0..T) |i| host_ids[i] = @intCast(ids_src[i]);
-            const rows = try allocator.alloc(i64, T * nh);
-            defer allocator.free(rows);
-            var prev: [8]u32 = @splat(st.hash.eos);
-            st.hash.rowIds(prev[0 .. st.hash.ngram_size - 1], host_ids, rows);
-            var bad: usize = 0;
-            for (0..T * nh) |i| {
-                if (rows[i] != ref_ids[i]) {
-                    if (bad < 6) std.debug.print("[qwen4 fixture] ngram id t={d} h={d}: ours {d} ref {d}\n", .{ i / nh, i % nh, rows[i], ref_ids[i] });
-                    bad += 1;
-                }
-            }
-            std.debug.print("[qwen4 fixture] ngram ids: {d}/{d} mismatched (eos {d}, mults {d} {d} {d}, vocab {d} {d} {d} {d})\n", .{ bad, T * nh, st.hash.eos, st.hash.multipliers[0], st.hash.multipliers[1], st.hash.multipliers[2], st.hash.vocab[0], st.hash.vocab[1], st.hash.vocab[2], st.hash.vocab[3] });
-        }
-        var trace: Transformer.Qwen4Trace = .{};
-        defer trace.deinit();
-        Transformer.qwen4_trace = &trace;
-        defer Transformer.qwen4_trace = null;
         const logits = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
         // MTP head: stream rows 0..T-2 + tokens 1..T-1 at positions 1.. → logits for 2..T.
@@ -43430,60 +43292,10 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             };
             defer head_ties.deinit(allocator);
             const rm = qwen4CompareTied("mtp", ours_m, ref_mtp, T - 1, v, 0, head_ties);
-            std.debug.print("[qwen4 fixture] MTP head T-1={d}: min cos {d:.5} ({d} rows acquitted) argmax {d}/{d} decisive rows\n", .{ T - 1, rm.min_cos, rm.tied, rm.agree, rm.decisive });
+            errdefer std.debug.print("[qwen4 fixture] MTP head T-1={d}: min cos {d:.5} ({d} rows acquitted) argmax {d}/{d} decisive rows\n", .{ T - 1, rm.min_cos, rm.tied, rm.agree, rm.decisive });
             try testing.expect(rm.min_cos > 0.995);
             try testing.expect(rm.decisive >= (T - 1) / 2);
         };
-        inline for (.{ "l0_mixed_attn", "l0_inj_attn", "l0_attn_out", "l0_mixed_mlp", "l0_inj_mlp", "l0_mlp_out", "l1_ple_emb", "l1_ple_out", "l3_qsa_mask", "l3_attn_out" }, .{ &trace.mixed_attn, &trace.inj_attn, &trace.attn_out, &trace.mixed_mlp, &trace.inj_mlp, &trace.mlp_out, &trace.ple_emb, &trace.ple_out, &trace.qsa_mask, &trace.attn3_out }) |key, ours_arr| {
-            if (fx.get(key)) |ref| if (ours_arr.ctx != null) {
-                const ref_h = try qwen4ReadF32(allocator, ref, s);
-                defer allocator.free(ref_h);
-                const our_h = try qwen4ReadF32(allocator, ours_arr.*, s);
-                defer allocator.free(our_h);
-                if (our_h.len == ref_h.len) {
-                    const w: usize = ref_h.len / T;
-                    const rc = qwen4CompareRows(our_h, ref_h, T, w);
-                    const r0 = qwen4CompareRows(our_h, ref_h, 1, w);
-                    std.debug.print("[qwen4 fixture] {s}: min row cos {d:.5} (row0 {d:.5})\n", .{ key, rc.min_cos, r0.min_cos });
-                    if (rc.min_cos < 0.999) {
-                        for (0..T) |row| {
-                            const rr = qwen4CompareRows(our_h[row * w ..][0..w], ref_h[row * w ..][0..w], 1, w);
-                            std.debug.print("    row {d}: cos {d:.4}\n", .{ row, rr.min_cos });
-                        }
-                    }
-                } else std.debug.print("[qwen4 fixture] {s}: size {d} vs ref {d}\n", .{ key, our_h.len, ref_h.len });
-            };
-        }
-        for (0..n_layers + 1) |i| {
-            var nb: [32]u8 = undefined;
-            const key = std.fmt.bufPrint(&nb, "stream_{d}", .{i}) catch unreachable;
-            const ref = fx.get(key) orelse continue;
-            const ref_h = try qwen4ReadF32(allocator, ref, s);
-            defer allocator.free(ref_h);
-            if (i == 0) continue;
-            const our_arr = if (i < n_layers) cap_out[i - 1] else final_all;
-            if (our_arr.ctx == null) continue;
-            const our_h = try qwen4ReadF32(allocator, our_arr, s);
-            defer allocator.free(our_h);
-            if (our_h.len != ref_h.len) {
-                std.debug.print("[qwen4 fixture] stream_{d}: size {d} vs ref {d}\n", .{ i, our_h.len, ref_h.len });
-            }
-        }
-        if (fx.get("stream_pre_mixer")) |ref_pm| {
-            const ref_h = try qwen4ReadF32(allocator, ref_pm, s);
-            defer allocator.free(ref_h);
-            const our_h = try qwen4ReadF32(allocator, final_all, s);
-            defer allocator.free(our_h);
-            if (our_h.len == ref_h.len) {
-                const w: usize = ref_h.len / T;
-                const rc = qwen4CompareRows(our_h, ref_h, T, w);
-                std.debug.print("[qwen4 fixture] pre-mixer stream (layer {d} out): min row cos {d:.5}\n", .{ n_layers - 1, rc.min_cos });
-                if (rc.min_cos < 0.999) for (0..T) |row| {
-                    const rr = qwen4CompareRows(our_h[row * w ..][0..w], ref_h[row * w ..][0..w], 1, w);
-                    std.debug.print("    row {d}: cos {d:.4}\n", .{ row, rr.min_cos });
-                };
-            }
-        }
         const ours = try qwen4ReadF32(allocator, logits, s);
         defer allocator.free(ours);
         try testing.expectEqual(T * v, ours.len);
@@ -43905,7 +43717,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
             try testing.expectEqualSlices(f32, full_l, last_l);
         } else {
             const c = qwen4CompareRows(last_l, full_l[(S - 1) * v ..], 1, v);
-            std.debug.print("[qwen4] MTP last-row projection S={d}: cos {d:.6} argmax {d}/1\n", .{ S, c.min_cos, c.argmax_agree });
+            errdefer std.debug.print("[qwen4] MTP last-row projection S={d}: cos {d:.6} argmax {d}/1\n", .{ S, c.min_cos, c.argmax_agree });
             try testing.expect(c.min_cos > 0.9999);
             try testing.expect(c.argmax_agree == 1);
         }
