@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const moe_gqmv = @import("moe_gqmv.zig");
 const generate_mod = @import("generate.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -471,7 +472,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     cost_xfm.cost_trace_active = cost_xfm.qwen4 != null;
     cost_xfm.cost_attention = 0;
     cost_xfm.cost_moe = 0;
-    const head_calls_before = transformer_mod.mtp_head_row_dispatches;
+    const head_calls_before = moe_gqmv.mtp_head_row_dispatches;
     defer cost_xfm.cost_trace_active = false;
     defer for (group) |slot| {
         if (slot.legacy_gen) |*gen| gen.mtp_batch_head = false;
@@ -854,7 +855,7 @@ fn observeGroupRound(live: []*Slot, states: []const mtp_round.MtpRoundState, exp
         .head_format = if (xfm.qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0,
         .attention = xfm.cost_attention,
         .moe = xfm.cost_moe,
-        .head_calls = @intCast(@min(std.math.maxInt(u16), transformer_mod.mtp_head_row_dispatches -% head_calls_before)),
+        .head_calls = @intCast(@min(std.math.maxInt(u16), moe_gqmv.mtp_head_row_dispatches -% head_calls_before)),
     };
     for (live, states, 0..) |slot, st, i| {
         const chain = st.chain;

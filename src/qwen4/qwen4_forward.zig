@@ -1,6 +1,7 @@
 //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
 
 const trf = @import("../transformer.zig");
+const moe_gqmv = @import("../moe_gqmv.zig");
 const qwen4_gdn = @import("qwen4_gdn.zig");
 const Transformer = trf.Transformer;
 const sliceBatchRows = Transformer.sliceBatchRows;
@@ -2937,8 +2938,8 @@ pub const Qwen4FwdProf = struct {
         const timing = env != null and (all or (seq_len >= 2 and seq_len <= 16));
         var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOnCached(&qwen4_opcount_env, "QWEN4_OPCOUNT"), .clock = ProfClock.init() };
         if (p.ops) {
-            trf.moe_rows_fused_layers = 0;
-            trf.moe_sorted_layers = 0;
+            moe_gqmv.moe_rows_fused_layers = 0;
+            moe_gqmv.moe_sorted_layers = 0;
         }
         if (timing) {
             try mlx.check(mlx.mlx_array_eval(h));
@@ -2972,7 +2973,7 @@ pub const Qwen4FwdProf = struct {
     }
 
     pub fn report(self: *const Qwen4FwdProf, seq_len: c_int, kv: usize, capture: bool, gdn_layers: u32, attn_layers: u32) void {
-        if (self.ops) log.info("[qwen4-ops] S={d} ple {d} hcRead {d} gdn {d} attn {d} hcWrite {d} mlp {d} moeFused {d} moeSorted {d}\n", .{ seq_len, self.op_ns[0], self.op_ns[1], self.op_ns[2], self.op_ns[3], self.op_ns[4], self.op_ns[5], trf.moe_rows_fused_layers, trf.moe_sorted_layers });
+        if (self.ops) log.info("[qwen4-ops] S={d} ple {d} hcRead {d} gdn {d} attn {d} hcWrite {d} mlp {d} moeFused {d} moeSorted {d}\n", .{ seq_len, self.op_ns[0], self.op_ns[1], self.op_ns[2], self.op_ns[3], self.op_ns[4], self.op_ns[5], moe_gqmv.moe_rows_fused_layers, moe_gqmv.moe_sorted_layers });
         if (!self.timing) return;
         const ms = struct {
             fn f(n: u64) f64 {
@@ -4867,8 +4868,8 @@ test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
 }
 
 test "moe decode dispatch: rows vs sorted vs gatherQmv" {
-    trf.moe_rows_fused_override = true;
-    defer trf.moe_rows_fused_override = null;
+    moe_gqmv.moe_rows_fused_override = true;
+    defer moe_gqmv.moe_rows_fused_override = null;
     qwen4_standin_override = .{};
     defer qwen4_standin_override = null;
     const K: c_int = 10;
@@ -5677,32 +5678,32 @@ test "qwen4 decode ladder: serial decode keeps the default off; an explicit stri
         const ids = ladderPleIds(&[_]u32{tok}, 1);
         defer _ = mlx.mlx_array_free(ids);
         // The batched default does not reach a serial forward.
-        trf.decode_ladder_engaged = false;
+        moe_gqmv.decode_ladder_engaged = false;
         const want = try rig.step(&off, ids, 0);
         defer testing.allocator.free(want.logits);
         try testing.expect(want.pending);
-        try testing.expect(!trf.decode_ladder_engaged);
+        try testing.expect(!moe_gqmv.decode_ladder_engaged);
 
         // Host-readable ids: the guard fills the leaf mid-build and the ladder fires.
         for (strides, &on) |stride, *sl| {
-            trf.decode_ladder_engaged = false;
+            moe_gqmv.decode_ladder_engaged = false;
             const got = try rig.step(sl, ids, stride);
             defer testing.allocator.free(got.logits);
             try expectLogitBitsEqual(want.logits, got.logits);
             try testing.expect(!got.pending);
-            try testing.expect(trf.decode_ladder_engaged);
+            try testing.expect(moe_gqmv.decode_ladder_engaged);
         }
 
         // Ids still a lazy sample (pipelined decode): the ladder stands down instead of syncing on them.
         var lazy_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(lazy_ids);
         try mlx.check(mlx.mlx_add(&lazy_ids, ids, zero, s));
-        trf.decode_ladder_engaged = false;
+        moe_gqmv.decode_ladder_engaged = false;
         const got = try rig.step(&lazy, lazy_ids, 1);
         defer testing.allocator.free(got.logits);
         try expectLogitBitsEqual(want.logits, got.logits);
         try testing.expect(got.pending);
-        try testing.expect(!trf.decode_ladder_engaged);
+        try testing.expect(!moe_gqmv.decode_ladder_engaged);
     }
 }
 
@@ -5738,12 +5739,12 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
             try testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(want.logits), std.mem.sliceAsBytes(zeroed.logits)));
         }
         for (strides[1..], slots[1..strides.len]) |stride, *arm| {
-            trf.decode_ladder_engaged = false;
+            moe_gqmv.decode_ladder_engaged = false;
             const got = try rig.batchedStep(arm, &ids, stride, true);
             defer alloc.free(got.logits);
             try expectLogitBitsEqual(want.logits, got.logits);
             try testing.expect(!got.pending);
-            try testing.expect(trf.decode_ladder_engaged);
+            try testing.expect(moe_gqmv.decode_ladder_engaged);
             for (slots[0], arm.*) |a, b| {
                 for (a.entries, b.entries) |*ea, *eb| {
                     try expectLadderPleHistoryEqual(ea, eb);

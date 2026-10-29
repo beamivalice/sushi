@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const moe_gqmv = @import("../moe_gqmv.zig");
 const nax_gate = @import("../nax_gate.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
@@ -988,12 +989,12 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
     try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, false, 8));
     try t.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, false, 8));
 
-    trf.moe_rows_fused_override = true;
-    defer trf.moe_rows_fused_override = null;
+    moe_gqmv.moe_rows_fused_override = true;
+    defer moe_gqmv.moe_rows_fused_override = null;
     try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10));
-    trf.moe_rows_fused_override = false;
+    moe_gqmv.moe_rows_fused_override = false;
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10));

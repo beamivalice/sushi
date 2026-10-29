@@ -1,4 +1,5 @@
 const trf = @import("transformer.zig");
+const moe_gqmv = @import("moe_gqmv.zig");
 const std = @import("std");
 const mtp_mod = @import("mtp.zig");
 const mlx = @import("mlx.zig");
@@ -934,11 +935,11 @@ test "verify attention projections preserve solo qmv values across request width
 test "qmatmulBits uses canonical arithmetic for plain batched projections" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    const saved_kernel = trf.sushi_qmv_rows_kernel;
-    trf.sushi_qmv_rows_kernel = null;
+    const saved_kernel = moe_gqmv.sushi_qmv_rows_kernel;
+    moe_gqmv.sushi_qmv_rows_kernel = null;
     defer {
-        if (trf.sushi_qmv_rows_kernel) |kernel| _ = mlx.mlx_fast_metal_kernel_free(kernel);
-        trf.sushi_qmv_rows_kernel = saved_kernel;
+        if (moe_gqmv.sushi_qmv_rows_kernel) |kernel| _ = mlx.mlx_fast_metal_kernel_free(kernel);
+        moe_gqmv.sushi_qmv_rows_kernel = saved_kernel;
     }
     var prng = std.Random.DefaultPrng.init(0xB47C4);
     const w_bf = try attn256RandBf16(prng.random(), &.{ 512, 2560 }, s);
@@ -962,8 +963,8 @@ test "qmatmulBits uses canonical arithmetic for plain batched projections" {
             const y = try qmatmulBits(x, w, sc, bi, bits, 64, .affine, s);
             defer _ = mlx.mlx_array_free(y);
             try mlx.check(mlx.mlx_array_eval(y));
-            if (trf.sushi_qmv_rows_kernel != null) std.debug.print("generic projection invoked MTP row-axis kernel: rows={d} bits={d}\n", .{ rows, bits });
-            try testing.expect(trf.sushi_qmv_rows_kernel == null);
+            if (moe_gqmv.sushi_qmv_rows_kernel != null) std.debug.print("generic projection invoked MTP row-axis kernel: rows={d} bits={d}\n", .{ rows, bits });
+            try testing.expect(moe_gqmv.sushi_qmv_rows_kernel == null);
             const expected = if (bits == 8) blk: {
                 var parts: [9]mlx.mlx_array = @splat(.{});
                 var count: usize = 0;

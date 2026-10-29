@@ -13,6 +13,7 @@ const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
+const moe_gqmv = @import("moe_gqmv.zig");
 const log = @import("log.zig");
 const Transformer = transformer_mod.Transformer;
 const expert_quant = @import("expert_quant.zig");
@@ -2060,7 +2061,6 @@ test "mtp: row-axis coarse logits equal each solo readout" {
     defer fx.deinit();
     var rc = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
     defer rc.deinit();
-    const tx = @import("transformer.zig");
     {
         for ([_]usize{ 2, 4, 8, 17 }) |n| {
             var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
@@ -2073,10 +2073,10 @@ test "mtp: row-axis coarse logits equal each solo readout" {
             var x = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x);
             try mlx.check(mlx.mlx_concatenate_axis(&x, vec, 0, s));
-            const before = tx.mtp_head_row_dispatches;
+            const before = moe_gqmv.mtp_head_row_dispatches;
             const got = try rerankCoarseRows(s, x, &rc);
             defer _ = mlx.mlx_array_free(got);
-            try testing.expectEqual(@as(usize, if (n <= 16) 1 else 0), tx.mtp_head_row_dispatches - before);
+            try testing.expectEqual(@as(usize, if (n <= 16) 1 else 0), moe_gqmv.mtp_head_row_dispatches - before);
             for (parts[0..n], 0..) |input, i| {
                 var want = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(want);
