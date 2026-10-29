@@ -6091,3 +6091,8 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
     try testing.expectEqual(start, owned_bytes.load(.monotonic));
     try testing.expectEqual(refused + 1, refused_imports.load(.monotonic));
 }
+
+test "qwen4PleInstalledAt accepts the MTP head's deliberate -1 and still refuses a stray PLE" {
+    try testing.expect(qwen4PleInstalledAt(&.{false}, -1));
+    try testing.expect(!qwen4PleInstalledAt(&.{true}, -1));
+}

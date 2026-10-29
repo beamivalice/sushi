@@ -5,11 +5,15 @@ const Transformer = trf.Transformer;
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
+const testing = std.testing;
+const test_support = @import("../test_support.zig");
+const attn256MaxDiff = test_support.attn256MaxDiff;
 
 const DenseKVView = trf.DenseKVView;
 const FUSED256_MIN_Q_LEN = trf.FUSED256_MIN_Q_LEN;
 const ForwardCtx = trf.ForwardCtx;
 const FullAttnWeights = trf.FullAttnWeights;
+const KVCache = trf.KVCache;
 const KvPrefixView = trf.KvPrefixView;
 const OneShotBits = trf.OneShotBits;
 const ProfClock = trf.ProfClock;
@@ -1630,4 +1634,122 @@ pub var qsa_pool_rope_fused_override: ?bool = null;
 
 pub fn qsaPoolRopeFusedEnabled() bool {
     return qsa_pool_rope_fused_override orelse true;
+}
+
+test "qsa pooled rope: one cos/sin build per forward, not one per full-attention layer" {
+    // The tables are a property of the forward, not of the layer.
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4; // = indexer_compress_ratio
+    const n: c_int = 5;
+
+    const cs = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+    for (0..11) |_| {
+        const again = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+        try testing.expect(again.cos.ctx == cs.cos.ctx and again.sin.ctx == cs.sin.ctx);
+    }
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+
+    var data: [@as(usize, @intCast(n)) * 128]f32 = undefined;
+    for (&data, 0..) |*d, i| d.* = @floatFromInt((i % 37) + 1);
+    const xshape = [_]c_int{ 1, 1, n, 128 };
+    const xf = mlx.mlx_array_new_data(&data, &xshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(xf);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+    const hoisted = try t.ropeApplyCosSin(x, rope_dims, cs.cos, cs.sin);
+    defer _ = mlx.mlx_array_free(hoisted);
+    const per_layer = try t.ropeAtPositions(x, rope_dims, t.config.rope_theta, @floatFromInt(base), @floatFromInt(step), n);
+    defer _ = mlx.mlx_array_free(per_layer);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(hoisted, per_layer, s));
+
+    // A new forward at the same position hits: the forward counter is not in the key.
+    t.fwd_gen += 1;
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+
+    // The M-RoPE arm is a different table at the same (base, step, n).
+    const pos = try testing.allocator.alloc(i32, 3 * 256);
+    defer testing.allocator.free(pos);
+    for (pos, 0..) |*p, i| p.* = @intCast(i % 256);
+    ctx.mrope_pos = pos;
+    ctx.mrope_total = 256;
+    const m = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+    const direct = try t.mropeCosSinAt(.{ .pos = pos, .total = 256, .delta = 0 }, @intCast(base + step), @intCast(step), @intCast(n), .bfloat16);
+    defer _ = mlx.mlx_array_free(direct.cos);
+    defer _ = mlx.mlx_array_free(direct.sin);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.cos, direct.cos, s));
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.sin, direct.sin, s));
+    for (0..11) |_| _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+}
+
+test "qsa pooled rope: a mark from another thread is observed by the next lookup" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4;
+    const n: c_int = 5;
+
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+
+    const Worker = struct {
+        fn run(xfm: *Transformer) void {
+            xfm.markQsaPooledRopeStale();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Worker.run, .{&t});
+    th.join();
+    try testing.expect(t.qsa_pooled_rope.stale.load(.acquire));
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
 }

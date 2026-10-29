@@ -12,6 +12,13 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
+const trf = @import("../transformer.zig");
+const testing = std.testing;
+const qwen4_test_support = @import("qwen4_test_support.zig");
+const logicalSsmCapture = qwen4_test_support.logicalSsmCapture;
+const test_support = @import("../test_support.zig");
+const qsaArraysAllEqual = test_support.qsaArraysAllEqual;
+const SSMCacheEntry = trf.SSMCacheEntry;
 
 const HEADER = @import("../transformer.zig").GDN_KERNEL_HEADER;
 
@@ -590,4 +597,35 @@ pub fn stepFold(g: Geometry, t_len: c_int, in: Inputs, z: mlx.mlx_array, norm_w:
     inline for (.{ &out.gated, &out.conv_state, &out.ssm_state, &out.state_seq, &out.conv_input }, 0..) |a, i|
         try mlx.check(mlx.mlx_vector_array_get(a, ov, i));
     return out;
+}
+
+test "logical capture includes every defined state and the separate final state" {
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    const captures = [_]mlx.mlx_array{
+        mlx.mlx_array_new_data(&[_]f32{ 11, 22, 999 }, &[_]c_int{ 3, 1, 1, 1, 1 }, 5, .float32),
+        mlx.mlx_array_new_data(&[_]f32{ 11, 22, -999 }, &[_]c_int{ 3, 1, 1, 1, 1 }, 5, .float32),
+        mlx.mlx_array_new_data(&[_]f32{ 11, 23, 999 }, &[_]c_int{ 3, 1, 1, 1, 1 }, 5, .float32),
+    };
+    defer for (captures) |arr| {
+        _ = mlx.mlx_array_free(arr);
+    };
+    const final = mlx.mlx_array_new_data(&[_]f32{33}, &[_]c_int{ 1, 1, 1, 1 }, 4, .float32);
+    defer _ = mlx.mlx_array_free(final);
+    var entries: [3]SSMCacheEntry = undefined;
+    for (&entries, captures) |*entry, capture| entry.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = final, .initialized = true, .spec_state_seq = capture };
+    const a = try logicalSsmCapture(stream, &entries[0]);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try logicalSsmCapture(stream, &entries[1]);
+    defer _ = mlx.mlx_array_free(b);
+    const c = try logicalSsmCapture(stream, &entries[2]);
+    defer _ = mlx.mlx_array_free(c);
+    try testing.expect(try qsaArraysAllEqual(a, b, stream));
+    try testing.expect(!try qsaArraysAllEqual(a, c, stream));
+    const changed_final = mlx.mlx_array_new_data(&[_]f32{34}, &[_]c_int{ 1, 1, 1, 1 }, 4, .float32);
+    defer _ = mlx.mlx_array_free(changed_final);
+    entries[1].ssm_state = changed_final;
+    const d = try logicalSsmCapture(stream, &entries[1]);
+    defer _ = mlx.mlx_array_free(d);
+    try testing.expect(!try qsaArraysAllEqual(a, d, stream));
 }
