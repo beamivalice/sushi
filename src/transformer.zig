@@ -3394,6 +3394,7 @@ pub fn sliceAttentionSeq(s: mlx.mlx_stream, a: mlx.mlx_array, start: c_int, end:
 }
 
 const model_mod = @import("model.zig");
+const qwen4_config = @import("qwen4/qwen4_config.zig");
 pub const log = @import("log.zig");
 const io_util_mod = @import("io_util.zig");
 const round_cost_mod = @import("round_cost.zig");
@@ -8589,7 +8590,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         const has_ple = try allocator.alloc(bool, moe_layers.len);
         defer allocator.free(has_ple);
         for (moe_layers, 0..) |*lw, i| has_ple[i] = lw.ple != null;
-        if (!model_mod.qwen4PleInstalledAt(has_ple, config.ple_layer_idx)) {
+        if (!qwen4_config.qwen4PleInstalledAt(has_ple, config.ple_layer_idx)) {
             log.err("[qwen4] the PLE was not installed at layer {d} ({d} layers carry PLE weights)\n", .{ config.ple_layer_idx, std.mem.count(bool, has_ple, &.{true}) });
             return error.Qwen4PleNotInstalled;
         }

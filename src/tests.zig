@@ -60,6 +60,7 @@ test {
     _ = @import("mimo2/mimo_forward.zig");
     _ = @import("mimo2/mimo_fixture_test.zig");
     _ = @import("qwen4/qwen4_gdn.zig");
+    _ = @import("qwen4/qwen4_config.zig");
     _ = @import("ssm_cache.zig");
     _ = @import("kv_cache.zig");
     _ = @import("qwen4/qwen4_forward.zig");

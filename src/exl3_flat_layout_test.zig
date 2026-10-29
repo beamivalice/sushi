@@ -5,6 +5,7 @@
 const std = @import("std");
 const expert_quant = @import("expert_quant.zig");
 const model = @import("model.zig");
+const qwen4_config = @import("qwen4/qwen4_config.zig");
 const model_discovery = @import("model_discovery.zig");
 
 const TensorSpec = struct {
@@ -378,16 +379,16 @@ test "flat EXL3 routed-key filtering is independent of shard filename" {
     var key_buf: [256]u8 = undefined;
     for (EXL3_SPECS) |spec| {
         try std.testing.expect(
-            model.qwen4StreamingWeightKey(.exl3_k4, &key_buf, spec.key) == null,
+            qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, spec.key) == null,
         );
     }
     try std.testing.expectEqualStrings(
         EMBED_SPEC.key,
-        model.qwen4StreamingWeightKey(.exl3_k4, &key_buf, EMBED_SPEC.key).?,
+        qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, EMBED_SPEC.key).?,
     );
     try std.testing.expectEqualStrings(
         "language_model.mtp.fc_hidden.weight",
-        model.qwen4StreamingWeightKey(.exl3_k4, &key_buf, "language_model.mtp.fc_hidden.weight").?,
+        qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, "language_model.mtp.fc_hidden.weight").?,
     );
 }
 
