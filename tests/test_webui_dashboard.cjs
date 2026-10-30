@@ -24,8 +24,11 @@ function installStubs(config) {
   const stub = window.__stub = { calls: [], aborted: 0, streams: 0, metricsStatus: config.metricsStatus, enableStatus: 200, openGate: null, ...config };
   const gate = new Promise((resolve) => { stub.openGate = resolve; });
   window.__clears = 0;
+  window.__axis = {};
   const realClear = CanvasRenderingContext2D.prototype.clearRect;
-  CanvasRenderingContext2D.prototype.clearRect = function (...args) { window.__clears += 1; return realClear.apply(this, args); };
+  CanvasRenderingContext2D.prototype.clearRect = function (...args) { window.__clears += 1; window.__axis[this.canvas.id] = []; return realClear.apply(this, args); };
+  const realText = CanvasRenderingContext2D.prototype.fillText;
+  CanvasRenderingContext2D.prototype.fillText = function (text, ...args) { window.__axis[this.canvas.id]?.push(String(text)); return realText.call(this, text, ...args); };
   if (config.key) localStorage.setItem('sushi-api-key', config.key);
   const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
   const realFetch = window.fetch.bind(window);
@@ -45,7 +48,7 @@ function installStubs(config) {
         return json({ metrics: true, already_enabled: false });
       case '/metrics.json':
         if (stub.metricsStatus !== 200) return json({ error: { message: 'metrics off' } }, stub.metricsStatus);
-        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
+        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, prefill_tokens_live: stub.prefillTick = (stub.prefillTick ?? 0) + (stub.prefillStep ?? 0), gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
       case '/v1/chat/completions': {
         stub.streams += 1;
         const signal = init.signal;
@@ -95,7 +98,7 @@ async function main() {
       assert.equal(await page.isVisible('#chatPanel'), true, 'chat is the view at /chat');
       assert.equal(await page.isVisible('#dashPanel'), false, 'the dashboard starts hidden');
       assert.equal(await page.getAttribute('#navChat', 'aria-current'), 'page');
-      assert.equal(await page.evaluate(() => document.getElementById('dashCTps').width), 300, 'a hidden dashboard draws nothing');
+      assert.equal(await page.evaluate(() => document.getElementById('dashCPre').width), 300, 'a hidden dashboard draws nothing');
 
       await page.fill('#promptInput', 'tell me a story');
       await page.click('#sendButton');
@@ -121,7 +124,7 @@ async function main() {
       assert.ok(hiddenChat.width > 0 && hiddenChat.height > 0, 'and its size');
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       await page.waitForFunction(() => document.getElementById('dashModels').textContent.includes('test-model'), null, { timeout: 5000 });
-      assert.notEqual(await page.evaluate(() => document.getElementById('dashCTps').width), 300, 'a visible dashboard draws its charts');
+      assert.notEqual(await page.evaluate(() => document.getElementById('dashCPre').width), 300, 'a visible dashboard draws its charts');
 
       await page.evaluate(() => window.__stub.openGate());
       await page.waitForTimeout(300);
@@ -368,6 +371,23 @@ async function main() {
       assert.equal(card['Failed or dropped'], '3.0 MiB', 'failed bytes are named apart from the written ones');
       const gib = (text) => parseFloat(text) * (/GiB/.test(text) ? 1 : /MiB/.test(text) ? 1 / 1024 : 1 / 1048576);
       assert.ok(Math.abs(parseFloat(card['Written per byte on disk']) - gib(card['Written']) / 2) < 0.06, 'written over the 2 GiB on disk');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      const { page, errors, context } = await openPage(browser, '/dashboard', { prefillStep: 800 });
+      const axisTop = (id) => page.evaluate((canvas) => Math.max(0, ...(window.__axis[canvas] ?? []).filter((t) => /^\d+(\.\d+)?k?$/.test(t)).map((t) => parseFloat(t) * (t.endsWith('k') ? 1000 : 1))), id);
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      const cards = await page.evaluate(() => [...document.querySelectorAll('#dashPanel .charts .card')].map((card) => ({ title: card.querySelector('h2').firstChild.textContent, legends: card.querySelectorAll('.legend').length, canvas: card.querySelector('canvas').id })));
+      assert.deepEqual(cards.slice(0, 2).map((card) => card.title), ['Prefill (tok/s)', 'Decode (tok/s)'], 'prefill and decode are separate cards');
+      assert.deepEqual(cards.slice(0, 2).map((card) => card.legends), [0, 0], 'a single series needs no legend');
+      assert.equal(new Set(cards.map((card) => card.canvas)).size, cards.length, 'every card draws on its own canvas');
+      assert.equal(await page.evaluate(() => /\bgeneration\b/i.test(document.getElementById('dashPanel').textContent)), false, 'the dashboard says decode, not generation');
+      await page.waitForFunction((ids) => ids.every((id) => (window.__axis[id] ?? []).length > 5), cards.slice(0, 2).map((card) => card.canvas), { timeout: 15000 });
+      await page.waitForFunction((id) => (window.__axis[id] ?? []).some((t) => /^\d+(\.\d+)?k?$/.test(t) && parseFloat(t) >= 100), cards[0].canvas, { timeout: 15000 });
+      const pre = await axisTop(cards[0].canvas), dec = await axisTop(cards[1].canvas);
+      assert.ok(dec > 0 && dec * 4 <= pre, `each chart scales to its own series (prefill top ${pre}, decode top ${dec})`);
       assert.deepEqual(errors, []);
       await context.close();
     }

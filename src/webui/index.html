@@ -764,6 +764,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 #dashPanel .row2 { display: grid; grid-template-columns: 1fr; gap: 12px; }
 @media (min-width: 900px) {
   #dashPanel .charts, #dashPanel .row2 { grid-template-columns: 1fr 1fr; }
+  #dashPanel .charts .card:last-child { grid-column: 1 / -1; }
 }
 #dashPanel .card { background: var(--d-panel); border: 1px solid var(--d-line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
 #dashPanel .card h2 { font-size: 13px; margin: 0 0 6px; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
@@ -994,7 +995,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   </div>
   <div class="d-main">
   <section class="tiles">
-    <div class="tile"><div class="k">Generation</div><div class="v" id="dashTGen">-</div><div class="s">tok/s</div></div>
+    <div class="tile"><div class="k">Decode</div><div class="v" id="dashTGen">-</div><div class="s">tok/s</div></div>
     <div class="tile"><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">tok/s</div></div>
     <div class="tile"><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
     <div class="tile"><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s">utilization</div></div>
@@ -1026,7 +1027,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   </section>
 
   <section class="charts">
-    <div class="card"><h2>Throughput (tok/s)<span class="legend"><span><i style="background:var(--d-c1)"></i>generation</span><span><i style="background:var(--d-c2)"></i>prefill</span></span></h2><canvas id="dashCTps"></canvas></div>
+    <div class="card"><h2>Prefill (tok/s)</h2><canvas id="dashCPre"></canvas></div>
+    <div class="card"><h2>Decode (tok/s)</h2><canvas id="dashCDec"></canvas></div>
     <div class="card"><h2>Requests<span class="legend"><span><i style="background:var(--d-c1)"></i>running</span><span><i style="background:var(--d-c2)"></i>prefilling</span><span><i style="background:var(--d-c3)"></i>waiting</span><span><i style="background:var(--d-c4)"></i>batched</span></span></h2><canvas id="dashCReq"></canvas></div>
     <div class="card"><h2>GPU utilization (%)<span class="legend"><span><i style="background:var(--d-c3)"></i>gpu</span></span></h2><canvas id="dashCGpu"></canvas></div>
     <div class="card"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--d-c1)"></i>footprint</span><span><i style="background:var(--d-c2)"></i>MLX active</span><span><i style="background:var(--d-c4)"></i>MLX cache</span></span></h2><canvas id="dashCMem"></canvas></div>
@@ -3163,7 +3165,7 @@ init();
 
   const tps = v => fmt(v, v < 100 ? 1 : 0) + ' tok/s', cnt = v => fmtInt(v), gb = v => fmt(v, 2) + ' GiB';
   const LABELS = {
-    gen: { name: 'Generation', fmt: tps, help: 'Output tokens produced per second across all requests, measured between polls.' },
+    gen: { name: 'Decode', fmt: tps, help: 'Output tokens produced per second across all requests, measured between polls.' },
     pre: { name: 'Prefill', fmt: tps, help: 'Prompt tokens processed per second. Tokens restored from the prefix cache are not counted, since they skip computation.' },
     run: { name: 'Running', fmt: cnt, help: 'Requests that currently own a slot, in prefill or decode.' },
     pref: { name: 'Prefilling', fmt: cnt, help: 'Requests reading their prompt before producing output.' },
@@ -3175,7 +3177,7 @@ init();
     cache: { name: 'MLX cache', fmt: gb, help: 'Freed buffers MLX keeps for reuse. Held by the process but not in use; a steady climb here explains footprint growth.' },
   };
 
-  for (const id of ['c-tps', 'c-req', 'c-gpu', 'c-mem']) {
+  for (const id of ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem']) {
     const cv = $(id);
     cv.addEventListener('pointermove', e => { const r = cv.getBoundingClientRect(); hover[id] = { x: e.clientX - r.left, y: e.clientY - r.top }; drawAll(); });
     cv.addEventListener('pointerleave', () => { delete hover[id]; hideTip(); drawAll(); });
@@ -3186,7 +3188,8 @@ init();
 
   function drawAll() {
     if (!dashActive) return;
-    chart('c-tps', [['pre', '--d-c2', true], ['gen', '--d-c1', true]]);
+    chart('c-pre', [['pre', '--d-c2', true]]);
+    chart('c-dec', [['gen', '--d-c1', true]]);
     chart('c-req', [['wait', '--d-c3'], ['pref', '--d-c2'], ['batch', '--d-c4'], ['run', '--d-c1']]);
     chart('c-gpu', [['gpu', '--d-c3', true]], { max: 100 });
     chart('c-mem', [['cache', '--d-c4'], ['act', '--d-c2'], ['mem', '--d-c1', true]], { dec: 1, extra: () => serverInfo.peak ? [['MLX peak (since start)', bytes(serverInfo.peak)]] : [] });
