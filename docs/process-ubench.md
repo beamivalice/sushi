@@ -83,6 +83,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `dsv41.attn_span` | dsv41 | one attention span at the release geometry: composed core, f16 wide arm, fused kernel; peak MB (min and max) |
 | `dsv41.attn_epilogue` | dsv41 | one prefill span's heads as `wo_a` takes them (64 heads x 512, 8 groups, QAT on): the fused kernel then rotation, fp8 round trip and transpose as ops, against the kernel's store doing all three; peak MB (min and max) |
 | `dsv41.hc_expand` | dsv41 | the hyper-connection expand of a wide chunk (hc 4 x 5120, bf16): the op chain against the fused kernel, alone (the layer tail) and with the FFN stage's mix and norm kernels, at 512 and 2048 rows |
+| `dsv41.hc_expand_decode` | dsv41 | the hyper-connection expand of one decode row (hc 4 x 5120, bf16), 40 chained calls: a thread a column against a thread an output element |
 | `dsv41.hc_stages` | dsv41 | the wide chunk's hyper-connection dispatches one by one (hc 4 x 5120, bf16): mix, norm, split, expand, the attention stage and the FFN stage against a copy of the stream; arms are the mix kernel's row x mix tile (4 x 6, 2 x 12), bytes checked equal, at 512 and 2048 rows |
 | `dsv41.topk` | dsv41 | the decode top-k over index scores, one threadgroup a row against the served split, per row of work in one eval of one or eight |
 | `glm5.verify_qmm` | glm5 | verify-row projections per stored width (A6, A5) at the trunk shapes: serial qmv rows, the row-streaming kernel, row tiles |

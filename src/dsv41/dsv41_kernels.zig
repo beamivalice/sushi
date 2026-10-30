@@ -2119,7 +2119,8 @@ pub fn hcExpandServes(x: A) bool {
 
 /// `hcExpand`'s op chain as one pass: `out[k] = post[k] * y + sum_j comb[j, k] * x[j]`. The chain's f32 matmul is
 /// TF32-class on a NAX GPU: both operands keep their top 10 mantissa bits (truncated), the four products are exact, and
-/// the sum is `(p0 + p1) + (p2 + p3)`; a GPU whose matmul is true f32 fails the probe and keeps the chain.
+/// the sum is `(p0 + p1) + (p2 + p3)`; a GPU whose matmul is true f32 fails the probe and keeps the chain. `COPY` sets
+/// how a thread maps to output: one element (`k` from the grid's z), or all HC copies of one column.
 const HC_EXPAND_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int d = int(thread_position_in_grid.x), l = int(thread_position_in_grid.y);
@@ -2129,7 +2130,8 @@ const HC_EXPAND_SOURCE =
     \\float xv[HC];
     \\for (int j = 0; j < HC; ++j) xv[j] = as_type<float>(as_type<uint>(float(x[xo + size_t(j) * D])) & 0xFFFFE000u);
     \\const float yv = float(y[size_t(l) * D + d]);
-    \\for (int k = 0; k < HC; ++k) {
+    \\const int k0 = COPY ? int(thread_position_in_grid.z) : 0, k1 = COPY ? k0 + 1 : HC;
+    \\for (int k = k0; k < k1; ++k) {
     \\  float p[HC];
     \\  for (int j = 0; j < HC; ++j) p[j] = as_type<float>(as_type<uint>(comb[l * HC * HC + j * HC + k]) & 0xFFFFE000u) * xv[j];
     \\  out[xo + size_t(k) * D] = T(post[l * HC + k] * yv + ((p[0] + p[1]) + (p[2] + p[3])));
@@ -2138,13 +2140,24 @@ const HC_EXPAND_SOURCE =
 
 var hc_expand_def = Def{ .name = "dsv41_hc_expand", .ins = &.{ "x", "y", "post", "comb" }, .outs = &.{"out"}, .source = HC_EXPAND_SOURCE };
 
-/// `hcExpand` of four copies in one kernel, in `x`'s dtype; valid only where `hcExpandServes`.
+/// `hcExpand` of four copies in one kernel, in `x`'s dtype, one thread an output element; valid only where
+/// `hcExpandServes`.
 pub fn hcExpandFused(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
+    return hcExpandLaunch(sc, x, y, post, comb, true);
+}
+
+/// The same bytes with a thread a column writing all four copies: the previous grid, kept for the microbench.
+pub fn hcExpandPerColumn(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
+    return hcExpandLaunch(sc, x, y, post, comb, false);
+}
+
+fn hcExpandLaunch(sc: *Scope, x: A, y: A, post: A, comb: A, per_element: bool) !A {
     const L = dim(x, 0);
     const D = dim(x, 2);
     const dt = mlx.mlx_array_dtype(x);
     var o: [1]A = undefined;
-    try launch(sc, &hc_expand_def, &.{ x, y, post, comb }, &.{.{ .shape = mlx.getShape(x), .dt = dt }}, .{ (D + 255) / 256 * 256, L, 1 }, .{ 256, 1, 1 }, &.{.{ .name = "HC", .v = 4 }}, &.{.{ .name = "T", .dt = dt }}, &o);
+    const grid: Grid = .{ (D + 255) / 256 * 256, L, if (per_element) 4 else 1 };
+    try launch(sc, &hc_expand_def, &.{ x, y, post, comb }, &.{.{ .shape = mlx.getShape(x), .dt = dt }}, grid, .{ 256, 1, 1 }, &.{ .{ .name = "HC", .v = 4 }, .{ .name = "COPY", .v = @intFromBool(per_element) } }, &.{.{ .name = "T", .dt = dt }}, &o);
     return o[0];
 }
 
@@ -3340,6 +3353,23 @@ test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
         try expectBitEqual("hc expand", got, want);
     };
     try testing.expect(hc_expand_tf32);
+}
+
+test "dsv41 hc expand: a thread an element writes the bytes of a thread a column, at stream magnitudes" {
+    try mlx.requireGpu();
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5120, 4096, 1000, 40 }) |D| for ([_]c_int{ 1, 2, 5, 17, 512 }) |L| {
+        for ([_][2]f32{ .{ 1.5, 1.0 }, .{ 400.0, 60.0 }, .{ 1e-3, 1e-4 } }) |mag| {
+            var cs = Scope.init(testing.allocator, mlx.gpuStream());
+            defer cs.deinit();
+            const x = try cs.astype(try randn(&cs, &.{ L, 4, D }, .float32, 191, mag[0]), dt);
+            const y = try cs.astype(try randn(&cs, &.{ L, D }, .float32, 192, mag[1]), dt);
+            const post = try randn(&cs, &.{ L, 4 }, .float32, 193, 0.7);
+            const comb = try randn(&cs, &.{ L, 4, 4 }, .float32, 194, 0.5);
+            const want = try hostOf(&cs, try hcExpandPerColumn(&cs, x, y, post, comb));
+            const got = try hostOf(&cs, try hcExpandFused(&cs, x, y, post, comb));
+            try expectBitEqual("hc expand grid", got, want);
+        }
+    };
 }
 
 test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {

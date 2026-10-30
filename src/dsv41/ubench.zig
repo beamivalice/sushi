@@ -12,7 +12,7 @@ const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand, hc_stages };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand, hc_expand_decode, hc_stages };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -706,6 +706,71 @@ fn runHcExpand(run: *report.Run) anyerror!void {
             try run.interleave(label, &s, sampleHcExpand);
         }
     }
+}
+
+// ── dsv41.hc_expand_decode ──────────────────────────────────────────────
+
+pub const hc_expand_decode: report.Bench = .{
+    .name = "dsv41.hc_expand_decode",
+    .scope = .dsv41,
+    .what = "the hyper-connection expand of one decode row (hc 4 x 5120, bf16 stream), 40 chained calls: a thread a column against a thread an output element",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{.{ .name = "rows", .values = &.{"1"} }},
+    .arms = &.{ "column", "element", "copy" },
+    .ref = "column",
+    .run = runHcExpandDecode,
+};
+
+const hc_decode_chain = 40;
+
+const HcExpandDecodeSample = struct { gpu: mlx.mlx_stream, d: HcExpandData };
+
+fn sampleHcExpandDecode(s: *HcExpandDecodeSample, arm: usize) anyerror!f64 {
+    const d = s.d;
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    var sw = io_util.Stopwatch.init(io());
+    var x = d.x;
+    const one = try sc.astype(try sc.f(1.0), .bfloat16);
+    for (0..hc_decode_chain) |_| x = switch (arm) {
+        0 => try kernels.hcExpandPerColumn(&sc, x, d.y, d.post, d.comb),
+        1 => try kernels.hcExpandFused(&sc, x, d.y, d.post, d.comb),
+        else => try sc.add(x, one),
+    };
+    try evalAll(&.{x});
+    return @as(f64, @floatFromInt(sw.read())) / hc_decode_chain;
+}
+
+fn runHcExpandDecode(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const D = 5120;
+    try kernels.probeHc(alloc, gpu, 4, D, 20);
+    var sc = Scope.init(alloc, gpu);
+    defer sc.deinit();
+    const f32t = mlx.mlx_dtype.float32;
+    const d: HcExpandData = .{
+        .x = try sc.astype(try kernels.randn(&sc, &.{ 1, 4, D }, f32t, 201, 1.5), .bfloat16),
+        .y = try sc.astype(try kernels.randn(&sc, &.{ 1, D }, f32t, 202, 1.0), .bfloat16),
+        .post = try kernels.randn(&sc, &.{ 1, 4 }, f32t, 203, 0.3),
+        .comb = try kernels.randn(&sc, &.{ 1, 4, 4 }, f32t, 204, 0.45),
+        .cpre = undefined,
+        .w = undefined,
+        .hw = undefined,
+        .eps = undefined,
+    };
+    try evalAll(&.{ d.x, d.y, d.post, d.comb });
+    var a = d.x;
+    var b = d.x;
+    for (0..hc_decode_chain) |_| {
+        a = try kernels.hcExpandPerColumn(&sc, a, d.y, d.post, d.comb);
+        b = try kernels.hcExpandFused(&sc, b, d.y, d.post, d.comb);
+    }
+    const want = try sc_mod.hostF32(try sc.astype(a, f32t));
+    const got = try sc_mod.hostF32(try sc.astype(b, f32t));
+    if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) run.invalid("the per-element expand's bytes differ from the per-column's");
+    var s: HcExpandDecodeSample = .{ .gpu = gpu, .d = d };
+    try run.interleave("expand 1 row x40", &s, sampleHcExpandDecode);
 }
 
 // ── dsv41.hc_stages ─────────────────────────────────────────────────────
