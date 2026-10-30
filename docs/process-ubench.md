@@ -81,6 +81,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `dsv41.index_block_peak` | dsv41 | a 16-row decode block's indexer with and without the candidate mask, by context; peak MB (min and max) |
 | `dsv41.rows_growth` | dsv41 | a full row store growing by one chunk: time, held MB and the peak beyond them (min and max) |
 | `dsv41.attn_span` | dsv41 | one attention span at the release geometry: composed core, f16 wide arm, fused kernel; peak MB (min and max) |
+| `dsv41.attn_decode` | dsv41 | one decode token's attention core (64 heads x 512, window 128, 512 or 64 picks, 4k or 250k compressed rows, the release's split count); us a call, 40 dependent calls a sample |
 | `dsv41.attn_epilogue` | dsv41 | one prefill span's heads as `wo_a` takes them (64 heads x 512, 8 groups, QAT on): the fused kernel then rotation, fp8 round trip and transpose as ops, against the kernel's store doing all three; peak MB (min and max) |
 | `dsv41.hc_expand` | dsv41 | the hyper-connection expand of a wide chunk (hc 4 x 5120, bf16): the op chain against the fused kernel, alone (the layer tail) and with the FFN stage's mix and norm kernels, at 512 and 2048 rows |
 | `dsv41.hc_expand_decode` | dsv41 | the hyper-connection expand of one decode row (hc 4 x 5120, bf16), 40 chained calls: a thread a column against a thread an output element |

@@ -799,7 +799,7 @@ var attn_softmax_def = Def{ .name = "dsv41_attn_softmax", .ins = &.{ "lw", "lc",
 const attn_dec_nsg = 8;
 
 /// Threadgroups a (row, head) splits its `rows` (window + selected) into: one per 160 rows.
-fn attnSplits(rows: usize) usize {
+pub fn attnSplits(rows: usize) usize {
     return @max(1, @min(8, rows / 160));
 }
 
@@ -2848,7 +2848,7 @@ const AttnCase = struct {
 const AttnData = struct { q: A, ring: A, comp: A, topk: A, sink: A, c: AttnCase };
 
 fn attnData(sc: *Scope, c: AttnCase, dt: mlx.mlx_dtype) !AttnData {
-    var picks: [256]i32 = undefined;
+    var picks: [512]i32 = undefined;
     for (0..c.k) |i| picks[i] = if (i % 11 == 5) -1 else @intCast((i * 7 + 3) % c.n_comp);
     return .{
         .q = try sc.astype(try randn(sc, &.{ 1, ci(c.heads), ci(c.d) }, .float32, 101, 1.5), dt),
