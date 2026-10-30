@@ -992,6 +992,9 @@ fn handleResponsesInner(
         var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
         defer if (delivery) |*d| d.deinit(allocator);
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
+        var content: think_tags.ContentStream = .{};
+        defer content.deinit(allocator);
+        var join: think_tags.ThoughtJoin = .{};
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var thought_shipped = false; // this thought has streamed a delta (`think_tags.openThoughtFlush`)
@@ -1100,7 +1103,7 @@ fn handleResponsesInner(
                 }
 
                 // Detect close tag (</think> or <channel|>).
-                const tp = std.mem.indexOf(u8, think_buf.items, "</think>");
+                const tp = if (think_tags.indexOfThinkCloseTag(think_buf.items, 0)) |t| t.pos else null;
                 const cp = std.mem.indexOf(u8, think_buf.items, "<channel|>");
                 const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
                     if (tp == null and cp == null) break :blk null;
@@ -1113,16 +1116,9 @@ fn handleResponsesInner(
                 if (close_match) |m| {
                     const before = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                     thought_shipped = false;
-                    if (before.len > 0) {
-                        if (!streamed_reasoning_started) {
-                            streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
-                            streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
-                            streamed_reasoning_started = true;
-                        }
-                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
-                    }
-                    if (streamed_reasoning_started) live_output_index += 1;
+                    try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, before);
+                    join.close();
+                    if (streamed_reasoning_started and !streamed_message_started) live_output_index += 1;
 
                     const after = m.pos + m.tag.len;
                     var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
@@ -1132,15 +1128,10 @@ fn handleResponsesInner(
                         content_after = content_after[10..];
                     }
                     content_after = std.mem.trimStart(u8, content_after, "\n ");
-                    if (content_after.len > 0) {
-                        if (!streamed_message_started) {
-                            streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
-                            streamed_message_index = live_output_index;
-                            try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
-                            streamed_message_started = true;
-                        }
-                        try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, content_after);
-                    }
+                    if (content_after.len > 0) switch (try content.deliver(allocator, content_after)) {
+                        .send => |bytes| try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, bytes),
+                        else => {},
+                    };
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
                 } else if (skipped_think_open) {
@@ -1150,13 +1141,7 @@ fn handleResponsesInner(
                     const safe_len = flush.skip + flush.ship;
                     if (safe_len > 0) {
                         if (flush.ship > 0) {
-                            if (!streamed_reasoning_started) {
-                                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
-                                streamed_reasoning_index = live_output_index;
-                                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
-                                streamed_reasoning_started = true;
-                            }
-                            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[flush.skip..safe_len]);
+                            try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_buf.items[flush.skip..safe_len]);
                             thought_shipped = true;
                         }
                         const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
@@ -1166,27 +1151,22 @@ fn handleResponsesInner(
                     }
                 }
             } else {
-                // Skip Gemma 4 channel tags that may leak after the thinking block.
-                // A think block the MODEL opens: seeded like a template-injected one.
+                // A think block the MODEL opens, first or after content: seeded like a template-injected one.
                 // Checked before the marker skip, which would swallow a bare `<think>`.
-                if (!streamed_message_started) if (think_tags.modelThinkOpener(channel_armed, token_text)) |opener| {
+                if (content.thoughtOpener(channel_armed, token_text)) |opener| {
+                    content.endPart();
                     channel_armed = false;
                     in_think_block = true;
+                    skipped_think_open = false;
                     try think_buf.appendSlice(allocator, opener);
                     continue;
-                };
-                if (think_tags.isChannelMarkerToken(token_text)) {
-                    channel_armed = !streamed_message_started and std.mem.eql(u8, token_text, "<|channel>");
-                    continue;
                 }
-                channel_armed = false;
-                if (!streamed_message_started) {
-                    streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
-                    streamed_message_index = live_output_index;
-                    try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
-                    streamed_message_started = true;
+                const step = try content.deliver(allocator, token_text);
+                channel_armed = step == .marker and !content.started and std.mem.eql(u8, token_text, "<|channel>");
+                switch (step) {
+                    .send => |bytes| try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, bytes),
+                    else => {},
                 }
-                try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, token_text);
             }
         }
 
@@ -1198,16 +1178,16 @@ fn handleResponsesInner(
             }
         }
 
+        // Whitespace the content arm withheld ships unless a thought followed it.
+        if (!client_gone and !active_has_tools) {
+            const held = content.finish();
+            if (held.len > 0) try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, held);
+        }
+
         // Flush any remaining think buffer (no close tag found) as reasoning.
-        const think_tail = think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
-        if (!client_gone and in_think_block and think_tail.len > 0 and !active_has_tools) {
-            if (!streamed_reasoning_started) {
-                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
-                streamed_reasoning_index = live_output_index;
-                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
-                streamed_reasoning_started = true;
-            }
-            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_tail);
+        const think_tail = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+        if (!client_gone and in_think_block and !active_has_tools) {
+            try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_tail);
         }
 
         ts.finalize();
@@ -1308,6 +1288,17 @@ fn handleResponsesInner(
         emitted_tool_calls.deinit(allocator);
     }
 
+    const reasoning_first = responsesReasoningFirst(
+        if (is_stream and streamed_reasoning_started) streamed_reasoning_index else null,
+        if (is_stream and streamed_message_started) streamed_message_index else null,
+    );
+    if (!reasoning_first) {
+        try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
+        try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, visible_text);
+        emitted += 1;
+        output_index += 1;
+    }
+
     if (reasoning_text) |rt| if (rt.len > 0) {
         if (emitted > 0) try out_buf.append(allocator, ',');
         if (is_stream and streamed_reasoning_started) {
@@ -1357,7 +1348,7 @@ fn handleResponsesInner(
     };
 
     const has_tool_calls = emitted_tool_calls.items.len > 0;
-    if (!has_tool_calls) {
+    if (!has_tool_calls and reasoning_first) {
         if (emitted > 0) try out_buf.append(allocator, ',');
         if (is_stream and streamed_message_started) {
             // Live deltas already streamed; emit just the closing events.
@@ -1838,6 +1829,44 @@ fn emitResponsesReasoningStart(
     }
 }
 
+/// Whether output[] lists the reasoning item before the message: always, unless a stream opened the
+/// reasoning item past the message (a thought re-opened after visible text), whose order it keeps.
+fn responsesReasoningFirst(streamed_reasoning_index: ?u32, streamed_message_index: ?u32) bool {
+    const r = streamed_reasoning_index orelse return true;
+    const m = streamed_message_index orelse return true;
+    return r < m;
+}
+
+/// Where the reasoning item opens: in turn, or past the message when a thought follows visible text.
+fn reasoningItemIndex(live_output_index: u32, message_started: bool, message_index: u32) u32 {
+    return if (message_started) message_index + 1 else live_output_index;
+}
+
+/// A reasoning delta into the response's one reasoning item, opened at its first delta and led by the
+/// blank line that joins a later thought to an earlier one (`ThoughtJoin`).
+fn emitResponsesReasoning(allocator: std.mem.Allocator, stream: *Conn, seq: *u64, id: *?[]u8, index: *u32, started: *bool, at: u32, join: *think_tags.ThoughtJoin, delta: []const u8) !void {
+    if (delta.len == 0) return;
+    if (!started.*) {
+        id.* = try responses_mod.makeId(stream.io, allocator, "rs");
+        index.* = at;
+        try emitResponsesReasoningStart(allocator, stream, seq, at, id.*.?);
+        started.* = true;
+    }
+    try emitResponsesReasoningDelta(allocator, stream, seq, index.*, id.*.?, join.lead(delta));
+    try emitResponsesReasoningDelta(allocator, stream, seq, index.*, id.*.?, delta);
+}
+
+/// Visible text into the response's message item, opened at its first delta.
+fn emitResponsesMessage(allocator: std.mem.Allocator, stream: *Conn, seq: *u64, id: *?[]u8, index: *u32, started: *bool, at: u32, text: []const u8) !void {
+    if (!started.*) {
+        id.* = try responses_mod.makeId(stream.io, allocator, "msg");
+        index.* = at;
+        try emitResponsesMessageStart(allocator, stream, seq, at, id.*.?);
+        started.* = true;
+    }
+    try emitResponsesMessageDelta(allocator, stream, seq, index.*, id.*.?, text);
+}
+
 /// Emit a single reasoning_summary_text.delta event with the given chunk.
 fn emitResponsesReasoningDelta(
     allocator: std.mem.Allocator,
@@ -2280,4 +2309,12 @@ test "a responses disconnect is never stored" {
     try std.testing.expect(!responsesStoresFinish("client_disconnect", false));
     try std.testing.expect(responsesStoresFinish("stop", true));
     try std.testing.expect(!responsesStoresFinish("length", false));
+}
+
+test "Responses output order: a reasoning item streamed past the message stays after it" {
+    try std.testing.expect(responsesReasoningFirst(null, null));
+    try std.testing.expect(responsesReasoningFirst(0, 1));
+    try std.testing.expect(responsesReasoningFirst(0, null));
+    try std.testing.expect(responsesReasoningFirst(null, 0));
+    try std.testing.expect(!responsesReasoningFirst(reasoningItemIndex(0, true, 0), 0));
 }

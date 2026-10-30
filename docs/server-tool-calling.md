@@ -179,6 +179,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`isChannelMarkerToken`), so `normalizeEmbeddedThinkBlocks` cuts closers out of the content between and after blocks
   (`contentWithoutClosers`; a closer inside a code span is text) and `trimTrailingThinkClosers` keeps the tail.
   `<think>t</think>391</think>391` is content `391391` stream and non-stream.
+- **Every stream's content arm is `think_tags.ContentStream`**: a think tag token inside an open code span is text
+  (`CodeSpan`, the `openCodeSpanStart` reading kept as bytes arrive); a `<think>` outside one re-opens a thought,
+  which streams as reasoning joined by `\n\n` (`ThoughtJoin`) while the content parts around it are trimmed and
+  joined by `\n`, as `normalizeEmbeddedThinkBlocks` merges them. Whitespace waits only as whole tokens.
+  A re-opened thought cut by the end of the reply is reasoning on both sides. Anthropic gives a thought after
+  text its own thinking block (a stopped block takes no deltas); Responses keeps one reasoning item, listed after
+  the message when the stream opened it there (`responsesReasoningFirst`).
 - **A live row never asserts that a model thinks**: a thought the model closes empty (`</think>42`) has no reasoning
   and no thinking block, on every surface. Rows 4 and 20 of `tests/test_format_matrix.sh` branch on an
   independent non-stream turn: a stream's billed reasoning tokens come from what it delivered, so they prove nothing.

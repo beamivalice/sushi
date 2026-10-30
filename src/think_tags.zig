@@ -93,20 +93,144 @@ pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
 /// not the end of the thought. Judged from the bytes before the tag alone, so a stream's verdict on a
 /// tag never changes as more arrive. A span ends with its line; three backticks are a fence, not a span.
 fn openCodeSpanStart(text: []const u8) ?usize {
-    var i = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| nl + 1 else 0;
-    var open: ?usize = null;
-    while (i < text.len) {
-        if (text[i] != '`') {
-            i += 1;
-            continue;
-        }
-        var end = i;
-        while (end < text.len and text[end] == '`') end += 1;
-        if (end - i < 3) open = if (open == null) i else null;
-        i = end;
-    }
-    return open;
+    const line = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| nl + 1 else 0;
+    var span = CodeSpan{ .at = line };
+    span.feed(text[line..]);
+    return span.openStart();
 }
+
+/// The code-span reading of `openCodeSpanStart` kept over bytes as they arrive, so a stream judges a tag
+/// token by the same rule the split applies to the whole reply.
+pub const CodeSpan = struct {
+    at: usize = 0,
+    open: ?usize = null,
+    run_start: usize = 0,
+    run: usize = 0,
+
+    pub fn feed(self: *CodeSpan, bytes: []const u8) void {
+        for (bytes) |b| {
+            if (b == '`') {
+                if (self.run == 0) self.run_start = self.at;
+                self.run += 1;
+            } else {
+                self.settleRun();
+                if (b == '\n') self.open = null;
+            }
+            self.at += 1;
+        }
+    }
+
+    /// A run of one or two backticks opens or closes a span; three or more are a fence.
+    fn settleRun(self: *CodeSpan) void {
+        if (self.run > 0 and self.run < 3) self.open = if (self.open == null) self.run_start else null;
+        self.run = 0;
+    }
+
+    /// Start of the span still open after the bytes fed, or null.
+    pub fn openStart(self: CodeSpan) ?usize {
+        var s = self;
+        s.settleRun();
+        return s.open;
+    }
+};
+
+/// What a stream's content arm does with one token (`ContentStream.deliver`).
+pub const ContentStep = union(enum) {
+    /// A control marker no stream shows.
+    marker,
+    /// Whitespace leading a content part: never shown, so its logprobs entries retire.
+    drop,
+    /// Whitespace at the content's tail: withheld until text follows or the reply ends.
+    hold,
+    /// The bytes to send now.
+    send: []const u8,
+};
+
+/// A stream's content arm, token by token, delivering the content the non-stream reply holds
+/// (`normalizeEmbeddedThinkBlocks` + `splitThinkBlock`): a think tag outside a code span is structure, a
+/// thought re-opened after content goes back to the thought arm, and the content parts around thoughts are
+/// trimmed of "\n " and joined by one "\n". Whitespace is withheld only as whole tokens (a logprobs entry
+/// describes a whole token), so a token mixing it with text ships whole, as `streamContentLead` does.
+pub const ContentStream = struct {
+    span: CodeSpan = .{},
+    /// A visible content byte was sent.
+    started: bool = false,
+    /// The current part has sent nothing yet.
+    lead: bool = true,
+    held: std.ArrayList(u8) = .empty,
+    out: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(self: *ContentStream, allocator: std.mem.Allocator) void {
+        self.held.deinit(allocator);
+        self.out.deinit(allocator);
+    }
+
+    /// The opener a thought starts with when `tt` opens one here, or null: inside a code span a tag is text.
+    pub fn thoughtOpener(self: *const ContentStream, channel_armed: bool, tt: []const u8) ?[]const u8 {
+        if (self.span.openStart() != null) return null;
+        return modelThinkOpener(channel_armed, tt);
+    }
+
+    /// A thought opens: the part so far ends, and its withheld whitespace is cut as the split trims the part.
+    pub fn endPart(self: *ContentStream) void {
+        self.held.clearRetainingCapacity();
+        self.lead = true;
+        self.span = .{};
+    }
+
+    /// One token (or the content a thought's close token carried). `.send` is valid until the next call.
+    pub fn deliver(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8) !ContentStep {
+        const think_tag = std.mem.eql(u8, tt, BARE_THINK_OPENER) or std.mem.eql(u8, tt, BARE_THINK_CLOSER);
+        if (isChannelMarkerToken(tt) and !(think_tag and self.span.openStart() != null)) return .marker;
+        self.span.feed(tt);
+        if (std.mem.trimStart(u8, tt, "\n ").len == 0) {
+            if (self.lead) return .drop;
+            try self.held.appendSlice(allocator, tt);
+            return .hold;
+        }
+        self.out.clearRetainingCapacity();
+        if (self.lead and self.started) try self.out.append(allocator, '\n');
+        self.lead = false;
+        self.started = true;
+        try self.out.appendSlice(allocator, self.held.items);
+        self.held.clearRetainingCapacity();
+        try self.out.appendSlice(allocator, tt);
+        return .{ .send = self.out.items };
+    }
+
+    /// The reply ended outside a thought: the withheld whitespace ships, as every token's did before.
+    pub fn finish(self: *ContentStream) []const u8 {
+        defer self.held.clearRetainingCapacity();
+        return self.held.items;
+    }
+};
+
+/// Reasoning across thoughts as the non-stream reply joins it: one "\n\n" ahead of the first delta of every
+/// thought after one that delivered reasoning.
+pub const ThoughtJoin = struct {
+    before: bool = false,
+    this: bool = false,
+    closed: bool = false,
+
+    /// The separator to send ahead of `delta`, or "".
+    pub fn lead(self: *ThoughtJoin, delta: []const u8) []const u8 {
+        if (delta.len == 0) return "";
+        defer self.this = true;
+        return if (self.before and !self.this) "\n\n" else "";
+    }
+
+    pub fn close(self: *ThoughtJoin) void {
+        self.before = self.before or self.this;
+        self.this = false;
+        self.closed = true;
+    }
+
+    /// The last delta of a thought the end of the reply cut (`cutThoughtDelta`). After a closed thought
+    /// the split merges it into one block, which trims its tail; a first thought keeps it.
+    pub fn cutTail(self: ThoughtJoin, tail: []const u8) []const u8 {
+        return if (self.closed) std.mem.trimEnd(u8, tail, "\n ") else tail;
+    }
+};
 
 /// How much of `text` a stream may ship so the rest still carries every open code span's backtick: a
 /// trailing run of backticks (its length is not yet known) and an open span wait.
@@ -348,7 +472,8 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
 /// `<|tool_call>` opener leaked as the entire content (live 2026-07-16 soak,
 /// gemma-4-26B). parseToolCalls runs BEFORE this strip and extracts any real
 /// call, so any residual `<tool_call|>` reaching here is orphan by construction.
-/// Loops so a run of closers is fully removed. Returns a prefix slice (no alloc).
+/// Loops so a run of closers is fully removed; a think closer inside an open code
+/// span is text and stays. Returns a prefix slice (no alloc).
 pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
     var s = content;
     while (true) {
@@ -358,6 +483,7 @@ pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
         } else if (std.mem.endsWith(u8, t, "<tool_call|>")) {
             s = t[0 .. t.len - "<tool_call|>".len];
         } else if (endsWithThinkCloseTag(t)) |l| {
+            if (openCodeSpanStart(t[0 .. t.len - l]) != null) return t;
             s = t[0 .. t.len - l];
         } else {
             return t;
@@ -622,8 +748,9 @@ fn skipContentChannelTag(text: []const u8, start: usize) usize {
     return pos;
 }
 
-/// `part` with every think/thought closer cut out: a closer in content is never visible, and a stream drops
-/// its marker token wherever it lands. A part that held one is copied into `owned`, which the caller frees.
+/// `part` with every think/thought closer cut out, as a stream drops its marker token (`ContentStream.deliver`);
+/// a think closer inside a code span is text on both. A part that held one is copied into `owned`, which the
+/// caller frees.
 fn contentWithoutClosers(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), part: []const u8) ![]const u8 {
     if (nextThinkClose(part, 0) == null) return part;
     var out = std.ArrayList(u8).empty;
@@ -698,9 +825,15 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
         else
             null;
         const close = found orelse {
-            // Unclosed trailing opener — leave verbatim for the trailing-strip
-            // logic in splitThinkBlock.
-            try content_parts.append(allocator, text[pos..]);
+            // With no closed block the split's own unclosed arm reads the opener.
+            if (closed_blocks == 0) {
+                try content_parts.append(allocator, text[pos..]);
+                break;
+            }
+            // A thought re-opened and cut by the end of the reply is reasoning, as a stream delivers it.
+            try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..o.pos]));
+            try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..], "\n "));
+            closed_blocks += 1;
             break;
         };
         try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..o.pos]));
@@ -1026,6 +1159,16 @@ pub const ThinkScan = struct {
     }
 };
 
+/// The settled reasoning of a thought still open on a tools stream, or null when it must wait for
+/// its close: only a thought that starts the undelivered buffer (prompt-opened, or its opener first)
+/// splits to the same prefix while open as once closed, so its deltas add up to the closed thought.
+pub fn heldThoughtSoFar(buf: []const u8, opens_think: bool, think_closed: bool) ?[]const u8 {
+    const prompt_opened = opens_think and !think_closed;
+    if (!prompt_opened and thinkOpenTagLenAt(buf) == null) return null;
+    const reasoning = splitThinkBlock(buf, true, prompt_opened).reasoning_content orelse return null;
+    return settledReasoning(reasoning);
+}
+
 /// `streamThinkGate2` with the per-token rescan memoized. Byte-identical
 /// verdicts — pinned prefix-by-prefix against the fresh gate over a corpus that
 /// includes every marker family, a close buried in a tool argument, and a
@@ -1250,6 +1393,72 @@ test "indexOfThinkCloseTag: a close quoted in a code span does not end the thoug
     // Nothing after the span changes the verdict on a tag inside it.
     try testing.expect(indexOfThinkCloseTag("a `</think>", 0) == null);
     try testing.expect(indexOfThinkCloseTag("a `</think>`", 0) == null);
+}
+
+test "CodeSpan: fed a byte at a time, it reads every prefix as the whole-text scan does" {
+    const texts = [_][]const u8{ "a `b` c `d", "``x`` `y\nz `", "```\nq\n``` `r", "` ` `", "x ``` y `z", "`a``b`" };
+    for (texts) |text| for (0..text.len + 1) |n| {
+        var span = CodeSpan{};
+        for (text[0..n]) |b| span.feed(&.{b});
+        try testing.expectEqual(openCodeSpanStart(text[0..n]), span.openStart());
+    };
+}
+
+test "ContentStream: a think tag is text only inside an open code span" {
+    const allocator = testing.allocator;
+    var content = ContentStream{};
+    defer content.deinit(allocator);
+    try testing.expect((try content.deliver(allocator, BARE_THINK_CLOSER)) == .marker);
+    try testing.expectEqualStrings("say `", (try content.deliver(allocator, "say `")).send);
+    try testing.expect(content.thoughtOpener(false, BARE_THINK_OPENER) == null);
+    try testing.expectEqualStrings(BARE_THINK_CLOSER, (try content.deliver(allocator, BARE_THINK_CLOSER)).send);
+    try testing.expect((try content.deliver(allocator, "<channel|>")) == .marker);
+    try testing.expectEqualStrings("` done", (try content.deliver(allocator, "` done")).send);
+    try testing.expect((try content.deliver(allocator, BARE_THINK_CLOSER)) == .marker);
+    try testing.expect(content.thoughtOpener(false, BARE_THINK_OPENER) != null);
+}
+
+test "ContentStream: parts around a thought are trimmed and joined by one newline" {
+    const allocator = testing.allocator;
+    var content = ContentStream{};
+    defer content.deinit(allocator);
+    try testing.expect((try content.deliver(allocator, "\n\n")) == .drop);
+    try testing.expectEqualStrings("A", (try content.deliver(allocator, "A")).send);
+    try testing.expect((try content.deliver(allocator, " ")) == .hold);
+    try testing.expect((try content.deliver(allocator, "\n")) == .hold);
+    content.endPart();
+    try testing.expect((try content.deliver(allocator, "\n")) == .drop);
+    try testing.expectEqualStrings("\nB", (try content.deliver(allocator, "B")).send);
+    try testing.expect((try content.deliver(allocator, " ")) == .hold);
+    try testing.expectEqualStrings(" C", (try content.deliver(allocator, "C")).send);
+    try testing.expect((try content.deliver(allocator, "\n")) == .hold);
+    try testing.expectEqualStrings("\n", content.finish());
+}
+
+test "ThoughtJoin: a later thought's first delta follows one blank line" {
+    var join = ThoughtJoin{};
+    try testing.expectEqualStrings("", join.lead("t"));
+    try testing.expectEqualStrings("", join.lead("u"));
+    join.close();
+    try testing.expectEqualStrings("", join.lead(""));
+    join.close();
+    try testing.expectEqualStrings("\n\n", join.lead("v"));
+    try testing.expectEqualStrings("", join.lead("w"));
+    try testing.expectEqualStrings("w", join.cutTail("w\n "));
+    try testing.expectEqualStrings("w\n", (ThoughtJoin{}).cutTail("w\n"));
+}
+
+test "normalizeEmbeddedThinkBlocks: a thought re-opened and cut by the end of the reply is reasoning" {
+    const merged = (try normalizeEmbeddedThinkBlocks(testing.allocator, "<think>t</think>A\n<think>\nu")).?;
+    defer testing.allocator.free(merged);
+    const split = splitThinkBlock(merged, true, false);
+    try testing.expectEqualStrings("t\n\nu", split.reasoning_content.?);
+    try testing.expectEqualStrings("A", split.content);
+}
+
+test "trimTrailingThinkClosers: a closer inside an open code span is text" {
+    try testing.expectEqualStrings("Use `</think>", trimTrailingThinkClosers("Use `</think>"));
+    try testing.expectEqualStrings("Use `x`", trimTrailingThinkClosers("Use `x`</think>\n</think>"));
 }
 
 test "a visible answer quoting a think block in a code span stays one answer" {
@@ -2170,4 +2379,11 @@ test "a model-opened think block latches from its own opener token" {
     try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
     try std.testing.expect(modelThinkOpener(true, "\n") == null);
     try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
+}
+
+test "heldThoughtSoFar: a held thought streams only while its start cannot move" {
+    try testing.expectEqualStrings("The user asks", heldThoughtSoFar("The user asks\n</thi", true, false).?);
+    try testing.expectEqualStrings("plan", heldThoughtSoFar("<think>plan", false, true).?);
+    try testing.expect(heldThoughtSoFar("Done. <think>plan", true, true) == null);
+    try testing.expect(heldThoughtSoFar("Done. <th", true, true) == null);
 }

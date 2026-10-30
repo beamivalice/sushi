@@ -1254,10 +1254,10 @@ pub fn handleStreamingGeneration(
     var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
     defer if (delivery) |*d| d.deinit(allocator);
     var think_closed = false; // a complete think block was already split+emitted this stream
-    // Leading whitespace is suppressed until the first visible byte, so the
-    // stream reaches the same content bytes as splitThinkBlock's own
-    // trimStart (think_tags.streamContentLead).
-    var content_started = false;
+    // The content arm delivers the non-stream content bytes (think_tags.ContentStream).
+    var content: think_tags.ContentStream = .{};
+    defer content.deinit(allocator);
+    var join: think_tags.ThoughtJoin = .{};
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     var thought_shipped = false; // this thought has streamed a delta (`think_tags.openThoughtFlush`)
     defer think_buf.deinit(allocator);
@@ -1393,12 +1393,9 @@ pub fn handleStreamingGeneration(
                         // reasoning token; at the cap the latch stops every
                         // later emitter from shipping the remainder.
                         if (!budget_exhausted) {
-                            const so_far = think_tags.splitThinkBlock(buf, true, opens_think);
-                            if (so_far.reasoning_content) |rc| {
-                                const settled = think_tags.settledReasoning(rc);
+                            if (think_tags.heldThoughtSoFar(undelivered, opens_think, think_closed)) |settled| {
                                 if (think_tags.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
-                                    if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{ .logprobs_json = null });
+                                    try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, fresh);
                                     reasoning_streamed = settled.len;
                                     reasoning_tokens_sent += 1;
                                     if (reasoning_budget >= 0 and reasoning_tokens_sent >= @as(usize, @intCast(reasoning_budget))) {
@@ -1433,36 +1430,31 @@ pub fn handleStreamingGeneration(
                         if (!budget_exhausted) {
                             if (split.reasoning_content) |rc| {
                                 if (think_tags.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
-                                    if (include_usage) try delivered_reasoning.appendSlice(allocator, fresh);
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{ .logprobs_json = null });
+                                    try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, fresh);
                                 }
                             }
                         }
+                        join.close();
                         // Block done and `text_buf` was just cleared — a thought
                         // re-opened later in the turn starts counting from zero.
                         reasoning_streamed = 0;
-                        if (split.content.len > 0) {
-                            content_started = true;
-                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = split.content }, null, null, null, .{ .logprobs_json = try lps.take() });
-                        }
+                        content.endPart();
+                        if (split.content.len > 0) switch (try content.deliver(allocator, split.content)) {
+                            .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
+                            else => {},
+                        };
                     },
                     .flush_text => {
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
-                            // Skip bare channel/think tags that leak without a full block
-                            if (think_tags.isChannelMarkerToken(tt)) {
-                                continue;
+                            switch (try content.deliver(allocator, tt)) {
+                                .marker, .hold => {},
+                                // Suppressed lead: nothing pending describes text the
+                                // client received, so retire it rather than letting it
+                                // ride the next chunk (logprobs.content ↔ content).
+                                .drop => lps.dropPending(),
+                                .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
                             }
-                            const vis = think_tags.streamContentLead(tt, content_started);
-                            // Suppressed lead: nothing pending describes text the
-                            // client received, so retire it rather than letting it
-                            // ride the next chunk (logprobs.content ↔ content).
-                            if (vis.len == 0) {
-                                lps.dropPending();
-                                continue;
-                            }
-                            content_started = true;
-                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
                         token_texts.clearRetainingCapacity();
                         text_delivered = text_buf.items.len;
@@ -1544,10 +1536,8 @@ pub fn handleStreamingGeneration(
             if (close_match) |m| {
                 const last = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 thought_shipped = false;
-                if (last.len > 0 and !budget_exhausted) {
-                    if (include_usage) try delivered_reasoning.appendSlice(allocator, last);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = last }, null, null, null, .{ .logprobs_json = null });
-                }
+                if (!budget_exhausted) try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, last);
+                join.close();
                 const after = m.pos + m.len;
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 // Strip Gemma 4 content channel tag: <|channel>\n or <|channel>
@@ -1561,10 +1551,9 @@ pub fn handleStreamingGeneration(
                     // The reasoning above this point never reaches the client,
                     // so its entries stop here rather than riding the answer.
                     lps.skipToContent(think_buf.items, content_after, stop_gate.carry_len);
-                    const vis_content_after = think_tags.streamContentLead(content_after, content_started);
-                    if (vis_content_after.len > 0) {
-                        content_started = true;
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_content_after }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    switch (try content.deliver(allocator, content_after)) {
+                        .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
+                        else => {},
                     }
                 } else {
                     lps.dropPending();
@@ -1578,10 +1567,7 @@ pub fn handleStreamingGeneration(
                 const flush = think_tags.openThoughtFlush(think_buf.items, thought_shipped);
                 const safe_len = flush.skip + flush.ship;
                 if (safe_len > 0) {
-                    if (flush.ship > 0 and !budget_exhausted) {
-                        if (include_usage) try delivered_reasoning.appendSlice(allocator, think_buf.items[flush.skip..safe_len]);
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[flush.skip..safe_len] }, null, null, null, .{ .logprobs_json = null });
-                    }
+                    if (!budget_exhausted) try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, think_buf.items[flush.skip..safe_len]);
                     if (flush.ship > 0) thought_shipped = true;
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
@@ -1591,27 +1577,25 @@ pub fn handleStreamingGeneration(
             }
         } else {
             defer allocator.free(token_text);
-            // Skip Gemma 4 channel tags that leak after thinking blocks
-            // A think block the MODEL opens: seeded like a template-injected one.
+            // A think block the MODEL opens, first or after content: seeded like a template-injected one.
             // Checked before the marker skip, which would swallow a bare `<think>`.
-            if (!content_started) if (think_tags.modelThinkOpener(channel_armed, token_text)) |opener| {
+            if (content.thoughtOpener(channel_armed, token_text)) |opener| {
+                // The opener and any whitespace held before it never reach content.
+                lps.dropPending();
+                content.endPart();
                 channel_armed = false;
                 in_think_block = true;
                 saw_think_open = true;
+                skipped_think_open = false;
                 try think_buf.appendSlice(allocator, opener);
                 continue;
-            };
-            if (think_tags.isChannelMarkerToken(token_text)) {
-                channel_armed = !content_started and std.mem.eql(u8, token_text, "<|channel>");
-                continue;
             }
-            channel_armed = false;
-            const vis_token_text = think_tags.streamContentLead(token_text, content_started);
-            if (vis_token_text.len == 0) {
-                lps.dropPending();
-            } else {
-                content_started = true;
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_token_text }, null, null, null, .{ .logprobs_json = try lps.take() });
+            const step = try content.deliver(allocator, token_text);
+            channel_armed = step == .marker and !content.started and std.mem.eql(u8, token_text, "<|channel>");
+            switch (step) {
+                .marker, .hold => {},
+                .drop => lps.dropPending(),
+                .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
             }
         }
 
@@ -1637,6 +1621,12 @@ pub fn handleStreamingGeneration(
         }
     }
 
+    // Whitespace the content arm withheld ships unless a thought followed it.
+    if (!client_gone) {
+        const held = content.finish();
+        if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take() });
+    }
+
     // Flush any remaining think buffer
     if (!client_gone and think_buf.items.len > 0) {
         // No close tag arrived. Reasoning ONLY with positive evidence a block
@@ -1647,15 +1637,12 @@ pub fn handleStreamingGeneration(
         // shipped its whole answer as reasoning with EMPTY content, while
         // non-streaming returned it correctly (live 2026-08-04).
         if (think_tags.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
-            const tail = think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
-            if (!budget_exhausted and tail.len > 0) {
-                if (include_usage) try delivered_reasoning.appendSlice(allocator, tail);
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = tail }, null, null, null, .{ .logprobs_json = null });
-            }
+            const tail = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+            if (!budget_exhausted) try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, tail);
         } else {
-            const vis_tail = think_tags.streamContentLead(think_buf.items, content_started);
+            const vis_tail = think_tags.streamContentLead(think_buf.items, content.started);
             if (vis_tail.len > 0) {
-                content_started = true;
+                content.started = true;
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null, .{ .logprobs_json = try lps.take() });
             }
         }
@@ -1704,8 +1691,7 @@ pub fn handleStreamingGeneration(
                     // Apply reasoning budget truncation if set
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
-                    if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{ .logprobs_json = null });
+                    try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, capped.text);
                 }
             }
 
@@ -1746,8 +1732,7 @@ pub fn handleStreamingGeneration(
                     // Apply reasoning budget truncation if set
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
-                    if (include_usage) try delivered_reasoning.appendSlice(allocator, capped.text);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = capped.text }, null, null, null, .{ .logprobs_json = null });
+                    try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, capped.text);
                 }
                 if (think_split.content.len > 0) {
                     // Locate against the RAW concatenation: it is always a true
@@ -1824,6 +1809,18 @@ const Finish = struct {
     reason: []const u8,
     details: ?[]const u8 = null,
 };
+
+/// A reasoning delta, led by the blank line that joins a later thought to an earlier one (`ThoughtJoin`).
+fn sendReasoning(allocator: std.mem.Allocator, stream: *Conn, chat_id: i64, model_name: []const u8, join: *think_tags.ThoughtJoin, usage: ?*std.ArrayList(u8), delta: []const u8) !void {
+    if (delta.len == 0) return;
+    const sep = join.lead(delta);
+    if (usage) |u| {
+        try u.appendSlice(allocator, sep);
+        try u.appendSlice(allocator, delta);
+    }
+    if (sep.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = sep }, null, null, null, .{ .logprobs_json = null });
+    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = delta }, null, null, null, .{ .logprobs_json = null });
+}
 
 fn sendSSEChunk(
     allocator: std.mem.Allocator,
