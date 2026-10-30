@@ -4,54 +4,34 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.4.1 — Faster DeepSeek prefill, DeepSeek with no flags
 
-- **DeepSeek-V4.1 serves with no flags**: it takes the full 1,000,000-token context and a 256,000-token answer budget (a Mac whose memory cannot hold 1M keeps the smaller context and logs why), and an SSD budget from the Mac's RAM when none is given: 80 GB on a 96 GB Mac, 96 GB on a 128 GB Mac (108 GB with `iogpu.wired_limit_mb` at 120000 or more), stepped down to what the Mac's memory limits hold, fully resident on a 192 or 256 GB Mac; `--ctx-size`, `--max-tokens` and `--ssd-budget-gb` still override them.
-- **A streamed answer that quotes `<think>` tags or thinks again mid-answer matches the non-streamed one**: a tag inside an inline code span stays text, and a thought the model re-opens after it started answering streams as reasoning instead of answer text, on the chat, Anthropic and Responses APIs alike; a non-streamed reply now keeps such a thought's reasoning when the length limit cuts it.
-- **An image conversation no longer restores another image's cached state**: two images of the same size could share an SSD prompt-cache record, so a request could resume from the other image's rows; a boot with `--vision-bf16` and one without no longer share cached image rows either (cached image prompts from earlier versions are recomputed once).
-- **A crash while a long prompt is being cached keeps the cached prefix**: the SSD prompt cache's token record is appended to instead of rewritten, so a kill between the record and the entry's manifest no longer drops the whole entry; a DeepSeek-V4.1 boot that serves the SIMD attention kernel no longer shares a cache namespace with the matrix-unit boots.
-- **`sushi kld capture --layer-major` captures DeepSeek-V4.1**: it writes the teacher and the calibration data (FFN inputs, routes, per-linear input statistics, expert second moments) layer by layer, reading each layer's experts once per batch within a fixed memory budget, and resumes where an interrupted run stopped.
-- **DeepSeek-V4.1 prefill is about 14% faster on M5 Macs at 32K tokens**: the attention core runs on the matrix units (outputs differ at rounding level, KLD unchanged within noise, and prompt caches written before are not reused); thanks @STRML for CommunityServe/plugins PR #6.
-- **DeepSeek-V4.1 prefill gains a little more with byte-identical output**: the shared expert rides the routed experts' prefill launches, and the hyper-connection mix runs on a better tile.
-- **Concurrent Qwen requests no longer end early on a `!`**: a single exclamation mark sampled while requests were batched could be counted as a run of three pad tokens and stop the reply empty; each token is now counted once. Thanks @stooit for the diagnosis and the fix.
-- **A batch handed back to one-at-a-time decoding no longer counts a `!` twice**: when a Qwen request that had not finished prefilling shared a batch, the others' pending pad token was counted again on the serial path, so two in a row still ended a reply early.
-- **DeepSeek-V4.1 prefills long prompts faster**: a prompt chunk that another chunk follows no longer runs the decoder tail whose rows nothing reads, with byte-identical output; a chunk that takes a restore point keeps it.
-- **The SSD prompt cache's write volume is measurable**: `/metrics`, `/metrics.json` and `/props` count the bytes it writes to disk, by kind, and the dashboard shows the total, the split and the write rate; thanks @cyrilmhansen for the request.
-- **Code for models sushi does not serve is gone**: `/v1/embeddings` (no served model embeds), the nvfp4 quantization mode and GGUF discovery are removed (a GGUF path is still refused by name), and `--drafter` now refuses a target other than Qwen3.8-Flash-Next or GLM-5.3 by name instead of loading a drafter that never ran correctly. The muse, harmony, ATEM, LFM2 and K2 tool-call dialects and the WordPiece and SentencePiece tokenizers went with them.
-- **A GLM or DeepSeek chat template that fails is refused by name**: instead of a generic-format prompt the model was never trained on, the request answers 500 `chat template unusable: <reason>` on every surface, streamed or not.
-- **Metrics can be turned on in a running server**: `POST /metrics/enable` (curl, or the dashboard's new Enable metrics button, shown only while metrics are off) starts the same `/metrics` and `/metrics.json` feeds as `--metrics` without a restart; counters start at zero when it is pressed.
-- **A prompt that does not fit unloads idle resident models before it is refused**: with several models loaded, a long prompt used to get a 400 while an idle model held the memory; it now unloads the least recently used idle models (never its own or one serving a request) until it fits.
-- **DeepSeek-V4.1 reads its routers as stored**: the BF16 router weights are no longer widened to f32 at load, so the logits are bit-identical, each decode step reads half the router bytes, and 0.16 GB returns to the expert cache.
-- **Qwen and GLM agent turns no longer re-prefill the previous reply's thought**: a thinking request with tools now keeps a restore point right behind its generated `</think>` (on GLM the pool position at or below it), so the next turn restores through the thought, MTP and DFlash2 rounds cut to land on it with byte-identical output.
-- **A running stream keeps a quarter of the time while another request prefills**: `--prefill-decode-share` now defaults to 0.25 (was 0), so a concurrent decode no longer advances one token per prefill chunk; the share only adds decode ticks between chunks and never narrows a prefill chunk, on any model.
-- **Every model keeps SSD restore points every 8192 tokens, to 1M tokens**: Qwen and GLM no longer thin a long conversation to 16 and 8 points, so an edit deep in a long prompt restores from the point just below it; raise `--prefix-cache-disk` for 1M-token conversations, since one that outgrows the budget drops its oldest points first. `--ssm-checkpoint-max` now caps only the states held in memory.
-- **`/v1/responses` keeps the model's own reasoning in a tool loop**: a replayed plaintext `reasoning` item now reaches the prompt on its assistant turn (it was dropped), so a thinking model keeps its chain of thought between tool calls and the prefix cache hits; encrypted or malformed reasoning items are still ignored.
-- **Tool-call parsing handles five more malformed shapes**: stray DeepSeek `</｜DSML｜` closers no longer leak as the answer, a `<tool_call>` whose value holds an `<invoke>` stays that call, prose `<invoke>` openers no longer take the next call's arguments, a doubled GLM `<arg_key>` keeps a clean key, and a special token written in place of `<` before `function=` still parses.
-- **A small-memory Mac gets a usable default context**: the prefix cache's reserve no longer takes more than half of the free GPU memory when sizing the context, and a context that would fit under 1024 tokens is served as 1024.
-- **Image input accepts GIF (first frame) and BMP** beside JPEG, PNG and WebP.
-- **DeepSeek-V4.1-Flash no longer aborts on M1 and M2 Macs**: the indexer's top-k kernel probes the largest threadgroup the GPU runs (832 threads there, not 1024) at load, with identical picks.
-- **`sushi launch codex` gives local models codex's current tool contract**: the launch writes `~/.sushi/codex/model-instructions.md` and points `model_instructions_file` at it, so models stop receiving fallback instructions that name an `apply_patch` tool codex no longer declares and end edit turns with no change.
-- **A reasoning budget no longer turns MTP off for the answer**: Qwen and MiMo re-seed their MTP head after the forced thought close and keep speculating, and the close lands at the same token as without MTP, alone or beside concurrent requests, with byte-identical output.
-- **A reasoning budget no longer turns MTP off for the answer**: Qwen and MiMo re-seed their MTP head after the forced thought close and keep speculating, and the close lands at the same token as without MTP, with byte-identical output.
-- **Seeded DeepSeek requests repeat exactly**: a sampled request with a `seed` now gives the same text on every run, streamed or not; DSpark verifies it at a fixed width instead of one chosen from measured timing.
-- **A reasoning budget no longer turns DSpark off for the answer**: DeepSeek-V4.1 cuts the round before the bound at the serial close position and keeps drafting after the forced thought close, with byte-identical output.
-- **GLM-5.3-Flash decode uses fewer GPU launches per MoE layer**: the shared expert now runs inside the routed experts' pair and down launches, for a serial token (two fewer), for batched requests and for DFlash2 verify rows (four fewer), with byte-identical output.
-- **`--vision-bf16` keeps a bf16 image tower as stored**: DeepSeek-V4.1 and Qwen skip the load-time 8-bit requantization and bill the full tower (about 0.47 GB and 0.30 GB more memory) for the stored tower's exact image quality.
-- **Qwen3.8-Flash-Next decode uses fewer GPU launches per MoE layer**: the shared expert, its gate logit and the gated add now run inside the routed experts' pair, down and finish launches, for a serial token (four fewer) and for MTP and DFlash2 verify rows (seven or more fewer), on both the one-bank and the rate-grouped packs, with byte-identical output.
-- **A load that wires more than macOS allows warns at startup**: past `vm.global_user_wire_limit` (116.82 GB by default on a 128 GB Mac) a prefill runs slower, so the log now names the limit and the `sudo sysctl` that raises it.
-- **DeepSeek-V4.1-Flash decodes with 200 fewer GPU launches per token**: the shared expert now runs inside the routed experts' decode launches on every speculated layer, serial decode and DSpark verify alike, with byte-identical output.
-- **DeepSeek-V4.1-Flash reads its token embedding from SSD**: the 4-bit table's 0.37 GB is no longer resident and goes to the expert cache; output is unchanged.
-- **Qwen's image tower takes a third less memory**: the packs' bf16 vision tower is requantized to 8 bits at load (0.90 GB to 0.60 GB, about 30 ms), so a resident load holds 0.30 GB less and a streamed `--vision` load gives the expert cache the difference; the tower's output stays within cosine 0.999 of the bf16 tower.
-- **DeepSeek-V4.1's image tower takes half the memory**: the pack's bf16 vision tower is requantized to 8 bits at load (0.97 GB to 0.50 GB, under 0.1 s), so images leave the expert cache about 0.5 GB more; the tower's output stays within cosine 0.999 of the bf16 tower.
-- **DeepSeek-V4.1-Flash prefills in about 8 GB less memory**: sushi now owns the pack's weight memory and every forward runs under a hard per-phase cap, so a 2048-row prefill chunk reserves 6.6–7.1 GB instead of 15–16 GB and no longer borrows expert layers. Output and prefill speed are unchanged. A request that would pass its cap fails with a 503 and the server keeps serving.
-- **DeepSeek speculates under JSON schemas**: a `response_format` JSON schema keeps DSpark on, with each draft row checked against the grammar.
-- **A queued request says so**: a streamed request waiting behind another gets an SSE comment naming the queue, and the log shows `[queue]` lines; a shutdown ends queued and running requests with a 503 instead of a truncated `length` finish.
-- **`sushi launch opencode` runs the newest opencode**: with an older opencode ahead of a newer one on PATH, the launcher started the older; it now picks the highest version installed.
-- **The server log names the token that ended each turn**: a reply that finishes `stop` logs `[stop]` with the EOS token id and text, the token before it, the completion count and the decode path, so a turn that ends mid-sentence can be traced to its token.
-- **`--model` and `sushi run` accept a relative path**: `sushi serve --model ./pack` used to fail with `ExpertLayoutUnsupported` (or lose expert streaming detection) unless the path was absolute; it is now resolved against the current directory at launch.
-- **Claude Code can count tokens**: `POST /v1/messages/count_tokens` answers `{"input_tokens": N}`, the prompt a
-  `/v1/messages` request with the same body would prefill, images included, without generating anything. Thanks to
-  [@cosmic-quokka](https://github.com/cosmic-quokka) for the request and the patch.
+- **DeepSeek-V4.1 prefills up to 47% faster and decodes up to 13% faster**: on an M5 Max with the 1.75bpw pack at 128K
+  tokens of code, prefill goes from 829 to 1,217 tok/s and decode from 63.7 to 72.0. The attention core runs on the
+  matrix units, the shared expert rides the routed experts' launches, a prompt chunk another chunk follows skips the
+  decoder tail, and the hyper-connection mix runs on a better tile; only the attention change moves output, at rounding
+  level with KLD unchanged within noise.
+- **DeepSeek-V4.1 runs with no flags**: a 1,000,000-token context, a 256,000-token answer budget, and an SSD budget from
+  the Mac's RAM: 80 GB on a 96 GB Mac, 96 GB on a 128 GB Mac (108 GB with `iogpu.wired_limit_mb` at 120000 or more),
+  fully resident on a 192 or 256 GB Mac. `--ctx-size`, `--max-tokens` and `--ssd-budget-gb` still override them.
+- **DeepSeek-V4.1 needs less memory and runs on more Macs**: prefill takes about 8 GB less, the token embedding is read
+  from SSD, the routers stay as stored and the image tower is half the size, all returned to the expert cache; M1 and M2
+  Macs no longer abort, seeded requests repeat exactly, and a JSON schema keeps DSpark on.
+- **Qwen and GLM do less work per token with byte-identical output**: fewer GPU launches per MoE layer, agent turns no
+  longer prefill the previous thought again, SSD restore points every 8192 tokens up to 1M, and a reasoning budget keeps
+  MTP and DSpark speculating through the answer.
+- **Streams match the non-streamed answer in more cases**: `<think>` tags quoted in code and thoughts re-opened
+  mid-answer stream as the non-streamed reply holds them, five more malformed tool-call shapes parse, `/v1/responses`
+  keeps the model's reasoning across a tool loop, and a chat template that fails is refused by name.
+- **Server additions**: `/v1/messages/count_tokens` for Claude Code, `POST /metrics/enable` and SSD-cache write metrics
+  on the dashboard, a queued request says so, GIF and BMP images, idle models unload before a long prompt is refused,
+  and a running stream keeps a quarter of the time while another request prefills.
+- **Code for models sushi does not serve is gone**: `/v1/embeddings`, the nvfp4 quantization mode, GGUF discovery and
+  unused tool-call dialects; a GGUF path is still refused by name.
+- **Thanks** to @stooit for the batched-decode `!` fix (#74), @cosmic-quokka for `count_tokens`, @cyrilmhansen for the
+  cache-write metrics request, and @STRML for the plugin attention work this release ports.
+
+---
 
 ## v1.4.0 — DeepSeek-V4.1-Flash, Qwen STQ 2.75bpw, sushi bench
 
