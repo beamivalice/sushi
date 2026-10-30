@@ -21,6 +21,7 @@ const ubench_mimo2 = @import("ubench_mimo2.zig");
 const registry = [_]report.Bench{
     exl3.ubench.dsv41_experts,
     exl3.ubench.dsv41_tail_routed,
+    exl3.ubench.dsv41_shared_prefill,
 } ++ dsv41.benches ++ [_]report.Bench{
     exl3.ubench.decode_chain,
     exl3.ubench.grouped_decode,

@@ -153,6 +153,43 @@ pub fn outsOf(alloc: std.mem.Allocator, a: Part, b: Part) ![]const [*:0]const u8
 
 /// The fused launch: A's outputs then B's, one grid of both parts' threadgroups, every template int of both.
 pub fn config(alloc: std.mem.Allocator, a: Launch, b: Launch, b_first: bool) !mlx.mlx_fast_metal_kernel_config {
+    return build(alloc, a, b, b_first, true);
+}
+
+/// The input that carries the grid split of a runtime-grid kernel (`sourceRuntime`), in `gridValues` order.
+pub const grid_input = "fz_grid";
+
+/// The grid split `configRuntime`'s launch needs: A's grid in threadgroups, B's, and whether B's come first.
+pub fn gridValues(a: Launch, b: Launch, b_first: bool) [grid_ints.len]u32 {
+    return .{ @intCast(a.tgs[0]), @intCast(a.tgs[1]), @intCast(b.tgs[0]), @intCast(b.tgs[1]), @intCast(a.count()), @intCast(b.count()), @intFromBool(b_first) };
+}
+
+/// `source` reading the grid split from the `grid_input` array, so one compiled kernel serves every launch width.
+pub fn sourceRuntime(alloc: std.mem.Allocator, a: Part, b: Part) ![:0]u8 {
+    const body = try source(alloc, a, b);
+    defer alloc.free(body);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (grid_ints, 0..) |name, i| try out.print(alloc, "const int {s} = int({s}[{d}]);\n", .{ name, grid_input, i });
+    try out.appendSlice(alloc, body);
+    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// `insOf` with the grid input last.
+pub fn insOfRuntime(alloc: std.mem.Allocator, a: Part, b: Part) ![]const [*:0]const u8 {
+    const base = try insOf(alloc, a, b);
+    const out = try alloc.alloc([*:0]const u8, base.len + 1);
+    @memcpy(out[0..base.len], base);
+    out[base.len] = grid_input;
+    return out;
+}
+
+/// `config` without the grid template ints: the launch's width is data, not part of the kernel's name.
+pub fn configRuntime(alloc: std.mem.Allocator, a: Launch, b: Launch, b_first: bool) !mlx.mlx_fast_metal_kernel_config {
+    return build(alloc, a, b, b_first, false);
+}
+
+fn build(alloc: std.mem.Allocator, a: Launch, b: Launch, b_first: bool, grid_template: bool) !mlx.mlx_fast_metal_kernel_config {
     if (a.threads != b.threads) return error.FuseThreadsDiffer;
     const na = a.count();
     const nb = b.count();
@@ -161,7 +198,7 @@ pub fn config(alloc: std.mem.Allocator, a: Launch, b: Launch, b_first: bool) !ml
     try ints.appendSlice(alloc, a.ints);
     for (b.ints) |i| try ints.append(alloc, .{ .name = try std.fmt.allocPrintSentinel(alloc, "{s}{s}", .{ shared_int_prefix, i.name }, 0), .value = i.value });
     const values = [_]c_int{ a.tgs[0], a.tgs[1], b.tgs[0], b.tgs[1], na, nb, @intFromBool(b_first) };
-    for (grid_ints, values) |name, v| try ints.append(alloc, .{ .name = name, .value = v });
+    if (grid_template) for (grid_ints, values) |name, v| try ints.append(alloc, .{ .name = name, .value = v });
     const outs = try std.mem.concat(alloc, Out, &.{ a.outs, b.outs });
     defer alloc.free(outs);
     return (Launch{ .tgs = .{ na + nb, 1, 1 }, .threads = a.threads, .ints = ints.items, .outs = outs }).config();

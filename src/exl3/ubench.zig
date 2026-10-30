@@ -46,8 +46,9 @@ pub const Mode = enum { uniform, highest, lowest, shared };
 /// route sets (every distinct expert once).
 pub fn makeRoutes(rnd: std.Random, rb: *const rate_groups.Ragged, rows: usize, topk: usize, mode: Mode, out: *[ROUTE_SETS]mlx.mlx_array) f64 {
     var total: f64 = 0;
+    const ids = std.heap.page_allocator.alloc(u32, rows * topk) catch @panic("OOM");
+    defer std.heap.page_allocator.free(ids);
     for (out) |*r| {
-        var ids: [256 * 6]u32 = undefined;
         var seen: [512]bool = @splat(false);
         for (0..rows) |row| {
             const ri = ids[row * topk ..][0..topk];
@@ -73,7 +74,7 @@ pub fn makeRoutes(rnd: std.Random, rb: *const rate_groups.Ragged, rows: usize, t
                 }
             }
         }
-        r.* = mlx.mlx_array_new_data(&ids, &[_]c_int{@intCast(rows * topk)}, 1, .uint32);
+        r.* = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .uint32);
     }
     return total / ROUTE_SETS;
 }
@@ -594,6 +595,90 @@ fn runRows(run: *report.Run) anyerror!void {
         const flop = @as(f64, @floatFromInt(experts * r)) * 3 * 2 * @as(f64, @floatFromInt(HIDDEN * INTER));
         try run.metric("grouped", "us/expert", "us", ms * 1e3 / @as(f64, @floatFromInt(experts)));
         try run.metric("grouped", "TFLOP/s", "TFLOP/s", flop / (ms / 1e3) / 1e12);
+    }
+}
+
+pub const dsv41_shared_prefill: report.Bench = .{
+    .name = "dsv41.shared_prefill",
+    .scope = .dsv41,
+    .what = "the shared expert beside the routed prefill chain at the plan's layers: its own chain, riding the routed launches, and absent, by rows",
+    .unit = .us,
+    .axes = &.{
+        .{ .name = "layout", .values = &.{ "L2", "L5", "L23" }, .numeric = false },
+        .{ .name = "rows", .values = &.{ "17", "128", "512", "2048" } },
+    },
+    .arms = &.{ "separate", "fused", "routed_only" },
+    .ref = "separate",
+    .run = runSharedPrefill,
+};
+
+const SharedPrefillArm = enum { separate, fused, routed_only };
+
+const SharedPrefillStep = struct { base: Ctx, se: rate_groups.SharedExpert, arm: SharedPrefillArm };
+
+fn sharedPrefillStep(c: SharedPrefillStep, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const b = c.base;
+    const slots = b.routes[i % ROUTE_SETS];
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    return switch (c.arm) {
+        .separate => rate_groups.moePrefillClampedSharedSeparate(s, x, b.rb, slots, b.scores, b.topk, LIMIT, c.se),
+        .fused => (try rate_groups.moePrefillClampedSharedFused(s, x, b.rb, slots, b.scores, b.topk, LIMIT, c.se)) orelse error.SharedFuseDeclined,
+        .routed_only => rate_groups.moePrefillClamped(s, x, b.rb, slots, b.scores, b.topk, LIMIT),
+    };
+}
+
+const SharedPrefillSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize, c: SharedPrefillStep };
+
+fn sampleSharedPrefill(smp: SharedPrefillSample, arm: usize) anyerror!f64 {
+    var c = smp.c;
+    c.arm = @enumFromInt(arm);
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, c, sharedPrefillStep);
+    const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
+}
+
+fn runSharedPrefill(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0xd550);
+    const rnd = prng.random();
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    var sbank = try bench.makeBank(rnd, HIDDEN, INTER, .{ 64, 64, 64 }, 1, 0.02, 0.9);
+    defer bench.freeBank(&sbank);
+    const sdec = exl3.Decode.tabled(.spec1, .w15);
+    for (LAYOUTS[0..3]) |lay| {
+        if (!listed(run.axis("layout"), lay.key)) continue;
+        var banks: [8]root.Bank = undefined;
+        for (lay.groups, 0..) |g, i| banks[i] = try bench.makeBank(rnd, HIDDEN, INTER, g.n, g.experts, 0.02, 0.9);
+        var rb = try rate_groups.Ragged.init(s, banks[0..lay.groups.len]);
+        defer rb.deinit();
+        const st = rb.storage();
+        const vec = mlx.mlx_vector_array_new_data(&st, st.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
+        for (run.axis("rows")) |rows_text| {
+            const rows = try std.fmt.parseInt(usize, rows_text, 10);
+            var routes: [ROUTE_SETS]mlx.mlx_array = undefined;
+            _ = makeRoutes(rnd, &rb, rows, lay.topk, .uniform, &routes);
+            defer for (routes) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            const xh = try std.heap.page_allocator.alloc(u16, rows * HIDDEN);
+            defer std.heap.page_allocator.free(xh);
+            for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
+            const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(HIDDEN) }, 2, .bfloat16);
+            defer _ = mlx.mlx_array_free(x0);
+            const scv = try std.heap.page_allocator.alloc(f32, rows * lay.topk);
+            defer std.heap.page_allocator.free(scv);
+            for (scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+            const scores = mlx.mlx_array_new_data(scv.ptr, &[_]c_int{@intCast(rows * lay.topk)}, 1, .float32);
+            defer _ = mlx.mlx_array_free(scores);
+            const base: Ctx = .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = true };
+            const smp: SharedPrefillSample = .{ .s = s, .x0 = x0, .steps = run.steps(4), .c = .{ .base = base, .se = .{ .bank = sbank, .dec = sdec }, .arm = .separate } };
+            const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ lay.key, rows });
+            try run.interleave(label, smp, sampleSharedPrefill);
+        }
     }
 }
 

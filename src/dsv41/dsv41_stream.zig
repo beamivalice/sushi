@@ -43,10 +43,10 @@ pub const Stream = struct {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque };
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?A) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?model.SharedOp) anyerror!A {
         const self: *Stream = @ptrCast(@alignCast(ctx));
         const y = try self.apply(sc, layer, x, idx, wts);
-        return if (shared) |sy| sc.add(y, try sc.astype(sy, .float32)) else y;
+        return if (shared) |op| sc.add(y, try sc.astype(try op.value(sc, x), .float32)) else y;
     }
 
     fn leaseOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!model.Experts.Lease {
@@ -192,7 +192,7 @@ pub const StqStream = struct {
         return self.engine.fill_ns_total + self.engine.copy_ns_total;
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?A) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?model.SharedOp) anyerror!A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         return self.applyScored(sc, layer, x, idx, wts, logits, shared orelse return error.Dsv41StqNeedsSharedExpert);
     }
@@ -206,16 +206,16 @@ pub const StqStream = struct {
 
     /// The routed sum plus the shared expert's `shared`, f32 `[L, dim]`.
     pub fn apply(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) !A {
-        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, shared);
+        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, .{ .array = shared });
     }
 
     /// `apply` with the router's `logits`, which a decode-width route's lossy pick (`stream.pick_tolerance`) reads.
-    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: A) !A {
+    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: model.SharedOp) !A {
         if (!mlx.streamIsGpu(sc.s)) return error.Dsv41StreamRequiresGpu;
         // A resident layer maps the picks to slots on the GPU: no host read, so the forward is never stalled on one.
         if (self.engine.residentRoute(@intCast(layer))) |rr| {
             const local = try sc.take(rr.map, try sc.astype(idx, .int32), 0);
-            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, .{ .array = shared });
+            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, shared);
         }
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
@@ -250,7 +250,7 @@ pub const StqStream = struct {
         const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
         // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
-        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, .{ .array = shared });
+        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared);
         self.engine.noteExpertCompute(@intCast(layer), clock.lap());
         return out;
     }
@@ -1093,6 +1093,55 @@ test "dsv41 stq: verify rows that decode each distinct expert once give the per-
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ga), std.mem.sliceAsBytes(gb));
         }
     }
+}
+
+test "dsv41 stq: a wide chunk's shared expert riding the routed prefill launches gives the separate chain's logits and state, byte for byte (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var packs: [2]StqServed = undefined;
+    var rows: [2][]f32 = undefined;
+    var slots: [2][]model.Slot = undefined;
+    var folded: [2]usize = undefined;
+    var built: usize = 0;
+    defer for (0..built) |i| {
+        testing.allocator.free(rows[i]);
+        for (slots[i]) |*sl| model.freeSlot(sl);
+        testing.allocator.free(slots[i]);
+        packs[i].deinit();
+    };
+    for ([_]bool{ false, true }, 0..) |fold, i| {
+        try packs[i].init(dir, .bfloat16, true, false, 8, s);
+        packs[i].m.shared_fold = fold;
+        built += 1;
+        const before = exl3.rate_groups.prefillFoldedCount();
+        var all: std.ArrayList(f32) = .empty;
+        defer all.deinit(testing.allocator);
+        // Both chunks are wider than a decode row group.
+        for ([_][]const u32{ ids[0..20], ids[20..] }) |chunk| {
+            const lg = try model.extend(packs[i].m, chunk, .all);
+            defer _ = mlx.mlx_array_free(lg);
+            const h = try model.hostRows(&sc, lg);
+            defer testing.allocator.free(h);
+            try all.appendSlice(testing.allocator, h);
+        }
+        folded[i] = exl3.rate_groups.prefillFoldedCount() - before;
+        rows[i] = try all.toOwnedSlice(testing.allocator);
+        slots[i] = try testing.allocator.alloc(model.Slot, model.slotCount(packs[i].m));
+        @memset(slots[i], model.nil_slot);
+        try model.captureState(packs[i].m, slots[i]);
+    }
+    try testing.expect(ids.len - 20 > exl3.kernels.DECODE_ROWS_MAX);
+    try testing.expectEqual(@as(usize, 0), folded[0]);
+    try testing.expect(folded[1] > 0);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rows[0]), std.mem.sliceAsBytes(rows[1]));
+    try model.expectSlotsBits(&sc, slots[0], slots[1]);
 }
 
 test "dsv41 stq: tile-major pools give the pack-order pools' bytes, through hits, misses, the union and prefill rows (DSV41_STQ_TINY)" {

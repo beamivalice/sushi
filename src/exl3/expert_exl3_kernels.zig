@@ -811,7 +811,7 @@ const TOKEN_PREPARE_SOURCE: [:0]const u8 =
     \\y[yb + lane + 96u] = half((s1 - s3) * sc);
 ;
 
-const TOKEN_PAIR_PREPARE_SOURCE: [:0]const u8 =
+pub const TOKEN_PAIR_PREPARE_SOURCE: [:0]const u8 =
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
     \\ushort lane = thread_index_in_simdgroup;
@@ -2271,7 +2271,7 @@ pub const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\}
 ;
 
-const MID_SOURCE: [:0]const u8 =
+pub const MID_SOURCE: [:0]const u8 =
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
     \\ushort lane = thread_index_in_simdgroup;

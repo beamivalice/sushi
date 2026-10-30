@@ -68,6 +68,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 |---|---|---|
 | `dsv41.experts` | dsv41 | the 384-expert PAIR1 grouped chain at the plan's layers 2, 5, 23 and the DSpark stage bank, by rows and routing mode |
 | `dsv41.tail_routed` | dsv41 | the CED decoder tail's routed experts at the plan's layers 2, 5, 23: the prefill sorted GEMM against the multi-row decode chain, 8 to 256 rows |
+| `dsv41.shared_prefill` | dsv41 | the shared expert beside the routed prefill chain at the plan's layers 2, 5, 23: its own chain, riding the routed launches, and absent, 17 to 2048 rows |
 | `dsv41.picks_span` | dsv41 | one attention span over a packed compressed store: picked rows unpacked and gathered then the fused kernel, against the fused kernel reading them packed; peak MB |
 | `shared.exl3_decode_chain` | shared | the EXL3 decode chain at Flash-Next geometry for any rate (n24 to n128, MCG and SPEC1, 1 to 4 rows) against n32, n48 and n64 |
 | `shared.exl3_grouped_decode` | shared | the decode chain at 1 to 8 rows with verify rows sharing expert reads: ungrouped, prepared, pairs, sized member capacity, on Flash-Next and DeepSeek geometry |

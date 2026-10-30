@@ -189,7 +189,7 @@ pub const Experts = union(enum) {
         ctx: *anyopaque,
         /// The routed sum (f32 `[L, dim]`) of normed `x` over router picks `idx` (`[L, k]`) weighted `wts`, plus `shared`
         /// (the shared expert's `[L, dim]`) added in f32 when given. `logits` are the router's (`Routes.logits`).
-        apply: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?A) anyerror!A,
+        apply: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?SharedOp) anyerror!A,
         /// The layer's picks `idx` (`[L, k]`) made readable as banks, with the ids as slots of those banks. The banks
         /// stay valid until `release`, which the caller calls once everything reading them is evaluated.
         lease: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!Lease,
@@ -652,6 +652,9 @@ pub const Model = struct {
     attn_nax: bool = true,
     /// A wide span's attention kernel stores the heads as `wo_a` takes them; off, the op chain does (the tests' oracle).
     attn_epilogue: bool = true,
+    /// A wide chunk's shared expert rides the routed prefill launches where the trellis chain takes it there; off, it runs
+    /// as a chain of its own (the tests' oracle).
+    shared_fold: bool = true,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
@@ -2102,7 +2105,7 @@ pub const SharedOp = union(enum) {
     array: A,
     layer: struct { m: *const Model, li: usize },
 
-    fn value(self: SharedOp, sc: *Scope, x: A) !A {
+    pub fn value(self: SharedOp, sc: *Scope, x: A) !A {
         return switch (self) {
             .array => |a| a,
             .layer => |l| sharedExpert(sc, l.m, &l.m.layers[l.li], x),
@@ -2110,10 +2113,20 @@ pub const SharedOp = union(enum) {
     }
 };
 
-fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+fn sharedBank(ly: *const Layer) ?exl3.rate_groups.SharedExpert {
     const q = [3]Stq{ ly.shared[0].stq orelse return null, ly.shared[1].stq orelse return null, ly.shared[2].stq orelse return null };
-    const se: exl3.rate_groups.SharedExpert = .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
+    return .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
+}
+
+fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+    const se = sharedBank(ly) orelse return null;
     const y = try exl3.rate_groups.moeDecodeClampedSharedFused(sc.s, x, rb, flat, scores, k, .float32, se, limit) orelse return null;
+    return try sc.keep(y);
+}
+
+fn prefillWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+    const se = sharedBank(ly) orelse return null;
+    const y = try exl3.rate_groups.moePrefillClampedSharedFused(sc.s, x, rb, flat, scores, k, limit, se) orelse return null;
     return try sc.keep(y);
 }
 
@@ -2136,6 +2149,9 @@ pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const e
         // The shared chain left its own codec active.
         exl3.kernels.setDecodeParams(dec);
         return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, sy, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
+    }
+    if (shared == .layer) {
+        if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k)) |y| return y;
     }
     const sy = try shared.value(sc, x);
     exl3.kernels.setDecodeParams(dec);
@@ -2214,9 +2230,13 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
         if (early) try submit(r.idx);
-        const sy = try sharedExpert(sc, m, ly, h);
-        if (early) try submit(sy);
-        if (pf) |p| try p.mark(.shared, &.{sy});
+        // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there.
+        const wide = m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null;
+        const sy: SharedOp = if (wide) .{ .layer = .{ .m = m, .li = li } } else .{ .array = try sharedExpert(sc, m, ly, h) };
+        if (!wide) {
+            if (early) try submit(sy.array);
+            if (pf) |p| try p.mark(.shared, &.{sy.array});
+        }
         const host0 = if (pf != null and hk.host_ns != null) hk.host_ns.?(hk.ctx) else 0;
         const out = try sc.astype(try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, sy), m.act);
         if (pf) |p| {
@@ -4534,7 +4554,7 @@ fn continueFrom(m: *Model, sc: *Scope, ids: []const u32, p: usize) !Run {
     return run;
 }
 
-fn expectSlotsBits(sc: *Scope, want: []const Slot, got: []const Slot) !void {
+pub fn expectSlotsBits(sc: *Scope, want: []const Slot, got: []const Slot) !void {
     try testing.expectEqual(want.len, got.len);
     for (want, got) |x, y| for (x, y) |u, v| {
         try testing.expectEqual(u.ctx == null, v.ctx == null);

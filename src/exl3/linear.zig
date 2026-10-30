@@ -100,7 +100,7 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
 }
 
 /// Windows of at most `win` rows that never straddle two banks.
-fn windowTable(groups: usize, rows: usize, win: c_int) !kernels.WindowTable {
+pub fn windowTable(groups: usize, rows: usize, win: c_int) !kernels.WindowTable {
     const w: usize = @intCast(win);
     const per = (rows + w - 1) / w;
     const alloc = std.heap.page_allocator;

@@ -474,6 +474,43 @@ into `moeDecodeClamped`'s reduce.
   builds the shared expert then from the kept input. The waiting schedule and the host-fed apply keep it as a chain of its
   own, queued behind the picks so the GPU runs it while the host fills misses.
 
+<a id="dsv41-shared-prefill"></a>
+**The shared expert rides the routed prefill launches** (`rate_groups.moePrefillClampedSharedFused`, rows past the decode
+width, bf16 `x`, SPEC1 n64 shared bank). Three launches carry its threadgroups after the routed ones: the token pair prepare
+(w1 and w3 inputs), the SwiGLU middle and the finish. The middle is one kernel for what the forward builds as two finishes,
+f32 op chain and a down prepare: the routed `MID_SOURCE` with the shared linears' bf16 rounding of gate and up, and one more
+bf16 rounding of the SwiGLU before the down prepare. The finish (`PREFILL_REDUCE_SOURCE`, one more simdgroup per threadgroup)
+stores the f32 sum of the routed bf16 sum and the shared bf16 down result, the add the forward made after both. The grid split
+rides an input array (`fuse.sourceRuntime`), so a chunk of another width reuses the compiled kernel. The shared expert's
+three GEMMs stay launches of their own, on the trunk's window table; riding the routed GEMM launches is not built: what
+the fold leaves of the shared stage is those GEMMs (2.2 to 2.6 ms of a 2048-row layer against the routed chain alone).
+- **Proof** (`exl3 rate groups: the shared expert riding the prefill launches ...`): bytes equal to `moePrefillClampedSharedSeparate`
+  (the forward's two-step sum: `moePrefillClamped`, `sharedPrefillSeparate`, f32 add) at 17, 33, 128 and 600 rows (512/256,
+  four groups with a mixed class, x scaled to engage and to stay under the clamp) and at 17, 128, 512 and 2048 rows on the
+  release geometry (5120/2304, 384 experts in five groups, SPEC1 n64 shared). A deliberately wrong arm (the SwiGLU rounding
+  left out of one lane) fails both tests.
+- **Served path** (`dsv41 stq: a wide chunk's shared expert riding the routed prefill launches ...`, `DSV41_STQ_TINY`): the tiny STQ pack's two
+  wide chunks (20 rows, then the rest) run with `Model.shared_fold` off and on; the fold is taken on the second arm only
+  (`rate_groups.prefillFoldedCount`), and the logits and the captured state are byte-equal. The wrong-arm SwiGLU fails it.
+- **Per layer** (`sushi-ubench run dsv41.shared_prefill`, 73aac2a9, ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC, fans
+  auto, die 49 C at start, median of 7 interleaved rounds of 16 steps, synthetic uniform top-6 routes, us; the L5 and L23
+  2048-row rungs ran at 80+ C):
+
+  | layout, rows | shared separate | fused | routed only | fused / separate |
+  |---|---|---|---|---|
+  | L2, 17 | 3051 | 2830 | 2754 | 0.928 |
+  | L2, 128 | 9732 | 9662 | 9505 | 0.993 |
+  | L2, 512 | 12905 | 12627 | 11987 | 0.978 |
+  | L2, 2048 | 26539 | 25129 | 22621 | 0.947 |
+  | L5, 2048 | 30143 | 28779 | 25392 | 0.955 |
+  | L23, 2048 | 30468 | 29300 | 25926 | 0.962 |
+
+  The fold takes 1.2 to 1.4 ms off a 2048-row layer and 0.07 to 0.28 ms off the narrower ones; the other rungs follow the same order.
+- **Live** (resident 32K stage profile, `--drop-expert 128 --ssd-budget-gb 94`, `SUSHI_DSV41_PREFILL_PROFILE=1`, AC, fans max,
+  die 49 C at boot, GPU lock, one A then one B, A = e7a7571c, B = 73aac2a9's engine, a 32768-token code prompt, one cold
+  prefill each): the 2048-row chunk at position 28672 takes 1369.0 ms on A (shared 81.8 + routed 466.7) and 1326.3 ms on B
+  (the shared stage is folded into routed, 515.2: 548.5 -> 515.2), prefill 1460.3 -> 1494.1 tok/s (+2.3%), same first token.
+
 **The trunk GEMM is not a prefill lever.** At 512 rows the sorted trellis GEMM matches MLX's mxfp8 GEMM and comes
 within ~15% of affine-4. Times in µs, trellis GEMM / mxfp8 / affine-4, interleaved:
 - `wq_b`: 837 / 828 / 730.
