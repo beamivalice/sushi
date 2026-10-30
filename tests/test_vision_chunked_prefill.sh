@@ -17,6 +17,9 @@
 # asserted: chunk width changes GEMM shapes and a 4-bit checkpoint flips
 # near-tie argmaxes across widths (same class as MTP verify — legit).
 #
+# The cap leaves room for the thought: a chunk width moves the thought's length, and a reply the cap cut after
+# "Red, blue" reads as lost rows (the thought itself names all four quadrants).
+#
 # Requires a vision model; SKIPs without one.
 
 set -u
@@ -56,7 +59,7 @@ filler = " ".join(f"item{i} shelf {i % 7}." for i in range(120))
 body = {
     "model": "sushi",
     "temperature": 0.0,
-    "max_tokens": 96,
+    "max_tokens": 512,
     "messages": [
         {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
@@ -85,6 +88,14 @@ run_arm on 1
 
 OFF_TXT=$(python3 -c "import json; print(json.load(open('$WORK/off.resp.json'))['choices'][0]['message']['content'])")
 ON_TXT=$(python3 -c "import json; print(json.load(open('$WORK/on.resp.json'))['choices'][0]['message']['content'])")
+
+for arm in off on; do
+    FIN=$(python3 -c "import json; print(json.load(open('$WORK/$arm.resp.json'))['choices'][0]['finish_reason'])")
+    if [ "$FIN" = length ]; then
+        echo "[fail] $arm arm: the reply was cut by max_tokens, so its colors say nothing about the splice"
+        exit 1
+    fi
+done
 
 echo "off: $OFF_TXT"
 echo "on:  $ON_TXT"
