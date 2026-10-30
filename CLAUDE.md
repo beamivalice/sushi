@@ -205,6 +205,7 @@ owner-approved card; the README pack line follows once the repo is live.
 ## Engine invariants (never break; the doc has the why)
 
 - The inference thread is the SOLE mlx caller, even for frees ([engine-mlx-gotchas](docs/engine-mlx-gotchas.md)).
+- Scheduler dispatch checks never count a pending token; the consuming decoder owns pad-run accounting ([server-lifecycle](docs/server-lifecycle.md)).
 - The weight loader is ONE decision, `model.loadWeightsForConfig` ([server-lifecycle](docs/server-lifecycle.md)).
 - An explicit launch flag outranks `model-settings.json`, which outranks the default
   ([server-lifecycle](docs/server-lifecycle.md#settings)).

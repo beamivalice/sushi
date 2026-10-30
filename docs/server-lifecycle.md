@@ -188,6 +188,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   run after that publishes onto the next request's state.
 - **A plain batched tick stop-checks a slot with no pipeline state** (`batchEntryStops`) before forwarding its pending
   token: a fresh DFlash2 slot whose prefill sampled EOS finishes `stop` with nothing published, as solo does.
+- **Count a pending token once, in the decoder that consumes it.** Planner preflight uses `checkDispatchStop`
+  (budget/EOS only), never the stateful pad-run check. Batch sampling does not count the next token; batch entry
+  does, including a new token sampled while draining a pipeline. `tests/test_pad_run_replay.py` replays a local
+  `SUSHI_PAD_REPLAY_REQUEST` fixture in warm concurrent waves; private captures are never committed.
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel
   (also one landing after prefill, `postPrefillTerminal`), failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
 - `src/generate.zig`: generation, `commitForcedTokens`; `src/mtp_policy.zig` / `src/mtp_round.zig`: MTP policy and rounds; `src/sampler.zig`: sampling;

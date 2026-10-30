@@ -4635,13 +4635,10 @@ pub fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (inner_err) |e| return e;
 }
 
-/// The stop check a slot with no pipeline state owes before its pending token is forwarded
-/// into a batch. Pad runs were counted when a batch sampled the token, not again here.
+/// Count the pending token once, immediately before forwarding it. Sampling and
+/// planner preflight must not count it: a slot may change decode paths between ticks.
 fn batchEntryStops(gen: *Generator) !bool {
-    const pad_run = gen.consecutive_pad;
-    if (try gen.checkStop()) return true;
-    gen.consecutive_pad = pad_run;
-    return false;
+    return gen.checkStop();
 }
 
 /// The slots a plain batched tick forwards, in `live`: each past the per-tick guards every decode
@@ -4686,7 +4683,10 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
                 slot_outcome.finishSlot(sch, slot, gen.finish_reason);
                 continue;
             }
-        } else if (try batchEntryStops(gen)) {
+        }
+        // A pipeline drain consumed the lookahead and sampled a NEW pending token.
+        // It needs the same accounting as a token carried from a previous batch.
+        if (try batchEntryStops(gen)) {
             slot.completion_tokens = gen.completion_tokens;
             slot.stop_path = "batch";
             slot_outcome.finishSlot(sch, slot, gen.finish_reason);
@@ -4893,17 +4893,6 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             slot.stop_path = "batch";
             slot_outcome.finishSlot(sch, slot, "stop");
             continue;
-        }
-        if (gen.next_token_id == 0) {
-            gen.consecutive_pad += 1;
-            if (gen.consecutive_pad >= 3) {
-                slot.stop_token = 0;
-                slot.stop_path = "batch";
-                slot_outcome.finishSlot(sch, slot, "stop");
-                continue;
-            }
-        } else {
-            gen.consecutive_pad = 0;
         }
         if (slot.completion_tokens >= slot.max_tokens) {
             slot_outcome.finishSlot(sch, slot, "length");
@@ -5264,6 +5253,46 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
 }
 
+test "planner and batch entry count each pending punctuation token once" {
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    gen.eos_token_ids = &.{2};
+    gen.step = 0;
+    gen.max_tokens = 100;
+    gen.consecutive_pad = 0;
+    gen.timeout_ns = 0;
+    gen.stall = .{};
+    gen.timer = io_util.Stopwatch.init(testing.io);
+    gen.done = false;
+    gen.finish_reason = "length";
+    const tokens = [_]u32{ 0, 17, 0, 0, 17, 0, 0, 0 };
+    const counts = [_]u32{ 1, 0, 1, 2, 0, 1, 2, 3 };
+    for (tokens, counts, 0..) |token, expected, i| {
+        gen.next_token_id = token;
+        const before = gen.consecutive_pad;
+        // A planner can inspect the same pending token repeatedly before dispatch.
+        try testing.expect(!(try gen.checkDispatchStop()));
+        try testing.expect(!(try gen.checkDispatchStop()));
+        try testing.expectEqual(before, gen.consecutive_pad);
+        // A slot can leave the batch for a solo/MTP tick without resetting the run.
+        const stopped = if (i % 2 == 0) try batchEntryStops(&gen) else try gen.checkStop();
+        try testing.expectEqual(i == tokens.len - 1, stopped);
+        try testing.expectEqual(expected, gen.consecutive_pad);
+        gen.step += 1;
+    }
+    gen.done = false;
+    gen.consecutive_pad = 0;
+    gen.next_token_id = 2;
+    try testing.expect(try gen.checkDispatchStop());
+    try testing.expectEqualStrings("stop", gen.finish_reason);
+    try testing.expectEqual(@as(u32, 0), gen.consecutive_pad);
+    gen.done = false;
+    gen.next_token_id = 17;
+    gen.step = gen.max_tokens;
+    try testing.expect(try gen.checkDispatchStop());
+    try testing.expectEqualStrings("length", gen.finish_reason);
+}
+
 test "a slot with no pipeline state is stop-checked before it joins a batch, EOS is never forwarded" {
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(testing.allocator);
@@ -5286,12 +5315,12 @@ test "a slot with no pipeline state is stop-checked before it joins a batch, EOS
     try testing.expectEqual(@as(u32, 0), gen.step);
     try testing.expectEqual(@as(usize, 0), gen.generated_ids.items.len);
 
-    // A real token joins the batch, and a pad the batch sampled is not counted a second time.
+    // Sampling does not account for the pending token; entry counts it once.
     gen.done = false;
     gen.next_token_id = 0;
     gen.consecutive_pad = 1;
     try testing.expect(!(try batchEntryStops(&gen)));
-    try testing.expectEqual(@as(u32, 1), gen.consecutive_pad);
+    try testing.expectEqual(@as(u32, 2), gen.consecutive_pad);
     try testing.expect(!gen.done);
 
     // A spent budget or stall ends it as the solo path does.
