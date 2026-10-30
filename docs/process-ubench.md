@@ -85,6 +85,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `dsv41.hc_expand` | dsv41 | the hyper-connection expand of a wide chunk (hc 4 x 5120, bf16): the op chain against the fused kernel, alone (the layer tail) and with the FFN stage's mix and norm kernels, at 512 and 2048 rows |
 | `dsv41.hc_expand_decode` | dsv41 | the hyper-connection expand of one decode row (hc 4 x 5120, bf16), 40 chained calls: a thread a column against a thread an output element |
 | `dsv41.hc_stages` | dsv41 | the wide chunk's hyper-connection dispatches one by one (hc 4 x 5120, bf16): mix, norm, split, expand, the attention stage and the FFN stage against a copy of the stream; arms are the mix kernel's row x mix tile (4 x 6, 2 x 12), bytes checked equal, at 512 and 2048 rows |
+| `dsv41.picks_glue` | dsv41 | a decode layer's picks glue (512 picks of 512-wide FP4 rows, some -1) as 40 dependent layers: the op chain against the one kernel, and the link between layers alone, by store rows and query rows |
 | `dsv41.topk` | dsv41 | the decode top-k over index scores, one threadgroup a row against the served split, per row of work in one eval of one or eight |
 | `glm5.verify_qmm` | glm5 | verify-row projections per stored width (A6, A5) at the trunk shapes: serial qmv rows, the row-streaming kernel, row tiles |
 | `glm5.a6_trunk` | glm5 | A6 g128 trunk projections at 2048 rows: qmm against dequantize + dense NAX GEMM, with the count of differing bf16 values |

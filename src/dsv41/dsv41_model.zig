@@ -1796,12 +1796,21 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
 /// index the unpacked rows in order.
 pub fn packedPicks(sc: *Scope, comp: *const Rows, topk: A, raw: bool) !Picks {
     if (raw) return .{ .topk = topk, .store = comp };
+    const pk = comp.pack.?;
+    const u = try qat_mod.unpackPicks(sc, comp.buf, comp.sbuf, try sc.astype(topk, .int32), pk.mode, pk.group, comp.dtype);
+    return .{ .topk = u.ids, .comp_rows = u.rows };
+}
+
+/// `packedPicks`' unpacked arm as ops: clamp the ids, gather codes and scales, unpack, number the rows. The oracle of
+/// its kernel and the bench's other arm.
+pub fn packedPicksOps(sc: *Scope, comp: *const Rows, topk: A) !Picks {
     const K = dim(topk, 1);
     const n = dim(topk, 0) * K;
     const picked = try comp.gather(sc, try sc.reshape(try sc.maximum(topk, try sc.i(0)), &.{ci(n)}));
     const order = try sc.astype(try sc.reshape(try sc.arange(0, n), mlx.getShape(topk)), mlx.mlx_array_dtype(topk));
     return .{ .topk = try sc.where(try sc.ge(topk, try sc.i(0)), order, topk), .comp_rows = picked };
 }
+
 
 /// The window rows of layer `ly` for `proj` (`wkv` of the normed input, `[L, head_dim]`) at `pos`: rms-normed, the tail
 /// rotated, and with the QAT round trips on the fp8 round trip.
@@ -5362,6 +5371,66 @@ test "dsv41 packed picks: the fused kernel reading the picked rows packed gives 
             errdefer std.debug.print("case {d} nax {}\n", .{ ci_, nax });
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(heads[0]), std.mem.sliceAsBytes(heads[1]));
         }
+    }
+}
+
+fn hostBytes(sc: *Scope, a: A) ![]const u8 {
+    const b = try sc.contiguous(try sc.view(a, .uint8));
+    try mlx.check(mlx.mlx_array_eval(b));
+    return mlx.mlx_array_data_uint8(b).?[0..mlx.mlx_array_size(b)];
+}
+
+test "dsv41 packed picks: one kernel gives the rows and ids of the op chain byte for byte (clamped and masked ids, both FP4 stores, release magnitudes)" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const cases = [_]struct { L: usize, K: usize, nc: usize, w: usize, mode: qat_mod.Qat, group: usize, dt: mlx.mlx_dtype, holes: bool }{
+        .{ .L = 1, .K = 512, .nc = 700, .w = 512, .mode = .fp4_e4m3, .group = 16, .dt = .bfloat16, .holes = true },
+        .{ .L = 1, .K = 512, .nc = 4096, .w = 512, .mode = .fp4_e4m3, .group = 16, .dt = .bfloat16, .holes = false },
+        .{ .L = 1, .K = 512, .nc = 9, .w = 512, .mode = .fp4_e4m3, .group = 16, .dt = .bfloat16, .holes = true },
+        .{ .L = 3, .K = 512, .nc = 300, .w = 512, .mode = .fp4_e4m3, .group = 16, .dt = .bfloat16, .holes = true },
+        .{ .L = 16, .K = 512, .nc = 1000, .w = 512, .mode = .fp4_e4m3, .group = 16, .dt = .bfloat16, .holes = true },
+        .{ .L = 2, .K = 24, .nc = 30, .w = 128, .mode = .fp4_ue8m0, .group = 32, .dt = .bfloat16, .holes = true },
+        .{ .L = 1, .K = 64, .nc = 40, .w = 128, .mode = .fp4_ue8m0, .group = 32, .dt = .float32, .holes = true },
+        .{ .L = 5, .K = 7, .nc = 3, .w = 64, .mode = .fp4_e4m3, .group = 16, .dt = .float32, .holes = true },
+    };
+    for (cases, 0..) |c, ci_| {
+        var sc = Scope.init(testing.allocator, gpu);
+        defer sc.deinit();
+        var prng = std.Random.DefaultPrng.init(0x9a1 + ci_);
+        const rnd = prng.random();
+        const host = try testing.allocator.alloc(f32, c.nc * c.w);
+        defer testing.allocator.free(host);
+        for (host, 0..) |*v, i| {
+            // Row magnitudes over many decades, so every scale byte is met; a zero row, and the grid's exact values.
+            const row = i / c.w;
+            const mag = std.math.pow(f32, 2, @as(f32, @floatFromInt(@as(i32, @intCast(row % 28)) - 18)));
+            v.* = if (row % 11 == 4) 0 else rnd.floatNorm(f32) * mag;
+        }
+        const comp = try sc.astype(try sc.floats(host, &.{ ci(c.nc), ci(c.w) }), c.dt);
+        var rows = Rows{ .width = @intCast(c.w), .dtype = c.dt, .pack = .{ .mode = c.mode, .group = c.group } };
+        defer rows.deinit();
+        const x = try qat_mod.qat(&sc, comp, c.mode, c.group);
+        try rows.append(&sc, try sc.slice(x, 0, 0, c.nc / 2));
+        try rows.append(&sc, try sc.slice(x, 0, c.nc / 2, c.nc));
+        const ids = try testing.allocator.alloc(i32, c.L * c.K);
+        defer testing.allocator.free(ids);
+        for (ids, 0..) |*v, i| {
+            const hole = c.holes and (i / c.K % 4 == 1 or rnd.uintLessThan(u32, 7) == 0);
+            v.* = if (hole) -1 else @intCast(rnd.uintLessThan(u32, @intCast(c.nc)));
+        }
+        if (c.holes) ids[0] = -1;
+        ids[ids.len - 1] = @intCast(c.nc - 1);
+        const topk = try sc.ints(ids, &.{ ci(c.L), ci(c.K) });
+        const want = try packedPicksOps(&sc, &rows, topk);
+        const got = try qat_mod.unpackPicks(&sc, rows.buf, rows.sbuf, topk, c.mode, c.group, c.dt);
+        const wr = try hostBytes(&sc, want.comp_rows);
+        const gr = try hostBytes(&sc, got.rows);
+        const wi = try hostBytes(&sc, want.topk);
+        const gi = try hostBytes(&sc, got.ids);
+        errdefer std.debug.print("case {d}\n", .{ci_});
+        try testing.expectEqualSlices(u8, wr, gr);
+        try testing.expectEqualSlices(u8, wi, gi);
     }
 }
 

@@ -243,6 +243,57 @@ pub fn unpackFp4(sc: *Scope, p: Packed, mode: Qat, group: usize, dt: mlx.mlx_dty
     return o[0];
 }
 
+// A thread unpacks four code bytes (eight values, inside one scale group), the arithmetic of UNPACK_SOURCE.
+const UNPACK_PICKS_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint hw = uint(codes_shape[1]);
+    \\const uint w = hw * 2u;
+    \\const uint per_row = hw / 4u;
+    \\const uint n = uint(topk_shape[0]) * uint(topk_shape[1]);
+    \\const uint i = thread_position_in_grid.x;
+    \\if (i >= n * per_row) return;
+    \\const uint r = i / per_row, q = i - r * per_row;
+    \\const int t = topk[r];
+    \\if (q == 0u) ids[r] = t >= 0 ? int(r) : t;
+    \\const uint src = uint(max(t, 0));
+    \\const uint c0 = q * 8u;
+    \\const float s = scale_of(uint(scales[src * (w / uint(G)) + c0 / uint(G)]), MODE);
+    \\const device uchar* cp = codes + src * hw + q * 4u;
+    \\device T* yp = y + r * w + c0;
+    \\for (uint j = 0; j < 4u; ++j) {
+    \\  const uint byte = uint(cp[j]);
+    \\  const float lo = E2M1[byte & 7u] * s, hi = E2M1[(byte >> 4) & 7u] * s;
+    \\  yp[2u * j] = static_cast<T>((byte & 8u) ? -lo : lo);
+    \\  yp[2u * j + 1u] = static_cast<T>((byte & 128u) ? -hi : hi);
+    \\}
+;
+
+var unpack_picks_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+pub const UnpackedPicks = struct { rows: A, ids: A };
+
+/// The rows of a packed store (`codes`, `scales` as `Rows` keeps them) that `topk` `[L, K]` int32 picks (-1 = none, read
+/// as row 0): `rows` `[L * K, w]` as `unpackFp4` of the gathered rows, `ids` `[L, K]` their numbering, -1 kept.
+pub fn unpackPicks(sc: *Scope, codes: A, scales: A, topk: A, mode: Qat, group: usize, dt: mlx.mlx_dtype) !UnpackedPicks {
+    const n = mlx.mlx_array_size(topk);
+    const w = dim(codes, 1) * 2;
+    std.debug.assert(w % 8 == 0 and group % 8 == 0);
+    const k = try kernelNew(&unpack_picks_kernel, "dsv41_unpack_picks", &.{ "codes", "scales", "topk" }, &.{ "y", "ids" }, UNPACK_PICKS_SOURCE, PACK_HEADER);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(n), ci(w) }, 2, dt));
+    const sh = mlx.getShape(topk);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, sh.len, .int32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(@max(n * w / 8, 1)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "G", ci(group)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "MODE", packMode(mode)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    var o: [2]A = undefined;
+    try applyKernel(sc, k, &.{ codes, scales, topk }, cfg, &o);
+    return .{ .rows = o[0], .ids = o[1] };
+}
+
 // ── hyper-connection split ───────────────────────────────────────────────
 
 const HC_SPLIT_SOURCE: [:0]const u8 =
