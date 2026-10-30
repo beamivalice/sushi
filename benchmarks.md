@@ -4,7 +4,7 @@
 - Results go into the tables ONLY. No text, no commentary, no per-release notes — commit messages carry the stories.
 - **Apple M5 Max 128 GB ONLY.** Numbers across hardware are not comparable and one mixed column poisons the history.
 - A cell is `./tests/bench.sh` decode tok/s (llmprobe `--bench-only`: warmup discarded, median of measured runs (3 unless specified), its own code-completion prompt), sushi ReleaseFast at its FASTEST config, with the speculative mode that engaged named beside the number. `·` = not measured that release.
-- From v1.4.0 a cell is `sushi bench` (`./tests/bench.sh`): the code arm's 4k decode median of 3 samples of 512 tokens, shipping defaults, prose median beside it; its numbers are not comparable with the llmprobe table above it.
+- From v1.4.0 a cell is `sushi bench` (`./tests/bench.sh`): the code arm's 4k decode median of 3 samples of 512 tokens, shipping defaults, prose median beside it; its numbers are not comparable with the llmprobe table above it. From v1.4.1 the prose median decodes 128 tokens on every model.
 - The perf gate is one pack, Qwen3.8-Flash-Next-Sushi-4bpw. `speedup` = first measured column vs the latest.
 
 ## Decode tok/s by release
@@ -18,9 +18,9 @@
 
 ## Decode tok/s by release, sushi bench (code / prose, 4k)
 
-| Model | v1.4.0 |
-|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (MTP) | 168.6 / 62.8 mtp |
-| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp |
-| GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark |
+| Model | v1.4.0 | v1.4.1 |
+|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (MTP) | 168.6 / 62.8 mtp | 161.0 / 68.6 mtp |
+| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp | 144.8 / 77.4 mtp |
+| GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash | 70.5 / 41.0 dflash |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark | 79.5 / 51.4 dspark |

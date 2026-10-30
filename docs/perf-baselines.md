@@ -389,6 +389,14 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## v1.4.1 release context ladder
+
+[Version summary and per-model reports](bench/v1.4.1/summary.md), 2026-10-30, Apple M5 Max 128 GB. The v1.4.0 `sushi bench`
+protocol and box settings; one binary from `b358cd38` (SHA `6944232d`). The prose arm decodes 128 tokens on every model.
+- DeepSeek, `--ssd-budget-gb 108`: prefill up to +47% over v1.4.0 (code 128K 1,217 vs 829), decode up to +13%.
+- GLM's code arm ran at heavy thermal pressure from 64K (GPU near 1,270 MHz vs 1,490 in v1.4.0), which accounts for its
+  64K and 128K decode; its 128K code samples are loop-stopped at 390 tokens.
+
 ## v1.4.0 release context ladder
 
 [Version summary and per-model reports](bench/v1.4.0/summary.md), 2026-10-27, Apple M5 Max 128 GB. `sushi bench`
