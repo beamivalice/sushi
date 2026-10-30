@@ -660,10 +660,13 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   the request's rows (`dsv41_prefix.captureShared`), is staged into the writer's bounded host buffers and released before
   the next forward appends, the newest and the prompt-end snapshot included. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
-- **Namespace**: `ModelConfig.cacheLayoutNamespace` returns `dsv41_prefix.namespaceTag` (`dsv41-state-v3`, plus
-  `-dspark` when the stages are resident), hashed into the tier's fingerprint beside the pack's shard names, sizes and
-  mtimes and `config.json`: another pack, another slot set or a bumped tag never reads these entries. Any change to what
-  a stored state means bumps the tag in the same landing.
+- **Namespace**: `dsv41_prefix.layoutKey` (`model_load.diskLayoutKey`) is `namespaceTag` (`dsv41-state-v3`, plus
+  `-dspark` when the stages are resident), then `-simd` when the SIMD attention kernel serves, then the drop list and
+  lossy pick. The key reads `Model.attn_nax` after the load's trial, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
+  or a GPU without NAX never writes into the namespace the matrix-unit boots read (their key is unchanged). It is hashed
+  into the tier's fingerprint beside the pack's shard names, sizes and mtimes and `config.json`: another pack, another
+  slot set, another arm or a bumped tag never reads these entries. Any change to what a stored state means bumps the
+  tag, or adds a key part, in the same landing.
 - **Checkpoints** come from the Qwen schedule: absolute multiples of the stride (at least the prefill chunk, 8192 by
   default) and the prompt-end snapshot 30 tokens before the end, where the next turn's re-rendered generation prefix
   still matches. In RAM (a RAM entry, a prefill's list) at most 4 (`dsv41_prefix.checkpoint_cap`): each is a full copy,

@@ -2053,8 +2053,8 @@ pub const DiskTier = struct {
 
         // Token record — the LONGER of the existing record and this commit's
         // tokens (a resumed incremental flush must not shrink the record its
-        // earlier chunks were committed against). Rewritten only on growth;
-        // tens of KB at most.
+        // earlier chunks were committed against). An extension appends only its new tail: the
+        // manifest still on disk names the old count, and the scan reads a longer record at it.
         const record: []const u32 = if (extend_idx) |i| blk: {
             const et = self.entries.items[i].tokens;
             break :blk if (et.len >= tokens.len) et else tokens;
@@ -2062,14 +2062,17 @@ pub const DiskTier = struct {
         if (extend_idx == null or record.ptr == tokens.ptr) {
             const tpath = try std.fmt.allocPrint(self.allocator, "{s}/tokens.bin", .{dir_rel});
             defer self.allocator.free(tpath);
-            errdefer self.stats.recordFailed(record.len * 4);
-            const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{});
+            const have: usize = if (extend_idx) |i| self.entries.items[i].tokens.len else 0;
+            const from: usize = if (have * 4 <= (fileSize(self.io, tpath) orelse 0)) have else 0;
+            errdefer self.stats.recordFailed((record.len - from) * 4);
+            const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{ .truncate = from == 0 });
             defer f.close(self.io);
             var wb: [8192]u8 = undefined;
             var fw = f.writer(self.io, &wb);
-            try fw.interface.writeSliceEndian(u32, record, .little);
+            try fw.seekTo(from * 4);
+            try fw.interface.writeSliceEndian(u32, record[from..], .little);
             try fw.interface.flush();
-            self.stats.recordWritten(.meta, record.len * 4);
+            self.stats.recordWritten(.meta, (record.len - from) * 4);
         }
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
@@ -3960,7 +3963,8 @@ pub const DiskTier = struct {
             return null;
         };
         defer self.allocator.free(raw);
-        if (raw.len != n_tokens * 4) {
+        // Longer is an extend's append that died before its manifest landed: the first `n_tokens` are the record.
+        if (raw.len < n_tokens * 4) {
             self.allocator.free(chunk_bytes);
             return null;
         }
@@ -8046,4 +8050,121 @@ test "DiskTier chunk share: a donor under other pixels lends only the chunks who
     _ = try mediaCommit(&tier, &cache, &toks.b, 0xB2B2_B2B2_B2B2_B2B2, 300, s);
     try testing.expectEqual(@as(usize, 2), tier.entryCount());
     try testing.expectEqual(@as(u32, 2), tier.entries.items[1].inherited_chunks);
+}
+
+test "DiskTier: an extend still staged behind the writer leaves an entry the scan reads at the manifest's count" {
+    // A kill before the staged manifest lands leaves the previous one, whose count is shorter than the record.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-torn-record", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    tier.drainWriter();
+    tier.writer.?.setPaused(true);
+    defer tier.writer.?.setPaused(false);
+    _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
+
+    var loaded = tier.loadEntry(1) orelse return error.TestExpectedEntry;
+    defer tier.freeIndexEntryOwned(&loaded.e);
+    try testing.expectEqualSlices(u32, tokens[0..600], loaded.e.tokens);
+}
+
+test "DiskTier: a token record longer than the manifest's count restores at the count" {
+    // A torn append: whole tokens past the count, then a partial one.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-longer", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    const record = try tmp.dir.readFileAlloc(io, "fp-longer/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    const torn = try std.mem.concat(testing.allocator, u8, &.{ record, &[_]u8{ 9, 0, 0, 0, 10, 0, 0, 0, 11, 0 } });
+    defer testing.allocator.free(torn);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-longer/e1/tokens.bin", .data = torn });
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-longer", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqualSlices(u32, &tokens, tier2.entries.items[0].tokens);
+    var out = try KVCache.init(testing.allocator, 1);
+    defer out.deinit();
+    try testing.expectEqual(@as(u32, 600), try tier2.restoreInto(&out, 0, s));
+}
+
+test "DiskTier: a token record shorter than the manifest's count drops the entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-shorter", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    const record = try tmp.dir.readFileAlloc(io, "fp-shorter/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shorter/e1/tokens.bin", .data = record[0 .. record.len - 2] });
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-shorter", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 0), tier2.entryCount());
+}
+
+test "DiskTier: an extend writes the new tail of the token record, not the whole record" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-tail", 0, 128);
+    defer tier.deinit();
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    const kind = @intFromEnum(write_stats.Kind.meta);
+    const before = tier.stats.snapshot().written[kind];
+    _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
+    const grown = tier.stats.snapshot().written[kind] - before;
+
+    const manifest = try std.fmt.allocPrint(testing.allocator, "{s}/e1/meta.json", .{tier.root});
+    defer testing.allocator.free(manifest);
+    try testing.expectEqual(600 * 4 + fileSize(io, manifest).?, grown);
+
+    const record = try tmp.dir.readFileAlloc(io, "fp-tail/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&tokens), record);
 }

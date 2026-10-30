@@ -379,6 +379,9 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   an earlier piece keeps what the entry had. Each piece used to rewrite it synchronously.
 - **Nothing is fsynced.** A file lands as `tmp` + `rename` and the manifest last, so a crash of the process leaves
   whole entries; a power loss can leave a manifest naming bytes the disk never kept. A failed restore cold-prefills.
+- **`tokens.bin` is append-only**: an extension writes only its new tail, at the old record's end (a whole record when the file is shorter than the old count). The
+  manifest, which lands last, names the count; `scan` drops a record SHORTER than it and reads the first `tokens` of a longer one, so a kill between the append and
+  the manifest keeps the entry at the old count instead of losing it, and a torn append only leaves bytes past the count that the next extension overwrites.
 - **GLM hands the SSD tier the request's own rows** (`MlaRows.shareLive`, `HotPrefixCache.glmDiskLen`): every row
   through the newest checkpoint that fits the tier's budget, never copied. The share holds the request's buffers
   from its commit to the flush, when nothing writes them. The RAM tier copies only what its budget keeps.

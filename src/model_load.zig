@@ -433,11 +433,11 @@ pub const VisionCost = struct {
 };
 
 /// The stored-state layout the SSD namespace is keyed by; DeepSeek's names the expert drop list and the lossy pick too.
-fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) !?[]u8 {
+fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, xfm: *const transformer_mod.Transformer) !?[]u8 {
     if (!config.isDsv41()) return if (config.cacheLayoutNamespace()) |tag| try allocator.dupe(u8, tag) else null;
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
     defer if (drop) |*d| d.deinit();
-    return try dsv41_prefix.layoutKey(allocator, config.dsparkOn(), if (drop) |*d| d else null, expert_stream_mod.pick_tolerance);
+    return try dsv41_prefix.layoutKey(allocator, config.dsparkOn(), xfm.dsv41.?.attn_nax, if (drop) |*d| d else null, expert_stream_mod.pick_tolerance);
 }
 
 /// The ONE streamed-load plan, read by the serving load, its registry gate and `kld`: the
@@ -2192,7 +2192,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // so every bill reads the same answer as `--prefix-cache-disk off`.
     var disk_tier: ?kv_disk_cache.DiskTier = null;
     if (cache_applies and params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-        const layout = diskLayoutKey(sch.allocator, params.config, entry.path) catch |err| {
+        const layout = diskLayoutKey(sch.allocator, params.config, entry.path, xfm_ptr) catch |err| {
             log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
