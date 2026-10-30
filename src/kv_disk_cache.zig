@@ -2072,6 +2072,8 @@ pub const DiskTier = struct {
             try fw.seekTo(from * 4);
             try fw.interface.writeSliceEndian(u32, record[from..], .little);
             try fw.interface.flush();
+            // Bytes past the record (a torn or stale tail) would never be billed or swept.
+            try f.setLength(self.io, record.len * 4);
             self.stats.recordWritten(.meta, (record.len - from) * 4);
         }
 
@@ -8111,6 +8113,37 @@ test "DiskTier: a token record longer than the manifest's count restores at the 
     var out = try KVCache.init(testing.allocator, 1);
     defer out.deinit();
     try testing.expectEqual(@as(u32, 600), try tier2.restoreInto(&out, 0, s));
+}
+
+test "DiskTier: an extend shorter than a stale token tail leaves a record of exactly its tokens" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 601, 8, 0.0, .float32);
+    var tokens: [601]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-stale", 0, 128);
+        defer tier.deinit();
+        _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    }
+    const record = try tmp.dir.readFileAlloc(io, "fp-stale/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    const torn = try std.mem.concat(testing.allocator, u8, &.{ record, &[_]u8{ 9, 0, 0, 0, 10, 0, 0, 0, 11, 0, 0, 0, 12, 0 } });
+    defer testing.allocator.free(torn);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stale/e1/tokens.bin", .data = torn });
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-stale", 0, 128);
+    defer tier.deinit();
+    _ = try tier.appendCommit(cache.entries, 601, cache.config, &tokens, false, null, s);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/e1/tokens.bin", .{tier.root});
+    defer testing.allocator.free(path);
+    try testing.expectEqual(@as(u64, tokens.len * 4), fileSize(io, path).?);
 }
 
 test "DiskTier: a token record shorter than the manifest's count drops the entry" {

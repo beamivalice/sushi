@@ -4698,6 +4698,20 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
     return live_n;
 }
 
+/// A GDN group with a slot that has no recurrent state yet cannot merge: it decodes serially this
+/// tick (skipping would advance nothing, so a group that never becomes ready would spin). Decided
+/// before `batchedTickRows` so a slot's pending token is stop-checked on exactly one path.
+fn serialFallback(sch: *Scheduler, xfm: *const Transformer, active: []*Slot, comptime serial: anytype) !bool {
+    if (!xfm.supportsBatchedGdnDecode()) return false;
+    const all_ready = for (active) |s| {
+        const gen = if (s.legacy_gen) |*g| g else continue;
+        if (!xfm.batchedGdnReady(&.{&gen.ctx})) break false;
+    } else true;
+    if (all_ready) return false;
+    for (active) |s| try serial(sch, s);
+    return true;
+}
+
 fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const N = active.len;
     if (N == 0) return;
@@ -4711,6 +4725,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     if (std.debug.runtime_safety) {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
+
+    if (try serialFallback(sch, xfm_ptr, active, runSingleDecodeTick)) return;
 
     const observe_plain = Planner.enabled() and xfm_ptr.qwen4 != null and N <= Planner.MAX_ROWS;
     var price_watch = io_util.Stopwatch.init(active[0].io);
@@ -4774,13 +4790,6 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // linear layer there, so it reads 0 forever and every batched token was
     // roped at position 0.
     for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn or use_mimo) slot.moe_seq_offset else slot.cache.step);
-    if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
-        // A slot with no recurrent state yet cannot join the merge. Decode the
-        // group serially this tick instead of skipping it — skipping advances
-        // nothing, so a group that never becomes ready would spin forever.
-        for (batch) |s| try runSingleDecodeTick(sch, s);
-        return;
-    }
     var want_hidden = false;
     for (batch) |slot| {
         want_hidden = want_hidden or slot.mtp_plain_tick;
@@ -5328,6 +5337,50 @@ test "a slot with no pipeline state is stop-checked before it joins a batch, EOS
     gen.step = 8;
     try testing.expect(try batchEntryStops(&gen));
     try testing.expectEqualStrings("length", gen.finish_reason);
+}
+
+test "a slot the batched tick hands back to the serial path counts its pending pad once" {
+    const Serial = struct {
+        var calls: usize = 0;
+        fn tick(_: *Scheduler, slot: *Slot) !void {
+            calls += 1;
+            _ = try slot.legacy_gen.?.checkStop();
+        }
+    };
+    var xfm: Transformer = undefined;
+    xfm.config.model_type = "qwen4_exp";
+    xfm.config.full_attention_interval = 4;
+    xfm.glm5 = null;
+    xfm.moe_layers = &.{};
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    gen.eos_token_ids = &.{2};
+    gen.next_token_id = 0;
+    gen.step = 0;
+    gen.max_tokens = 100;
+    gen.consecutive_pad = 1;
+    gen.timeout_ns = 0;
+    gen.stall = .{};
+    gen.timer = io_util.Stopwatch.init(testing.io);
+    gen.done = false;
+    gen.finish_reason = "length";
+    gen.ctx.ssm_entries = null;
+    var slot: Slot = undefined;
+    slot.legacy_gen = gen;
+    var sch: Scheduler = undefined;
+    var active = [_]*Slot{&slot};
+
+    Serial.calls = 0;
+    try testing.expect(try serialFallback(&sch, &xfm, &active, Serial.tick));
+    try testing.expectEqual(@as(usize, 1), Serial.calls);
+    try testing.expectEqual(@as(u32, 2), slot.legacy_gen.?.consecutive_pad);
+    try testing.expect(!slot.legacy_gen.?.done);
+
+    // A group whose slots all carry state merges: nothing runs serially and nothing is counted.
+    slot.legacy_gen.?.ctx.ssm_entries = &.{};
+    try testing.expect(!(try serialFallback(&sch, &xfm, &active, Serial.tick)));
+    try testing.expectEqual(@as(usize, 1), Serial.calls);
+    try testing.expectEqual(@as(u32, 2), slot.legacy_gen.?.consecutive_pad);
 }
 
 test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary" {

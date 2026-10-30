@@ -260,12 +260,16 @@ pub fn rowDivisors(allocator: std.mem.Allocator, c: *const @import("dsv41_config
 /// The SSD namespace of one boot: `namespaceTag` plus what changes the numbers a stored state was computed
 /// under. `drop` is the ranked list in use; a non-zero `pick_tolerance` stores states built on cache-dependent
 /// picks, so no exact boot reads them. `attn_nax` is the attention arm that serves: the SIMD arm sums in another
-/// order, so its states are no NAX boot's. A boot with none of these keeps `namespaceTag`.
-pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, attn_nax: bool, drop: ?*const expert_usage.Drop, pick_tolerance: f32) ![]u8 {
+/// order, so its states are no NAX boot's. A composed boot (`fused` off) runs the op chains, and DSpark rounds that
+/// sum by width (`dspark_exact` off) change the verify rows; neither writes into the served namespace. A boot with
+/// none of these keeps `namespaceTag`.
+pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, attn_nax: bool, fused: bool, dspark_exact: bool, drop: ?*const expert_usage.Drop, pick_tolerance: f32) ![]u8 {
     var key = std.ArrayList(u8).empty;
     errdefer key.deinit(allocator);
     try key.appendSlice(allocator, namespaceTag(dspark));
     if (!attn_nax) try key.appendSlice(allocator, "-simd");
+    if (!fused) try key.appendSlice(allocator, "-composed");
+    if (dspark and !dspark_exact) try key.appendSlice(allocator, "-dsparkinexact");
     if (drop) |d| try key.print(allocator, "-drop{d}-{x:0>16}", .{ d.n, d.digest() });
     if (pick_tolerance > 0) try key.print(allocator, "-pick{x:0>8}", .{@as(u32, @bitCast(pick_tolerance))});
     return key.toOwnedSlice(allocator);
@@ -366,7 +370,7 @@ pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, t
 
 test "layoutKey: a boot that drops other experts or picks leniently has its own namespace" {
     const a = testing.allocator;
-    const full = try layoutKey(a, false, true, null, 0);
+    const full = try layoutKey(a, false, true, true, true, null, 0);
     defer a.free(full);
     try testing.expectEqualStrings(namespaceTag(false), full);
 
@@ -380,29 +384,48 @@ test "layoutKey: a boot that drops other experts or picks leniently has its own 
     var d16 = try expert_usage.fixedDrop(a, 1, &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &.{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } });
     defer d16.deinit();
 
-    const k8 = try layoutKey(a, false, true, &d8, 0);
+    const k8 = try layoutKey(a, false, true, true, true, &d8, 0);
     defer a.free(k8);
-    const k8_same = try layoutKey(a, false, true, &d8_same, 0);
+    const k8_same = try layoutKey(a, false, true, true, true, &d8_same, 0);
     defer a.free(k8_same);
-    const k8_other = try layoutKey(a, false, true, &d8_other, 0);
+    const k8_other = try layoutKey(a, false, true, true, true, &d8_other, 0);
     defer a.free(k8_other);
-    const k16 = try layoutKey(a, false, true, &d16, 0);
+    const k16 = try layoutKey(a, false, true, true, true, &d16, 0);
     defer a.free(k16);
-    const k8_dspark = try layoutKey(a, true, true, &d8, 0);
+    const k8_dspark = try layoutKey(a, true, true, true, true, &d8, 0);
     defer a.free(k8_dspark);
-    const k_lossy = try layoutKey(a, false, true, null, 0.3);
+    const k_lossy = try layoutKey(a, false, true, true, true, null, 0.3);
     defer a.free(k_lossy);
-    const k_lossier = try layoutKey(a, false, true, null, 0.4);
+    const k_lossier = try layoutKey(a, false, true, true, true, null, 0.4);
     defer a.free(k_lossier);
-    const k8_lossy = try layoutKey(a, false, true, &d8, 0.3);
+    const k8_lossy = try layoutKey(a, false, true, true, true, &d8, 0.3);
     defer a.free(k8_lossy);
-    const k_simd = try layoutKey(a, false, false, null, 0);
+    const k_simd = try layoutKey(a, false, false, true, true, null, 0);
     defer a.free(k_simd);
-    const k8_simd = try layoutKey(a, false, false, &d8, 0);
+    const k8_simd = try layoutKey(a, false, false, true, true, &d8, 0);
     defer a.free(k8_simd);
 
+    const k_composed = try layoutKey(a, false, true, false, true, null, 0);
+    defer a.free(k_composed);
+    const k_composed_simd = try layoutKey(a, false, false, false, true, null, 0);
+    defer a.free(k_composed_simd);
+    const k_dspark = try layoutKey(a, true, true, true, true, null, 0);
+    defer a.free(k_dspark);
+    const k_dspark_inexact = try layoutKey(a, true, true, true, false, null, 0);
+    defer a.free(k_dspark_inexact);
+    const k_dspark_composed = try layoutKey(a, true, true, false, false, null, 0);
+    defer a.free(k_dspark_composed);
+
+    // The served keys are unchanged, and a model without DSpark has no verify rows to sum differently.
+    try testing.expectEqualStrings("dsv41-state-v3", full);
+    try testing.expectEqualStrings("dsv41-state-v3-simd", k_simd);
+    try testing.expectEqualStrings(namespaceTag(true), k_dspark);
+    const no_dspark = try layoutKey(a, false, true, true, false, null, 0);
+    defer a.free(no_dspark);
+    try testing.expectEqualStrings(full, no_dspark);
+
     try testing.expectEqualStrings(k8, k8_same);
-    const distinct = [_][]const u8{ full, k8, k8_other, k16, k8_dspark, k_lossy, k_lossier, k8_lossy, k_simd, k8_simd };
+    const distinct = [_][]const u8{ full, k8, k8_other, k16, k8_dspark, k_lossy, k_lossier, k8_lossy, k_simd, k8_simd, k_composed, k_composed_simd, k_dspark, k_dspark_inexact, k_dspark_composed };
     for (distinct, 0..) |x, i| for (distinct[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x, y));
 }
 

@@ -180,8 +180,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`contentWithoutClosers`; a closer inside a code span is text) and `trimTrailingThinkClosers` keeps the tail.
   `<think>t</think>391</think>391` is content `391391` stream and non-stream.
 - **A live row never asserts that a model thinks**: a thought the model closes empty (`</think>42`) has no reasoning
-  and no thinking block, on every surface. Rows 4 and 20 of `tests/test_format_matrix.sh` branch on billed reasoning
-  tokens and on the non-stream turn.
+  and no thinking block, on every surface. Rows 4 and 20 of `tests/test_format_matrix.sh` branch on an
+  independent non-stream turn: a stream's billed reasoning tokens come from what it delivered, so they prove nothing.
 
 ## Loop stops
 

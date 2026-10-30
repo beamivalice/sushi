@@ -437,7 +437,8 @@ fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model
     if (!config.isDsv41()) return if (config.cacheLayoutNamespace()) |tag| try allocator.dupe(u8, tag) else null;
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
     defer if (drop) |*d| d.deinit();
-    return try dsv41_prefix.layoutKey(allocator, config.dsparkOn(), xfm.dsv41.?.attn_nax, if (drop) |*d| d else null, expert_stream_mod.pick_tolerance);
+    const m = xfm.dsv41.?;
+    return try dsv41_prefix.layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, expert_stream_mod.pick_tolerance);
 }
 
 /// The ONE streamed-load plan, read by the serving load, its registry gate and `kld`: the

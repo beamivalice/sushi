@@ -676,7 +676,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   the next forward appends, the newest and the prompt-end snapshot included. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
 - **Namespace**: `dsv41_prefix.layoutKey` (`model_load.diskLayoutKey`) is `namespaceTag` (`dsv41-state-v3`, plus
-  `-dspark` when the stages are resident), then `-simd` when the SIMD attention kernel serves, then the drop list and
+  `-dspark` when the stages are resident), then `-simd` when the SIMD attention kernel serves, `-composed` for a
+  `SUSHI_DSV41_COMPOSED=1` boot, `-dsparkinexact` for `SUSHI_DSV41_DSPARK_EXACT=0` with DSpark, then the drop list and
   lossy pick. The key reads `Model.attn_nax` after the load's trial, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
   or a GPU without NAX never writes into the namespace the matrix-unit boots read (their key is unchanged). It is hashed
   into the tier's fingerprint beside the pack's shard names, sizes and mtimes and `config.json`: another pack, another
