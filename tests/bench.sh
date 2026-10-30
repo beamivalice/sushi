@@ -3,7 +3,7 @@
 # bench.sh — the release bench for ONE model: boots a sushi server, drives it with `sushi bench`, stops it.
 #
 #   ./tests/bench.sh --version 1.4.0 <pack> [-- <sushi serve flags>]
-#   ./tests/bench.sh --tag try1 <pack> -- --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000
+#   ./tests/bench.sh --tag try1 <pack> -- --ssd-budget-gb 108
 #
 # <pack> is a directory, or a name under ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}. Everything after `--` goes to
 # the server; the shipping defaults (speculative mode, kv8) stay on unless a flag changes them. The protocol,

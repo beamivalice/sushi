@@ -489,10 +489,10 @@ pub fn handleAnthropicMessages(
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
     const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
-    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else launchMaxTokensDefault();
+    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else request_policy.filledMaxTokens(config);
     // For the request log line only. This surface 400s on a missing budget, so
     // the origin here is never `.auto`.
-    const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault());
+    const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault(), config.defaultMaxTokens());
     if (max_tokens == 0) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
         return;

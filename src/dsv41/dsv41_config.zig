@@ -73,6 +73,11 @@ pub const Vision = struct {
 };
 
 pub const Config = struct {
+    /// DeepSeek's recommended serving for V4.1-Flash: a 1M window and a generation budget of at least 256K.
+    pub fn serveDefaults(comptime D: type) D {
+        return .{ .context = 1_000_000, .max_tokens = 256_000, .ram_budget = true };
+    }
+
     vocab: u32 = 0,
     dim: u32 = 0,
     layers: u32 = 0,

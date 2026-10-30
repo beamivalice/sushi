@@ -1337,7 +1337,9 @@ pub fn serve(
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = safeAutoContext(memory_ctx);
         const rope_ctx = config.contextCap();
-        if (rope_ctx > 0 and pinned >= rope_ctx) {
+        if (config.defaultContext() > 0 and pinned == config.defaultContext()) {
+            log.info("Context size: {d} tokens (auto: the model's default; memory would allow {d}) [pinned]\n", .{ pinned, memory_ctx });
+        } else if (rope_ctx > 0 and pinned >= rope_ctx) {
             // The checkpoint's own maximum binds; memory had room to spare.
             log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
         } else {
@@ -1357,8 +1359,8 @@ pub fn serve(
     } else {
         log.info("Reasoning budget: unlimited\n", .{});
     }
-    if (request_policy.launchMaxTokensDefault() > 0) {
-        log.info("default max_tokens for omitted requests: {d}\n", .{request_policy.launchMaxTokensDefault()});
+    if (request_policy.filledMaxTokens(config) > 0) {
+        log.info("default max_tokens for omitted requests: {d} ({s})\n", .{ request_policy.filledMaxTokens(config), if (request_policy.launchMaxTokensDefault() > 0) "--max-tokens" else "model default" });
     }
     if (scheduler.dflash != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
@@ -1974,14 +1976,16 @@ fn safeAutoContext(raw: u32) u32 {
 /// The context the server advertises, from the largest context memory alone allows (93%
 /// margin on the memory number, checkpoint cap afterwards). Shared by the load-time session
 /// bill and the boot-time sizer so the two cannot spell the relation two ways.
-fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
+fn autoContextFrom(memory_ctx: u32, ctx_cap: u32, ctx_default: u32) u32 {
     const with_headroom = safeAutoContext(memory_ctx);
+    // The default is served only where the margined memory context reaches it: the headroom stays.
+    if (ctx_default > 0 and with_headroom >= ctx_default) return ctx_default;
     return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
 }
 
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
     if (billedAutoContext(config)) return billedAdvertisedContext(config, computeMemoryContext(config));
-    return autoContextFrom(computeMemoryContext(config), config.contextCap());
+    return autoContextFrom(computeMemoryContext(config), config.contextCap(), config.defaultContext());
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -2001,6 +2005,9 @@ fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context == 0) {
         config.pinned_context = autoContextFor(config);
+        const want = config.defaultContext();
+        if (want > 0 and config.pinned_context < want)
+            log.warn("[context] this Mac's memory bill admits {d} tokens, below the {d} the model defaults to; serving {d}\n", .{ computeMemoryContext(config), want, config.pinned_context });
     }
     return config.pinned_context;
 }
@@ -2344,6 +2351,31 @@ pub fn warnUserWireLimit() void {
     const limits = [2]u64{ readSysctlU64("vm.global_user_wire_limit"), readSysctlU64("vm.user_wire_limit") };
     if (userWireWarning(&buf, model_mod.ownedBytesTotal(), limits, wiredLimitBytes(), metrics.getTotalMemBytes())) |line|
         log.warn("{s}\n", .{line});
+}
+
+/// The limits a default `--ssd-budget-gb` must fit: the residency limit (the declared wired limit, else Metal's working
+/// set) and the lower user-wire sysctl, each less what stays unplanned under it.
+pub fn defaultBudgetLimits() model_load.BudgetLimits {
+    const wire = [2]u64{ readSysctlU64("vm.global_user_wire_limit"), readSysctlU64("vm.user_wire_limit") };
+    const wire_bind: usize = if (wire[0] == 0 or (wire[1] != 0 and wire[1] < wire[0])) 1 else 0;
+    return .{
+        .wired_limit = wiredLimitBytes(),
+        .ceiling = ssdBudgetCeiling(wiredLimitBytes(), staticGpuMemoryCeiling()),
+        .ceiling_name = if (wiredLimitBytes() > 0) "iogpu.wired_limit_mb" else "the GPU working-set limit",
+        .margin = wired_limit_margin_bytes,
+        .user_wire = wire[wire_bind],
+        .user_wire_name = if (wire_bind == 0) "vm.global_user_wire_limit" else "vm.user_wire_limit",
+        .user_wire_margin = USER_WIRE_MARGIN_BYTES,
+    };
+}
+
+/// What a request at the model's default context bills beside the ssd budget with its prefill borrowed from the decoder
+/// pools (`dsv41-memory`): the state, the restore points in flight and a decode block's working set.
+pub fn defaultRequestBill(config: *const model_mod.ModelConfig) u64 {
+    var probe = config.*;
+    probe.expert_streaming = false;
+    probe.expert_borrow_bytes = std.math.maxInt(u64) / 2;
+    return prefillNeededAtChunk(&probe, config.defaultContext(), 0, 16, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], .{});
 }
 
 var wired_floor_logged = std.atomic.Value(bool).init(false);
@@ -2837,7 +2869,7 @@ fn contextNeutralChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceili
 }
 
 fn advertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
-    return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap());
+    return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap(), config.defaultContext());
 }
 
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
@@ -2889,8 +2921,17 @@ pub fn maxSushiContextForBudget(config: *const model_mod.ModelConfig, kv_bits: u
 }
 
 fn maxSushiContextAtWidth(config: *const model_mod.ModelConfig, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix) u32 {
+    return maxSushiContextUpTo(config, if (config.contextCap() > 0) config.contextCap() else std.math.maxInt(u32), kv_bits, budget, fixed_chunk, warm);
+}
+
+/// The smallest memory context whose margined value (`safeAutoContext`) reaches `target`.
+fn memoryContextForMargined(target: u32) u32 {
+    return target / auto_ctx_safety_pct * 100 + 1024;
+}
+
+fn maxSushiContextUpTo(config: *const model_mod.ModelConfig, upper: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix) u32 {
     var low: u32 = 0;
-    var high: u32 = if (config.contextCap() > 0) config.contextCap() else std.math.maxInt(u32);
+    var high: u32 = upper;
     // Before the auto context is pinned the bill's reservation reads `getEffectiveContextLength`,
     // which is this very search: bill each probe as the context it is asking about.
     const unpinned = manualContext(config) == 0 and config.pinned_context == 0;
@@ -3231,6 +3272,7 @@ pub fn resolvedContextForLoad(
     transient_reserve: u64,
     per_tok: u64,
     ctx_cap: u32,
+    ctx_default: u32,
 ) u32 {
     if (explicit_ctx > 0) return explicit_ctx;
     if (pinned_ctx > 0) return pinned_ctx;
@@ -3240,7 +3282,7 @@ pub fn resolvedContextForLoad(
         cache_reserve +| transient_reserve,
         per_tok,
         0,
-    ), ctx_cap);
+    ), ctx_cap, ctx_default);
 }
 
 /// The SSD-first call site. Takes the static ceiling (the budget is a property of the machine),
@@ -3257,6 +3299,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
+        config.defaultContext(),
     );
 }
 
@@ -3350,6 +3393,7 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
+        config.defaultContext(),
     );
 }
 
@@ -3828,6 +3872,7 @@ test "bf16 expert cache admission bills cache workspace bounce and resident trun
 test "DeepSeek's streamed request bill brackets the prefill peaks measured on the M5 Max" {
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
     // No decoder pool to lend: the bill is the working set's, as measured.
@@ -3859,6 +3904,7 @@ test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
     config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
@@ -3880,13 +3926,14 @@ test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024
     var buf: [256]u8 = undefined;
     try t.expectEqualStrings("Prefill chunk: per request, up to 2048 at a short prompt (the widest rung each request's bill admits); load-time fallback 512\n", prefillChunkLoadLine(&buf, &config, 512, 8192).?);
     // The ladder never narrows the advertised context: it is priced at the 512 floor.
-    try t.expectEqual(@as(u32, 974_848), advertisedContextAt(&config, 16, 110_100 * MB, 97_080 * MB, 512));
+    try t.expectEqual(@as(u32, 1_000_000), advertisedContextAt(&config, 16, 110_100 * MB, 97_080 * MB, 512));
 }
 
 test "DeepSeek advertises the longest context its own request bill admits" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
     config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
@@ -3902,14 +3949,15 @@ test "DeepSeek advertises the longest context its own request bill admits" {
             try t.expect(memoryContextAtChunk(&config, 16, 100 * GB + bill - 1, 100 * GB, chunk) < seq);
         }
     }
-    // At 96 the whole 1M context fits the fallback width's bill.
+    // At 96 the whole 1M context fits the fallback width's bill, with the memory the margined default needs to spare.
     const MB: u64 = 1 << 20;
-    try t.expectEqual(@as(u32, 1_048_576), memoryContextAtChunk(&config, 16, 110_100 * MB, 97_080 * MB, 512));
+    try t.expect(memoryContextAtChunk(&config, 16, 110_100 * MB, 97_080 * MB, 512) >= memoryContextForMargined(1_000_000));
 }
 
 test "a streamed DeepSeek bills its workspace at load and no fill peak at load or per request" {
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     config.expert_cache_bytes = 93_993 << 20;
     config.expert_bounce_bytes = 512 << 20;
@@ -3931,6 +3979,7 @@ test "DeepSeek's live headroom and its load fit each count the decode pool the l
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     // The parked pool is in MLX's cache, not its active bytes, so `ceiling - active` does not see it.
     try t.expectEqual(@as(u64, 10 << 30) - config.expertPoolBytes(), dsv41HeadroomOf(10 << 30, &config));
@@ -3945,6 +3994,7 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     const c = config.dsv41.?;
     const seq: u64 = 524_288;
@@ -3972,10 +4022,77 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     try t.expect(adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st0) < 2048);
 }
 
+test "a default context is served when the margined bill admits it, else the margined memory ceiling" {
+    const t = std.testing;
+    const dflt: u32 = 1_000_000;
+    // The margined memory context reaches the default: it is served whole.
+    const reach = memoryContextForMargined(dflt);
+    try t.expect(safeAutoContext(reach) >= dflt);
+    try t.expectEqual(dflt, autoContextFrom(reach, 1_048_576, dflt));
+    try t.expectEqual(dflt, autoContextFrom(4_000_000, 1_048_576, dflt));
+    // Just below it, and at the checkpoint's window, the margined memory value stands, never the default.
+    const below = reach - 6 * 1024;
+    try t.expect(safeAutoContext(below) < dflt);
+    try t.expectEqual(safeAutoContext(below), autoContextFrom(below, 1_048_576, dflt));
+    try t.expectEqual(@as(u32, 974_848), autoContextFrom(1_048_576, 1_048_576, dflt));
+    try t.expectEqual(safeAutoContext(390_144), autoContextFrom(390_144, 1_048_576, dflt));
+    // Another architecture has no default: the margin applies as before.
+    try t.expectEqual(@as(u32, 974_848), autoContextFrom(1_048_576, 1_048_576, 0));
+    // The same relation on the load-time bill, so the bill covers what is advertised.
+    const MiB: u64 = 1 << 20;
+    const roomy = resolvedContextForLoad(0, 0, 4_000_000 * MiB, 0, 0, 0, 890, 1_048_576, dflt);
+    try t.expectEqual(dflt, roomy);
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(0, 0, 4_000_000 * MiB, 0, 0, 0, 890, 1_048_576, 0));
+    // An explicit context, from the flag or the pin, outranks it.
+    try t.expectEqual(@as(u32, 250_000), resolvedContextForLoad(250_000, 0, 4_000_000 * MiB, 0, 0, 0, 890, 1_048_576, dflt));
+    try t.expectEqual(@as(u32, 300_000), resolvedContextForLoad(0, 300_000, 4_000_000 * MiB, 0, 0, 0, 890, 1_048_576, dflt));
+}
+
+test "a default context never exceeds the checkpoint's window, and --ctx-size or model-settings still win" {
+    const t = std.testing;
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 262_144, .serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults) };
+    try t.expectEqual(@as(u32, 262_144), autoContextFrom(1_048_576, config.contextCap(), config.defaultContext()));
+
+    config.max_position_embeddings = 1_048_576;
+    config.pinned_context = 1_000_000;
+    server_config.max_context_size = 0;
+    try t.expectEqual(@as(u32, 1_000_000), getEffectiveContextLength(&config));
+    config.ctx_override = 300_000;
+    try t.expectEqual(@as(u32, 300_000), getEffectiveContextLength(&config));
+    server_config.max_context_size = 250_000;
+    try t.expectEqual(@as(u32, 250_000), getEffectiveContextLength(&config));
+}
+
+test "the default request bill at 1M tokens is the borrowed bill plus the decode pool" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.num_attention_heads = 64;
+    const saved = .{ prefix_cache_ram_enabled, prefix_cache_disk_bytes };
+    defer {
+        prefix_cache_ram_enabled = saved[0];
+        prefix_cache_disk_bytes = saved[1];
+    }
+    prefix_cache_ram_enabled = false;
+    prefix_cache_disk_bytes = 20 << 30;
+    const bill = defaultRequestBill(&config);
+    // dsv41-memory: 3.4 GB at 1M with the prefill borrowed (state, writer in flight, rings, x5/4, the decode cap), plus the
+    // 1 GiB decode pool the ledger parks beside it.
+    try t.expectApproxEqAbs(@as(f64, 4_400_000_000), @as(f64, @floatFromInt(bill)), 300_000_000);
+    // The bill leaves the config's own streaming fields as they were.
+    try t.expect(config.expert_streaming);
+    try t.expectEqual(@as(u64, 0), config.expert_borrow_bytes);
+}
+
 test "with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpark on wired 124000 advertises its whole context" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
     const saved = .{ prefix_cache_ram_enabled, prefix_cache_disk_bytes };
@@ -3993,7 +4110,7 @@ test "with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpa
     const active: u64 = (100_328 + 17 * 1024) * MB - (1 << 30);
     // Its expert cache, 13.57 GB under the budget (94% of the experts), split evenly: the decoder half is lendable.
     config.expert_borrow_bytes = (117 * (1 << 30) - 13_570_000_000) / 2;
-    try t.expectEqual(@as(u32, 974_848), advertisedContextAt(&config, 16, ceiling, active, 2048));
+    try t.expectEqual(@as(u32, 1_000_000), advertisedContextAt(&config, 16, ceiling, active, 2048));
     // Billing the working set to the request, with nothing to lend, advertises well under the whole context.
     config.expert_borrow_bytes = 0;
     try t.expectEqual(@as(u32, 390_144), advertisedContextAt(&config, 16, ceiling, active, 512));
@@ -4531,16 +4648,16 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
     const cap: u32 = cfg.contextCap();
 
     // The sizing reserve is a constant, so the answer cannot move with the ask.
-    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
-    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, 0);
+    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, 0);
     try t.expectEqual(ctx_default, ctx_big_ask);
     try t.expect(ctx_default > 900_000); // a real context, not the floor
 
     // The defect, both spellings: sizing against the granted budget...
-    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
+    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap, 0);
     try t.expect(vs_granted <= 1024);
     // ...and against the raw ask, which saturates usable to zero.
-    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
+    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap, 0);
     try t.expect(vs_raw_ask <= 1024);
     try t.expect(ctx_default > vs_granted * 500);
 }
@@ -4628,7 +4745,7 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     try t.expectEqual(reserve_floor, plan.reserve);
 
     // The session the floor holds is the one the server advertises.
-    const advertised = autoContextFrom(memoryContextAt(&cfg, ceiling, active), cfg.contextCap());
+    const advertised = autoContextFrom(memoryContextAt(&cfg, ceiling, active), cfg.contextCap(), cfg.defaultContext());
     try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
 }
 
@@ -4713,14 +4830,14 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
     const transient: u64 = prefillTransientReserve(&cfg, kv_bits, chunk);
 
-    const advertised = autoContextFrom(memoryContextAt(&cfg, ceiling, active), cfg.contextCap());
+    const advertised = autoContextFrom(memoryContextAt(&cfg, ceiling, active), cfg.contextCap(), cfg.defaultContext());
     const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
     try t.expectEqual(advertised, billed);
 
     // And on a tighter box where the checkpoint cap does not bind.
     const tight: u64 = active + 24_000 * MiB;
     const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
-    try t.expectEqual(autoContextFrom(memoryContextAt(&cfg, tight, active), cfg.contextCap()), billed_t);
+    try t.expectEqual(autoContextFrom(memoryContextAt(&cfg, tight, active), cfg.contextCap(), cfg.defaultContext()), billed_t);
     try t.expect(billed > 500_000);
     try t.expect(billed_t > 300_000);
     try t.expect(billed_t < billed);
@@ -4847,7 +4964,7 @@ test "an explicit --ctx-size boot never consults the session reserve" {
     for ([_]u64{ 0, CTX_SIZING_CACHE_RESERVE, 99_000 * MiB }) |reserve| {
         try t.expectEqual(
             @as(u32, 262_144),
-            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap()),
+            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap(), cfg.defaultContext()),
         );
     }
 
@@ -4860,8 +4977,8 @@ test "an explicit --ctx-size keeps the load-time context byte-identical" {
     const t = std.testing;
     const MiB: u64 = 1 << 20;
     const per_tok: u64 = 20_736;
-    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144));
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576));
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144, 0));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576, 0));
 }
 
 test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
@@ -5339,7 +5456,11 @@ fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceil
         return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
     }
     // DeepSeek's request bill grows with the prompt (the indexer's scores), so its context is the longest that bill admits.
-    if (config.isDsv41()) return maxSushiContextAtWidth(config, kv_bits, admissionAvailable(ceiling, active_mem) -| ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)), chunk, .{});
+    if (config.isDsv41()) {
+        // Searched past the checkpoint's window, up to the memory a margined default needs, so the margin is judged against memory.
+        const upper = @max(config.contextCap(), memoryContextForMargined(config.defaultContext()));
+        return maxSushiContextUpTo(config, upper, kv_bits, admissionAvailable(ceiling, active_mem) -| ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)), chunk, .{});
+    }
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
     const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
     return safeContextForBudget(
@@ -7412,10 +7533,10 @@ pub fn handleChatCompletions(
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
     const max_tokens: u32 = request_policy.resolveRequestMaxTokens(
         requested_max_tokens,
-        request_policy.omittedMaxTokensDefault(getEffectiveContextLength(config)),
+        request_policy.omittedMaxTokensDefault(config),
     );
     // For the request log line only: which of the three sources this came from.
-    const max_tokens_origin = request_policy.maxTokensOrigin(requested_max_tokens, request_policy.launchMaxTokensDefault());
+    const max_tokens_origin = request_policy.maxTokensOrigin(requested_max_tokens, request_policy.launchMaxTokensDefault(), config.defaultMaxTokens());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -9087,7 +9208,7 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     unbounded.max_position_embeddings = 0;
     try testing.expect(autoContextFor(&unbounded) > 0);
     const memory_ctx = memoryContextAt(&unbounded, 96 << 30, 40 << 30);
-    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap()));
+    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap(), 0));
 }
 
 test "every served model advertises 93% of the memory ceiling, capped at its own maximum" {
@@ -9100,9 +9221,9 @@ test "every served model advertises 93% of the memory ceiling, capped at its own
     defer glm.deinit(t.allocator);
     for ([_]*const model_mod.ModelConfig{ &qwen, &mimo, &glm }) |cfg| {
         try t.expectEqual(@as(u32, 1_048_576), cfg.contextCap());
-        try t.expectEqual(@as(u32, 88064), autoContextFrom(94729, cfg.contextCap()));
-        try t.expectEqual(cfg.contextCap(), autoContextFrom(4_000_000, cfg.contextCap()));
-        try t.expectEqual(@as(u32, 974_848), autoContextFrom(1_048_576, cfg.contextCap()));
+        try t.expectEqual(@as(u32, 88064), autoContextFrom(94729, cfg.contextCap(), 0));
+        try t.expectEqual(cfg.contextCap(), autoContextFrom(4_000_000, cfg.contextCap(), 0));
+        try t.expectEqual(@as(u32, 974_848), autoContextFrom(1_048_576, cfg.contextCap(), 0));
     }
 }
 
@@ -11018,7 +11139,7 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const without = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{});
     try t.expect(with_terms > without + 3_000_000_000);
     // The sentinel runs through the same path: an omitted max_tokens must not move the bill past the context.
-    const sentinel: u64 = request_policy.omittedMaxTokensDefault(@intCast(@min(getEffectiveContextLength(&cfg), 1_048_576)));
+    const sentinel: u64 = request_policy.omittedMaxTokensDefault(&cfg);
     const with_sentinel = prefillRequestTerms(&cfg, seq, sentinel, 8, chunk, .{});
     const with_explicit = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
     try t.expect(with_sentinel.reserved_kv_bytes < 8 * 1024 * 1024 * 1024);
@@ -11052,7 +11173,7 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
     try t.expectEqual(@as(u64, 1_048_576), ctx);
     const seq: u64 = 383_067;
     const chunk: u64 = 4096;
-    const clamped: u64 = request_policy.clampMaxTokens(@intCast(request_policy.omittedMaxTokensDefault(@intCast(ctx))), @intCast(seq), @intCast(ctx));
+    const clamped: u64 = request_policy.clampMaxTokens(@intCast(request_policy.omittedMaxTokensDefault(&cfg)), @intCast(seq), @intCast(ctx));
     try t.expectEqual(ctx - seq, clamped); // 665,509 — the live number
 
     // The reservation is bounded by the headroom, not by the context.
@@ -11503,7 +11624,7 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
 
     // Auto boot, nothing pinned: the session is what the machine can serve. `cache_reserve = 0`
     // is a test isolation.
-    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
+    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap, 0);
     try t.expect(auto > 100_000);
     try t.expect(auto <= cap);
 
@@ -11524,9 +11645,9 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
     try t.expect(fixed -| real_kv < (bogus -| placeholder_kv) / 2);
 
     // An explicit --ctx-size wins outright, and a pinned context is used as-is.
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap));
-    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap));
-    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap, 0));
+    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap, 0));
+    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap, 0));
 }
 
 test "the advertised context does not move with the cache ask" {
@@ -11554,8 +11675,8 @@ test "the advertised context does not move with the cache ask" {
     try t.expect(vs_resolved <= 1024);
 
     // The pair agrees at the advertised number: both sides go through `autoContextFrom`.
-    const advertised = autoContextFrom(memory_ctx, cfg.contextCap());
-    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
+    const advertised = autoContextFrom(memory_ctx, cfg.contextCap(), cfg.defaultContext());
+    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap(), cfg.defaultContext());
     try t.expectEqual(advertised, clamp_ctx);
 }
 
@@ -13858,7 +13979,7 @@ test "auto context on a room of about 1.8 GB neither advertises a few tokens nor
     const share = ctxCacheShare(room + 5 * GiB, 5 * GiB, 2 * GiB);
     try testing.expectEqual(room / 2, share);
     try testing.expectEqual(@as(u64, GiB), ctxCacheShare(64 * GiB, 5 * GiB, GiB));
-    const auto = resolvedContextForLoad(0, 0, room + 5 * GiB, 5 * GiB, share, 0, per_tok, 0);
+    const auto = resolvedContextForLoad(0, 0, room + 5 * GiB, 5 * GiB, share, 0, per_tok, 0, 0);
     try testing.expectEqual(@as(u32, 2048), auto);
     // A room that fits a few tokens past the reserve floors at 1024 instead of advertising them.
     try testing.expectEqual(@as(u32, 1024), safeContextForBudget(2 * GiB + 100 * (1 << 20), 0, 2 * GiB, per_tok, 0));

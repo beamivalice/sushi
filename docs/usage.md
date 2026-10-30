@@ -108,12 +108,20 @@ derivatives); the smaller copy sushi builds from it in `dflash2/` on first load 
 
 ```bash
 sushi pull deepseek-v4.1-flash
-sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
-  --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000
-# 128 GB Mac: 108 (or 96 to leave memory to other apps); 96 GB Mac: 80
+sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw
+# pass --ssd-budget-gb to change the budget: 96 on a 128 GB Mac leaves memory to other apps
 ```
 
-- **`--ssd-budget-gb` is required.** It is everything the load keeps resident (trunk, DSpark, vision tower, workspace)
+On a 128 GB Mac the 108 default needs the GPU wired limit raised (`iogpu.wired_limit_mb=125000`, the limit the
+heading names); without it the default is 96, and it steps down further, saying so, when the Mac's limits cannot hold it.
+
+DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a request that omits `max_tokens`, as its
+authors recommend; `--ctx-size` and `--max-tokens` still override them.
+
+- **`--ssd-budget-gb` defaults to 80 on 96 GB Macs; 128 GB Macs default to 96, or 108 with `iogpu.wired_limit_mb` at 120000 or more (the recommended 125000); pass `--ssd-budget-gb` to change it.** 192 and
+  256 GB Macs load the pack fully resident by default. Any other RAM size must pass it. The default steps down to the
+  largest budget the Mac's limits hold beside a 1M request and an image encode, and the load log says which limit bound
+  it; a flag outranks `ssd_budget_gb` in `model-settings.json`, which outranks the default. The budget is everything the load keeps resident (trunk, DSpark, vision tower, workspace)
   plus the expert cache, which gets the rest; more budget means more expert slots and fewer SSD reads. Budget, the
   request's state (3.7 GB billed at 1M) and an image encode (1.6 GB) must fit under the GPU limit.
 

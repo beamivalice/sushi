@@ -204,10 +204,10 @@ pub fn handleCompletions(
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
     const max_tokens: u32 = resolveRequestMaxTokens(
         requested_max_tokens,
-        omittedMaxTokensDefault(getEffectiveContextLength(config)),
+        omittedMaxTokensDefault(config),
     );
     // For the request log line only: which of the three sources this came from.
-    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
+    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault(), config.defaultMaxTokens());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 

@@ -99,7 +99,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   every pool to its whole layer, reads all of them at load (`[expert-stream] resident:` line; no 80% warm) and maps
   each expert to its slot (`LayerState.resident_map`), so a DeepSeek STQ route takes its slots on the GPU with no
   host read of the picks (`Engine.residentRoute`). Same bytes out as the streamed path (tested on the tiny STQ pack).
-- Precedence: `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming both.
+- Precedence: `--ssd-budget-gb` > setting > the RAM default (DeepSeek only: `model_load.ramDefaultBudget`) > `ExpertStreamingRequired` 503 naming all three. The default is 80 GiB on a 96 GB Mac, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), the planner's resident need on 192 and 256 GB, each stepped down to the largest whole GiB that fits the lower of the residency limit and the user-wire cap beside a 1M request and an image encode.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit

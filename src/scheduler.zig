@@ -1611,7 +1611,7 @@ pub const Scheduler = struct {
             owned.config.expertStreamingRequired(),
             settings_budget,
         )) blk: {
-            if (settings_budget == 0) return error.ExpertStreamingRequired;
+            if (settings_budget == 0 and model_load.ramDefaultTierFor(owned.config) == null) return error.ExpertStreamingRequired;
             const mtp = model_load.mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
             const verdict = model_load.mtpStreamingVerdict(mtp, model_load.streamedHeadSupportedAt(self.io, self.allocator, owned.config, entry.path));
             switch (verdict) {
