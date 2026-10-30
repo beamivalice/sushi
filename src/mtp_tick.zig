@@ -355,7 +355,7 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     for (active) |slot| {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
-        if (try gen.checkStop()) {
+        if (try gen.checkDispatchStop()) {
             slot.stop_path = "batch";
             finishSlot(sch, slot, gen.finish_reason);
             continue;

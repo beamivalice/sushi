@@ -4695,6 +4695,18 @@ pub const Generator = struct {
         return false;
     }
 
+    /// Scheduler preflight; the selected decode path owns token accounting.
+    pub fn checkDispatchStop(self: *Generator) !bool {
+        if (self.checkBudgetStop()) return true;
+        if (isEosId(self.next_token_id, self.eos_token_ids)) {
+            self.done = true;
+            self.finish_reason = "stop";
+            self.stop_token = self.next_token_id;
+            return true;
+        }
+        return false;
+    }
+
     /// Check all stop conditions. Returns true if generation should stop.
     pub fn checkStop(self: *Generator) !bool {
         if (self.checkBudgetStop()) return true;
