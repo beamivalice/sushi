@@ -156,9 +156,9 @@ pub const IndexEntry = struct {
     rings: []RingFile = &.{},
     /// v10: the media chain this record's rows were computed under (`prefix_cache.MediaSpan`), as
     /// its last block's key, and the first media placeholder in `tokens`. 0 / null = no media row,
-    /// which is what every pre-v10 record is. The tier never interprets them: a lookup hands it
-    /// per-entry limits (`MediaLimits`) computed from these by the one owner of the rule,
-    /// `prefix_cache.crossKeyBoundary`.
+    /// which is what every pre-v10 record is. A lookup hands the tier per-entry limits
+    /// (`MediaLimits`) computed from these by the one owner of the rule,
+    /// `prefix_cache.crossKeyBoundary`; a commit applies that rule with no chain (`commitShares`).
     vision_key: u64 = 0,
     media_start: ?u32 = null,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
@@ -1820,6 +1820,7 @@ pub const DiskTier = struct {
         const has_tools = p.has_tools;
         const ssm_checkpoints = p.ssm_checkpoints;
         const ring = p.ring;
+        const media: CommitMedia = .{ .key = p.vision_key, .start = p.media_start };
         var tokens = all_tokens;
         var dflash_snap = p.dflash_snap;
         var mtp_snap = p.mtp_snap;
@@ -1889,7 +1890,7 @@ pub const DiskTier = struct {
         // pending SSM checkpoints (byte-capped across turns), which take a
         // dedicated SSM-only append path (the KV chunks are all present, so
         // the extend machinery would pointlessly rewrite the tail chunk).
-        var target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+        var target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
         if (target.superseded) return .persisted;
         // Re-derive the budget before every store, and only a store: the probe is slow and the idle
         // spill reaches this point once per idle entry. It also gates the SSM-only append.
@@ -1897,7 +1898,7 @@ pub const DiskTier = struct {
             self.refreshDiskBudget();
             self.ssm_budget = self.pointBudget(kv_entries, kv_target, ssm_checkpoints, ring_srcs, spec_bytes);
             // Its eviction swap-removes: indices picked above may now name other entries.
-            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
             if (target.superseded) return .persisted;
         }
         // A sole entry never outgrows the tier: its oldest points go first (`ssm_budget`); a record whose rows
@@ -1918,7 +1919,7 @@ pub const DiskTier = struct {
                 self.allocator.free(ring_srcs);
                 ring_srcs = srcs;
             }
-            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
             if (target.superseded) return .persisted;
         }
         const extend_idx = target.extend_idx;
@@ -1943,7 +1944,7 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config) else null;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -2031,10 +2032,7 @@ pub const DiskTier = struct {
             return if (chunk_complete) .persisted else .partial;
         }
 
-        const prefix_rows: u32 = if (donor) |d|
-            @intCast(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)))
-        else
-            kv_len;
+        const prefix_rows: u32 = if (donor) |d| @min(d.shared, kv_len) else kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s);
         const complete = chunk_complete and ssm_res.complete;
@@ -3023,14 +3021,27 @@ pub const DiskTier = struct {
 
     const StoreTarget = struct { superseded: bool = false, extend_idx: ?usize = null, ssm_only_idx: ?usize = null };
 
-    /// Which resident entry a commit of `tokens` supersedes, extends or tops up. Indices are valid
-    /// only until the next eviction.
+    /// A commit's media identity, as `CommitParams` carries it.
+    const CommitMedia = struct { key: u64, start: ?u32 };
+
+    /// Leading rows of `e` that are also a commit's rows: `prefix_cache.crossKeyBoundary` with no
+    /// chain. An equal key shares everything; any other pair only the text before either side's
+    /// first media row, since two same-size images render the same placeholder ids.
+    fn commitShares(e: *const IndexEntry, media: CommitMedia) u32 {
+        if (e.vision_key == media.key) return MediaLimits.UNBOUNDED;
+        const es = e.media_start orelse return media.start orelse 0;
+        return if (media.start) |cs| @min(es, cs) else es;
+    }
+
+    /// Which resident entry a commit of `tokens` supersedes, extends or tops up: only one whose
+    /// rows are the commit's wherever both records reach. Indices are valid only until the next eviction.
     fn selectStoreTarget(
         self: *DiskTier,
         tokens: []const u32,
         kv_target: u32,
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
+        media: CommitMedia,
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
@@ -3041,9 +3052,12 @@ pub const DiskTier = struct {
             if (e.poisoned) continue; // dead: never superseded, never extended
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
+            // Covering the commit needs its rows through `tokens`; resuming the entry keeps all of its own.
+            const shares = commitShares(e, media);
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
+                        if (shares < tokens.len) continue;
                         if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
                             !specWorkPending(e, dflash_snap, mtp_snap) and
                             !self.ringWorkPending(e, ring_srcs))
@@ -3057,9 +3071,9 @@ pub const DiskTier = struct {
                     }
                     // Same token record, SHORTER persisted KV — a byte-capped
                     // incremental flush in progress. Resume into its dir.
-                    t.extend_idx = i;
+                    if (shares >= e.tokens.len) t.extend_idx = i;
                 }
-            } else if (std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
+            } else if (shares >= e.tokens.len and std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
                 // This commit extends `e` — reuse its directory and chunks.
                 t.extend_idx = i;
             }
@@ -3538,25 +3552,27 @@ pub const DiskTier = struct {
     }
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
-    /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
-    /// the synchronous legacy arm.
-    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
+    /// same tool flag and kv-quant config, most whole chunks below the prefix whose rows are the
+    /// commit's (`commitShares`). Null on the synchronous legacy arm.
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: CommitMedia) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
-            const shared: u64 = @min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len));
-            const whole: u32 = @intCast(shared / self.chunk_tokens);
+            const common: u32 = @min(@as(u32, @intCast(commonPrefixLen(e.tokens, tokens))), commitShares(e, media));
+            const shared = @min(common, kv_target, e.kv_len);
+            const whole: u32 = shared / self.chunk_tokens;
             const usable: u32 = @min(whole, @as(u32, @intCast(e.chunk_bytes.len)));
             if (usable == 0) continue;
-            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable };
+            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable, .shared = common };
         }
         return best;
     }
 
-    pub const ChunkDonor = struct { idx: usize, id: u64, chunks: u32 };
+    /// `shared`: the leading tokens whose rows the donor and the heir provably agree on.
+    pub const ChunkDonor = struct { idx: usize, id: u64, chunks: u32, shared: u32 };
 
     /// Hard-link the donor's leading landed chunk files into `e<id>/`; returns how many. Stops
     /// at the first chunk not landed and never touches the donor's queue (`Writer.fence` would
@@ -7929,4 +7945,105 @@ test "DiskTier write counters: the synchronous manifest write counts meta on suc
     const landed = tier.stats.snapshot();
     try testing.expectEqual(fileSize(io, path).?, landed.written[@intFromEnum(write_stats.Kind.meta)]);
     try testing.expectEqual(missing_dir.failed, landed.failed);
+}
+
+fn mediaCommit(tier: *DiskTier, cache: *const KVCache, tokens: []const u32, key: u64, start: ?u32, s: mlx.mlx_stream) !PersistOutcome {
+    return tier.appendCommitWith(.{
+        .kv_entries = cache.entries,
+        .step = tokens.len,
+        .config = cache.config,
+        .tokens = tokens,
+        .has_tools = false,
+        .vision_key = key,
+        .media_start = start,
+    }, s, .{});
+}
+
+fn keyedKvLen(tier: *const DiskTier, key: u64) ?u32 {
+    for (tier.entries.items) |*e| {
+        if (e.vision_key == key) return e.kv_len;
+    }
+    return null;
+}
+
+test "DiskTier: a commit under other pixels gets its own record, never superseded by or extending another image's" {
+    // Two images of one size render the same placeholder ids, so the token record cannot tell their rows apart.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-target", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const kb: u64 = 0xB2B2_B2B2_B2B2_B2B2;
+    const kc: u64 = 0xC3C3_C3C3_C3C3_C3C3;
+
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], ka, 100, s);
+    // B's longer commit would extend A's record.
+    _ = try mediaCommit(&tier, &cache, &tokens, kb, 100, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    // A's own commit is still superseded by A's record.
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], ka, 100, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    // C's commit is covered by B's tokens, not by its rows.
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], kc, 100, s);
+    try testing.expectEqual(@as(usize, 3), tier.entryCount());
+    try testing.expectEqual(@as(?u32, 600), keyedKvLen(&tier, ka));
+    try testing.expectEqual(@as(?u32, 1200), keyedKvLen(&tier, kb));
+    try testing.expectEqual(@as(?u32, 600), keyedKvLen(&tier, kc));
+}
+
+test "DiskTier: a text record extends into the image turn after it, and that image's record extends under its own key" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-extend", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1800, 8, 0.0, .float32);
+    var tokens: [1800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], 0, null, s);
+    const id = tier.entries.items[0].id;
+    _ = try mediaCommit(&tier, &cache, tokens[0..1200], ka, 700, s);
+    _ = try mediaCommit(&tier, &cache, &tokens, ka, 700, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(id, tier.entries.items[0].id);
+    try testing.expectEqual(@as(u32, 1800), tier.entries.items[0].kv_len);
+    try testing.expectEqual(ka, tier.entries.items[0].vision_key);
+}
+
+test "DiskTier chunk share: a donor under other pixels lends only the chunks wholly below the first image row" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-share", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    // The token records agree through 520 (4 whole chunks); the images start at 300.
+    const toks = chunkShareTokens(520);
+    _ = try mediaCommit(&tier, &cache, &toks.a, 0xA1A1_A1A1_A1A1_A1A1, 300, s);
+    _ = try mediaCommit(&tier, &cache, &toks.b, 0xB2B2_B2B2_B2B2_B2B2, 300, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    try testing.expectEqual(@as(u32, 2), tier.entries.items[1].inherited_chunks);
 }

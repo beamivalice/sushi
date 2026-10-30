@@ -251,7 +251,7 @@ test "the chain key of a decoded image is pinned: existing prefix-cache records 
     defer a.free(img.pixels);
     const chain = try mediaChain(a, &.{.{ .kind = .image, .start = 3, .rows = 1 }}, &.{img}, &.{}, null);
     defer a.free(chain);
-    try std.testing.expectEqual(@as(u64, 16185945656631848181), chain[0].key);
+    try std.testing.expectEqual(@as(u64, 1721405797674843983), chain[0].key);
 }
 
 test "a request whose image will not decode is refused naming it when it is keyed" {
@@ -625,7 +625,8 @@ fn mediaChain(
 ) ![]prefix_cache_mod.MediaSpan {
     const out = try allocator.alloc(prefix_cache_mod.MediaSpan, placed.len);
     errdefer allocator.free(out);
-    var prev: u64 = 0x5ec0de;
+    // A bf16 tower and the requantized one give other rows for the same pixels.
+    var prev: u64 = if (vision_common.vision_bf16) 0x5ec0de_bf16 else 0x5ec0de_a8;
     var next_image: usize = 0;
     var next_video: usize = 0;
     for (placed, out) |p, *span| {
@@ -1791,6 +1792,25 @@ test "mediaChain keys every block by its pixels, its position and the blocks bef
     for ([_][]const prefix_cache_mod.MediaSpan{ one, two, moved, other, swapped }) |chain| {
         for (chain) |span| try std.testing.expect(span.key != 0);
     }
+}
+
+test "mediaChain keys the same pixels apart under a bf16 tower and the requantized one" {
+    const saved = vision_common.vision_bf16;
+    defer vision_common.vision_bf16 = saved;
+    const img = testGridImage(2, 2, "pixels-a");
+    const placed = [_]PlacedMedia{.{ .kind = .image, .start = 3, .rows = 1 }};
+    var keys: [2][2]u64 = undefined;
+    for ([_]bool{ false, true }, &keys) |bf16, *pair| {
+        vision_common.vision_bf16 = bf16;
+        for (pair) |*k| {
+            const chain = try mediaChain(std.testing.allocator, &placed, &.{img}, &.{}, null);
+            defer std.testing.allocator.free(chain);
+            k.* = chain[0].key;
+        }
+    }
+    try std.testing.expectEqual(keys[0][0], keys[0][1]);
+    try std.testing.expectEqual(keys[1][0], keys[1][1]);
+    try std.testing.expect(keys[0][0] != keys[1][0]);
 }
 
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {

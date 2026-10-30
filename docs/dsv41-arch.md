@@ -809,7 +809,8 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   The CED replay slices the image mask with its rows. DSpark's draft is text and reads the target layers' streams, which
   already hold the image rows, so an image request keeps DSpark.
 - **Prefix cache**: the lookup takes the request's media key and boundary (`lookupAndRestoreDsv41`), so ids that
-  repeat under another image restore only the text before it; the splice resumes at the image rows inside the restored
+  repeat under another image restore only the text before it, and a write-through point lands only in a record of its
+  own key ([engine-prefix-cache](engine-prefix-cache.md)); the splice resumes at the image rows inside the restored
   prefix; the tower encodes only the images the restored prefix does not hold whole, so a 450k-token history of
   screenshots costs no tower pass.
 - **Chat**: the template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image as the atom

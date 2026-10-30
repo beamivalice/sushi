@@ -10688,3 +10688,41 @@ test "HotPrefixCache: a checkpoint taken inside the generated reply is where a p
         try testing.expectEqual(c.conv, pcSsmVal(ssm[0].conv_state, 0, s));
     }
 }
+
+test "a write-through under other pixels never extends the record that holds the first image's rows" {
+    // Two images of one size render the same placeholder ids, so the token match alone cannot tell them apart.
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const tokens = mediaTurnTokens(2048);
+    const at: usize = 600;
+    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const kb: u64 = 0xB2B2_B2B2_B2B2_B2B2;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media-swap", 0, 1024);
+    defer hc.deinit();
+    var rows_a = try KVCache.init(testing.allocator, 3);
+    defer rows_a.deinit();
+    try kv_disk_cache.fillCache(&rows_a, s, 3, tokens.len, 8, 0.0, .float32);
+    var rows_b = try KVCache.init(testing.allocator, 3);
+    defer rows_b.deinit();
+    try kv_disk_cache.fillCache(&rows_b, s, 3, tokens.len, 8, 5_000_000.0, .float32);
+
+    // Image A's prefill stops after its first chunk (a disconnect); image B's request has the same ids.
+    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), &.{}, std.math.maxInt(u64), s);
+    hc.disk.?.drainWriter();
+
+    const chain = [_]MediaSpan{.{ .start = at, .key = kb }};
+    var dst = try KVCache.init(testing.allocator, 3);
+    defer dst.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, kb, at, &chain, null, null, null, false);
+    try testing.expect(res.matched > at);
+    for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys, rows_b.entries[li].keys, res.matched);
+}

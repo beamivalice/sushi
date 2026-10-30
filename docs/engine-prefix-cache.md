@@ -38,6 +38,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   in BOTH directions: placeholder ids are ordinary vocabulary entries, so a TEXT prompt can match a media record's
   tokens past its first image row while the rows there are that record's pixels — a text request is held to the
   record's pre-media text, never given its image rows.
+- **A commit reuses a record only under its own media key** (`DiskTier.commitShares`, the rule with no chain): it is
+  superseded by, extends or tops up a record only where that record's rows are its rows, an equal key or text wholly
+  below both sides' first media row; a chunk-share donor lends only whole chunks below that bound. Two same-size images
+  render the same placeholder ids, so a token-only match let image B's commit extend image A's record and restore A's
+  state. A turn that appends a second image gets a fresh record (donor chunks below the first image), not an extend.
 - **A record claims only the media blocks its rows cover** (`truncatedMediaKey`): a write-through chunk or a cancelled
   prefill that stops between two blocks claims the chain up to the last block inside it. Key 0 means no media row at
   all, which is what lets a text prompt share a record whole. Overclaiming is safe (an equal key is clamped by
@@ -46,7 +51,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   position (`request_media.zig`), stored as hex because a u64 key runs past JSON's i64. Changing what it hashes without
   changing the hash would make a stale record match a prompt it does not describe; a changed hash only costs misses.
   The tier fingerprint (model dir + `config.json`) covers the tower's weights, and `ImageData.pixels` is already
-  post-preprocessing, so a preprocessing change rolls the key by itself.
+  post-preprocessing, so a preprocessing change rolls the key by itself. The tower's storage is in the key's seed
+  (`--vision-bf16` or the requantized affine-8 tower give other rows for the same pixels); text records stay shared.
 - **A restore is not bit-identical on a HYBRID** (≤ 0.047 nats; the chunking class ~0.3 nats top-5 for QSA state) ⇒
   byte-stable greedy needs `--prefix-cache-entries 0`. A hybrid cache hit moves the top logprob ~0.2 nats, so any
   scorer boots with the cache off.

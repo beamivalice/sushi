@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **An image conversation no longer restores another image's cached state**: two images of the same size could share an SSD prompt-cache record, so a request could resume from the other image's rows; a boot with `--vision-bf16` and one without no longer share cached image rows either (cached image prompts from earlier versions are recomputed once).
 - **DeepSeek-V4.1 prefill is about 14% faster on M5 Macs at 32K tokens**: the attention core runs on the matrix units (outputs differ at rounding level, KLD unchanged within noise, and prompt caches written before are not reused); thanks @STRML for CommunityServe/plugins PR #6.
 - **Concurrent Qwen requests no longer end early on a `!`**: a single exclamation mark sampled while requests were batched could be counted as a run of three pad tokens and stop the reply empty; each token is now counted once. Thanks @stooit for the diagnosis and the fix.
 - **DeepSeek-V4.1 prefills long prompts faster**: a prompt chunk that another chunk follows no longer runs the decoder tail whose rows nothing reads, with byte-identical output; a chunk that takes a restore point keeps it.

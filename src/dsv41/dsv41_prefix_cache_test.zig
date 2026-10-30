@@ -1162,3 +1162,75 @@ test "DeepSeek SSD tier under the engine's default KV scheme, which every slot c
     try testing.expectEqual(@as(usize, 512), res.matched);
     try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
 }
+
+test "DeepSeek SSD tier: an image's restore points never land in, or come from, another same-size image's record (DSV41_TINY)" {
+    // Images A and B have one size, so their prompts carry the same ids; A's rows are stood in for by the state of
+    // another prompt, which is what other pixels at the image rows give.
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var b_buf: [700]u32 = undefined;
+    const ids = dsv41LongPrompt(&net, &b_buf, null, 0);
+    var a_buf: [700]u32 = undefined;
+    for (&a_buf, 0..) |*t, i| t.* = if (i < 100) ids[i] else (ids[i] + 1) % 90;
+    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const kb: u64 = 0xB2B2_B2B2_B2B2_B2B2;
+    const image_at: u32 = 100;
+
+    var hc = try dsv41SplitCache(io, base, "dsv41-media-swap", &net, 128);
+    defer hc.deinit();
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+
+    // Image A: its prefill writes the point at 512 through, then the client disconnects.
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, a_buf[0..512], .last));
+    {
+        var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, 512)};
+        defer cps[0].deinit(testing.allocator);
+        cache.step = 512;
+        hc.writeThroughDsv41(net.m, &cache, ids[0..512], false, .{ .key = ka, .start = image_at }, &cps, s, "prefill");
+    }
+
+    // Image B: a cold prefill (A's record holds other pixels), writing its points through at 512 and 640.
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, ids[0..512], .last));
+    var b_512 = try dsv41_prefix.capture(testing.allocator, net.m, 512);
+    defer b_512.deinit(testing.allocator);
+    {
+        var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, 512)};
+        defer cps[0].deinit(testing.allocator);
+        cache.step = 512;
+        hc.writeThroughDsv41(net.m, &cache, ids[0..512], false, .{ .key = kb, .start = image_at }, &cps, s, "prefill");
+    }
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, ids[512..640], .last));
+    var b_640 = try dsv41_prefix.capture(testing.allocator, net.m, 640);
+    defer b_640.deinit(testing.allocator);
+    {
+        var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, 640)};
+        defer cps[0].deinit(testing.allocator);
+        cache.step = 640;
+        hc.writeThroughDsv41(net.m, &cache, ids[0..640], false, .{ .key = kb, .start = image_at }, &cps, s, "prefill");
+    }
+    hc.disk.?.drainWriter();
+
+    // Image B's next requests restore B's own points, bit for bit.
+    for ([_]usize{ 600, 700 }, [_]*const SSMCheckpoint{ &b_512, &b_640 }) |len, want| {
+        dsv41_model.resetState(net.m);
+        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, ids[0..len], false, kb, image_at, &.{}, null, false);
+        try testing.expectEqual(want.pos, res.matched);
+        var got = try dsv41_prefix.capture(testing.allocator, net.m, res.matched);
+        defer got.deinit(testing.allocator);
+        try expectCheckpointBits(want, &got);
+    }
+}
