@@ -657,6 +657,8 @@ pub const Model = struct {
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
     engram_ahead_used: u64 = 0,
+    /// Prefill chunks that left state only (`extendState`).
+    state_only_used: u64 = 0,
     /// The next chunk's embedding rows, read from the SSD table while this one runs (`aheadEmbed`).
     embed_ahead: ?*embed_ssd.Ahead = null,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
@@ -3259,17 +3261,60 @@ fn cedRows(m: *const Model, st: *const State, L: usize, want: Want) ?usize {
     return if (L > w) w else null;
 }
 
+/// A prompt chunk whose CED decoder tail nothing reads: another chunk wider than the window follows it in the same
+/// prefill. The tail would only fill the decoder's and the DSpark stages' window rings (`window` rows), and the next
+/// chunk's tail overwrites those rows before any query reads one: its band starts at its own first row (`cedReplay`).
+/// So the chunk runs the encoder layers and the split layer's compressor over every row, then stops: no decoder, no
+/// DSpark rows, no head. A caller that takes a restore point at this boundary, or whose next chunk is no wider than the
+/// window, must not use it: the rings it leaves are not the ones the window reads.
+pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows, ahead: []const u32) !void {
+    const split = m.ced_split orelse return error.Dsv41NoCedSplit;
+    errdefer m.dropAhead();
+    errdefer m.dropEmbedAhead();
+    const st = try ensureState(m);
+    if (st.verify != null or ids.len <= m.cfg.window) return error.Dsv41NoCedSplit;
+    transient_peak.begin();
+    var pass = try beginPassWith(m, st, ids, st.n, span, vision);
+    defer pass.deinit(m.gpa);
+    pass.ahead = ahead;
+    aheadEmbed(m, ahead);
+    try prefetchEngram(m, &pass);
+    for (0..split) |li| try passLayer(m, &pass, li);
+    _ = try settleLast(m, &pass);
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    try cedCompress(&sc, m, &pass, split);
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(m.gpa);
+    try appendStateArrays(m.gpa, &ev, &st.layers[split]);
+    try evalAll(ev.items);
+    reportEngramWait(m, ids.len);
+    st.n = pass.p0 + ids.len;
+    m.state_only_used += 1;
+    if (prof(m, ids.len)) |pf| {
+        pf.restart();
+        pf.report(ids.len, pass.p0);
+    }
+    transient_peak.end(.prefill_chunk, ids.len);
+}
+
+/// The CED decoder's first layer `li` over every row of the pass: only its compressor, whose ratio-1 rows (and index
+/// keys) every later layer reads.
+fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
+    const ly = &m.layers[li];
+    const pa = try hcPre(sc, m, p.x, null, p.cpre, &ly.hc_attn, ly.attn_norm);
+    try compress(sc, m, p.st, li, pa.h, p.p0, none);
+}
+
 /// CED: the decoder's first layer `li` compresses every row of the pass (the ratio-1 rows every later layer reads),
 /// then the pass keeps its last `t` rows. The decoder writes no window rows before them, and none of its queries
 /// reaches one: the replay's band starts at its first row.
 fn cedReplay(m: *Model, p: *Pass, li: usize, t: usize) !void {
     const gpa = m.gpa;
     const L = p.ids.len;
-    const ly = &m.layers[li];
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const pa = try hcPre(&sc, m, p.x, null, p.cpre, &ly.hc_attn, ly.attn_norm);
-    try compress(&sc, m, p.st, li, pa.h, p.p0, none);
+    try cedCompress(&sc, m, p, li);
     const x = sc.out(try sc.slice(p.x, 0, L - t, L));
     errdefer _ = mlx.mlx_array_free(x);
     const pre = sc.out(try sc.slice(p.cpre, 0, L - t, L));
@@ -4650,6 +4695,180 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
             try testing.expect(d.err < 1e-4 and d.same_max);
         }
     }
+}
+
+/// `slots` of two states at position `n` agree bit for bit where a later pass can read them: a decoder layer's window
+/// ring keeps `ring_slack` rows no query reaches, which a state-only chunk leaves as an earlier pass wrote them.
+fn expectSlotsLive(sc: *Scope, m: *const Model, want: []const Slot, got: []const Slot, n: usize) !void {
+    const split = m.ced_split.?;
+    for (want, got, 0..) |x, y, i| {
+        if (i % 2 != 0 or i >= 2 * m.cfg.layers or i / 2 < split) {
+            try expectSlotsBits(sc, want[i..][0..1], got[i..][0..1]);
+            continue;
+        }
+        const cap = dim(x[0], 0);
+        const hx = try hostRows(sc, x[0]);
+        defer testing.allocator.free(hx);
+        const hy = try hostRows(sc, y[0]);
+        defer testing.allocator.free(hy);
+        const w = dim(x[0], 1);
+        for (n - m.cfg.window..n) |p| try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(hx[p % cap * w ..][0..w]), std.mem.sliceAsBytes(hy[p % cap * w ..][0..w]));
+        try expectSlotsBits(sc, &.{.{ none, x[1], x[2], x[3] }}, &.{.{ none, y[1], y[2], y[3] }});
+    }
+}
+
+const StateArm = struct {
+    last: []f32 = &.{},
+    run: Run = .{},
+    mid: []Slot = &.{},
+    mid_n: usize = 0,
+
+    fn deinit(self: *StateArm) void {
+        testing.allocator.free(self.last);
+        self.run.deinit();
+        for (self.mid) |*sl| freeSlot(sl);
+        testing.allocator.free(self.mid);
+    }
+};
+
+/// A prefill in `chunks` (a chunk with `skip` set leaves state only), then a one-row pass and `steps` decodes. The last
+/// chunk's logits, its state, and the rows after.
+fn stateArm(m: *Model, sc: *Scope, ids: []const u32, chunks: []const usize, skip: []const bool, steps: usize, vision: ?A, span: usize) !StateArm {
+    resetState(m);
+    var arm: StateArm = .{};
+    errdefer arm.deinit();
+    var at: usize = 0;
+    var consumed: usize = 0;
+    for (chunks, skip) |n, state_only| {
+        const chunk = ids[at..][0..n];
+        const vr: ?VisionRows = if (vision) |rows| .{ .rows = rows, .offset = consumed } else null;
+        if (state_only) {
+            try extendState(m, chunk, span, vr, &.{});
+        } else {
+            const lg = try extendVision(m, chunk, .last, span, vr);
+            defer _ = mlx.mlx_array_free(lg);
+            testing.allocator.free(arm.last);
+            arm.last = try hostRows(sc, lg);
+        }
+        consumed += imageRows(m, chunk);
+        at += n;
+    }
+    arm.mid = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(arm.mid, nil_slot);
+    try captureState(m, arm.mid);
+    arm.mid_n = at;
+    for (0..steps + 1) |i| {
+        const vr: ?VisionRows = if (vision) |rows| .{ .rows = rows, .offset = consumed } else null;
+        try arm.run.take(sc, try extendVision(m, ids[at + i ..][0..1], .last, span, vr));
+    }
+    arm.run.slots = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(arm.run.slots, nil_slot);
+    try captureState(m, arm.run.slots);
+    return arm;
+}
+
+fn expectArmsEqual(sc: *Scope, m: *const Model, want: *const StateArm, got: *const StateArm) !void {
+    try expectSlotsLive(sc, m, want.mid, got.mid, want.mid_n);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.last), std.mem.sliceAsBytes(got.last));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.run.rows.items), std.mem.sliceAsBytes(got.run.rows.items));
+    try expectSlotsLive(sc, m, want.run.slots, got.run.slots, want.mid_n + got.run.rows.items.len / m.cfg.vocab);
+}
+
+/// A tiny model whose window is wider than a decode-width pass, as the release's is: a replay of fewer rows reads the
+/// ring below its first row on the GPU (`attnDecode`), which the release never does.
+fn wideWindowModel(dir: []const u8, opts: Opts, s: S) !*Model {
+    const m = try tinyModel(dir, opts, s);
+    m.cfg.window = NARROW_ROWS + 4;
+    return m;
+}
+
+fn syntheticPrompt(ids: []const u32, n: usize) ![]u32 {
+    const out = try testing.allocator.alloc(u32, n);
+    for (out, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
+    return out;
+}
+
+test "dsv41 state-only chunks: a chunk another chunk wider than the window follows leaves the logits and state of the full pass (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const ids = try syntheticPrompt(base, 120);
+    defer testing.allocator.free(ids);
+    for ([_]bool{ false, true }) |spark| for ([_]bool{ true, false }) |qat| {
+        const m = try wideWindowModel(dir, .{ .act = .bfloat16, .qat = qat, .dspark = spark }, s);
+        defer m.deinit();
+        const w = m.cfg.window;
+        const plans = [_]struct { chunks: []const usize, skip: []const bool }{
+            .{ .chunks = &.{ 33, 29, 25 }, .skip = &.{ true, true, false } },
+            .{ .chunks = &.{ 22, 40, 21 }, .skip = &.{ false, true, false } },
+            .{ .chunks = &.{ w + 1, w + 1, w + 1, w + 1 }, .skip = &.{ true, true, true, false } },
+        };
+        const no_skip: [4]bool = @splat(false);
+        for (plans) |plan| {
+            var full = try stateArm(m, &sc, ids, plan.chunks, no_skip[0..plan.chunks.len], 3, null, SPAN);
+            defer full.deinit();
+            var lean = try stateArm(m, &sc, ids, plan.chunks, plan.skip, 3, null, SPAN);
+            defer lean.deinit();
+            try expectArmsEqual(&sc, m, &full, &lean);
+        }
+    };
+}
+
+test "dsv41 state-only chunks: skipping before a chunk the window covers leaves stale rows, which the logits show (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const ids = try syntheticPrompt(base, 120);
+    defer testing.allocator.free(ids);
+    const m = try wideWindowModel(dir, .{ .act = .bfloat16, .qat = true, .dspark = true }, s);
+    defer m.deinit();
+    const w = m.cfg.window;
+    // The second chunk has `window` rows: no replay, so its first rows read the ring the skipped chunk left stale.
+    const chunks = [_]usize{ 33, w };
+    var full = try stateArm(m, &sc, ids, &chunks, &.{ false, false }, 3, null, SPAN);
+    defer full.deinit();
+    var lean = try stateArm(m, &sc, ids, &chunks, &.{ true, false }, 3, null, SPAN);
+    defer lean.deinit();
+    try testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(full.last), std.mem.sliceAsBytes(lean.last)));
+}
+
+test "dsv41 state-only chunks: an image prompt cut by skipped chunks gives the logits and state of the full passes (DSV41_TINY)" {
+    const dir = try fixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, cpu);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    exact_matmul = true;
+    defer exact_matmul = false;
+    const t = try visionTinyModel(dir, cpu);
+    defer t.m.deinit();
+    const m = t.m;
+    const ids = try testing.allocator.dupe(u32, base[0..TINY_S]);
+    defer testing.allocator.free(ids);
+    for (ids[5..15]) |*id| id.* = t.image_id;
+    const rows = try routerRows(&sc, m.cfg.dim, 10, 0x1a6e);
+    const chunks = [_]usize{ 14, 14, 9 };
+    var full = try stateArm(m, &sc, ids, &chunks, &.{ false, false, false }, 2, rows, 5);
+    defer full.deinit();
+    var lean = try stateArm(m, &sc, ids, &chunks, &.{ true, true, false }, 2, rows, 5);
+    defer lean.deinit();
+    try expectArmsEqual(&sc, m, &full, &lean);
 }
 
 test "dsv41 Engram: each table keeps a row cache of exactly the bytes the load bills (DSV41_TINY)" {

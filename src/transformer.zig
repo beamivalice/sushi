@@ -812,6 +812,11 @@ pub const ForwardCtx = struct {
     /// DeepSeek-V4.1 chunked prefill: the prompt tokens after this chunk, whose Engram rows the model reads while the
     /// chunk runs. Empty for the last chunk and for decode.
     ahead_ids: []const i32 = &.{},
+    /// DeepSeek-V4.1 chunked prefill: the fewest rows the chunk after this one can have, 0 when none follows in the
+    /// prefill loop. A model whose decoder tail nothing reads may leave state only (`dsv41_model.extendState`).
+    ahead_min_rows: usize = 0,
+    /// A restore point is taken at this chunk's end.
+    holds_point: bool = false,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens

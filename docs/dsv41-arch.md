@@ -193,6 +193,39 @@ Proofs (`DSV41_TINY`, CPU stream, f32, QAT off):
 - The reference-oracle tests (decode after prefill, DSpark QAT off) compare against the reference's full forward,
   so they set `ced_split = null`.
 
+State-only chunks (a chunk another chunk follows runs no decoder tail):
+- A chunk's decoder tail only fills the decoder's and DSpark's window rings (`window` rows), and the next chunk's tail
+  overwrites them before any query reads one. `dsv41_model.extendState` runs the encoder layers and the split layer's
+  compressor over every row and stops: no decoder, no DSpark rows, no head, no logits. Port of CommunityServe/plugins
+  #11 by @STRML ([NOTICE](../NOTICE)).
+- The chunk loop engages it (`ForwardCtx.ahead_min_rows` and `holds_point`, `dsv41_serving.tailUnread`) for a chunk of
+  more than `window` rows that takes no restore point at its end and is followed in the loop by a chunk of more than
+  `window` rows, at the narrowest width the width hook can step down to (`prefill_plan.PREFILL_CHUNK_FLOOR`, 512).
+  The loop's last chunk keeps its tail (the prompt-end point and the final span read those rings), so does a chunk
+  that ends on a restore point (a ring left stale there is restored and read by a short continuation), and so does
+  a chunk before one of `window` rows or fewer (a stride-boundary cut or a merged tail: a full pass reads the ring).
+- With DSpark on, a decoder layer's ring holds `ring_slack` rows beyond the window that no query reads. A state-only
+  chunk leaves them as an earlier pass wrote them, so a restore point's raw ring bytes can differ from the full
+  pass's there; every row a pass reads is the same bits.
+- The release's tail (128 rows) is wider than a decode-width pass (`narrow_rows`, 16); the tiny fixture's window (8) is
+  not, so its replay takes the decode kernel, which reads the ring below the tail's first row. The tests raise the
+  window to 20 so the replay takes the span path the release takes.
+- Proofs (`DSV41_TINY`): `dsv41 state-only chunks:` (model level: logits, every state slot and the decode after, bf16
+  GPU with and without DSpark and QAT, and an image prompt cut by skipped chunks on the CPU stream; a skip before a
+  window-sized chunk gives other logits) and `dsv41 generator: a prefill that skips the decoder tails` (a cold
+  prefill with and without the skip: tokens, restore points, and the logits of a five-row continuation and three
+  decode steps after each point restored; engagement counted by `Model.state_only_used`). A predicate that ignores the
+  restore point fails the continuation compare at the first point. What only the release shapes reach: the 2048-row
+  chunks and the 128-row window over the span path at 32k+; the CPU-stream f32 tests prove the bits, the 32k run the
+  per-chunk saving.
+- Measured at 19b5ae9d against ea8941a7 (resident 32k, STQ 1.75bpw, `--drop-expert 128 --ssd-budget-gb 94`,
+  `SUSHI_DSV41_PREFILL_PROFILE=1`, code prompt of 32768 tokens, AC, `taskpolicy -a`, GPU lock, fans max, one A then one B):
+  prefill 1137.0 -> 1239.7 tok/s (+9.0%; 28.82 s -> 26.43 s), the same first token. Of the 16 chunks, 12 left state only
+  (the three ending on an 8192 point and the last kept their tails). The decoder stage lines of the chunk ending at 30,720: 205.8 ms
+  in A (encoder 1,589.1 ms), none in B (encoder 1,600.7 ms); the decoder lines of the whole prefill summed 5,018.6 ms in
+  A and 2,231.8 ms in B. The profile syncs each stage, so the gain with the profile off is the decoder tail's share of an
+  unsynced chunk.
+
 Prefill width:
 - DeepSeek picks its chunk per request: 2048 (`dsv41_config.prefill_width`) while that request's bill fits, then 1024,
   then 512. Load line: `Prefill chunk: per request, up to 2048 at a short prompt (...); load-time fallback N`. On an STQ

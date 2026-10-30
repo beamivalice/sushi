@@ -75,6 +75,13 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     return shell;
 }
 
+/// Whether the chunk's CED decoder tail is read by nothing (`dsv41_model.extendState`): no restore point at its end,
+/// and the next chunk of the loop replays a full window, whose rows overwrite every ring slot a query reads. A next
+/// chunk of `window` rows or fewer is a full pass that reads the rings this chunk's tail would have filled.
+pub fn tailUnread(window: usize, rows: usize, ahead_min_rows: usize, holds_point: bool) bool {
+    return window > 0 and !holds_point and rows > window and ahead_min_rows > window;
+}
+
 /// One request at a time: the model holds its state, which `cache.step` mirrors. Logits are the last row.
 pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *dsv41_model.Model) !mlx.mlx_array {
     if (ctx.cache.step == 0) dsv41_model.resetState(m);
@@ -98,6 +105,12 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
     const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
     defer m.gpa.free(ahead);
     for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
+    if (m.ced_split != null and tailUnread(m.cfg.window, n, ctx.ahead_min_rows, ctx.holds_point) and st.verify == null) {
+        try dsv41_model.extendState(m, host[0..n], dsv41_model.SPAN, vision, ahead);
+        if (self.expert_stream) |engine| engine.finishForward(n);
+        ctx.cache.step = st.n;
+        return mlx.mlx_array_new();
+    }
     const last = try dsv41_model.extendAhead(m, host[0..n], .last, dsv41_model.SPAN, vision, ahead);
     defer _ = mlx.mlx_array_free(last);
     if (self.expert_stream) |engine| engine.finishForward(n);
@@ -141,4 +154,15 @@ pub fn dsv41FinishImpl(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !v
     m.s = self.s;
     try dsv41_model.finishVerify(m, accepted);
     ctx.cache.step = (try dsv41_model.ensureState(m)).n;
+}
+
+test "tailUnread: a chunk is state only when no point is taken and the next chunk replays a full window" {
+    const t = std.testing;
+    try t.expect(tailUnread(128, 2048, 2048, false));
+    try t.expect(!tailUnread(128, 2048, 2048, true));
+    try t.expect(!tailUnread(128, 2048, 0, false));
+    try t.expect(!tailUnread(128, 2048, 128, false));
+    try t.expect(tailUnread(128, 2048, 129, false));
+    try t.expect(!tailUnread(128, 128, 2048, false));
+    try t.expect(!tailUnread(0, 2048, 2048, false));
 }

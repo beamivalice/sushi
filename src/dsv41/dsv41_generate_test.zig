@@ -1090,6 +1090,127 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     try testing.expectEqualSlices(u32, want.items, got.items);
 }
 
+/// A request over the tiny pack whose prefill leaves the decoder tails nothing reads (or runs them all), kept with its
+/// model so its restore points can be continued.
+const TailArm = struct {
+    weights: model_mod.Weights,
+    xfm: Transformer,
+    gen: Generator,
+    tokens: std.ArrayList(u32) = .empty,
+
+    fn start(a: std.mem.Allocator, config: model_mod.ModelConfig, dir: []const u8, tok: *Tokenizer, prompt: []const u32, offset: usize, skip: bool) !*TailArm {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const self = try a.create(TailArm);
+        errdefer a.destroy(self);
+        self.tokens = .empty;
+        var cfg = config;
+        self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &cfg, false);
+        errdefer self.weights.deinit();
+        self.xfm = try Transformer.init(io, a, config, &self.weights);
+        errdefer self.xfm.deinit();
+        const m = self.xfm.dsv41.?;
+        // Wider than a decode-width pass, as the release's window is: a narrower replay reads the ring below its floor.
+        m.cfg.window = 20;
+        m.s = self.xfm.s;
+        if (offset > 0) {
+            _ = mlx.mlx_array_free(try @import("dsv41_model.zig").extend(m, prompt[0..offset], .last));
+            self.xfm.cache.step = offset;
+        }
+        const opts: Generator.InitOptions = .{
+            .skip_lazy_preforward = true,
+            .pinned_prefill_chunk = 256,
+            .adaptive_chunk_width = false,
+            .ssm_checkpoint_stride = 512,
+            .ssm_checkpoint_max = 8,
+            .ssm_checkpoint_pos_offset = offset,
+            .skip_unread_tails = skip,
+        };
+        self.gen = try Generator.initWithOptions(io, a, &self.xfm, tok, prompt[offset..], 6, .{ .temperature = 0.0 }, &.{}, opts);
+        errdefer self.gen.deinit(a);
+        try self.tokens.append(a, self.gen.next_token_id);
+        while (try self.gen.next(a)) |t| try self.tokens.append(a, t);
+        return self;
+    }
+
+    fn destroy(self: *TailArm, a: std.mem.Allocator) void {
+        self.tokens.deinit(a);
+        self.gen.deinit(a);
+        self.xfm.deinit();
+        self.weights.deinit();
+        a.destroy(self);
+    }
+
+    /// The logits of what a request does after restore point `i`: a pass of fewer rows than the window, then decode.
+    fn continueAt(self: *TailArm, a: std.mem.Allocator, sc: *@import("dsv41_scope.zig").Scope, i: usize, prompt: []const u32) ![]f32 {
+        const dsv41_model = @import("dsv41_model.zig");
+        const m = self.xfm.dsv41.?;
+        const cp = &self.gen.ssm_checkpoints.items[i];
+        try dsv41_prefix.restore(m, cp, prompt);
+        var rows: std.ArrayList(f32) = .empty;
+        errdefer rows.deinit(a);
+        var at = cp.pos;
+        for ([_]usize{ 5, 1, 1, 1 }) |n| {
+            const lg = try dsv41_model.extend(m, prompt[at..][0..n], .all);
+            defer _ = mlx.mlx_array_free(lg);
+            const h = try dsv41_model.hostRows(sc, lg);
+            defer a.free(h);
+            try rows.appendSlice(a, h);
+            at += n;
+        }
+        return rows.toOwnedSlice(a);
+    }
+};
+
+test "dsv41 generator: a prefill that skips the decoder tails nothing reads gives the tokens and restore points of the full passes, and a short continuation after each (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var prompt: [1400]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
+    const saved_chunk = generate.prefill_chunk_override;
+    defer generate.prefill_chunk_override = saved_chunk;
+    generate.prefill_chunk_override = 256;
+
+    // Offset 0: chunks end at 256, 512, 768 and 1369 (a merged tail); points at 512 and the prompt end. The chunks
+    // ending at 256 and 768 leave state only. Offset 246: the chunk ending at 502 is followed by one of ten rows,
+    // which a skipped tail would leave stale; only the chunk ending at 768 is skipped.
+    for ([_]struct { offset: usize, skipped: u64 }{ .{ .offset = 0, .skipped = 2 }, .{ .offset = 246, .skipped = 1 } }) |c| {
+        const full = try TailArm.start(a, config, dir, &tok, &prompt, c.offset, false);
+        defer full.destroy(a);
+        const lean = try TailArm.start(a, config, dir, &tok, &prompt, c.offset, true);
+        defer lean.destroy(a);
+        try testing.expectEqual(@as(u64, 0), full.xfm.dsv41.?.state_only_used);
+        try testing.expectEqual(c.skipped, lean.xfm.dsv41.?.state_only_used);
+        try testing.expectEqualSlices(u32, full.tokens.items, lean.tokens.items);
+        try testing.expectEqual(@as(usize, 2), full.gen.ssm_checkpoints.items.len);
+        try testing.expectEqual(full.gen.ssm_checkpoints.items.len, lean.gen.ssm_checkpoints.items.len);
+        for (full.gen.ssm_checkpoints.items, lean.gen.ssm_checkpoints.items, 0..) |f, l, i| {
+            try testing.expectEqual(f.pos, l.pos);
+            const want = try full.continueAt(a, &sc, i, &prompt);
+            defer a.free(want);
+            const got = try lean.continueAt(a, &sc, i, &prompt);
+            defer a.free(got);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+        }
+    }
+}
+
 test "dsv41 generator: a chunked prefill tells the model the tokens after each chunk, and the next pass takes their Engram rows (DSV41_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");

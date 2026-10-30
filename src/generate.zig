@@ -1610,6 +1610,9 @@ pub const Generator = struct {
         interleave_hook: ?InterleaveHook = null,
         /// SSD-first write-through (qwen4_exp and GLM; see `WriteThroughHook`).
         write_through_hook: ?WriteThroughHook = null,
+        /// DeepSeek: a prefill chunk whose decoder tail nothing reads leaves state only. False runs every tail, the
+        /// full passes the tests compare against.
+        skip_unread_tails: bool = true,
         /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
         /// `mlx_clear_cache` and before the interleave tick. Null keeps the admitted width.
         /// Presence is NOT the arch gate (`serve` installs it process-wide); read `adaptive_chunk_width`.
@@ -2001,8 +2004,14 @@ pub const Generator = struct {
                     else
                         prompt_ids.len;
                     ctx.ahead_ids = ids_i32[end..ahead_end];
+                    // A narrower width can follow the hook's step-down at this boundary, never below the ladder's floor.
+                    const floor: usize = if (adapt_chunked and options.chunk_width_hook != null) @min(cap_adapt, prefill_plan.PREFILL_CHUNK_FLOOR) else std.math.maxInt(usize);
+                    ctx.ahead_min_rows = if (options.skip_unread_tails and end < loop_end) @min(ahead_end - end, floor) else 0;
+                    ctx.holds_point = want_ssm_cp and cp_grid > 0 and (end + ssm_cp_offset) % cp_grid == 0;
                 }
                 defer ctx.ahead_ids = &.{};
+                defer ctx.ahead_min_rows = 0;
+                defer ctx.holds_point = false;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
