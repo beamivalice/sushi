@@ -482,7 +482,16 @@ within ~15% of affine-4. Times in µs, trellis GEMM / mxfp8 / affine-4, interlea
 - shared `w1`: 297 / 346 / 300.
 
 A decode-once dense arm (the layer's weights decoded once into f16, then an MLX matmul) is slower at 512 rows
-(`wq_b` 1005, `wo_b` 1182) and only draws level at 2048. It was not landed. The trunk is ~10% of a chunk; the routed
+(`wq_b` 1005, `wo_b` 1182) and only draws level at 2048. It was not landed. **A decode-once dense GEMM does not
+give the trellis GEMM's bytes** (the dense twin of `decodeDense` at `ea8941a7`, SPEC1 n64 random banks on the
+trunk shapes, 2048 bf16 rows, GPU lock, `taskpolicy -a`): with the weight stored bf16, 43% of the output elements
+differ (relRms 2.6e-3 between the arms); stored f16, 17% (1.6e-3). Against an f32 CPU product of the same decoded
+weight (8 rows a bank) the trellis GEMM sits at 1.7e-3, the dense arm at 2.3e-3 (bf16) and 1.7e-3 (f16): the arms are
+equally close to the truth in f16 and the bytes still move, so it is an output-changing variant for the KLD gate.
+mxfp8 trunk linears (source-FP8 packs, no shipped pack) are not byte-safe either: `dequantize` to bf16 plus a dense GEMM
+equals `quantized_matmul` at 2048 rows on every trunk shape, but at 1024 and 1300 rows `wq_a` and `wkv` (K 5120) differ in
+0.02% of the elements, so a row threshold would have to be shape-keyed. mlx-serve PR 1019's "lossless" covers the weight
+values only. Not landed. The trunk is ~10% of a chunk; the routed
 experts are about half ([dsv41-arch](dsv41-arch.md#ced)).
 
 ## Parity bars
