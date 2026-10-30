@@ -608,7 +608,10 @@ layer) the forward queues the argmax, the embedding gather and layer 0 before th
 (`dsv41_model.extendLazy`, `Model.lazy_starts`); the host then reads the token, hashes it for the Engram rows and runs
 layer 1 on. A token the pass refuses (an image id without image rows) restores layer 0's state (`Undo`) and the next
 forward at that position gives the bytes of one that never saw it (`dsv41 generator: a one-row decode that hands its
-logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit). The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
+logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit). The FFN's hc split
+(`sf`: pre, post, comb) is submitted with the picks (`submitWith`, `Spec.queue`'s `ride`), so the one-simdgroup Sinkhorn
+runs beside the gate GEMV and not in a buffer of its own behind the routed chain; same kernel, same bytes
+(`dsv41 submit`). The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
 round's kept rows ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
 

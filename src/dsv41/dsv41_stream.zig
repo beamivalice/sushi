@@ -164,14 +164,12 @@ pub const StqStream = struct {
     }
 
     /// The chain over the slots the layer's GPU map holds for the picks, which the host checks in `settle`.
-    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp) anyerror!model.Experts.Queued {
+    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, ride: []const A) anyerror!model.Experts.Queued {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const spec = try self.engine.specGrouped(@intCast(layer)) orelse return error.Dsv41StqLayerNotGrouped;
         const idx32 = try sc.astype(idx, .int32);
         // Submitted before the chain, so the host's read of the picks waits for the router only, not for the chain.
-        const ids = mlx.mlx_vector_array_new_data(&[_]A{idx32}, 1);
-        defer _ = mlx.mlx_vector_array_free(ids);
-        try mlx.check(mlx.mlx_async_eval(ids));
+        try model.submitWith(idx32, ride);
         const local = try sc.take(spec.slots, idx32, 0);
         const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec.bank, x, local, wts, shared);
         return .{ .out = out, .idx = idx32, .map = spec.host };

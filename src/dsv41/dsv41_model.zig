@@ -193,7 +193,8 @@ pub const Experts = union(enum) {
         can: *const fn (ctx: *anyopaque, layer: usize) bool,
         /// The routed sum plus `shared` (as `Hook.apply`) over the slots the map holds for the picks `idx`, with no host
         /// read; `map` is the host copy of that map, kept until the layer is settled.
-        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp) anyerror!Queued,
+        /// `ride` is submitted with the picks, in the same command buffer.
+        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, ride: []const A) anyerror!Queued,
         /// The host's side of a queued layer: null when every pick sat in the slot the GPU read, else the exact sum.
         settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, map: []const i32) anyerror!?A,
     };
@@ -2198,7 +2199,15 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
 
 /// Queues `x` on the GPU without waiting for it.
 pub fn submit(x: A) !void {
-    const v = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+    try submitWith(x, &.{});
+}
+
+/// `submit` with `ride` in the same command buffer: work independent of `x` runs beside it instead of in a buffer of its own.
+pub fn submitWith(x: A, ride: []const A) !void {
+    var all: [4]A = undefined;
+    all[0] = x;
+    @memcpy(all[1 .. 1 + ride.len], ride);
+    const v = mlx.mlx_vector_array_new_data(&all, 1 + ride.len);
     defer _ = mlx.mlx_vector_array_free(v);
     try mlx.check(mlx.mlx_async_eval(v));
 }
@@ -2234,7 +2243,8 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) 
     return ly.shared[2].apply(sc, act);
 }
 
-fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
+/// `ride`: arrays independent of the router (the FFN's hc split) that go out with its picks.
+fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, ride: []const A) !A {
     const img = sh.img;
     const c = &m.cfg;
     const ly = &m.layers[li];
@@ -2254,7 +2264,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
             // Submitted ahead of the chain, so the host's read of it waits for nothing but the router.
             const pred = if (target) |j| try predictLogits(sc, m, h, j) else none;
             if (pred.ctx != null) try submit(pred);
-            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } });
+            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } }, ride);
             const out = try sc.astype(q.out, m.act);
             sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts) };
             if (pred.ctx != null) {
@@ -2267,7 +2277,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
         // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
-        if (early) try submit(r.idx);
+        if (early) try submitWith(r.idx, ride);
         // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there.
         const wide = m.tap == null and m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null;
         const sy: SharedOp = if (wide) .{ .layer = .{ .m = m, .li = li } } else .{ .array = try sharedExpert(sc, m, li, ly, h) };
@@ -2410,7 +2420,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     const y = blk: {
         var fsc = Scope.init(sc.a, sc.s);
         defer fsc.deinit();
-        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh)));
+        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, &.{ sf.pre, sf.post, sf.comb })));
     };
     if (sh.spec) |*u| {
         u.x1 = sc.out(x1);
@@ -6070,5 +6080,31 @@ test "dsv41 embed: a row gathered on the GPU is the dequantized stored row, for 
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(lazy));
             try testing.expect(std.mem.indexOfNone(u8, std.mem.sliceAsBytes(want), &.{0}) != null);
         }
+    }
+}
+
+test "dsv41 submit: arrays riding the picks' submit are computed with it, and the hc split's bytes are the split evaluated alone" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const eps = try kernels.hcEps(&sc, 1e-6, 1e-6);
+    var prng = std.Random.DefaultPrng.init(0x64a1);
+    const rnd = prng.random();
+    for ([_]f32{ 0.05, 1.0, 40.0 }) |mag| {
+        var z: [24]f32 = undefined;
+        for (&z) |*v| v.* = (rnd.float(f32) * 2 - 1) * mag;
+        const alone = try kernels.hcSplitZ(&sc, try sc.floats(&z, &.{ 1, 24 }), 4, 20, eps);
+        const want = [_][]const f32{ try sc_mod.hostF32(alone.pre), try sc_mod.hostF32(alone.post), try sc_mod.hostF32(alone.comb) };
+        const rode = try kernels.hcSplitZ(&sc, try sc.floats(&z, &.{ 1, 24 }), 4, 20, eps);
+        const idx = try sc.add(try sc.floats(&z, &.{ 1, 24 }), try sc.f(1));
+        try submitWith(idx, &.{ rode.pre, rode.post, rode.comb });
+        try mlx.check(mlx.mlx_array_eval(idx));
+        for ([_]A{ rode.pre, rode.post, rode.comb }) |a| {
+            var ready = false;
+            try mlx.check(mlx._mlx_array_is_available(&ready, a));
+            try testing.expect(ready);
+        }
+        const got = [_][]const f32{ try sc_mod.hostF32(rode.pre), try sc_mod.hostF32(rode.post), try sc_mod.hostF32(rode.comb) };
+        for (got, want) |g, w| try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w), std.mem.sliceAsBytes(g));
     }
 }
