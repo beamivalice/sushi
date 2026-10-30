@@ -688,6 +688,140 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     }
 }
 
+const LazyHeadRun = struct {
+    tokens: std.ArrayList(u32) = .empty,
+    logits: std.ArrayList(f32) = .empty,
+
+    fn deinit(self: *LazyHeadRun, a: std.mem.Allocator) void {
+        self.tokens.deinit(a);
+        self.logits.deinit(a);
+    }
+};
+
+fn forwardIds(xfm: *Transformer, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
+    const a = testing.allocator;
+    const ids32 = try a.alloc(i32, ids.len);
+    defer a.free(ids32);
+    for (ids, ids32) |t, *o| o.* = @intCast(t);
+    const shape = [_]c_int{ 1, @intCast(ids.len) };
+    const arr = mlx.mlx_array_new_data(ids32.ptr, &shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(arr);
+    return xfm.forwardWith(ctx, arr);
+}
+
+fn argmaxHost(xfm: *Transformer, logits: mlx.mlx_array) !u32 {
+    var am = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(am);
+    try mlx.check(mlx.mlx_argmax_axis(&am, logits, -1, false, xfm.s));
+    try mlx.check(mlx.mlx_array_eval(am));
+    var v: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&v, am));
+    return @intCast(v);
+}
+
+/// Greedy decode by hand: each step's token is evaluated from the logits before anything reads their bytes, as the
+/// Generator does; with `lazy` the forward may hand the logits back unevaluated.
+fn lazyHeadSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, steps: usize, lazy: bool) !LazyHeadRun {
+    var run: LazyHeadRun = .{};
+    errdefer run.deinit(a);
+    try xfm.resetCache();
+    var ctx = xfm.defaultCtx();
+    var lg = try forwardIds(xfm, &ctx, prompt);
+    var tok = try argmaxHost(xfm, lg);
+    _ = mlx.mlx_array_free(lg);
+    try run.tokens.append(a, tok);
+    const vocab = xfm.dsv41.?.cfg.vocab;
+    for (0..steps) |_| {
+        ctx.lazy_logits = lazy;
+        lg = try forwardIds(xfm, &ctx, &.{tok});
+        defer _ = mlx.mlx_array_free(lg);
+        tok = try argmaxHost(xfm, lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        const data = mlx.mlx_array_data_float32(lg) orelse return error.NoLogits;
+        try run.logits.appendSlice(a, data[0..vocab]);
+        try run.tokens.append(a, tok);
+    }
+    return run;
+}
+
+fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dsv41_model = @import("dsv41_model.zig");
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = dspark;
+    config.expert_cache_bytes = if (stq) 64 << 20 else 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    const m = xfm.dsv41.?;
+    try testing.expectEqual(dspark, m.dspark != null);
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const prompt = ids[0..30];
+    const steps: usize = 24;
+
+    var want = try lazyHeadSteps(a, &xfm, prompt, steps, false);
+    defer want.deinit(a);
+    try testing.expectEqual(@as(u64, 0), m.heads_deferred);
+    var got = try lazyHeadSteps(a, &xfm, prompt, steps, true);
+    defer got.deinit(a);
+    try testing.expectEqual(@as(u64, steps), m.heads_deferred);
+    try testing.expectEqualSlices(u32, want.tokens.items, got.tokens.items);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(got.logits.items));
+
+    // The Generator's pipelined greedy decode takes the same path and says the same tokens.
+    var served: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&served) |*r| r.deinit(a);
+    var used: [2]u64 = undefined;
+    for (&served, &used, [_]bool{ false, true }) |*out, *n, lazy| {
+        m.lazy_head = lazy;
+        const before = m.heads_deferred;
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, @intCast(steps + 1), .{ .temperature = 0.0 }, &.{}, .{});
+        defer gen.deinit(a);
+        while (try gen.next(a)) |t| try out.append(a, t);
+        n.* = m.heads_deferred - before;
+    }
+    m.lazy_head = true;
+    try testing.expectEqual(@as(u64, 0), used[0]);
+    try testing.expect(used[1] >= steps - 2);
+    try testing.expectEqual(@as(usize, steps + 1), served[0].items.len);
+    try testing.expectEqualSlices(u32, served[0].items, served[1].items);
+
+    // A request that reads the logits themselves keeps the evaluated head.
+    const kept = m.heads_deferred;
+    try xfm.resetCache();
+    var lp = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 8, .{ .temperature = 0.0 }, &.{}, .{ .logprobs_n = 3 });
+    defer lp.deinit(a);
+    lp.logprobs_n = 3;
+    while (try lp.next(a)) |_| {}
+    try testing.expectEqual(kept, m.heads_deferred);
+}
+
+test "dsv41 generator: a one-row decode that hands its logits back unevaluated gives the evaluated head's tokens and logits bit for bit (DSV41_TINY)" {
+    const dir = try @import("dsv41_model.zig").fixtureDir();
+    try lazyHeadProof(dir, false, false);
+    try lazyHeadProof(dir, false, true);
+}
+
+test "dsv41 generator: a one-row decode that hands its logits back unevaluated gives the evaluated head's tokens and logits bit for bit (DSV41_STQ_TINY)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    try lazyHeadProof(dir, true, false);
+    try lazyHeadProof(dir, true, true);
+}
+
 test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its closer and decodes the rest serially (DSV41_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");

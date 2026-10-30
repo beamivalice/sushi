@@ -703,6 +703,13 @@ pub const Model = struct {
     state_only_used: u64 = 0,
     /// The next chunk's embedding rows, read from the SSD table while this one runs (`aheadEmbed`).
     embed_ahead: ?*embed_ssd.Ahead = null,
+    /// A one-row decode hands its logits back unevaluated when the caller asks (`ForwardCtx.lazy_logits`); off, the
+    /// head is waited on as every other pass's is (the tests' oracle).
+    lazy_head: bool = true,
+    /// The next pass's caller evaluates a value computed from its logits at once, so `finishPass` need not wait for them.
+    defer_head: bool = false,
+    /// One-row passes whose logits `finishPass` handed back unevaluated.
+    heads_deferred: u64 = 0,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
     engram_wait_ns: u64 = 0,
     engram_forwards: u64 = 0,
@@ -3234,6 +3241,13 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         pf.restart();
         try pf.mark(.head, &.{res});
         pf.report(L, p.p0);
+    }
+    // The caller's own evaluation of a value built on the logits waits for the head, so the host does not wake between them.
+    if (m.defer_head and L == 1 and want == .last and p.st.verify == null and m.tap == null and prof(m, L) == null) {
+        try submit(res);
+        m.heads_deferred += 1;
+        reportReads(L);
+        return res;
     }
     const t0 = readStart();
     defer readDone(.head, t0);

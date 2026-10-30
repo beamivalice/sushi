@@ -602,8 +602,11 @@ of a kept layer never come from a wrong sum. An Engram layer is rebuilt from the
 (`Pass.engram_rows`). A layer the stream cannot queue (resident, released, lossy pick) settles its predecessor first; a
 pass that rebuilt 3 layers plus a third of those built (`Model.route_spec_rebuilds`) stops queueing. A decode pass does
 not wait for its embedding, and queues the head from the last layer's queued sum before settling it (a rebuild builds the
-head again), so the GPU's only idle points are the logits read and the host's sampling. The bytes equal
-the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
+head again), so the GPU's only idle points are the logits read and the host's sampling. A pipelined one-row greedy
+decode (`ForwardCtx.lazy_logits`, set by the Generator when the request reads only the argmax) takes the logits back
+unevaluated, so the sampler's argmax rides the head's wait (`Model.heads_deferred`); logprobs, penalties, grammar, DSpark
+verify and every wider pass keep the waited head (`dsv41 generator: a one-row decode that hands its logits back
+unevaluated`, tokens and logits bit for bit). The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
 round's kept rows ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
 

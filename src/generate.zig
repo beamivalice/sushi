@@ -2629,7 +2629,7 @@ pub const Generator = struct {
         // Regular path: sample first token lazily, then build the next forward pass
         const lazy_token = try sampler.firstTokenSample(xfm, logits, sampling, s);
 
-        const next_logits = try lazyForward(xfm, &ctx, lazy_token);
+        const next_logits = try lazyForward(xfm, &ctx, lazy_token, ctx.argmax_only);
 
         // Async-eval the decode pipeline (single-token graphs, much smaller)
         {
@@ -4138,7 +4138,7 @@ pub const Generator = struct {
                 _ = mlx.mlx_array_free(lazy_token);
             };
             const t_fwd = tick_prof.mark();
-            if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
+            if (lazyForward(self.xfm, &self.ctx, lazy_token, self.ctx.argmax_only)) |next_logits| {
                 tick_prof.add(.fwd, t_fwd);
                 defer if (!adopted) {
                     _ = mlx.mlx_array_free(next_logits);
@@ -4253,7 +4253,7 @@ pub const Generator = struct {
 
         if (self.step < self.max_tokens) {
             const t_fwd = tick_prof.mark();
-            const next_logits = lazyForward(self.xfm, &self.ctx, lazy_token) catch {
+            const next_logits = lazyForward(self.xfm, &self.ctx, lazy_token, self.ctx.argmax_only) catch {
                 tick_prof.add(.fwd, t_fwd);
                 try mlx.check(mlx.mlx_array_eval(lazy_token));
                 var val: i32 = 0;
@@ -4610,7 +4610,7 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(lazy);
         var next_logits: ?mlx.mlx_array = null;
         if (self.step + 1 < self.max_tokens) {
-            if (lazyForward(self.xfm, &self.ctx, lazy)) |nl| {
+            if (lazyForward(self.xfm, &self.ctx, lazy, false)) |nl| {
                 const arr = [_]mlx.mlx_array{ lazy, nl };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
                 _ = mlx.mlx_async_eval(vec);
@@ -4753,7 +4753,7 @@ pub const Generator = struct {
 
 /// Build forward pass from a lazy sampled token array.
 /// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
-fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !mlx.mlx_array {
+fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array, lazy_logits: bool) !mlx.mlx_array {
     const tok_shape = [_]c_int{ 1, 1 };
     var reshaped = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(reshaped);
@@ -4762,7 +4762,11 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
     // arch with a host-side token lookup (qwen4 n-gram PLE) fills its leaf
     // afterwards, so the one sync on the token comes AFTER the build.
     ctx.ple_defer = true;
-    defer ctx.ple_defer = false;
+    ctx.lazy_logits = lazy_logits;
+    defer {
+        ctx.ple_defer = false;
+        ctx.lazy_logits = false;
+    }
     const logits = xfm.forwardWith(ctx, reshaped) catch |e| {
         xfm.discardDeferredPle(ctx);
         return e;

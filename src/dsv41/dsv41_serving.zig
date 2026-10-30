@@ -113,6 +113,8 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
         ctx.cache.step = st.n;
         return mlx.mlx_array_new();
     }
+    m.defer_head = m.lazy_head and ctx.lazy_logits and n == 1;
+    defer m.defer_head = false;
     const last = try dsv41_model.extendAhead(m, host[0..n], .last, dsv41_model.SPAN, vision, ahead);
     defer _ = mlx.mlx_array_free(last);
     if (self.expert_stream) |engine| engine.finishForward(n);

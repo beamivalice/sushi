@@ -860,6 +860,9 @@ pub const ForwardCtx = struct {
     /// certified-below-the-winner elsewhere — exactly enough for an argmax,
     /// not for a tail distribution. Default false = dense path everywhere.
     argmax_only: bool = false,
+    /// The caller's next act is to evaluate a value computed from the returned logits, so the forward may hand them
+    /// back unevaluated (DeepSeek's one-row decode). Nothing else may read the logits' bytes first.
+    lazy_logits: bool = false,
     /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
     /// Non-null means: this forward runs at `batch == batch_slots.len`,
     /// `seq_len == 1`, and every per-slot KV cache lives on the slot ctxs
