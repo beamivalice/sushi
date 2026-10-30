@@ -43,21 +43,14 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   the Engram rows, the MTP/DSpark tensors and (under `--no-vision`) the vision/aligner/image tensors and `bias_vl`, read by name from the shard headers. FP8
   linears become MLX `mxfp8`: the u8 codes viewed as u32 and each 32-row scale row repeated down its 32 rows. FP4 experts
   are MLX `mxfp4` exactly (the int8 viewed as u32, low nibble first; proven bit for bit against a numpy decode of a real
-  expert). The head is widened to f32; a dense embedding stays bf16. An affine embedding (an STQ pack's 4-bit g64 triple, `embed.weight/scales/biases`) is [read from the shard by row](#embed-ssd), not loaded.
-<a id="embed-ssd"></a>
-- **Token embedding on SSD** (`src/dsv41/dsv41_embed.zig`): a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`)
-  is left out of the resident load and of the trunk term (`dsv41_source.embedOnSsd`, the one test for both), 0.37 GB on the
-  STQ pack. A forward `pread`s the rows of its token ids (`Ssd.read`: each distinct id once, 16 rows a thread, `F_RDADVISE`
-  first, page cache on, read-ahead off) and `Embed.rows` dequantizes them with the resident call, over the same stored bytes
-  (scales and biases cast to the activation dtype as the loader cast them), so the rows are bit-identical. The page cache
-  keeps the common tokens' rows hot. A prefill chunk's pass is told the prompt tokens after it (`ForwardCtx.ahead_ids`)
-  and reads the next chunk's rows on a thread while it runs (`aheadEmbed`, ~2.3 KB a token of host memory, unbilled);
-  the next pass takes them when its ids are the same, else reads its own. Decode and a DSpark draft read their few rows
-  inline. The DSpark draft embeds `[t1, noise_id...]` through the same table; MTP stages, the head and the vision tower
-  never touch it. A dense embedding (the FP8 checkpoint's bf16 table) stays resident. Load logs
-  `[dsv41] token embedding on SSD (0.37 GB freed to the expert cache)`. Live (873b0fd4 vs 09977e23, budget 108, AC, fans
-  max, one A then one B): +1 slot a layer (270 -> 271 serial, 260 -> 261 DSpark), 512-token decode byte-identical at
-  46.8 / 46.9 tok/s serial and 52.0 / 52.2 DSpark, cold 32,888-token prefill 792.7 / 790.4 tok/s.
+  expert). The head is widened to f32; a dense embedding stays bf16. An affine embedding (an STQ pack's 4-bit g64 triple, `embed.weight/scales/biases`) loads with the trunk, [resident](#embed-resident).
+<a id="embed-resident"></a>
+- **Token embedding, resident**: a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`; 0.37 GB on the
+  STQ pack) is loaded and billed with the trunk like a dense table, and `Embed.rows` gathers and dequantizes the rows of
+  its ids on the GPU, so the ids may be an array still being computed (`extendLazy`). The rows equal the ones the table
+  read by row from the shard gave (`dsv41 embed: a row gathered on the GPU ...`, host and lazy ids, bf16/f16/f32
+  scales). The cache gives back the 0.37 GB the SSD read had freed (at most one slot a layer). The DSpark draft embeds
+  `[t1, noise_id...]` through the same table; MTP stages, the head and the vision tower never touch it.
 - **Routed experts** (`src/dsv41/dsv41_stream.zig`): the shared expert cache reads each layer's picked experts from the shards
   into slabs (layout `mxfp4_w123`, `layers.L.ffn.experts.E.w1|w3|w2.{weight,scale}`; w1 gate, w3 up, w2 down) and the
   layer gathers them as `mxfp4`. The slab path gives the resident path's logits bit for bit on a tiny pack, with a cache
@@ -605,8 +598,12 @@ not wait for its embedding, and queues the head from the last layer's queued sum
 head again), so the GPU's only idle points are the logits read and the host's sampling. A pipelined one-row greedy
 decode (`ForwardCtx.lazy_logits`, set by the Generator when the request reads only the argmax) takes the logits back
 unevaluated, so the sampler's argmax rides the head's wait (`Model.heads_deferred`); logprobs, penalties, grammar, DSpark
-verify and every wider pass keep the waited head (`dsv41 generator: a one-row decode that hands its logits back
-unevaluated`, tokens and logits bit for bit). The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
+verify and every wider pass keep the waited head. On the same gate (text, no tap/trace/profile, layer 0 not an Engram
+layer) the forward queues the argmax, the embedding gather and layer 0 before the host reads the token
+(`dsv41_model.extendLazy`, `Model.lazy_starts`); the host then reads the token, hashes it for the Engram rows and runs
+layer 1 on. A token the pass refuses (an image id without image rows) restores layer 0's state (`Undo`) and the next
+forward at that position gives the bytes of one that never saw it (`dsv41 generator: a one-row decode that hands its
+logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit). The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
 round's kept rows ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
 

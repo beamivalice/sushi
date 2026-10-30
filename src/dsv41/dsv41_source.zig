@@ -37,18 +37,6 @@ pub fn keeps(key: []const u8, parts: Parts) bool {
     return true;
 }
 
-/// Does this shard hold the embedding as an affine triple? Such a triple stays in the shard, and the model reads its
-/// rows from there (`dsv41_embed`); a dense `embed.weight` is loaded.
-fn embedOnSsd(header: *const expert_io.SafetensorsHeader) bool {
-    const t = header.parsed.value.object;
-    return t.contains("embed.weight") and t.contains("embed.scales") and t.contains("embed.biases");
-}
-
-fn isEmbedKey(key: []const u8) bool {
-    for ([_][]const u8{ "embed.weight", "embed.scales", "embed.biases" }) |k| if (std.mem.eql(u8, key, k)) return true;
-    return false;
-}
-
 /// The checkpoint's weight shards in name order; the caller frees each name and the list.
 fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !std.ArrayList([]const u8) {
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
@@ -109,11 +97,10 @@ pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8,
         defer _ = std.c.close(fd);
         var header = try expert_io.SafetensorsHeader.read(allocator, fd);
         defer header.deinit();
-        const embed_ssd = embedOnSsd(&header);
         var tensors = header.parsed.value.object.iterator();
         while (tensors.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "__metadata__") or (embed_ssd and isEmbedKey(key)) or !keep(key, ctx)) continue;
+            if (std.mem.eql(u8, key, "__metadata__") or !keep(key, ctx)) continue;
             const read = try model.readSafetensorArray(&reader, fd, &header, entry.value_ptr.*);
             const value = read.array;
             var value_owned = true;
@@ -181,11 +168,10 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
         defer _ = std.c.close(fd);
         var header = try expert_io.SafetensorsHeader.read(allocator, fd);
         defer header.deinit();
-        const embed_ssd = embedOnSsd(&header);
         var tensors = header.parsed.value.object.iterator();
         while (tensors.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "__metadata__") or (embed_ssd and isEmbedKey(key)) or !keeps(key, .{ .dspark = true, .vision = true })) continue;
+            if (std.mem.eql(u8, key, "__metadata__") or !keeps(key, .{ .dspark = true, .vision = true })) continue;
             const mine: Section = if (isVisionKey(key)) .vision else if (std.mem.startsWith(u8, key, "mtp.")) .stages else .trunk;
             if (mine != section) continue;
             const offs = (entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader).array.items;
@@ -419,7 +405,7 @@ test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's
     try testing.expectEqual(expert_io.pageRoundUp(3 * mib + 100) + expert_io.pageRoundUp(100), try dsparkBytes(testing.io, testing.allocator, root));
 }
 
-test "dsv41 source: an affine embedding stays in its shard and leaves the trunk term, a dense one is loaded and billed" {
+test "dsv41 source: an affine embedding is loaded and billed with the trunk" {
     const mib: usize = 1 << 20;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -431,36 +417,10 @@ test "dsv41 source: an affine embedding stays in its shard and leaves the trunk 
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    try testing.expectEqual(@as(u64, 4000), try residentBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(expert_io.pageRoundUp(2 * mib) + 1000 + 1000 + 4000, try residentBytes(testing.io, testing.allocator, root));
     var w = try loadResident(testing.io, testing.allocator, root, .{});
     defer w.deinit();
-    try testing.expect(w.get("embed.weight") == null and w.get("embed.scales") == null and w.get("embed.biases") == null);
-    try testing.expect(w.get("norm.weight") != null);
-
-    var dense = testing.tmpDir(.{});
-    defer dense.cleanup();
-    try writeShard(dense.dir, "model-a.safetensors", &.{ .{ "embed.weight", 2 * mib }, .{ "norm.weight", 4000 } });
-    var dense_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dense_root = dense_buf[0..try dense.dir.realPath(testing.io, &dense_buf)];
-    try testing.expectEqual(expert_io.pageRoundUp(2 * mib) + 4000, try residentBytes(testing.io, testing.allocator, dense_root));
-    var dw = try loadResident(testing.io, testing.allocator, dense_root, .{});
-    defer dw.deinit();
-    try testing.expect(dw.get("embed.weight") != null);
-}
-
-test "dsv41 source: the bytes an SSD embedding frees go to the expert cache in the ssd budget ledger" {
-    const budgetLedger = @import("../expert_stream.zig").budgetLedger;
-    const table: u64 = 371_000_000;
-    const trunk: u64 = 4_780_000_000;
-    const budget: u64 = 108 << 30;
-    // 40 layers of 384 experts, 9.62 MB the largest.
-    const resident = try budgetLedger(budget, trunk, 3_920_000_000, 0, 40, 384, 6, 9_620_000, 600_000_000, .{});
-    const freed = try budgetLedger(budget, trunk - table, 3_920_000_000, 0, 40, 384, 6, 9_620_000, 600_000_000, .{});
-    try testing.expectEqual(resident.trunk_bytes - table, freed.trunk_bytes);
-    // The table is 0.96 of a slot a layer: the cache gains one slot a layer or none, never more.
-    try testing.expect(freed.slots_per_layer - resident.slots_per_layer <= 1);
-    const spare = budget - (resident.trunk_bytes + resident.mtp_bytes + resident.workspace_bytes + resident.selected_bytes + resident.bounce_bytes) - resident.cache_bytes;
-    try testing.expectEqual(freed.slots_per_layer - resident.slots_per_layer, (spare + table) / (40 * 9_620_000));
+    for ([_][]const u8{ "embed.weight", "embed.scales", "embed.biases", "norm.weight" }) |k| try testing.expect(w.get(k) != null);
 }
 
 test "dsv41 source: a router weight is billed at its stored size, in the trunk and in a DSpark stage" {

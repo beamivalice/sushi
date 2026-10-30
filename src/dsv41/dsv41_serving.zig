@@ -92,12 +92,16 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
     m.s = self.s;
     const rows = mlx.getShape(ids);
     if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
+    const n: usize = @intCast(rows[1]);
+    // A one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
+    const lazy = n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, self.s));
-    try mlx.check(mlx.mlx_array_eval(flat));
-    const host = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidDsv41Input;
-    const n: usize = @intCast(rows[1]);
+    // Queued before any host work, so the token is ready as soon as the head is.
+    if (lazy) try dsv41_model.submit(flat) else try mlx.check(mlx.mlx_array_eval(flat));
+    var one: [1]u32 = undefined;
+    const host: []const u32 = if (lazy) &one else (mlx.mlx_array_data_uint32(flat) orelse return error.InvalidDsv41Input)[0..n];
     if (self.expert_stream) |engine| {
         try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n);
         engine.beginForward();
@@ -108,14 +112,14 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
     defer m.gpa.free(ahead);
     for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
     if (m.ced_split != null and tailUnread(m.cfg.window, n, ctx.ahead_min_rows, ctx.holds_point) and st.verify == null) {
-        try dsv41_model.extendState(m, host[0..n], dsv41_model.SPAN, vision, ahead);
+        try dsv41_model.extendState(m, host, dsv41_model.SPAN, vision, ahead);
         if (self.expert_stream) |engine| engine.finishForward(n);
         ctx.cache.step = st.n;
         return mlx.mlx_array_new();
     }
     m.defer_head = m.lazy_head and ctx.lazy_logits and n == 1;
     defer m.defer_head = false;
-    const last = try dsv41_model.extendAhead(m, host[0..n], .last, dsv41_model.SPAN, vision, ahead);
+    const last = if (lazy) try dsv41_model.extendLazy(m, flat, &one) else try dsv41_model.extendAhead(m, host, .last, dsv41_model.SPAN, vision, ahead);
     defer _ = mlx.mlx_array_free(last);
     if (self.expert_stream) |engine| engine.finishForward(n);
     ctx.cache.step = st.n;

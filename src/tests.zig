@@ -138,7 +138,6 @@ test {
     _ = @import("dsv41/dsv41_config.zig");
     _ = @import("dsv41/dsv41_qat.zig");
     _ = @import("dsv41/dsv41_engram.zig");
-    _ = @import("dsv41/dsv41_embed.zig");
     _ = @import("dsv41/dsv41_source.zig");
     _ = @import("dsv41/dsv41_owned.zig");
     _ = @import("dsv41/dsv41_model.zig");

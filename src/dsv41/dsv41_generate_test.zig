@@ -744,6 +744,82 @@ fn lazyHeadSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, s
     return run;
 }
 
+/// `lazyHeadSteps` with each step's token handed to the forward as the argmax array itself, read back after the forward
+/// returns; `queue` lets the forward queue layer 0 ahead of it.
+fn lazyIdSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, steps: usize, queue: bool) !LazyHeadRun {
+    var run: LazyHeadRun = .{};
+    errdefer run.deinit(a);
+    const m = xfm.dsv41.?;
+    m.lazy_start = queue;
+    defer m.lazy_start = true;
+    try xfm.resetCache();
+    var ctx = xfm.defaultCtx();
+    var lg = try forwardIds(xfm, &ctx, prompt);
+    defer _ = mlx.mlx_array_free(lg);
+    const vocab = m.cfg.vocab;
+    for (0..steps + 1) |step| {
+        var am = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(am);
+        try mlx.check(mlx.mlx_argmax_axis(&am, lg, -1, false, xfm.s));
+        if (step < steps) {
+            var one = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(one);
+            try mlx.check(mlx.mlx_reshape(&one, am, &[_]c_int{ 1, 1 }, 2, xfm.s));
+            ctx.lazy_logits = true;
+            const next = try xfm.forwardWith(&ctx, one);
+            _ = mlx.mlx_array_free(lg);
+            lg = next;
+        }
+        try mlx.check(mlx.mlx_array_eval(am));
+        var v: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&v, am));
+        try run.tokens.append(a, @intCast(v));
+        if (step < steps) {
+            try mlx.check(mlx.mlx_array_eval(lg));
+            try run.logits.appendSlice(a, (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab]);
+        }
+    }
+    return run;
+}
+
+/// A lazy pass whose token the model refuses (an image id with no image rows) is dropped from the state it was queued on.
+fn droppedStartLeavesNothing(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, token: u32) !void {
+    const m = xfm.dsv41.?;
+    const vocab = m.cfg.vocab;
+    var logits: [2]std.ArrayList(f32) = @splat(.empty);
+    defer for (&logits) |*l| l.deinit(a);
+    for (&logits, [_]bool{ false, true }) |*out, dropped| {
+        try xfm.resetCache();
+        var ctx = xfm.defaultCtx();
+        const first = try forwardIds(xfm, &ctx, prompt);
+        _ = mlx.mlx_array_free(first);
+        if (dropped) {
+            const image_id = m.cfg.image_token_id;
+            m.cfg.image_token_id = token;
+            defer m.cfg.image_token_id = image_id;
+            const base = [_]i32{ @intCast(token), 0 };
+            const held = mlx.mlx_array_new_data(&base, &[_]c_int{ 1, 1 }, 2, .int32);
+            defer _ = mlx.mlx_array_free(held);
+            const none_ = mlx.mlx_array_new_data(&base[1], &[_]c_int{ 1, 1 }, 2, .int32);
+            defer _ = mlx.mlx_array_free(none_);
+            var id = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(id);
+            try mlx.check(mlx.mlx_add(&id, held, none_, xfm.s));
+            ctx.lazy_logits = true;
+            const before = m.lazy_starts;
+            try testing.expectError(error.Dsv41VisionRowsMissing, xfm.forwardWith(&ctx, id));
+            try testing.expectEqual(before, m.lazy_starts);
+            try testing.expectEqual(prompt.len, ctx.cache.step);
+        }
+        ctx.lazy_logits = false;
+        const lg = try forwardIds(xfm, &ctx, &.{token});
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        try out.appendSlice(a, (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab]);
+    }
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(logits[0].items), std.mem.sliceAsBytes(logits[1].items));
+}
+
 fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -781,24 +857,47 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     try testing.expectEqualSlices(u32, want.tokens.items, got.tokens.items);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(got.logits.items));
 
-    // The Generator's pipelined greedy decode takes the same path and says the same tokens.
-    var served: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    // The Generator's pipelined greedy decode takes the same path and says the same tokens: the waited head, the
+    // deferred head, and the deferred head with layer 0 queued ahead of the token.
+    var served: [3]std.ArrayList(u32) = @splat(.empty);
     defer for (&served) |*r| r.deinit(a);
-    var used: [2]u64 = undefined;
-    for (&served, &used, [_]bool{ false, true }) |*out, *n, lazy| {
-        m.lazy_head = lazy;
+    var used: [3]u64 = undefined;
+    var started: [3]u64 = undefined;
+    for (&served, &used, &started, [_][2]bool{ .{ false, false }, .{ true, false }, .{ true, true } }) |*out, *n, *started_n, arm| {
+        m.lazy_head, m.lazy_start = arm;
         const before = m.heads_deferred;
+        const before_starts = m.lazy_starts;
         try xfm.resetCache();
         var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, @intCast(steps + 1), .{ .temperature = 0.0 }, &.{}, .{});
         defer gen.deinit(a);
         while (try gen.next(a)) |t| try out.append(a, t);
         n.* = m.heads_deferred - before;
+        started_n.* = m.lazy_starts - before_starts;
     }
     m.lazy_head = true;
+    m.lazy_start = true;
     try testing.expectEqual(@as(u64, 0), used[0]);
     try testing.expect(used[1] >= steps - 2);
+    try testing.expectEqual([_]u64{ 0, 0 }, started[0..2].*);
+    try testing.expect(started[2] >= steps - 2);
     try testing.expectEqual(@as(usize, steps + 1), served[0].items.len);
     try testing.expectEqualSlices(u32, served[0].items, served[1].items);
+    try testing.expectEqualSlices(u32, served[0].items, served[2].items);
+
+    // A token still on the GPU, as the Generator's argmax is: the logits and tokens match the token read first.
+    var held_back = try lazyIdSteps(a, &xfm, prompt, steps, false);
+    defer held_back.deinit(a);
+    const queued_before = m.lazy_starts;
+    var queued = try lazyIdSteps(a, &xfm, prompt, steps, true);
+    defer queued.deinit(a);
+    try testing.expectEqual(@as(u64, steps), m.lazy_starts - queued_before);
+    try testing.expectEqualSlices(u32, want.tokens.items, queued.tokens.items);
+    try testing.expectEqualSlices(u32, held_back.tokens.items, queued.tokens.items);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(held_back.logits.items), std.mem.sliceAsBytes(queued.logits.items));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(queued.logits.items));
+
+    // A token the pass refuses leaves nothing of its layer 0 behind: the same token decodes to the same bytes after.
+    try droppedStartLeavesNothing(a, &xfm, prompt, want.tokens.items[0]);
 
     // A request that reads the logits themselves keeps the evaluated head.
     const kept = m.heads_deferred;
@@ -810,13 +909,13 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     try testing.expectEqual(kept, m.heads_deferred);
 }
 
-test "dsv41 generator: a one-row decode that hands its logits back unevaluated gives the evaluated head's tokens and logits bit for bit (DSV41_TINY)" {
+test "dsv41 generator: a one-row decode that hands its logits back unevaluated and queues layer 0 ahead of its token gives the evaluated head's tokens and logits bit for bit (DSV41_TINY)" {
     const dir = try @import("dsv41_model.zig").fixtureDir();
     try lazyHeadProof(dir, false, false);
     try lazyHeadProof(dir, false, true);
 }
 
-test "dsv41 generator: a one-row decode that hands its logits back unevaluated gives the evaluated head's tokens and logits bit for bit (DSV41_STQ_TINY)" {
+test "dsv41 generator: a one-row decode that hands its logits back unevaluated and queues layer 0 ahead of its token gives the evaluated head's tokens and logits bit for bit (DSV41_STQ_TINY)" {
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     try lazyHeadProof(dir, true, false);
     try lazyHeadProof(dir, true, true);
