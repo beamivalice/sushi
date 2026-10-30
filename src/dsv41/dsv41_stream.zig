@@ -144,6 +144,9 @@ pub const StqStream = struct {
     engine: *stream.Engine,
     cfg: *const Config,
     settles: u64 = 0,
+    /// A wide chunk starts each rate group's GEMMs as its experts land (`Engine.fillStaged`); false reads the whole fill
+    /// first (the byte-identity test's reference).
+    overlap: bool = true,
 
     pub fn hook(self: *StqStream) model.Experts.Hook {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque, .host_ns = hostNsOpaque, .prefetch = prefetchOpaque, .spec = .{
@@ -265,7 +268,8 @@ pub const StqStream = struct {
             h.* = @intCast(id);
         }
         if (scores) |sv| _ = try self.engine.swapGroupedMisses(@intCast(layer), host, try sc_mod.hostF32(sv), tolerance, @intCast(mlx.getShape(idx)[1]));
-        var prepared = try if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host);
+        const staged = wide and self.overlap;
+        var prepared = try if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host);
         defer prepared.deinit();
         errdefer _ = mlx.mlx_synchronize(sc.s);
         const rb = prepared.ragged orelse return error.Dsv41StqLayerNotGrouped;
@@ -274,9 +278,25 @@ pub const StqStream = struct {
         for (slots, prepared.remapped) |*o, r| o.* = r;
         const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
+        const fill_before = self.engine.layers[@intCast(layer)].stats.fill_ns;
+        var early: exl3.rate_groups.EarlyPlanes = .{};
+        defer early.deinit();
         // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
-        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared);
-        self.engine.noteExpertCompute(@intCast(layer), clock.lap());
+        const out = try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared, if (staged) &early else null);
+        if (staged) {
+            const Start = struct {
+                early: *const exl3.rate_groups.EarlyPlanes,
+                rb: *const exl3.Ragged,
+                fn ready(ctx: *anyopaque, group: usize) anyerror!void {
+                    const st: *@This() = @ptrCast(@alignCast(ctx));
+                    try st.early.start(st.rb, group);
+                }
+            };
+            var start = Start{ .early = &early, .rb = rb };
+            try self.engine.fillStaged(&prepared, &start, Start.ready);
+        }
+        // The staged fill runs inside this span; fill_ms already reports it.
+        self.engine.noteExpertCompute(@intCast(layer), clock.lap() -| (self.engine.layers[@intCast(layer)].stats.fill_ns - fill_before));
         return out;
     }
 };
@@ -977,6 +997,39 @@ fn argmax(row: []const f32) usize {
 
 test "dsv41 stq: greedy DSpark rounds over the STQ pack emit the serial greedy tokens (DSV41_STQ_TINY)" {
     try dsparkMatchesSerial(null);
+}
+
+test "dsv41 stq: a wide chunk whose fill is staged per rate group gives the unstaged chunk's bytes, through misses and the union (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    try testing.expect(ids.len > 2 * (exl3.kernels.DECODE_ROWS_MAX + 1));
+    for ([_]u64{ 8, 3 }) |slots| {
+        var plain: StqServed = undefined;
+        try plain.init(dir, .bfloat16, true, false, slots, s);
+        defer plain.deinit();
+        plain.hook.overlap = false;
+        var staged: StqServed = undefined;
+        try staged.init(dir, .bfloat16, true, false, slots, s);
+        defer staged.deinit();
+        const half = ids.len / 2;
+        for ([_][]const u32{ ids[0..half], ids[half..] }) |chunk| {
+            const a = try model.extend(plain.m, chunk, .all);
+            defer _ = mlx.mlx_array_free(a);
+            const b = try model.extend(staged.m, chunk, .all);
+            defer _ = mlx.mlx_array_free(b);
+            try expectSameBits(&sc, a, b);
+        }
+        try testing.expectEqual(@as(u64, 0), plain.engine.staged_routes);
+        // A resident pool serves every route on the GPU, with no fill to stage.
+        try testing.expectEqual(!staged.engine.plan.resident, staged.engine.staged_routes > 0);
+    }
 }
 
 test "dsv41 drop: greedy DSpark rounds over the STQ pack with experts dropped emit the serial greedy tokens of the same mask (DSV41_STQ_TINY)" {

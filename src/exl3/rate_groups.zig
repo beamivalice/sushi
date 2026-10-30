@@ -47,6 +47,12 @@ pub const Ragged = struct {
     prefill_only: bool = false,
     /// Every projection's tiles are in `layout.tileMajor` order, which only the funnel decode kernels read.
     tile_major: bool = false,
+    /// The rate group each pool's experts belong to (`initSplit` serves a group as two pools).
+    origin: [max_groups]u8 = blk: {
+        var o: [max_groups]u8 = undefined;
+        for (&o, 0..) |*v, i| v.* = @intCast(i);
+        break :blk o;
+    },
 
     /// Builds the ragged storage from per-group banks (lazy or evaluated); the banks stay the caller's.
     pub fn init(s: mlx.mlx_stream, banks: []const root.Bank) !Ragged {
@@ -200,8 +206,9 @@ pub const Ragged = struct {
     /// the first `overflow[g]` slots of `spill`'s pool g as a pool of its own. A route's slot ids follow the pools in
     /// that order. The scales are concatenated lazily, so they read the storage when the forward runs.
     pub fn initSplit(s: mlx.mlx_stream, cache: *const Ragged, spill: *const Ragged, overflow: []const u32) !Ragged {
-        if (overflow.len != cache.count or spill.count != cache.count) return error.Exl3GroupMissing;
-        if (cache.tile_major != spill.tile_major) return error.Exl3GroupMissing;
+        if (overflow.len != cache.count) return error.Exl3GroupMissing;
+        // A route that spills nothing needs no spill bank, which a resident pack has not made.
+        for (overflow) |count| if (count > 0 and (spill.count != cache.count or spill.tile_major != cache.tile_major)) return error.Exl3GroupMissing;
         var self: Ragged = .{ .hidden = cache.hidden, .inter = cache.inter, .prefill_only = true, .tile_major = cache.tile_major };
         errdefer self.deinit();
         var meta: std.ArrayList(u32) = .empty;
@@ -232,6 +239,7 @@ pub const Ragged = struct {
                 self.views[p] = view;
                 self.view_count += 1;
                 self.rates[p] = cache.rates[g];
+                self.origin[p] = @intCast(g);
                 self.base[p] = self.experts;
                 self.experts_of[p] = part.slots;
                 for (0..part.slots) |local| try meta.appendSlice(std.heap.page_allocator, &.{ self.rates[p][0], self.rates[p][1], self.rates[p][2], @intCast(p), 0, 0, 0, @intCast(local) });
@@ -1566,8 +1574,37 @@ fn combine(s: mlx.mlx_stream, planes: []const mlx.mlx_array, sorted: mlx.mlx_arr
     }
 }
 
-/// One projection's GEMM, once per group over the group's own window segment and bank view, combined.
-fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, sorted: mlx.mlx_array, w: *const GroupWindows, win: c_int) !mlx.mlx_array {
+/// The gate and up GEMM planes of each pool of a prefill chain (`moePrefillEarly`), for a caller that starts a group's
+/// GEMMs as soon as its experts land. The caller frees them.
+pub const EarlyPlanes = struct {
+    gate: [max_groups]mlx.mlx_array = @splat(.{ .ctx = null }),
+    up: [max_groups]mlx.mlx_array = @splat(.{ .ctx = null }),
+
+    pub fn deinit(self: *EarlyPlanes) void {
+        for ([_][]mlx.mlx_array{ &self.gate, &self.up }) |set| for (set) |*a| freeHandle(a);
+    }
+
+    /// Queues on the GPU the planes of every pool of `rb` drawn from rate group `group`, without waiting.
+    pub fn start(self: *const EarlyPlanes, rb: *const Ragged, group: usize) !void {
+        var pick: [2 * max_groups]mlx.mlx_array = undefined;
+        var n: usize = 0;
+        for (0..rb.count) |p| {
+            if (rb.origin[p] != group) continue;
+            for ([_]mlx.mlx_array{ self.gate[p], self.up[p] }) |a| if (a.ctx != null) {
+                pick[n] = a;
+                n += 1;
+            };
+        }
+        if (n == 0) return;
+        const vec = mlx.mlx_vector_array_new_data(&pick, n);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_async_eval(vec));
+    }
+};
+
+/// One projection's GEMM, once per group over the group's own window segment and bank view, combined. `keep` takes a
+/// handle to each group's plane.
+fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, sorted: mlx.mlx_array, w: *const GroupWindows, win: c_int, keep: ?*[max_groups]mlx.mlx_array) !mlx.mlx_array {
     var planes: [max_groups]mlx.mlx_array = undefined;
     var made: usize = 0;
     defer for (planes[0..made]) |a| {
@@ -1585,6 +1622,10 @@ fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize
         const bank = rb.views[g];
         const trellis = projOf(bank, pi).trellis;
         planes[made] = try kernels.innerGemmSortedTableOrdered(s, x, trellis, w.local, win, true, .{ .starts = starts, .nlives = nlives, .nwin = len }, if (rb.tile_major) .tile_major else .pack);
+        if (keep) |k| {
+            k[g] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&k[g], planes[made]));
+        }
         made += 1;
     }
     if (made == 1) {
@@ -1602,6 +1643,11 @@ pub fn moePrefill(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots:
 
 /// `moePrefill` with the SwiGLU clamped at `limit` (0: none).
 pub fn moePrefillClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int) !mlx.mlx_array {
+    return moePrefillEarly(s, x, rb, slots, scores, topk, limit, null);
+}
+
+/// `moePrefillClamped`, keeping each pool's gate and up planes in `early`.
+pub fn moePrefillEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, early: ?*EarlyPlanes) !mlx.mlx_array {
     const rows = mlx.getShape(x)[0];
     const n = rows * topk;
     logEngaged(.prefill, rb, 0, 0);
@@ -1622,13 +1668,13 @@ pub fn moePrefillClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged,
     defer for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    const g = try groupedGemm(s, prep[0], rb, 0, sorted, &w, win);
+    const g = try groupedGemm(s, prep[0], rb, 0, sorted, &w, win, if (early) |e| &e.gate else null);
     defer _ = mlx.mlx_array_free(g);
-    const u = try groupedGemm(s, prep[1], rb, 1, sorted, &w, win);
+    const u = try groupedGemm(s, prep[1], rb, 1, sorted, &w, win, if (early) |e| &e.up else null);
     defer _ = mlx.mlx_array_free(u);
     const mid = try kernels.midSwigluPrepWithLimit(s, g, u, rb.svh[0], rb.svh[1], rb.suh[2], sorted, rb.inter, n, limit);
     defer _ = mlx.mlx_array_free(mid);
-    const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win);
+    const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win, null);
     defer _ = mlx.mlx_array_free(d);
     return sorted_windows.finishSortedInverse(s, d, w.inverse, rb.svh[2], slots, scores, rb.hidden, rows, topk, mlx.mlx_array_dtype(x));
 }
@@ -1782,6 +1828,12 @@ fn sharedServed(se: SharedExpert, rb: *const Ragged) bool {
 /// of their own. Null where the layer does not apply (nothing has run then); the active decode params are the routed
 /// bank's on entry and on return.
 pub fn moePrefillClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, se: SharedExpert) !?mlx.mlx_array {
+    return moePrefillSharedFusedEarly(s, x, rb, slots, scores, topk, limit, se, null);
+}
+
+/// `moePrefillClampedSharedFused`, keeping each pool's gate and up planes in `early` (null where the layer does not
+/// apply, with `early` untouched).
+pub fn moePrefillSharedFusedEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, se: SharedExpert, early: ?*EarlyPlanes) !?mlx.mlx_array {
     if (mlx.mlx_array_dtype(x) != .bfloat16 or topk + 1 > kernels.REDUCE_MAX_TOPK or limit < 0) return null;
     if (@rem(rb.hidden, 128) != 0 or @rem(rb.inter, 128) != 0 or !sharedServed(se, rb)) return null;
     try se.dec.requireTable();
@@ -1823,9 +1875,9 @@ pub fn moePrefillClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *co
     defer for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    const g = try groupedGemm(s, prep_g, rb, 0, sorted, &w, win);
+    const g = try groupedGemm(s, prep_g, rb, 0, sorted, &w, win, if (early) |e| &e.gate else null);
     defer _ = mlx.mlx_array_free(g);
-    const u = try groupedGemm(s, prep_u, rb, 1, sorted, &w, win);
+    const u = try groupedGemm(s, prep_u, rb, 1, sorted, &w, win, if (early) |e| &e.up else null);
     defer _ = mlx.mlx_array_free(u);
 
     const mid_ov = try applyPrefillFused(s, try prefillFused(.mid, geo), &.{ g, u, rb.svh[0], rb.svh[1], rb.suh[2], sorted }, &.{ sg, su, se.bank.gate.svh, se.bank.up.svh, se.bank.down.suh }, 2);
@@ -1837,7 +1889,7 @@ pub fn moePrefillClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *co
 
     const sd = try sharedGemm(s, smid, se.bank.down, se.dec, routed_dec, zeros, rows);
     defer _ = mlx.mlx_array_free(sd);
-    const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win);
+    const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win, null);
     defer _ = mlx.mlx_array_free(d);
     const out = try prefillReduce(s, d, w.inverse, rb, slots, scores, sd, se, rows, topk);
     prefill_folded += 1;

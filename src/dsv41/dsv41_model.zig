@@ -2179,9 +2179,9 @@ fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.
     return try sc.keep(y);
 }
 
-fn prefillWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+fn prefillWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int, early: ?*exl3.rate_groups.EarlyPlanes) !?A {
     const se = sharedBank(ly) orelse return null;
-    const y = try exl3.rate_groups.moePrefillClampedSharedFused(sc.s, x, rb, flat, scores, k, limit, se) orelse return null;
+    const y = try exl3.rate_groups.moePrefillSharedFusedEarly(sc.s, x, rb, flat, scores, k, limit, se, early) orelse return null;
     return try sc.keep(y);
 }
 
@@ -2189,6 +2189,11 @@ fn prefillWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3
 /// SwiGLU of each, summed, plus the shared expert's output (`[L, dim]`, f32). Decode-width chunks ride the
 /// one-dispatch-per-stage decode chain, whose reduce adds the shared expert, wider ones the grouped GEMM.
 pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp) !A {
+    return stqRoutedEarly(sc, dec, limit, rb, x, slots, wts, shared, null);
+}
+
+/// `stqRouted`, a wide chunk keeping each pool's gate and up planes in `early` (`rate_groups.EarlyPlanes`).
+pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp, early: ?*exl3.rate_groups.EarlyPlanes) !A {
     const L = dim(x, 0);
     const k: c_int = @intCast(dim(slots, 1));
     const flat = try sc.reshape(try sc.astype(slots, .uint32), &.{ci(L) * k});
@@ -2206,11 +2211,11 @@ pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const e
         return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, sy, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
     }
     if (shared == .layer) {
-        if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k)) |y| return y;
+        if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k, early)) |y| return y;
     }
     const sy = try shared.value(sc, x);
     exl3.kernels.setDecodeParams(dec);
-    const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillClamped(sc.s, x, rb, flat, scores, k, limit)), .float32);
+    const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillEarly(sc.s, x, rb, flat, scores, k, limit, early)), .float32);
     return sc.add(y, try sc.astype(sy, .float32));
 }
 

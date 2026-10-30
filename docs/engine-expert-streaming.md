@@ -175,6 +175,16 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   keeps its hits and admitted misses in its pool, only the declined misses are read into the workspace, and
   `Ragged.initSplit` serves each overflowing group as two pools, its cache and its spill. No host copies, the same
   SSD reads, the same bytes out. The decode kernels index one trellis, so a decode-width route keeps the copying union.
+- **A wide route's fill is staged** (`prepareHostStaged` + `fillStaged`, `Staged`): stage 0 reads every miss's scale
+  pieces, stage 1 + g rate group g's trellis. The caller builds the whole MoE graph first and `fillStaged` calls it
+  back after each stage, so it can queue group g's gate and up GEMMs (`rate_groups.EarlyPlanes.start`, `mlx_async_eval`)
+  while group g+1 is read; mid, down and finish run after the last stage. Same kernels and inputs, so the bytes are
+  unchanged, with or without the shared expert riding the routed launches (`moePrefillSharedFusedEarly`).
+  `prepareHostWide` is the same route with a no-op callback; a borrowed layer's route is not staged. A route dropped
+  before its last stage is aborted (`Prepared.deinit`), and the caller synchronizes the stream first. `staged_routes`
+  (in the `[expert-stream] forward=` line) counts the routes.
+  Measured on the STQ 1.75bpw pack (default SSD budget, M5 Max on AC, one boot per arm, a cold llmprobe code prompt):
+  prefill 1383 / 1451 tok/s staged against 1242 / 1372 tok/s with the fill read whole, at 32k / 64k tokens.
 - The breakdown line's `copy_ms` / `unions` time the host copies of a union route: cached hits copied into the
   workspace and admitted misses copied back. A read-ahead (the next router on this layer's rows) was measured and cut:
   it guessed about a quarter of a 1024-row chunk's picks and did not move cold prefill.

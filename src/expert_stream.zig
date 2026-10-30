@@ -1712,6 +1712,44 @@ fn presentSlabCount(slabs: []const SlabOperand) u64 {
     return count;
 }
 
+/// A wide route's SSD fill in stages: stage 0 every miss's scale pieces, stage 1 + g rate group g's trellis.
+pub const Staged = struct {
+    layer: u16,
+    gl: *GroupedLayer,
+    groups: usize,
+    /// Slab sets the route fills and leases: the layer's cache, then the union workspace when a group spills.
+    sets: usize,
+    begun: [2]usize = @splat(0),
+    spans: [1 + quant.rate_group_limit]std.ArrayList(io_mod.FillSpan) = @splat(.empty),
+    /// Admitted misses as (group, slot), ready once every stage has landed.
+    admitted: std.ArrayList([2]u16) = .empty,
+    misses: u64 = 0,
+    /// Stages read so far.
+    done: usize = 0,
+    ended: bool = false,
+
+    pub fn stages(self: *const Staged) usize {
+        return 1 + self.groups;
+    }
+
+    fn slabSets(self: *const Staged, engine: *Engine) [2][]SlabOperand {
+        return .{ engine.layers[self.layer].slabs, engine.grouped_union };
+    }
+
+    /// Gives the slabs back unpublished and drops the admitted misses from the caches.
+    fn abort(self: *Staged, engine: *Engine) void {
+        for (self.slabSets(engine)[0..self.sets], self.begun[0..self.sets]) |set, begun| for (set[0..begun]) |*operand| abortFill(operand);
+        self.begun = @splat(0);
+        for (self.gl.caches[0..self.groups]) |*cache| cache.invalidateUnready();
+    }
+
+    fn destroy(self: *Staged, allocator: std.mem.Allocator) void {
+        for (&self.spans) |*list| list.deinit(allocator);
+        self.admitted.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
 pub const Prepared = struct {
     allocator: std.mem.Allocator,
     gate: mlx.mlx_array = .{ .ctx = null },
@@ -1730,6 +1768,8 @@ pub const Prepared = struct {
     defer_to: ?*Engine = null,
     /// A split route's own bank (`ragged` points at it), freed with the route.
     split: ?*Ragged = null,
+    /// A wide route's fill, read by `Engine.fillStaged`; one dropped before it ends is aborted.
+    staged: ?*Staged = null,
 
     pub fn quantOperand(self: *const Prepared, c: quant.Component) mlx.mlx_array {
         return self.quant_raw[@backingInt(c)];
@@ -1751,6 +1791,10 @@ pub const Prepared = struct {
             }
             held.slab.release(held.lease) catch {};
             held.slab.retire() catch {};
+        }
+        if (self.staged) |st| {
+            if (!st.ended) if (self.defer_to) |engine| st.abort(engine);
+            st.destroy(self.allocator);
         }
         if (self.split) |bank| {
             bank.deinit();
@@ -1826,6 +1870,8 @@ pub const Engine = struct {
     fill_ns_total: u64 = 0,
     copy_ns_total: u64 = 0,
     copy_bytes_total: u64 = 0,
+    /// Wide routes whose fill the caller staged (`prepareHostStaged`).
+    staged_routes: u64 = 0,
     forward_clock: Clock,
     last: Breakdown = .{},
     route_linear: RouteClass = .{},
@@ -2139,7 +2185,7 @@ pub const Engine = struct {
         // At debug level every prefill chunk gets its line: a chunk is one forward, so the schedule would skip them.
         if (!scheduled and !acc.probe and !(rows > 64 and log.isDebug())) return;
         const fill_seconds = @as(f64, @floatFromInt(acc.fill_ns)) / 1e9;
-        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d} copy_ms={d:.1} unions={d}\n", .{
+        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d} copy_ms={d:.1} unions={d} staged_routes={d}\n", .{
             acc.forward,
             acc.rows,
             @as(f64, @floatFromInt(acc.wall_ns)) / 1e6,
@@ -2155,6 +2201,7 @@ pub const Engine = struct {
             slab_release_timeouts.load(.monotonic),
             @as(f64, @floatFromInt(acc.copy_ns)) / 1e6,
             acc.unions,
+            self.staged_routes,
         });
         log.info("[expert-stream] route forward={d} rows={d} probe={} linear n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2} full n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2}\n", .{
             acc.forward,
@@ -2252,11 +2299,11 @@ pub const Engine = struct {
     /// `prepareHost` for a route only the per-group prefill GEMMs read (`rate_groups.moePrefill`): a rate-grouped layer
     /// whose group overflows its pool then reads its cached experts in place instead of copying them into the union.
     pub fn prepareHostWide(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
-        if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
-        if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
-        self.prefetchWait(layer_index);
-        self.drainPendingReaders();
-        return self.prepareSlab(layer_index, occurrences, true);
+        var prepared = try self.prepareWide(layer_index, occurrences);
+        errdefer prepared.deinit();
+        var unused: u8 = 0;
+        try self.fillStaged(&prepared, &unused, noReady);
+        return prepared;
     }
 
     fn snapshotCache(self: *Engine, cache: *const GroupCache) !CacheSnapshot {
@@ -2872,7 +2919,7 @@ pub const Engine = struct {
             }
         }
         if (use_union and self.grouped_union.len != n) return error.MissingExpertSlab;
-        if (use_union and wide) {
+        if (wide) {
             wrote_cache = true;
             const split = try self.prepareSplit(layer_index, gl, occurrences, resolutions[0..count]);
             committed = true;
@@ -3010,9 +3057,9 @@ pub const Engine = struct {
         };
     }
 
-    /// The union path of a wide route: each group keeps its hits and admitted misses in its pool, its declined misses
-    /// are read into the union workspace, and `Ragged.initSplit` serves both where they lie. The caller restores the
-    /// caches on an error.
+    /// A wide route: each group keeps its hits and admitted misses in its pool, its declined misses (a group that
+    /// overflows) are read into the union workspace, and `Ragged.initSplit` serves both where they lie. Nothing is
+    /// read yet: `fillStaged` reads it, `Prepared.staged` says how. The caller restores the caches on an error.
     fn prepareSplit(self: *Engine, layer_index: u16, gl: *GroupedLayer, occurrences: []const u16, resolutions: []const GroupResolution) !Prepared {
         const layer = &self.layers[layer_index];
         const n = quant.component_count;
@@ -3021,62 +3068,45 @@ pub const Engine = struct {
         var spill_base: [quant.rate_group_limit]u32 = @splat(0);
         var at: u32 = 0;
         var experts: usize = 0;
+        var spills = false;
         for (resolutions, 0..) |resolution, g| {
             overflow[g] = @intCast(resolution.declined);
+            spills = spills or overflow[g] > 0;
             cache_base[g] = at;
             spill_base[g] = at + gl.slots[g];
             at += gl.slots[g] + overflow[g];
             experts += gl.groups.experts[g];
         }
-        const sets = [2][]SlabOperand{ layer.slabs, self.grouped_union };
-        var begun: [2]usize = @splat(0);
-        errdefer for (sets, begun) |set, done| for (set[0..done]) |*operand| abortFill(operand);
-        for (0..2) |k| while (begun[k] < n) : (begun[k] += 1) {
-            const slab = sets[k][begun[k]].slab orelse return error.MissingExpertSlab;
+        const st = try self.allocator.create(Staged);
+        st.* = .{ .layer = layer_index, .gl = gl, .groups = resolutions.len, .sets = if (spills) 2 else 1 };
+        errdefer st.destroy(self.allocator);
+        const sets = st.slabSets(self);
+        for (sets[0..st.sets], 0..) |set, k| while (st.begun[k] < n) : (st.begun[k] += 1) {
+            const slab = set[st.begun[k]].slab orelse return error.MissingExpertSlab;
             _ = try slab.tryBeginFill();
         };
+        errdefer st.abort(self);
 
         const to_slot = try self.allocator.alloc(u16, experts);
         defer self.allocator.free(to_slot);
-        var spans: std.ArrayList(io_mod.FillSpan) = .empty;
-        defer spans.deinit(self.allocator);
-        var misses: u64 = 0;
         for (resolutions, 0..) |resolution, g| {
             var spilled: u32 = 0;
             for (resolution.bindings) |binding| {
                 const global = gl.groups.base[g] + binding.expert;
                 to_slot[global] = @intCast(if (binding.slot) |slot| cache_base[g] + slot else spill_base[g] + spilled);
                 if (binding.hit) continue;
-                misses += 1;
+                st.misses += 1;
+                if (binding.slot) |slot| try st.admitted.append(self.allocator, .{ @intCast(g), slot });
                 for (0..n) |ci| {
                     const source = self.store.spanAt(layer_index, global, ci);
                     const dst = if (binding.slot) |slot| gl.cacheRegion(&layer.slabs[ci], g, ci, slot) else gl.unionRegion(&self.grouped_union[ci], g, ci, spilled);
-                    try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
+                    // The scales go first: every group's GEMM prepares its rows with all of them.
+                    const stage = if (ci % 3 == 0) 1 + g else 0;
+                    try st.spans[stage].append(self.allocator, gl.fillSpan(source, dst, g, ci));
                 }
                 if (binding.slot == null) spilled += 1;
             }
         }
-        try self.runFill(layer_index, spans.items);
-        self.fill_experts_total += misses;
-        for (resolutions, 0..) |resolution, g| {
-            for (resolution.bindings) |binding| {
-                if (!binding.hit) if (binding.slot) |slot| gl.caches[g].markReady(slot);
-            }
-        }
-
-        var held: [HELD_MAX]?HeldLease = @splat(null);
-        var leased: usize = 0;
-        errdefer for (held[0..leased]) |entry| {
-            const taken = entry orelse continue;
-            taken.slab.release(taken.lease) catch {};
-            taken.slab.retire() catch {};
-        };
-        for (sets) |set| for (set) |operand| {
-            const slab = operand.slab orelse return error.MissingExpertSlab;
-            _ = try slab.publish();
-            held[leased] = .{ .slab = slab, .lease = try slab.lease() };
-            leased += 1;
-        };
 
         const bank = try self.allocator.create(Ragged);
         errdefer self.allocator.destroy(bank);
@@ -3085,22 +3115,21 @@ pub const Engine = struct {
         const remapped = try self.allocator.alloc(u16, occurrences.len);
         for (occurrences, remapped) |expert, *slot| slot.* = to_slot[expert];
 
-        layer.stats.unions += 1;
+        if (spills) layer.stats.unions += 1;
         for (resolutions) |resolution| {
             layer.stats.union_members += resolution.union_ids.len;
             layer.stats.hits += resolution.hits;
             layer.stats.misses += resolution.misses;
         }
         layer.stats.groups += 1;
-        for (spans.items) |span_value| layer.stats.fill_bytes += span_value.len;
         return .{
             .allocator = self.allocator,
             .remapped = remapped,
             .quantized = true,
-            .workspace = true,
+            .workspace = spills,
             .ragged = bank,
             .split = bank,
-            .held = held,
+            .staged = st,
             .defer_to = self,
         };
     }
@@ -3109,6 +3138,56 @@ pub const Engine = struct {
     pub fn isDropped(self: *const Engine, layer: u16, expert: u16) bool {
         const d = self.geometry.drop orelse return false;
         return d.isDropped(layer, expert);
+    }
+
+    /// `prepareHostWide` with the fill left to `fillStaged`, which hands each rate group to the caller as its experts
+    /// land: the caller can run a group's GEMMs while the next group is read.
+    pub fn prepareHostStaged(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
+        const prepared = try self.prepareWide(layer_index, occurrences);
+        if (prepared.staged != null) self.staged_routes += 1;
+        return prepared;
+    }
+
+    /// Reads a staged route: the scales of every miss, then each rate group's trellis in turn. `ready(ctx, g)` runs
+    /// once a group's experts are all in place (those with no misses right after the scales), then the slabs are
+    /// published and leased for the route.
+    pub fn fillStaged(self: *Engine, p: *Prepared, ctx: *anyopaque, ready: *const fn (ctx: *anyopaque, group: usize) anyerror!void) !void {
+        const st = p.staged orelse return;
+        try self.runFill(st.layer, st.spans[0].items);
+        st.done = 1;
+        for (0..st.groups) |g| if (st.spans[1 + g].items.len == 0) try ready(ctx, g);
+        for (0..st.groups) |g| {
+            if (st.spans[1 + g].items.len == 0) continue;
+            try self.runFill(st.layer, st.spans[1 + g].items);
+            st.done = 2 + g;
+            try ready(ctx, g);
+        }
+        st.done = st.stages();
+        for (st.admitted.items) |pair| st.gl.caches[pair[0]].markReady(pair[1]);
+        const layer = &self.layers[st.layer];
+        var leased: usize = 0;
+        for (st.slabSets(self)[0..st.sets]) |set| for (set) |operand| {
+            const slab = operand.slab orelse return error.MissingExpertSlab;
+            _ = try slab.publish();
+            p.held[leased] = .{ .slab = slab, .lease = try slab.lease() };
+            leased += 1;
+        };
+        st.ended = true;
+        self.fill_experts_total += st.misses;
+        for (st.spans[0 .. st.stages()]) |list| for (list.items) |span_value| {
+            layer.stats.fill_bytes += span_value.len;
+        };
+    }
+
+    fn noReady(_: *anyopaque, _: usize) anyerror!void {}
+
+    /// A wide grouped route through `prepareSplit`; any other layer as `prepareSlab` serves it.
+    fn prepareWide(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
+        if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
+        if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
+        self.prefetchWait(layer_index);
+        self.drainPendingReaders();
+        return self.prepareSlab(layer_index, occurrences, true);
     }
 
     fn prepareSlab(self: *Engine, layer_index: u16, occurrences: []const u16, wide: bool) !Prepared {
