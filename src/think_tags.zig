@@ -622,6 +622,24 @@ fn skipContentChannelTag(text: []const u8, start: usize) usize {
     return pos;
 }
 
+/// `part` with every think/thought closer cut out: a closer in content is never visible, and a stream drops
+/// its marker token wherever it lands. A part that held one is copied into `owned`, which the caller frees.
+fn contentWithoutClosers(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), part: []const u8) ![]const u8 {
+    if (nextThinkClose(part, 0) == null) return part;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var pos: usize = 0;
+    while (nextThinkClose(part, pos)) |c| {
+        try out.appendSlice(allocator, part[pos..c.pos]);
+        pos = c.after;
+    }
+    try out.appendSlice(allocator, part[pos..]);
+    const kept = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(kept);
+    try owned.append(allocator, kept);
+    return kept;
+}
+
 /// Merge ALL closed think/thought blocks in `text` into one leading block.
 ///
 /// The split/strip layer understands exactly one leading block plus an
@@ -641,6 +659,11 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
     defer reasoning_parts.deinit(allocator);
     var content_parts = std.ArrayList([]const u8).empty;
     defer content_parts.deinit(allocator);
+    var stripped = std.ArrayList([]u8).empty;
+    defer {
+        for (stripped.items) |part| allocator.free(part);
+        stripped.deinit(allocator);
+    }
 
     var style_think = false;
     var style_set = false;
@@ -665,7 +688,7 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 
     while (true) {
         const o = nextThinkOpen(text, pos) orelse {
-            try content_parts.append(allocator, text[pos..]);
+            try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..]));
             break;
         };
         const found: ?TagAt = if (o.is_think_style)
@@ -680,7 +703,7 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
             try content_parts.append(allocator, text[pos..]);
             break;
         };
-        try content_parts.append(allocator, text[pos..o.pos]);
+        try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..o.pos]));
         try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..close.pos], "\n "));
         if (!style_set) {
             style_think = o.is_think_style;
@@ -693,7 +716,7 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 
     // Rewrite only when a closed block exists beyond the single leading one.
     if (closed_blocks == 0) return null;
-    if (closed_blocks == 1 and first_block_leading) return null;
+    if (closed_blocks == 1 and first_block_leading and stripped.items.len == 0) return null;
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);

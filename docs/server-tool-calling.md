@@ -173,8 +173,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   structure, and a thinking block or reasoning item opens at its first delta, so an empty thought streams none.
 - **A token that opens an assistant turn ends the reply** (`ModelConfig.turn_opener`, merged into the eos ids at load
   by `mergeTokenizerStops`): the GLM pack answers, then writes `<|assistant|>` and a second short thought and answer,
-  which rode out as content with an orphan `</think>` (streams drop the tag, non-streams kept it). The cause is the
-  checkpoint, on serial and DFlash2 alike; the stop is the engine's boundary. A KLD run keeps the config's own eos set.
+  which rode out as content with an orphan `</think>`. The cause is the checkpoint, on serial and DFlash2 alike; the stop
+  is the engine's boundary. A KLD run keeps the config's own eos set.
+- **A closer in content is dropped wherever it lands, on every surface**: a stream drops the marker token
+  (`isChannelMarkerToken`), so `normalizeEmbeddedThinkBlocks` cuts closers out of the content between and after blocks
+  (`contentWithoutClosers`; a closer inside a code span is text) and `trimTrailingThinkClosers` keeps the tail.
+  `<think>t</think>391</think>391` is content `391391` stream and non-stream.
 - **A live row never asserts that a model thinks**: a thought the model closes empty (`</think>42`) has no reasoning
   and no thinking block, on every surface. Rows 4 and 20 of `tests/test_format_matrix.sh` branch on billed reasoning
   tokens and on the non-stream turn.

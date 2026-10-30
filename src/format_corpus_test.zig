@@ -2772,6 +2772,53 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
     }
 }
 
+/// The content a no-tools chat stream delivers for these tokens: the thought's own tokens go to
+/// reasoning, and after its close every marker token is dropped before the rest ships.
+fn streamedContent(allocator: std.mem.Allocator, tokens: []const []const u8, opened: bool) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var in_think = opened;
+    var content_started = false;
+    for (tokens) |tt| {
+        if (!content_started and !in_think and think_tags.modelThinkOpener(false, tt) != null) {
+            in_think = true;
+            continue;
+        }
+        if (in_think) {
+            in_think = !std.mem.eql(u8, tt, think_tags.BARE_THINK_CLOSER);
+            continue;
+        }
+        if (think_tags.isChannelMarkerToken(tt)) continue;
+        const vis = think_tags.streamContentLead(tt, content_started);
+        if (vis.len > 0) content_started = true;
+        try out.appendSlice(allocator, vis);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "format corpus: a closer in content after the thought is dropped on the stream and the non-stream reply alike" {
+    // The GLM pack writes `</think>391` twice in one reply. Streams drop a marker token wherever it
+    // lands; the split once kept every closer but a trailing one.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, tokens: []const []const u8, opened: bool };
+    const cases = [_]Case{
+        .{ .raw = "<think>t</think>391</think>391", .tokens = &.{ "<think>", "t", "</think>", "391", "</think>", "391" }, .opened = false },
+        .{ .raw = "t</think>391</think>391", .tokens = &.{ "t", "</think>", "391", "</think>", "391" }, .opened = true },
+        .{ .raw = "t</think>\n\n391</think>\n\n391</think>", .tokens = &.{ "t", "</think>", "\n\n", "391", "</think>", "\n\n", "391", "</think>" }, .opened = true },
+    };
+    for (cases) |c| {
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
+        defer if (norm) |n| allocator.free(n);
+        const split = think_tags.splitThinkBlock(norm orelse c.raw, true, c.opened);
+        const streamed = try streamedContent(allocator, c.tokens, c.opened);
+        defer allocator.free(streamed);
+        errdefer std.debug.print("\nraw: {s}\nnon-stream content: {s}\nstream content: {s}\n", .{ c.raw, split.content, streamed });
+        try testing.expectEqualStrings("t", split.reasoning_content.?);
+        try testing.expect(std.mem.indexOf(u8, split.content, "</think>") == null);
+        try testing.expectEqualStrings(std.mem.trim(u8, streamed, "\n "), split.content);
+    }
+}
+
 /// Streams `raw` cut by the length limit after `cut` bytes, the way each stream
 /// path does, and returns (tools path, no-tools path) reasoning deltas joined. A
 /// thought the model opens arrives as one `<think>` token, every later byte as a token.
