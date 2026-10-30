@@ -344,12 +344,31 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_rope_tail`, `dsv41_kv_row` | `rotate` plus the QAT round trip (q, indexer q/k, compressed latent, inverse rotation of the heads); the window row's rms norm, rotation and fp8 round trip | every width | bit for bit (rms in MLX's accumulation order) |
 | `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
 | `dsv41_attn_fused` (`_fp4`) | a wide span's whole `attnCore`: window band and picked rows read by index (`_fp4`: straight from the packed FP4 store), online f32 softmax with the sink, no gathered rows or logits | wide chunks (more than 16 rows) on the GPU stream, bf16 activations, 16 divides the heads | 4e-6 to 1.3e-5 of peak against the CPU f32 `attnCore`, where the GPU `attnCore` is 3.5e-4 to 7e-4; the tiny oracle (4 heads) never engages it |
+| `dsv41_attn_nax` (`_fp4`) | `dsv41_attn_fused`'s two products on NAX `matmul2d` fragments (arm `Model.attn_nax`, on where `attnNaxFits` and the load's trial pass); the same tiling, f32 softmax, sink, high + low bf16 P, epilogue store and packed rows | the fused kernel's wide chunks on an M5 (`attnNaxFits`: heads multiple of 16, width a multiple of 256) | 3.0e-6 to 6.6e-6 of peak against the CPU f32 `attnCore` (the fused kernel 3.1e-6 to 1.3e-5 on the same cases); packed rows and the epilogue store equal the NAX gather and op chain byte for byte |
 | `dsv41_attn_softmax` | the f16 arm of a wide span (`Model.attn_f16`, off) | wide spans, window + picks <= 1024 columns | within 1/64 of peak of the f32 chain (bf16 outputs); f16 scores change output, so it waits for a KLD run |
 | `dsv41_index_scores`, `dsv41_index_scores_fp4`, `dsv41_index_tile` | the indexer's relu-weighted scores over key tiles, with the unseen groups at -inf | scalar up to 16 rows (`_fp4` reads the packed keys), matrix tiles when 8 divides the heads and the width | scalar and tile no further from the f64 truth than the chain; `_fp4` the unpacked keys' scores bit for bit; a tile scored at its key offset the whole list's columns bit for bit |
 | `dsv41_hc_stage`, `dsv41_hc_stage_x`, `dsv41_hc_stage_z`, `dsv41_hc_split` | `hcMixes`, the previous-mix collapse and rms norm, and (`_x`) the `hcExpand` that feeds the FFN stage; the Sinkhorn split on one simdgroup; `_z` takes the attention's mixes and splits them in every threadgroup (no `dsv41_hc_split` dispatch after the attention stage) | up to 16 rows | mixes and normed collapse no further from the f64 truth than the chain; the expanded stream likewise; the split to 2e-6 of the thread-per-row split; `_z` bit for bit the split kernel plus `_x` (1, 3, 16 rows, bf16 and f32) |
 | `dsv41_hc_mix`, `dsv41_hc_norm` | the same for a wide block (a tile of rows and mixes a threadgroup; split + collapse + norm) | more than 16 rows | bit for bit the stage's z, split and normed collapse |
 | `dsv41_hc_expand` | `hcExpand`'s op chain (post x y + comb^T x) on a wide block: the stream in one pass | any rows, GPU stream, 4 copies, where `probeHc` finds the GPU's f32 matmul TF32-class and the kernel equal to the chain | bit for bit the chain (bf16 and f32; 1 to 4096 rows; D 40 to 5120) |
 | `dsv41_engram` | the Engram gate chain after `wkv` | up to 16 rows | bit for bit (MLX's row-reduction order) |
+
+**Attention core on the matrix units (landed).** `Model.attn_nax` is on by default: a wide span's attention runs on `dsv41_attn_nax` wherever
+`attnNaxFits` holds (an M5 with NAX, 16 divides the heads, width a multiple of 256) and the load's trial passes
+(`kernels.attnNaxProbe` at the model's head shape: the plain kernel in f32 within 3e-5 of the SIMD kernel's peak, and the packed epilogue
+store within 5000 x that, the fp8 rounding being allowed a quantum). A trial that fails, a launch that fails or any other GPU leaves the SIMD
+kernel serving and logs the decline at debug level; `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses it. The load logs
+`[dsv41] attention kernel on the matrix units`. The output bytes change at rounding level (only the sum order inside the two
+products), so the SSD namespace tag moved to `dsv41-state-v3`. Landed at the commit that carries this text; measured at edf5e283 (the same
+kernels), AC, pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`:
+- Kernel (`sushi-ubench run dsv41.picks_span`, quiet, 9 rounds, median ms): packed span 256 3.2 to 1.7, span 128 1.7 to 1.0
+  (`dsv41.attn_span`, bf16 rows: 256 x 512 picks 3.3 to 2.2, 128 x 512 1.9 to 1.1, window only 1.1 to 0.9).
+- Resident 32K prefill (`--drop-expert 128 --ssd-budget-gb 94`, one boot an arm, same binary, `taskpolicy -a`, fans max, QUIET): profiled
+  1294.1 to 1494.2 tok/s, last full chunk (pos 28672) `core` 536.4 to 320.2 ms and total 1530.3 to 1335.1 ms (mean of the 12 full chunks
+  `core` 482.7 to 278.8); unprofiled 1407.6 to 1604.4 tok/s (+14.0%).
+- KLD (`sushi kld compare`, 8-category fixture, `--tokens 512 --top-k 10 --kv-quant 16 --no-mtp --ctx-size 8192 --ssd-budget-gb 100`,
+  `MLX_ENABLE_TF32=0`): to-first-EOS 0.18575 (88.51% top-1, 7775 positions) against the recorded 0.1843 (published) and
+  0.1853 (same-binary live check); per category code 0.0352, math 0.0593, reasoning 0.1158, design 0.1651, wikitext 0.2815,
+  multilingual 0.2736, story 0.4878, stem 0.0963.
 
 `SUSHI_DSV41_COMPOSED=1` (a diagnostic, read at load) runs the op chains instead and the load logs
 `[dsv41] fused kernels on|off`: the teacher arm of the KLD A/B. The hyper-connection kernels run at 1024 threads a
@@ -641,7 +660,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   the request's rows (`dsv41_prefix.captureShared`), is staged into the writer's bounded host buffers and released before
   the next forward appends, the newest and the prompt-end snapshot included. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
-- **Namespace**: `ModelConfig.cacheLayoutNamespace` returns `dsv41_prefix.namespaceTag` (`dsv41-state-v2`, plus
+- **Namespace**: `ModelConfig.cacheLayoutNamespace` returns `dsv41_prefix.namespaceTag` (`dsv41-state-v3`, plus
   `-dspark` when the stages are resident), hashed into the tier's fingerprint beside the pack's shard names, sizes and
   mtimes and `config.json`: another pack, another slot set or a bumped tag never reads these entries. Any change to what
   a stored state means bumps the tag in the same landing.

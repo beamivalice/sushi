@@ -228,7 +228,7 @@ pub fn markRows(cache: *transformer.KVCache) !void {
 /// Names the stored layout for the SSD cache namespace: a restore point written under another layout, or
 /// with a different set of slots, is never read.
 pub fn namespaceTag(dspark: bool) []const u8 {
-    return if (dspark) "dsv41-state-v2-dspark" else "dsv41-state-v2";
+    return if (dspark) "dsv41-state-v3-dspark" else "dsv41-state-v3";
 }
 
 /// Tokens of compressed rows and index keys one `g<n>` segment of an SSD entry holds.

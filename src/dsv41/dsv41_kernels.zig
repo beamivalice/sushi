@@ -6,6 +6,7 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
+const nax_gate = @import("../nax_gate.zig");
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -1143,11 +1144,197 @@ const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
     \\
 ;
 
+/// Fragments of the matrix units (MetalPerformancePrimitives `matmul2d`, as MLX's `steel/attn/nax.h`): a simdgroup
+/// holds a 16 x 16 fragment as 8 elements, rows `dsv41_nax_r` (lane, i) and columns `dsv41_nax_c` (lane, i), four
+/// contiguous columns a row. `dsv41_nax_mma` runs one 16 x N x KK multiply-accumulate on register fragments (one of N and
+/// KK is 32): `a` is 16 x KK, `b` KK x N, a dimension of 32 two consecutive 16-wide fragments.
+const ATTN_NAX_HEADER =
+    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+    \\inline short dsv41_nax_r(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 4) | ((short(lane) >> 1) & 3)) + (i >> 2) * 8; }
+    \\inline short dsv41_nax_c(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 2) | (short(lane) & 1)) * 4 + (i & 3); }
+    \\template <int N, int KK, typename AT, typename BT>
+    \\inline void dsv41_nax_mma(thread float* c, thread const AT* a, thread const BT* b) {
+    \\  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, N, KK, false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    \\  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    \\  auto ca = op.template get_left_input_cooperative_tensor<AT, BT, float>();
+    \\  auto cb = op.template get_right_input_cooperative_tensor<AT, BT, float>();
+    \\  auto cc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < KK / 2; ++i) ca[i] = a[i];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < KK * N / 32; ++i) cb[i] = b[i];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < N / 2; ++i) cc[i] = c[i];
+    \\  op.run(ca, cb, cc);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < N / 2; ++i) c[i] = cc[i];
+    \\}
+    \\
+;
+
+/// `ATTN_FUSED_HEAD` with both products on the matrix units: the scores as 16 heads x 16 keys over 32-channel steps,
+/// P x V as 16 heads x 32 channels over the 16 keys. Only the summation order inside the products differs.
+const ATTN_NAX_HEAD =
+    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const int l = threadgroup_position_in_grid.y, h0 = threadgroup_position_in_grid.x * HB;
+    \\const int wp = meta[0], window = meta[1], K = meta[2], nc = meta[3];
+    \\const int H = q_shape[1];
+    \\const int c1 = wp + l, c0 = metal::max(0, c1 - window + 1), nw = c1 - c0 + 1, total = nw + K;
+    \\constexpr int DS = D / NSG, QS = DS / 32, OF = DS / 16, NT = NSG * 32, TPH = NT / HB, NJ = KT / TPH;
+    \\const int d0 = int(sg) * DS;
+    \\threadgroup T kt[KT * D];
+    \\threadgroup float sp[NSG * HB * KT];
+    \\threadgroup T ph[HB * KT], pl[HB * KT];
+    \\threadgroup float cr[HB], rl[HB];
+    \\threadgroup int rsrc[KT];
+    \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
+    \\float m = sink[h0 + hh], lsum = 1.0f;
+    \\const float scale = scal[0];
+    \\T qa[QS][16];
+    \\float o[OF * 8];
+    \\#pragma clang loop unroll(full)
+    \\for (int ks = 0; ks < QS; ++ks)
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 16; ++i) qa[ks][i] = q[(size_t(l) * H + h0 + dsv41_nax_r(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_c(lane, i % 8)];
+    \\#pragma clang loop unroll(full)
+    \\for (int i = 0; i < OF * 8; ++i) o[i] = 0.0f;
+    \\for (int t0 = 0; t0 < total; t0 += KT) {
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (tid < KT) {
+    \\    const int t = t0 + int(tid);
+    \\    int src = -1;
+    \\    if (t < nw) src = c0 + t;
+    \\    else if (t < total) { const int c = topk[size_t(l) * K + t - nw]; if (c >= 0 && c < nc) src = -2 - c; }
+    \\    rsrc[tid] = src;
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  bool any = false;
+    \\  for (int j = 0; j < KT; ++j) any = any || rsrc[j] != -1;
+    \\  if (!any) continue;
+;
+
+const ATTN_NAX_TAIL =
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  float s[8];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int ks = 0; ks < QS; ++ks) {
+    \\    T b[16];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < 16; ++i) b[i] = kt[dsv41_nax_c(lane, i % 8) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
+    \\    dsv41_nax_mma<16, 32>(s, qa[ks], b);
+    \\  }
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_r(lane, i)) * KT + dsv41_nax_c(lane, i)] = s[i];
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  float sv[NJ], tmax = -INFINITY;
+    \\  for (int jj = 0; jj < NJ; ++jj) {
+    \\    const int j = sub + jj * TPH;
+    \\    float v = -INFINITY;
+    \\    if (rsrc[j] != -1) {
+    \\      float a = 0.0f;
+    \\      for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + j];
+    \\      v = a * scale;
+    \\    }
+    \\    sv[jj] = v;
+    \\    tmax = metal::max(tmax, v);
+    \\  }
+    \\  for (int off = TPH / 2; off > 0; off >>= 1) tmax = metal::max(tmax, metal::simd_shuffle_xor(tmax, ushort(off)));
+    \\  const float mn = metal::max(m, tmax), corr = metal::precise::exp(m - mn);
+    \\  float psum = 0.0f;
+    \\  for (int jj = 0; jj < NJ; ++jj) {
+    \\    const int j = sub + jj * TPH;
+    \\    const float p = metal::precise::exp(sv[jj] - mn);
+    \\    const T hi = T(p);
+    \\    psum += p;
+    \\    ph[hh * KT + j] = hi;
+    \\    pl[hh * KT + j] = T(p - float(hi));
+    \\  }
+    \\  for (int off = TPH / 2; off > 0; off >>= 1) psum += metal::simd_shuffle_xor(psum, ushort(off));
+    \\  lsum = lsum * corr + psum;
+    \\  m = mn;
+    \\  if (sub == 0) cr[hh] = corr;
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < OF * 8; ++i) o[i] *= cr[dsv41_nax_r(lane, i % 8)];
+    \\  T ah[8], al[8];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 8; ++i) { ah[i] = ph[dsv41_nax_r(lane, i) * KT + dsv41_nax_c(lane, i)]; al[i] = pl[dsv41_nax_r(lane, i) * KT + dsv41_nax_c(lane, i)]; }
+    \\  #pragma clang loop unroll(full)
+    \\  for (int g = 0; g < OF / 2; ++g) {
+    \\    T b[16];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int f = 0; f < 2; ++f)
+    \\      #pragma clang loop unroll(full)
+    \\      for (int i = 0; i < 8; ++i) b[f * 8 + i] = kt[dsv41_nax_r(lane, i) * D + d0 + g * 32 + f * 16 + dsv41_nax_c(lane, i)];
+    \\    dsv41_nax_mma<32, 16>(o + g * 16, al, b);
+    \\    dsv41_nax_mma<32, 16>(o + g * 16, ah, b);
+    \\  }
+    \\}
+    \\if (sub == 0) rl[hh] = 1.0f / lsum;
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\const int cc0 = dsv41_nax_c(lane, 0);
+    \\#pragma clang loop unroll(full)
+    \\for (int hs = 0; hs < 2; ++hs) {
+    \\  const int row = dsv41_nax_r(lane, hs * 4);
+    \\  const float inv = rl[row];
+    \\  const int head = h0 + row;
+    \\  if (EPI) {
+    \\    float v[OF][4];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int f = 0; f < OF; ++f) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < 4; ++j) v[f][j] = float(OT(o[f * 8 + hs * 4 + j] * inv));
+    \\      #pragma clang loop unroll(full)
+    \\      for (int p = 0; p < 2; ++p) {
+    \\        const int c = d0 + f * 16 + cc0 + p * 2;
+    \\        if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[f][p * 2], v[f][p * 2 + 1], meta[4] + l, freqs[(c - (D - RD)) / 2]);
+    \\      }
+    \\    }
+    \\    #pragma clang loop unroll(full)
+    \\    for (int g = 0; g < OF / 2 && QAT; ++g) {
+    \\      float amax = 0.0f;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\        #pragma clang loop unroll(full)
+    \\        for (int j = 0; j < 4; ++j) amax = metal::max(amax, metal::abs(v[f][j]));
+    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+    \\      const float sc = qat_scale<0>(amax);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\        #pragma clang loop unroll(full)
+    \\        for (int j = 0; j < 4; ++j) v[f][j] = float(static_cast<OT>(qat_round<0>(v[f][j], sc)));
+    \\    }
+    \\    #pragma clang loop unroll(full)
+    \\    for (int f = 0; f < OF; ++f) {
+    \\      const int flat = head * D + d0 + f * 16 + cc0;
+    \\      device OT* dst = out + (size_t(flat / GIN) * q_shape[0] + l) * GIN + flat % GIN;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < 4; ++j) dst[j] = OT(v[f][j]);
+    \\    }
+    \\  } else {
+    \\    device OT* dst = out + (size_t(l) * H + head) * D + d0 + cc0;
+    \\    #pragma clang loop unroll(full)
+    \\    for (int f = 0; f < OF; ++f)
+    \\      #pragma clang loop unroll(full)
+    \\      for (int j = 0; j < 4; ++j) dst[f * 16 + j] = OT(o[f * 8 + hs * 4 + j] * inv);
+    \\  }
+    \\}
+;
+
 const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
 const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
+const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_NAX_TAIL;
+const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_NAX_TAIL;
 
 var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE, .header = ATTN_EPI_HEADER };
 var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
+
+var attn_nax_def = Def{ .name = "dsv41_attn_nax", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_NAX_SOURCE, .header = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER };
+var attn_nax_fp4_def = Def{ .name = "dsv41_attn_nax_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_NAX_FP4_SOURCE, .header = ATTN_NAX_HEADER ++ ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
 
 const fused_hb = 16;
 const fused_nsg = 8;
@@ -1156,6 +1343,12 @@ const fused_kt = 16;
 /// Whether `attnFused` serves `h` heads of `d` channels.
 pub fn attnFusedFits(h: usize, d: usize) bool {
     return h % fused_hb == 0 and d % (fused_nsg * 8) == 0;
+}
+
+/// Whether `attnFused`'s matrix-unit arm (`nax`) serves `h` heads of `d` channels here: the simdgroup slices are whole
+/// 32-channel steps and the GPU has the units.
+pub fn attnNaxFits(h: usize, d: usize) bool {
+    return attnFusedFits(h, d) and d % (fused_nsg * 32) == 0 and nax_gate.verifyQmmNaxAvailable();
 }
 
 /// What attnOut does to the heads before `wo_a`, done by the kernel's store: the tail's inverse rotation at
@@ -1170,24 +1363,24 @@ pub fn attnEpilogueFits(h: usize, d: usize, og: usize) bool {
 /// `attnWide` without the intermediates or the f16: `attnCore`'s heads `[L, H, D]` for `q` `[L, H, D]` (bf16)
 /// against the window rows `keys_w` (query i sees rows (wp + i - window, wp + i]) and the compressed rows
 /// `comp_rows` it picked (`topk` `[L, K]`), f32 throughout past the bf16 operands. With `epi` they leave as attnOut
-/// takes them.
-pub fn attnFused(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype, epi: ?Epilogue) !A {
+/// takes them. `nax` runs both products on the matrix units (`attnNaxFits` must hold): the sums' order changes.
+pub fn attnFused(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype, epi: ?Epilogue, nax: bool) !A {
     const dt = mlx.mlx_array_dtype(q);
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const keys = try sc.astype(keys_w, dt);
     const comp = if (K > 0) try sc.astype(comp_rows, dt) else keys;
     const picks = if (K > 0) try sc.astype(topk, .int32) else sc_mod.none;
-    return attnFusedLaunch(sc, &attn_fused_def, sink, q, keys, &.{comp}, wp, window, K, if (K > 0) dim(comp_rows, 0) else 0, picks, scale, out_dt, &.{}, epi);
+    return attnFusedLaunch(sc, if (nax) &attn_nax_def else &attn_fused_def, sink, q, keys, &.{comp}, wp, window, K, if (K > 0) dim(comp_rows, 0) else 0, picks, scale, out_dt, &.{}, epi);
 }
 
 /// `attnFused` with the picked rows read where the compressed store keeps them: `codes` `[rows, D / 2]` and
 /// `scales` `[rows, D / group]` (`qat_mod.packFp4`'s form), `topk` the ids into them. Each row is decoded as
 /// `qat_mod.unpackFp4` does, so the heads are the bytes `attnFused` gives for the unpacked rows.
-pub fn attnFusedPacked(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, codes: A, scales: A, mode: qat_mod.Qat, group: usize, topk: A, scale: f32, out_dt: mlx.mlx_dtype, epi: ?Epilogue) !A {
+pub fn attnFusedPacked(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, codes: A, scales: A, mode: qat_mod.Qat, group: usize, topk: A, scale: f32, out_dt: mlx.mlx_dtype, epi: ?Epilogue, nax: bool) !A {
     std.debug.assert(group % 8 == 0 and dim(codes, 1) * 2 == dim(q, 2));
     const keys = try sc.astype(keys_w, mlx.mlx_array_dtype(q));
     const extra = [_]Tmpl{ .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) } };
-    return attnFusedLaunch(sc, &attn_fused_fp4_def, sink, q, keys, &.{ codes, scales }, wp, window, dim(topk, 1), dim(codes, 0), try sc.astype(topk, .int32), scale, out_dt, &extra, epi);
+    return attnFusedLaunch(sc, if (nax) &attn_nax_fp4_def else &attn_fused_fp4_def, sink, q, keys, &.{ codes, scales }, wp, window, dim(topk, 1), dim(codes, 0), try sc.astype(topk, .int32), scale, out_dt, &extra, epi);
 }
 
 /// `comp`: the picked rows' arrays, as `def` takes them; `picks`: `topk` as int32, none without picks.
@@ -1224,6 +1417,70 @@ fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const 
     const out_shape: [3]c_int = if (epi != null) .{ ci(og), ci(L), ci(H * D / og) } else .{ ci(L), ci(H), ci(D) };
     try launch(sc, def, ins[0..n], &.{.{ .shape = &out_shape, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
     return o[0];
+}
+
+/// How far the matrix-unit arm's heads may sit from the SIMD arm's in the load's trial, as a fraction of the peak: both
+/// are within 1.3e-5 of the f32 truth.
+pub const attn_nax_bar: f64 = 3e-5;
+
+/// One trial of the matrix-unit arm against the SIMD kernel at the model's head shape, over the plain kernel in f32 and
+/// the packed one with its epilogue store: false when a launch fails or the heads differ by more than `bar` of the peak
+/// (the epilogue's fp8 rounding may flip a value by a quantum, so its bar is 5000 x `bar`).
+pub fn attnNaxProbe(a: std.mem.Allocator, h: usize, d: usize, rd: usize, og: usize, bar: f64) bool {
+    const had = mlx.errorPending();
+    const ok = attnNaxTrial(a, h, d, rd, og, bar) catch false;
+    if (!ok) mlx.dropLatchedErrorUnless(had);
+    return ok;
+}
+
+fn maxRelDiff(got: []const f32, want: []const f32) f64 {
+    var peak: f64 = 1e-30;
+    var worst: f64 = 0;
+    for (got, want) |g, w| {
+        const e = @abs(@as(f64, g) - @as(f64, w));
+        if (std.math.isNan(e)) return std.math.inf(f64);
+        worst = @max(worst, e);
+        peak = @max(peak, @abs(w));
+    }
+    return worst / peak;
+}
+
+fn attnNaxTrial(a: std.mem.Allocator, h: usize, d: usize, rd: usize, og: usize, bar: f64) !bool {
+    if (!attnNaxFits(h, d)) return false;
+    const L = 32;
+    const wp = 40;
+    const K = 48;
+    const nc = 40;
+    const window = 128;
+    var sc = Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const bf16 = mlx.mlx_dtype.bfloat16;
+    const q = try randn(&sc, &.{ L, ci(h), ci(d) }, bf16, 0x4a1, 1.5);
+    const keys = try randn(&sc, &.{ wp + L, ci(d) }, bf16, 0x4a2, 1.5);
+    const comp = try randn(&sc, &.{ nc, ci(d) }, bf16, 0x4a3, 1.5);
+    const sink = try randn(&sc, &.{ ci(h), 1 }, bf16, 0x4a4, 1.0);
+    var picks: [L * K]i32 = undefined;
+    for (&picks, 0..) |*v, i| v.* = if (i % 5 == 3) -1 else @intCast((i * 7) % nc);
+    const topk = try sc.ints(&picks, &.{ L, K });
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+    const plain = [2][]const f32{
+        try sc_mod.hostF32(try attnFused(&sc, sink, q, keys, wp, window, comp, topk, scale, .float32, null, false)),
+        try sc_mod.hostF32(try attnFused(&sc, sink, q, keys, wp, window, comp, topk, scale, .float32, null, true)),
+    };
+    if (!(maxRelDiff(plain[1], plain[0]) <= bar)) return false;
+    if (rd == 0 or !attnEpilogueFits(h, d, og)) return true;
+    const pk = try qat_mod.packFp4(&sc, comp, .fp4_e4m3, 16);
+    var f: [64]f32 = undefined;
+    if (rd > 2 * f.len) return false;
+    qat_mod.invFreqs(f[0 .. rd / 2], rd, 65536, 160000, 16, 32, 1);
+    const freqs = try sc.floats(f[0 .. rd / 2], &.{ci(rd / 2)});
+    const epi: Epilogue = .{ .freqs = freqs, .rd = rd, .pos0 = 30720, .qat = true, .og = og };
+    var packed_heads: [2][]const f32 = undefined;
+    for (&packed_heads, [_]bool{ false, true }) |*out, nax| {
+        const y = try attnFusedPacked(&sc, sink, q, keys, wp, window, pk.codes, pk.scales, .fp4_e4m3, 16, topk, scale, .bfloat16, epi, nax);
+        out.* = try sc_mod.hostF32(try sc.astype(y, .float32));
+    }
+    return maxRelDiff(packed_heads[1], packed_heads[0]) <= bar * 5000;
 }
 
 // ── indexer ──────────────────────────────────────────────────────────────

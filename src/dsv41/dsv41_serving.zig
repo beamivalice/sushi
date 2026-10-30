@@ -2,6 +2,7 @@ const trf = @import("../transformer.zig");
 const std = @import("std");
 const dsv41_model = @import("dsv41_model.zig");
 const dsv41_stream = @import("dsv41_stream.zig");
+const kernels = @import("dsv41_kernels.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -34,6 +35,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
     dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);
+    dsv41_model.setAttnNax(mdl, kernels.attn_nax_bar);
     dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
     if (mdl.ced_split) |split|
         log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });

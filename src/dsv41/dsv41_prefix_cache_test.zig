@@ -1028,6 +1028,38 @@ test "DeepSeek SSD tier: the namespace names the layout, and another layout's en
     var next_buf: [620]u32 = undefined;
     @memcpy(next_buf[0..600], first);
     for (next_buf[600..]) |*t| t.* = 91;
+    // Entries written by the SIMD attention kernel (the tag before the matrix-unit arm) are never restored.
+    const old = try disk_placement.modelFingerprintWithLayout(testing.allocator, io, dir, "dsv41-state-v2-dspark");
+    defer testing.allocator.free(old);
+    try testing.expect(!std.mem.eql(u8, old, a));
+    var tmp_old = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_old.cleanup();
+    var buf_old: [512]u8 = undefined;
+    const base_old = buf_old[0..try tmp_old.dir.realPath(io, &buf_old)];
+    {
+        var hc = try dsv41SsdOnlyCache(io, base_old, old);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+    }
+    for ([_]struct { fp: []const u8, want: usize }{ .{ .fp = old, .want = 512 }, .{ .fp = a, .want = 0 } }) |arm| {
+        var hc = try dsv41SsdOnlyCache(io, base_old, arm.fp);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
+        try testing.expectEqual(arm.want, res.matched);
+    }
     for ([_]struct { fp: []const u8, want: usize }{ .{ .fp = a, .want = 512 }, .{ .fp = b, .want = 0 } }) |arm| {
         var hc = try dsv41SsdOnlyCache(io, base, arm.fp);
         defer hc.deinit();
