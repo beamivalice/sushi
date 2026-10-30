@@ -153,7 +153,7 @@ pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWei
             return .{ .stream = try standinRef(n.stream), .mixed = read.mixed, .inj = read.inj };
         }
     }
-    if (batch * seq_len > HC_FUSED_MAX_ROWS or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
+    if (trf.linear_tap != null or batch * seq_len > HC_FUSED_MAX_ROWS or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
     const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
     const uqp = self.quantParamsFor(w.up_w, w.up_s);
     if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;

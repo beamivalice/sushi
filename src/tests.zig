@@ -184,6 +184,7 @@ test {
     _ = @import("glm5/glm5_dflash_dense_rows.zig");
     _ = @import("glm5/glm5_dflash_reserve.zig");
     _ = @import("glm5/glm5_kld_capture.zig");
+    _ = @import("dsv41/kld_capture.zig");
     _ = @import("glm5/glm5_layer_major.zig");
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");

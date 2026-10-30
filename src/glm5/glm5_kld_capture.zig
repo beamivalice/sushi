@@ -178,7 +178,7 @@ fn armDispatches() struct { hc_prefill: usize, hc_collapse_simd32: usize, kda_va
     };
 }
 
-fn json(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u8, value: anytype) !void {
+pub fn json(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u8, value: anytype) !void {
     const raw = try std.json.Stringify.valueAlloc(a, value, .{ .whitespace = .indent_2 });
     defer a.free(raw);
     var dir = try std.Io.Dir.cwd().openDir(io, directory, .{});
@@ -222,7 +222,7 @@ fn exportRow(s: mlx.mlx_stream, logits: Arr, row: []f32) !mlx.mlx_dtype {
     if (!nonzero) return error.NativeGlmTeacherZeroNormLogits;
     return dtype;
 }
-fn greedy(row: []const f32) u32 {
+pub fn greedy(row: []const f32) u32 {
     var best: usize = 0;
     for (row, 0..) |v, i| if (v > row[best]) {
         best = i;
@@ -272,13 +272,13 @@ const WindowRecord = struct {
     hidden_sha256: []const u8,
 };
 
-fn shaHex(bytes: []const u8) [64]u8 {
+pub fn shaHex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn inputsSha(prompts: []const kld.Prompt, inputs: []const []u32) [64]u8 {
+pub fn inputsSha(prompts: []const kld.Prompt, inputs: []const []u32) [64]u8 {
     var h = Sha256.init(.{});
     for (prompts, inputs) |p, ids| {
         h.update(std.mem.asBytes(&@as(u64, p.id.len)));
@@ -289,13 +289,13 @@ fn inputsSha(prompts: []const kld.Prompt, inputs: []const []u32) [64]u8 {
     return std.fmt.bytesToHex(h.finalResult(), .lower);
 }
 
-fn engineSha(a: std.mem.Allocator, io: std.Io) ![64]u8 {
+pub fn engineSha(a: std.mem.Allocator, io: std.Io) ![64]u8 {
     const path = try std.process.executablePathAlloc(io, a);
     defer a.free(path);
     return @import("../update.zig").fileSha256Hex(io, path);
 }
 
-fn fsyncPath(path: []const u8) !void {
+pub fn fsyncPath(path: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const fd = std.c.open(try std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.GlmLayerMajorSyncFailed;
@@ -304,7 +304,7 @@ fn fsyncPath(path: []const u8) !void {
 }
 
 /// While `pause` exists the capture idles between batches, `<pause>.ack` saying so.
-fn waitWhilePaused(a: std.mem.Allocator, io: std.Io, pause: []const u8, committed: usize, out: *kld.Out) !void {
+pub fn waitWhilePaused(a: std.mem.Allocator, io: std.Io, pause: []const u8, committed: usize, out: *kld.Out) !void {
     if (pause.len == 0) return;
     const cwd = std.Io.Dir.cwd();
     cwd.access(io, pause, .{}) catch return;
@@ -625,7 +625,7 @@ fn layerMajorDiskBytes(tokens: u64, windows: u64, boundaries: u64, width: u64, v
     return tokens * (boundaries * width * 2 + 4) + windows * vocab * 4;
 }
 
-fn appendLine(fd: std.c.fd_t, line: []const u8) !void {
+pub fn appendLine(fd: std.c.fd_t, line: []const u8) !void {
     for ([_][]const u8{ line, "\n" }) |part| {
         var done: usize = 0;
         while (done < part.len) {
@@ -942,7 +942,7 @@ test "GLM native KLD capture CPU exact logits export and greedy full vocabulary"
     try std.testing.expectError(error.NativeGlmTeacherUnsupportedLogits, exportRow(s, y, row[0..2]));
 }
 
-fn metadataHash(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u8) ![64]u8 {
+pub fn metadataHash(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u8) ![64]u8 {
     var dir = try std.Io.Dir.openDirAbsolute(io, directory, .{});
     defer dir.close(io);
     const bytes = try dir.readFileAlloc(io, name, a, .limited(128 * 1024 * 1024));
@@ -951,7 +951,7 @@ fn metadataHash(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: [
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     return std.fmt.bytesToHex(hash, .lower);
 }
-fn completeBaseline(a: std.mem.Allocator, io: std.Io, directory: []const u8, count: usize, tokens: u32) !void {
+pub fn completeBaseline(a: std.mem.Allocator, io: std.Io, directory: []const u8, count: usize, tokens: u32) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, directory, .{});
     defer dir.close(io);
     const raw = try dir.readFileAlloc(io, "baseline.json", a, .limited(16 * 1024 * 1024));

@@ -194,6 +194,8 @@ When it engages:
   layers after it. Engram layers must sit below it. DSpark targets and the candidate source must sit at or above it.
 - A prefill pass engages CED when it wants only the last row's logits, has no verify, and is wider than the window
   (`Model.planCed`).
+- A tap (calibration capture) never engages it. The layer-major KLD capture forks the tail as its own pass at the
+  split (`cedFork`), so its served logits are the CED logits.
 - Load line: `[dsv41] CED: layers 20..39 run the last 128 rows of a prefill chunk`. Each chunk logs
   `[dsv41] CED prefill: N rows encoder-only, replay 128 rows` at debug.
 

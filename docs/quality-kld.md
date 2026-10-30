@@ -86,9 +86,9 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
 
 `kld capture` and `compare` run `deepseek_v41` through the generic path, streamed (`--ssd-budget-gb` is required; the
 load names it before touching the GPU). The state is the activation dtype and the model keeps its own, so a flag that
-would silently do nothing is refused by name at load (`refuseForDsv41`): `--kv-quant` (`Dsv41KvQuantUnsupported`),
+would silently do nothing is refused by name at load (`kld_capture.refuse`): `--kv-quant` (`Dsv41KvQuantUnsupported`),
 `--qwen-gdn 16` (`Dsv41HasNoQwenGdnState`), `--hidden-out` (`Dsv41HiddenCaptureUnsupported`) and `SUSHI_IMATRIX_OUT`
-(`Dsv41ImatrixCaptureUnsupported`). The teacher is exact routing: `capture` refuses `--drop-expert` and
+(`Dsv41ImatrixCaptureUnsupported`; the layer-major capture below takes it). The teacher is exact routing: `capture` refuses `--drop-expert` and
 `--expert-pick-tolerance`; `compare --drop-expert n` scores a pruned student against it
 ([dsv41-arch](dsv41-arch.md#drop-expert)). `compare --expert-pick-tolerance n` acts on the one-row steps that score the
 generated tokens (the prompt prefill is exact) and only where an expert can miss: a budget that holds every expert loads
@@ -100,6 +100,57 @@ A tiny-model test (`DSV41_TINY`) captures a teacher and compares it in both arms
 `compare` scores prefill chunks on the GEMM and the generated tokens on one-row steps, so it never runs the NAX 2 to 8 row
 arm: a change to that arm's sum order leaves the KLD identical to the last digit (0.186614243 on the STQ 1.75bpw pack for
 main and for the reordered trunk rows) and is gated by the f32-truth bars and the width-invariance byte test instead.
+`--layer-major --tokens 1` instead runs the calibration capture below.
+
+<a id="dsv41-capture"></a>
+### DeepSeek-V4.1 calibration capture (layer-major)
+
+`--layer-major --tokens 1 --no-template` on a `deepseek_v41` checkpoint (`kld_capture.zig`) runs W windows through
+layer 0, then layer 1, and so on, with one pinned union of the layer's 384 FP4 experts per batch
+(`dsv41_stream.Stream.pin`, `--ssd-budget-gb` sizes W: the cache itself stays at its two-slot floor). A window is one
+forward of at most 2048 rows (longer ones run in 2048-row chunks, each layer over all its chunks in order); the layer step
+is the model's own (`dsv41_model.passLayer`, the same code `extendSpan` loops), so the standard fixture (`prompts/NN_id`,
+`baseline.json`) is the window-major capture's byte for byte. It also writes, in `<out>/calib/`, what a quantizer needs:
+
+| file | holds |
+|---|---|
+| `mlp-in-LL.bf16` | the FFN input every routed and shared expert of layer LL reads, `[tokens, dim]` bf16, windows in order |
+| `route-LL.u16`, `route-w-LL.f32` | the router's top-k expert ids and the weights it applied (normalized, times the routed scale), `[tokens, top_k]` |
+| `trunk-LL.safetensors`, `trunk-head.safetensors` | `layers.LL.<input>`: X^T X of the input of each trunk linear, summed over every token in f32, with `<name>.rows` (I64) |
+| `imatrix.safetensors` | the experts' gate/up and down second moments (`SUSHI_IMATRIX_OUT` names another file) |
+| `dspark-in-LL.bf16` | the mean of the hc copies entering each DSpark target layer (config `dspark_target_layer_ids`), `[tokens, dim]` bf16: what the draft stages' main projection reads |
+| `head-in.bf16` | opt-in (`SUSHI_DSV41_HEAD_ROWS=1`): the array the head multiplies for every row (final RMSNorm output after the last hyper-connection collapse), `[tokens, dim]` bf16, windows in order; `head @ row` in f32 is the teacher's logits |
+| `tokens.bin`, `layout.json` | the window ids (u32; `../windows.jsonl` has the lengths) and this table |
+
+The trunk inputs: `attn_in` (wq_a, wkv, the compressor projections, the indexer's weights projection), `q_lora` (wq_b and
+the indexer's wq_b), `index_latent` (the indexer's key projection, index-key owners), `wo_a_in` (`[groups, in, in]`: one
+matrix per output group of wo_a), `wo_b_in`, `ffn_in` (the shared expert's w1 and w3), `shared_act` (its w2),
+`engram_in` (the Engram wkv, layers 1 and 14) and `head_in` (the head). They are what the forward feeds, with
+no `act_quant` on the way ([dsv41-arch](dsv41-arch.md#gaps-against-the-reference)).
+- The sums add on the GPU per layer, in f32 (MLX's f32 matmul keeps full f32 here: 1.3e-6 of peak against f64 on a 2048x5120 X^T X,
+  21.6 TFLOPs), and a worker thread folds each layer's batch total into `trunk-LL.<windows>.safetensors` (read, add, write,
+  rename); the finished files lose the window count. Bytes depend on the batch partition (f32 addition order); rows,
+  routes, logits and the imatrix do not.
+- The tiny seeded pack (`DSV41_TINY`) proves it: logits, rows, routes and tokens equal the window-major forward at W of 1
+  and 3 and chunks of 4 and 64 rows, the generic `kld capture` fixture equals the layer-major one, the sums match an f64
+  X^T X of the recorded inputs, the imatrix matches the dumped rows and routes, and an interruption inside a batch resumes to
+  the uninterrupted bytes, also at another batch size.
+- Measured (32 real 2048-token windows, `--ssd-budget-gb 100`, `taskpolicy -a`, GPU lock, fans auto):
+  309.5 s a batch = 212 tok/s; the forward alone 306 tok/s (213.8 s), the one-per-batch read of all 288.8 GB 27.5 s
+  (0.69 s a layer), the capture's extras 68.2 s (22%: the X^T X sums, row and route writes, imatrix). 496 windows in 16
+  batches take about 1.3 h. Disk at 1M tokens: rows 416 GB, DSpark rows 31 GB, sums 41 GB.
+- Resume as above: `layer-major.json` binds the run, `windows.jsonl` commits a window after every file of its batch is synced,
+  a rerun truncates the row, route and token files to the committed tokens and re-adds the in-flight batch; the previous
+  sums version stays until the batch commits. The disk check counts rows, routes, two versions of the sums and the logits plus 16 GiB.
+- Teacher rows: `SUSHI_DSV41_HEAD_ROWS=1` adds `head-in.bf16` (the forward's activation dtype is bf16 and the head casts it to f32,
+  so the file loses nothing); with `SUSHI_DSV41_CAPTURE_LEAN=1` as well the run writes only `tokens.bin`, `windows.jsonl`, the
+  fixture, `layout.json` and `head-in.bf16`: no rows, routes, sums, imatrix or DSpark rows, and none of their GPU work. Lean
+  without head rows is refused (`Dsv41CaptureLeanNeedsHeadRows`); `layer-major.json` binds the mode, so a rerun in another mode
+  is refused. The tiny pack proves the rows equal the forward's head input, the last row of each window through the head
+  reproduces the fixture logits, a lean run's rows and logits equal the full run's, and both modes resume.
+- Refused by name: `--hidden-out` / `SUSHI_HIDDEN_OUT`, `--imatrix-windows`, a quantized KV (`Dsv41KvQuantUnsupported`),
+  `--qwen-gdn 16`, `--tokens` other than 1, a missing budget.
+
 
 ## Bundled four-prompt screen
 

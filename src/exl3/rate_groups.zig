@@ -2659,7 +2659,7 @@ test "exl3 rate groups: the shared expert riding the prefill launches writes the
     for ([_]f32{ 400, 4000 }) |x_scale| for ([_]usize{ 17, 33, 128, 600 }) |rows| try sharedPrefillCase(t.allocator, s, 512, 256, &rates, &experts, rows, 6, x_scale, 0x91 + rows);
 }
 
-test "exl3 rate groups: the shared expert riding the prefill launches at DeepSeek's geometry, 17 to 2048 rows" {
+test "exl3 rate groups: the shared expert riding the prefill launches at 5120x2304 with 384 experts in five groups, 17 to 2048 rows" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;

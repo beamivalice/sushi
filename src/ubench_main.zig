@@ -12,7 +12,7 @@ pub const log = @import("log.zig");
 pub const report = @import("ubench_report.zig");
 const box = @import("bench_box.zig");
 const exl3 = @import("sushi_exl3");
-const dsv41 = @import("ubench_dsv41.zig");
+const dsv_benches = @import("dsv41/ubench.zig");
 const glm5 = @import("ubench_glm5.zig");
 const shared = @import("ubench_shared.zig");
 const encoder = @import("sushi_encoder");
@@ -22,7 +22,7 @@ const registry = [_]report.Bench{
     exl3.ubench.dsv41_experts,
     exl3.ubench.dsv41_tail_routed,
     exl3.ubench.dsv41_shared_prefill,
-} ++ dsv41.benches ++ [_]report.Bench{
+} ++ dsv_benches.benches ++ [_]report.Bench{
     exl3.ubench.decode_chain,
     exl3.ubench.grouped_decode,
     exl3.ubench.moe_layer,

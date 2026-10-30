@@ -40,13 +40,22 @@ pub const Arch = enum {
     qwen4_exp,
     mimo_v2,
     glm5_next,
+    /// A checkpoint that names the expert block `layers.N.ffn.experts` (no model-type lookup: its capture builds the
+    /// collector itself).
+    ffn_experts,
 
     /// The SOURCE checkpoint's decoder-layer prefix.
     pub fn layerPrefix(self: Arch) []const u8 {
         return switch (self) {
             .qwen4_exp, .glm5_next => "model.language_model.layers.",
             .mimo_v2 => "model.layers.",
+            .ffn_experts => "layers.",
         };
+    }
+
+    /// What follows the layer index in the name of the layer's expert block.
+    pub fn expertsInfix(self: Arch) []const u8 {
+        return if (self == .ffn_experts) ".ffn.experts." else ".mlp.experts.";
     }
 
     pub fn fromModelType(model_type: []const u8) ?Arch {
@@ -190,6 +199,39 @@ pub const Collector = struct {
         try mlx.check(mlx.mlx_concatenate_axis(&joined, parts, 0, self.s));
         try mlx.check(mlx.mlx_array_eval(joined));
         const ids = try tap.ids.toOwnedSlice(self.allocator);
+        const topk = tap.topk;
+        tap.clear(self.allocator);
+        return .{ .x = joined, .ids = ids, .topk = topk };
+    }
+
+    /// `takeRows` of forwards that ran out of order: `order[i]` is the capture (one per forward) that goes i-th.
+    pub fn takeRowsInOrder(self: *Collector, order: []const usize) !CapturedRows {
+        const tap = &(self.rows_tap orelse return error.ImatrixNoRows);
+        const n = tap.x.items.len;
+        if (order.len != n) return error.ImatrixBadShape;
+        const starts = try self.allocator.alloc(usize, n + 1);
+        defer self.allocator.free(starts);
+        starts[0] = 0;
+        for (tap.x.items, 0..) |a, i| starts[i + 1] = starts[i] + @as(usize, @intCast(mlx.getShape(a)[0])) * tap.topk;
+        if (starts[n] != tap.ids.items.len) return error.ImatrixBadShape;
+        const xs = try self.allocator.alloc(mlx.mlx_array, n);
+        defer self.allocator.free(xs);
+        const ids = try self.allocator.alloc(i32, tap.ids.items.len);
+        errdefer self.allocator.free(ids);
+        var at: usize = 0;
+        for (order, xs) |o, *x| {
+            if (o >= n) return error.ImatrixBadShape;
+            x.* = tap.x.items[o];
+            const part = tap.ids.items[starts[o]..starts[o + 1]];
+            @memcpy(ids[at..][0..part.len], part);
+            at += part.len;
+        }
+        const parts = mlx.mlx_vector_array_new_data(xs.ptr, n);
+        defer _ = mlx.mlx_vector_array_free(parts);
+        var joined = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(joined);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, parts, 0, self.s));
+        try mlx.check(mlx.mlx_array_eval(joined));
         const topk = tap.topk;
         tap.clear(self.allocator);
         return .{ .x = joined, .ids = ids, .topk = topk };
@@ -474,11 +516,11 @@ pub const Collector = struct {
             try held.append(self.allocator, down);
             try mlx.check(mlx.mlx_array_eval(slot.rows));
             const prefix = self.arch.layerPrefix();
-            const gu_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}.mlp.experts.gate_up_proj", .{ prefix, li }, 0);
+            const gu_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj", .{ prefix, li, self.arch.expertsInfix() }, 0);
             try mlx.check(mlx.mlx_map_string_to_array_insert(map, gu_key.ptr, gu));
-            const rows_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}.mlp.experts.gate_up_proj.rows", .{ prefix, li }, 0);
+            const rows_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj.rows", .{ prefix, li, self.arch.expertsInfix() }, 0);
             try mlx.check(mlx.mlx_map_string_to_array_insert(map, rows_key.ptr, slot.rows));
-            const down_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}.mlp.experts.down_proj", .{ prefix, li }, 0);
+            const down_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}down_proj", .{ prefix, li, self.arch.expertsInfix() }, 0);
             try mlx.check(mlx.mlx_map_string_to_array_insert(map, down_key.ptr, down));
             entries += 3;
         }
@@ -816,6 +858,36 @@ test "imatrix keeps the armed layer's MLP input rows and routing ids for the enc
     const data = mlx.mlx_array_data_float32(got.x).?;
     try testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, data[0..6]);
     try testing.expectError(error.ImatrixNoRows, col.takeRows());
+}
+
+test "rows captured out of order come back in the order asked, ids with their rows" {
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    const col = try Collector.init(alloc, s, "/dev/null", 1, 4, .qwen4_exp);
+    defer col.deinit();
+    col.armRows(0);
+    const x0 = [_]f32{ 1, 2, 3, 4 };
+    const x1 = [_]f32{ 5, 6 };
+    const ids0 = [_]i32{ 0, 3, 2, 1 };
+    const ids1 = [_]i32{ 1, 2 };
+    const a0 = mlx.mlx_array_new_data(&x0, &[_]c_int{ 2, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(a0);
+    const a1 = mlx.mlx_array_new_data(&x1, &[_]c_int{ 1, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(a1);
+    const ia0 = mlx.mlx_array_new_data(&ids0, &[_]c_int{ 2, 2 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ia0);
+    const ia1 = mlx.mlx_array_new_data(&ids1, &[_]c_int{ 1, 2 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ia1);
+    try col.observeGateUp(0, a1, ia1);
+    try col.observeGateUp(0, a0, ia0);
+    try testing.expectError(error.ImatrixBadShape, col.takeRowsInOrder(&.{0}));
+
+    const got = try col.takeRowsInOrder(&.{ 1, 0 });
+    defer _ = mlx.mlx_array_free(got.x);
+    defer alloc.free(got.ids);
+    try testing.expectEqualSlices(i32, &.{ 0, 3, 2, 1, 1, 2 }, got.ids);
+    const data = mlx.mlx_array_data_float32(got.x).?;
+    try testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, data[0..6]);
 }
 
 test "an encoder request arms the rows tap without the environment variable, and only for a known architecture" {

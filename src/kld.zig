@@ -11,6 +11,7 @@ const model_settings_mod = @import("model_settings.zig");
 const server_mod = @import("server.zig");
 const hidden_capture = @import("hidden_capture.zig");
 const fp8_block = @import("fp8_block.zig");
+const dsv_capture = @import("dsv41/kld_capture.zig");
 const testing = std.testing;
 
 pub const SCHEMA = "mlx-serve-kld-baseline-v1";
@@ -235,8 +236,9 @@ pub const USAGE =
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
-    \\  --layer-major         native GLM BF16 teacher, --tokens 1: batches of windows run layer by layer,
-    \\                        each layer's experts read once per batch; resumable by rerunning
+    \\  --layer-major         native GLM BF16 teacher or a streamed checkpoint's calibration capture, --tokens 1:
+    \\                        batches of windows run layer by layer, each layer's experts read once per batch;
+    \\                        resumable by rerunning
     \\  --imatrix-windows <n> layer-major: SUSHI_IMATRIX_OUT counts only the first n windows (0 = all)
     \\  --batch-windows <n>   windows per layer-major batch (default: from the budget, at most 32)
     \\  --pause-file <path>   layer-major: idle after the current batch while <path> exists (<path>.ack)
@@ -900,16 +902,6 @@ pub const Loaded = struct {
     }
 };
 
-/// DeepSeek-V4.1 keeps its own state in the activation dtype and has no hidden-boundary or imatrix tap:
-/// a flag that would silently do nothing is refused by name.
-pub fn refuseForDsv41(config: *const model_mod.ModelConfig, opts: Options) !void {
-    if (!config.isDsv41()) return;
-    if (opts.kv_quant_config.isQuant()) return error.Dsv41KvQuantUnsupported;
-    if (!opts.qwen_gdn_f32) return error.Dsv41HasNoQwenGdnState;
-    if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;
-    if (opts.imatrix_out.len > 0) return error.Dsv41ImatrixCaptureUnsupported;
-}
-
 pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Loaded {
     const self = try allocator.create(Loaded);
     errdefer allocator.destroy(self);
@@ -925,7 +917,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         .xfm = undefined,
     };
     errdefer self.config.deinit(allocator);
-    try refuseForDsv41(&self.config, opts);
+    try dsv_capture.refuse(&self.config, opts);
     if (server_mod.archFlagRefusal(&self.config, .{ .drop_expert = opts.drop_expert != 0 })) |why| {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
@@ -1593,6 +1585,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         opts.imatrix_out = path;
     };
     if (try @import("glm5/glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
+    if (try dsv_capture.tryRun(allocator, io, opts, &out)) return;
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.wired_margin_bytes > 0) server_mod.wired_limit_margin_bytes = opts.wired_margin_bytes;
@@ -2923,13 +2916,13 @@ test "pickToken scores the forced token and falls back to the argmax" {
 
 test "kld: deepseek_v41 refuses by name what its module-owned state cannot honor" {
     const dsv = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
-    try refuseForDsv41(&dsv, .{});
-    try testing.expectError(error.Dsv41KvQuantUnsupported, refuseForDsv41(&dsv, .{ .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) }));
-    try testing.expectError(error.Dsv41HasNoQwenGdnState, refuseForDsv41(&dsv, .{ .qwen_gdn_f32 = false }));
-    try testing.expectError(error.Dsv41HiddenCaptureUnsupported, refuseForDsv41(&dsv, .{ .hidden_out = "/x" }));
-    try testing.expectError(error.Dsv41ImatrixCaptureUnsupported, refuseForDsv41(&dsv, .{ .imatrix_out = "/x.safetensors" }));
+    try dsv_capture.refuse(&dsv, .{});
+    try testing.expectError(error.Dsv41KvQuantUnsupported, dsv_capture.refuse(&dsv, .{ .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) }));
+    try testing.expectError(error.Dsv41HasNoQwenGdnState, dsv_capture.refuse(&dsv, .{ .qwen_gdn_f32 = false }));
+    try testing.expectError(error.Dsv41HiddenCaptureUnsupported, dsv_capture.refuse(&dsv, .{ .hidden_out = "/x" }));
+    try testing.expectError(error.Dsv41ImatrixCaptureUnsupported, dsv_capture.refuse(&dsv, .{ .imatrix_out = "/x.safetensors" }));
     const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    try refuseForDsv41(&qwen, .{ .qwen_gdn_f32 = false, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) });
+    try dsv_capture.refuse(&qwen, .{ .qwen_gdn_f32 = false, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) });
 }
 
 test "kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)" {

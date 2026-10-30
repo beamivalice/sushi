@@ -3,14 +3,14 @@
 //! indexer's and the row stores' working set, the attention span arms, and the decode top-k. Run by `sushi-ubench`,
 //! never by a test.
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const io_util = @import("io_util.zig");
-const report = @import("ubench_report.zig");
-const cfg_mod = @import("dsv41/dsv41_config.zig");
-const sc_mod = @import("dsv41/dsv41_scope.zig");
-const qat_mod = @import("dsv41/dsv41_qat.zig");
-const kernels = @import("dsv41/dsv41_kernels.zig");
-const model = @import("dsv41/dsv41_model.zig");
+const mlx = @import("../mlx.zig");
+const io_util = @import("../io_util.zig");
+const report = @import("../ubench_report.zig");
+const cfg_mod = @import("dsv41_config.zig");
+const sc_mod = @import("dsv41_scope.zig");
+const qat_mod = @import("dsv41_qat.zig");
+const kernels = @import("dsv41_kernels.zig");
+const model = @import("dsv41_model.zig");
 
 pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand, hc_stages };
 

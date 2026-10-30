@@ -937,6 +937,14 @@ pub fn slidingDecodeMask(s: mlx.mlx_stream, kv_len: c_int, window: c_int) !mlx.m
 
 // ── Transformer ──
 
+/// The encoder's view of the projections a forward runs: `record(ctx, w, x)` before each `x @ w` that goes
+/// through `Transformer.qmatmul`, with `w` the loaded weight handle. Null outside the encoder.
+pub var linear_tap: ?LinearTap = null;
+pub const LinearTap = struct {
+    ctx: *anyopaque,
+    record: *const fn (ctx: *anyopaque, w: mlx.mlx_array, x: mlx.mlx_array) void,
+};
+
 pub const Transformer = struct {
     config: ModelConfig,
     cache: KVCache,
@@ -1770,6 +1778,7 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     pub inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+        if (linear_tap) |tap| tap.record(tap.ctx, w, x);
         // u8 codes + f32 tile scales = an FP8 source linear (`mimo_source`).
         if (mlx.mlx_array_dtype(w) == .uint8) return fp8_block.linearServing(self.s, x, w, sc);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the

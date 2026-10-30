@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 135 vars. By kind: tradeoff levers 14, diagnostics 49, microbenches 19, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 137 vars. By kind: tradeoff levers 14, diagnostics 51, microbenches 19, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (49)
+## Diagnostics (51)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -52,6 +52,8 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DSV41_COMPOSED` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` runs deepseek_v41 on the op chains instead of the fused kernels (the KLD A/B's teacher arm; the load logs `[dsv41] fused kernels on\|off`) | load | yes: dsv41-arch |
 | `SUSHI_DSV41_DSPARK_ROWS` | `dsv41_dspark.zig` | deepseek_v41 DSpark diagnostic: `sweep` cycles the verify width 1..8 per round, `<n>` forces it, `log` keeps the policy; each round logs `[dspark-round]` (ctx, rows, draft and verify ms, confidence logits) | request | yes: dsv41-arch |
 | `SUSHI_DSV41_VERIFY_PROFILE` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` times every stage of decode-width chunks (a verify) as `[dsv41-prof]` lines, each stage evaluated before the next (the absolute ms inflate about 2x) | load | yes: dsv41-arch |
+| `SUSHI_DSV41_CAPTURE_LEAN` | `kld_capture.zig` | `1` (only with `SUSHI_DSV41_HEAD_ROWS`) the layer-major capture writes only tokens, windows, fixture, layout and the head rows | once | yes: quality-kld |
+| `SUSHI_DSV41_HEAD_ROWS` | `kld_capture.zig` | `1` the layer-major capture also writes `calib/head-in.bf16`, the head's input for every row | once | yes: quality-kld |
 | `SUSHI_DFLASH_TRACE` | `generate.zig:4016` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `transformer.zig:5999` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_DUMP_RESTORE` | `restore_dump.zig:31` | `<dir>` dumps prefix-restore tensors | once | no |
@@ -121,7 +123,7 @@ A path, a credential or an output location.
 |---|---|---|---|---|
 | `HF_TOKEN`, `HF_TOKEN_PATH`, `HF_HOME` | `cli.zig` `HfEnv` | Bearer token for `sushi pull` and `sushi list`: `HF_TOKEN`, else the file `HF_TOKEN_PATH`, else `$HF_HOME/token`, else `~/.cache/huggingface/token` (the standard Hugging Face names); curl reads it from a 0600 temp header file, never argv | per call | yes: usage |
 | `SUSHI_HIDDEN_OUT`, `SUSHI_HIDDEN_SPOOL_BYTES`, `SUSHI_HIDDEN_SPOOL_FIRST` | `hidden_capture.zig` | `<abs dir>` enables hidden-state block-boundary capture; spool budget and first window index of its spool mode | boot | yes: engine-expert-streaming, glm5-arch, quality-kld |
-| `SUSHI_IMATRIX_OUT` | `imatrix.zig:34` | `<abs>.safetensors` enables expert-imatrix capture | boot | yes: engine-expert-streaming, quality-kld |
+| `SUSHI_IMATRIX_OUT` | `imatrix.zig:34` | `<abs>.safetensors` enables expert-imatrix capture (also the file a DeepSeek-V4.1 layer-major capture writes it to) | boot | yes: engine-expert-streaming, quality-kld |
 | `SUSHI_NGRAM_BF16_DIR` | `model.zig:1086` | serves a Flash-Next pack with the original bf16 n-gram table (KLD isolation) | load | yes: engine-expert-streaming, quality-kld, qwen4-arch |
 
 ## Flag twins that are not equivalents (2)

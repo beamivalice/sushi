@@ -255,7 +255,7 @@ const stamp_script =
 /// `ubench_report.zig` is the harness's host tier and keeps its tests.
 fn guardBenchFiles(b: *std.Build) void {
     const io = b.graph.io;
-    const files = [_][]const u8{ "src/ubench_qwen4.zig", "src/ubench_mimo2.zig", "src/ubench_glm5.zig", "src/ubench_dsv41.zig", "src/ubench_shared.zig", "src/exl3/ubench.zig", "src/encoder/ubench.zig" };
+    const files = [_][]const u8{ "src/ubench_qwen4.zig", "src/ubench_mimo2.zig", "src/ubench_glm5.zig", "src/dsv41/ubench.zig", "src/ubench_shared.zig", "src/exl3/ubench.zig", "src/encoder/ubench.zig" };
     for (files) |path| {
         const source = buildRootHandle(b).readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch continue;
         var lines = std.mem.splitScalar(u8, source, '\n');

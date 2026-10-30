@@ -38,6 +38,26 @@ pub const Stream = struct {
     act: mlx.mlx_dtype,
     /// The slabs of the layer in flight, between `lease` and `release`.
     held: ?stream.Prepared = null,
+    /// Every expert of one layer, resident until `unpin`: its leases read no SSD.
+    pinned: ?Pinned = null,
+    pinned_leases: u64 = 0,
+
+    const Pinned = struct { layer: usize, prepared: stream.Prepared };
+
+    /// Reads all of `layer`'s experts once; a layer-major batch runs every window against them.
+    pub fn pin(self: *Stream, layer: usize) !void {
+        self.unpin();
+        const gpa = self.engine.allocator;
+        const all = try gpa.alloc(u16, self.cfg.experts);
+        defer gpa.free(all);
+        for (all, 0..) |*id, i| id.* = @intCast(i);
+        self.pinned = .{ .layer = layer, .prepared = try self.engine.prepareHost(@intCast(layer), all) };
+    }
+
+    pub fn unpin(self: *Stream) void {
+        if (self.pinned) |*p| p.prepared.deinit();
+        self.pinned = null;
+    }
 
     pub fn hook(self: *Stream) model.Experts.Hook {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque };
@@ -71,15 +91,20 @@ pub const Stream = struct {
             if (id < 0 or id >= self.cfg.experts) return error.ExpertOutOfRange;
             h.* = @intCast(id);
         }
-        var fresh = try self.engine.prepareHost(@intCast(layer), host);
-        errdefer {
+        const pin_hit = if (self.pinned) |*p| p.layer == layer else false;
+        var fresh: ?stream.Prepared = if (pin_hit) null else try self.engine.prepareHost(@intCast(layer), host);
+        errdefer if (fresh) |*p| {
             _ = mlx.mlx_synchronize(sc.s);
-            fresh.deinit();
-        }
-        const prepared: *const stream.Prepared = &fresh;
+            p.deinit();
+        };
+        const prepared: *const stream.Prepared = if (fresh) |*p| p else &self.pinned.?.prepared;
         const slots = try gpa.alloc(i32, host.len);
         defer gpa.free(slots);
-        for (slots, prepared.remapped) |*s, r| s.* = r;
+        if (pin_hit) {
+            // `remapped` of a pinned layer is indexed by expert id.
+            for (slots, host) |*s, id| s.* = prepared.remapped[id];
+            self.pinned_leases += 1;
+        } else for (slots, prepared.remapped) |*s, r| s.* = r;
         const local = try sc.ints(slots, mlx.getShape(idx));
         const C = stream.quant.Component;
         const bank = struct {
