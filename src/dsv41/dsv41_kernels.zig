@@ -2012,8 +2012,10 @@ var hc_norm_def = Def{ .name = "dsv41_hc_norm", .ins = &.{ "z", "x", "cpre", "w"
 
 /// Threads a hyper-connection threadgroup runs; `probeHc` halves it where the GPU caps register-heavy kernels lower.
 pub var hc_tg: usize = 1024;
-const hc_mix_rows = 4;
-const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
+/// The row x mix tile a `hcMix` threadgroup takes. Every tile gives the same bytes (each dot keeps its order); the
+/// tile only moves the time, and `hc_mix_tile` is its test seam.
+pub const HcMixTile = struct { rows: usize, cols: usize };
+pub var hc_mix_tile: HcMixTile = .{ .rows = 2, .cols = 12 };
 
 pub const HcWeights = struct { fn_w: A, scale: A, base: A };
 pub const HcSplit = struct { pre: A, post: A, comb: A };
@@ -2072,15 +2074,18 @@ pub fn hcSplitZ(sc: *Scope, z: A, hc: usize, iters: usize, eps: A) !HcSplit {
 
 /// The mixes `z` `[L, mix]` of the stream `x` `[L, hc, D]`, a tile of rows and mixes a threadgroup (wide blocks).
 pub fn hcMix(sc: *Scope, x: A, hw: HcWeights, eps: A) !A {
+    return hcMixTiled(sc, x, hw, eps, hc_mix_tile);
+}
+
+pub fn hcMixTiled(sc: *Scope, x: A, hw: HcWeights, eps: A, tile: HcMixTile) !A {
     const L = dim(x, 0);
     const hc = dim(x, 1);
     const mix = dim(hw.fn_w, 0);
-    const cols = for (hc_mix_cols) |c| {
-        if (mix % c == 0) break c;
-    } else unreachable;
+    const cols = if (mix % tile.cols == 0) tile.cols else 1;
+    std.debug.assert(tile.rows * cols <= hc_tg);
     var o: [1]A = undefined;
-    try launch(sc, &hc_mix_def, &.{ x, hw.fn_w, hw.scale, hw.base, eps }, &.{.{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 }}, .{ mix / cols * hc_tg, (L + hc_mix_rows - 1) / hc_mix_rows, 1 }, .{ hc_tg, 1, 1 }, &.{
-        .{ .name = "TG", .v = ci(hc_tg) }, .{ .name = "R", .v = hc_mix_rows }, .{ .name = "M", .v = ci(cols) }, .{ .name = "HC", .v = ci(hc) },
+    try launch(sc, &hc_mix_def, &.{ x, hw.fn_w, hw.scale, hw.base, eps }, &.{.{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 }}, .{ mix / cols * hc_tg, (L + tile.rows - 1) / tile.rows, 1 }, .{ hc_tg, 1, 1 }, &.{
+        .{ .name = "TG", .v = ci(hc_tg) }, .{ .name = "R", .v = ci(tile.rows) }, .{ .name = "M", .v = ci(cols) }, .{ .name = "HC", .v = ci(hc) },
     }, &.{}, &o);
     return o[0];
 }
@@ -3287,6 +3292,18 @@ test "dsv41 hc wide: the mix and norm kernels give the decode stage's mixes, spl
         try expectBitEqual("hc norm post", try sc_mod.hostF32(wide.sp.post), try sc_mod.hostF32(sp.post));
         try expectBitEqual("hc norm comb", try sc_mod.hostF32(wide.sp.comb), try sc_mod.hostF32(sp.comb));
     }
+}
+
+test "dsv41 hc wide: the release mix tile gives the previous tile's mixes at the release shapes, bit for bit" {
+    try mlx.requireGpu();
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 3, 17, 512, 2048 }) |L| {
+        var sc = Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const d = try hcData(&sc, L, dt);
+        const want = try hcMixTiled(&sc, d.x, d.hw, d.eps, .{ .rows = 4, .cols = 6 });
+        const got = try hcMix(&sc, d.x, d.hw, d.eps);
+        try expectBitEqual("hc mix tile", try sc_mod.hostF32(got), try sc_mod.hostF32(want));
+    };
 }
 
 test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {

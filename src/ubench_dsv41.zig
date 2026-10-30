@@ -12,7 +12,7 @@ const qat_mod = @import("dsv41/dsv41_qat.zig");
 const kernels = @import("dsv41/dsv41_kernels.zig");
 const model = @import("dsv41/dsv41_model.zig");
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand, hc_stages };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -704,6 +704,93 @@ fn runHcExpand(run: *report.Run) anyerror!void {
             var s: HcExpandSample = .{ .gpu = gpu, .d = d, .ffn = std.mem.eql(u8, stage, "ffn") };
             const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ stage, L });
             try run.interleave(label, &s, sampleHcExpand);
+        }
+    }
+}
+
+// ── dsv41.hc_stages ─────────────────────────────────────────────────────
+
+pub const hc_stages: report.Bench = .{
+    .name = "dsv41.hc_stages",
+    .scope = .dsv41,
+    .what = "the wide chunk's hyper-connection dispatches one by one (hc 4 x 5120, bf16 stream): mix, norm, split, expand, the attention stage (mix + norm) and the FFN stage (expand + mix + norm), against a copy of the stream; the arms are the mix kernel's row x mix tile",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{
+        .{ .name = "rows", .values = &.{ "512", "2048" } },
+        .{ .name = "stage", .values = &.{ "copy", "mix", "norm", "split", "expand", "attn", "ffn" }, .numeric = false },
+    },
+    .arms = &.{ "r4m6", "r2m12" },
+    .ref = "r4m6",
+    .run = runHcStages,
+};
+
+const hc_stage_names = [_][]const u8{ "copy", "mix", "norm", "split", "expand", "attn", "ffn" };
+const hc_tiles = [_]kernels.HcMixTile{ .{ .rows = 4, .cols = 6 }, .{ .rows = 2, .cols = 12 } };
+const hc_reps = 8;
+
+const HcStagesSample = struct { gpu: mlx.mlx_stream, d: HcExpandData, z: A, stage: []const u8 };
+
+fn sampleHcStages(s: *HcStagesSample, arm: usize) anyerror!f64 {
+    const d = s.d;
+    const tile = hc_tiles[arm];
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    var ev: [hc_reps]A = undefined;
+    var sw = io_util.Stopwatch.init(io());
+    for (&ev) |*e| {
+        if (std.mem.eql(u8, s.stage, "copy")) {
+            e.* = try sc.add(d.x, try sc.astype(try sc.f(1.0), .bfloat16));
+        } else if (std.mem.eql(u8, s.stage, "mix")) {
+            e.* = try kernels.hcMixTiled(&sc, d.x, d.hw, d.eps, tile);
+        } else if (std.mem.eql(u8, s.stage, "norm")) {
+            e.* = (try kernels.hcNorm(&sc, s.z, d.x, d.cpre, d.w, 20, d.eps)).h;
+        } else if (std.mem.eql(u8, s.stage, "split")) {
+            e.* = (try kernels.hcSplitZ(&sc, s.z, 4, 20, d.eps)).comb;
+        } else if (std.mem.eql(u8, s.stage, "expand")) {
+            e.* = try kernels.hcExpandFused(&sc, d.x, d.y, d.post, d.comb);
+        } else {
+            const x1 = if (std.mem.eql(u8, s.stage, "ffn")) try kernels.hcExpandFused(&sc, d.x, d.y, d.post, d.comb) else d.x;
+            e.* = (try kernels.hcNorm(&sc, try kernels.hcMixTiled(&sc, x1, d.hw, d.eps, tile), x1, d.cpre, d.w, 20, d.eps)).h;
+        }
+    }
+    try evalAll(&ev);
+    return @as(f64, @floatFromInt(sw.read())) / hc_reps;
+}
+
+fn runHcStages(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const D = 5120;
+    const mix = 24;
+    try kernels.probeHc(alloc, gpu, 4, D, 20);
+    var rows_buf: [8]usize = undefined;
+    for (try axisInts(run, "rows", &rows_buf)) |L| {
+        var sc = Scope.init(alloc, gpu);
+        defer sc.deinit();
+        const l: c_int = ci(L);
+        const f32t = mlx.mlx_dtype.float32;
+        const d: HcExpandData = .{
+            .x = try sc.astype(try kernels.randn(&sc, &.{ l, 4, D }, f32t, 201, 1.5), .bfloat16),
+            .y = try sc.astype(try kernels.randn(&sc, &.{ l, D }, f32t, 202, 1.0), .bfloat16),
+            .post = try kernels.randn(&sc, &.{ l, 4 }, f32t, 203, 0.7),
+            .comb = try kernels.randn(&sc, &.{ l, 4, 4 }, f32t, 204, 0.5),
+            .cpre = try sc.op1(mlx.mlx_abs, try kernels.randn(&sc, &.{ l, 4 }, f32t, 205, 0.6)),
+            .w = try sc.astype(try sc.add(try kernels.randn(&sc, &.{D}, f32t, 206, 0.2), try sc.f(1.0)), .bfloat16),
+            .hw = .{ .fn_w = try kernels.randn(&sc, &.{ mix, 4 * D }, f32t, 207, 0.02), .scale = try sc.floats(&.{ 0.3, 0.5, 0.7 }, &.{3}), .base = try kernels.randn(&sc, &.{mix}, f32t, 208, 0.5) },
+            .eps = try kernels.hcEps(&sc, 1e-6, 1e-6),
+        };
+        const z = try kernels.hcMixTiled(&sc, d.x, d.hw, d.eps, hc_tiles[0]);
+        try evalAll(&.{ d.x, d.y, d.post, d.comb, d.cpre, d.w, d.hw.fn_w, d.hw.scale, d.hw.base, d.eps, z });
+        const zbytes = std.mem.sliceAsBytes(try sc_mod.hostF32(z));
+        for (hc_tiles[1..]) |tile| {
+            const got = try sc_mod.hostF32(try kernels.hcMixTiled(&sc, d.x, d.hw, d.eps, tile));
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(got), zbytes)) run.invalid("a mix tile's bytes differ from the first arm's");
+        }
+        for (hc_stage_names) |stage| {
+            if (!listed(run.axis("stage"), stage)) continue;
+            var s: HcStagesSample = .{ .gpu = gpu, .d = d, .z = z, .stage = stage };
+            const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ stage, L });
+            try run.interleave(label, &s, sampleHcStages);
         }
     }
 }

@@ -5350,6 +5350,40 @@ test "dsv41 attention epilogue: a prefill on the kernel's store gives the op cha
     }
 }
 
+test "dsv41 hc mix tile: a prefill on the release tile gives the previous tile's logits and state, byte for byte (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const release = kernels.hc_mix_tile;
+    defer kernels.hc_mix_tile = release;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |act| {
+        const m = try tinyModel(dir, .{ .act = act, .qat = false }, s);
+        defer m.deinit();
+        try testing.expect(m.fused and m.cfg.dim % 32 == 0 and m.cfg.hc_mult == 4);
+        var runs: [2]Run = .{ .{}, .{} };
+        defer for (&runs) |*r| r.deinit();
+        for ([_]kernels.HcMixTile{ .{ .rows = 4, .cols = 6 }, release }, &runs) |tile, *r| {
+            kernels.hc_mix_tile = tile;
+            resetState(m);
+            // wider than a verify block, so every chunk takes the wide stage
+            try r.take(&sc, try extendSpan(m, ids[0..20], .all, 16));
+            try r.take(&sc, try extendSpan(m, ids[20..TINY_S], .all, 16));
+            r.slots = try testing.allocator.alloc(Slot, slotCount(m));
+            @memset(r.slots, nil_slot);
+            try captureState(m, r.slots);
+        }
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(runs[0].rows.items), std.mem.sliceAsBytes(runs[1].rows.items));
+        try expectSlotsBits(&sc, runs[0].slots, runs[1].slots);
+    }
+}
+
 const StreamCase = struct { L: usize, nb: usize, r: usize, tile: usize, distinct: usize, masked: bool = false };
 
 /// Index keys at the release's width with only `distinct` different rows, so scores tie across tiles.

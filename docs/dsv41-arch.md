@@ -133,6 +133,18 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   max): the 2048 chunk ending at 30,720 ran `hc_ffn` 132.7 + 10.4 (encoder + decoder) to 50.1 + 6.6 ms and `expand` 95.2 + 8.6
   to 12.4 + 4.2, total 2,000.6 to 1,854.2 ms; the 32,768-token prefill 1,015.6 to 1,107.7 tok/s. What is left of the stage
   (mix and norm, 1.6 ms of the 2.2 per layer) keeps its reduction order, so it is not fused further.
+  The wide mix (`dsv41_hc_mix`, 1.5 of that stage's 1.7 ms at 2048 rows, the rest norm 0.2 and split 0.1) took the
+  largest share of the stage, and its tile, not a fold, was the lever: every (row, mix) dot keeps its order whatever tile
+  runs it, so the tile (`hc_mix_tile`) moves only time. Quiet and contended ubench rungs of `dsv41.hc_stages` at 2048
+  rows: 4 rows x 6 mixes 1.5 ms, 2 x 12 1.0, 2 x 24 1.2, 3 x 12 1.2, 1 x 12 1.6, 4 x 12 1.4, 8 x 6 2.0, 16 x 3 3.6; with
+  the dot loop skipped 0.1 ms, with the reduction skipped 1.1, so the loop is the cost. A kernel that also took the
+  stage's norm (the first mix tile of a row also collapses `h`, the stream read once) gave the pair's bytes but ran 3x
+  slower (register pressure at 1024 threads), and the norm is only 0.2 ms, so it was dropped.
+  Landed as 2 x 12 (`dsv41.hc_stages`, quiet, AC, `taskpolicy -a`, 9 rounds, e7a7571c plus this change, bytes of every
+  tile checked equal): mix 1.5 to 1.0 ms and the attention stage 1.7 to 1.2 at 2048 rows, the FFN stage 2.0 to 1.9, 512
+  rows within 5%. End to end, resident 32K stage profile (`--drop-expert 128 --ssd-budget-gb 94`, one boot each, A e7a7571c, B
+  this change, GPU lock, QUIET, fans max): the 2048 chunk ending at 28,672 ran `hc_attn` 40.1 to 31.7 ms and `hc_ffn` 50.8
+  to 42.3, total 1,342.4 to 1,327.3 ms; the 32,768-token prefill 1,458.0 to 1,486.2 tok/s.
 
 ### QAT round trips
 
