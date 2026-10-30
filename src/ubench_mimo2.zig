@@ -14,6 +14,8 @@ const model_mod = @import("model.zig");
 const mimo_source = @import("mimo2/mimo_source.zig");
 const mimo_vision = @import("mimo2/mimo_vision.zig");
 
+pub const benches = [_]report.Bench{ global_decode_attn, prefill_attn, fp8_gemv, vision_encode };
+
 const RowSplit = fp8_block.RowSplit;
 
 fn nowNs(io: std.Io) i96 {

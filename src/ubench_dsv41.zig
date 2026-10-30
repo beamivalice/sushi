@@ -12,6 +12,8 @@ const qat_mod = @import("dsv41/dsv41_qat.zig");
 const kernels = @import("dsv41/dsv41_kernels.zig");
 const model = @import("dsv41/dsv41_model.zig");
 
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand };
+
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
 const none = sc_mod.none;
