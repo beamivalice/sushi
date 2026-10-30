@@ -108,6 +108,7 @@ pub fn parseGlm5Fields(c: *ModelConfig, obj: std.json.ObjectMap) !void {
     c.rms_norm_eps = try glmF32(obj, "rms_norm_eps");
     c.has_vision = false;
     c.model_type = "glm5_next";
+    c.turn_opener = "<|assistant|>";
     c.weight_prefix = "model.language_model";
     c.norm_has_offset = false;
     c.scale_embeddings = false;
@@ -238,6 +239,21 @@ test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assum
     try testing.expectEqual(@as(u64, 11 * 3 * 128 * 2 * 2), c.qsaRingBytes());
     try testing.expectApproxEqAbs(@as(f32, -5), c.kda_gate_lower_bound, 1e-6);
     try testing.expect(c.moe_sigmoid_router and c.moe_route_norm and !c.norm_has_offset);
+}
+
+test "GLM stops at the assistant opener the pack emits after its answer" {
+    var c = try parseConfigFromJson(testing.allocator, @embedFile("../fixtures/glm5_config.json"));
+    const user: u32 = 154827;
+    const assistant: u32 = 154828;
+    c.mergeEosTokens(&.{ 154820, user, 154829 });
+    try testing.expectEqualStrings("<|assistant|>", c.turn_opener);
+    try testing.expect(!c.isEosToken(assistant));
+    c.stopAtTurnOpener(null);
+    try testing.expect(!c.isEosToken(assistant));
+    c.stopAtTurnOpener(assistant);
+    c.stopAtTurnOpener(assistant);
+    try testing.expect(c.isEosToken(assistant) and c.isEosToken(user) and c.isEosToken(154829) and c.isEosToken(154820));
+    try testing.expectEqual(@as(usize, 4), c.eosTokenSlice().len);
 }
 
 test "GLM config refuses unsupported semantics and invalid geometry" {

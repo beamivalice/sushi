@@ -1662,6 +1662,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
+    params.config.mergeTokenizerStops(params.tok);
     sampler.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
     generate_mod.installThinkMarkers(xfm_ptr, params.tok);
     try generate_mod.installLogitBias(sch.io, xfm_ptr, params.tok);

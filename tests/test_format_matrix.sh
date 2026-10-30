@@ -277,10 +277,11 @@ fi
 #      CONTENT deltas (pins the answer-misfiled-as-reasoning stream bug) ──
 T4=""
 [ "$THINKS" = 1 ] && T4=",$THINK"
-R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":3000,\"temperature\":0,\"tools\":[$BASH_TOOL]$T4}")
+R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":3000,\"temperature\":0,\"tools\":[$BASH_TOOL]$T4,\"stream_options\":{\"include_usage\":true}}")
 chk "4. stream+tools: answer (391) in CONTENT deltas" "'391' in r['content'] or r['finish']=='length'"
 chk_clean "4. stream+tools: no control-tag leak" content
-[ "$THINKS" != 1 ] || chk "4. stream+tools: reasoning still separated" "r['reasoning']"
+# A model may close its thought empty (billed 0 reasoning tokens): then there is nothing to separate.
+[ "$THINKS" != 1 ] || chk "4. stream+tools: reasoning still separated" "r['reasoning'] or r['usage'].get('completion_tokens_details',{}).get('reasoning_tokens',0)==0"
 
 # ── 5. Tool-call fidelity, non-stream (pins the brace-swallow bug live) ──
 R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$WRITE_PROMPT],\"max_tokens\":2000,\"temperature\":0,\"reasoning_effort\":\"low\",\"tools\":[$WRITE_TOOL]}")
@@ -444,9 +445,15 @@ chk "19. tool result of multi-line code: the round trip is well-formed (finish, 
 CC_TOOLS='[{"name":"get_weather","description":"Get current weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]'
 CC_THINK='"thinking":{"type":"enabled","budget_tokens":8000}'
 if [ "$THINKS" = 1 ]; then
-    R=$(ask messages 1 "{\"model\":\"m\",\"max_tokens\":4000,\"temperature\":0,$CC_THINK,\"tools\":$CC_TOOLS,\"messages\":[$(user 'What is 17+25? Answer with just the number. Do not use any tools.')]}")
+    BODY20="{\"model\":\"m\",\"max_tokens\":4000,\"temperature\":0,$CC_THINK,\"tools\":$CC_TOOLS,\"messages\":[$(user 'What is 17+25? Answer with just the number. Do not use any tools.')]}"
+    R=$(ask messages 1 "$BODY20")
+    # A model may close its thought empty: the stream then has no thinking block, and the non-stream turn has no thought either.
+    R=$(python3 -I -c 'import json, sys
+s = json.loads(sys.argv[1])
+s["plain_thinking"] = json.loads(sys.argv[2]).get("thinking", "")
+print(json.dumps(s))' "$R" "$(ask messages 0 "$BODY20")")
     chk "20. thinking+tools stream, plain answer: protocol-valid block lifecycle, no think-tag leak" "r['err'] is None"
-    chk "20. thinking+tools stream, plain answer: thinking arrives as thinking block(s)" "r['n_thinking']>=1"
+    chk "20. thinking+tools stream, plain answer: thinking arrives as thinking block(s)" "r['n_thinking']>=1 or not r['plain_thinking']"
     chk "20. thinking+tools stream, plain answer: the visible answer arrives as text block(s)" "r['n_text']>=1 or r['finish']=='max_tokens'"
 
     R=$(ask messages 1 "{\"model\":\"m\",\"max_tokens\":4000,\"temperature\":0,$CC_THINK,\"tools\":$CC_TOOLS,\"messages\":[$(user 'What is the weather in Paris right now? Use the get_weather tool.')]}")

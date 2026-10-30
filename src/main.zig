@@ -1450,6 +1450,7 @@ pub fn main(init: std.process.Init) !void {
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.
+        config.mergeTokenizerStops(tok);
         sampler.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
         generate_mod.installThinkMarkers(&xfm, tok);
         try generate_mod.installLogitBias(io, &xfm, tok);

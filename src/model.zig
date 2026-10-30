@@ -331,6 +331,8 @@ pub const ModelConfig = struct {
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = @splat(0),
     num_eos_tokens: u32 = 0,
+    /// The special token that opens an assistant turn, for a checkpoint that can start a second turn after its answer; empty = none.
+    turn_opener: []const u8 = "",
 
     // Model-author sampling recommendations from generation_config.json
     // (e.g. temp 1.0 / top_p 0.95 / top_k 20).
@@ -964,6 +966,16 @@ pub const ModelConfig = struct {
 
     pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
         for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
+    }
+
+    /// Resolves the stops a checkpoint's config files do not list, once the tokenizer is loaded.
+    pub fn mergeTokenizerStops(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
+        if (self.turn_opener.len > 0) self.stopAtTurnOpener(tok.specialTokenId(self.turn_opener));
+    }
+
+    /// A reply never holds a second assistant turn, so its opener ends the reply like an eos id.
+    pub fn stopAtTurnOpener(self: *ModelConfig, id: ?u32) void {
+        if (id) |i| self.mergeEosTokens(&.{i});
     }
 
     pub fn addEosToken(self: *ModelConfig, id: u32) void {
