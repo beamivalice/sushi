@@ -490,6 +490,119 @@ test "exl3 linear: the multi-row kernel gives a row the same bytes at widths 2 t
     }
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 8 at Flash-Next's trunk shapes, stacked, on the machine's own arm and on SIMD" {
+    try mlx.requireGpu();
+    // The arm follows the hardware, never the row count.
+    project_rows.rows_exact = true;
+    defer project_rows.rows_exact = false;
+    for (1..9) |rows| try std.testing.expectEqual(kernels.gemmNaxOn(), project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1).nax);
+    try exactRowsCase();
+    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
+    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    for (1..9) |rows| try std.testing.expect(!project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1).nax);
+    try exactRowsCase();
+}
+
+/// Rows 1 to 8 of an exact call equal the same row alone, on one bank, and on three linears stacked into one launch.
+fn exactRowsCase() !void {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0xe4ac7);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    // The 12288-wide output, a deep input and a narrow one each split k differently.
+    const shapes = [_][3]usize{ .{ 2560, 12288, 48 }, .{ 2560, 12288, 96 }, .{ 2560, 10240, 64 }, .{ 2560, 6144, 64 }, .{ 6144, 2560, 48 }, .{ 2560, 640, 32 }, .{ 256, 131072, 32 } };
+    for (shapes) |sh| {
+        var h = try Host.init(alloc, rnd, 1, sh[0], sh[1], @intCast(sh[2]));
+        defer h.deinit();
+        const xb = try alloc.alloc(u16, 8 * sh[0]);
+        for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
+        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(sh[0]) }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(x);
+        var solo: [8][]const f32 = undefined;
+        var solo_arrays: [8]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (solo_arrays[0..made]) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (0..8) |r| {
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            try mlx.check(mlx.mlx_slice(&row, x, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), @intCast(sh[0]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const y = try linear(s, row, h.p, dec);
+            solo_arrays[made] = mlx.mlx_array_new();
+            made += 1;
+            solo[r] = try hostF32(s, y, &solo_arrays[made - 1]);
+            _ = mlx.mlx_array_free(y);
+        }
+        for (2..9) |width| {
+            var part = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(part);
+            try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(sh[0]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const y = try linear(s, part, h.p, dec);
+            defer _ = mlx.mlx_array_free(y);
+            var cy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cy);
+            const got = try hostF32(s, y, &cy);
+            for (0..width) |r| try t.expectEqualSlices(u8, std.mem.sliceAsBytes(solo[r]), std.mem.sliceAsBytes(got[r * sh[1] ..][0..sh[1]]));
+        }
+    }
+
+    // Stacked: three linears that share an input, each row of the one launch the row alone in the same launch.
+    const in: usize = 2560;
+    const widths = [3]usize{ 1280, 512, 512 };
+    var h = try Host.init(alloc, rnd, 1, in, widths[0] + widths[1] + widths[2], 48);
+    defer h.deinit();
+    var tiled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tiled);
+    try mlx.check(mlx.mlx_tile(&tiled, h.p.suh, &[_]c_int{ 3, 1 }, 2, s));
+    const stacked = Shared{ .p = .{ .trellis = h.p.trellis, .suh = tiled, .svh = h.p.svh }, .cols = .{ 0, 1280, 1792, 2304, 0 }, .count = 3 };
+    const xb = try alloc.alloc(u16, 8 * in);
+    for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
+    const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(in) }, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    var want: [3][8][]const f32 = undefined;
+    var want_arrays: [24]mlx.mlx_array = undefined;
+    var wm: usize = 0;
+    defer for (want_arrays[0..wm]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (0..8) |r| {
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_slice(&row, x, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), @intCast(in) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var outs: [3]mlx.mlx_array = undefined;
+        try linearShared(s, row, stacked, dec, &outs);
+        for (outs, 0..) |o, i| {
+            want_arrays[wm] = mlx.mlx_array_new();
+            wm += 1;
+            want[i][r] = try hostF32(s, o, &want_arrays[wm - 1]);
+            _ = mlx.mlx_array_free(o);
+        }
+    }
+    for (2..9) |width| {
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(in) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var outs: [3]mlx.mlx_array = undefined;
+        try linearShared(s, part, stacked, dec, &outs);
+        for (outs, 0..) |o, i| {
+            defer _ = mlx.mlx_array_free(o);
+            var co = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(co);
+            const got = try hostF32(s, o, &co);
+            for (0..width) |r| try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want[i][r]), std.mem.sliceAsBytes(got[r * widths[i] ..][0..widths[i]]));
+        }
+    }
+}
+
 test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at DeepSeek's trunk shapes, and the lm_head keeps its serial launch's" {
     const t = std.testing;
     const s = mlx.gpuStream();

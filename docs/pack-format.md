@@ -163,6 +163,31 @@ does not convert keeps the release's own name and format (FP8 + scale, or dense)
   a stage group set that does not cover the stage's experts), `UnsupportedDsv41Config` (a fractional clamp, a quant
   block naming a non-STQ codebook), `ExpertLayoutUnsupported` (an index without every routed group).
 
+<a id="qwen4-stq"></a>
+### Flash-Next trellis trunk (`qwen4_exp`)
+
+A `qwen4_exp` pack may store dense trunk projections as trellis banks, the DeepSeek-V4.1 contract above, beside affine ones.
+A pack without `trunk_quant` is read exactly as before.
+- `trunk_quant`: an STQ block (a tabled codebook; EXL3 codebooks are `InvalidQwen4ConfigField`). Its table must hold a row
+  for every bank's rate (`Exl3CodebookTableRateMissing`: STD1 stops at K4); `k` is the widest bank, the head included.
+- A projection `<base>` stored as `<base>.trellis` U16 `[in/16, out/16, n]`, `<base>.suh` F16 `[in]`, `<base>.svh` F16
+  `[out]` replaces `<base>.weight`, `.scales` and `.biases`, which the index must not list beside it. Each bank's rate is its
+  own `n`; both sides on the 128 grid. The choice is per tensor:
+
+| `<base>` under `language_model.model.layers.{L}` | trellis? |
+|---|---|
+| `self_attn.{q,k,v,o}_proj`, `self_attn.indexer.index_qk_proj` | yes |
+| `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` | yes |
+| `mlp.shared_expert.{gate,up,down}_proj`, a dense layer's `mlp.{gate,up,down}_proj` | yes |
+| `language_model.lm_head`; the MTP head's layer as `language_model.mtp.layers.0.<same bases>` | yes |
+| `linear_attn.in_proj_{a,b}` (48 rows), hyper-connection `input_mix_weight_*` and `block_inject_weight`, `mlp.gate`, `mlp.shared_expert_gate`, PLE `key_proj`/`value_proj`, `mtp.fc_*`, `embed_tokens`, norms | no, stays as stored |
+
+- A bank without `trunk_quant` is `TrunkQuantMissing`; a bank that is not U16 with F16 scales, is off the 128 grid, has a
+  scale missing or a rate no tile carries is `TrunkStqLayout`. Shard stamps of a trunk shard are not checked.
+- The decode widths (up to eight rows) stack the projections that share an input into one launch (q/k/v, GDN qkv/z, shared
+  expert gate/up, dense gate/up) when all are trellis banks of one input width and one rate: give those the same rate.
+- The bill is the stored bytes; a trellis head keeps no coarse rerank copy ([engine-memory-admission](engine-memory-admission.md)).
+
 ### Stored-affine trunk linears (`mimo_v2`)
 
 A MiMo pack may STORE `o_proj` (every layer's `model.layers.{L}.self_attn.o_proj`),

@@ -2,6 +2,7 @@ const trf = @import("transformer.zig");
 const std = @import("std");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const trunk_stq = @import("trunk_stq.zig");
 const expert_exl3 = sushi_exl3.format;
 const mlx = @import("mlx.zig");
 const test_support = @import("test_support.zig");
@@ -63,6 +64,8 @@ pub const FullAttnWeights = struct {
     // [n_heads]). One extra column in the softmax DENOMINATOR, letting a head
     // attend to "nothing". Null-ctx on every other arch.
     sinks: mlx.mlx_array = .{ .ctx = null },
+    /// q, k and v as one trellis bank, for the decode widths; `q_w`.. are then views of it.
+    qkv_stack: ?trunk_stq.Shared = null,
 };
 
 /// qwen4_exp gated residual ("hyper connection"). `norm_w` is the grouped
@@ -121,6 +124,8 @@ pub const LinearAttnWeights = struct {
     out_w: mlx.mlx_array,
     out_s: mlx.mlx_array,
     out_b: mlx.mlx_array,
+    /// qkv and z as one trellis bank, for the decode widths; `qkv_w` and `z_w` are then views of it.
+    qkvz_stack: ?trunk_stq.Shared = null,
 };
 
 pub const DenseMlpWeights = struct {
@@ -133,6 +138,8 @@ pub const DenseMlpWeights = struct {
     down_w: mlx.mlx_array,
     down_s: mlx.mlx_array,
     down_b: mlx.mlx_array,
+    /// gate and up as one trellis bank, for the decode widths; `gate_w` and `up_w` are then views of it.
+    gate_up_stack: ?trunk_stq.Shared = null,
 };
 
 pub const MoeMlpWeights = struct {
@@ -161,6 +168,8 @@ pub const MoeMlpWeights = struct {
     shared_down_b: mlx.mlx_array,
     // The dense shared-expert gate as one contiguous [hidden] vector (null ctx otherwise), for the router kernel's dot.
     shared_gate_vec: mlx.mlx_array = .{ .ctx = null },
+    /// The shared expert's gate and up as one trellis bank, for the decode widths; `shared_gate_w` and `shared_up_w` are then views of it.
+    shared_gate_up_stack: ?trunk_stq.Shared = null,
     // Shared expert gating (qwen4_exp; null for MiMo)
     shared_expert_gate_w: ?mlx.mlx_array = null,
     shared_expert_gate_s: ?mlx.mlx_array = null,
@@ -402,6 +411,7 @@ pub fn appendStructArrays(vec: mlx.mlx_vector_array, w: anytype) void {
 
 pub fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) void {
     inline for (comptime structFields(FullAttnWeights)) |field| {
+        if (comptime field.type != mlx.mlx_array) continue;
         // Dense bf16 full-attn layers carry null-ctx scales/biases — skip those
         // so null arrays don't poison the eval batch. Mirrors the linear/mlp paths.
         const arr = @field(fa, field.name);
@@ -448,6 +458,7 @@ pub fn appendHybridMlpWeights(vec: mlx.mlx_vector_array, hw: *const HybridMlpWei
         },
         .dense => |*dw| {
             inline for (comptime structFields(DenseMlpWeights)) |field| {
+                if (comptime field.type != mlx.mlx_array) continue;
                 const arr = @field(dw, field.name);
                 if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
             }
@@ -669,6 +680,102 @@ pub fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
         return error.MissingWeight;
+    };
+}
+
+/// How a projection's `.scales` and `.biases` are read when the pack stores it affine.
+pub const ScalePolicy = enum {
+    /// The weight is required; scales and biases are optional (a dense bf16 weight has neither).
+    optional,
+    /// Scales and biases follow the model's quantization (`quant_bits`, `quant_mode`).
+    by_config,
+    /// The whole projection may be absent (a shared expert a checkpoint dropped).
+    absent_ok,
+};
+
+/// The trellis projections a layer set holds, and how many of them ride a stacked launch.
+pub const TrunkCounts = struct {
+    banks: usize = 0,
+    stacks: usize = 0,
+
+    fn add(self: *TrunkCounts, w: anytype) void {
+        inline for (comptime structFields(@TypeOf(w.*))) |field| {
+            // `switch_*_w` are the routed experts' banks, not trunk projections.
+            if (comptime field.type == mlx.mlx_array and std.mem.endsWith(u8, field.name, "_w") and !std.mem.startsWith(u8, field.name, "switch_")) {
+                if (trunk_stq.isStq(@field(w, field.name))) self.banks += 1;
+            } else if (comptime field.type == ?trunk_stq.Shared) {
+                if (@field(w, field.name) != null) self.stacks += 1;
+            }
+        }
+    }
+
+    pub fn of(layers: []const MoeLayerWeights) TrunkCounts {
+        var c: TrunkCounts = .{};
+        for (layers) |*lw| {
+            switch (lw.attn) {
+                inline else => |*w| c.add(w),
+            }
+            switch (lw.mlp) {
+                inline else => |*w| c.add(w),
+            }
+        }
+        return c;
+    }
+};
+
+/// Stacks the trellis projections `parts` (loaded from layer `layer`'s `bases`) that read one input, and drops the stored
+/// banks from `weights`; null, with nothing changed, when the pack stores any of them another way.
+pub fn stackProjs(
+    weights: *Weights,
+    config: *const ModelConfig,
+    layer: u32,
+    comptime bases: []const []const u8,
+    parts: []const *trunk_stq.Triple,
+    owned_bf16: *std.ArrayList(mlx.mlx_array),
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+) !?trunk_stq.Shared {
+    const stack = (try trunk_stq.fuse(parts, owned_bf16, allocator, s)) orelse return null;
+    inline for (bases) |base| {
+        var name: [160]u8 = undefined;
+        trunk_stq.drop(weights, std.fmt.bufPrint(&name, "{s}.layers.{d}." ++ base, .{ config.weight_prefix, layer }) catch unreachable);
+    }
+    return stack;
+}
+
+/// One layer projection `<layer>.<base>`: the trellis bank a pack stores as `<base>.{trellis,suh,svh}` under `trunk_quant`
+/// (`trunk_stq`), else its affine or dense triple `<base>.{weight,scales,biases}`.
+pub fn layerProj(
+    weights: *const Weights,
+    buf: *[256]u8,
+    config: *const ModelConfig,
+    layer: u32,
+    comptime base: []const u8,
+    comptime policy: ScalePolicy,
+    owned_bf16: *std.ArrayList(mlx.mlx_array),
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+) !trunk_stq.Triple {
+    const prefix = config.weight_prefix;
+    var name: [160]u8 = undefined;
+    const full = std.fmt.bufPrint(&name, "{s}.layers.{d}." ++ base, .{ prefix, layer }) catch unreachable;
+    if (try trunk_stq.load(weights, full, config.trunk_quant, owned_bf16, allocator, s)) |bank| return bank;
+    return switch (policy) {
+        .optional => .{
+            .w = try getLayerWeight(weights, buf, prefix, layer, base ++ ".weight"),
+            .s = getLayerWeightOpt(weights, buf, prefix, layer, base ++ ".scales") orelse mlx.mlx_array_new(),
+            .b = getLayerWeightOpt(weights, buf, prefix, layer, base ++ ".biases") orelse mlx.mlx_array_new(),
+        },
+        .by_config => .{
+            .w = try getLayerWeight(weights, buf, prefix, layer, base ++ ".weight"),
+            .s = try getLayerScaleOrEmpty(weights, buf, prefix, layer, base ++ ".scales", config.quant_bits),
+            .b = try getLayerBias(weights, buf, prefix, layer, base ++ ".biases", config),
+        },
+        .absent_ok => .{
+            .w = getLayerWeightOpt(weights, buf, prefix, layer, base ++ ".weight") orelse mlx.mlx_array_new(),
+            .s = getLayerWeightOpt(weights, buf, prefix, layer, base ++ ".scales") orelse mlx.mlx_array_new(),
+            .b = getLayerWeightOpt(weights, buf, prefix, layer, base ++ ".biases") orelse mlx.mlx_array_new(),
+        },
     };
 }
 

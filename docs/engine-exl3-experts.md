@@ -283,6 +283,14 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   - Policy: k is split into ranges of at most 512 over at least 320 threadgroups, then one finish dispatch.
   - An output of at least 1024 128-blocks (lm_head) folds the finish into a single dispatch.
   - Time the served geometry with `sushi-ubench run shared.exl3_trunk_rows` (SPEC1 n64 at rows 1, 2, 3, 5, 8).
+- **Exact rows** (`project_rows.rows_exact`): every row, up to `PROJECT_ROWS_MAX`, and the serial one-row tick take ONE
+  arm, chosen by the hardware: NAX where `gemmNaxOn()`, else SIMD. Each arm is row-invariant on its own (k split from the
+  shape alone; NAX pads to a 16-row tile and runs 1 row too), so a row beside others is bit-identical to the same row
+  alone on that arm, stacked or folded, rows 1 to 8 (`with exact rows a row has the same bytes ... at Flash-Next's trunk
+  shapes`). NAX and SIMD may differ from each other (the accepted cross-hardware rule). Unpinned, one row takes SIMD and
+  two or more take NAX, so a row beside others need not equal itself alone. The
+  Flash-Next trunk pins it around each trellis projection (`trunk_stq`) and restores it; DeepSeek pins it around its
+  DSpark verify.
 - The parity bar scores each 128-wide output block in inner space: its error L2 (divided by svh) against the L2 of the
   block's summand magnitudes. The output transform is an orthonormal rotation, so this keeps the inner GEMV bar's
   scale. The composite is `projectIndexed` per row, which shares the bitstream, so it cannot convict a codeword flip;

@@ -133,6 +133,8 @@ pub const ModelConfig = struct {
     expert_quant_table: ?u8 = null,
     /// The bank rates the pack's codebook table has a row for (bit n/2); null admits every rate.
     expert_quant_rates: ?u128 = null,
+    /// How the trunk projections a pack stores as trellis banks decode (`trunk_quant`); null for an all-affine trunk.
+    trunk_quant: ?expert_exl3.Decode = null,
     expert_source_dir: ?[]u8 = null,
     /// `SUSHI_NGRAM_BF16_DIR`: serve the PLE n-gram table from the ORIGINAL bf16
     /// shards in this HF checkpoint dir instead of the pack's quantized `ngram_table.bin`
@@ -1675,6 +1677,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
             if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
         }
+        if (cfgField(root, "trunk_quant")) |block| {
+            const spec = sushi_exl3.parseQuantBlock(block) catch return error.InvalidQwen4ConfigField;
+            if (!spec.codebook.hasTable()) return error.InvalidQwen4ConfigField;
+            config.trunk_quant = .{ .codebook = spec.codebook, .window = spec.window, .table = spec.table };
+        }
         try qwen4_config.validateQwen4Config(&config);
     } else if (std.mem.eql(u8, model_type, "mimo_v2")) {
         try mimo_config.parseMimoConfig(&config, cfg_obj);
@@ -1864,7 +1871,8 @@ pub fn streamedResidentKey(load: StreamingLoad, buf: []u8, key: []const u8) ?[]c
 }
 
 /// `vision`: the tower's bytes, kept apart from `trunk` where a streamed load decides on it.
-pub const ResidentSplit = struct { trunk: u64, mtp: u64, vision: u64 = 0 };
+/// `stq_head`: the pack stores the lm_head as a trellis bank, which keeps no coarse rerank copy.
+pub const ResidentSplit = struct { trunk: u64, mtp: u64, vision: u64 = 0, stq_head: bool = false };
 
 /// Resident Sushi EXL3 packs have a measured load envelope and exact component bills.
 pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
@@ -1875,7 +1883,7 @@ pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
 /// Flash-Next's resident tensor payloads, with the loader's vision filter and optional native head.
 pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool, mtp_on: bool) !ResidentSplit {
     const split = try indexedResidentSplit(io, allocator, model_dir, null, mtp_on);
-    return .{ .trunk = split.trunk +| (if (vision) split.vision else 0), .mtp = split.mtp };
+    return .{ .trunk = split.trunk +| (if (vision) split.vision else 0), .mtp = split.mtp, .stq_head = split.stq_head };
 }
 
 /// What a streamed load keeps resident under `config.expert_layout`: everything but the routed banks,
@@ -1914,6 +1922,7 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     var total: u64 = 0;
     var mtp: u64 = 0;
     var tower: u64 = 0;
+    var stq_head = false;
     var found: usize = 0;
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
@@ -1962,13 +1971,14 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
                 if (@import("qwen4/qwen_vision.zig").quantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
                     size = @import("vision_common.zig").quantizedBytes(m.dims[0], m.dims[1], group);
             };
+            if (std.mem.eql(u8, canonical, "language_model.lm_head.trellis")) stq_head = true;
             const bucket = if (is_mtp) &mtp else if (is_vision) &tower else &total;
             bucket.* = std.math.add(u64, bucket.*, size) catch return error.InvalidSafetensorsHeader;
             found += 1;
         }
     }
     if (found == 0) return error.NoWeightFiles;
-    return .{ .trunk = total, .mtp = mtp, .vision = tower };
+    return .{ .trunk = total, .mtp = mtp, .vision = tower, .stq_head = stq_head };
 }
 
 /// Load all safetensors files from model_dir.

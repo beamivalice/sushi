@@ -75,6 +75,7 @@ test {
     _ = @import("kv_cache.zig");
     _ = @import("qwen4/qwen4_forward.zig");
     _ = @import("qwen4/qwen4_fixture_test.zig");
+    _ = @import("qwen4/qwen4_trunk_stq_test.zig");
     _ = @import("qwen4/qwen4_hc.zig");
     _ = @import("hc_prefill.zig");
     _ = @import("qwen4/gdn_decode.zig");
@@ -100,6 +101,7 @@ test {
     _ = @import("mtp_lookup.zig");
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
+    _ = @import("trunk_stq.zig");
     _ = @import("model_settings.zig");
     _ = @import("spec_cost_gate.zig");
     _ = @import("dsv41/dspark_rows.zig");

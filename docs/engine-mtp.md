@@ -217,6 +217,7 @@ chain/group paths still capture per row. `dflash_policy.ladder()` is that table 
 - **Sampled auto-mode output follows the round times**: the plan reads measured round costs, and the draft counts
   decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
   SUSHI_MTP_COST_TABLE=0`, or a pinned depth).
+- **Trellis (STQ) trunk projections are row-invariant per arm**: a verify row equals its serial tick bit for bit on the machine's own arm (NAX where present, else SIMD, exact rows); NAX and SIMD boxes may differ from each other, the accepted cross-hardware rule ([engine-exl3-experts](engine-exl3-experts.md#dense-linears)).
 - Pinned-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
 - The router and shared-expert gate run the dense-rows kernel at every width, serial decode included, so one arithmetic
   serves a row whether it decodes alone or verifies beside others on any device

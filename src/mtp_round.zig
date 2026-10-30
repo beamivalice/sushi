@@ -418,7 +418,7 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
                 // The coarse head just retired: propose greedily and hand
                 // the verify the one-hot q that proposal really has.
                 const id = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
-                const prop = try sampler.argmaxStepProposal(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
+                const prop = try sampler.argmaxStepProposal(id, xfm.lmHeadRows(), s);
                 chain.draft_arrs[i] = prop.id;
                 slots[i] = prop.q;
             }
@@ -576,7 +576,7 @@ pub fn mtpGroupSampledDrafts(
     if (!have) {
         // No coarse head: every row proposes greedily and hands the verify
         // the one-hot q that proposal really has.
-        const vocab: c_int = @intCast(mlx.getShape(xfm.lm_head_w)[0]);
+        const vocab: c_int = xfm.lmHeadRows();
         for (gens, chains, 0..) |g, *c, k| {
             const k_c: c_int = @intCast(k);
             var xk = mlx.mlx_array_new();

@@ -39,6 +39,7 @@ const qkvExpectBitsEqual = test_support.qkvExpectBitsEqual;
 const qkvIdentityArray = test_support.qkvIdentityArray;
 const qwen4ReadF32 = test_support.qwen4ReadF32;
 
+const trunk_stq = @import("../trunk_stq.zig");
 const DenseKVView = trf.DenseKVView;
 const DenseMlpWeights = trf.DenseMlpWeights;
 const FUSED256_MIN_Q_LEN = trf.FUSED256_MIN_Q_LEN;
@@ -504,7 +505,7 @@ pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array
 }
 
 /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
-pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
+pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
     const mtp_prefix = "language_model.mtp";
     if (weights.get(mtp_prefix ++ ".fc_hidden.weight") == null) return null;
     var mcfg = config;
@@ -2194,6 +2195,14 @@ fn hcStreamMean(s: mlx.mlx_stream, h: mlx.mlx_array, hc: u32) !mlx.mlx_array {
     return tap;
 }
 
+/// q, k and v of `x` from the stacked trellis bank, or null when the layer has none or `x` is wider than a stacked launch.
+pub fn stackedAttnProjections(self: *Transformer, x: mlx.mlx_array, fa: *const FullAttnWeights) !?AttnVerifyInputs {
+    const stack = fa.qkv_stack orelse return null;
+    var outs: [3]mlx.mlx_array = undefined;
+    if (!try trunk_stq.sharedProject(self.s, x, stack, self.config.trunk_quant orelse return error.TrunkQuantMissing, &outs)) return null;
+    return .{ .q = outs[0], .k = outs[1], .v = outs[2] };
+}
+
 pub fn gatedFullAttnProjected(
     self: *Transformer,
     ctx: *ForwardCtx,
@@ -2216,9 +2225,14 @@ pub fn gatedFullAttnProjected(
     const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
     const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
 
+    // A stacked trellis q/k/v is one launch at the decode widths.
+    var stacked = if (projected == null) try stackedAttnProjections(self, x, fa) else null;
+    defer if (stacked) |*values| values.deinit();
+    const given: ?*const AttnVerifyInputs = if (stacked) |*values| values else projected;
+
     // Q projection
-    const q_proj = if (projected) |values| values.q else try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
-    defer if (projected == null) {
+    const q_proj = if (given) |values| values.q else try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
+    defer if (given == null) {
         _ = mlx.mlx_array_free(q_proj);
     };
 
@@ -2258,12 +2272,12 @@ pub fn gatedFullAttnProjected(
     }
 
     // K, V projections
-    const k_proj = if (projected) |values| values.k else try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
-    defer if (projected == null) {
+    const k_proj = if (given) |values| values.k else try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
+    defer if (given == null) {
         _ = mlx.mlx_array_free(k_proj);
     };
-    const v_proj = if (projected) |values| values.v else try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
-    defer if (projected == null) {
+    const v_proj = if (given) |values| values.v else try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
+    defer if (given == null) {
         _ = mlx.mlx_array_free(v_proj);
     };
 

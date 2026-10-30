@@ -15,6 +15,7 @@ const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const log = @import("log.zig");
+const trunk_stq = @import("trunk_stq.zig");
 const Transformer = transformer_mod.Transformer;
 const expert_quant = @import("expert_quant.zig");
 
@@ -481,6 +482,11 @@ pub fn fullReadoutArgmax(
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
 ) !mlx.mlx_array {
+    if (trunk_stq.isStq(target.lm_head_w)) {
+        const head_logits = try target.lmHeadLogits(x);
+        defer _ = mlx.mlx_array_free(head_logits);
+        return maskAndArgmax(s, head_logits, suppress_mask);
+    }
     var logits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(logits);
     if (target.lm_head_s.ctx == null) {

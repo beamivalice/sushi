@@ -23,6 +23,7 @@ hidden 2560, expert intermediate 640.
 | `src/transformer.zig` | shared `Transformer`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3`; `KVCache` is in `src/kv_cache.zig`, the SSM cache in `src/ssm_cache.zig` |
 | `src/qwen4/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
+| `src/trunk_stq.zig` | Trunk projections stored as trellis banks: the loader (`load`), the one-launch stacking (`fuse`, `sharedProject`), the matmul |
 | `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, see [engine-mtp](engine-mtp.md) |
 
 ## Trunk rules
@@ -42,6 +43,25 @@ hidden 2560, expert intermediate 640.
   read); HC + GDN prefill fusions take the chunk WIDTH as a scalar input. Each of the 36 GDN layers decodes and
   verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/qwen4/gdn_decode.zig`), then the norm-gate. Details in
   [engine-kernels](engine-kernels.md).
+- **Trunk storage is per tensor** ([pack-format](pack-format.md#qwen4-stq)): a projection is the affine/dense `(w, s, b)`
+  triple or a trellis bank carried in the same three slots (`w` the U16 trellis `[1, in/16, out/16, n]`, `s` and `b` the
+  F16 scales), and `Transformer.qmatmul` tells them apart by `w`'s dtype, so every call site serves a mixed pack. Tensors
+  too narrow for a 16x16 tile grid (GDN a/b, the router, HC mixes) stay affine; the embedding stays affine (a row gather).
+  - **A row rounds the same beside others as alone**: trellis projections run with `project_rows.rows_exact` pinned
+    (one arm per machine at every width up to eight: NAX where the box has it, else SIMD,
+    [engine-exl3-experts](engine-exl3-experts.md#dense-linears)), so batched ticks, MTP verify blocks and serial ticks
+    agree bit for bit on that arm (hermetic: `a GDN layer on trellis projections verifies bit-identically to serial
+    decode`); NAX and SIMD boxes may differ from each other. A chunk past eight rows runs the sorted GEMM, as the affine
+    trunk's qmm differs from its qmv.
+  - **Stacked launches**: q/k/v, GDN qkv/z, the shared expert's gate/up and a dense layer's gate/up load as one bank each
+    (`stackProjs`), up to eight rows one launch, the parts views of it for a wider chunk. `Transformer.init` consumes the
+    stored banks of a stack from the weight map (held once), so a second `init` on the same map needs a fresh load. A
+    stacked row is not bitwise a separate launch's, but it is the same row at every width.
+  - **The joined slot rows decline a trellis projection** (`decodeRowsProjection`, `verifyJoinedProjection` need affine8):
+    concurrent slots and cross-slot verify run those projections per slot, bytes unchanged. The shared-expert fold
+    (`qwen_riders`) declines a trellis shared expert and the separate chain runs. The trellis lm_head is read whole by the
+    draft (`fullReadoutArgmax`), with no coarse rerank copy.
+  - Load logs `[trunk-stq] N trellis projections (M stacked), lm_head trellis|affine; <codebook> window W`.
 - **A GDN trunk's `KVCache.step` is 0 forever**: see [engine-kv-cache](engine-kv-cache.md#gdn).
 
 <a id="vision-tower"></a>

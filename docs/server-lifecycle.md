@@ -101,6 +101,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`: streaming index > MiMo source trunk > vision >
   plain). A second site builds a model the server never serves — a MiMo pack read without its source trunk binds the
   raw FP8 fused QKV and its logits stop following the routed experts.
+- `qwen4_exp` `trunk_quant` rides `config.trunk_quant`; `Transformer.init` binds each trellis projection per tensor and
+  consumes the banks it stacks from the map ([qwen4-arch](qwen4-arch.md#trunk-rules)).
 - **A missing tensor is a load ERROR, never `unreachable`** (`error.MissingWeight` → named 503 via
   `loadErrorFromName`); a load failure crosses the inference thread by NAME (`req.error_name`).
 - Discovery (`src/model_discovery.zig` / `src/model_registry.zig`): two-level org/name, multi-root, streaming stubs,

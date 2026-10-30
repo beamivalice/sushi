@@ -927,13 +927,26 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
     if (config.isMimo()) return mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
-    const head_bytes = split.mtp;
-    const coarse_bits = mtp_mod.rerankCoarseBits();
-    const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0)
-        mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits)
-    else
-        0;
-    return split.trunk +| head_bytes +| coarse;
+    return split.trunk +| split.mtp +| rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
+}
+
+/// The draft head's coarse lm_head copy: built only with MTP on, from an affine head (a trellis head has no packed rows to shrink).
+fn rerankCoarseBill(split: model_mod.ResidentSplit, config: *const ModelConfig, mtp_on: bool, coarse_bits: u32) u64 {
+    if (!mtp_on or split.mtp == 0 or coarse_bits == 0 or split.stq_head) return 0;
+    return mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits);
+}
+
+test "the Sushi resident bill leaves out the coarse rerank copy of a trellis head" {
+    var config = ModelConfig{ .model_type = "qwen4_exp" };
+    config.vocab_size = 128;
+    config.hidden_size = 64;
+    const affine: model_mod.ResidentSplit = .{ .trunk = 1000, .mtp = 100 };
+    const trellis: model_mod.ResidentSplit = .{ .trunk = 1000, .mtp = 100, .stq_head = true };
+    const coarse = mtp_mod.rerankCoarseBytes(128, 64, 3);
+    try testing.expect(coarse > 0);
+    try testing.expectEqual(coarse, rerankCoarseBill(affine, &config, true, 3));
+    try testing.expectEqual(@as(u64, 0), rerankCoarseBill(trellis, &config, true, 3));
+    try testing.expectEqual(@as(u64, 0), rerankCoarseBill(affine, &config, false, 3));
 }
 
 /// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads

@@ -3,6 +3,7 @@ const expectError = @import("../test_expect.zig").expectError;
 const expert_quant = @import("../expert_quant.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
+const sushi_exl3 = @import("sushi_exl3");
 const qwen4_exp = @import("qwen4_exp.zig");
 const ModelConfig = model_mod.ModelConfig;
 const QWEN4_GOOD_FIELDS = model_mod.QWEN4_GOOD_FIELDS;
@@ -644,6 +645,24 @@ test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load er
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"make_ngram_vocab_size_divisible_by\":0"),
     ));
+}
+
+test "qwen4_exp config: trunk_quant names the STQ codebook the stored trellis trunk decodes with" {
+    const doc = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"trunk_quant\":{\"format\":\"stq\",\"k\":6,\"codebook\":\"spec1\",\"window\":15," ++
+        "\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"}");
+    const c = try parseConfigFromJson(testing.allocator, doc);
+    try testing.expectEqual(sushi_exl3.format.Codebook.spec1, c.trunk_quant.?.codebook);
+    try testing.expectEqual(sushi_exl3.format.Window.w15, c.trunk_quant.?.window);
+    try testing.expect(c.trunk_quant.?.table != null);
+    try testing.expectEqual(@as(?sushi_exl3.format.Decode, null), (try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS))).trunk_quant);
+    // An EXL3 codebook or a malformed block is no STQ trunk.
+    inline for ([_][]const u8{
+        ",\"trunk_quant\":{\"format\":\"exl3\",\"k\":4,\"codebook\":\"mcg\"}",
+        ",\"trunk_quant\":{\"format\":\"stq\"}",
+        ",\"trunk_quant\":4",
+    }) |bad| {
+        try expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ bad)));
+    }
 }
 
 test "n-gram head count overflow is refused by the config" {

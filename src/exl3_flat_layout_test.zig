@@ -1030,6 +1030,28 @@ test "EXL3 streaming GPU a cache profile moves slots to the layer that reuses it
     try std.testing.expect(slots[1][1] > slots[0][1] and slots[1][0] < slots[0][0]);
 }
 
+test "Sushi quant memory bills a trellis trunk as stored and flags a trellis head" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const q_trellis = TensorSpec{ .key = "language_model.model.layers.0.self_attn.q_proj.trellis", .dtype = "U16", .shape = TRELLIS_SHAPE[0..], .bytes = 256 };
+    const q_suh = TensorSpec{ .key = "language_model.model.layers.0.self_attn.q_proj.suh", .dtype = "F16", .shape = SIDE_SHAPE[0..], .bytes = 64 };
+    const q_svh = TensorSpec{ .key = "language_model.model.layers.0.self_attn.q_proj.svh", .dtype = "F16", .shape = SIDE_SHAPE[0..], .bytes = 64 };
+    const head = TensorSpec{ .key = "language_model.lm_head.trellis", .dtype = "U16", .shape = TRELLIS_SHAPE[0..], .bytes = 256 };
+    const specs = [_]TensorSpec{ q_trellis, q_suh, q_svh, head, TRUNK_AUX_SPEC };
+    try writeSafetensors(io, a, tmp.dir, "model.safetensors", &specs);
+    var entries: [specs.len]IndexSpec = undefined;
+    for (specs, &entries) |spec, *e| e.* = .{ .key = spec.key, .file = "model.safetensors" };
+    try writeIndex(io, a, tmp.dir, &entries);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const bill = try model.qwenResidentWeightBytes(io, a, path, false, false);
+    // The trellis, both scale vectors and the head are billed as stored, beside the affine k_proj.
+    try std.testing.expectEqual(@as(u64, 256 + 64 + 64 + 256 + 1024), bill.trunk);
+    try std.testing.expect(bill.stq_head);
+}
+
 test "EXL3 streaming CPU bills a grouped store's floor, one expert of every rate group, and one workspace set per layer kind" {
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;

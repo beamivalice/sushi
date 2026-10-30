@@ -110,7 +110,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `qwen4/qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side, fused HC prefill | qwen4-arch |
 | `qwen4/gdn_decode.zig` | fused GDN decode/verify step (one dispatch) | engine-kernels |
 | `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, stamp check | mimo2-arch |
-| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3/STQ decoders and kernels, rate groups, dense linears | engine-exl3-experts |
+| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) / `trunk_stq.zig` | expert layout, EXL3/STQ decoders and kernels, rate groups, dense linears; trellis trunk banks | engine-exl3-experts |
 | `encoder/` | `sushi convert exl3`: trellis search, source readers, trunk/shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, cost table | engine-mtp |
@@ -124,8 +124,6 @@ Box: M5 Max 128 GB, macOS 27.
 | `ubench_main.zig` / `ubench_report.zig` / `exl3/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |
-
-Flags: `sushi --help` lists them all.
 
 ## Building
 

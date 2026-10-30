@@ -5,6 +5,8 @@ const std = @import("std");
 const gdn_decode = @import("gdn_decode.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
+const trunk_stq = @import("../trunk_stq.zig");
+const sushi_exl3 = @import("sushi_exl3");
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
 const attn256MaxDiff = test_support.attn256MaxDiff;
@@ -2166,7 +2168,8 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
 }
 
 /// The gate is f32 at either width; `wide` selects the f32 state, else the bf16 state of `--qwen-gdn 16`.
-fn gdnRecurLayerCase(wide: bool) !void {
+fn gdnRecurLayerCase(wide: bool, proj: GdnProjections) !void {
+    if (proj != .dense) try mlx.requireGpu();
     const s = mlx.gpuStream();
     gdn_prework_override = true;
     defer gdn_prework_override = null;
@@ -2193,7 +2196,7 @@ fn gdnRecurLayerCase(wide: bool) !void {
     xfm.config.gdn_state_f32 = wide;
     var prng = std.Random.DefaultPrng.init(0x6D5E1);
     const rnd = prng.random();
-    const la = LinearAttnWeights{
+    var la = LinearAttnWeights{
         .qkv_w = try gdnRecurRand(rnd, &.{ hidden, c_dim }, 0.5, .bfloat16, s),
         .qkv_s = .{},
         .qkv_b = .{},
@@ -2214,9 +2217,37 @@ fn gdnRecurLayerCase(wide: bool) !void {
         .out_s = .{},
         .out_b = .{},
     };
-    defer inline for (.{ la.qkv_w, la.z_w, la.a_w, la.b_w, la.conv1d_w, la.A_log, la.dt_bias, la.norm_w, la.out_w }) |arr| {
+    const dense = [_]mlx.mlx_array{ la.qkv_w, la.z_w, la.a_w, la.b_w, la.conv1d_w, la.A_log, la.dt_bias, la.norm_w, la.out_w };
+    defer for (dense) |arr| {
         _ = mlx.mlx_array_free(arr);
     };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var held: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (held.items) |a| _ = mlx.mlx_array_free(a);
+        held.deinit(testing.allocator);
+    }
+    if (proj != .dense) {
+        xfm.config.trunk_quant = sushi_exl3.format.Decode.tabled(.spec1, .w15);
+        const dims = [3][2]usize{ .{ @intCast(hidden), @intCast(c_dim) }, .{ @intCast(hidden), @intCast(hv * 128) }, .{ @intCast(hv * 128), @intCast(hidden) } };
+        var banks: [3]trunk_stq.Triple = undefined;
+        for (dims, &banks) |d, *slot| {
+            slot.* = try (try trunk_stq.TestBank.init(arena.allocator(), rnd, d[0], d[1], 48)).triple(s);
+            try held.appendSlice(testing.allocator, &.{ slot.w, slot.s, slot.b });
+        }
+        const stack = if (proj == .stacked) (try trunk_stq.fuse(&.{ &banks[0], &banks[1] }, &held, testing.allocator, s)).? else null;
+        la.qkv_w = banks[0].w;
+        la.qkv_s = banks[0].s;
+        la.qkv_b = banks[0].b;
+        la.z_w = banks[1].w;
+        la.z_s = banks[1].s;
+        la.z_b = banks[1].b;
+        la.out_w = banks[2].w;
+        la.out_s = banks[2].s;
+        la.out_b = banks[2].b;
+        la.qkvz_stack = stack;
+    }
     const conv0 = try gdnRecurRand(rnd, &.{ 1, 3, c_dim }, 4.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(conv0);
     const state0 = try gdnRecurRand(rnd, &.{ 1, hv, 128, 128 }, 1.0, if (wide) .float32 else .bfloat16, s);
@@ -3300,6 +3331,7 @@ pub fn computeGdnGate(self: *const Transformer, A_log: mlx.mlx_array, a: mlx.mlx
 }
 
 pub fn gdnProjGpu(self: *Transformer, x: mlx.mlx_array, la: *const LinearAttnWeights) !GdnProj {
+    if (try self.stackedPair(x, la.qkvz_stack)) |pair| return .{ .qkv = pair[0], .z = pair[1] };
     const qkv = try self.qmatmul(x, la.qkv_w, la.qkv_s, la.qkv_b);
     errdefer _ = mlx.mlx_array_free(qkv);
     const z = try self.qmatmul(x, la.z_w, la.z_s, la.z_b);
@@ -3842,9 +3874,17 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
 
 test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and verify widths; rollback to every row is serial decode" {
     try mlx.requireGpu();
-    try gdnRecurLayerCase(false);
-    try gdnRecurLayerCase(true);
+    try gdnRecurLayerCase(false, .dense);
+    try gdnRecurLayerCase(true, .dense);
 }
+
+test "trunk STQ: a GDN layer on trellis projections verifies bit-identically to serial decode at every width" {
+    try gdnRecurLayerCase(true, .trellis);
+    try gdnRecurLayerCase(true, .stacked);
+}
+
+/// How a test GDN layer stores its qkv, z and out projections.
+const GdnProjections = enum { dense, trellis, stacked };
 
 test "gdn state f32: prefill, decode, a restored bf16 state and verify capture all store f32; rollback is serial decode" {
     try mlx.requireGpu();
