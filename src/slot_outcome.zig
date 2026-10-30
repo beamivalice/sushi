@@ -249,6 +249,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
+        slot.spec_mode = g.specMode();
         g.logSpecStats();
         // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
         // wiring it only beside generate.zig's own logSpecStats() calls (the

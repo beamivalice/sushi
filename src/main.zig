@@ -129,8 +129,9 @@ fn printUsage(io: std.Io) void {
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
-        \\  bench               Drive a running server through the release bench
-        \\                      (tests/bench.sh boots it and takes the box rules).
+        \\  bench               Bench a model in this process (--model <dir>), or
+        \\                      drive a running server (--url; tests/bench.sh boots
+        \\                      it and takes the box rules).
         \\                      `sushi bench --help` for options
         \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
         \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
@@ -423,7 +424,7 @@ pub fn main(init: std.process.Init) !void {
     while (args_iter.next()) |arg| {
         try args_list.append(allocator, try allocator.dupe(u8, arg));
     }
-    const args = args_list.items;
+    var args: []const []const u8 = args_list.items;
     // Runs after every other defer: an update asked for by /v1/update or the REPL replaces this process only once
     // the server has shut down the way a SIGTERM exit does.
     defer update_mod.relaunchIfRequested(allocator, io, args);
@@ -440,6 +441,8 @@ pub fn main(init: std.process.Init) !void {
     var run_model_dir: ?[]u8 = null;
     defer if (run_model_dir) |d| allocator.free(d);
     var use_default_models_root = false;
+    var bench_run: ?*bench_mod.InProcess = null;
+    defer if (bench_run) |r| r.finish();
     var repl_after_serve = false;
     var run_opts: cli_mod.ReplOptions = .{};
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
@@ -492,8 +495,16 @@ pub fn main(init: std.process.Init) !void {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
         } else if (std.mem.eql(u8, cmd, "bench")) {
-            try bench_mod.cmdBench(allocator, io, args[2..]);
-            return;
+            switch (try bench_mod.start(allocator, io, args[2..])) {
+                .done => return,
+                .in_process => |run| {
+                    bench_run = run;
+                    bench_mod.setCurrent(run);
+                    // The serve parser below reads the flags the bench left, as `sushi serve --model` does.
+                    args = try run.argv(args[0]);
+                    arg_start = 1;
+                },
+            }
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
             return;
@@ -935,6 +946,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    if (bench_run != null and (host_flag != null or port_flag != null or prompt != null)) {
+        log.err("sushi bench --model: --host, --port and --prompt do not apply, it starts no server\n", .{});
+        std.process.exit(1);
+    }
     if (tool_flag_given and run_model_dir == null) {
         log.err("--tool: only valid with `sushi run <model>`\n", .{});
         std.process.exit(1);
@@ -948,7 +963,7 @@ pub fn main(init: std.process.Init) !void {
         log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
         return error.PromptModeConflict;
     }
-    const bind = server_mod.resolveBind(host_flag, if (prompt != null) @as(u16, 0) else port_flag);
+    const bind = server_mod.resolveBind(host_flag, if (prompt != null or bench_run != null) @as(u16, 0) else port_flag);
     const host = bind.host;
     const port = bind.port;
 
@@ -1027,6 +1042,10 @@ pub fn main(init: std.process.Init) !void {
     // NOTE: opened AFTER `--log-level` is parsed (so the level gates what
     // reaches disk) and BEFORE model discovery/loading (so weight-load and
     // auto-context lines land in the file).
+    if (bench_run) |r| {
+        try r.prepare();
+        if (log_file_arg == null) log_file_arg = try r.logPath();
+    }
     if (serve_mode or repl_after_serve) {
         var log_path_buf: [1024]u8 = undefined;
         const chosen: ?[]const u8 = if (log_file_arg) |a|
@@ -1044,7 +1063,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
-    if (serve_mode and prompt == null) update_mod.startDailyCheck(io, no_update_check);
+    if (serve_mode and prompt == null and bench_run == null) update_mod.startDailyCheck(io, no_update_check);
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1096,7 +1115,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
-    if (serve_mode) {
+    if (serve_mode and bench_run == null) {
         server_mod.ensurePortFree(io, host, port) catch |err| {
             var msg_buf: [512]u8 = undefined;
             if (server_mod.startupRefusal(err, host, port, &msg_buf)) |msg| {
@@ -1429,9 +1448,11 @@ pub fn main(init: std.process.Init) !void {
         };
         var serve_cfg = launch_serve.serverConfig();
         serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
+        serve_cfg.embedded_client = if (bench_run != null) bench_mod.embeddedClient else null;
         serve_cfg.default_force_mtp = force_mtp;
         try server_mod.serve(io, allocator, params, config, host, port, serve_cfg);
         if (prompt_state.err) |err| return err;
+        if (bench_run) |r| if (r.err) |err| return err;
     } else {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.

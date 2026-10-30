@@ -7,64 +7,143 @@ const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const gpu_clock = @import("gpu_clock.zig");
 const box = @import("bench_box.zig");
+const completions = @import("completions.zig");
+const server_mod = @import("server.zig");
+const LoadedModel = @import("model_registry.zig").LoadedModel;
+const build_options = @import("build_options");
 const testing = std.testing;
 
 pub const window: usize = 8192;
 pub const first_rung: usize = 4096;
-pub const ladder_steps: usize = 16;
+pub const max_rung: usize = 131072;
 pub const samples_per_rung: usize = 3;
 pub const corpus_seed: u64 = 0x5a5a_c0de;
 /// Pride and Prejudice, public domain (Project Gutenberg #1342) with the Project Gutenberg header and footer removed.
 const prose_text = @embedFile("fixtures/prose_pride_and_prejudice.txt");
-/// The ladder must reach 128k tokens, plus a margin so the last window is never short.
-const corpus_tokens: usize = 132_000;
+/// A corpus holds the largest rung's prompt plus this margin, so the last window is never short.
+const corpus_margin: usize = 928;
 /// A request counts as restored when its cached tokens fall this close below the point it should restore
 /// (the prompt-end checkpoint trails the prompt end by up to 34 tokens).
 const restore_slack: usize = 64;
-const rungs = [_]usize{ 4096, 8192, 16384, 32768, 65536, 131072 };
+pub const default_rungs = [_]usize{ 4096, 8192, 16384, 32768, 65536, 131072 };
 
 pub const USAGE =
-    \\Usage: sushi bench --out <dir> --log <server.log> [options]
+    \\Usage: sushi bench --model <dir> [bench options] [serve flags]
+    \\       sushi bench --url <host:port> --out <dir> --log <server.log> [bench options]
     \\
-    \\Drives a running server through the release bench, once on a code corpus and once on prose: a cold 4k
-    \\request, 16 windows of 8192 tokens each restoring the previous prompt end, and 3 decode samples at
-    \\4k, 8k, 16k, 32k, 64k and 128k. It reads the GPU clock and thermal pressure through `sudo -n powermetrics`
-    \\beside every request and stops with an error when the busy clock is throttled (at most 1100 MHz); the
-    \\pressure level is recorded only. Without a passwordless sudo rule it says so and runs unmonitored.
-    \\Boot the server and take the box rules with tests/bench.sh.
+    \\The release bench, once on a code corpus and once on prose: a cold 4k request, then windows of 8192 tokens
+    \\each restoring the previous prompt end, and 3 decode samples at every rung (4k, 8k, 16k, 32k, 64k and 128k).
+    \\
+    \\--model loads the pack in this process and sends the requests straight to the scheduler: no server, no HTTP.
+    \\Every serve flag (--ssd-budget-gb, --kv-quant, --no-mtp, --ctx-size, ...) is accepted and applies as it does
+    \\to `sushi serve --model`; the speculative mode, the prefix cache and the kv8 default are the server's. The
+    \\prefix cache is a private directory under --out, removed at the end unless --out names the run. The run ends
+    \\with a table of prefill, decode and mode by arm and rung.
+    \\--url drives a server somebody else booted (tests/bench.sh boots it and takes the box rules) and reads its log.
+    \\
+    \\Either way it reads the GPU clock and thermal pressure through `sudo -n powermetrics` beside every request and
+    \\stops with an error when the busy clock is throttled (at most 1100 MHz); the pressure level is recorded only.
+    \\Without a passwordless sudo rule it says so and runs unmonitored.
     \\
     \\Options:
-    \\  --url <host:port>      Server to drive (default 127.0.0.1:8080)
-    \\  --model <id>           Model id to send (default: the first id of /v1/models)
-    \\  --out <dir>            Directory for bench.json, the raw samples (required)
-    \\  --log <path>           The server's log, for the speculative mode and the restore time (required)
+    \\  --model <dir>          Pack to load and bench in this process (with --url: the model id to send)
+    \\  --url <host:port>      Server to drive instead (default 127.0.0.1:8080 when --model is absent)
+    \\  --rungs <list>         Decode rungs, comma separated, `k` = 1024: 4k,16k or 8192 (default
+    \\                           4k,8k,16k,32k,64k,128k). Each is 4096 or a multiple of 8192 up to 131072; the
+    \\                           ladder runs in 8192-token windows to the largest and decodes only at the listed ones
+    \\  --tokens <n>           Tokens decoded per sample (default 256; the prose arm decodes at most 128)
+    \\  --code-only            Run the code arm only
+    \\  --prose-only           Run the prose arm only
+    \\  --out <dir>            Directory for bench.json, the raw samples (default with --model:
+    \\                           ~/.sushi/runs/bench-<UTC yyyymmdd-hhmmss>/; required with --url)
+    \\  --log <path>           --url only: the server's log, for the speculative mode and the restore time (required)
     \\  --report <path>        Write the docs/bench/v<ver>/<model>.md report here
-    \\  --version <ver>        Release version for the report title
+    \\  --version [<ver>]      Release version for the report title (default: this binary's version)
     \\  --stamp <text>         Header lines for the report (commit, binary, hardware); \n separates lines
-    \\  --decode-tokens <n>    Tokens decoded per code-arm sample (default 256; the prose arm decodes at most 128)
     \\  --help                 Show this help
     \\
 ;
 
+pub const ArmSelect = enum { both, code_only, prose_only };
+
+pub const default_url = "127.0.0.1:8080";
+
 pub const Options = struct {
     help: bool = false,
-    url: []const u8 = "127.0.0.1:8080",
+    url: []const u8 = default_url,
+    url_given: bool = false,
     model: []const u8 = "",
     out_dir: []const u8 = "",
     log_path: []const u8 = "",
     report: []const u8 = "",
-    version: []const u8 = "",
+    version: []const u8 = build_options.version,
     stamp: []const u8 = "",
     decode_tokens: u32 = 256,
+    rungs: []const usize = &default_rungs,
+    arms: ArmSelect = .both,
+    serve_args: []const []const u8 = &.{},
+
+    pub fn inProcess(o: Options) bool {
+        return !o.url_given and o.model.len > 0;
+    }
+
+    pub fn runsArm(o: Options, arm: Arm) bool {
+        return switch (o.arms) {
+            .both => true,
+            .code_only => arm == .code,
+            .prose_only => arm == .prose,
+        };
+    }
 };
 
-pub const ParseError = error{ UnknownArgument, MissingValue, BadValue, MissingRequired };
+pub const ParseError = error{ UnknownArgument, MissingValue, BadValue, MissingRequired, ConflictingFlags };
+
+/// The flag a failed parse names, for the message beside the error.
+pub var rejected_flag: []const u8 = "";
 
 /// Every flag that takes a value, for the parser and the help-lists-every-flag test.
-const value_flags = [_][]const u8{ "--url", "--model", "--out", "--log", "--report", "--version", "--stamp", "--decode-tokens" };
+const value_flags = [_][]const u8{ "--url", "--model", "--out", "--log", "--report", "--version", "--stamp", "--tokens", "--rungs" };
 
-pub fn parseArgs(args: []const []const u8) ParseError!Options {
+fn fail(flag: []const u8, err: ParseError) ParseError {
+    rejected_flag = flag;
+    return err;
+}
+
+fn validRung(len: usize) bool {
+    return len == first_rung or (len >= window and len <= max_rung and len % window == 0);
+}
+
+pub fn parseRungs(allocator: std.mem.Allocator, text: []const u8) error{ BadValue, OutOfMemory }![]usize {
+    var list: std.ArrayList(usize) = .empty;
+    errdefer list.deinit(allocator);
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " ");
+        const kilo = item.len > 0 and (item[item.len - 1] == 'k' or item[item.len - 1] == 'K');
+        const n = std.fmt.parseInt(usize, if (kilo) item[0 .. item.len - 1] else item, 10) catch return error.BadValue;
+        const len = if (kilo) std.math.mul(usize, n, 1024) catch return error.BadValue else n;
+        if (!validRung(len)) return error.BadValue;
+        try list.append(allocator, len);
+    }
+    std.mem.sort(usize, list.items, {}, std.sort.asc(usize));
+    var kept: usize = 0;
+    for (list.items) |v| {
+        if (kept > 0 and list.items[kept - 1] == v) continue;
+        list.items[kept] = v;
+        kept += 1;
+    }
+    list.shrinkRetainingCapacity(kept);
+    return list.toOwnedSlice(allocator);
+}
+
+/// With `--url` the bench is an HTTP client, and a flag it does not own is an error. Without it, `--model` names
+/// a pack to load here, and every flag the bench does not own is left in `serve_args` for the serve parser.
+pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) (ParseError || std.mem.Allocator.Error)!Options {
+    rejected_flag = "";
     var o: Options = .{};
+    var rest: std.ArrayList([]const u8) = .empty;
+    var code_only = false;
+    var prose_only = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -72,16 +151,30 @@ pub fn parseArgs(args: []const []const u8) ParseError!Options {
             o.help = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--code-only")) {
+            code_only = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--prose-only")) {
+            prose_only = true;
+            continue;
+        }
+        // The version is optional: bare, or followed by a flag, it is this binary's.
+        if (std.mem.eql(u8, a, "--version") and (i + 1 >= args.len or std.mem.startsWith(u8, args[i + 1], "-"))) continue;
         const idx = for (value_flags, 0..) |f, n| {
             if (std.mem.eql(u8, a, f)) break n;
-        } else return error.UnknownArgument;
+        } else {
+            try rest.append(allocator, a);
+            continue;
+        };
         i += 1;
-        if (i >= args.len) return error.MissingValue;
+        if (i >= args.len) return fail(a, error.MissingValue);
         const v = args[i];
         switch (idx) {
             0 => {
-                if (std.mem.indexOfScalar(u8, v, ':') == null or std.mem.indexOfScalar(u8, v, '/') != null) return error.BadValue;
+                if (std.mem.indexOfScalar(u8, v, ':') == null or std.mem.indexOfScalar(u8, v, '/') != null) return fail(a, error.BadValue);
                 o.url = v;
+                o.url_given = true;
             },
             1 => o.model = v,
             2 => o.out_dir = v,
@@ -90,14 +183,32 @@ pub fn parseArgs(args: []const []const u8) ParseError!Options {
             5 => o.version = v,
             6 => o.stamp = v,
             7 => {
-                o.decode_tokens = std.fmt.parseInt(u32, v, 10) catch return error.BadValue;
-                if (o.decode_tokens < 2) return error.BadValue;
+                o.decode_tokens = std.fmt.parseInt(u32, v, 10) catch return fail(a, error.BadValue);
+                if (o.decode_tokens < 2) return fail(a, error.BadValue);
             },
+            8 => o.rungs = parseRungs(allocator, v) catch |e| return if (e == error.OutOfMemory) e else fail(a, error.BadValue),
             else => unreachable,
         }
     }
-    if (!o.help and (o.out_dir.len == 0 or o.log_path.len == 0)) return error.MissingRequired;
+    if (code_only and prose_only) return fail("--code-only with --prose-only", error.ConflictingFlags);
+    o.arms = if (code_only) .code_only else if (prose_only) .prose_only else .both;
+    if (o.help) return o;
+    if (o.inProcess()) {
+        if (o.log_path.len > 0) return fail("--log", error.ConflictingFlags);
+        var serve: std.ArrayList([]const u8) = .empty;
+        try serve.appendSlice(allocator, &.{ "--model", o.model });
+        try serve.appendSlice(allocator, rest.items);
+        o.serve_args = serve.items;
+    } else {
+        if (rest.items.len > 0) return fail(rest.items[0], error.UnknownArgument);
+        if (o.out_dir.len == 0) return fail("--out", error.MissingRequired);
+        if (o.log_path.len == 0) return fail("--log", error.MissingRequired);
+    }
     return o;
+}
+
+pub fn corpusTokens(rungs: []const usize) usize {
+    return rungs[rungs.len - 1] + corpus_margin;
 }
 
 // ── The corpus ──────────────────────────────────────────────────────────
@@ -220,8 +331,8 @@ pub const Request = struct {
     base: usize,
 };
 
-fn isRung(len: usize) bool {
-    return std.mem.indexOfScalar(usize, &rungs, len) != null;
+fn isRung(rungs: []const usize, len: usize) bool {
+    return std.mem.indexOfScalar(usize, rungs, len) != null;
 }
 
 /// The 4k cold request, then every 8192-token window; a rung is followed by its two repeats at once so
@@ -233,18 +344,18 @@ pub fn armDecodeTokens(arm: Arm, decode_tokens: u32) u32 {
     return if (arm == .prose) @min(decode_tokens, prose_decode_tokens) else decode_tokens;
 }
 
-pub fn plan(allocator: std.mem.Allocator, decode_tokens: u32) ![]Request {
+pub fn plan(allocator: std.mem.Allocator, decode_tokens: u32, rungs: []const usize) ![]Request {
     var list: std.ArrayList(Request) = .empty;
     errdefer list.deinit(allocator);
     var prev: usize = 0;
     var len: usize = first_rung;
     var step: usize = 0;
     while (true) : (step += 1) {
-        const decode = isRung(len);
+        const decode = isRung(rungs, len);
         try list.append(allocator, .{ .prompt_len = len, .max_tokens = if (decode) decode_tokens else 1, .kind = .ladder, .base = prev });
         if (decode) for (1..samples_per_rung) |_| try list.append(allocator, .{ .prompt_len = len, .max_tokens = decode_tokens, .kind = .repeat, .base = len });
         prev = len;
-        if (step >= ladder_steps) break;
+        if (len >= rungs[rungs.len - 1]) break;
         len = window * (step + 1);
     }
     return list.toOwnedSlice(allocator);
@@ -425,6 +536,8 @@ pub const Report = struct {
     /// Why the run stopped early; empty for a complete run.
     aborted: []const u8 = "",
     cooldown: ?box.Cooldown = null,
+    /// Requests went to the scheduler in this process, not over HTTP.
+    in_process: bool = false,
 };
 
 fn writeThousands(w: *std.Io.Writer, v: f64) !void {
@@ -557,6 +670,54 @@ fn writeSummaryRows(w: *std.Io.Writer, name: []const u8, rows: []const RungRow, 
     try w.writeAll("\n");
 }
 
+fn problemText(p: Problem) []const u8 {
+    return switch (p) {
+        .restore_missed => "restored fewer tokens than the previous prompt end holds",
+        .no_restore_line => "no restore was reported for it, so the restore time was not taken out",
+        .short_decode => "decoded fewer tokens than asked",
+        .gpu_throttled => "the GPU clock or thermal pressure failed the abort rule (see the GPU columns)",
+    };
+}
+
+/// The end-of-run table of an in-process bench: for each arm and decode rung, the window that ends at the rung
+/// (what it restored, its prefill rate and time to first token) beside the rung's median decode and its mode.
+pub fn renderTable(allocator: std.mem.Allocator, samples: []const Sample) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("arm    rung   restored  prefill tok/s  ttft s  decode tok/s  mode\n");
+    for ([_]Arm{ .code, .prose }) |arm| {
+        var rows = try rungRows(allocator, samples, arm);
+        defer rows.deinit(allocator);
+        for (rows.items) |row| {
+            const ladder = for (samples) |s| {
+                if (s.arm == arm and s.kind == .ladder and s.prompt_len == row.len) break s;
+            } else continue;
+            var rung: [16]u8 = undefined;
+            var prefill: [24]u8 = undefined;
+            var pw = std.Io.Writer.fixed(&prefill);
+            try writeThousands(&pw, ladder.prefillTps());
+            try w.print("{s:<6} {s:<5}  {d:>8}  {s:>13}  {d:>6.2}  {d:>12.1}  {s}\n", .{
+                @tagName(arm),
+                try std.fmt.bufPrint(&rung, "{d}k", .{row.len / 1024}),
+                ladder.cached_n,
+                pw.buffered(),
+                ladder.ttftMs() / 1000.0,
+                median(row.tps[0..row.n]),
+                modeLabel(row),
+            });
+        }
+    }
+    var any = false;
+    for (samples) |s| {
+        const p = check(s) orelse continue;
+        if (!any) try w.writeAll("\nNot a valid measurement:\n");
+        any = true;
+        try w.print("- {s}, {d} tokens ({s}): {s}\n", .{ @tagName(s.arm), s.prompt_len, @tagName(s.kind), problemText(p) });
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -576,11 +737,16 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
     if (rep.aborted.len > 0) try w.print("**Aborted, not a measurement:** {s}\n\n", .{rep.aborted});
     try gpu_clock.writeRunHeader(w, rep.clock);
     try w.print(
-        "Protocol: token ids on `/v1/completions`, greedy, `ignore_eos`, {d} decoded tokens a sample ({d} on prose). The code arm is one fixed seeded TypeScript corpus; " ++
+        "Protocol: {s}, greedy, `ignore_eos`, {d} decoded tokens a sample ({d} on prose). The code arm is one fixed seeded TypeScript corpus; " ++
             "the prose arm is Pride and Prejudice (public domain), where speculative acceptance is lower. " ++
-            "Each arm runs in turn on the same server: the 4k request is cold; each later request restores the previous prompt-end point. A decode rung's samples 2 and 3 run right after its ladder request, and the first request counts. " ++
+            "Each arm runs in turn on the same {s}: the 4k request is cold; each later request restores the previous prompt-end point. A decode rung's samples 2 and 3 run right after its ladder request, and the first request counts. " ++
             "The server's own prefill time, the restore time (logged apart) taken out; TTFT is the request wall time minus its decode time. The server's default speculative mode stays on.",
-        .{ rep.decode_tokens, armDecodeTokens(.prose, rep.decode_tokens) },
+        .{
+            if (rep.in_process) "token ids submitted to the scheduler in this process" else "token ids on `/v1/completions`",
+            rep.decode_tokens,
+            armDecodeTokens(.prose, rep.decode_tokens),
+            if (rep.in_process) "loaded model" else "server",
+        },
     );
     if (rep.cooldown) |c| {
         try w.print(" The server idled {d} s between the arms (", .{c.waited_s});
@@ -640,12 +806,7 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
         const p = check(s) orelse continue;
         if (!any) try w.writeAll("\n## Warnings\n\nA row with a warning is not a valid measurement.\n\n");
         any = true;
-        try w.print("- {s}, {d} tokens ({s}): {s}\n", .{ @tagName(s.arm), s.prompt_len, @tagName(s.kind), switch (p) {
-            .restore_missed => "restored fewer tokens than the previous prompt end holds",
-            .no_restore_line => "no restore line in the server log, so the restore time was not taken out",
-            .short_decode => "decoded fewer tokens than asked",
-            .gpu_throttled => "the GPU clock or thermal pressure failed the abort rule (see the GPU columns)",
-        } });
+        try w.print("- {s}, {d} tokens ({s}): {s}\n", .{ @tagName(s.arm), s.prompt_len, @tagName(s.kind), problemText(p) });
     }
 
     var noted = false;
@@ -786,19 +947,198 @@ fn throttleMessage(a: std.mem.Allocator, s: Sample) ![]u8 {
     });
 }
 
-pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    const opts = parseArgs(args) catch |err| {
-        log.err("sushi bench: {s}\n\n{s}", .{ @errorName(err), USAGE });
+const Backend = struct {
+    ptr: *anyopaque,
+    tokenizeFn: *const fn (ptr: *anyopaque, a: std.mem.Allocator, text: []const u8, ids: *std.ArrayList(u32)) anyerror!void,
+    requestFn: *const fn (ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler) anyerror!Sample,
+};
+
+const Outcome = struct {
+    samples: []const Sample,
+    clock: gpu_clock.RunSummary,
+    aborted: []const u8,
+    cooldown: ?box.Cooldown,
+};
+
+/// The arms the options select, each with its whole schedule, through one backend.
+fn runArms(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Options, model: []const u8, backend: Backend) !Outcome {
+    var samples: std.ArrayList(Sample) = .empty;
+    const sampler = startSampler(gpa, io);
+    defer if (sampler) |s| s.stop();
+    var aborted: []const u8 = "";
+    var cooldown: ?box.Cooldown = null;
+    var first = true;
+    const need = corpusTokens(opts.rungs);
+    arms: for ([_]Arm{ .code, .prose }) |arm| {
+        if (!opts.runsArm(arm)) continue;
+        if (!first) {
+            const c = box.cooldown(a, io);
+            if (c.start_c) |t| log.info("[bench] arms cooldown: {d:.0} C -> {d:.0} C in {d} s\n", .{ t, c.end_c orelse t, c.waited_s }) else log.info("[bench] arms cooldown: {d} s (no fanctl)\n", .{c.waited_s});
+            cooldown = c;
+        }
+        first = false;
+        var ids: std.ArrayList(u32) = .empty;
+        switch (arm) {
+            .code => {
+                var corpus = Corpus.init(corpus_seed);
+                while (ids.items.len < need) try backend.tokenizeFn(backend.ptr, a, try corpus.nextChunk(a), &ids);
+            },
+            .prose => {
+                var chunks: ProseChunks = .{ .text = prose_text };
+                while (ids.items.len < need) {
+                    const piece = chunks.next() orelse {
+                        log.err("sushi bench: the prose corpus holds {d} tokens, short of the {d} the ladder needs\n", .{ ids.items.len, need });
+                        return error.BenchProseTooShort;
+                    };
+                    try backend.tokenizeFn(backend.ptr, a, piece, &ids);
+                }
+            },
+        }
+        log.info("[bench] {s} corpus: {d} tokens, model {s}\n", .{ @tagName(arm), ids.items.len, model });
+        const reqs = try plan(a, armDecodeTokens(arm, opts.decode_tokens), opts.rungs);
+        for (reqs) |req| {
+            const s = try backend.requestFn(backend.ptr, a, ids.items, req, arm, sampler);
+            try samples.append(a, s);
+            log.info("[bench] {s} {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}, gpu {d:.0} MHz {s}{s}\n", .{
+                @tagName(arm),                     s.prompt_len,  @tagName(s.kind), s.cached_n, s.newTokens(), s.prefillTps(), s.ttftMs() / 1000.0, s.decodeTps(),
+                if (s.mode.len > 0) s.mode else "none", s.gpu_mhz, if (s.gpu_pressure) |p| gpu_clock.pressureLabel(p) else "unmonitored", if (check(s) != null) " WARNING" else "",
+            });
+            if (check(s) == .gpu_throttled) {
+                aborted = try throttleMessage(a, s);
+                break :arms;
+            }
+        }
+    }
+    return .{ .samples = samples.items, .clock = if (sampler) |s| try s.summarizeAll(a) else .{}, .aborted = aborted, .cooldown = cooldown };
+}
+
+const HttpBackend = struct {
+    io: std.Io,
+    client: *std.http.Client,
+    base: []const u8,
+    url: []const u8,
+    model: []const u8,
+    log_path: []const u8,
+    log_len: usize,
+
+    fn tokenize(ptr: *anyopaque, a: std.mem.Allocator, text: []const u8, ids: *std.ArrayList(u32)) anyerror!void {
+        const self: *HttpBackend = @ptrCast(@alignCast(ptr));
+        try tokenizeChunk(a, self.client, self.base, text, ids);
+    }
+
+    fn request(ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler) anyerror!Sample {
+        const self: *HttpBackend = @ptrCast(@alignCast(ptr));
+        return runRequest(a, self.io, self.client, self.url, self.model, self.log_path, ids, req, arm, &self.log_len, sampler);
+    }
+
+    fn backend(self: *HttpBackend) Backend {
+        return .{ .ptr = self, .tokenizeFn = tokenize, .requestFn = request };
+    }
+};
+
+/// A request through `completions.completeIds`: the scheduler's own timings, the restore time and the
+/// speculative mode read off the slot instead of the server's log.
+const LocalBackend = struct {
+    io: std.Io,
+    lm: *LoadedModel,
+
+    fn tokenize(ptr: *anyopaque, a: std.mem.Allocator, text: []const u8, ids: *std.ArrayList(u32)) anyerror!void {
+        const self: *LocalBackend = @ptrCast(@alignCast(ptr));
+        const piece = try self.lm.tokenizer.?.encode(a, text);
+        defer a.free(piece);
+        try ids.appendSlice(a, piece);
+    }
+
+    fn request(ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler) anyerror!Sample {
+        const self: *LocalBackend = @ptrCast(@alignCast(ptr));
+        var wall = io_util.Stopwatch.init(self.io);
+        const started_ms = io_util.nowMsMonotonic(self.io);
+        const r = completions.completeIds(a, self.lm, ids[0..req.prompt_len], req.max_tokens) catch |err| {
+            log.err("sushi bench: the {s} {d}-token request failed: {s}\n", .{ @tagName(arm), req.prompt_len, @errorName(err) });
+            if (err == error.PromptExceedsContext) log.err("sushi bench: the context is shorter than the ladder: pass --ctx-size, or fewer rungs\n", .{});
+            return err;
+        };
+        const ended_ms = io_util.nowMsMonotonic(self.io);
+        const wall_ms = @as(f64, @floatFromInt(wall.read())) / std.time.ns_per_ms;
+        defer a.free(r.text);
+        defer a.free(r.token_ids);
+
+        var gpu: gpu_clock.Summary = .{};
+        if (sampler) |s| {
+            _ = s.waitPast(ended_ms, 2 * gpu_clock.interval_ms);
+            gpu = try s.summarizeWindow(a, started_ms, ended_ms);
+        }
+        return .{
+            .arm = arm,
+            .prompt_len = req.prompt_len,
+            .kind = req.kind,
+            .base = req.base,
+            .max_tokens = req.max_tokens,
+            .prompt_n = r.prompt_tokens,
+            .cached_n = r.cached_tokens,
+            .completion_n = r.completion_tokens,
+            .prompt_ms = nsToMs(r.prefill_ns),
+            .predicted_ms = nsToMs(r.decode_ns),
+            .wall_ms = wall_ms,
+            .restore_ms = nsToMs(r.restore_ns orelse 0),
+            .restore_logged = r.restore_ns != null,
+            .mode = if (r.spec_mode == .none) "" else @tagName(r.spec_mode),
+            .gpu_mhz = gpu.mhz,
+            .gpu_pressure = gpu.pressure,
+            .loop_stop = std.mem.eql(u8, r.finish_reason, "stop") and if (r.finish_details) |d| std.mem.eql(u8, d, "repetition_loop") else false,
+        };
+    }
+
+    fn backend(self: *LocalBackend) Backend {
+        return .{ .ptr = self, .tokenizeFn = tokenize, .requestFn = request };
+    }
+};
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
+}
+
+fn rawJson(a: std.mem.Allocator, opts: Options, model: []const u8, url: ?[]const u8, out: Outcome) ![]u8 {
+    return std.json.Stringify.valueAlloc(a, .{
+        .model = model,
+        .url = url,
+        .decode_tokens = opts.decode_tokens,
+        .rungs = opts.rungs,
+        .arms = @tagName(opts.arms),
+        .corpus_seed = corpus_seed,
+        .stamp = opts.stamp,
+        .aborted = out.aborted,
+        .samples = out.samples,
+    }, .{ .whitespace = .indent_2 });
+}
+
+pub const Launch = union(enum) { done, in_process: *InProcess };
+
+/// Parses the arguments. `--url` mode is the HTTP client and runs here to its end; `--model` mode hands back the
+/// run, which main starts through the serve path.
+pub fn start(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !Launch {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var keep_arena = false;
+    defer if (!keep_arena) arena_state.deinit();
+    const opts = parseArgs(arena_state.allocator(), args) catch |err| {
+        log.err("sushi bench: {s}{s}{s}\n\n{s}", .{ @errorName(err), if (rejected_flag.len > 0) " " else "", rejected_flag, USAGE });
         return err;
     };
     if (opts.help) {
         try printOut(io, USAGE);
-        return;
+        return .done;
     }
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
+    if (opts.inProcess()) {
+        keep_arena = true;
+        const run = try gpa.create(InProcess);
+        run.* = .{ .gpa = gpa, .io = io, .arena = arena_state, .opts = opts };
+        return .{ .in_process = run };
+    }
+    try runClient(gpa, arena_state.allocator(), io, opts);
+    return .done;
+}
 
+fn runClient(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const base = try std.fmt.allocPrint(a, "http://{s}", .{opts.url});
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();
@@ -815,95 +1155,241 @@ pub fn cmdBench(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         model = parsed.value.data[0].id;
     }
 
-    var samples: std.ArrayList(Sample) = .empty;
-    const url = try std.fmt.allocPrint(a, "{s}/v1/completions", .{base});
-    var log_len: usize = (try readLog(a, io, opts.log_path)).len;
-    const sampler = startSampler(gpa, io);
-    defer if (sampler) |s| s.stop();
-    var aborted: []const u8 = "";
-    var cooldown: ?box.Cooldown = null;
-    arms: for ([_]Arm{ .code, .prose }) |arm| {
-        if (arm == .prose) {
-            const c = box.cooldown(a, io);
-            if (c.start_c) |t| log.info("[bench] arms cooldown: {d:.0} C -> {d:.0} C in {d} s\n", .{ t, c.end_c orelse t, c.waited_s }) else log.info("[bench] arms cooldown: {d} s (no fanctl)\n", .{c.waited_s});
-            cooldown = c;
-        }
-        var ids: std.ArrayList(u32) = .empty;
-        switch (arm) {
-            .code => {
-                var corpus = Corpus.init(corpus_seed);
-                while (ids.items.len < corpus_tokens) try tokenizeChunk(a, &client, base, try corpus.nextChunk(a), &ids);
-            },
-            .prose => {
-                var chunks: ProseChunks = .{ .text = prose_text };
-                while (ids.items.len < corpus_tokens) {
-                    const piece = chunks.next() orelse {
-                        log.err("sushi bench: the prose corpus holds {d} tokens, short of the {d} the ladder needs\n", .{ ids.items.len, corpus_tokens });
-                        return error.BenchProseTooShort;
-                    };
-                    try tokenizeChunk(a, &client, base, piece, &ids);
-                }
-            },
-        }
-        log.info("[bench] {s} corpus: {d} tokens, model {s}\n", .{ @tagName(arm), ids.items.len, model });
-        const reqs = try plan(a, armDecodeTokens(arm, opts.decode_tokens));
-        for (reqs) |req| {
-            const s = try runRequest(a, io, &client, url, model, opts.log_path, ids.items, req, arm, &log_len, sampler);
-            try samples.append(a, s);
-            log.info("[bench] {s} {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}, gpu {d:.0} MHz {s}{s}\n", .{
-                @tagName(arm),                     s.prompt_len,  @tagName(s.kind), s.cached_n, s.newTokens(), s.prefillTps(), s.ttftMs() / 1000.0, s.decodeTps(),
-                if (s.mode.len > 0) s.mode else "none", s.gpu_mhz, if (s.gpu_pressure) |p| gpu_clock.pressureLabel(p) else "unmonitored", if (check(s) != null) " WARNING" else "",
-            });
-            if (check(s) == .gpu_throttled) {
-                aborted = try throttleMessage(a, s);
-                break :arms;
-            }
-        }
-    }
+    var http: HttpBackend = .{
+        .io = io,
+        .client = &client,
+        .base = base,
+        .url = try std.fmt.allocPrint(a, "{s}/v1/completions", .{base}),
+        .model = model,
+        .log_path = opts.log_path,
+        .log_len = (try readLog(a, io, opts.log_path)).len,
+    };
+    const out = try runArms(gpa, a, io, opts, model, http.backend());
 
     const rep: Report = .{
         .model = model,
         .version = opts.version,
         .stamp = opts.stamp,
         .decode_tokens = opts.decode_tokens,
-        .samples = samples.items,
-        .clock = if (sampler) |s| try s.summarizeAll(a) else .{},
-        .aborted = aborted,
-        .cooldown = cooldown,
+        .samples = out.samples,
+        .clock = out.clock,
+        .aborted = out.aborted,
+        .cooldown = out.cooldown,
     };
-    const raw = try std.json.Stringify.valueAlloc(a, .{ .model = model, .url = opts.url, .decode_tokens = opts.decode_tokens, .corpus_seed = corpus_seed, .stamp = opts.stamp, .aborted = aborted, .samples = samples.items }, .{ .whitespace = .indent_2 });
-    try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench.json" }), raw);
+    try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench.json" }), try rawJson(a, opts, model, opts.url, out));
     const md = try render(a, rep);
     try printOut(io, md);
-    if (aborted.len > 0) {
+    if (out.aborted.len > 0) {
         // The partial report stays in the run directory: a docs/bench report is a finished measurement.
         try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench-aborted.md" }), md);
-        log.err("sushi bench: aborted, {s}\n", .{aborted});
+        log.err("sushi bench: aborted, {s}\n", .{out.aborted});
         return error.BenchGpuThrottled;
     }
     if (opts.report.len > 0) try writeFile(io, opts.report, md);
-    for (samples.items) |s| if (check(s) != null) return error.BenchInvalidSamples;
+    for (out.samples) |s| if (check(s) != null) return error.BenchInvalidSamples;
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+/// `sushi bench --model`: the serve path loads the model and, with no listener, starts `embeddedClient`,
+/// which runs the bench against the scheduler and ends the run.
+pub const InProcess = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    arena: std.heap.ArenaAllocator,
+    opts: Options,
+    out_dir: []const u8 = "",
+    cache_dir: []const u8 = "",
+    err: ?anyerror = null,
+
+    /// The directory the run's files go to: `--out`, else a fresh `~/.sushi/runs/bench-<UTC timestamp>/`.
+    /// The prefix cache lives beside them as a private directory, removed at the end unless `--out` named the run.
+    pub fn prepare(self: *InProcess) !void {
+        const a = self.arena.allocator();
+        self.out_dir = if (self.opts.out_dir.len > 0) self.opts.out_dir else blk: {
+            const home = std.c.getenv("HOME") orelse return error.NoHome;
+            break :blk try std.fmt.allocPrint(a, "{s}/.sushi/runs/bench-{s}", .{ std.mem.span(home), stampName(std.Io.Timestamp.now(self.io, .real).toSeconds()) });
+        };
+        const rel = try std.fs.path.join(a, &.{ self.out_dir, "cache" });
+        std.Io.Dir.cwd().deleteTree(self.io, rel) catch {};
+        try std.Io.Dir.cwd().createDirPath(self.io, rel);
+        const abs = try std.Io.Dir.cwd().realPathFileAlloc(self.io, rel, a);
+        self.cache_dir = abs;
+        if (setenv("SUSHI_PREFIX_CACHE_DIR", abs.ptr, 1) != 0) return error.SetenvFailed;
+    }
+
+    /// The server log of the run, unless `--log-file` says otherwise.
+    pub fn logPath(self: *InProcess) ![]const u8 {
+        return std.fs.path.join(self.arena.allocator(), &.{ self.out_dir, "server.log" });
+    }
+
+    /// The serve parser's argv: the program name, `--serve` (one model, no discovery), then what the bench left.
+    pub fn argv(self: *InProcess, prog: []const u8) ![]const []const u8 {
+        const a = self.arena.allocator();
+        var list: std.ArrayList([]const u8) = .empty;
+        try list.appendSlice(a, &.{ prog, "--serve" });
+        try list.appendSlice(a, self.opts.serve_args);
+        return list.items;
+    }
+
+    pub fn finish(self: *InProcess) void {
+        if (self.cache_dir.len > 0 and self.opts.out_dir.len == 0) std.Io.Dir.cwd().deleteTree(self.io, self.cache_dir) catch {};
+        self.arena.deinit();
+        self.gpa.destroy(self);
+    }
+};
+
+var current: ?*InProcess = null;
+
+pub fn setCurrent(run: *InProcess) void {
+    current = run;
+}
+
+pub fn embeddedClient() anyerror!std.Thread {
+    return std.Thread.spawn(.{}, inProcessMain, .{current.?});
+}
+
+fn inProcessMain(run: *InProcess) void {
+    defer server_mod.requestShutdown();
+    runLocal(run) catch |err| {
+        run.err = err;
+    };
+}
+
+fn runLocal(run: *InProcess) !void {
+    const a = run.arena.allocator();
+    const io = run.io;
+    const sch = server_mod.global_scheduler orelse return error.BenchNoScheduler;
+    const lm = try sch.ensureLoaded("");
+    defer sch.release(lm);
+    var local: LocalBackend = .{ .io = io, .lm = lm };
+    const out = try runArms(run.gpa, a, io, run.opts, lm.id, local.backend());
+
+    const rep: Report = .{
+        .model = lm.id,
+        .version = run.opts.version,
+        .stamp = run.opts.stamp,
+        .decode_tokens = run.opts.decode_tokens,
+        .samples = out.samples,
+        .clock = out.clock,
+        .aborted = out.aborted,
+        .cooldown = out.cooldown,
+        .in_process = true,
+    };
+    try writeFile(io, try std.fs.path.join(a, &.{ run.out_dir, "bench.json" }), try rawJson(a, run.opts, lm.id, null, out));
+    try printOut(io, try renderTable(a, out.samples));
+    if (out.aborted.len > 0) {
+        try writeFile(io, try std.fs.path.join(a, &.{ run.out_dir, "bench-aborted.md" }), try render(a, rep));
+        log.err("sushi bench: aborted, {s}\n", .{out.aborted});
+        return error.BenchGpuThrottled;
+    }
+    if (run.opts.report.len > 0) try writeFile(io, run.opts.report, try render(a, rep));
+    for (out.samples) |s| if (check(s) != null) return error.BenchInvalidSamples;
+}
+
+/// `YYYYMMDD-HHMMSS` in UTC.
+fn stampName(epoch_s: i64) [15]u8 {
+    const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(epoch_s) };
+    const day = es.getEpochDay().calculateYearDay();
+    const md = day.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    var buf: [15]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+        day.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    }) catch unreachable;
+    return buf;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
-test "bench args: defaults, every flag, and a refusal for the rest" {
-    const o = try parseArgs(&.{ "--out", "/tmp/o", "--log", "/tmp/l", "--decode-tokens", "256", "--url", "127.0.0.1:9", "--version", "1.4.0" });
+fn parseTest(args: []const []const u8) !Options {
+    return parseArgs(std.heap.page_allocator, args);
+}
+
+test "bench args: url mode needs --out and --log, takes every report flag, and refuses the rest" {
+    const o = try parseTest(&.{ "--out", "/tmp/o", "--log", "/tmp/l", "--tokens", "256", "--url", "127.0.0.1:9", "--version", "1.4.0" });
+    try testing.expect(!o.inProcess());
     try testing.expectEqual(@as(u32, 256), o.decode_tokens);
     try testing.expectEqualStrings("127.0.0.1:9", o.url);
-    try testing.expectEqual(@as(u32, 256), (try parseArgs(&.{ "--out", "o", "--log", "l" })).decode_tokens);
-    try testing.expectError(error.UnknownArgument, parseArgs(&.{ "--out", "o", "--log", "l", "--fast" }));
-    try testing.expectError(error.MissingValue, parseArgs(&.{ "--out", "o", "--log" }));
-    try testing.expectError(error.BadValue, parseArgs(&.{ "--out", "o", "--log", "l", "--decode-tokens", "0" }));
-    try testing.expectError(error.BadValue, parseArgs(&.{ "--out", "o", "--log", "l", "--decode-tokens", "x" }));
-    try testing.expectError(error.BadValue, parseArgs(&.{ "--out", "o", "--log", "l", "--url", "http://h:1" }));
-    try testing.expectError(error.MissingRequired, parseArgs(&.{ "--url", "h:1" }));
-    try testing.expect((try parseArgs(&.{"--help"})).help);
+    try testing.expectEqual(@as(usize, default_rungs.len), o.rungs.len);
+    try testing.expectEqual(ArmSelect.both, o.arms);
+    const bare = try parseTest(&.{ "--out", "o", "--log", "l" });
+    try testing.expectEqual(@as(u32, 256), bare.decode_tokens);
+    try testing.expectEqualStrings(default_url, bare.url);
+    try testing.expect(!bare.inProcess());
+    // A model id beside --url is the id to send, not a pack to load.
+    try testing.expect(!(try parseTest(&.{ "--url", "h:1", "--model", "id", "--out", "o", "--log", "l" })).inProcess());
+    try testing.expectError(error.UnknownArgument, parseTest(&.{ "--out", "o", "--log", "l", "--fast" }));
+    try testing.expectError(error.UnknownArgument, parseTest(&.{ "--out", "o", "--log", "l", "--decode-tokens", "8" }));
+    try testing.expectError(error.MissingValue, parseTest(&.{ "--out", "o", "--log" }));
+    try testing.expectError(error.BadValue, parseTest(&.{ "--out", "o", "--log", "l", "--tokens", "1" }));
+    try testing.expectError(error.BadValue, parseTest(&.{ "--out", "o", "--log", "l", "--tokens", "x" }));
+    try testing.expectError(error.BadValue, parseTest(&.{ "--out", "o", "--log", "l", "--url", "http://h:1" }));
+    try testing.expectError(error.MissingRequired, parseTest(&.{ "--url", "h:1" }));
+    try testing.expectError(error.MissingRequired, parseTest(&.{ "--url", "h:1", "--out", "o" }));
+    try testing.expect((try parseTest(&.{"--help"})).help);
+}
+
+test "bench args: --model alone loads in this process, leaves --out optional and hands the serve flags on in order" {
+    const o = try parseTest(&.{ "--model", "/m/pack", "--rungs", "4k", "--ssd-budget-gb", "48", "--tokens", "64", "--no-mtp", "--code-only" });
+    try testing.expect(o.inProcess());
+    try testing.expectEqualStrings("", o.out_dir);
+    try testing.expectEqual(@as(u32, 64), o.decode_tokens);
+    try testing.expectEqual(ArmSelect.code_only, o.arms);
+    try testing.expectEqualSlices(usize, &.{4096}, o.rungs);
+    const want = [_][]const u8{ "--model", "/m/pack", "--ssd-budget-gb", "48", "--no-mtp" };
+    try testing.expectEqual(want.len, o.serve_args.len);
+    for (want, o.serve_args) |w, got| try testing.expectEqualStrings(w, got);
+    const out = try parseTest(&.{ "--out", "/r/x", "--model", "/m/pack" });
+    try testing.expectEqualStrings("/r/x", out.out_dir);
+    // The server's log is a client-mode input.
+    try testing.expectError(error.ConflictingFlags, parseTest(&.{ "--model", "/m/pack", "--log", "l" }));
+    try testing.expect((try parseTest(&.{ "--model", "/m/pack", "--help" })).help);
+}
+
+test "bench args: --rungs takes a k suffix, sorts, and refuses a rung the ladder cannot land on" {
+    const a = std.heap.page_allocator;
+    try testing.expectEqualSlices(usize, &.{ 4096, 16384 }, try parseRungs(a, "4k,16k"));
+    try testing.expectEqualSlices(usize, &.{8192}, try parseRungs(a, "8192"));
+    try testing.expectEqualSlices(usize, &.{ 4096, 131072 }, try parseRungs(a, "128K,4k"));
+    try testing.expectEqualSlices(usize, &.{ 8192, 24576 }, try parseRungs(a, "24k,8k,24576"));
+    for ([_][]const u8{ "", "4k,", "x", "0", "2k", "5k", "12k", "136k", "131073", "4096k", "k", "-4k" }) |bad| {
+        try testing.expectError(error.BadValue, parseRungs(a, bad));
+    }
+    try testing.expectError(error.BadValue, parseTest(&.{ "--model", "m", "--rungs", "6k" }));
+    try testing.expectError(error.MissingValue, parseTest(&.{ "--model", "m", "--rungs" }));
+}
+
+test "bench args: the report's version is this binary's unless --version names another, and --version needs no value" {
+    const own = @import("build_options").version;
+    try testing.expectEqualStrings(own, (try parseTest(&.{ "--model", "m" })).version);
+    try testing.expectEqualStrings("9.9.9", (try parseTest(&.{ "--model", "m", "--version", "9.9.9" })).version);
+    try testing.expectEqualStrings(own, (try parseTest(&.{ "--model", "m", "--version" })).version);
+    // A flag after a bare --version is that flag, not the version.
+    const o = try parseTest(&.{ "--model", "m", "--version", "--rungs", "4k" });
+    try testing.expectEqualStrings(own, o.version);
+    try testing.expectEqualSlices(usize, &.{4096}, o.rungs);
+    const client = try parseTest(&.{ "--version", "--out", "o", "--log", "l" });
+    try testing.expectEqualStrings(own, client.version);
+    try testing.expectEqualStrings("o", client.out_dir);
+}
+
+test "bench args: the two arm flags exclude each other, and an arm flag picks its arm" {
+    const code = try parseTest(&.{ "--model", "m", "--code-only" });
+    try testing.expect(code.runsArm(.code) and !code.runsArm(.prose));
+    const prose = try parseTest(&.{ "--model", "m", "--prose-only" });
+    try testing.expect(!prose.runsArm(.code) and prose.runsArm(.prose));
+    const both = try parseTest(&.{ "--model", "m" });
+    try testing.expect(both.runsArm(.code) and both.runsArm(.prose));
+    try testing.expectError(error.ConflictingFlags, parseTest(&.{ "--model", "m", "--code-only", "--prose-only" }));
+    try testing.expectError(error.ConflictingFlags, parseTest(&.{ "--out", "o", "--log", "l", "--prose-only", "--code-only" }));
+    try testing.expect((try parseTest(&.{ "--out", "o", "--log", "l", "--prose-only" })).runsArm(.prose));
 }
 
 test "bench: --help lists every flag the parser accepts" {
     for (value_flags) |f| try testing.expect(std.mem.indexOf(u8, USAGE, f) != null);
-    try testing.expect(std.mem.indexOf(u8, USAGE, "--help") != null);
+    for ([_][]const u8{ "--code-only", "--prose-only", "--rungs", "--tokens", "--help" }) |f| try testing.expect(std.mem.indexOf(u8, USAGE, f) != null);
+    try testing.expect(std.mem.indexOf(u8, USAGE, "--decode-tokens") == null);
 }
 
 test "bench corpus: the same seed gives the same bytes, a chunk is whole modules" {
@@ -927,10 +1413,10 @@ test "bench corpus: the same seed gives the same bytes, a chunk is whole modules
     try testing.expect(!std.mem.eql(u8, x, next));
 }
 
-test "bench plan: a cold 4k, 16 windows, two repeats after each of the six decode rungs" {
-    const reqs = try plan(testing.allocator, 512);
+test "bench plan: the default ladder is a cold 4k, 16 windows, two repeats after each of the six decode rungs" {
+    const reqs = try plan(testing.allocator, 512, &default_rungs);
     defer testing.allocator.free(reqs);
-    try testing.expectEqual(@as(usize, 1 + ladder_steps + 6 * 2), reqs.len);
+    try testing.expectEqual(@as(usize, 1 + 16 + 6 * 2), reqs.len);
     try testing.expectEqual(@as(usize, 4096), reqs[0].prompt_len);
     try testing.expectEqual(@as(usize, 0), reqs[0].base);
     try testing.expectEqual(@as(u32, 512), reqs[0].max_tokens);
@@ -951,9 +1437,92 @@ test "bench plan: a cold 4k, 16 windows, two repeats after each of the six decod
     var ladder: usize = 0;
     for (reqs) |r| {
         if (r.kind == .ladder) ladder += 1;
-        try testing.expect(r.prompt_len <= window * ladder_steps);
+        try testing.expect(r.prompt_len <= max_rung);
     }
-    try testing.expectEqual(@as(usize, 1 + ladder_steps), ladder);
+    try testing.expectEqual(@as(usize, 1 + 16), ladder);
+}
+
+test "bench plan: the ladder ends at the largest listed rung and decodes only at the listed ones" {
+    const a = testing.allocator;
+    const reqs = try plan(a, 8, &.{ 4096, 24576 });
+    defer a.free(reqs);
+    // 4k with its two repeats, windows 8192 and 16384 (one token each), 24k with its two repeats.
+    try testing.expectEqual(@as(usize, 3 + 2 + 3), reqs.len);
+    const want = [_]struct { len: usize, tokens: u32, base: usize }{
+        .{ .len = 4096, .tokens = 8, .base = 0 },
+        .{ .len = 4096, .tokens = 8, .base = 4096 },
+        .{ .len = 4096, .tokens = 8, .base = 4096 },
+        .{ .len = 8192, .tokens = 1, .base = 4096 },
+        .{ .len = 16384, .tokens = 1, .base = 8192 },
+        .{ .len = 24576, .tokens = 8, .base = 16384 },
+        .{ .len = 24576, .tokens = 8, .base = 24576 },
+        .{ .len = 24576, .tokens = 8, .base = 24576 },
+    };
+    for (want, reqs) |w, r| {
+        try testing.expectEqual(w.len, r.prompt_len);
+        try testing.expectEqual(w.tokens, r.max_tokens);
+        try testing.expectEqual(w.base, r.base);
+    }
+    try testing.expectEqual(Kind.ladder, reqs[5].kind);
+    try testing.expectEqual(Kind.repeat, reqs[6].kind);
+}
+
+test "bench plan: a lone 4k rung is one cold request and its two repeats, a lone big rung walks the whole ladder to it" {
+    const a = testing.allocator;
+    const one = try plan(a, 8, &.{4096});
+    defer a.free(one);
+    try testing.expectEqual(@as(usize, 3), one.len);
+    for (one) |r| try testing.expectEqual(@as(usize, 4096), r.prompt_len);
+    const big = try plan(a, 8, &.{32768});
+    defer a.free(big);
+    // 4k, then 8k 16k 24k 32k: five ladder requests, decoded only at the end.
+    try testing.expectEqual(@as(usize, 5 + 2), big.len);
+    for (big[0..4]) |r| try testing.expectEqual(@as(u32, 1), r.max_tokens);
+    try testing.expectEqual(@as(u32, 8), big[4].max_tokens);
+    try testing.expectEqual(@as(usize, 32768), big[big.len - 1].prompt_len);
+}
+
+test "bench corpus: it holds the largest rung and a margin, the full ladder's 132,000 tokens as before" {
+    try testing.expectEqual(@as(usize, 132_000), corpusTokens(&default_rungs));
+    try testing.expectEqual(@as(usize, 4096 + 928), corpusTokens(&.{4096}));
+    try testing.expectEqual(@as(usize, 16384 + 928), corpusTokens(&.{ 4096, 16384 }));
+}
+
+test "bench table: one row a decode rung with the window that ends at it, the decode median and the mode" {
+    const a = testing.allocator;
+    const mk = struct {
+        fn s(arm: Arm, len: usize, kind: Kind, base: usize, max: u32, cached: u32, prompt_ms: f64, decode_ms: f64, mode: []const u8) Sample {
+            return .{ .arm = arm, .prompt_len = len, .kind = kind, .base = base, .max_tokens = max, .prompt_n = @intCast(len), .cached_n = cached, .completion_n = if (max > 1) 512 else 1, .prompt_ms = prompt_ms, .predicted_ms = decode_ms, .wall_ms = prompt_ms + decode_ms, .restore_ms = 0, .restore_logged = true, .mode = mode };
+        }
+    }.s;
+    const samples = [_]Sample{
+        mk(.code, 4096, .ladder, 0, 512, 0, 2000, 10_000, "dspark"),
+        mk(.code, 4096, .repeat, 4096, 512, 4065, 40, 8_000, "dspark"),
+        mk(.code, 4096, .repeat, 4096, 512, 4065, 40, 16_000, "dspark"),
+        mk(.code, 8192, .ladder, 4096, 1, 4065, 3000, 50, ""),
+        mk(.prose, 4096, .ladder, 0, 512, 0, 4000, 20_000, "mtp"),
+        mk(.prose, 4096, .repeat, 4096, 512, 4065, 40, 20_000, "mtp"),
+        mk(.prose, 4096, .repeat, 4096, 512, 4065, 40, 20_000, "none"),
+    };
+    const t = try renderTable(a, &samples);
+    defer a.free(t);
+    var lines = std.mem.splitScalar(u8, t, '\n');
+    const head = lines.next().?;
+    for ([_][]const u8{ "arm", "rung", "restored", "prefill tok/s", "ttft s", "decode tok/s", "mode" }) |col| try testing.expect(std.mem.indexOf(u8, head, col) != null);
+    // 4096 new tokens in 2.0 s is 2,048 tok/s; 512 tokens in 10 s, 8 s, 16 s is a 51.2 tok/s median.
+    const code4 = lines.next().?;
+    try testing.expect(std.mem.indexOf(u8, code4, "code") != null);
+    try testing.expect(std.mem.indexOf(u8, code4, "4k") != null);
+    try testing.expect(std.mem.indexOf(u8, code4, "2,048") != null);
+    try testing.expect(std.mem.indexOf(u8, code4, "51.2") != null);
+    try testing.expect(std.mem.indexOf(u8, code4, "dspark") != null);
+    // The 8k window decodes one token, so it has no decode row; the prose arm follows.
+    const prose4 = lines.next().?;
+    try testing.expect(std.mem.indexOf(u8, prose4, "prose") != null);
+    try testing.expect(std.mem.indexOf(u8, prose4, "25.6") != null);
+    try testing.expect(std.mem.indexOf(u8, prose4, "mixed") != null);
+    try testing.expectEqualStrings("", lines.next().?);
+    try testing.expect(lines.next() == null);
 }
 
 test "bench samples: the restore comes out of the prefill time, and a missed restore is flagged" {

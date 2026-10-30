@@ -95,6 +95,19 @@ refusal while any `sushi`, `sushi-repack` or `sushi-grid` runs), boots the serve
 and stops it. The raw `bench.json` (every request), the server log and `bench.log` stay in the run directory; the report
 `docs/bench/v<ver>/<pack>.md` carries the commit, binary SHA-256 and mtime, flags and hardware.
 
+`sushi bench --model <pack> [--rungs 4k,16k] [--tokens 256] [--code-only | --prose-only] [<serve flags>]` is the same
+bench with no server to boot: the pack loads in this process, through the serve path, and each request goes straight
+to the scheduler (`completions.completeIds`, the resolution `/v1/completions` does for a token-id body: default sampling,
+speculative mode, context clamp). It reads prefill, decode, TTFT, the restore time and the speculative mode that
+engaged off the finished slot instead of the HTTP reply and the log, so a request is the one `--url` mode would send.
+Every serve flag applies as it does to `sushi serve --model` (`--ssd-budget-gb`, `--kv-quant`, `--no-mtp`, `--ctx-size`);
+`--host`, `--port` and `--prompt` are refused. The ladder grows in 8192-token windows to the largest rung and decodes
+only at the listed ones; the run ends with a compact arm-by-rung table and any warnings, and `bench.json` lands in
+`--out` (default `~/.sushi/runs/bench-<UTC stamp>/`, with the run's `server.log`). The prefix cache is a private
+`<out>/cache`, removed at the end unless `--out` named the run. It takes none of the box rules (lock, quiet window, fans
+at the boot, AC check): for a number you record, take them as `tests/bench.sh` does, which keeps the `--url` mode.
+`bench.sh` passes `--rungs` and `--tokens` through.
+
 The protocol, fixed for every model and release:
 - **Two corpora, two arms.** The code arm is a seeded synthetic TypeScript codebase (`bench.Corpus`, seed fixed). The prose
   arm is Pride and Prejudice (`src/fixtures/prose_pride_and_prejudice.txt`, Project Gutenberg #1342, public domain, header
@@ -128,7 +141,7 @@ The protocol, fixed for every model and release:
   directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Without a passwordless `sudo -n powermetrics` both say the clock is not monitored and
   go on; a decode number from a run that was not monitored needs a `powermetrics` look beside it before it is recorded.
 - **The prose arm starts cool.** Between the arms `sushi bench` sets the fans to max and idles until the hottest
-  `fanctl status` die is under 50 C, at most 180 s (a fixed 180 s without `fanctl`); the wait is logged and named in the report's protocol line.
+  `fanctl status` die is under 50 C, at most 180 s (no idle when `fanctl` gives no reading); the wait is logged and named in the report's protocol line.
 - **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
   short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement. A decode the
   server's loop stop ended (`finish_details.type` = `repetition_loop`) is valid: it counts and is listed under Notes.

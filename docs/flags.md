@@ -8,7 +8,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 114 rows: 58 shared by `run`, `serve` and the bare form, 56 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 33, operator 28, machine 17, dev 35, dead 1. By recommendation: keep 106, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
+**Summary.** 117 rows: 58 shared by `run`, `serve` and the bare form, 59 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 33, operator 28, machine 17, dev 38, dead 1. By recommendation: keep 109, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -139,14 +139,16 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--ctx-size` | model max → context override (kld.zig:108) | dev | help | keep |
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
 | `kld`: `--qwen-gdn` | `32` → `16` scores a bf16-state student against the f32 teacher; a GLM capture refuses it (kld.zig:107) | dev | help, quality-kld; 2 tests | keep |
-| `bench`: `--url` | `127.0.0.1:8080` → `host:port` of the running server to drive (bench.zig `parseArgs`) | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--model` | first id of `/v1/models` → model id sent in each request | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--out` | required → directory for `bench.json`, the raw samples | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--log` | required → the server's log, read for `[spec-stats] mode=` and the restore line | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--url` | none → `host:port` of the running server to drive; naming it selects the HTTP client mode (bench.zig `parseArgs`) | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--model` | none → a pack to load and bench in this process, with no server; every flag it does not own is a serve flag. With `--url`: the model id sent in each request (default the first id of `/v1/models`) | dev | help, process-measurement; 2 tests | keep |
+| `bench`: `--out` | `~/.sushi/runs/bench-<UTC stamp>/` with `--model`, required with `--url` → directory for `bench.json`; with `--model` also the run's `server.log` and its private prefix cache, which is removed at the end unless `--out` named the run | dev | help, process-measurement; 2 tests | keep |
+| `bench`: `--log` | required with `--url` → the server's log, read for `[spec-stats] mode=` and the restore line; refused with `--model`, where the engine reports both | dev | help, process-measurement; 1 test | keep |
 | `bench`: `--report` | none → write the `docs/bench/v<ver>/<model>.md` report here | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--version` | none → release version in the report title | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--version` | this binary's version (`sushi --version`) → release version in the report title; bare or before another flag it is the default, `--version <ver>` overrides | dev | help, process-measurement; 1 test | keep |
 | `bench`: `--stamp` | none → header lines for the report (`\n` separates), which `tests/bench.sh` fills | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--decode-tokens` | `512` → tokens decoded per sample, at least 2 | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--tokens` | `256` → tokens decoded per sample, at least 2; the prose arm decodes at most 128 | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--rungs` | `4k,8k,16k,32k,64k,128k` → the decode rungs, a comma list with an optional `k` (1024); each 4096 or a multiple of 8192 up to 131072. The ladder grows in 8192-token windows to the largest | dev | help, process-measurement; 2 tests | keep |
+| `bench`: `--code-only`, `--prose-only` | both arms → run one arm; they exclude each other | dev | help, process-measurement; 1 test | keep |
 | `kld`: `--drop-expert` | `0` → compare only, the student drops n experts a layer by the pack's usage list; a capture refuses it (the teacher is exact) (kld.zig:112) | dev | help, dsv41-arch; 1 test | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |

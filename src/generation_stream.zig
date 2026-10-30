@@ -483,6 +483,8 @@ pub fn nonStreamingViaScheduler(
         .logprobs = logprobs_slice,
         .finish_details = slot.finish_details,
         .constraint_payload_byte = constraint_payload_byte,
+        .restore_ns = slot.restore_ns,
+        .spec_mode = slot.spec_mode,
     };
 }
 

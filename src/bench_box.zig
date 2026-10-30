@@ -16,7 +16,12 @@ pub const Cooldown = struct {
     end_c: ?f64 = null,
 };
 
-/// No reading means the fixed wait: only the cap ends it.
+/// Without a first reading (no `fanctl`) there is nothing to wait for: the idle is skipped, not a fixed wait.
+pub fn cooldownSkipped(start_c: ?f64) bool {
+    return start_c == null;
+}
+
+/// Once readings come, a missing one means only the cap ends the wait.
 pub fn cooldownDone(die_c: ?f64, waited_s: u32) bool {
     if (waited_s >= cooldown_cap_s) return true;
     return if (die_c) |t| t < cooldown_target_c else false;
@@ -55,6 +60,7 @@ pub fn cooldown(a: std.mem.Allocator, io: std.Io) Cooldown {
     fansMax(a, io);
     var clock = io_util.Stopwatch.init(io);
     const start_c = readDie(a, io);
+    if (cooldownSkipped(start_c)) return .{ .waited_s = 0 };
     var die = start_c;
     while (true) {
         const waited: u32 = @intCast(clock.read() / std.time.ns_per_s);
@@ -194,6 +200,12 @@ test "box: the first thing wrong is the refusal, and a clean box has none" {
     try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .pri = 4, .gpu_jobs = "1 sushi" }, &buf).?, "taskpolicy -a") != null);
     try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .pri = 31, .gpu_jobs = "812 sushi\n" }, &buf).?, "812 sushi") != null);
     try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .power = .battery }, &buf).?, "AC power") != null);
+}
+
+test "bench cooldown: no first reading skips the idle, any reading keeps it" {
+    try testing.expect(cooldownSkipped(null));
+    try testing.expect(!cooldownSkipped(30));
+    try testing.expect(!cooldownSkipped(87));
 }
 
 test "bench cooldown: stops under 50 C, is capped at 180 s, and waits the full cap without a reading" {

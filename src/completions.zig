@@ -6,6 +6,7 @@ const expert_stream_mod = @import("expert_stream.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const scheduler_mod = @import("scheduler.zig");
+const generate_mod = @import("generate.zig");
 const slot_admission = @import("slot_admission.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
@@ -211,16 +212,7 @@ pub fn handleCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_mod.server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_mod.server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_mod.server_config.default_top_k, config.gen_top_k, 0);
-
-    const repeat_penalty = parseRepeatPenalty(root);
-
-    const presence_penalty_c = parseAdditivePenalty(root, "presence_penalty");
-    const frequency_penalty_c = parseAdditivePenalty(root, "frequency_penalty");
-
-    const seed: ?u64 = parseRequestSeed(root.get("seed"));
+    var sampling = requestSampling(config, root);
 
     // Parse stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -251,25 +243,18 @@ pub fn handleCompletions(
     } else false;
 
     // Spec-decode flags (mirror chat-completions).
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm.dflash != null;
-    if (enable_drafter and lm.dflash == null) enable_drafter = false;
-    const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
-    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
-        (v == .bool and v.bool)
-    else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+    const spec_request = requestSpec(config, root, lm.dflash != null, lm.mtp != null, nativeMeasuredMoeHead(lm));
+    const enable_drafter = spec_request.drafter;
+    const allow_batch_mtp = spec_request.allow_batch_mtp;
+    var enable_mtp = spec_request.mtp;
 
     // Log the request
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
-    log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
+    log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), sampling.temperature, sampling.top_p, sampling.top_k, is_stream });
     switch (prompt) {
         .text => |s| log.info("  > \"{s}{s}\"\n", .{ s[0..@min(s.len, 80)], if (s.len > 80) "..." else "" }),
         .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
@@ -305,20 +290,11 @@ pub fn handleCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty_c, .frequency_penalty = frequency_penalty_c }, logprobs_n);
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = sampling.repeat_penalty, .presence_penalty = sampling.presence_penalty, .frequency_penalty = sampling.frequency_penalty }, logprobs_n);
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, root);
-    var sampling = sampler.SamplingParams{
-        .temperature = temperature,
-        .top_p = top_p,
-        .top_k = top_k,
-        .repeat_penalty = repeat_penalty,
-        .presence_penalty = presence_penalty_c,
-        .frequency_penalty = frequency_penalty_c,
-        .seed = seed,
-    };
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, true, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = requestThinkPenalty(allocator, lm, root, prompt_ids);
     const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
         return;
@@ -337,6 +313,64 @@ pub fn handleCompletions(
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
+}
+
+/// The sampling a completions request resolves, before the think penalty: the body, then the launch flags,
+/// then the model's generation config.
+fn requestSampling(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) sampler.SamplingParams {
+    return .{
+        .temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_mod.server_config.default_temperature, config.gen_temperature, 1.0),
+        .top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_mod.server_config.default_top_p, config.gen_top_p, 1.0),
+        .top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_mod.server_config.default_top_k, config.gen_top_k, 0),
+        .repeat_penalty = parseRepeatPenalty(root),
+        .presence_penalty = parseAdditivePenalty(root, "presence_penalty"),
+        .frequency_penalty = parseAdditivePenalty(root, "frequency_penalty"),
+        .seed = parseRequestSeed(root.get("seed")),
+    };
+}
+
+fn requestThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, root: std.json.ObjectMap, prompt_ids: []const u32) @import("think_penalty.zig").ThinkPenalty {
+    const config = lm.config.?;
+    return armThinkPenalty(allocator, lm, lm.tokenizer.?, prompt_ids, true, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
+}
+
+const SpecRequest = struct { drafter: bool, mtp: bool, allow_batch_mtp: bool };
+
+/// The speculative switches a request resolves: its own fields, else what the loaded model defaults to.
+fn requestSpec(config: *const model_mod.ModelConfig, root: std.json.ObjectMap, dflash_loaded: bool, mtp_loaded: bool, native_measured: bool) SpecRequest {
+    const drafter = if (root.get("enable_drafter")) |v| (v == .bool and v.bool) else dflash_loaded;
+    const mtp = if (root.get("enable_mtp")) |v|
+        (v == .bool and v.bool)
+    else
+        defaultEnableMtpForStreaming(mtp_loaded, config.isMoe(), forceMtpFor(config), native_measured, model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
+    return .{
+        .drafter = drafter and dflash_loaded,
+        .mtp = mtp and mtp_loaded,
+        .allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true,
+    };
+}
+
+/// A non-streaming completion of token ids with no connection, for `sushi bench` in this process: the request
+/// `handleCompletions` resolves from `{"prompt": ids, "max_tokens": n, "temperature": 0, "ignore_eos": true}`,
+/// through the same resolution and the same scheduler path.
+pub fn completeIds(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, max_tokens: u32) !generate_mod.GenerationResult {
+    const tok = lm.tokenizer.?;
+    const config = lm.config.?;
+    var body_buf: [96]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf, "{{\"max_tokens\":{d},\"temperature\":0,\"ignore_eos\":true}}", .{max_tokens});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const effective_ctx = getEffectiveContextLength(config);
+    if (ids.len > effective_ctx) return error.PromptExceedsContext;
+    var sampling = requestSampling(config, root);
+    sampling.think_penalty = requestThinkPenalty(allocator, lm, root, ids);
+    const spec_request = requestSpec(config, root, lm.dflash != null, lm.mtp != null, nativeMeasuredMoeHead(lm));
+    const enable_mtp = admitMtpForCtx(spec_request.mtp, ids.len);
+    const spec = requestSpecModes(spec_request.drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
+
+    return nonStreamingViaScheduler(allocator, server_mod.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, ids.len, effective_ctx), sampling, requestEosSlice(config, root), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true });
 }
 
 fn handleNonStreamingCompletion(
@@ -728,4 +762,68 @@ test "completionTimingsField: a non-streaming completion reports cached and pref
     const none = try completionTimingsField(a, 1, 0, 1, 0, 0);
     defer a.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+fn rootOf(arena: std.mem.Allocator, body: []const u8) !std.json.ObjectMap {
+    return (try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{})).object;
+}
+
+test "completions sampling: the body outranks the launch flag, which outranks the generation config, which outranks the fallback" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var config = model_mod.ModelConfig{};
+    const bare = requestSampling(&config, try rootOf(a, "{}"));
+    try testing.expectEqual(@as(f32, 1.0), bare.temperature);
+    try testing.expectEqual(@as(f32, 1.0), bare.top_p);
+    try testing.expectEqual(@as(u32, 0), bare.top_k);
+    try testing.expectEqual(@as(f32, 1.0), bare.repeat_penalty);
+    try testing.expectEqual(@as(f32, 0.0), bare.presence_penalty);
+    try testing.expect(bare.seed == null);
+
+    config.gen_temperature = 0.6;
+    config.gen_top_p = 0.95;
+    config.gen_top_k = 20;
+    const gen = requestSampling(&config, try rootOf(a, "{}"));
+    try testing.expectEqual(@as(f32, 0.6), gen.temperature);
+    try testing.expectEqual(@as(f32, 0.95), gen.top_p);
+    try testing.expectEqual(@as(u32, 20), gen.top_k);
+
+    const saved = server_mod.server_config;
+    defer server_mod.server_config = saved;
+    server_mod.server_config.default_temperature = 0.3;
+    server_mod.server_config.default_top_k = 5;
+    const flag = requestSampling(&config, try rootOf(a, "{}"));
+    try testing.expectEqual(@as(f32, 0.3), flag.temperature);
+    try testing.expectEqual(@as(u32, 5), flag.top_k);
+    try testing.expectEqual(@as(f32, 0.95), flag.top_p);
+
+    const body = requestSampling(&config, try rootOf(a, "{\"temperature\":0,\"top_k\":0,\"repetition_penalty\":1.1,\"presence_penalty\":0.5,\"seed\":7}"));
+    try testing.expectEqual(@as(f32, 0.0), body.temperature);
+    try testing.expectEqual(@as(u32, 0), body.top_k);
+    try testing.expectEqual(@as(f32, 1.1), body.repeat_penalty);
+    try testing.expectEqual(@as(f32, 0.5), body.presence_penalty);
+    try testing.expectEqual(@as(?u64, 7), body.seed);
+}
+
+test "completions spec: a request's own switches outrank the model's defaults, and a head that is not loaded stays off" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen4_exp";
+    const loaded = requestSpec(&config, try rootOf(a, "{}"), true, true, false);
+    try testing.expect(loaded.drafter and loaded.mtp and loaded.allow_batch_mtp);
+    const off = requestSpec(&config, try rootOf(a, "{\"enable_drafter\":false,\"enable_mtp\":false,\"enable_batch_mtp\":false}"), true, true, false);
+    try testing.expect(!off.drafter and !off.mtp and !off.allow_batch_mtp);
+    const asked = requestSpec(&config, try rootOf(a, "{\"enable_drafter\":true,\"enable_mtp\":true}"), false, false, false);
+    try testing.expect(!asked.drafter and !asked.mtp);
+    const unserved = model_mod.ModelConfig{};
+    const other = requestSpec(&unserved, try rootOf(a, "{}"), false, true, false);
+    try testing.expect(other.mtp);
+    var moe = model_mod.ModelConfig{};
+    moe.model_type = "unserved_moe";
+    moe.num_experts = 8;
+    try testing.expect(!requestSpec(&moe, try rootOf(a, "{}"), false, true, false).mtp);
+    try testing.expect(requestSpec(&moe, try rootOf(a, "{}"), false, true, true).mtp);
 }

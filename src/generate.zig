@@ -828,6 +828,9 @@ pub const GenerationResult = struct {
     /// (completion cap mid-reasoning), or the boundary fell outside the
     /// emitted (loop-trimmed) tokens.
     constraint_payload_byte: ?usize = null,
+    /// Time the prefix lookup and restore took inside `prefill_ns`; null when no lookup ran.
+    restore_ns: ?u64 = null,
+    spec_mode: Generator.SpecMode = .none,
 };
 
 /// Throughput in tokens/sec. Returns 0 when no time elapsed so unmeasured paths
@@ -1272,10 +1275,21 @@ pub const Generator = struct {
         );
     }
 
+    pub const SpecMode = enum { none, dspark, mtp, dflash };
+
+    /// The mode `logSpecStats` reports: the first that drafted.
+    pub fn specMode(self: *const Generator) SpecMode {
+        if (self.dspark and self.dspark_stats.rounds > 0) return .dspark;
+        if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) return .mtp;
+        if (self.dflash != null and self.dflash_attempted > 0) return .dflash;
+        return .none;
+    }
+
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
-        if (self.dspark and self.dspark_stats.rounds > 0) {
+        const mode = self.specMode();
+        if (mode == .dspark) {
             const st = self.dspark_stats;
             const rounds: f64 = @floatFromInt(st.rounds);
             const round_ms = @as(f64, @floatFromInt(st.draft_ns + st.verify_ns)) / rounds / 1e6;
@@ -1303,7 +1317,7 @@ pub const Generator = struct {
             return;
         }
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
-        if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {
+        if (mode == .mtp) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
                 @as(f64, @floatFromInt(@max(self.mtp_attempted, 1)));
             // Depth varies per round under the EV controller — the honest
@@ -1364,7 +1378,7 @@ pub const Generator = struct {
             });
             return;
         }
-        if (self.dflash != null and self.dflash_attempted > 0) {
+        if (mode == .dflash) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dflash_attempted));
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;

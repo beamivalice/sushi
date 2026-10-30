@@ -432,6 +432,10 @@ pub const Slot = struct {
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
     prefill_ns: u64,
+    /// The prefix lookup-and-restore part of `prefill_ns`; null until a lookup ran.
+    restore_ns: ?u64 = null,
+    /// What speculation drafted, set where `logSpecStats` reports it.
+    spec_mode: Generator.SpecMode = .none,
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -2360,6 +2364,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
                 // Streams end this way on a stop sequence or a client that leaves: finishSlot's line is theirs too.
                 if (s.legacy_gen) |*g| {
+                    s.spec_mode = g.specMode();
                     g.logSpecStats();
                     g.logQsaArms();
                 }
@@ -3441,6 +3446,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
+            slot.restore_ns = lookup_sw.read();
             var restore_line_buf: [192]u8 = undefined;
             if (prefix_cache_mod.restoreLogLine(
                 &restore_line_buf,

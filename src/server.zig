@@ -202,6 +202,9 @@ pub fn requestShutdown() void {
 pub const ServerConfig = struct {
     /// Starts an embedded client only after this process owns its listening socket.
     on_ready: ?*const fn (u16) anyerror!std.Thread = null,
+    /// Starts a client that submits to the scheduler directly, once the model is loaded and the context is
+    /// pinned. The server binds no socket; the client ends the run with `requestShutdown`.
+    embedded_client: ?*const fn () anyerror!std.Thread = null,
     /// Maximum context size (0 = unlimited). `--ctx-size N`.
     max_context_size: u32 = 0,
     /// Request timeout in seconds (0 = no timeout). `--timeout N`.
@@ -1311,7 +1314,7 @@ pub fn serve(
     listen_host = host;
     listen_port = port;
     // Parse host address
-    var server = http_conn.startListener(host, port) catch |err| {
+    var listener: ?std.Io.net.Server = if (cfg.embedded_client != null) null else http_conn.startListener(host, port) catch |err| {
         var msg_buf: [512]u8 = undefined;
         if (startupRefusal(err, host, port, &msg_buf)) |msg| {
             log.err("{s}\n", .{msg});
@@ -1320,8 +1323,8 @@ pub fn serve(
         return err;
     };
     var client_thread: ?std.Thread = null;
-    defer http_conn.closeEmbeddedListener(io, &server, client_thread);
-    listen_port = server.socket.address.ip4.port;
+    defer if (listener) |*l| http_conn.closeEmbeddedListener(io, l, client_thread) else if (client_thread) |t| t.join();
+    if (listener) |l| listen_port = l.socket.address.ip4.port;
     client_thread = if (server_config.on_ready) |ready| try ready(listen_port) else null;
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
@@ -1377,26 +1380,28 @@ pub fn serve(
     if (generate_mod.max_mtp_ctx != 0) {
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
-    log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
-    if (g_api_key != null) {
-        log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health and the chat page stay open)\n", .{});
+    if (listener != null) {
+        log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
+        if (g_api_key != null) {
+            log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health and the chat page stay open)\n", .{});
+        }
+        log.info("  GET  /, /chat (chat page)\n", .{});
+        log.info("  GET  /health\n", .{});
+        log.info("  GET  /props\n", .{});
+        log.info("  GET  /v1/models\n", .{});
+        log.info("  POST /v1/chat/completions\n", .{});
+        log.info("  POST /v1/completions\n", .{});
+        log.info("  POST /v1/messages (Anthropic)\n", .{});
+        log.info("  POST /v1/messages/count_tokens (Anthropic)\n", .{});
+        log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
+        log.info("  POST /v1/responses/compact\n", .{});
+        log.info("  GET  /v1/responses/{{id}}\n", .{});
+        log.info("  DEL  /v1/responses/{{id}}\n", .{});
+        log.info("  POST /tokenize\n", .{});
+        log.info("  POST /detokenize\n\n", .{});
+        var chat_url_buf: [96]u8 = undefined;
+        log.info("chat in your browser: {s}\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
     }
-    log.info("  GET  /, /chat (chat page)\n", .{});
-    log.info("  GET  /health\n", .{});
-    log.info("  GET  /props\n", .{});
-    log.info("  GET  /v1/models\n", .{});
-    log.info("  POST /v1/chat/completions\n", .{});
-    log.info("  POST /v1/completions\n", .{});
-    log.info("  POST /v1/messages (Anthropic)\n", .{});
-    log.info("  POST /v1/messages/count_tokens (Anthropic)\n", .{});
-    log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
-    log.info("  POST /v1/responses/compact\n", .{});
-    log.info("  GET  /v1/responses/{{id}}\n", .{});
-    log.info("  DEL  /v1/responses/{{id}}\n", .{});
-    log.info("  POST /tokenize\n", .{});
-    log.info("  POST /detokenize\n\n", .{});
-    var chat_url_buf: [96]u8 = undefined;
-    log.info("chat in your browser: {s}\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
 
     // Print system metrics once at startup
     const rss = metrics.getAppRssMb();
@@ -1412,8 +1417,11 @@ pub fn serve(
         });
     }
 
+    if (cfg.embedded_client) |start| client_thread = try start();
+
+    // No listener: poll ignores a negative fd and sleeps out the timeout, so the loop still watches the shutdown flag.
     var poll_fds = [_]std.posix.pollfd{.{
-        .fd = server.socket.handle,
+        .fd = if (listener) |l| l.socket.handle else -1,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
@@ -1428,7 +1436,7 @@ pub fn serve(
         if (poll_result == 0) continue; // timeout, re-check shutdown flag
         if (shutdown_requested.load(.acquire)) break;
 
-        const accepted_stream = server.accept(io) catch |err| {
+        const accepted_stream = listener.?.accept(io) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
             log.err("accept error: {}\n", .{err});
             continue;
