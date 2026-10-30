@@ -615,7 +615,9 @@ forward at that position gives the bytes of one that never saw it (`dsv41 genera
 logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit). The FFN's hc split
 (`sf`: pre, post, comb) is submitted with the picks (`submitWith`, `Spec.queue`'s `ride`), so the one-simdgroup Sinkhorn
 runs beside the gate GEMV and not in a buffer of its own behind the routed chain; same kernel, same bytes
-(`dsv41 submit`). The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
+(`dsv41 submit`). Together with the picks kernel and the hc expand grid, serial `--no-mtp` decode at 4.7k went
+52.65 / 51.85 -> 54.42 / 53.53 tok/s (r2 / r3, A B B A, one boot an arm, b95886f8 vs this stack, AC, GPU lock, fans max,
+die < 50 C at boot, `taskpolicy -a`), same text. The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
 round's kept rows ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
 
