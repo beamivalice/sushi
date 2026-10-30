@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const slot_admission = @import("slot_admission.zig");
+const write_stats = @import("disk_write_stats.zig");
 
 // ---------------------------------------------------------------------------
 // Histogram bounds (comptime constants shared by Metrics.init)
@@ -278,6 +279,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
         if (name.len == 0) continue;
         try w.print("sushi:decode_serial_total{{reason=\"{s}\"}} {d}\n", .{ name, m.decode_serial_total[i].load() });
     }
+    try w.print("\n", .{});
+    try write_stats.writePrometheus(write_stats.process.snapshot(), w);
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -458,7 +461,9 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
         try w.print("{s}\"{s}\":{d}", .{ if (first) "" else ",", name, m.decode_serial_total[i].load() });
         first = false;
     }
-    try w.print("}},\"histograms\":{{", .{});
+    try w.print("}},", .{});
+    try write_stats.writeJson(write_stats.process.snapshot(), w);
+    try w.print(",\"histograms\":{{", .{});
 
     try writeHistogramJson(w, "time_to_first_token_seconds", &m.ttft_ns, ns_to_s);
     try w.print(",", .{});
@@ -1172,4 +1177,25 @@ test "the inference thread adopts a published sink once and never drops the one 
     try testing.expect(adoptPublished(null, &a) == &a);
     try testing.expect(adoptPublished(&a, &b) == &a);
     try testing.expect(adoptPublished(&a, null) == &a);
+}
+
+test "both feeds carry the SSD prefix cache write counters, for every kind" {
+    const testing = std.testing;
+    write_stats.process.recordWritten(.ring, 1);
+    write_stats.process.recordFailed(1);
+    var m = Metrics.init();
+    var buf: [32 * 1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderPrometheus(&m, &w);
+    var jbuf: [16 * 1024]u8 = undefined;
+    var jw = std.Io.Writer.fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jw.buffered(), .{});
+    defer parsed.deinit();
+    const written = parsed.value.object.get("prefix_cache_writes").?.object.get("written_bytes").?.object;
+    inline for (@typeInfo(write_stats.Kind).@"enum".field_names) |name| {
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "sushi:prefix_cache_write_bytes_total{kind=\"" ++ name ++ "\"} ") != null);
+        try testing.expect(written.get(name) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "sushi:prefix_cache_write_failed_bytes_total ") != null);
 }

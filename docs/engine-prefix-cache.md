@@ -16,6 +16,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
 | `src/disk_placement.zig` | The SSD tier's default budget (`resolveDiskBudget`), cache roots and model fingerprint, and the startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
+| `src/disk_write_stats.zig` | Cumulative write bytes by file kind, per tier and per process ([write counters](#write-counters)) |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
 | `src/glm5/glm5_prefix.zig` | GLM restore points and the `HotPrefixCache` arms and tests that serve them: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
 | `src/dsv41/dsv41_prefix.zig` | DeepSeek-V4.1 restore points and the `HotPrefixCache` arms and tests that serve them: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
@@ -416,6 +417,40 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   - The default RAM tier (6.3 GB) plus SSD, this change: turn 1 whole on disk after the response (1,771 MB, 139 ms,
     0 ms waiting), where it used to persist one synchronous 512 MB piece per turn; 0.28 / 0.32 / 0.29 s from RAM;
     each later turn hard-links 145 chunks and writes one. After a restart 0.87 s, 148,902 restored from SSD in 524 ms.
+
+<a id="write-counters"></a>
+## Write counters
+
+Cumulative bytes the SSD tier wrote to the filesystem, by file kind (`src/disk_write_stats.zig`): one `Stats` per tier
+(`/props` per model) chained into the process total (`/metrics`, `/metrics.json`; [server-http-apis](server-http-apis.md)).
+They count what the filesystem accepted, never what was submitted, and run from process start whatever turns `--metrics` on.
+
+| kind | counts | written by |
+|---|---|---|
+| `kv` | `c*.safetensors` KV chunks | `writeChunkFile` |
+| `ssm` | `s*.safetensors` restore points and `g*.safetensors` row segments (every arch's restore point, GLM's and DeepSeek's included) | `writePoint`, `writeGrownSegment` |
+| `qsa` | `qsa.safetensors` history | `writeQsaHistoryFile` (`persistQsaHistory`) |
+| `spec` | `spec.safetensors` draft state | `writeSpecSidecar` |
+| `ring` | `r*.safetensors` ring restore points | `writeRingFile` |
+| `meta` | `meta.json` manifests and `tokens.bin` records | `writeMeta`, the token record in `appendCommitWithSpecBounded` |
+
+- **Every safetensors file goes through `DiskTier.saveNamed(..., kind, ...)`**, which takes the kind: staged through the
+  writer thread (`kv_disk_writer.zig` counts at the landing, per part of a file staged in parts) or written synchronously
+  (counted at the return, the file's size). `meta.json` and `tokens.bin` are the only other writers. A new file kind is a
+  new `Kind` variant and a column here, never a filename test.
+- **A rewrite counts its full bytes again**: the partial tail chunk of an extended entry, a longer `qsa.safetensors`
+  history, a replaced `spec.safetensors` and every `meta.json` rewrite (including the LRU re-index after a restore).
+  A hard-linked chunk or QSA history (`linkInheritedChunks`, `linkInheritedQsa`) is not a write, and a commit
+  that finds its prefix already stored writes nothing.
+- **`failed` is apart from `written`**: a blob the writer could not write (a failed `open`/`write`/`rename`), dropped for
+  a broken multi-part file or a stale epoch, discarded by a fence (the entry was deleted before it landed), or refused
+  at `submit`; a synchronous write that raised counts its tensor payload. A part that landed before its file broke stays
+  in `written`, since the filesystem took it. These are filesystem bytes, not NAND wear.
+- `/props settings.prefix_cache.disk_written_bytes` is the tier's own total, so a model that unloads takes its figure with
+  it while the process counters keep it.
+- Guards: `disk_write_stats.zig` (accounting and both renderings), `kv_disk_writer.zig` (`landed bytes count under their
+  kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
+  and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`.
 
 ## SSD-first
 

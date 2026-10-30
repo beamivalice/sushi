@@ -2947,7 +2947,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     }
 }
 
-/// Publish every resident model's SSD tier (budget, bytes in use, entries) onto its own `LoadedModel`.
+/// Publish every resident model's SSD tier (budget, bytes in use, entries, bytes written) onto its own `LoadedModel`.
 /// Inference thread.
 pub fn publishDiskStats(sch: *Scheduler) void {
     sch.registry.mutex.lockUncancelable(sch.io);
@@ -2958,7 +2958,7 @@ pub fn publishDiskStats(sch: *Scheduler) void {
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount() };
+                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten() };
             };
         }
         entry.disk_stats.publish(snap);

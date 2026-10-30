@@ -25,6 +25,7 @@ test {
     _ = @import("dsv41/dspark_rows.zig");
     _ = @import("dsv41/expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
+    _ = @import("disk_write_stats.zig");
     _ = @import("mtp_acceptance.zig");
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("mtp_group_cost.zig");

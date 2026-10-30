@@ -37,7 +37,7 @@ function installStubs(config) {
     switch (url.pathname) {
       case '/health': return json({ status: 'ok' });
       case '/v1/models': return json({ data: [{ id: 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
-      case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
+      case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: { disk_bytes: 20 * 2 ** 30, disk_used_bytes: 2 * 2 ** 30, disk_written_bytes: 4 * 2 ** 30, disk_entries: 3 } }, memory: { available_bytes: 5e9 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
       case '/v1/tools': return json({ edit_default: false });
       case '/metrics/enable':
         if (stub.enableStatus !== 200) return json({ error: { message: 'refused' } }, stub.enableStatus);
@@ -45,7 +45,7 @@ function installStubs(config) {
         return json({ metrics: true, already_enabled: false });
       case '/metrics.json':
         if (stub.metricsStatus !== 200) return json({ error: { message: 'metrics off' } }, stub.metricsStatus);
-        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [] });
+        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
       case '/v1/chat/completions': {
         stub.streams += 1;
         const signal = init.signal;
@@ -352,6 +352,23 @@ async function main() {
       const count = () => page.evaluate(() => window.__stub.calls.filter((call) => call.path === '/metrics.json').length);
       await page.clock.runFor(60_000);
       assert.equal(await count(), 1, `a hidden dashboard stops after a ${status}`);
+      await context.close();
+    }
+
+    {
+      const { page, errors, context } = await openPage(browser, '/dashboard');
+      const rows = () => page.evaluate(() => Object.fromEntries([...document.querySelectorAll('#dashWrites span')].reduce((acc, el, i, all) => (i % 2 ? acc : [...acc, [el.textContent, all[i + 1].textContent]]), [])));
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      // The rate needs two polls and the ratio needs /props: wait for both, then read one consistent render.
+      await page.waitForFunction(() => /\/s$/.test(document.querySelector('#dashWrites span:nth-child(4)')?.textContent ?? '') && /x$/.test(document.querySelector('#dashWrites span:nth-child(6)')?.textContent ?? ''), null, { timeout: 15000 });
+      const card = await rows();
+      for (const label of ['Written', 'Write rate', 'Written per byte on disk', 'KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
+        assert.ok(label in card, `the card has a ${label} row`);
+      }
+      assert.equal(card['Failed or dropped'], '3.0 MiB', 'failed bytes are named apart from the written ones');
+      const gib = (text) => parseFloat(text) * (/GiB/.test(text) ? 1 : /MiB/.test(text) ? 1 / 1024 : 1 / 1048576);
+      assert.ok(Math.abs(parseFloat(card['Written per byte on disk']) - gib(card['Written']) / 2) < 0.06, 'written over the 2 GiB on disk');
+      assert.deepEqual(errors, []);
       await context.close();
     }
 

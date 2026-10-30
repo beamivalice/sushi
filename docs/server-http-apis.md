@@ -265,6 +265,12 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   from `Slot.cancelled` (`complete` sets it on every completion): success feeds the histograms; `sushi:request_cancelled_total`
   (a disconnect mid-decode; a request ended by its own stop sequence sets `Slot.stop_hit` first and counts as success), `sushi:request_failed_total` and a refusal before a slot
   (`sushi:request_rejected_total`: context overflow, memory preflight, `PrefillDoesNotFit`) move only their counter.
+- **SSD prefix-cache writes** ([engine-prefix-cache](engine-prefix-cache.md#write-counters)): `/metrics` carries
+  `sushi:prefix_cache_write_bytes_total{kind="kv|ssm|qsa|spec|ring|meta"}` and `sushi:prefix_cache_write_failed_bytes_total`;
+  `/metrics.json` carries `"prefix_cache_writes":{"written_bytes":{<kind>:n},"failed_bytes":n}` after `decode_serial`.
+  Unlike the request counters they run from process start whatever turns metrics on, and the routes keep the 503-while-off
+  rule. `/props settings.prefix_cache.disk_written_bytes` is that model's own total since its tier opened (`disk_stats`,
+  the same sequence-locked publish as `disk_used_bytes`), so an unload and reload restarts it while the process total keeps it.
 - `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
   by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
   `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),
@@ -304,6 +310,12 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
   401 stops the hidden poll until the dashboard is shown again. It follows the chat's
   theme. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
+- The dashboard's **Prefix cache writes** card (the last card) shows the `prefix_cache_writes` totals: bytes written since
+  the server started, the rate between the last two polls (`-` on the first poll and across a restart), bytes written per
+  byte now on disk (the sum of every ready model's `/props` `disk_used_bytes`, refreshed every 15 s), one row per kind and
+  the failed or dropped bytes. A server without the counters shows "Not reported by this server". Logic:
+  `prefixWrites` in the dashboard script, guarded by `tests/test_webui_prefix_cache.cjs` and the card arm of
+  `tests/test_webui_dashboard.cjs`.
 - The right sidebar's "Prefix cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
   (`disk_used_bytes / disk_bytes`, "<used> / <budget> GB" and the entry count beside it). It is read after each reply
   and again 2.5 s later (the server stores a turn's entry after answering) and stays hidden while `disk_bytes` is 0.

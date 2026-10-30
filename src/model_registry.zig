@@ -133,15 +133,16 @@ pub const MemoryContextRefusal = struct {
     chunk: u64,
 };
 
-/// One model's SSD prefix tier as the inference thread last saw it: the budget, bytes in use and entry
-/// count. A sequence lock keeps a reader's three numbers from one publish.
+/// One model's SSD prefix tier as the inference thread last saw it: the budget, bytes in use, entry
+/// count and bytes written since the tier opened. A sequence lock keeps a reader's numbers from one publish.
 pub const DiskStats = struct {
-    pub const Snapshot = struct { budget: u64 = 0, used: u64 = 0, entries: u64 = 0 };
+    pub const Snapshot = struct { budget: u64 = 0, used: u64 = 0, entries: u64 = 0, written: u64 = 0 };
 
     seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     budget: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     used: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     entries: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    written: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Inference thread only (the single writer).
     pub fn publish(self: *DiskStats, snap: Snapshot) void {
@@ -149,6 +150,7 @@ pub const DiskStats = struct {
         self.budget.store(snap.budget, .seq_cst);
         self.used.store(snap.used, .seq_cst);
         self.entries.store(snap.entries, .seq_cst);
+        self.written.store(snap.written, .seq_cst);
         _ = self.seq.fetchAdd(1, .seq_cst);
     }
 
@@ -160,6 +162,7 @@ pub const DiskStats = struct {
                 .budget = self.budget.load(.seq_cst),
                 .used = self.used.load(.seq_cst),
                 .entries = self.entries.load(.seq_cst),
+                .written = self.written.load(.seq_cst),
             };
             if (self.seq.load(.seq_cst) == before) return snap;
         }
@@ -2228,10 +2231,12 @@ test "Sushi quant memory load diagnostics survive refusal and clear on retry and
 test "DiskStats: each model keeps its own tier, and a reader never mixes two publishes" {
     var a: DiskStats = .{};
     var b: DiskStats = .{};
-    a.publish(.{ .budget = 20, .used = 3, .entries = 2 });
-    b.publish(.{ .budget = 6, .used = 1, .entries = 1 });
+    a.publish(.{ .budget = 20, .used = 3, .entries = 2, .written = 90 });
+    b.publish(.{ .budget = 6, .used = 1, .entries = 1, .written = 4 });
     try std.testing.expectEqual(@as(u64, 3), a.snapshot().used);
     try std.testing.expectEqual(@as(u64, 1), b.snapshot().used);
+    try std.testing.expectEqual(@as(u64, 90), a.snapshot().written);
+    try std.testing.expectEqual(@as(u64, 4), b.snapshot().written);
     b.publish(.{});
     try std.testing.expectEqual(@as(u64, 20), a.snapshot().budget);
     try std.testing.expectEqual(@as(u64, 0), b.snapshot().budget);
@@ -2240,7 +2245,7 @@ test "DiskStats: each model keeps its own tier, and a reader never mixes two pub
     const Writer = struct {
         fn run(stats: *DiskStats, stop: *std.atomic.Value(bool)) void {
             var n: u64 = 1;
-            while (!stop.load(.seq_cst)) : (n += 1) stats.publish(.{ .budget = n, .used = 2 * n, .entries = 3 * n });
+            while (!stop.load(.seq_cst)) : (n += 1) stats.publish(.{ .budget = n, .used = 2 * n, .entries = 3 * n, .written = 4 * n });
         }
     };
     var stop = std.atomic.Value(bool).init(false);
@@ -2251,6 +2256,7 @@ test "DiskStats: each model keeps its own tier, and a reader never mixes two pub
         const s = shared.snapshot();
         try std.testing.expectEqual(s.budget * 2, s.used);
         try std.testing.expectEqual(s.budget * 3, s.entries);
+        try std.testing.expectEqual(s.budget * 4, s.written);
     }
     stop.store(true, .seq_cst);
     thread.join();

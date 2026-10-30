@@ -1038,6 +1038,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     <div class="card"><h2>Request totals</h2><div class="kv" id="dashTotals"></div></div>
     <div class="card"><h2>Time to first token<span class="legend">requests per bucket</span></h2><div class="hist" id="dashHTtft"></div><div class="histlabels" id="dashHlTtft"></div></div>
     <div class="card"><h2>End-to-end time per request<span class="legend">requests per bucket</span></h2><div class="hist" id="dashHE2e"></div><div class="histlabels" id="dashHlE2e"></div></div>
+    <div class="card"><h2>Prefix cache writes<span class="legend">SSD, since the server started</span></h2><div class="kv" id="dashWrites"></div><div class="foot" style="text-align:left">Filesystem writes, not SSD wear. A rewritten file counts again.</div></div>
   </section>
 </div>
 </section>
@@ -2753,7 +2754,7 @@ init();
 
   let paused = false, timer = null, prev = null, inflight = false;
   let dashActive = false, lastData = null, bgStopped = false, lastPollAt = 0, lastServerAt = 0, failures = 0;
-  let lastCounters = null, restartNote = '', metricsOff = false;
+  let lastCounters = null, restartNote = '', metricsOff = false, prevWrites = null;
   const restarts = []; // times the server was seen restarting, drawn on the charts
   const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [] };
   const lastGen = new Map(); // request_id -> {gen, t}
@@ -2833,6 +2834,17 @@ init();
   }
   document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSoon(); });
 
+  const WRITE_KINDS = { kv: 'KV chunks', ssm: 'Restore points', qsa: 'QSA history', spec: 'Speculative state', ring: 'Ring points', meta: 'Manifests and token records' };
+  // The cache's write counters as the card shows them: the rate since the previous poll (null on the first poll
+  // and across a restart) and the bytes written per byte now on disk (null while nothing is on disk).
+  function prefixWrites(w, prev, now, onDisk) {
+    if (!w || !w.written_bytes) return null;
+    const total = Object.values(w.written_bytes).reduce((a, b) => a + b, 0);
+    const dt = prev ? (now - prev.t) / 1000 : 0;
+    return { t: now, total, kinds: w.written_bytes, failed: w.failed_bytes || 0,
+      rate: prev && dt > 0 && total >= prev.total ? (total - prev.total) / dt : null,
+      amplification: onDisk > 0 ? total / onDisk : null };
+  }
   function push(k, v) { series[k].push(v); }
   function trim(now) {
     const cut = now - (+$('window').value) * 1000;
@@ -2870,11 +2882,15 @@ init();
     push('gpu', g.gpu_utilization_pct || 0); push('mem', (g.memory_mb || 0) / 1024);
     push('act', gib(g.mlx_active_bytes || 0)); push('cache', gib(g.mlx_cache_bytes || 0));
     trim(now);
-    lastData = { d, now, gen, pre };
+    let onDisk = 0;
+    for (const p of modelProps.values()) if (p && typeof p === 'object') onDisk += p.settings?.prefix_cache?.disk_used_bytes || 0;
+    const writes = prefixWrites(d.prefix_cache_writes, prevWrites, now, onDisk);
+    prevWrites = writes || prevWrites;
+    lastData = { d, now, gen, pre, writes };
     if (dashActive) render(lastData);
   }
 
-  function render({ d, now, gen, pre }) {
+  function render({ d, now, gen, pre, writes }) {
     const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
 
     $('t-gen').textContent = fmt(gen, 1);
@@ -2918,6 +2934,13 @@ init();
       ...serial,
     ]);
 
+    kv($('writes'), writes ? [
+      ['Written', bytes(writes.total)],
+      ['Write rate', writes.rate == null ? '-' : bytes(writes.rate) + '/s'],
+      ['Written per byte on disk', writes.amplification == null ? '-' : fmt(writes.amplification, 1) + 'x'],
+      ...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || esc(k), bytes(v)]),
+      ['Failed or dropped', bytes(writes.failed)],
+    ] : [['Not reported by this server', '-']]);
     hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     hist('e2e', h.e2e_request_latency_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     sessions(d.sessions || [], now, g);

@@ -58,6 +58,7 @@ const disk_qsa = @import("qwen4/qwen4_disk_qsa.zig");
 const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
+const write_stats = @import("disk_write_stats.zig");
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
 
@@ -406,6 +407,8 @@ pub const DiskTier = struct {
     ssm_budget_drops: usize = 0,
     /// Bytes of restore-point and row-segment files staged so far, for the write-through log line.
     point_bytes_written: u64 = 0,
+    /// Bytes this tier wrote, by kind. Heap-allocated: the background writer holds the pointer.
+    stats: *write_stats.Stats,
     /// Background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
@@ -460,10 +463,14 @@ pub const DiskTier = struct {
             log.info("[disk-cache] {s} is in use by another sushi process: this one keeps a private SSD tier at {s}, removed at exit\n", .{ shared, root });
         }
         disk_placement.reapPrivateRoots(allocator, io, shared);
+        const stats = try allocator.create(write_stats.Stats);
+        errdefer allocator.destroy(stats);
+        stats.* = .{ .parent = &write_stats.process };
         var self: DiskTier = .{
             .allocator = allocator,
             .io = io,
             .root = root,
+            .stats = stats,
             .max_bytes = max_bytes,
             .operator_cap = max_bytes,
             .chunk_tokens = if (chunk_tokens == 0) DEFAULT_CHUNK_TOKENS else chunk_tokens,
@@ -494,6 +501,7 @@ pub const DiskTier = struct {
         const w = self.allocator.create(disk_writer.Writer) catch return;
         w.* = disk_writer.Writer.init(self.allocator, self.io);
         w.permit_bytes = self.writer_permit_bytes;
+        w.stats = self.stats;
         w.start() catch {
             self.allocator.destroy(w);
             log.warn("[disk-cache] background writer unavailable — writing synchronously\n", .{});
@@ -696,6 +704,7 @@ pub const DiskTier = struct {
         if (self.private_root) disk_placement.deleteTreeAbsolute(self.io, self.root);
         if (self.root_lock) |f| f.close(self.io);
         self.root_lock = null;
+        self.allocator.destroy(self.stats);
         self.allocator.free(self.root);
     }
 
@@ -2055,12 +2064,14 @@ pub const DiskTier = struct {
         if (extend_idx == null or record.ptr == tokens.ptr) {
             const tpath = try std.fmt.allocPrint(self.allocator, "{s}/tokens.bin", .{dir_rel});
             defer self.allocator.free(tpath);
+            errdefer self.stats.recordFailed(record.len * 4);
             const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{});
             defer f.close(self.io);
             var wb: [8192]u8 = undefined;
             var fw = f.writer(self.io, &wb);
             try fw.interface.writeSliceEndian(u32, record, .little);
             try fw.interface.flush();
+            self.stats.recordWritten(.meta, record.len * 4);
         }
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
@@ -2320,7 +2331,7 @@ pub const DiskTier = struct {
             n_meta += 1;
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors", .{dir_abs});
-        res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], s);
+        res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], .spec, s);
         return res;
     }
 
@@ -2649,7 +2660,7 @@ pub const DiskTier = struct {
             try self.appendLayerSlices(&list, li, entry, config, c0, c1, s);
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/c{d:0>6}.safetensors", .{ dir_abs, chunk_idx });
-        return self.saveNamed(path, list.items, no_meta, s);
+        return self.saveNamed(path, list.items, no_meta, .kv, s);
     }
 
     /// One layer's K/V rows `[r0, r1)` of its own buffers, every stored kind.
@@ -2675,8 +2686,18 @@ pub const DiskTier = struct {
 
     /// Write (or, with the writer, stage) one safetensors file at `path`, which it takes.
     /// Returns the file's byte size.
-    pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
-        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, s);
+    pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, kind, s);
+        const size = self.saveSync(path, list, meta) catch |err| {
+            self.stats.recordFailed(dataLen(list));
+            return err;
+        };
+        self.stats.recordWritten(kind, size);
+        return size;
+    }
+
+    /// The synchronous arm of `saveNamed`; takes `path`.
+    fn saveSync(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair) !u64 {
         defer self.allocator.free(path);
         const tensor_map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
@@ -2815,7 +2836,7 @@ pub const DiskTier = struct {
 
     /// Stage one materialized file through the writer: one blob, or `Writer.partBytes` parts
     /// when larger, each allocated only once the permit has room for it. Takes `path`.
-    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
+    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         var path_owned: ?[]u8 = path;
         defer if (path_owned) |p| self.allocator.free(p);
         // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
@@ -2845,7 +2866,7 @@ pub const DiskTier = struct {
                 return err;
             };
             if (last) path_owned = null;
-            w.submitPart(blob_path, bytes, part); // takes both buffers
+            w.submitPart(blob_path, bytes, part, kind); // takes both buffers
             staged += n;
         }
         return total;
@@ -2943,7 +2964,7 @@ pub const DiskTier = struct {
             }
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/g{d:0>5}.safetensors", .{ dir_rel, j });
-        return self.saveNamed(path, list.items, no_meta, s);
+        return self.saveNamed(path, list.items, no_meta, .ssm, s);
     }
 
     /// Writes the row segments `cp`'s point leans on that the entry lacks, from `cp`'s own rows; returns how many it leans on.
@@ -3272,7 +3293,7 @@ pub const DiskTier = struct {
         }
 
         const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
-        return self.saveNamed(path, list.items, meta.items, s);
+        return self.saveNamed(path, list.items, meta.items, .ssm, s);
     }
 
     pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false };
@@ -3431,7 +3452,7 @@ pub const DiskTier = struct {
         var lc_buf: [24]u8 = undefined;
         const lc = try std.fmt.bufPrint(&lc_buf, "{d}", .{src.entries.len});
         const path = try std.fmt.allocPrint(self.allocator, "{s}/r{d:0>7}.safetensors", .{ dir_rel, src.pos });
-        return self.saveNamed(path, list.items, &.{.{ .key = "layers", .value = lc }}, s);
+        return self.saveNamed(path, list.items, &.{.{ .key = "layers", .value = lc }}, .ring, s);
     }
 
     fn deleteRingFile(self: *DiskTier, id: u64, pos: u32) void {
@@ -3632,12 +3653,13 @@ pub const DiskTier = struct {
             errdefer self.allocator.free(final_path);
             w.waitForRoom(buf.items.len);
             const bytes = try buf.toOwnedSlice(self.allocator);
-            w.submit(final_path, bytes);
+            w.submit(final_path, bytes, .meta);
             return;
         }
         defer self.allocator.free(final_path);
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json.{d}.tmp", .{ self.root, e.id, std.c.getpid() });
         defer self.allocator.free(tmp_path);
+        errdefer self.stats.recordFailed(buf.items.len);
         {
             const f = try std.Io.Dir.createFileAbsolute(self.io, tmp_path, .{});
             defer f.close(self.io);
@@ -3647,6 +3669,7 @@ pub const DiskTier = struct {
             try fw.interface.flush();
         }
         try std.Io.Dir.renameAbsolute(tmp_path, final_path, self.io);
+        self.stats.recordWritten(.meta, buf.items.len);
     }
 
     /// The lowest manifest version that describes this entry. The version is a compatibility
@@ -7527,8 +7550,10 @@ test "DiskTier hybrid lookup leaves a prompt token to compute logits" {
     var entry_list: std.ArrayList(IndexEntry) = .empty;
     defer entry_list.deinit(testing.allocator);
     try entry_list.appendSlice(testing.allocator, &entries);
+    var stats: write_stats.Stats = .{};
     const tier = DiskTier{
         .allocator = testing.allocator,
+        .stats = &stats,
         .io = testing.io,
         .root = &.{},
         .max_bytes = 0,
@@ -7739,4 +7764,169 @@ test "DiskTier: a thought point past the prompt end is the newest point and surv
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
         try testing.expectEqualSlices(u32, c.want, tier.entries.items[0].ssm_positions);
     }
+}
+
+fn wroteKind(tier: *const DiskTier, kind: write_stats.Kind) u64 {
+    return tier.stats.snapshot().written[@intFromEnum(kind)];
+}
+
+fn sumBytes(items: []const u64) u64 {
+    var n: u64 = 0;
+    for (items) |b| n += b;
+    return n;
+}
+
+test "DiskTier write counters: a cold persist counts its kinds, an exact reuse adds nothing, an extension counts the tail and the new chunks" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var dfl = try KVCache.init(testing.allocator, 2);
+    defer dfl.deinit();
+    try fillCache(&dfl, s, 2, 600, 8, 3.5, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const dflash: SpecCommit = .{ .entries = dfl.entries, .step = dfl.step, .config = dfl.config, .base_pos = 0 };
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wcount", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
+    tier.drainWriter();
+
+    const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/meta.json", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(meta_path);
+    const meta_json = fileSize(io, meta_path) orelse return error.TestUnexpectedResult;
+    const cold = tier.stats.snapshot();
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@intFromEnum(write_stats.Kind.kv)]);
+    try testing.expect(e.spec_bytes > 0);
+    try testing.expectEqual(e.spec_bytes, cold.written[@intFromEnum(write_stats.Kind.spec)]);
+    try testing.expectEqual(@as(u64, 600 * 4) + meta_json, cold.written[@intFromEnum(write_stats.Kind.meta)]);
+    for ([_]write_stats.Kind{ .ssm, .qsa, .ring }) |k| try testing.expectEqual(@as(u64, 0), wroteKind(&tier, k));
+    try testing.expectEqual(@as(u64, 0), cold.failed);
+
+    // The same commit again persists nothing.
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
+    tier.drainWriter();
+    try testing.expectEqual(cold, tier.stats.snapshot());
+
+    // 600 -> 800 tokens: chunks 0-3 are whole on disk; chunk 4 (the old partial tail) is written again with chunks 5 and 6.
+    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s));
+    tier.drainWriter();
+    const ext = tier.stats.snapshot();
+    const grown = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, 7), grown.chunk_bytes.len);
+    try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@intFromEnum(write_stats.Kind.kv)] - cold.written[@intFromEnum(write_stats.Kind.kv)]);
+    try testing.expectEqual(cold.written[@intFromEnum(write_stats.Kind.spec)], ext.written[@intFromEnum(write_stats.Kind.spec)]);
+    try testing.expectEqual(@as(u64, 0), ext.failed);
+}
+
+test "DiskTier write counters: a spec sidecar replaced by an extension counts its full bytes again" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wspec", 0, 128);
+    defer tier.deinit();
+    const first: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, null, first, s);
+    const spec_one = tier.entries.items[0].spec_bytes;
+    try testing.expect(spec_one > 0);
+    try testing.expectEqual(spec_one, wroteKind(&tier, .spec));
+
+    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
+    try fillCache(&mtp, s, 1, 200, 8, 9.5 + 590 * 8, .float32);
+    const second: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, second, s);
+    const spec_two = tier.entries.items[0].spec_bytes;
+    try testing.expect(spec_two > spec_one);
+    try testing.expectEqual(spec_one + spec_two, wroteKind(&tier, .spec));
+}
+
+test "DiskTier write counters: a failed background write lands in failed, never in written" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wfail", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    tier.writer.?.setPaused(true);
+    defer tier.writer.?.setPaused(false);
+    tier.writer.?.injectFailure("c000003", .write);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const cb = tier.entries.items[0].chunk_bytes;
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expectEqual(cb[3], tier.stats.snapshot().failed);
+    try testing.expectEqual(sumBytes(cb) - cb[3], wroteKind(&tier, .kv));
+}
+
+test "DiskTier write counters: the synchronous manifest write counts meta on success and failed on error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wmeta", 0, 128);
+    defer tier.deinit();
+    try testing.expect(tier.writer == null);
+    var toks = [_]u32{ 1, 2, 3 };
+    var cb = [_]u64{64};
+    var no_pos = [_]u32{};
+    var no_sz = [_]u64{};
+    const e = IndexEntry{
+        .id = 5,
+        .tokens = &toks,
+        .kv_len = 3,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 64,
+        .chunk_bytes = &cb,
+        .ssm_positions = &no_pos,
+        .ssm_bytes = &no_sz,
+        .last_used = 0,
+    };
+    try testing.expectError(error.FileNotFound, tier.writeMeta(e));
+    const missing_dir = tier.stats.snapshot();
+    try testing.expect(missing_dir.failed > 0);
+    try testing.expectEqual(@as(u64, 0), missing_dir.totalWritten());
+
+    try tmp.dir.createDirPath(io, "fp-wmeta/e5");
+    try tier.writeMeta(e);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/e5/meta.json", .{tier.root});
+    defer testing.allocator.free(path);
+    const landed = tier.stats.snapshot();
+    try testing.expectEqual(fileSize(io, path).?, landed.written[@intFromEnum(write_stats.Kind.meta)]);
+    try testing.expectEqual(missing_dir.failed, landed.failed);
 }

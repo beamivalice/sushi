@@ -1,5 +1,6 @@
 const kd = @import("../kv_disk_cache.zig");
 const disk_placement = @import("../disk_placement.zig");
+const write_stats = @import("../disk_write_stats.zig");
 const log = @import("../log.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
@@ -168,7 +169,7 @@ pub fn writeQsaHistoryFile(
     }
     if (list.items.len == 0) return 0;
     const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
-    return self.saveNamed(path, list.items, meta.items, s);
+    return self.saveNamed(path, list.items, meta.items, .qsa, s);
 }
 
 pub fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !transformer_mod.SSMCheckpoint {
@@ -1853,4 +1854,54 @@ test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+test "DiskTier write counters: a QSA history rewritten for a longer checkpoint counts its full bytes again, beside the checkpoint files" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wqsa", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 2048, 8, 0.0, .float32);
+    var tokens: [2048]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    var short = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&short);
+    short[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    short[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 256, 8 }, 800.0);
+    short[2].qsa_ratio = 4;
+    var first = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &short, 1024, s)};
+    defer for (&first) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&first, &short, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &first, s);
+    const qsa_one = tier.entries.items[0].qsa_history_bytes;
+    try testing.expect(qsa_one > 0);
+    try testing.expectEqual(qsa_one, tier.stats.snapshot().written[@intFromEnum(write_stats.Kind.qsa)]);
+
+    var long = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&long);
+    long[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    long[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 500, 8 }, 800.0);
+    long[2].qsa_ratio = 4;
+    var second = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &long, 2000, s)};
+    defer for (&second) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&second, &long, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &second, s);
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(u32, 2000), e.qsa_history_rows);
+    try testing.expect(e.qsa_history_bytes > qsa_one);
+    const snap = tier.stats.snapshot();
+    try testing.expectEqual(qsa_one + e.qsa_history_bytes, snap.written[@intFromEnum(write_stats.Kind.qsa)]);
+    var points: u64 = 0;
+    for (e.ssm_bytes) |b| points += b;
+    try testing.expectEqual(points, snap.written[@intFromEnum(write_stats.Kind.ssm)]);
+    try testing.expectEqual(@as(u64, 0), snap.failed);
 }

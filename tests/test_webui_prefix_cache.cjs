@@ -1,5 +1,6 @@
 // sushi-test: tier=hermetic needs=node,playwright
-// The chat page's SSD prefix-cache meter, driven through the page's own functions without a browser or model.
+// The chat page's SSD prefix-cache meter and the dashboard's write-counter card, driven through the page's own
+// functions without a browser or model.
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
@@ -55,3 +56,24 @@ Promise.resolve().then(() => Promise.resolve()).then(() => {
   assert.equal(node('prefixCacheUsage').textContent, '2.00 / 10.0 GB');
   console.log('Web UI prefix-cache meter: passed');
 });
+
+// The dashboard card: the rate since the previous poll and the bytes written per byte on disk.
+const dash = source.match(/<script id="dashboardScript">([\s\S]*?)<\/script>/)[1];
+const writesStart = dash.indexOf('function prefixWrites(');
+const writes = vm.createContext({});
+vm.runInContext(dash.slice(writesStart, dash.indexOf('function push(', writesStart)) + '\nthis.prefixWrites = prefixWrites;', writes);
+const counters = (kv, extra = {}) => ({ written_bytes: { kv, ssm: 0, qsa: 0, spec: 0, ring: 0, meta: 0, ...extra }, failed_bytes: 7 });
+
+assert.equal(writes.prefixWrites(undefined, null, 0, 0), null, 'a server without the counters reports none');
+const first = writes.prefixWrites(counters(8 * GiB, { qsa: 2 * GiB }), null, 10_000, 5 * GiB);
+assert.equal(first.total, 10 * GiB);
+assert.equal(first.rate, null, 'no rate on the first poll');
+assert.equal(first.amplification, 2, 'written over what is on disk');
+assert.equal(first.failed, 7);
+assert.equal(writes.prefixWrites(counters(1), null, 0, 0).amplification, null, 'nothing on disk, no ratio');
+
+const second = writes.prefixWrites(counters(8 * GiB + 100, { qsa: 2 * GiB + 300 }), first, 12_000, 5 * GiB);
+assert.equal(second.rate, 200, 'bytes per second between the two polls');
+assert.equal(writes.prefixWrites(counters(5), second, 14_000, 0).rate, null, 'a restarted server counts from zero: no negative rate');
+assert.equal(writes.prefixWrites(counters(8 * GiB + 100, { qsa: 2 * GiB + 300 }), second, 14_000, 0).rate, 0, 'idle writes nothing');
+console.log('Web UI prefix-cache writes: passed');

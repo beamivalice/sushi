@@ -7,6 +7,7 @@ earlier history is mlx-serve's, in that project's changelog.
 ## Unreleased
 
 - **DeepSeek-V4.1 prefills long prompts faster**: a prompt chunk that another chunk follows no longer runs the decoder tail whose rows nothing reads, with byte-identical output; a chunk that takes a restore point keeps it.
+- **The SSD prompt cache's write volume is measurable**: `/metrics`, `/metrics.json` and `/props` count the bytes it writes to disk, by kind, and the dashboard shows the total, the split and the write rate; thanks @cyrilmhansen for the request.
 - **Code for models sushi does not serve is gone**: `/v1/embeddings` (no served model embeds), the nvfp4 quantization mode and GGUF discovery are removed (a GGUF path is still refused by name), and `--drafter` now refuses a target other than Qwen3.8-Flash-Next or GLM-5.3 by name instead of loading a drafter that never ran correctly. The muse, harmony, ATEM, LFM2 and K2 tool-call dialects and the WordPiece and SentencePiece tokenizers went with them.
 - **A GLM or DeepSeek chat template that fails is refused by name**: instead of a generic-format prompt the model was never trained on, the request answers 500 `chat template unusable: <reason>` on every surface, streamed or not.
 - **Metrics can be turned on in a running server**: `POST /metrics/enable` (curl, or the dashboard's new Enable metrics button, shown only while metrics are off) starts the same `/metrics` and `/metrics.json` feeds as `--metrics` without a restart; counters start at zero when it is pressed.
