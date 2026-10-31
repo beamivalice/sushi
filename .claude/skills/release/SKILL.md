@@ -10,6 +10,8 @@ directly: no driver script, no pause/resume bookkeeping. A failed step goes to t
 loads take the GPU lock; step 2 waits for a quiet box (no builds, no AirDrop or other transfers).
 
 Order (owner, 2026-10-31):
+0. Read `docs/private/future.md` (main checkout) and tell the owner, before anything runs, every entry this release
+   gates or is due with it (e.g. a pack upload that waits for the published release), and what each still needs.
 1. Step 1, then the version bump (Release steps 1 and 2 below), committed and pushed.
 2. Two tracks start together and should finish about together:
    - remote: `./release.sh` (`release.yml` builds, tests and leaves the DRAFT);

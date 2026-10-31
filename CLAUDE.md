@@ -75,7 +75,7 @@ link to or quote them from a committed file.
 | `docs/private/sashimi-codebooks.md` | MCG decision, decoder dead ends, fractional-rate trellis |
 | `docs/private/quality-kld-research.md` | KLD of every intermediate and experimental pack, sweeps, how packs were made |
 | `docs/private/measurement-raw.md` | the raw-file path behind every committed measurement, keyed by doc and section |
-| `docs/private/future.md` | work still to explore; an entry leaves when it starts or lands |
+| `docs/private/future.md` | future repo work; read at each release; an entry leaves when it starts or lands |
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
 | `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging, card, upload, verification |
 
@@ -161,18 +161,17 @@ their matrix: `tests/CLAUDE.md`.
   Test the behaviour or state the rule in a comment.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
-- `zig build test` sometimes reports `failed command` on a FIRST run and is green on a direct re-run (Metal
-  contention between parallel test binaries, benign, unpinned).
+- `zig build test` sometimes fails a FIRST run and is green on a direct re-run (Metal contention, benign, unpinned).
 
 ## Releases & benchmarking
 
 `/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw,
 GLM 2.4bpw, DeepSeek STQ 1.75bpw), report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per
 release. Protocol: [process-measurement](docs/process-measurement.md#release-bench).
-- Release order:
-  1. Local tests, then commit and push the version bump.
-  2. `./release.sh` (CI builds the DRAFT), running beside the local perf and KLD gates.
-  3. Both green: publish the draft. Any issue: fix, push, delete the draft and its tag, rerun `./release.sh`.
+- Release order: local tests, push the version bump; `./release.sh` (CI's DRAFT) beside the local perf and KLD gates;
+  both green: publish. Any issue: fix, push, delete the draft and its tag, rerun it.
+- Future repo work (a deferred task or plan) goes to `docs/private/future.md`, never agent memory. A
+  release starts by reading it and telling the owner what is due.
 
 `/bench` for methodology: same-methodology cells only. Interleave A/B kernels in ONE process (separate runs drift 15%);
 same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for cross-engine comparisons only.
@@ -275,7 +274,7 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Reports partial work to the owner every :00 and :30 while work runs.
 - Relays owner decisions and rule changes to ALL live workers at once.
 - Keeps docs/ fresh: every landing updates the matching doc (knowledge, numbers, lessons learned) in the same
-  landing, and this index when a doc appears. CLAUDE.md stays rules + index, never the knowledge store.
+  landing, and this index when a doc appears.
 
 **Workers.**
 - Report progress and blockers to the coordinator; commit per step; don't push or merge unless told.
