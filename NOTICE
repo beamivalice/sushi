@@ -360,6 +360,9 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
   * The DeepSeek-V4.1 fused attention kernel's matrix-unit arm (`dsv41_attn_nax` in `src/dsv41/dsv41_kernels.zig`: the
     `matmul2d` fragment helpers and the tiling of both products), from CommunityServe/plugins #6 by Samuel Reed (@STRML), MIT.
     Modifications: the epilogue store and the packed FP4 row load run on the fragment layout.
+  * The DeepSeek-V4.1 DSpark copy round (`Index.matchBest`, `copyLen` and `CopyBackoff` in `src/mtp_lookup.zig`, the copy arm in
+    `src/dsv41/dsv41_dspark.zig`), from CommunityServe/plugins #15 by Samuel Reed (@STRML), MIT. Modifications: the index and
+    match code are the MTP lookup's, copies stop at eight verify rows, and the generator keeps the backoff per request.
   * The SSD restore that evaluates each chunk before opening the next and
     drops the MLX error its failure latched (`src/kv_disk_cache.zig`, the fd-limit
     arm of `tests/test_prefix_cache_restart.sh`), from mlx-serve #527 by @brandondyal.

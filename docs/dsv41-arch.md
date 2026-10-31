@@ -593,6 +593,21 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   ran 2x slower), trunk weight prefetch under the small stages gained nothing in a process bench, and the rows geometry
   policy is within 2-5% of the best of a sweep.
 
+- **Copy rounds** (`nextDspark`, `mtp_lookup.matchBest` / `copyLen` / `CopyBackoff`, the MTP lookup's index): when the committed tail
+  plus t1 matches 16 or more tokens earlier in the prompt or output (the best of the last 8 occurrences) and the continuation
+  outruns the stage block, the round verifies the copy (up to 7 drafts) and skips the stage draft. It is capped at 8 rows,
+  `dsv41_exact_verify_rows`: past `PROJECT_ROWS_MAX` the trunk linears leave the multi-row arm for the sorted GEMM (`exl3/linear.zig`),
+  so 9-16 row verifies are not the one-row step's bits (the tiny fixture's text differs from the first token; follow-up: exact verify
+  past 8 rows, then the cap can rise to 16). A backoff skips copies that lose to the stage rounds on ms per token, a doubling stretch
+  up to 16 matches, and sizes a copy to what copies have landed plus 2. Greedy text is byte-identical on and off. Design after
+  CommunityServe/plugins #15 (@STRML, MIT). Pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`, `--ssd-budget-gb 108`, greedy, no
+  thinking, 800 tokens, main + copy arm `aacdc607` ReleaseFast, GPU lock, fans max, `taskpolicy -a`, arm off by a temporary env knob
+  (since removed), decode tok/s off (two boots) vs on: echo a 2.0k-token file 64.0 / 68.1 vs 80.6 (+22%), rename an identifier in a
+  4.1k-token file 81.1 / 79.6 vs 96.3 (+20%), free prose 46.4 / 46.0 vs 46.6 (flat, no copy round), echo of a 9.6k-token tool result
+  78.3 / 79.2 vs 89.1 (+13%). The copy rounds were 95-97 of ~104 rounds a request at 8 rows, 665-679 of 665-679 drafts accepted;
+  the text md5 is equal on and off for all four prompts. The stage rounds already accepted 98% of drafts on those echoes (2.9-3.8
+  tokens a round at 6 rows), so the gain is the wider verify, not a better draft.
+
 - **Expert prefetch** (forwards of 2 to 16 rows, i.e. DSpark verify; a one-row step does nothing extra): a missed expert
   rebuilds its layer (~1.9 ms), and 6-9 of 40 layers did per R4 round. A layer's router input (V1) times the gate matrix of
   the layer `d` = 3 ahead ranks its experts, and the first uncached of each row's top 12 is read ahead of the layer. On the
@@ -607,8 +622,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
 
 Differences from mlx-serve: the attention-output fp8 round trip stays (upstream drops it), the verify block takes the same
 masked argmax as serial decode, and a verify is not split from the draft with a host sync per Markov step (the chain is
-one lazy graph). Gaps: a verify chunk is not drafted from a copied context (prompt lookup; a copy turn accepts 3.3-3.9 of 5 drafts, so
-a wider block would pay there), and a verify row is its own routed-expert GEMV where a third of the picks of five neighbouring rows
+one lazy graph). Gaps: a verify row is its own routed-expert GEMV where a third of the picks of five neighbouring rows
 (30-40% by the `[expert-stream]` distinct-pick counts) repeat an expert (decoding each distinct expert once for all its rows is the
 lever on the 13 ms step).
 

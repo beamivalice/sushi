@@ -222,6 +222,85 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     try testing.expect(std.mem.count(u32, single[0].items, &.{single[0].items[1]}) < want - 1);
 }
 
+test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole or partly wrong copies alike (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const prompt = ids[0..30];
+    const want: u32 = 120;
+
+    // One row a round is the serial decode, which exact DSpark rounds reproduce at every width.
+    var serial: std.ArrayList(u32) = .empty;
+    defer serial.deinit(a);
+    {
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .{ .rows = 1 };
+        while (try gen.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try serial.appendSlice(a, r.tokens);
+        }
+    }
+    try testing.expectEqual(@as(usize, want), serial.items.len);
+
+    // Copy rounds keep to `dsv41_exact_verify_rows`, the widest verify this fixture matches serial decode at.
+    // The lookup context is the prompt, the output the model is about to write, and the prompt again: the generated
+    // tail then matches the output's start, and the copy is the model's own continuation. `wrong_every` spoils drafts.
+    for ([_]usize{ 0, 11 }) |wrong_every| {
+        const ctx = try a.alloc(u32, prompt.len * 2 + serial.items.len);
+        defer a.free(ctx);
+        @memcpy(ctx[0..prompt.len], prompt);
+        @memcpy(ctx[prompt.len..][0..serial.items.len], serial.items);
+        if (wrong_every > 0) {
+            var i: usize = wrong_every;
+            while (i < serial.items.len) : (i += wrong_every) ctx[prompt.len + i] +%= 1;
+        }
+        @memcpy(ctx[prompt.len + serial.items.len ..], prompt);
+        for ([_]bool{ false, true }) |copy| {
+            try xfm.resetCache();
+            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true, .lookup_prompt = ctx });
+            defer gen.deinit(a);
+            gen.dspark_copy = copy;
+            var got: std.ArrayList(u32) = .empty;
+            defer got.deinit(a);
+            while (try gen.nextDspark(a)) |r| {
+                defer a.free(r.tokens);
+                try got.appendSlice(a, r.tokens);
+            }
+            try testing.expectEqualSlices(u32, serial.items, got.items);
+            const st = gen.dspark_stats;
+            try testing.expectEqual(copy, st.copy_rounds > 0);
+            if (copy) {
+                try testing.expect(st.copy_accepted <= st.copy_drafted);
+                try testing.expect(wrong_every > 0 or st.copy_accepted == st.copy_drafted);
+                try testing.expect(wrong_every == 0 or st.copy_accepted < st.copy_drafted);
+            }
+        }
+    }
+}
+
 test "dsv41 generator: with exact DSpark rounds greedy text is the same at every round-width mix (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");

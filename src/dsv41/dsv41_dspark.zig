@@ -4,6 +4,7 @@ const generate_mod = @import("../generate.zig");
 const io_util = @import("../io_util.zig");
 const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
+const mtp_lookup = @import("../mtp_lookup.zig");
 const mtp_mod = @import("../mtp.zig");
 const mtp_plan = @import("../mtp_plan.zig");
 const row_grammar = @import("../row_grammar.zig");
@@ -40,6 +41,10 @@ pub const dsv41_max_drafts = 16;
 /// The widest verify `dsv41Verify` accepts, a ring slack's rows.
 pub const dsv41_max_verify_rows: u8 = @intCast(@import("dsv41_config.zig").ring_slack);
 
+/// The widest verify whose rows are their one-row step's bits: past `project_rows.PROJECT_ROWS_MAX` the trunk linears
+/// leave the multi-row arm for the sorted GEMM, which sums in another order. Adaptive rounds stay inside the block (6).
+pub const dsv41_exact_verify_rows: u8 = 8;
+
 /// `SUSHI_DSV41_DSPARK_ROWS` (diagnostic): `sweep` cycles the verify width over `dspark_sweep_rows`, a number forces
 /// it (rows past the block repeat its last draft, so only their cost means anything), `log` keeps the policy; each
 /// round logs a `[dspark-round]` line.
@@ -61,6 +66,21 @@ pub fn dsparkDiag() DsparkDiag {
     const d: DsparkDiag = if (std.c.getenv("SUSHI_DSV41_DSPARK_ROWS")) |r| parseDsparkDiag(std.mem.span(r)) else .off;
     dspark_diag_cache = d;
     return d;
+}
+
+/// The copy arm: the context's continuation after `t1` into `drafts`, as many as a copy round verifies, or 0 for a stage
+/// round. Adaptive rounds only; a forced or seeded width keeps its rows.
+fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []u32) !usize {
+    const remaining = self.max_tokens - self.completion_tokens;
+    const cap = @min(drafts.len, remaining -| 1, self.dspark_copy_rows - 1);
+    const block: usize = if (self.xfm.dsv41) |m| m.cfg.dspark.block else return 0;
+    if (cap <= block) return 0;
+    const idx = try self.mtpLookupIndex(allocator);
+    const found = idx.matchBest(t1, @intCast(self.dspark_copy_backoff.width(cap)));
+    const n = mtp_lookup.copyLen(found, cap, block, mtp_lookup.COPY_SUFFIX);
+    if (n == 0 or !self.dspark_copy_backoff.take()) return 0;
+    @memcpy(drafts[0..n], found.?.draft[0..n]);
+    return n;
 }
 
 /// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
@@ -106,23 +126,29 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         tb.observe(self.generated_ids.items);
         break :room tb.room();
     } else null;
-    const policy_rows: ?usize = if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) 1 else switch (diag) {
+    const adaptive = (diag == .off or diag == .log) and dsparkSeededRows(self.sampling, policy.range) == null;
+    var ids_buf: [dsv41_max_drafts + 1]u32 = undefined;
+    const copied: usize = if (self.dspark_copy and adaptive and !self.spec_disabled_runtime and (think_room orelse 2) > 1)
+        try dsparkCopyDrafts(self, allocator, t1, ids_buf[1..])
+    else
+        0;
+    const policy_rows: ?usize = if (copied > 0) copied + 1 else if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) 1 else switch (diag) {
         .off, .log => dsparkSeededRows(self.sampling, policy.range) orelse if (policy.next() == .plain) 1 else null,
         .rows => |n| n,
         .sweep => dspark_sweep_rows[self.dspark_stats.rounds % dspark_sweep_rows.len],
     };
     const forced: ?usize = if (think_room != null and think_room.? <= 1) 1 else policy_rows;
-    var ids_buf: [dsv41_max_drafts + 1]u32 = undefined;
+    ids_buf[0] = t1;
     var conf_buf: [dsv41_max_drafts]f32 = @splat(0);
     var block: ?@import("dsv41_model.zig").Draft = null;
     defer if (block) |*b| b.deinit();
-    var block_len: usize = 1;
-    if (forced == null or forced.? > 1) {
+    var block_len: usize = 1 + copied;
+    if (copied == 0 and (forced == null or forced.? > 1)) {
         block = try xfm.dsv41Draft(t1);
         block_len = block.?.ids.len;
         @memcpy(ids_buf[0..block_len], block.?.ids);
         @memcpy(conf_buf[0 .. block_len - 1], block.?.conf);
-    } else ids_buf[0] = t1;
+    }
     const draft_ns = timer.read();
     timer.reset();
     if (forced) |f| if (f > block_len) for (block_len..f) |i| {
@@ -193,6 +219,9 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     st.rows_hist[rows] += 1;
     st.drafted += rows - 1;
     st.accepted += accepted;
+    st.copy_rounds += @intFromBool(copied > 0);
+    st.copy_drafted += if (copied > 0) rows - 1 else 0;
+    st.copy_accepted += if (copied > 0) accepted else 0;
     st.draft_ns += draft_ns;
     st.verify_ns += verify_ns;
     if (diag == .off or diag == .log) {
@@ -201,7 +230,13 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
                 return @floatCast(@as(f64, @floatFromInt(ns)) / 1e6);
             }
         }.of;
-        if (block == null) policy.observePlain(ms(verify_ns)) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, ms(draft_ns), ms(verify_ns));
+        if (copied > 0) {
+            // The stage policy learns from stage blocks only: a wide copy verify would move its fitted row price.
+            self.dspark_copy_backoff.observeCopy(rows - 1, accepted, ms(draft_ns + verify_ns));
+        } else {
+            self.dspark_copy_backoff.observeStage(n_commit, ms(draft_ns + verify_ns));
+            if (block == null) policy.observePlain(ms(verify_ns)) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, ms(draft_ns), ms(verify_ns));
+        }
     }
     if (dsparkDiag() != .off) log.info("  [dspark-round] ctx={d} rows={d} accepted={d} draft_ms={d:.1} verify_ms={d:.1} gate={s} conf={any}\n", .{
         ctx_before,
