@@ -99,7 +99,27 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   tie or lose a little at any split (the merge costs what the split saves); 32 splits lose everywhere. Output is
   bit-identical, so the gate is the unit test (47f5d3c1's timing run, 487ecb62's kernel; GPU lock, QUIET, fans max, die
   under 50 C, `taskpolicy -a`, server down). Eight chunks is the best count at every size that splits; 16 is 5-10% slower.
-  The matrix-unit decode index score kernel that the same run timed (20-30% slower than the scalar one) is ruled out.
+  The f32 matrix-tile decode index score kernel that the same run timed (20-30% slower than the scalar one) is ruled out.
+- **Decode index scan on the matrix units** (`indexScoresPackedNax`, `indexScoresGatherNax`, `Model.index_nax`, `indexNaxProbe`
+  at load; QAT on, 32 heads x 128, UE8M0 scales over 32): q and a packed key are, per group of 32 channels, a small integer
+  times a power of two (|n| <= 12 for the doubled E2M1 code, <= 16 for q), so with each group scaled to its head's (q) or key's
+  largest the 128-term dot is a sum of products n n' 2^-d that half operands with f32 accumulation hold exactly while the four
+  groups span at most 9 binades (128 x 192 x 2^9 < 2^24); any summing order is then the scalar loop's dot, and the head sum keeps
+  the scalar kernel's order (a power of two moved into the head weight leaves each product's value alone). A key past the span,
+  a scale byte outside +-40 binades, or a q off the FP4 grid (the prep kernel flags the row) takes the scalar loop inside the
+  kernel, so the scores are the scalar kernel's bits for every input. On the saved live scans (layers 2/8/14/20, 4k to 512k
+  positions) the span peaks at 7 and every key stays on the matrix path. Served from 131072 keys on one row and from 2 rows
+  (the extra q launch loses at 32768 keys on one row); the gather from 5 rows (ties at 4, loses at 1). `sushi-ubench run
+  dsv41.index_decode`, db5920f3, GPU lock, QUIET, fans max, die 49 C, `taskpolicy -a`, 9 rounds, server down, us per scan,
+  scalar to matrix: 131072 keys 1 row 290 to 218, 4 rows 767 to 369, 16 rows 2387 to 799; 524288 keys 1 row 737 to 410, 4 rows
+  2422 to 859, 6 rows 3510 to 1187, 16 rows 9104 to 2653; 1048576 keys 1 row 1301 to 603, 4 rows 4631 to 1565, 6 rows 6849 to
+  2148, 16 rows 17968 to 5048. Gather of 2048 blocks, scalar to matrix: 1 row 177 to 225 (loses), 6 rows 305 to 247, 16 rows
+  500 to 294 (1M keys). The matrix units' f16 GEMM rate bounds it (about 21 TFLOPS of the ~33 an MLX GEMM reaches); the tiling
+  (rows and simdgroups per threadgroup, steps per simdgroup) is flat. Live, STQ 1.75bpw code arm, contexts restored from
+  a kept prefix cache, cooled under 50 C per rung, 1581-1620 MHz, median of 3, against f472204f: one-row decode 53.3, 51.1,
+  49.5 to 53.1, 53.3, 52.2 tok/s at 128k, 256k, 512k; DSpark 77.6, 70.1, 69.1 to 79.2, 74.3, 76.9. Tests: `dsv41 index scores: the integer matrix kernel
+  gives the packed scalar kernel's scores bit for bit` (spans 0-11, partials at the integer bound, a q off the grid, a 15-binade
+  row, rows 1/4/6/16, the gather) and the saved scans (`DSV41_INDEX_SCANS`, all 20, against the live kernel's own scores).
 
 - **Tile-major expert pools**: the streamed STQ pools hold each trellis projection per output tile pair
   (`layout.tileMajor`, [engine-exl3-experts](engine-exl3-experts.md#rate-groups)), filled through the bounce buffers and
@@ -359,7 +379,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_attn_fused` (`_fp4`) | a wide span's whole `attnCore`: window band and picked rows read by index (`_fp4`: straight from the packed FP4 store), online f32 softmax with the sink, no gathered rows or logits | wide chunks (more than 16 rows) on the GPU stream, bf16 activations, 16 divides the heads | 4e-6 to 1.3e-5 of peak against the CPU f32 `attnCore`, where the GPU `attnCore` is 3.5e-4 to 7e-4; the tiny oracle (4 heads) never engages it |
 | `dsv41_attn_nax` (`_fp4`) | `dsv41_attn_fused`'s two products on NAX `matmul2d` fragments (arm `Model.attn_nax`, on where `attnNaxFits` and the load's trial pass); the same tiling, f32 softmax, sink, high + low bf16 P, epilogue store and packed rows | the fused kernel's wide chunks on an M5 (`attnNaxFits`: heads multiple of 16, width a multiple of 256) | 3.0e-6 to 6.6e-6 of peak against the CPU f32 `attnCore` (the fused kernel 3.1e-6 to 1.3e-5 on the same cases); packed rows and the epilogue store equal the NAX gather and op chain byte for byte |
 | `dsv41_attn_softmax` | the f16 arm of a wide span (`Model.attn_f16`, off) | wide spans, window + picks <= 1024 columns | within 1/64 of peak of the f32 chain (bf16 outputs); f16 scores change output, so it waits for a KLD run |
-| `dsv41_index_scores`, `dsv41_index_scores_fp4`, `dsv41_index_tile` | the indexer's relu-weighted scores over key tiles, with the unseen groups at -inf | scalar up to 16 rows (`_fp4` reads the packed keys), matrix tiles when 8 divides the heads and the width | scalar and tile no further from the f64 truth than the chain; `_fp4` the unpacked keys' scores bit for bit; a tile scored at its key offset the whole list's columns bit for bit |
+| `dsv41_index_scores`, `dsv41_index_scores_fp4`, `dsv41_index_tile` (`_fp4` also as `dsv41_index_scores_nax`, `_nax_gather` on the matrix units) | the indexer's relu-weighted scores over key tiles, with the unseen groups at -inf | scalar up to 16 rows (`_fp4` reads the packed keys), matrix tiles when 8 divides the heads and the width | scalar and tile no further from the f64 truth than the chain; `_fp4` the unpacked keys' scores bit for bit; a tile scored at its key offset the whole list's columns bit for bit |
 | `dsv41_hc_stage`, `dsv41_hc_stage_x`, `dsv41_hc_stage_z`, `dsv41_hc_split` | `hcMixes`, the previous-mix collapse and rms norm, and (`_x`) the `hcExpand` that feeds the FFN stage; the Sinkhorn split on one simdgroup; `_z` takes the attention's mixes and splits them in every threadgroup (no `dsv41_hc_split` dispatch after the attention stage) | up to 16 rows | mixes and normed collapse no further from the f64 truth than the chain; the expanded stream likewise; the split to 2e-6 of the thread-per-row split; `_z` bit for bit the split kernel plus `_x` (1, 3, 16 rows, bf16 and f32) |
 | `dsv41_hc_mix`, `dsv41_hc_norm` | the same for a wide block (a tile of rows and mixes a threadgroup; split + collapse + norm) | more than 16 rows | bit for bit the stage's z, split and normed collapse |
 | `dsv41_hc_expand` | `hcExpand`'s op chain (post x y + comb^T x) on a wide block: the stream in one pass, one thread an output element (grid z = copy) | any rows, GPU stream, 4 copies, where `probeHc` finds the GPU's f32 matmul TF32-class and the kernel equal to the chain | bit for bit the chain (bf16 and f32; 1 to 4096 rows; D 40 to 5120) |

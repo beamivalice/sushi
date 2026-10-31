@@ -42,7 +42,9 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - build.zig names a bucket's files at configure time, so every folder or file it scans is declared with
   `b.dependOnDirectoryContents`/`dependOnFileContents`; without that a new test file never runs until the cache goes.
 - `SUSHI_TEST_NO_GPU=1` makes a test build see no Metal backend, so `requireGpu` skips (diagnostic, test builds only).
-- The pack tier's envs: `DSV41_TINY`, `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `QWEN4_TEST_MODEL`,
+- The pack tier's envs: `DSV41_TINY`, `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
+  folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
+  `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`. A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green
   suite proves nothing there.
 - Two real-weight runs have no script. The encoder's real-checkpoint capture:

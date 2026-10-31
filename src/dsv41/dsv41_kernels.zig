@@ -1742,6 +1742,379 @@ pub fn candidateKeys(sc: *Scope, pos: A, blocks: A, bs: usize) !A {
     return o[0];
 }
 
+/// The packed scan's `q` for the matrix units: per (row, head) the values are n * 2^(e - e0) with n an integer of at most
+/// 16 (FP4 q: at most 12), e the exponent of the group of 32 channels and e0 the head's largest, written as half in the
+/// order the key fragments pair them (`dsv41_index_scores_nax`); `pq` is 2^e0. `sqr[l]` is the widest spread of e across
+/// a head's groups, or 1000 when a group is not of that form (no FP4 grid, a range the products cannot hold) or a head
+/// weight is out of the range its products stay normal in: such a row scores on the scalar loop.
+const IDX_NAX_PREP_SOURCE =
+    \\const int l = threadgroup_position_in_grid.x;
+    \\const uint t = thread_index_in_threadgroup;
+    \\const int h = int(t) / 4, g = int(t) % 4;
+    \\threadgroup int emax[128], emin[128], bad[128], wbad[32], hs[32];
+    \\const auto qp = q + (size_t(l) * 32 + h) * 128 + g * 32;
+    \\float amax = 0.0f;
+    \\for (int j = 0; j < 32; ++j) amax = metal::max(amax, metal::abs(qp[j]));
+    \\int flag = (amax >= 0.0f && !metal::isinf(amax)) ? 0 : 1;
+    \\const uint eb = (as_type<uint>(amax) >> 23) & 255u;
+    \\const int ex = amax > 0.0f ? int(eb) - 127 : 0;
+    \\const int eq = ex - 3;
+    \\if (amax > 0.0f && (eb == 0u || eb == 255u || eq < -40 || eq > 40)) flag = 1;
+    \\const float up = as_type<float>(uint(metal::clamp(130 - ex, 1, 254)) << 23);
+    \\for (int j = 0; j < 32; ++j) {
+    \\  const float v = qp[j] * up;
+    \\  if (!(v == metal::rint(v)) || metal::abs(v) > 16.0f) flag = 1;
+    \\}
+    \\emax[t] = amax > 0.0f ? eq : -1000;
+    \\emin[t] = amax > 0.0f ? eq : 1000;
+    \\bad[t] = flag;
+    \\if (t < 32) {
+    \\  const float aw = metal::abs(float(w[size_t(l) * 32 + t]) * wsc[0]);
+    \\  wbad[t] = (aw != 0.0f && !(aw >= as_type<float>(67u << 23) && aw <= as_type<float>(187u << 23))) ? 1 : 0;
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\int mx = -1000, mn = 1000;
+    \\for (int k = 0; k < 4; ++k) { mx = metal::max(mx, emax[h * 4 + k]); mn = metal::min(mn, emin[h * 4 + k]); }
+    \\const int e0 = mx < mn ? 0 : mx;
+    \\const float fold = amax > 0.0f ? as_type<float>(uint(metal::clamp(127 + eq - e0, 1, 254)) << 23) : 0.0f;
+    \\for (int j = 0; j < 32; ++j)
+    \\  qa[((size_t(l) * 32 + h) * 4 + g) * 32 + (j >> 2) + 8 * (j & 3)] = half(qp[j] * up * fold);
+    \\if (g == 0) {
+    \\  pq[size_t(l) * 32 + h] = as_type<float>(uint(e0 + 127) << 23);
+    \\  hs[h] = mx < mn ? 0 : mx - mn;
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (t == 0) {
+    \\  int s = 0, b = 0;
+    \\  for (int k = 0; k < 32; ++k) { s = metal::max(s, hs[k]); b |= wbad[k]; }
+    \\  for (int k = 0; k < 128; ++k) b |= bad[k];
+    \\  sqr[l] = b ? 1000 : s;
+    \\}
+;
+
+/// `dsv41_index_scores_fp4`'s loop for one key of one row, `q` read in place: the keys the matrix form cannot hold.
+const IDX_NAX_HEADER = IDX_PACKED_HEADER ++
+    \\template <typename Q, typename C, typename S, typename W, typename WS>
+    \\inline float dsv41_idx_scalar(Q qf, C codes, S scales, W w, WS wsc, int l, int key) {
+    \\  const auto qr = qf + size_t(l) * 32 * 128;
+    \\  const auto kc = codes + size_t(key) * 64;
+    \\  const auto ks = scales + size_t(key) * 4;
+    \\  float dots[32];
+    \\  for (int h = 0; h < 32; ++h) dots[h] = 0.0f;
+    \\  for (int j = 0; j < 128; j += 4) {
+    \\    const float k0 = dsv41_fp4_at(kc, ks, j, 32, 1), k1 = dsv41_fp4_at(kc, ks, j + 1, 32, 1), k2 = dsv41_fp4_at(kc, ks, j + 2, 32, 1), k3 = dsv41_fp4_at(kc, ks, j + 3, 32, 1);
+    \\    for (int h = 0; h < 32; ++h) {
+    \\      const auto qp = qr + h * 128 + j;
+    \\      const float4 qv = float4(qp[0], qp[1], qp[2], qp[3]);
+    \\      dots[h] += qv.x * k0;
+    \\      dots[h] += qv.y * k1;
+    \\      dots[h] += qv.z * k2;
+    \\      dots[h] += qv.w * k3;
+    \\    }
+    \\  }
+    \\  float s = 0.0f;
+    \\  for (int h = 0; h < 32; ++h) s += (float(w[l * 32 + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
+    \\  return s;
+    \\}
+    \\
+;
+
+/// The packed scan on the matrix units, byte-identical to `dsv41_index_scores_fp4`. q and a key are, per group of 32
+/// channels, an integer n (|n| <= 16 for q, <= 12 for keys: the doubled E2M1 code) times a power of two. Scaling each
+/// group to its head's (q) or key's (key) largest, a head's dot is the sum of 128 products n * n' * 2^-d of integers
+/// and a shift d of at most `sq` + the key's span: exact in half operands with f32 accumulation (products of at most
+/// 9 bits, 128 of them, in units of 2^-9: at most 128 * 192 * 2^9 < 2^24) whatever the order of summing, so it is the
+/// scalar loop's dot, and 2^(e0 + ek0) times it is exact too. The head sum then runs in the scalar kernel's order, on
+/// the same products: a power of two moved from the dot to the head's weight leaves each product's value alone.
+/// A key outside the span of 9 (or a scale byte out of range) takes the scalar loop.
+///
+/// A simdgroup holds one row's q fragments (heads 0-15 and 16-31, 4 groups of 32 channels, K ordered so a lane's four
+/// K are four adjacent channels) and scores 32 keys a step as two 16-key units: the lane decodes its B fragment straight
+/// from the codes. RB rows a threadgroup, SPR simdgroups a row, each taking 32-key steps SPR apart, IT steps a group.
+/// The result for a column n is `-inf` past what its row sees. GATHER: columns are the keys of `blocks` (BS a block).
+const IDX_NAX_COMMON =
+    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const int l0 = threadgroup_position_in_grid.y * RB;
+    \\const int L = qf_shape[0];
+    \\threadgroup uint lut[256];
+    \\threadgroup float wt[RB * 32], wtp[RB * SPR * 32];
+    \\threadgroup float4 scr[RB * SPR * 256];
+    \\for (uint i = tid; i < 256u; i += RB * SPR * 32) {
+    \\  uint e[2];
+    \\  for (uint hf = 0; hf < 2; ++hf) {
+    \\    const uint nib = hf ? (i >> 4) : (i & 15u), mag = nib & 7u;
+    \\    const uint x2 = mag < 4u ? mag : (2u + (mag & 1u)) << ((mag >> 1) - 1u);
+    \\    e[hf] = uint(as_type<ushort>((nib & 8u) ? -half(x2) : half(x2)));
+    \\  }
+    \\  lut[i] = e[0] | (e[1] << 16);
+    \\}
+    \\for (uint i = tid; i < uint(RB * 32); i += RB * SPR * 32) {
+    \\  const int ll = l0 + int(i) / 32;
+    \\  wt[i] = ll < L ? float(w[size_t(ll) * 32 + i % 32]) * wsc[0] : 0.0f;
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\const int rs = int(sg) / SPR, ks = int(sg) % SPR, l = l0 + rs;
+    \\if (l >= L) return;
+    \\const short r0 = dsv41_nax_r(lane, 0), cb = dsv41_nax_c(lane, 0);
+    \\half a[4][2][16];
+    \\#pragma clang loop unroll(full)
+    \\for (int g = 0; g < 4; ++g)
+    \\  #pragma clang loop unroll(full)
+    \\  for (int hh = 0; hh < 2; ++hh)
+    \\    #pragma clang loop unroll(full)
+    \\    for (int i = 0; i < 16; ++i) a[g][hh][i] = qa[((size_t(l) * 32 + hh * 16 + dsv41_nax_r(lane, i % 8)) * 4 + g) * 32 + (i / 8) * 16 + dsv41_nax_c(lane, i % 8)];
+    \\wtp[sg * 32 + lane] = wt[rs * 32 + lane] * pq[size_t(l) * 32 + lane];
+    \\metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\const int sq = sqr[l];
+    \\const int seen = (meta[0] + l + 1) / meta[1];
+    \\threadgroup float4* sc4 = scr + sg * 256;
+    \\threadgroup float* sc = (threadgroup float*)sc4;
+    \\const threadgroup float* wr = wtp + sg * 32;
+    \\const int tile0 = threadgroup_position_in_grid.x * (SPR * IT * 32);
+    \\for (int it = 0; it < IT; ++it) {
+    \\  const int n0 = tile0 + (it * SPR + ks) * 32;
+    \\  if (n0 >= NC) break;
+    \\  const int n = n0 + int(lane);
+    \\  int mykey;
+    \\  bool myvis;
+    \\  COLUMN(n, myvis, mykey)
+    \\  if (!simd_any(myvis)) {
+    \\    if (n < NC) scores[size_t(l) * NC + n] = -INFINITY;
+    \\    continue;
+    \\  }
+    \\  uint bg[4];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int g = 0; g < 4; ++g) bg[g] = uint(scales[size_t(mykey) * 4 + g]);
+    \\  const uint bmin = metal::min(metal::min(bg[0], bg[1]), metal::min(bg[2], bg[3]));
+    \\  const uint bmax = metal::max(metal::max(bg[0], bg[1]), metal::max(bg[2], bg[3]));
+    \\  const bool slow = sq + int(bmax - bmin) > 9 || bmin < 88u || bmax > 168u;
+    \\  const float kscale = as_type<float>((bmax - 1u) << 23);
+    \\  uint hs[4];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int g = 0; g < 4; ++g) hs[g] = (15u - metal::min(bmax - bg[g], 14u)) << 10;
+    \\  const uint ps0 = hs[0] | (hs[1] << 16), ps1 = hs[2] | (hs[3] << 16);
+    \\  for (int u = 0; u < 2; ++u) {
+    \\    int key[4];
+    \\    float kj[4];
+    \\    half2 sv[4][4];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < 4; ++j) {
+    \\      const ushort col = ushort(16 * u + cb + j);
+    \\      key[j] = metal::simd_shuffle(mykey, col);
+    \\      kj[j] = metal::simd_shuffle(kscale, col);
+    \\      const uint s0 = metal::simd_shuffle(ps0, col), s1 = metal::simd_shuffle(ps1, col);
+    \\      sv[j][0] = half2(as_type<half>(ushort(s0 & 0xffffu)));
+    \\      sv[j][1] = half2(as_type<half>(ushort(s0 >> 16)));
+    \\      sv[j][2] = half2(as_type<half>(ushort(s1 & 0xffffu)));
+    \\      sv[j][3] = half2(as_type<half>(ushort(s1 >> 16)));
+    \\    }
+    \\    half b[4][16];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int j = 0; j < 4; ++j)
+    \\      #pragma clang loop unroll(full)
+    \\      for (int g = 0; g < 4; ++g) {
+    \\        const auto cp = codes + size_t(key[j]) * 64 + g * 16 + 2 * r0;
+    \\        const half2 h0 = as_type<half2>(lut[uint(cp[0])]) * sv[j][g], h1 = as_type<half2>(lut[uint(cp[1])]) * sv[j][g];
+    \\        b[g][j] = h0.x;
+    \\        b[g][j + 4] = h0.y;
+    \\        b[g][j + 8] = h1.x;
+    \\        b[g][j + 12] = h1.y;
+    \\      }
+    \\    float c[2][8];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int hh = 0; hh < 2; ++hh) {
+    \\      #pragma clang loop unroll(full)
+    \\      for (int i = 0; i < 8; ++i) c[hh][i] = 0.0f;
+    \\      #pragma clang loop unroll(full)
+    \\      for (int g = 0; g < 4; ++g) dsv41_nax_mma<16, 32>(c[hh], a[g][hh], b[g]);
+    \\    }
+    \\    #pragma clang loop unroll(full)
+    \\    for (int rr = 0; rr < 4; ++rr)
+    \\      sc4[(r0 + 8 * rr) * 8 + u * 4 + (cb >> 2)] = float4(
+    \\        metal::max(c[rr >> 1][(rr & 1) * 4] * kj[0], 0.0f), metal::max(c[rr >> 1][(rr & 1) * 4 + 1] * kj[1], 0.0f),
+    \\        metal::max(c[rr >> 1][(rr & 1) * 4 + 2] * kj[2], 0.0f), metal::max(c[rr >> 1][(rr & 1) * 4 + 3] * kj[3], 0.0f));
+    \\  }
+    \\  metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  float s = 0.0f;
+    \\  for (int h = 0; h < 32; ++h) s += wr[h] * sc[h * 32 + lane];
+    \\  float res = -INFINITY;
+    \\  if (myvis) res = slow ? dsv41_idx_scalar(qf, codes, scales, w, wsc, l, mykey) : s;
+    \\  if (n < NC) scores[size_t(l) * NC + n] = res;
+    \\  metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+;
+
+const IDX_NAX_SOURCE: [:0]const u8 =
+    \\const int NC = codes_shape[0];
+    \\#define COLUMN(n, vis, key) { vis = (n) < NC && (n) < seen; key = metal::min((n), NC - 1); }
+    \\
+++ IDX_NAX_COMMON;
+
+const IDX_NAX_GATHER_SOURCE: [:0]const u8 =
+    \\const int NC = blocks_shape[1] * BS;
+    \\#define COLUMN(n, vis, key) { const int blk = (n) < NC ? blocks[size_t(l) * blocks_shape[1] + (n) / BS] : -1; key = blk >= 0 ? blk * BS + (n) % BS : 0; vis = blk >= 0 && key < seen; }
+    \\
+++ IDX_NAX_COMMON;
+
+var idx_nax_prep_def = Def{ .name = "dsv41_index_qprep", .ins = &.{ "q", "w", "wsc" }, .outs = &.{ "qa", "pq", "sqr" }, .source = IDX_NAX_PREP_SOURCE };
+var idx_nax_def = Def{ .name = "dsv41_index_scores_nax", .ins = &.{ "qa", "pq", "sqr", "qf", "codes", "scales", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_NAX_SOURCE, .header = ATTN_NAX_HEADER ++ IDX_NAX_HEADER };
+var idx_nax_gather_def = Def{ .name = "dsv41_index_scores_nax_gather", .ins = &.{ "qa", "pq", "sqr", "qf", "codes", "scales", "w", "meta", "wsc", "blocks" }, .outs = &.{"scores"}, .source = IDX_NAX_GATHER_SOURCE, .header = ATTN_NAX_HEADER ++ IDX_NAX_HEADER };
+
+/// Whether `indexScoresPackedNax` and `indexScoresGatherNax` serve these packed keys: the release's 32 heads of 128
+/// channels, UE8M0 scales over groups of 32, and the matrix units.
+pub fn indexNaxFits(mode: qat_mod.Qat, group: usize, ih: usize, ihd: usize) bool {
+    return mode == .fp4_ue8m0 and group == 32 and ih == 32 and ihd == 128 and nax_gate.verifyQmmNaxAvailable();
+}
+
+const NaxTiling = struct { rb: usize, spr: usize };
+
+/// Rows and simdgroups a threadgroup takes for `rows` query rows: every simdgroup scores one row, and a lone row is
+/// shared among several.
+fn naxTiling(rows: usize) NaxTiling {
+    return switch (rows) {
+        1 => .{ .rb = 1, .spr = 6 },
+        2 => .{ .rb = 2, .spr = 3 },
+        3 => .{ .rb = 3, .spr = 2 },
+        else => .{ .rb = @min(rows, 4), .spr = 1 },
+    };
+}
+
+const nax_steps = 8;
+
+fn naxScores(sc: *Scope, def: *Def, q: A, codes: A, scales: A, w: A, wscale: f32, p0: usize, ratio: usize, blocks: ?A, bs: usize) !A {
+    const L = dim(q, 0);
+    const nc = if (blocks) |b| dim(b, 1) * bs else dim(codes, 0);
+    const meta = try sc.ints(&.{ ci(p0), ci(ratio) }, &.{2});
+    var prep: [3]A = undefined;
+    const wsc = try f32Const(sc, &.{wscale});
+    try launch(sc, &idx_nax_prep_def, &.{ q, w, wsc }, &.{
+        .{ .shape = &.{ ci(L), 32, 4, 32 }, .dt = .float16 }, .{ .shape = &.{ ci(L), 32 }, .dt = .float32 }, .{ .shape = &.{ci(L)}, .dt = .int32 },
+    }, .{ L * 128, 1, 1 }, .{ 128, 1, 1 }, &.{}, &.{}, &prep);
+    const t = naxTiling(L);
+    const nsg = t.rb * t.spr;
+    const tiles = (nc + t.spr * nax_steps * 32 - 1) / (t.spr * nax_steps * 32);
+    var o: [1]A = undefined;
+    const fixed = [_]A{ prep[0], prep[1], prep[2], q, codes, scales, w, meta, wsc };
+    const ins: []const A = if (blocks) |b| &(fixed ++ [_]A{b}) else &fixed;
+    try launch(sc, def, ins, &.{.{ .shape = &.{ ci(L), ci(nc) }, .dt = .float32 }}, .{ tiles * nsg * 32, (L + t.rb - 1) / t.rb, 1 }, .{ nsg * 32, 1, 1 }, &.{
+        .{ .name = "RB", .v = ci(t.rb) }, .{ .name = "SPR", .v = ci(t.spr) }, .{ .name = "IT", .v = nax_steps }, .{ .name = "BS", .v = ci(bs) },
+    }, &.{}, &o);
+    return o[0];
+}
+
+/// `indexScoresPacked` on the matrix units, the same bits; `indexNaxFits` must hold and `q` be f32 `[L, 32, 128]`.
+pub fn indexScoresPackedNax(sc: *Scope, q: A, codes: A, scales: A, w: A, wscale: f32, p0: usize, ratio: usize, mode: qat_mod.Qat, group: usize) !A {
+    std.debug.assert(indexNaxFits(mode, group, dim(q, 1), dim(q, 2)));
+    return naxScores(sc, &idx_nax_def, q, codes, scales, w, wscale, p0, ratio, null, 0);
+}
+
+/// `indexScoresGather` on the matrix units, the same bits.
+pub fn indexScoresGatherNax(sc: *Scope, q: A, codes: A, scales: A, w: A, wscale: f32, p0: usize, ratio: usize, mode: qat_mod.Qat, group: usize, blocks: A, bs: usize) !A {
+    std.debug.assert(indexNaxFits(mode, group, dim(q, 1), dim(q, 2)));
+    return naxScores(sc, &idx_nax_gather_def, q, codes, scales, w, wscale, p0, ratio, blocks, bs);
+}
+
+const E2M1_MAG = [8]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
+
+/// What a trial of the integer matrix arm scores against the scalar kernel: `rows` query rows over `nb` keys; row r of
+/// the keys spans `key_cycle` group-exponent spreads (r % cycle binades between its groups) and a head of q spans
+/// `q_cycle`; `q_cycle` 0 gives q no FP4 grid at all, `wide_row` makes the last query row span 15 binades, and every
+/// `extreme_every`-th key is all +-6 so the integer partials reach their bound.
+pub const IndexNaxSpec = struct { rows: usize, nb: usize, ratio: usize, key_cycle: usize, q_cycle: usize, extreme_every: usize = 0, wide_row: bool = false };
+
+/// `n` rows of 128 channels: each group of 32 an FP4 grid times a power of two, the four groups' exponents spanning
+/// `row % cycle` binades from `base`.
+fn fp4GridRows(a: std.mem.Allocator, seed: u64, n: usize, base: i32, cycle: usize, extreme_every: usize) ![]f32 {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const out = try a.alloc(f32, n * 128);
+    for (0..n) |r| {
+        const spread: u32 = @intCast(r % cycle);
+        var e: [4]i32 = undefined;
+        for (&e, 0..) |*x, g| x.* = base + @as(i32, @intCast(switch (g) {
+            0 => 0,
+            1 => spread,
+            else => rnd.uintLessThan(u32, spread + 1),
+        }));
+        const extreme = extreme_every != 0 and r % extreme_every == 0;
+        for (0..128) |c| {
+            const mag = if (extreme) 7 else rnd.uintLessThan(usize, 8);
+            const sign: f32 = if (!extreme and rnd.boolean()) -1 else 1;
+            out[r * 128 + c] = sign * E2M1_MAG[mag] * std.math.pow(f32, 2, @floatFromInt(e[c / 32]));
+        }
+    }
+    return out;
+}
+
+fn bitsEqual(a: []const f32, b: []const f32) bool {
+    return std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b));
+}
+
+/// Whether the integer matrix arm scores `spec`'s packed keys with the bits of the scalar kernel, over the whole scan
+/// and over a gather of candidate blocks.
+pub fn indexNaxTrial(a: std.mem.Allocator, spec: IndexNaxSpec) !bool {
+    var sc = Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const L = spec.rows;
+    const nb = spec.nb;
+    const keys_h = try fp4GridRows(a, 0x4e1, nb, -2, spec.key_cycle, spec.extreme_every);
+    defer a.free(keys_h);
+    const keys = try qat_mod.packFp4(&sc, try sc.floats(keys_h, &.{ ci(nb), 128 }), .fp4_ue8m0, 32);
+    const q = if (spec.q_cycle > 0) blk: {
+        const q_h = try fp4GridRows(a, 0x4e2, L * 32, -1, spec.q_cycle, spec.extreme_every);
+        defer a.free(q_h);
+        if (spec.wide_row) {
+            const wide = try fp4GridRows(a, 0x4e3, 32, -1, 16, 0);
+            defer a.free(wide);
+            @memcpy(q_h[(L - 1) * 32 * 128 ..], wide);
+        }
+        break :blk try sc.floats(q_h, &.{ ci(L), 32, 128 });
+    } else try sc.astype(try sc.astype(try randn(&sc, &.{ ci(L), 32, 128 }, .float32, 0x4e4, 1.5), .bfloat16), .float32);
+    const w = try sc.astype(try randn(&sc, &.{ ci(L), 32 }, .float32, 0x4e5, 1.0), .bfloat16);
+    const wscale: f32 = 1.0 / @sqrt(128.0) / @sqrt(32.0);
+    const p0 = spec.ratio * (nb -| 20) -| 1;
+    const want = try sc_mod.hostF32(try indexScoresPacked(&sc, q, keys.codes, keys.scales, w, wscale, p0, spec.ratio, .fp4_ue8m0, 32));
+    const got = try sc_mod.hostF32(try indexScoresPackedNax(&sc, q, keys.codes, keys.scales, w, wscale, p0, spec.ratio, .fp4_ue8m0, 32));
+    if (!bitsEqual(want, got)) return false;
+
+    const bs = 8;
+    const kb = @min(40, nb / bs);
+    if (kb == 0) return true;
+    const ids = try a.alloc(i32, L * kb);
+    defer a.free(ids);
+    for (0..L) |l| for (0..kb) |j| {
+        ids[l * kb + j] = if (j + 5 >= kb) -1 else @intCast(j * (nb / bs / kb) + l % 3);
+    };
+    const blocks = try sc.ints(ids, &.{ ci(L), ci(kb) });
+    const want_g = try sc_mod.hostF32(try indexScoresGather(&sc, q, keys.codes, keys.scales, w, wscale, p0, spec.ratio, .fp4_ue8m0, 32, blocks, bs));
+    const got_g = try sc_mod.hostF32(try indexScoresGatherNax(&sc, q, keys.codes, keys.scales, w, wscale, p0, spec.ratio, .fp4_ue8m0, 32, blocks, bs));
+    return bitsEqual(want_g, got_g);
+}
+
+/// Whether the integer matrix arm scores packed keys of every kind a trial can hold (spans inside and outside its
+/// bound, partials at the integer bound, a q off the FP4 grid) with the scalar kernel's bits on this GPU, over the whole
+/// scan and a gather: false when a launch fails or a bit differs. Its row counts take every tiling, so every kernel variant
+/// compiles at the load, not inside a request.
+pub fn indexNaxProbe(a: std.mem.Allocator) bool {
+    const had = mlx.errorPending();
+    const ok = indexNaxProbeRun(a) catch false;
+    if (!ok) mlx.dropLatchedErrorUnless(had);
+    return ok;
+}
+
+fn indexNaxProbeRun(a: std.mem.Allocator) !bool {
+    if (!indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return false;
+    const specs = [_]IndexNaxSpec{
+        .{ .rows = 1, .nb = 1537, .ratio = 1, .key_cycle = 7, .q_cycle = 4, .extreme_every = 13 },
+        .{ .rows = 6, .nb = 1537, .ratio = 2, .key_cycle = 12, .q_cycle = 4, .extreme_every = 13 },
+        .{ .rows = 2, .nb = 700, .ratio = 1, .key_cycle = 12, .q_cycle = 4, .wide_row = true },
+        .{ .rows = 3, .nb = 700, .ratio = 1, .key_cycle = 9, .q_cycle = 4 },
+    };
+    for (specs) |spec| if (!try indexNaxTrial(a, spec)) return false;
+    return true;
+}
+
 /// `indexScores` for a wide block on 8x8 matrix ops; `q` is cast to the keys' dtype. `keys` are the list's rows from
 /// `key0` on, a multiple of the kernel's key tile, so a slice scores the bits the whole list's columns would.
 pub fn indexScoresTile(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, ratio: usize, key0: usize) !A {
@@ -3132,6 +3505,55 @@ test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked 
         const want = try hostOf(&sc, try indexScores(&sc, q, keys, w, wscale, p0, ratio));
         const got = try hostOf(&sc, try indexScoresPacked(&sc, q, packed_keys.codes, packed_keys.scales, w, wscale, p0, ratio, .fp4_ue8m0, 32));
         try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+    };
+}
+
+test "dsv41 index scores: the integer matrix kernel gives the packed scalar kernel's scores bit for bit" {
+    try mlx.requireGpu();
+    if (!mlx.streamIsGpu(mlx.gpuStream()) or !indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
+    // key_cycle 7 keeps every key on the matrix path (spreads <= 6, q <= 3), 12 mixes in keys the scalar loop must take,
+    // and a q without an FP4 grid or one 15 binades wide sends its row to the scalar loop whole.
+    for ([_]usize{ 1, 4, 6, 16 }) |rows| for ([_]usize{ 1, 2 }) |ratio| for ([_]usize{ 7, 12 }) |key_cycle| {
+        try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = rows, .nb = 1537, .ratio = ratio, .key_cycle = key_cycle, .q_cycle = 4, .extreme_every = 13 }));
+    };
+    for ([_]usize{ 1, 33, 4, 100 }) |nb| try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = 3, .nb = nb, .ratio = 1, .key_cycle = 10, .q_cycle = 4 }));
+    try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = 4, .nb = 1537, .ratio = 1, .key_cycle = 12, .q_cycle = 0 }));
+    try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = 4, .nb = 1537, .ratio = 2, .key_cycle = 12, .q_cycle = 4, .wide_row = true }));
+}
+
+test "dsv41 index scores: the integer matrix kernel gives the bits the scalar kernel gave on scans saved from a long-context decode (DSV41_INDEX_SCANS)" {
+    try mlx.requireGpu();
+    if (!mlx.streamIsGpu(mlx.gpuStream()) or !indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_INDEX_SCANS") orelse return error.SkipZigTest);
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    for ([_]u8{ 2, 8, 14, 20 }) |layer| for ([_]usize{ 4096, 32768, 131072, 262144, 524288 }) |pos| {
+        const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/L{d}-pos{d}.safetensors", .{ dir, layer, pos }, 0);
+        defer testing.allocator.free(path);
+        var map = mlx.mlx_map_string_to_array_new();
+        var md = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        defer _ = mlx.mlx_map_string_to_string_free(md);
+        try mlx.check(mlx.mlx_load_safetensors(&map, &md, path.ptr, mlx.mlx_default_cpu_stream_new()));
+        var got: [7]A = undefined;
+        for (&got, [_][:0]const u8{ "scores", "q", "w", "codes", "scales", "meta", "wscale" }) |*g, key| {
+            var arr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_map_string_to_array_get(&arr, map, key.ptr));
+            g.* = try sc.keep(arr);
+        }
+        const meta = try sc_mod.hostI32(got[5]);
+        const q = try sc.astype(got[1], .float32);
+        const w = try sc.astype(got[2], .bfloat16);
+        const codes = try sc.astype(got[3], .uint8);
+        const scales = try sc.astype(got[4], .uint8);
+        const wscale = (try sc_mod.hostF32(try sc.astype(got[6], .float32)))[0];
+        const p0: usize = @intCast(meta[0]);
+        const ratio: usize = @intCast(meta[1]);
+        const live = try sc_mod.hostF32(try sc.astype(got[0], .float32));
+        const scalar = try sc_mod.hostF32(try indexScoresPacked(&sc, q, codes, scales, w, wscale, p0, ratio, .fp4_ue8m0, 32));
+        const matrix = try sc_mod.hostF32(try indexScoresPackedNax(&sc, q, codes, scales, w, wscale, p0, ratio, .fp4_ue8m0, 32));
+        try testing.expect(bitsEqual(live, scalar));
+        try testing.expect(bitsEqual(live, matrix));
     };
 }
 

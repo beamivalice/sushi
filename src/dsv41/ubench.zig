@@ -91,19 +91,19 @@ fn mb(bytes: usize) f64 {
 pub const index_decode: report.Bench = .{
     .name = "dsv41.index_decode",
     .scope = .dsv41,
-    .what = "a decode block's indexer stages over packed keys: scores, candidate mask applied, top-512, candidate-source blocks, scores + top-k",
+    .what = "a decode block's indexer stages over packed keys: scores (scalar and integer matrix kernels), a later layer's gather of the candidate blocks (both), candidate mask applied, top-512, candidate-source blocks, scores + top-k",
     .unit = .us,
     .steps = 1,
     .axes = &.{
-        .{ .name = "keys", .values = &.{ "32768", "65536", "131072", "262144" } },
-        .{ .name = "rows", .values = &.{ "1", "2", "4" } },
+        .{ .name = "keys", .values = &.{ "32768", "131072", "524288", "1048576" } },
+        .{ .name = "rows", .values = &.{ "1", "4", "6", "16" } },
     },
-    .arms = &.{ "scores", "mask", "topk", "cand", "scores_topk" },
+    .arms = &.{ "scores", "scores_nax", "gather", "gather_nax", "mask", "topk", "cand", "scores_topk" },
     .ref = "scores",
     .run = runIndexDecode,
 };
 
-const IndexStage = enum { scores, mask, topk, cand, scores_topk };
+const IndexStage = enum { scores, scores_nax, gather, gather_nax, mask, topk, cand, scores_topk };
 
 const IndexDecode = struct {
     gpu: mlx.mlx_stream,
@@ -115,6 +115,7 @@ const IndexDecode = struct {
     lens: A,
     codes: A,
     scl: A,
+    ids: A,
     mode: qat_mod.Qat,
     group: usize,
     full: A,
@@ -128,6 +129,9 @@ fn sampleIndexDecode(c: *const IndexDecode, arm: usize) anyerror!f64 {
     var sw = io_util.Stopwatch.init(io());
     switch (@as(IndexStage, @fromBackingInt(@intCast(arm)))) {
         .scores => try evalAll(&.{try kernels.indexScoresPacked(&t, c.q, c.codes, c.scl, c.w, 0.01, c.nb - c.L, 1, c.mode, c.group)}),
+        .scores_nax => try evalAll(&.{try kernels.indexScoresPackedNax(&t, c.q, c.codes, c.scl, c.w, 0.01, c.nb - c.L, 1, c.mode, c.group)}),
+        .gather => try evalAll(&.{try kernels.indexScoresGather(&t, c.q, c.codes, c.scl, c.w, 0.01, c.nb - c.L, 1, c.mode, c.group, c.ids, 8)}),
+        .gather_nax => try evalAll(&.{try kernels.indexScoresGatherNax(&t, c.q, c.codes, c.scl, c.w, 0.01, c.nb - c.L, 1, c.mode, c.group, c.ids, 8)}),
         .mask => {
             var o = mlx.mlx_array_new();
             const rep = try t.res(mlx.mlx_repeat_axis(&o, c.mask, 8, -1, t.s), &o);
@@ -156,7 +160,8 @@ fn runIndexDecode(run: *report.Run) anyerror!void {
         defer rows.deinit();
         const pk = rows.pack.?;
         for (try axisInts(run, "rows", &rows_buf)) |L| {
-            const q = try sc.astype(try model.sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0), .float32);
+            if (!kernels.indexNaxFits(pk.mode, pk.group, 32, 128)) return error.NoMatrixUnits;
+            const q = try qat_mod.qat(&sc, try sc.astype(try model.sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0), .float32), pk.mode, pk.group);
             const w = try sc.astype(try model.sc_mod_randn(&sc, &.{ ci(L), 32 }, 0x6d0), .bfloat16);
             const lens_h = try alloc.alloc(i32, L);
             defer alloc.free(lens_h);
@@ -167,11 +172,17 @@ fn runIndexDecode(run: *report.Run) anyerror!void {
             const full = try kernels.indexScoresPacked(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
             const mask = try model.candidateBlocks(&sc, &fake, 0, full, lens, 8, 2048);
             if (mask.ctx == null) return error.KeysUnderTheCandidateBlocks;
+            const ids = try model.candidateBlockIds(&sc, &fake, 0, full, lens, 8, 2048);
+            const nax = try kernels.indexScoresPackedNax(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(try sc_mod.hostF32(full)), std.mem.sliceAsBytes(try sc_mod.hostF32(nax)))) return error.NaxScoresDiffer;
+            const gather = try kernels.indexScoresGather(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group, ids, 8);
+            const gather_nax = try kernels.indexScoresGatherNax(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group, ids, 8);
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(try sc_mod.hostF32(gather)), std.mem.sliceAsBytes(try sc_mod.hostF32(gather_nax)))) return error.NaxGatherDiffers;
             var o = mlx.mlx_array_new();
             const rep = try sc.res(mlx.mlx_repeat_axis(&o, mask, 8, -1, sc.s), &o);
             const masked = try sc.where(try sc.slice(rep, -1, 0, nb), full, try sc.f(neg_inf));
-            try evalAll(&.{ q, w, lens, codes, scl, full, mask, masked });
-            const c: IndexDecode = .{ .gpu = gpu, .fake = &fake, .nb = nb, .L = L, .q = q, .w = w, .lens = lens, .codes = codes, .scl = scl, .mode = pk.mode, .group = pk.group, .full = full, .mask = mask, .masked = masked };
+            try evalAll(&.{ q, w, lens, codes, scl, ids, full, mask, masked });
+            const c: IndexDecode = .{ .gpu = gpu, .fake = &fake, .nb = nb, .L = L, .q = q, .w = w, .lens = lens, .codes = codes, .scl = scl, .ids = ids, .mode = pk.mode, .group = pk.group, .full = full, .mask = mask, .masked = masked };
             const label = try std.fmt.allocPrint(run.a, "keys {d} rows {d}", .{ nb, L });
             try run.interleave(label, &c, sampleIndexDecode);
         }

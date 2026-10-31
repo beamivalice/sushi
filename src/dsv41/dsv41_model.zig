@@ -672,6 +672,9 @@ pub const Model = struct {
     /// The fused attention kernel's products run on the matrix units where the GPU has them (`kernels.attnNaxFits`) and
     /// the load's trial passed (`setAttnNax`); off, the SIMD kernel serves (the tests' oracle arm).
     attn_nax: bool = true,
+    /// The decode indexer's packed scans run on the matrix units (`kernels.indexScoresPackedNax`) where the GPU has them and
+    /// the load's trial gave the scalar kernel's bits (`setIndexNax`); off, the scalar kernel serves. Same bytes either way.
+    index_nax: bool = true,
     /// A wide span's attention kernel stores the heads as `wo_a` takes them; off, the op chain does (the tests' oracle).
     attn_epilogue: bool = true,
     /// A wide chunk's shared expert rides the routed prefill launches where the trellis chain takes it there; off, it runs
@@ -1470,7 +1473,7 @@ fn blockMax(sc: *Scope, scores: A, bs: usize) !A {
 
 /// `candidateBlocks` as the picked block ids `[L, kb]` int32 (ascending, -1 = a block no query reaches), or none when
 /// every block is kept.
-fn candidateBlockIds(sc: *Scope, m: *const Model, li: usize, scores: A, lens: A, bs: usize, kb: usize) !A {
+pub fn candidateBlockIds(sc: *Scope, m: *const Model, li: usize, scores: A, lens: A, bs: usize, kb: usize) !A {
     if ((dim(scores, 1) + bs - 1) / bs <= kb) return none;
     const p = try candidatePicks(sc, m, li, try blockMax(sc, scores, bs), lens, bs, kb);
     return sc.where(p.reach, p.chosen, try sc.i(-1));
@@ -1658,13 +1661,24 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
         idx = got.idx;
     } else if (masked and mlx.mlx_array_dtype(cand.*) == .int32) {
         const pk = rows.pack.?;
-        const scores = try kernels.indexScoresGather(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, pk.mode, pk.group, cand.*, bs);
+        const keys = try sc.slice(rows.buf, 0, 0, nb);
+        const key_scales = try sc.slice(rows.sbuf, 0, 0, nb);
+        const scores = if (indexNaxOn(m, pk, q, nb, true))
+            try kernels.indexScoresGatherNax(sc, q, keys, key_scales, wts, wscale, p0, r, pk.mode, pk.group, cand.*, bs)
+        else
+            try kernels.indexScoresGather(sc, q, keys, key_scales, wts, wscale, p0, r, pk.mode, pk.group, cand.*, bs);
         idx = try kernels.candidateKeys(sc, try topkRows(sc, m, scores, kk), cand.*, bs);
     } else {
         const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
-        var scores = if (packed_scan) // [Ls, nb]
-            try kernels.indexScoresPacked(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, rows.pack.?.mode, rows.pack.?.group)
-        else
+        var scores = if (packed_scan) blk: { // [Ls, nb]
+            const pk = rows.pack.?;
+            const keys = try sc.slice(rows.buf, 0, 0, nb);
+            const key_scales = try sc.slice(rows.sbuf, 0, 0, nb);
+            break :blk if (indexNaxOn(m, pk, q, nb, false))
+                try kernels.indexScoresPackedNax(sc, q, keys, key_scales, wts, wscale, p0, r, pk.mode, pk.group)
+            else
+                try kernels.indexScoresPacked(sc, q, keys, key_scales, wts, wscale, p0, r, pk.mode, pk.group);
+        } else
             try indexScores(sc, m, q, try rows.rows(sc, nb), wts, wscale, p0, r);
         if (is_source) {
             // A decode block's later layers score only the picked blocks' keys, so they get the ids; the picks are the
@@ -1693,6 +1707,14 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
 fn streamsIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
     const c = &m.cfg;
     return fusedOn(sc, m) and m.trace == null and !narrowIndex(sc, m, Ls, nb) and nb > m.index_stream_tile and kernels.indexTileFits(c.index_heads, c.index_head_dim, nb);
+}
+
+/// Whether a packed scan of `q` (f32 `[Ls, ih, ihd]`, FP4-rounded where QAT is on) runs on the matrix units.
+fn indexNaxOn(m: *const Model, pk: Rows.Pack, q: A, nb: usize, gather: bool) bool {
+    const rows = dim(q, 0);
+    // The extra launch for q does not pay back on one row of a short scan, or on a gather of the few candidate keys.
+    const big = if (gather) rows >= 5 else rows > 1 or nb >= 131072;
+    return big and m.index_nax and m.qat_on and kernels.indexNaxFits(pk.mode, pk.group, dim(q, 1), dim(q, 2));
 }
 
 /// Whether `indexScores` runs the scalar kernel (a few rows), which reads packed keys as they are.
@@ -2728,6 +2750,17 @@ pub fn setAttnNax(m: *Model, bar: f64) void {
     }
     m.attn_nax = kernels.attnNaxProbe(m.gpa, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar);
     if (m.attn_nax) log.info("[dsv41] attention kernel on the matrix units\n", .{}) else log.debug("[dsv41] attention kernel: the matrix-unit trial differs from the SIMD kernel, SIMD serves\n", .{});
+}
+
+/// Keeps the matrix-unit index scan only if its trial gave the scalar kernel's bits on this GPU; a declined arm leaves the
+/// scalar kernel serving.
+pub fn setIndexNax(m: *Model) void {
+    if (!m.index_nax or !kernels.indexNaxFits(.fp4_ue8m0, 32, m.cfg.index_heads, m.cfg.index_head_dim)) {
+        m.index_nax = false;
+        return;
+    }
+    m.index_nax = kernels.indexNaxProbe(m.gpa);
+    if (m.index_nax) log.info("[dsv41] index scan on the matrix units\n", .{}) else log.info("[dsv41] index scan: the matrix-unit trial differs from the scalar kernel, the scalar kernel serves\n", .{});
 }
 
 pub fn setDsparkExact(m: *Model, on: bool) void {
@@ -5503,6 +5536,17 @@ test "dsv41 attention NAX trial: the release head shape passes it, and a trial o
     // a declined arm stays declined
     setAttnNax(m, kernels.attn_nax_bar);
     try testing.expect(!m.attn_nax);
+}
+
+test "dsv41 index NAX trial: the release shape passes it, and a model whose index heads the kernel does not serve keeps the scalar kernel" {
+    try mlx.requireGpu();
+    if (!mlx.streamIsGpu(mlx.gpuStream()) or !kernels.indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
+    try testing.expect(kernels.indexNaxProbe(testing.allocator));
+    const m = try tinyModel(try epiFixtureDir(), .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
+    defer m.deinit();
+    try testing.expect(m.index_nax);
+    setIndexNax(m);
+    try testing.expect(!m.index_nax);
 }
 
 fn epiFixtureDir() ![]const u8 {
