@@ -158,10 +158,13 @@ pub const StqStream = struct {
     /// A settle's picks as expert ids, and the slots they resolved to: kept between settles.
     picks: std.ArrayList(u16) = .empty,
     slots: std.ArrayList(i32) = .empty,
+    /// The flat positions of a settle's picks that left the slot the queued chain read.
+    bad: std.ArrayList(u32) = .empty,
 
     pub fn deinit(self: *StqStream) void {
         self.picks.deinit(self.engine.allocator);
         self.slots.deinit(self.engine.allocator);
+        self.bad.deinit(self.engine.allocator);
     }
 
     pub fn hook(self: *StqStream) model.Experts.Hook {
@@ -187,13 +190,15 @@ pub const StqStream = struct {
         // Submitted before the chain, so the host's read of the picks waits for the router only, not for the chain.
         if (ride) |r| try model.submitWith(idx32, r);
         const local = try sc.take(spec.slots, idx32, 0);
-        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec.bank, x, local, wts, shared);
-        return .{ .out = out, .idx = idx32, .map = spec.host };
+        var kept: exl3.rate_groups.Kept = .{};
+        errdefer kept.deinit();
+        const out = try model.stqRoutedKept(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec.bank, x, local, wts, shared, &kept);
+        return .{ .out = out, .idx = idx32, .map = spec.host, .kept = kept };
     }
 
     /// Reads the picks and resolves them in the cache: null when each sat in the slot `map` gave the queued chain, else
     /// the chain over the slots they now hold. The cache is touched here only, so a discarded successor never moves it.
-    fn settleOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, map: []const i32) anyerror!?A {
+    fn settleOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, map: []const i32, kept: exl3.rate_groups.Kept) anyerror!?A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
@@ -217,6 +222,24 @@ pub const StqStream = struct {
         for (slots, prepared.remapped) |*o, r| o.* = r;
         const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
+        model.spec_rebuilt_picks += host.len;
+        // The picks that held keep the planes the queued chain made; only the ones that moved run again.
+        const bad = try scratch(u32, &self.bad, gpa, host.len);
+        var n_bad: usize = 0;
+        for (host, prepared.remapped, 0..) |expert, slot, i| {
+            if (stream.specPickHeld(map, expert, slot)) continue;
+            bad[n_bad] = @intCast(i);
+            n_bad += 1;
+        }
+        if (!prepared.workspace and n_bad < host.len) {
+            if (try model.stqRoutedRedo(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, prepared.remapped, wts, shared, kept, bad[0..n_bad])) |out| {
+                model.spec_redone += 1;
+                model.spec_redo_picks += n_bad;
+                self.engine.noteExpertCompute(@intCast(layer), clock.lap());
+                return out;
+            }
+        }
+        model.spec_redo_picks += host.len;
         const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared);
         self.engine.noteExpertCompute(@intCast(layer), clock.lap());
         return out;
@@ -299,7 +322,7 @@ pub const StqStream = struct {
         var early: exl3.rate_groups.EarlyPlanes = .{};
         defer early.deinit();
         // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
-        const out = try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared, if (staged) &early else null);
+        const out = try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared, if (staged) &early else null, null);
         if (staged) {
             const Start = struct {
                 early: *const exl3.rate_groups.EarlyPlanes,
@@ -1347,8 +1370,10 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
-    // 8 holds every expert (resident: nothing to queue), the others stream through hits and misses.
-    for ([_]u64{ 8, 4, 3 }) |slots| {
+    // The prepared chain is the pack's geometry (5120/2304) in serving: it keeps the planes a settle reuses.
+    defer exl3.rate_groups.prepared_force = null;
+    for ([_]?bool{ null, true }) |prepared| for ([_]u64{ 8, 4, 3 }) |slots| {
+        exl3.rate_groups.prepared_force = prepared;
         var drained: StqServed = undefined;
         try drained.init(dir, .bfloat16, true, false, slots, s);
         defer drained.deinit();
@@ -1368,6 +1393,9 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         const kept0 = model.spec_kept;
         const rebuilt0 = model.spec_rebuilt;
         const folded0 = model.expands_folded;
+        const redone0 = model.spec_redone;
+        const redo_picks0 = model.spec_redo_picks;
+        const rebuilt_picks0 = model.spec_rebuilt_picks;
         var at: usize = 0;
         for ([_]usize{ 20, 1, 1, 5, 1, 3, 1, 16, 1, 1, 1, 1, 2, 1, 1 }) |n| {
             const take = @min(n, ids.len - at);
@@ -1387,7 +1415,8 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         }
         const kept = model.spec_kept - kept0;
         const rebuilt = model.spec_rebuilt - rebuilt0;
-        if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq route-spec slots {d}: {d} layers kept, {d} rebuilt\n", .{ slots, kept, rebuilt });
+        const redone = model.spec_redone - redone0;
+        if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq route-spec prepared {?} slots {d}: {d} layers kept, {d} rebuilt, {d} of them recomputing only the missed picks ({d} of {d} picks)\n", .{ prepared, slots, kept, rebuilt, redone, model.spec_redo_picks - redo_picks0, model.spec_rebuilt_picks - rebuilt_picks0 });
         // The queued and eager packs' decode layers write their stream in the reduce; the drained pack's expand is the kernel.
         try testing.expectEqual(slots != 8, model.expands_folded > folded0);
         if (slots == 8) {
@@ -1395,8 +1424,67 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         } else if (slots <= 3) {
             try testing.expect(kept > 0);
             try testing.expect(rebuilt > 0);
+            if (prepared != null) try testing.expect(redone > 0) else try testing.expectEqual(@as(u64, 0), redone);
         }
-    }
+    };
+}
+
+test "dsv41 stq: a settle that recomputes only the picks off the map gives the whole chain's bytes, 1 to 16 rows, one, two and every pick off (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    exl3.rate_groups.prepared_force = true;
+    defer exl3.rate_groups.prepared_force = null;
+    const s = mlx.gpuStream();
+    var pack: StqServed = undefined;
+    try pack.init(dir, .bfloat16, true, false, 4, s);
+    defer pack.deinit();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const h = &pack.hook;
+    const layer: usize = 3;
+    try testing.expect(StqStream.canQueue(h, layer));
+    const k = pack.m.layers[layer].top_k;
+    const dim_h: usize = pack.m.cfg.dim;
+    var prng = std.Random.DefaultPrng.init(0x5e771e);
+    const rnd = prng.random();
+    const shared: model.SharedOp = .{ .layer = .{ .m = pack.m, .li = layer } };
+    var redone: u64 = 0;
+    for ([_]usize{ 1, 2, 4, 16 }) |rows| for ([_]usize{ 1, 2, 0 }) |off| {
+        const picks = try testing.allocator.alloc(i32, rows * k);
+        defer testing.allocator.free(picks);
+        for (0..rows) |r| for (0..k) |j| {
+            picks[r * k + j] = @intCast((r + j * 2) % 4);
+        };
+        const xs = try testing.allocator.alloc(f32, rows * dim_h);
+        defer testing.allocator.free(xs);
+        for (xs) |*v| v.* = (rnd.float(f32) * 2 - 1) * 4;
+        const ws = try testing.allocator.alloc(f32, rows * k);
+        defer testing.allocator.free(ws);
+        for (ws) |*v| v.* = 0.05 + rnd.float(f32) * 0.3;
+        const x = try sc.astype(try sc.floats(xs, &.{ @intCast(rows), @intCast(dim_h) }), .bfloat16);
+        const idx = try sc.ints(picks, &.{ @intCast(rows), @intCast(k) });
+        const wts = try sc.floats(ws, &.{ @intCast(rows), @intCast(k) });
+        // The first settle fills the pool; the second queues from the map it left.
+        const none_map = try testing.allocator.alloc(i32, pack.m.cfg.experts);
+        defer testing.allocator.free(none_map);
+        @memset(none_map, -1);
+        _ = try StqStream.settleOpaque(h, &sc, layer, x, idx, wts, shared, none_map, .{});
+        var q = try StqStream.queueOpaque(h, &sc, layer, x, idx, wts, shared, null);
+        defer q.kept.deinit();
+        try mlx.check(mlx.mlx_array_eval(q.out));
+        // The picks the chain read from the map, taken off it: the settle sees them move.
+        const forced = try testing.allocator.dupe(i32, q.map);
+        defer testing.allocator.free(forced);
+        const n_off = if (off == 0) rows * k else off;
+        for (picks[0..n_off]) |e| forced[@intCast(e)] = -1;
+        const redone0 = model.spec_redone;
+        const part = (try StqStream.settleOpaque(h, &sc, layer, x, q.idx, wts, shared, forced, q.kept)) orelse return error.TestUnexpectedResult;
+        const whole = (try StqStream.settleOpaque(h, &sc, layer, x, q.idx, wts, shared, forced, .{})) orelse return error.TestUnexpectedResult;
+        try expectSameBits(&sc, part, whole);
+        // Every pick that shares an expert with a forced one is off the map as well.
+        redone += model.spec_redone - redone0;
+    };
+    try testing.expect(redone > 0);
 }
 
 test "dsv41 stq: a queued decode layer is one command buffer, two where a prefetch prediction rides its picks (DSV41_STQ_TINY)" {

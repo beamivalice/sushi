@@ -1725,12 +1725,13 @@ fn refreshGroupedSpecMap(gl: *const GroupedLayer, out: []i32) bool {
 /// every routed id from the slot the GPU gathered for it.
 pub fn specMatches(map: []const i32, ids: []const u16, remapped: []const u16, workspace: bool) bool {
     if (workspace or ids.len != remapped.len) return false;
-    for (ids, remapped) |expert, slot| {
-        if (expert >= map.len) return false;
-        const predicted = map[expert];
-        if (predicted < 0 or predicted != slot) return false;
-    }
+    for (ids, remapped) |expert, slot| if (!specPickHeld(map, expert, slot)) return false;
     return true;
+}
+
+/// Whether the GPU read `expert` from `slot`, the slot the host resolved it to.
+pub fn specPickHeld(map: []const i32, expert: u16, slot: u16) bool {
+    return expert < map.len and map[expert] >= 0 and map[expert] == slot;
 }
 
 fn createSlabSet(allocator: std.mem.Allocator, store: *const ExpertStore, count: u32, s: mlx.mlx_stream) ![]SlabOperand {

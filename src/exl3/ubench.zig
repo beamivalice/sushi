@@ -936,6 +936,127 @@ pub fn runReduceExpand(run: *report.Run) anyerror!void {
     }
 }
 
+// ---- the settle that recomputes only the picks that missed ----
+
+const RedoArm = enum { full, redo, queued, queued_keep };
+
+const RedoCtx = struct {
+    base: Ctx,
+    se: rate_groups.SharedExpert,
+    kept: rate_groups.Kept,
+    host: []const u16,
+    bad: []const u32,
+    arm: RedoArm,
+};
+
+fn redoStep(c: RedoCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    _ = i;
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    const b = c.base;
+    const slots = b.routes[0];
+    return switch (c.arm) {
+        .full, .queued => (try rate_groups.moeDecodeClampedSharedFused(s, x, b.rb, slots, b.scores, b.topk, .float32, c.se, LIMIT)) orelse error.SharedFuseDeclined,
+        .queued_keep => blk: {
+            var kept: rate_groups.Kept = .{};
+            defer kept.deinit();
+            break :blk (try rate_groups.moeDecodeClampedSharedFusedKeep(s, x, b.rb, slots, b.scores, b.topk, .float32, c.se, LIMIT, null, &kept)) orelse error.SharedFuseDeclined;
+        },
+        .redo => (try rate_groups.moeDecodeClampedSharedRedo(s, x, b.rb, slots, c.host, b.scores, b.topk, .float32, c.se, LIMIT, c.kept, c.bad)) orelse error.SharedFuseDeclined,
+    };
+}
+
+const RedoSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize, c: RedoCtx };
+
+fn redoSample(smp: RedoSample, arm: usize) anyerror!f64 {
+    var c = smp.c;
+    c.arm = @enumFromInt(arm);
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, c, redoStep);
+    const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
+}
+
+pub fn runSettleRedo(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0xd5ee);
+    const rnd = prng.random();
+    const pair1: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    kernels.setDecodeParams(pair1);
+    var sbank = try bench.makeBank(rnd, HIDDEN, INTER, .{ 64, 64, 64 }, 1, 0.02, 0.9);
+    defer bench.freeBank(&sbank);
+    const se: rate_groups.SharedExpert = .{ .bank = sbank, .dec = exl3.Decode.tabled(.spec1, .w15) };
+    for (LAYOUTS[0..3]) |lay| {
+        if (!listed(run.axis("layout"), lay.key)) continue;
+        var banks: [8]root.Bank = undefined;
+        for (lay.groups, 0..) |g, i| banks[i] = try bench.makeBank(rnd, HIDDEN, INTER, g.n, g.experts, 0.02, 0.9);
+        var rb = try rate_groups.Ragged.init(s, banks[0..lay.groups.len]);
+        defer rb.deinit();
+        const st = rb.storage();
+        const vec = mlx.mlx_vector_array_new_data(&st, st.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
+        for (run.axis("rows")) |rows_text| {
+            const rows = try std.fmt.parseInt(usize, rows_text, 10);
+            const n = rows * lay.topk;
+            var routes: [ROUTE_SETS]mlx.mlx_array = undefined;
+            _ = makeRoutes(rnd, &rb, rows, lay.topk, .uniform, &routes);
+            defer for (routes) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            try mlx.check(mlx.mlx_array_eval(routes[0]));
+            const resolved: [*]const u32 = @ptrCast(@alignCast(mlx.mlx_array_data_uint32(routes[0]) orelse return error.Unreadable));
+            var host: [256 * 6]u16 = undefined;
+            for (host[0..n], resolved) |*h, v| h.* = @intCast(v);
+            const xh = try std.heap.page_allocator.alloc(u16, rows * HIDDEN);
+            defer std.heap.page_allocator.free(xh);
+            for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
+            const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(HIDDEN) }, 2, .bfloat16);
+            defer _ = mlx.mlx_array_free(x0);
+            var scv: [256 * 6]f32 = undefined;
+            for (&scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+            const scores = mlx.mlx_array_new_data(&scv, &[_]c_int{@intCast(n)}, 1, .float32);
+            defer _ = mlx.mlx_array_free(scores);
+            for (run.axis("bad")) |bad_text| {
+                const n_bad = try std.fmt.parseInt(usize, bad_text, 10);
+                var bad: [8]u32 = undefined;
+                var stale: [256 * 6]u32 = undefined;
+                @memcpy(stale[0..n], resolved[0..n]);
+                for (bad[0..n_bad], 0..) |*p, j| {
+                    p.* = @intCast((j * (lay.topk + 1)) % n);
+                    stale[p.*] = (resolved[p.*] + 1) % rb.experts;
+                }
+                const queued = mlx.mlx_array_new_data(&stale, &[_]c_int{@intCast(n)}, 1, .uint32);
+                defer _ = mlx.mlx_array_free(queued);
+                var kept: rate_groups.Kept = .{};
+                defer kept.deinit();
+                const first = (try rate_groups.moeDecodeClampedSharedFusedKeep(s, x0, &rb, queued, scores, @intCast(lay.topk), .float32, se, LIMIT, null, &kept)) orelse return error.SharedFuseDeclined;
+                try mlx.check(mlx.mlx_array_eval(first));
+                _ = mlx.mlx_array_free(first);
+                const base: Ctx = .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = false };
+                const smp: RedoSample = .{ .s = s, .x0 = x0, .steps = run.steps(16), .c = .{ .base = base, .se = se, .kept = kept, .host = host[0..n], .bad = bad[0..n_bad], .arm = .full } };
+                var launches: [4]u32 = @splat(0);
+                for (&launches, 0..) |*count, arm| {
+                    if (!run.hasArm(@tagName(@as(RedoArm, @enumFromInt(arm))))) continue;
+                    kernels.resetFusedDispatchCount();
+                    var c = smp.c;
+                    c.arm = @enumFromInt(arm);
+                    const y = try redoStep(c, s, 0, x0);
+                    try mlx.check(mlx.mlx_array_eval(y));
+                    _ = mlx.mlx_array_free(y);
+                    count.* = kernels.fusedDispatchCount();
+                }
+                const label = try std.fmt.allocPrint(run.a, "{s} rows {d} bad {d}", .{ lay.key, rows, n_bad });
+                try run.interleave(label, smp, redoSample);
+                for (launches, 0..) |count, arm| {
+                    const name = @tagName(@as(RedoArm, @enumFromInt(arm)));
+                    if (run.hasArm(name)) try run.metric(name, "launches", "n", @floatFromInt(count));
+                }
+            }
+        }
+    }
+}
+
 const MCG_W15: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
 
 const RATES_TEXT = [_][]const u8{

@@ -460,6 +460,22 @@ into `moeDecodeClamped`'s reduce.
   stream `x [rows, 4, hidden]`, `post` and `comb` and stores `hcExpand`'s result (the sum rounded to the stream dtype, operands truncated to 10
   mantissa bits, uncontracted) instead of the sum, so the bf16 cast and the expand kernel are gone. Proof: `exl3 rate groups: the shared expert
   riding ...` compares the stream with a host expand of the unfused sum; ubench in [dsv41-arch](dsv41-arch.md).
+- **A route-spec settle recomputes only the picks that missed** (`moeDecodeClampedSharedRedo`, `Kept`): the queued chain's
+  down planes (`[rows * topk, hidden]` f16) and the shared expert's are kept (`moeDecodeClampedSharedFusedKeep`, handles on
+  the chain's own outputs, no launch or copy on the common path). The bad picks run as rows of their own, one pick a row
+  (a gather of the row's `x`, then `pairPrepare`, the pair GEMV, mid and down, ungrouped: the chain's kernels at a smaller
+  grid, each pick's plane being a function of its expert and its row's input only, which `groupFor`'s byte-exactness
+  against the one-slot chain already pins), and `sushi_exl3_down_reduce_fused_shared_redo` (the plain reduce's source with
+  the plane's row source switched by `redo[slot]`) sums the kept and new planes in the plain reduce's order. A queue that
+  folds the stream (`...FusedExpand`) keeps the same planes; the settle returns the sum as before. Proof: `exl3 rate
+  groups: a settle recomputing only the picks that missed ...` (1, 2, 4 and 16 rows; one, two, three and every pick
+  stale; mixed rate groups at 512/256 and the real 5120/2304; with and without the folded queue), `dsv41 stq: a settle that
+  recomputes only the picks off the map ...` (through the stream hook, forced off the cache map). Ubench
+  `dsv41.settle_redo` (layer 2 and 23 plans, `c8543034`, ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC, fans max, die 49 C,
+  median of 9 interleaved rounds of 16 dependent steps, us a settle; layer 2, layer 23 within 3%): the whole chain 152 / 286 /
+  547 at 1 / 2 / 4 rows, only the missed picks 40 / 60 / 75 with 1 / 2 / 3 bad picks at 1 row (39 to 42 for one bad pick at
+  any of 1, 2, 4 rows; 0.26x of the whole chain at 1 row, 0.08x at 4); the queued chain keeping its planes against not
+  keeping them 1.00x at every rung (same kernels, handles only). Five launches either way; the redo's gather is an MLX op.
 - **Launches**: 10 a layer become 5, so 200 fewer per serial token (40 layers) and per verify round, and 15 fewer on a
   drafting round (three DSpark stage layers). A launch costs ~1.76 us of gap; the saving is larger because the shared
   chain's tails fill with routed work.

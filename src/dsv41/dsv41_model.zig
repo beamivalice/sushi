@@ -199,7 +199,8 @@ pub const Experts = union(enum) {
         /// `ride` is submitted with the picks, in the same command buffer; null leaves the picks to the layer's own submit.
         queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, ride: ?[]const A) anyerror!Queued,
         /// The host's side of a queued layer: null when every pick sat in the slot the GPU read, else the exact sum.
-        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, map: []const i32) anyerror!?A,
+        /// `kept` holds the queued chain's planes, which a settle may reuse for the picks that held.
+        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, map: []const i32, kept: exl3.rate_groups.Kept) anyerror!?A,
     };
 
     pub const Queued = struct {
@@ -207,6 +208,8 @@ pub const Experts = union(enum) {
         /// The picks as int32: the settle reads this array, never a node built after the layer.
         idx: A,
         map: []const i32,
+        /// The chain's down planes where it kept them; the caller frees them.
+        kept: exl3.rate_groups.Kept = .{},
     };
 
     pub const Lease = struct { banks: BankSet, local: A };
@@ -2260,10 +2263,10 @@ fn sharedBank(ly: *const Layer) ?exl3.rate_groups.SharedExpert {
     return .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
 }
 
-fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int, expand: ?Expand) !?A {
+fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int, expand: ?Expand, keep: ?*exl3.rate_groups.Kept) !?A {
     const se = sharedBank(ly) orelse return null;
     const epi: ?exl3.rate_groups.StreamExpand = if (expand) |e| .{ .x = e.x, .post = e.post, .comb = e.comb } else null;
-    const y = try exl3.rate_groups.moeDecodeClampedSharedFusedExpand(sc.s, x, rb, flat, scores, k, .float32, se, limit, epi) orelse return null;
+    const y = try exl3.rate_groups.moeDecodeClampedSharedFusedKeep(sc.s, x, rb, flat, scores, k, .float32, se, limit, epi, keep) orelse return null;
     return try sc.keep(y);
 }
 
@@ -2277,11 +2280,31 @@ fn prefillWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3
 /// SwiGLU of each, summed, plus the shared expert's output (`[L, dim]`, f32). Decode-width chunks ride the
 /// one-dispatch-per-stage decode chain, whose reduce adds the shared expert, wider ones the grouped GEMM.
 pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp) !A {
-    return stqRoutedEarly(sc, dec, limit, rb, x, slots, wts, shared, null);
+    return stqRoutedEarly(sc, dec, limit, rb, x, slots, wts, shared, null, null);
+}
+
+/// `stqRouted` at decode width, keeping the down planes of the fused chain in `keep` where that chain runs.
+pub fn stqRoutedKept(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp, keep: *exl3.rate_groups.Kept) !A {
+    return stqRoutedEarly(sc, dec, limit, rb, x, slots, wts, shared, null, keep);
+}
+
+/// `stqRouted` over the slots `host_slots` (flat, as `slots`), reusing the planes `kept` holds for every pick not in `bad`
+/// (flat positions): the same bytes, with only the picks that changed recomputed. Null where the chain keeps no planes.
+pub fn stqRoutedRedo(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, host_slots: []const u16, wts: A, shared: SharedOp, kept: exl3.rate_groups.Kept, bad: []const u32) !?A {
+    if (shared != .layer or dim(x, 0) > exl3.kernels.DECODE_ROWS_MAX) return null;
+    const se = sharedBank(&shared.layer.m.layers[shared.layer.li]) orelse return null;
+    const L = dim(x, 0);
+    const k: c_int = @intCast(dim(slots, 1));
+    const flat = try sc.reshape(try sc.astype(slots, .uint32), &.{ci(L) * k});
+    const scores = try sc.reshape(try sc.astype(wts, .float32), &.{ci(L) * k});
+    try dec.requireTable();
+    exl3.kernels.setDecodeParams(dec);
+    const y = try exl3.rate_groups.moeDecodeClampedSharedRedo(sc.s, x, rb, flat, host_slots, scores, k, .float32, se, limit, kept, bad) orelse return null;
+    return try sc.reshape(try sc.keep(y), &.{ ci(L), ci(dim(x, 1)) });
 }
 
 /// `stqRouted`, a wide chunk keeping each pool's gate and up planes in `early` (`rate_groups.EarlyPlanes`).
-pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp, early: ?*exl3.rate_groups.EarlyPlanes) !A {
+pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp, early: ?*exl3.rate_groups.EarlyPlanes, keep: ?*exl3.rate_groups.Kept) !A {
     const L = dim(x, 0);
     const k: c_int = @intCast(dim(slots, 1));
     const flat = try sc.reshape(try sc.astype(slots, .uint32), &.{ci(L) * k});
@@ -2293,7 +2316,7 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
     // The decode reduce returns one row as `[dim]`.
     if (L <= exl3.kernels.DECODE_ROWS_MAX) {
         if (shared == .layer) {
-            if (try routedWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k, expand)) |y| return sc.reshape(y, if (expand) |e| mlx.getShape(e.x) else &.{ ci(L), ci(dim(x, 1)) });
+            if (try routedWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k, expand, keep)) |y| return sc.reshape(y, if (expand) |e| mlx.getShape(e.x) else &.{ ci(L), ci(dim(x, 1)) });
         }
         const sy = try shared.value(sc, x);
         // The shared chain left its own codec active.
@@ -2404,9 +2427,10 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
             @memcpy(rode[0..ride.len], ride);
             const rode_n = ride.len + @intFromBool(pred.ctx != null);
             if (pred.ctx != null) rode[ride.len] = pred;
-            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li, .expand = expand } }, if (pred.ctx != null) rode[0..rode_n] else null);
+            var q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li, .expand = expand } }, if (pred.ctx != null) rode[0..rode_n] else null);
+            errdefer q.kept.deinit();
             const out = try sc.astype(q.out, m.act);
-            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts) };
+            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts), .kept = q.kept };
             if (pred.ctx != null) {
                 sh.spec.?.pred = sc.out(pred);
                 sh.spec.?.pred_layer = target.?;
@@ -3085,8 +3109,10 @@ const Unresolved = struct {
     /// The router logits of layer `pred_layer` over this layer's router input, for the expert prefetch.
     pred: A = none,
     pred_layer: usize = 0,
+    kept: exl3.rate_groups.Kept = .{},
 
     fn deinit(self: *Unresolved) void {
+        self.kept.deinit();
         for ([_]A{ self.h, self.idx, self.wts, self.x1, self.post, self.comb, self.pre, self.pred }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
@@ -3097,6 +3123,10 @@ const Unresolved = struct {
 pub var expands_folded: u64 = 0;
 pub var spec_kept: u64 = 0;
 pub var spec_rebuilt: u64 = 0;
+/// Rebuilt layers that recomputed only the picks that missed, and the picks of the rebuilt layers that were recomputed.
+pub var spec_redone: u64 = 0;
+pub var spec_redo_picks: u64 = 0;
+pub var spec_rebuilt_picks: u64 = 0;
 /// Prefetch predictions computed (`predictLogits`); a test reads it to see that unprefetchable targets cost none.
 pub var prefetch_predicted: u64 = 0;
 
@@ -3238,10 +3268,10 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const t0 = readStart();
-    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, .{ .layer = .{ .m = m, .li = u.li } }, u.map);
+    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, .{ .layer = .{ .m = m, .li = u.li } }, u.map, u.kept);
     readDone(settle_site, t0);
     if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
-    if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });
+    if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map ({d} of those {d} picks recomputed)\n", .{ spec_kept, spec_rebuilt, spec_redo_picks, spec_rebuilt_picks });
     if (sum == null) return null;
     return sc.out(try hcExpand(&sc, m, u.x1, try sc.astype(sum.?, m.act), u.post, u.comb));
 }

@@ -818,6 +818,7 @@ var fused_reduce_expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// The hyper-connection expand a decode reduce can write its sum through: the stream `x` `[rows, 4, hidden]`, the new
 /// stream's `post` `[rows, 4]` and `comb` `[rows, 4, 4]` (f32).
 pub const StreamExpand = struct { x: mlx.mlx_array, post: mlx.mlx_array, comb: mlx.mlx_array };
+var fused_reduce_redo_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// Test and bench arm: which part's threadgroups the fused grid lists first.
 pub var fused_shared_first: bool = false;
 
@@ -972,7 +973,13 @@ fn applyStage(s: mlx.mlx_stream, f: *const FusedStage, a: []const mlx.mlx_array,
 /// The finish reduce with the shared expert's down finish in one more simdgroup per threadgroup: its H128 and `svh`
 /// scale, rounded to the shared chain's dtype `ST`, then the routed sum's own `T` add, in the statements of the two
 /// reduces it replaces.
-const REDUCE_FUSED_SOURCE: [:0]const u8 =
+const REDUCE_FUSED_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_PLAIN ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_PLAIN ++ REDUCE_FUSED_TAIL;
+
+/// The same reduce reading the planes of the picks `part` holds (`redo[slot]` is a row of `part`, -1 where the kept plane
+/// of `inner` stands): a settle that recomputed some picks sums over the kept planes and theirs, in the same order.
+const REDUCE_FUSED_REDO_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_REDO ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_REDO ++ REDUCE_FUSED_TAIL;
+
+const REDUCE_FUSED_HEAD =
     \\threadgroup float vals[(uint(TOPK) + 1u) * 128u];
     \\const uint block = uint(threadgroup_position_in_grid.x);
     \\const uint row = uint(threadgroup_position_in_grid.y);
@@ -981,9 +988,30 @@ const REDUCE_FUSED_SOURCE: [:0]const u8 =
     \\const uint base = block * 128u;
     \\const bool own = sg >= uint(TOPK);
     \\const uint slot = own ? row : row * uint(TOPK) + sg;
+    \\
+;
+const REDUCE_ROWS_PLAIN =
     \\const device half *rows_in = own ? s_inner : inner;
+    \\
+;
+const REDUCE_ROWS_REDO =
+    \\const int at = own ? -1 : redo[slot];
+    \\const device half *rows_in = own ? s_inner : (at >= 0 ? part : inner);
+    \\
+;
+const REDUCE_FUSED_SCALE =
     \\const device half *scale = own ? s_svh : svh;
+    \\
+;
+const REDUCE_XB_PLAIN =
     \\const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+    \\
+;
+const REDUCE_XB_REDO =
+    \\const size_t xb = (size_t)(at >= 0 ? uint(at) : slot) * (size_t)(ODIM) + base;
+    \\
+;
+const REDUCE_FUSED_TAIL =
     \\const size_t sb = own ? (size_t)base : (size_t)uint(slots[slot]) * (size_t)(ODIM) + base;
     \\const float scv = 0.08838834764831845f;
     \\float4 v = float4(float(rows_in[xb + lane]), float(rows_in[xb + lane + 32u]), float(rows_in[xb + lane + 64u]), float(rows_in[xb + lane + 96u]));
@@ -1093,7 +1121,10 @@ fn unitScore() mlx.mlx_array {
     return a;
 }
 
-fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, expand: ?StreamExpand) !mlx.mlx_array {
+/// A settle's recomputed picks: their planes, and for each slot its row of `part` or -1.
+const Redo = struct { part: mlx.mlx_array, at: mlx.mlx_array };
+
+fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, expand: ?StreamExpand, redo: ?Redo) !mlx.mlx_array {
     const xdt = if (expand) |e| mlx.mlx_array_dtype(e.x) else out_dtype;
     const key: ReduceKey = .{ .hidden = rb.hidden, .rows = rows, .topk = topk, .expand_dt = if (expand != null) xdt else null };
     const cfg = fused_reduce_cfgs.get(key) orelse blk: {
@@ -1118,8 +1149,13 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
         defer _ = mlx.mlx_vector_array_free(ov);
         return getOut(ov, 0);
     }
-    const kernel = try kernels.getNamedKernel(&fused_reduce_kernel, "sushi_exl3_down_reduce_fused_shared", &.{ "inner", "svh", "slots", "sc", "s_inner", "s_svh", "unit" }, &.{"y"}, REDUCE_FUSED_SOURCE, "");
-    const ov = try kernels.applyOuts(s, kernel, &ins, cfg, 1);
+    const ov = if (redo) |r| blk: {
+        const kernel = try kernels.getNamedKernel(&fused_reduce_redo_kernel, "sushi_exl3_down_reduce_fused_shared_redo", &.{ "inner", "part", "redo", "svh", "slots", "sc", "s_inner", "s_svh", "unit" }, &.{"y"}, REDUCE_FUSED_REDO_SOURCE, "");
+        break :blk try kernels.applyOuts(s, kernel, &.{ down, r.part, r.at, rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore() }, cfg, 1);
+    } else blk: {
+        const kernel = try kernels.getNamedKernel(&fused_reduce_kernel, "sushi_exl3_down_reduce_fused_shared", &.{ "inner", "svh", "slots", "sc", "s_inner", "s_svh", "unit" }, &.{"y"}, REDUCE_FUSED_SOURCE, "");
+        break :blk try kernels.applyOuts(s, kernel, &ins, cfg, 1);
+    };
     defer _ = mlx.mlx_vector_array_free(ov);
     return getOut(ov, 0);
 }
@@ -1144,9 +1180,35 @@ pub fn moeDecodeClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *con
     return moeDecodeClampedSharedFusedExpand(s, x, rb, slots, scores, topk, out_dtype, se, limit, null);
 }
 
+/// The routed and the shared expert's down planes of a queued chain, held for `moeDecodeClampedSharedRedo`. The holder frees them.
+pub const Kept = struct {
+    down: mlx.mlx_array = .{ .ctx = null },
+    shared: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: *Kept) void {
+        for ([_]mlx.mlx_array{ self.down, self.shared }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        self.* = .{};
+    }
+
+    fn hold(self: *Kept, down: mlx.mlx_array, shared: mlx.mlx_array) void {
+        self.deinit();
+        self.down = mlx.mlx_array_new();
+        self.shared = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&self.down, down);
+        _ = mlx.mlx_array_set(&self.shared, shared);
+    }
+};
+
 /// `moeDecodeClampedSharedFused`, its sum written through `expand` into the new stream `[rows, 4, hidden]` (the sum rounded
 /// to the stream's dtype first) where given.
 pub fn moeDecodeClampedSharedFusedExpand(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, out_dtype: mlx.mlx_dtype, se: SharedExpert, limit: c_int, expand: ?StreamExpand) !?mlx.mlx_array {
+    return moeDecodeClampedSharedFusedKeep(s, x, rb, slots, scores, topk, out_dtype, se, limit, expand, null);
+}
+
+/// `moeDecodeClampedSharedFusedExpand` that also keeps the chain's down planes in `keep`.
+pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, out_dtype: mlx.mlx_dtype, se: SharedExpert, limit: c_int, expand: ?StreamExpand, keep: ?*Kept) !?mlx.mlx_array {
     if (rb.prefill_only or !preparedOn(rb) or mlx.mlx_array_dtype(x) != .bfloat16 or topk > kernels.REDUCE_MAX_TOPK - 1) return null;
     if (rb.tile_major and !kernels.gemvLayout(1).funnel) return null;
     const rows = mlx.getShape(x)[0];
@@ -1240,7 +1302,54 @@ pub fn moeDecodeClampedSharedFusedExpand(s: mlx.mlx_stream, x: mlx.mlx_array, rb
     defer _ = mlx.mlx_array_free(down);
     const sdown = try getOut(down_ov, 1);
     defer _ = mlx.mlx_array_free(sdown);
-    return try reduceFused(s, down, rb, slots, scores, sdown, se, rows, topk, out_dtype, expand);
+    if (keep) |k| k.hold(down, sdown);
+    return try reduceFused(s, down, rb, slots, scores, sdown, se, rows, topk, out_dtype, expand, null);
+}
+
+/// The chain `kept` came from, over resolved `slots` (`host_slots`, flat `[rows * topk]`) that differ from its own at the
+/// flat positions `bad` only. Those picks run alone, one row each, and the reduce sums their planes with the kept ones:
+/// the bytes of the whole chain over `slots`, as a pick's plane depends on its expert and its row's input only.
+/// Null where the whole chain would not have been this one.
+pub fn moeDecodeClampedSharedRedo(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, host_slots: []const u16, scores: mlx.mlx_array, topk: c_int, out_dtype: mlx.mlx_dtype, se: SharedExpert, limit: c_int, kept: Kept, bad: []const u32) !?mlx.mlx_array {
+    if (kept.down.ctx == null or bad.len == 0 or rb.prefill_only or !preparedOn(rb) or mlx.mlx_array_dtype(x) != .bfloat16 or topk > kernels.REDUCE_MAX_TOPK - 1) return null;
+    if (rb.tile_major and !kernels.gemvLayout(1).funnel) return null;
+    const rows = mlx.getShape(x)[0];
+    const n = host_slots.len;
+    const max_slots = kernels.DECODE_ROWS_MAX * @as(usize, @intCast(kernels.REDUCE_MAX_TOPK));
+    if (n != @as(usize, @intCast(rows * topk)) or n > max_slots or bad.len > n or mlx.mlx_array_size(kept.down) != n * @as(usize, @intCast(rb.hidden))) return null;
+    var pc: [max_groups]RateClass = undefined;
+    var dc: [max_groups]RateClass = undefined;
+    const pair = classesOf(rb, false, &pc);
+    const downs = classesOf(rb, true, &dc);
+    var bad_slots: [max_slots]u32 = undefined;
+    var bad_rows: [max_slots]i32 = undefined;
+    var at: [max_slots]i32 = @splat(-1);
+    for (bad, 0..) |p, j| {
+        bad_slots[j] = host_slots[p];
+        bad_rows[j] = @intCast(p / @as(u32, @intCast(topk)));
+        at[p] = @intCast(j);
+    }
+    const nb: c_int = @intCast(bad.len);
+    const slots_b = mlx.mlx_array_new_data(&bad_slots, &[_]c_int{nb}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots_b);
+    const rows_b = mlx.mlx_array_new_data(&bad_rows, &[_]c_int{nb}, 1, .int32);
+    defer _ = mlx.mlx_array_free(rows_b);
+    const redo_at = mlx.mlx_array_new_data(&at, &[_]c_int{@intCast(n)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(redo_at);
+    var xr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xr);
+    try mlx.check(mlx.mlx_take_axis(&xr, x, rows_b, 0, s));
+    const prep = try kernels.pairPrepare(s, xr, rb.suh[0], rb.suh[1], slots_b, rb.hidden, nb, 1);
+    defer _ = mlx.mlx_array_free(prep);
+    const inner = try pairPreparedMixed(s, prep, rb, slots_b, 1, pair, 0);
+    defer for (inner) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const middle = try midMixed(s, inner, rb, slots_b, limit);
+    defer _ = mlx.mlx_array_free(middle);
+    const part = try downPreparedMixed(s, middle, rb, slots_b, downs, 0);
+    defer _ = mlx.mlx_array_free(part);
+    return try reduceFused(s, kept.down, rb, slots, scores, kept.shared, se, rows, topk, out_dtype, null, .{ .part = part, .at = redo_at });
 }
 
 // ---- Qwen's shared expert inside the unprepared decode chain ----
@@ -2791,6 +2900,104 @@ test "exl3 rate groups: the shared expert riding the decode launches at DeepSeek
     const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 40, 40, 40 }, .{ 32, 32, 26 } };
     const experts = [_]u32{ 3, 2, 2 };
     for ([_]usize{ 1, 2, 4, 6 }) |rows| try sharedFusedCase(t.allocator, s, 5120, 2304, &rates, &experts, rows, 6, 0xd5 + rows);
+}
+
+/// The queued chain ran over `queued` slots; the settle resolves `bad` of them to other experts. Recomputing only those
+/// picks over the kept down planes must give the bytes of the whole chain over the resolved slots.
+fn redoCase(t: std.mem.Allocator, s: mlx.mlx_stream, hidden: usize, inter: usize, rates: []const [3]u32, experts: []const u32, rows: usize, topk: usize, seed: u64) !void {
+    const limit: c_int = 10;
+    const dec: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    const sdec = exl3.Decode.tabled(.spec1, .w15);
+    var arena = std.heap.ArenaAllocator.init(t);
+    defer arena.deinit();
+    var f = try Fixture.init(arena.allocator(), s, .{ .hidden = hidden, .inter = inter, .rates = rates, .experts = experts, .rows = rows, .topk = topk, .seed = seed, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
+    defer f.deinit();
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a);
+    var sb = try sharedBankAt(prng.random(), hidden, inter, 64, .{ 0.0126, 1.03, 0.0083, 1.009 });
+    defer freeBank(&sb);
+    const se: SharedExpert = .{ .bank = sb, .dec = sdec };
+    const xb = try cast(s, f.x, .bfloat16);
+    defer _ = mlx.mlx_array_free(xb);
+    const n: u32 = @intCast(rows * topk);
+    const one = [_]u32{n / 2};
+    const two = [_]u32{ 0, n - 1 };
+    const three = [_]u32{ 1, n / 2, n - 2 };
+    var all: [128]u32 = undefined;
+    for (all[0..n], 0..) |*v, i| v.* = @intCast(i);
+    const cases = [_][]const u32{ &one, &two, &three, all[0..n] };
+    var host16: [128]u16 = undefined;
+    for (host16[0..n], f.slot_ids) |*h, v| h.* = @intCast(v);
+    var want_bytes: []const u8 = &.{};
+    var cw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cw);
+    kernels.setDecodeParams(dec);
+    const want = (try moeDecodeClampedSharedFused(s, xb, &f.rb, f.slots, f.scores, f.topk(), .float32, se, limit)) orelse return error.TestUnexpectedResult;
+    defer _ = mlx.mlx_array_free(want);
+    want_bytes = try bytesOf(s, want, &cw);
+    // A chain of zeros or NaNs would equal itself.
+    var live: usize = 0;
+    for (std.mem.bytesAsSlice(f32, want_bytes)) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+        if (v != 0) live += 1;
+    }
+    try std.testing.expect(live > want_bytes.len / 8);
+    // The queued chain may write the new stream from its reduce; the kept planes are the same.
+    const zeros = try t.alloc(u16, rows * 4 * hidden);
+    defer t.free(zeros);
+    @memset(zeros, 0);
+    const r: c_int = @intCast(rows);
+    const xa = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4, @intCast(hidden) }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(xa);
+    const pa = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(pa);
+    const ca = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(ca);
+    const stream_out: StreamExpand = .{ .x = xa, .post = pa, .comb = ca };
+    for (cases) |bad| for ([_]bool{ false, true }) |folded| {
+        var stale: [128]u32 = undefined;
+        @memcpy(stale[0..n], f.slot_ids);
+        for (bad) |p| stale[p] = (f.slot_ids[p] + 1) % f.experts;
+        const queued = mlx.mlx_array_new_data(&stale, &[_]c_int{@intCast(n)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(queued);
+        var kept: Kept = .{};
+        defer kept.deinit();
+        kernels.setDecodeParams(dec);
+        const first = (try moeDecodeClampedSharedFusedKeep(s, xb, &f.rb, queued, f.scores, f.topk(), .float32, se, limit, if (folded) stream_out else null, &kept)) orelse return error.TestUnexpectedResult;
+        defer _ = mlx.mlx_array_free(first);
+        try mlx.check(mlx.mlx_array_eval(first));
+        kernels.setDecodeParams(dec);
+        kernels.resetFusedDispatchCount();
+        const got = (try moeDecodeClampedSharedRedo(s, xb, &f.rb, f.slots, host16[0..n], f.scores, f.topk(), .float32, se, limit, kept, bad)) orelse return error.TestUnexpectedResult;
+        defer _ = mlx.mlx_array_free(got);
+        var cg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cg);
+        const got_bytes = try bytesOf(s, got, &cg);
+        // The picks' prepare, pair, mid and down, then the reduce over the kept planes.
+        try std.testing.expectEqual(@as(u32, 5), kernels.fusedDispatchCount());
+        try std.testing.expectEqualSlices(u8, want_bytes, got_bytes);
+    };
+}
+
+test "exl3 rate groups: a settle recomputing only the picks that missed writes the whole chain's bytes, over mixed rate groups, 1 to 16 rows" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer kernels.setDecodeParams(.mul1);
+    defer prepared_force = null;
+    prepared_force = true;
+    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 40, 40, 40 }, .{ 32, 26, 24 } };
+    const experts = [_]u32{ 5, 3, 4, 2 };
+    for ([_]usize{ 1, 2, 4, 16 }) |rows| try redoCase(t.allocator, s, 512, 256, &rates, &experts, rows, 6, 0x61 + rows);
+}
+
+test "exl3 rate groups: a settle recomputing only the picks that missed writes the whole chain's bytes at the real 5120x2304 geometry, 1 to 16 rows" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer kernels.setDecodeParams(.mul1);
+    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 40, 40, 40 }, .{ 32, 32, 26 } };
+    const experts = [_]u32{ 9, 8, 7 };
+    for ([_]usize{ 1, 2, 4, 16 }) |rows| try redoCase(t.allocator, s, 5120, 2304, &rates, &experts, rows, 6, 0xe5 + rows);
 }
 
 fn sharedPrefillCase(t: std.mem.Allocator, s: mlx.mlx_stream, hidden: usize, inter: usize, rates: []const [3]u32, experts: []const u32, rows: usize, topk: usize, x_scale: f32, seed: u64) !void {

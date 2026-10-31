@@ -674,7 +674,18 @@ pick sat in the slot the GPU read, else the exact sum. A miss rebuilds the layer
 stream, `Unresolved`), restores what the successor's pass changed (`Undo`: the open pooling group, the verify copies, the
 compressed/index row counts and, over several rows, the window ring, because a later row's write can land on a slot an
 earlier row still reads; a one-row pass's ring slot and appended rows are written again at the same places) and runs the
-successor again. The settle keeps its pick and slot buffers between layers (`StqStream.picks`, `slots`), and the layers of a pass share
+successor again. Where only some picks left their slot, the settle recomputes only those (`model.stqRoutedRedo`): `queue`
+keeps the chain's per-pick down planes and the shared expert's (`rate_groups.Kept`, `Unresolved.kept`, references, no
+copy), each bad pick runs alone as a row of a smaller chain (prepare, pair, mid, down at its resolved slot), and the
+reduce reads each slot's plane from the kept ones or the new ones and sums in the same order, so the bytes are the whole
+recompute's: a plane depends on its expert and its row's input only. A settle with every pick off, or over the union
+workspace (a group spilled its pool), recomputes everything. `model.spec_redone`, `spec_redo_picks` and `spec_rebuilt_picks`
+count them, and the 4096th-settle log line reports the picks recomputed. Live (the served adaptive DSpark, 400 tokens of the lighthouse prompt, `--ssd-budget-gb` 108 / 60, prefetch at its default): 723 / 3539
+rebuilt layers recompute 1634 of 22872 / 6057 of 39006 picks (7% / 16% of the work a whole recompute did); the text md5 equals
+the whole recompute's. Decode tok/s, base `c1f23a44` vs `c8543034`, one boot an arm, GPU lock, fans max, die under 50 C at
+boot, `taskpolicy -a`, fresh prefix cache: branch vs main 42.3 vs 41.7 at 108 and 25.8 vs 25.9 at 60 (a hot-box 108 pair, 69 and 75 C at boot, read 36.4 vs 40.1 and is not used), so inside the run-to-run noise (process CPU seconds were not measured; the launch count is unchanged at five): the
+settle's expert work is a small part of a rebuild, whose cost is the successor layer run again. The settle itself drops from 150 to 40 us at one pick and one row
+([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)). The settle keeps its pick and slot buffers between layers (`StqStream.picks`, `slots`), and the layers of a pass share
 the position and group-count arrays they have in common (`Shared.index`, one build per distinct key). Only the settle touches the cache, so a discarded route moves no LRU or stat. The picks of a layer
 are verified against the pool before any later layer's, so a DSpark target, a verify round's rows and the state arrays
 of a kept layer never come from a wrong sum. An Engram layer is rebuilt from the rows its pass read once

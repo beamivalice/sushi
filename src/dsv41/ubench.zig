@@ -13,7 +13,7 @@ const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
 const exl3 = @import("sushi_exl3");
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, reduce_expand };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, reduce_expand, settle_redo };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -1204,4 +1204,19 @@ pub const reduce_expand: report.Bench = .{
     .arms = &.{ "reduce_cast_expand", "reduce_expand", "reduce" },
     .ref = "reduce_cast_expand",
     .run = exl3.ubench.runReduceExpand,
+};
+
+pub const settle_redo: report.Bench = .{
+    .name = "dsv41.settle_redo",
+    .scope = .dsv41,
+    .what = "a route-spec settle at the plan's layers: the whole chain over the resolved slots, only the missed picks over the queued chain's planes, and the queued chain with and without keeping its planes",
+    .unit = .us,
+    .axes = &.{
+        .{ .name = "layout", .values = &.{ "L2", "L23" }, .numeric = false },
+        .{ .name = "rows", .values = &.{ "1", "2", "4" } },
+        .{ .name = "bad", .values = &.{ "1", "2", "3" } },
+    },
+    .arms = &.{ "full", "redo", "queued", "queued_keep" },
+    .ref = "full",
+    .run = exl3.ubench.runSettleRedo,
 };
