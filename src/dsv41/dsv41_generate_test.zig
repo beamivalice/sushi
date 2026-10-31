@@ -1881,3 +1881,222 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
         try expectAnswer(a, first);
     }
 }
+
+const WidthProbe = struct {
+    const dsv41_model = @import("dsv41_model.zig");
+    const A = mlx.mlx_array;
+
+    /// One forward of `ids` as the server runs it: a verify round, or a plain chunk when `plain`.
+    fn forward(xfm: *Transformer, ids: []const u32, plain: bool) !A {
+        const m = xfm.dsv41.?;
+        const engine = xfm.expert_stream.?;
+        const st = try dsv41_model.ensureState(m);
+        try @import("dsv41_borrow.zig").beforeForward(engine, &xfm.config, &m.cfg, ids.len, st.n + ids.len);
+        engine.beginForward();
+        const out = if (plain) try dsv41_model.extendAhead(m, ids, .last, dsv41_model.SPAN, null, &.{}) else try dsv41_model.verify(m, ids);
+        engine.finishForward(ids.len);
+        try mlx.check(mlx.mlx_array_eval(out));
+        return out;
+    }
+
+    fn last(t: *const dsv41_model.Trace, name: []const u8) ?A {
+        var i = t.items.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, t.items.items[i].name, name)) return t.items.items[i].arr;
+        }
+        return null;
+    }
+
+    /// Row `row` of `a` (axis 0) as host f32.
+    fn rowF32(a: std.mem.Allocator, x: A, row: usize) ![]f32 {
+        const s = mlx.gpuStream();
+        const sh = mlx.getShape(x);
+        var start: [8]c_int = @splat(0);
+        var stop: [8]c_int = undefined;
+        const one: [8]c_int = @splat(1);
+        @memcpy(stop[0..sh.len], sh);
+        start[0] = @intCast(row);
+        stop[0] = @intCast(row + 1);
+        var sl = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sl);
+        try mlx.check(mlx.mlx_slice(&sl, x, &start, sh.len, &stop, sh.len, &one, sh.len, s));
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_astype(&f, sl, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(f));
+        const p = mlx.mlx_array_data_float32(f) orelse return error.HostRead;
+        return a.dupe(f32, p[0..mlx.mlx_array_size(f)]);
+    }
+
+    /// Counts the elements of row `row` of `wide` that differ from row 0 of `narrow`; reports each name that differs.
+    fn diffRow(a: std.mem.Allocator, wide: *const dsv41_model.Trace, narrow: *const dsv41_model.Trace, row: usize, verbose: bool) !usize {
+        var differing: usize = 0;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(a);
+        for (wide.items.items) |it| {
+            if (seen.contains(it.name) or std.mem.startsWith(u8, it.name, "ffn_")) continue;
+            try seen.put(a, it.name, {});
+            const w = last(wide, it.name).?;
+            const n = last(narrow, it.name) orelse continue;
+            const wr = try rowF32(a, w, row);
+            defer a.free(wr);
+            const nr = try rowF32(a, n, 0);
+            defer a.free(nr);
+            if (std.mem.startsWith(u8, it.name, "a_topk")) {
+                // A wider block carries more picks, -1 past the row's own; packed picks index rows gathered per call,
+                // so only which entries are -1 compares across widths.
+                var same = wr.len >= nr.len;
+                if (same) for (wr, 0..) |v, j| {
+                    same = same and (v == -1) == (j >= nr.len or nr[j] == -1);
+                };
+                if (!same) {
+                    differing += 1;
+                    if (verbose) std.debug.print("  row {d} {s}: the picks differ (wide {d}, narrow {d})\n", .{ row, it.name, wr.len, nr.len });
+                }
+                continue;
+            }
+            if (wr.len != nr.len) return error.ShapeMismatch;
+            var cnt: usize = 0;
+            var maxd: f32 = 0;
+            var maxv: f32 = 0;
+            for (wr, nr) |x, y| {
+                if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) cnt += 1;
+                maxd = @max(maxd, @abs(x - y));
+                maxv = @max(maxv, @abs(y));
+            }
+            if (cnt > 0) {
+                differing += 1;
+                if (verbose) std.debug.print("  row {d} {s}: {d}/{d} differ, max |d| {e:.3} (max |x| {e:.3})\n", .{ row, it.name, cnt, wr.len, maxd, maxv });
+            }
+        }
+        return differing;
+    }
+
+    fn at(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, cont: []const u32, W: usize, verbose: bool) !usize {
+        const m = xfm.dsv41.?;
+        // One-row rounds, each traced.
+        dsv41_model.resetState(m);
+        _ = mlx.mlx_array_free(try forward(xfm, prompt, true));
+        var narrow: [16]dsv41_model.Trace = undefined;
+        for (&narrow) |*t| t.* = .{ .gpa = a };
+        defer for (&narrow) |*t| t.deinit();
+        for (0..W + 1) |i| {
+            dsv41_model.width_probe = &narrow[i];
+            defer dsv41_model.width_probe = null;
+            _ = mlx.mlx_array_free(try forward(xfm, cont[i .. i + 1], false));
+            try dsv41_model.finishVerify(m, 0);
+        }
+
+        // The same tokens as one W-row verify that keeps every row, then a one-row round after it.
+        dsv41_model.resetState(m);
+        _ = mlx.mlx_array_free(try forward(xfm, prompt, true));
+        var wide: dsv41_model.Trace = .{ .gpa = a };
+        defer wide.deinit();
+        var after: dsv41_model.Trace = .{ .gpa = a };
+        defer after.deinit();
+        {
+            dsv41_model.width_probe = &wide;
+            defer dsv41_model.width_probe = null;
+            _ = mlx.mlx_array_free(try forward(xfm, cont[0..W], false));
+            try dsv41_model.finishVerify(m, W - 1);
+        }
+        {
+            dsv41_model.width_probe = &after;
+            defer dsv41_model.width_probe = null;
+            _ = mlx.mlx_array_free(try forward(xfm, cont[W .. W + 1], false));
+            try dsv41_model.finishVerify(m, 0);
+        }
+        var bad: usize = 0;
+        for (0..W) |r| bad += try diffRow(a, &wide, &narrow[r], r, verbose);
+        if (verbose) std.debug.print("  -- the one-row round after the wide verify\n", .{});
+        bad += try diffRow(a, &after, &narrow[W], 0, verbose);
+
+        // A W-row verify that keeps two rows (its drafts after the first are wrong), then one-row rounds over the rest.
+        dsv41_model.resetState(m);
+        _ = mlx.mlx_array_free(try forward(xfm, prompt, true));
+        {
+            var ids: [16]u32 = undefined;
+            @memcpy(ids[0..W], cont[0..W]);
+            for (2..W) |k| ids[k] = (cont[k] + 7) % 1000 + 1000;
+            var t: dsv41_model.Trace = .{ .gpa = a };
+            defer t.deinit();
+            dsv41_model.width_probe = &t;
+            _ = mlx.mlx_array_free(try forward(xfm, ids[0..W], false));
+            dsv41_model.width_probe = null;
+            try dsv41_model.finishVerify(m, 1);
+            if (verbose) std.debug.print("  -- rejected verify: kept rows\n", .{});
+            for (0..2) |r| bad += try diffRow(a, &t, &narrow[r], r, verbose);
+        }
+        for (2..W + 1) |i| {
+            var t: dsv41_model.Trace = .{ .gpa = a };
+            defer t.deinit();
+            dsv41_model.width_probe = &t;
+            _ = mlx.mlx_array_free(try forward(xfm, cont[i .. i + 1], false));
+            dsv41_model.width_probe = null;
+            try dsv41_model.finishVerify(m, 0);
+            if (verbose) std.debug.print("  -- one-row round {d} after the rollback\n", .{i});
+            bad += try diffRow(a, &t, &narrow[i], 0, verbose);
+        }
+
+        // One-row rounds with a draft pass before each, as a drafted round runs it.
+        dsv41_model.resetState(m);
+        _ = mlx.mlx_array_free(try forward(xfm, prompt, true));
+        for (0..W + 1) |i| {
+            var d = try dsv41_model.draftHeads(m, cont[i], .conf);
+            d.deinit();
+            var t: dsv41_model.Trace = .{ .gpa = a };
+            defer t.deinit();
+            dsv41_model.width_probe = &t;
+            _ = mlx.mlx_array_free(try forward(xfm, cont[i .. i + 1], false));
+            dsv41_model.width_probe = null;
+            try dsv41_model.finishVerify(m, 0);
+            if (verbose) std.debug.print("  -- one-row round {d} behind a draft\n", .{i});
+            bad += try diffRow(a, &t, &narrow[i], 0, verbose);
+        }
+        return bad;
+    }
+};
+
+test "dsv41 DSpark: on the real pack each row of a wide verify is the bits of its own one-row round (SUSHI_DSV41_REAL_PACK)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_PACK") orelse return error.SkipZigTest);
+    const W: usize = if (std.c.getenv("SUSHI_DSV41_PROBE_WIDTH")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 4;
+    const verbose = std.c.getenv("SUSHI_DSV41_PROBE_VERBOSE") != null;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.stream_mtp_head = true;
+    config.has_vision = false;
+    const budget: u64 = 40 << 30;
+    const model_load = @import("../model_load.zig");
+    const plan = try model_load.planExpertStreamingWith(io, a, &config, dir, budget, false, 0);
+    model_load.applyStreamingPlan(&config, plan, budget);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    const m = xfm.dsv41.?;
+    try testing.expect(m.dspark != null);
+    var tok = try tokenizer_mod.loadTokenizer(io, a, dir);
+    defer tok.deinit();
+    var text_buf: []u8 = &.{};
+    defer a.free(text_buf);
+    const text: []const u8 = if (std.c.getenv("SUSHI_DSV41_PROBE_TEXT")) |path| blk: {
+        text_buf = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(path), a, .limited(1 << 20));
+        break :blk text_buf;
+    } else "Write a long, detailed story about a lighthouse keeper and the storms of one winter. The keeper climbed the iron stairs each night, counting the steps as the wind rose over the black water and the lamp turned.";
+    const all = try tok.encode(a, text);
+    defer a.free(all);
+    var at_it = std.mem.tokenizeScalar(u8, if (std.c.getenv("SUSHI_DSV41_PROBE_AT")) |v| std.mem.span(v) else "17", ',');
+    var bad: usize = 0;
+    while (at_it.next()) |at_s| {
+        const P = try std.fmt.parseInt(usize, at_s, 10);
+        if (P + W + 1 > all.len) return error.ProbeTextTooShort;
+        if (verbose) std.debug.print("== context {d}, width {d}\n", .{ P, W });
+        bad += try WidthProbe.at(a, &xfm, all[0..P], all[P..], W, verbose);
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}

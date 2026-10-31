@@ -377,7 +377,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_rope_kv` | `dsv41_kv_row` and the query's `dsv41_rope_tail` as one launch (the window rows in the first threadgroups, the rotation after) | the attention sublayer when the query and the window row share a dtype and the profiler is off | bit for bit both kernels (`dsv41 rope kv`) |
 | `dsv41_route_split` | `dsv41_route` and the FFN stage's `dsv41_hc_split`: the grid's second threadgroup of a row is the split | a narrow FFN stage whose mixes are still unsplit (`HcMix.z`) | bit for bit both kernels (`dsv41 route split`) |
 | `dsv41_unpack_picks` | a decode block's picks of the packed store: the id clamp, two gathers, FP4 unpack, mask and row numbering (7 dispatches a layer) | `packedPicks` when the picked rows are handed over unpacked (decode, narrow blocks) | bytes: rows and ids of `packedPicksOps` over both FP4 stores, clamped and masked ids |
-| `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
+| `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows; with `ratio` a row splits its own `min(K, (pos + 1) / ratio)` picks, so it is its one-row step's bytes in a verify block) | one token or a verify block | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
 | `dsv41_attn_fused` (`_fp4`) | a wide span's whole `attnCore`: window band and picked rows read by index (`_fp4`: straight from the packed FP4 store), online f32 softmax with the sink, no gathered rows or logits | wide chunks (more than 16 rows) on the GPU stream, bf16 activations, 16 divides the heads | 4e-6 to 1.3e-5 of peak against the CPU f32 `attnCore`, where the GPU `attnCore` is 3.5e-4 to 7e-4; the tiny oracle (4 heads) never engages it |
 | `dsv41_attn_nax` (`_fp4`) | `dsv41_attn_fused`'s two products on NAX `matmul2d` fragments (arm `Model.attn_nax`, on where `attnNaxFits` and the load's trial pass); the same tiling, f32 softmax, sink, high + low bf16 P, epilogue store and packed rows | the fused kernel's wide chunks on an M5 (`attnNaxFits`: heads multiple of 16, width a multiple of 256) | 3.0e-6 to 6.6e-6 of peak against the CPU f32 `attnCore` (the fused kernel 3.1e-6 to 1.3e-5 on the same cases); packed rows and the epilogue store equal the NAX gather and op chain byte for byte |
 | `dsv41_attn_softmax` | the f16 arm of a wide span (`Model.attn_f16`, off) | wide spans, window + picks <= 1024 columns | within 1/64 of peak of the f32 chain (bf16 outputs); f16 scores change output, so it waits for a KLD run |
@@ -743,8 +743,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   the request's rows (`dsv41_prefix.captureShared`), is staged into the writer's bounded host buffers and released before
   the next forward appends, the newest and the prompt-end snapshot included. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
-- **Namespace**: `dsv41_prefix.layoutKey` (`model_load.diskLayoutKey`) is `namespaceTag` (`dsv41-state-v3`, plus
-  `-dspark` when the stages are resident), then `-simd` when the SIMD attention kernel serves, `-composed` for a
+- **Namespace**: `dsv41_prefix.layoutKey` (`model_load.diskLayoutKey`) is `namespaceTag` (`dsv41-state-v3`, or
+  `dsv41-state-v4-dspark` when the stages are resident: the per-row attention split moved the verify rows' bytes), then `-simd` when the SIMD attention kernel serves, `-composed` for a
   `SUSHI_DSV41_COMPOSED=1` boot, `-dsparkinexact` for `SUSHI_DSV41_DSPARK_EXACT=0` with DSpark, then the drop list and
   lossy pick. The key reads `Model.attn_nax` after the load's trial, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
   or a GPU without NAX never writes into the namespace the matrix-unit boots read (their key is unchanged). It is hashed
@@ -844,8 +844,13 @@ rows arm and 2 or more rows the NAX arm, whose k sums differ. A DSpark round now
 (`project_rows.rows_exact`, set around `verify`), except the lm_head, whose SIMD rows arm equals its one-row launch bit for bit and
 is the faster one up to 5 rows, so it takes the SIMD arm at every width. The rest is already width-invariant, by test: the shared
 expert's one-row coop chain against the lane chain (`STQ shared expert at DeepSeek's shape`), the expert-grouped routed chain
-(`verify rows that decode each distinct expert once`), the per-row commit and attention, router and indexer rows (the indexer's
-top-k split changes no pick). Where there is no NAX the arms are the same and nothing changes. `--no-mtp` serial keeps its SIMD
+(`verify rows that decode each distinct expert once`), the per-row commit, router and indexer rows (the indexer's
+top-k split changes no pick). The decode attention is not width-invariant by itself: it splits a row's window and picked columns
+across threadgroups, and a block's pick width is its last row's, so a row sat in a wider block would split elsewhere than its
+one-row step and sum in another order. Each row therefore splits its own `min(K, (pos + 1) / ratio)` picks (`DecodeArgs.ratio`) at
+its own `attnSplits` count, and the rows of a round that take different counts run as separate launches (only a round straddling a
+split step makes more than one). The real-pack probe (`SUSHI_DSV41_REAL_PACK`, `testsuite.md`) compares every verify row with its
+one-row round layer by layer. Where there is no NAX the arms are the same and nothing changes. `--no-mtp` serial keeps its SIMD
 one-row arm, so its text can part from DSpark's at a near-tie (it is itself the same at every repeat). `SUSHI_DSV41_DSPARK_EXACT=0`
 restores the arms that sum by width (SIMD one-row step, NAX head at 2..8 rows); text then depends on the round mix. What holds
 either way is that a generation's stream and non-stream responses carry the same bytes.

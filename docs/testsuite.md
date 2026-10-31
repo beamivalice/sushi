@@ -45,7 +45,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - The pack tier's envs: `DSV41_TINY`, `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
-  `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`. A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green
+  `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack;
+  its `SUSHI_DSV41_PROBE_*` knobs are in [envvar](envvar.md); a ~40 GB-budget run, GPU lock). A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green
   suite proves nothing there.
 - Two real-weight runs have no script. The encoder's real-checkpoint capture:
   `SUSHI_ENCODER_REAL_MODEL=1 SUSHI_MODELS_DIR=<root holding Qwen/Qwen3.8-Flash-Next> zig build test -Doptimize=ReleaseFast -Dmodel=enc`.

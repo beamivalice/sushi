@@ -719,7 +719,8 @@ pub fn kvRow(sc: *Scope, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f32, qat
 
 /// Decode attention for one (row, head) per threadgroup: the window rows the query sees (read from the ring after
 /// this step's write) then its selected compressed rows, f32 online softmax split over NSG simdgroups, the sink in
-/// the denominator only. meta = {p0, L, K, window, cap, n_comp}; `topk` entries < 0 or >= n_comp are skipped.
+/// the denominator only. meta = {p0, L, K, window, cap, n_comp, ratio}; `topk` entries < 0 or >= n_comp are skipped,
+/// and a row under a ratio splits only its own min(K, (pos + 1) / ratio) picks.
 const ATTN_DEC_BODY =
     \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int i = threadgroup_position_in_grid.y, h = threadgroup_position_in_grid.x;
@@ -733,8 +734,9 @@ const ATTN_DEC_BODY =
     \\for (int v = 0; v < V; ++v) { qv[v] = float(q[(i * H + h) * D + lane * V + v]); acc[v] = 0.0f; }
     \\float mx = -INFINITY, den = 0.0f;
     \\const float scale = scal[0];
-    \\const int S = int(threadgroups_per_grid.z), sp = threadgroup_position_in_grid.z, chunk = (nw + K + S - 1) / S;
-    \\const int t_lo = sp * chunk, t_hi = metal::min(nw + K, t_lo + chunk);
+    \\const int Ki = meta[6] > 0 ? metal::min(K, (pos + 1) / meta[6]) : K;
+    \\const int S = int(threadgroups_per_grid.z), sp = threadgroup_position_in_grid.z, chunk = (nw + Ki + S - 1) / S;
+    \\const int t_lo = sp * chunk, t_hi = metal::min(nw + Ki, t_lo + chunk);
     \\for (int t = t_lo + sg; t < t_hi; t += NSG) {
     \\  const device KT* row;
     \\  if (t < nw) row = ring + size_t((lo + t) % cap) * D;
@@ -903,6 +905,9 @@ pub const DecodeArgs = struct {
     /// The heads leave through attnOut's fp8 round trip (groups of 32 channels).
     qat_fp8: bool = false,
     out_dt: mlx.mlx_dtype,
+    /// The compression ratio the picks were made at: row i carries the min(K, (p0 + i + 1) / ratio) picks its one-row
+    /// step would, and splits its columns as that step does. 0: every row carries K.
+    ratio: usize = 0,
 };
 
 /// Whether `attnDecode` serves head rows of `d` channels.
@@ -910,9 +915,34 @@ pub fn attnDecodeFits(d: usize) bool {
     return d % 32 == 0 and d <= 1024;
 }
 
+/// The splits row `r` of the block takes: those of its one-row step.
+fn rowSplits(a: DecodeArgs, K: usize, r: usize) usize {
+    return attnSplits(a.window + if (a.ratio > 0) @min(K, (a.p0 + r + 1) / a.ratio) else K);
+}
+
 /// The heads `[L, H, D]` of a decode block, softmax over window and selected rows with the sink, inverse-rotated.
+/// With `ratio` a row splits its columns as its one-row step does, so rows that take different split counts run as
+/// separate launches.
 pub fn attnDecode(sc: *Scope, a: DecodeArgs) !A {
-    return attnDecodeSplit(sc, a, attnSplits(a.window + (if (a.topk.ctx != null) dim(a.topk, 1) else 0)));
+    const K = if (a.topk.ctx != null) dim(a.topk, 1) else 0;
+    const L = dim(a.q, 0);
+    var parts: [16]A = undefined;
+    var np: usize = 0;
+    var r0: usize = 0;
+    while (r0 < L) {
+        const s0 = rowSplits(a, K, r0);
+        var r1 = r0 + 1;
+        while (r1 < L and rowSplits(a, K, r1) == s0) r1 += 1;
+        if (r0 == 0 and r1 == L) return attnDecodeSplit(sc, a, s0);
+        var g = a;
+        g.q = try sc.slice(a.q, 0, r0, r1);
+        g.topk = try sc.slice(a.topk, 0, r0, r1);
+        g.p0 = a.p0 + r0;
+        parts[np] = try attnDecodeSplit(sc, g, s0);
+        np += 1;
+        r0 = r1;
+    }
+    return sc.concat(parts[0..np], 0);
 }
 
 pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
@@ -921,7 +951,7 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     const D = dim(a.q, 2);
     const K = if (a.topk.ctx != null) dim(a.topk, 1) else 0;
     const kt = mlx.mlx_array_dtype(a.ring);
-    const meta_v = [_]i32{ ci(a.p0), ci(L), ci(K), ci(a.window), ci(dim(a.ring, 0)), if (K > 0) ci(dim(a.comp, 0)) else 0 };
+    const meta_v = [_]i32{ ci(a.p0), ci(L), ci(K), ci(a.window), ci(dim(a.ring, 0)), if (K > 0) ci(dim(a.comp, 0)) else 0, ci(a.ratio) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
     const scal = try f32Const(sc, &.{a.scale});
     const comp = if (K > 0) try sc.astype(a.comp, kt) else a.ring;
@@ -3490,6 +3520,40 @@ test "dsv41 decode attention: a block of rows is the rows of single-row blocks, 
         args.topk = try sc.slice(a.topk, 0, r, r + 1);
         args.p0 = c.p0 + r;
         try expectBitEqual("attn rows", got[r * row ..][0..row], try hostOf(&sc, try attnDecode(&sc, args)));
+    }
+}
+
+test "dsv41 decode attention: a verify block's row is its one-row step's bits when the block carries more compressed picks (release shape, two splits)" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const freqs = try ropeFreqs(&sc);
+    const rows = 6;
+    const ratio = 1;
+    // Rows at 188 cross from one split to two inside the block; at 200 every row takes two, split where its own picks end.
+    for ([_]usize{ 188, 200 }) |p0| {
+        const c: AttnCase = .{ .p0 = p0, .n_comp = (p0 + rows) / ratio };
+        var a = try attnData(&sc, c, .bfloat16);
+        a.q = try sc.astype(try randn(&sc, &.{ rows, ci(c.heads), ci(c.d) }, .float32, 121, 1.5), .bfloat16);
+        a.ring = try sc.astype(try randn(&sc, &.{ ci(c.window + 16), ci(c.d) }, .float32, 122, 1.5), .bfloat16);
+        // As the indexer hands them over below its cap: every reachable group in ascending order, -1 past the row's own.
+        const kw = c.n_comp;
+        var picks: [rows * 256]i32 = undefined;
+        for (0..rows) |r| for (0..kw) |i| {
+            picks[r * kw + i] = if (i < (p0 + r + 1) / ratio) @intCast(i) else -1;
+        };
+        a.topk = try sc.ints(picks[0 .. rows * kw], &.{ rows, ci(kw) });
+        var args = decodeArgs(&a, .bfloat16, freqs);
+        args.ratio = ratio;
+        const got = try hostOf(&sc, try attnDecode(&sc, args));
+        const row = c.heads * c.d;
+        for (0..rows) |r| {
+            const k = (p0 + r + 1) / ratio;
+            args.q = try sc.slice(a.q, 0, r, r + 1);
+            args.topk = try sc.slice(try sc.slice(a.topk, 0, r, r + 1), 1, 0, k);
+            args.p0 = p0 + r;
+            try expectBitEqual("attn verify row", got[r * row ..][0..row], try hostOf(&sc, try attnDecode(&sc, args)));
+        }
     }
 }
 

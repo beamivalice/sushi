@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1 DSpark greedy text no longer depends on the verify-width mix**: the decode attention split a verify
+  row's columns by its block's width, so the same request could differ between runs; it now gives the same text every run.
 - **DeepSeek-V4.1 decode spends less CPU per token with byte-identical output**: fewer Metal command buffers per layer,
   two fewer kernel launches per layer, custom kernels handed to MLX without comments or unused helpers, a DSpark verify
   round waits on the host only for its argmax, idle expert prefetches are skipped, and a streamed reply no longer

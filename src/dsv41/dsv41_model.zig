@@ -539,6 +539,10 @@ pub const Trace = struct {
     }
 };
 
+/// Diagnostic: each layer's input stream, the block's intermediates and the logits, kept without turning any arm off
+/// (`trace` turns the fused paths off). The width-exactness harness compares a row across verify widths with it.
+pub var width_probe: ?*Trace = null;
+
 /// The inputs a calibration capture reads off a forward, by the linears that consume them.
 pub const TapKind = enum {
     /// attn_norm output: wq_a, wkv, the compressor projections and the indexer's weights projection.
@@ -1763,6 +1767,8 @@ pub fn attnCore(sc: *Scope, sink: A, q: A, keys_w: A, band: A, comp_rows: A, top
 /// What a chunk's layers hand down, per span: the selected compressed groups and the candidate blocks.
 const Shared = struct {
     topk: []A,
+    /// The compression ratio of the indexer that made each `topk`.
+    topk_ratio: []u8,
     cand: []A,
     /// A CED replay's first position: the decoder has no window rows before it, and its compressor already ran.
     floor: ?usize = null,
@@ -1802,9 +1808,12 @@ const Shared = struct {
         const t = try gpa.alloc(A, spans);
         errdefer gpa.free(t);
         const cd = try gpa.alloc(A, spans);
+        errdefer gpa.free(cd);
+        const tr = try gpa.alloc(u8, spans);
         @memset(t, none);
         @memset(cd, none);
-        return .{ .topk = t, .cand = cd };
+        @memset(tr, 0);
+        return .{ .topk = t, .topk_ratio = tr, .cand = cd };
     }
 
     fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
@@ -1817,16 +1826,18 @@ const Shared = struct {
             _ = mlx.mlx_array_free(a);
         };
         gpa.free(self.topk);
+        gpa.free(self.topk_ratio);
         gpa.free(self.cand);
     }
 };
 
 /// `comp_rows`: the picked rows as values, `topk` indexing them. `store`, with `raw`: the compressed store itself, with
-/// `topk` the ids into it.
+/// `topk` the ids into it. `ratio`: the compression ratio the picks were made at.
 pub const Picks = struct {
     comp_rows: A = none,
     topk: A = none,
     store: ?*const Rows = null,
+    ratio: usize = 0,
 
     fn any(self: Picks) bool {
         return self.comp_rows.ctx != null or self.store != null;
@@ -1846,12 +1857,17 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
         const sp = try indexer(sc, m, st, li, try sc.slice(h, 0, a, b), try sc.slice(qr, 0, a, b), p0 + a, &sh.cand[si], sh);
         if (sh.topk[si].ctx != null) _ = mlx.mlx_array_free(sh.topk[si]);
         sh.topk[si] = sc.out(sp);
+        sh.topk_ratio[si] = ly.ratio;
     }
     if (clen == 0 or sh.topk[si].ctx == null) return .{};
     const src = c.latest(li, Config.isKvSource);
     const comp = &st.layers[src].comp.?;
-    if (comp.pack == null) return .{ .topk = sh.topk[si], .comp_rows = try comp.rows(sc, clen) };
-    return packedPicks(sc, comp, sh.topk[si], raw and comp.dtype == .bfloat16);
+    var picks: Picks = if (comp.pack == null)
+        .{ .topk = sh.topk[si], .comp_rows = try comp.rows(sc, clen) }
+    else
+        try packedPicks(sc, comp, sh.topk[si], raw and comp.dtype == .bfloat16);
+    picks.ratio = sh.topk_ratio[si];
+    return picks;
 }
 
 /// The picks `topk` of the packed store `comp`: handed over as they are when `raw`, else unpacked, and then the ids
@@ -1923,6 +1939,10 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         try ls.win.write(kv, p0, sc.s);
         const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
         if (pf) |p| try p.mark(.indexer, if (picks.comp_rows.ctx != null) &.{ picks.comp_rows, picks.topk } else &.{ls.win.buf});
+        if (width_probe) |t| {
+            try t.put("a_q_{d}", .{li}, q);
+            if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
+        }
         const o = try kernels.attnDecode(sc, .{
             .q = q,
             .ring = ls.win.buf,
@@ -1936,8 +1956,10 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             .rd = rd,
             .qat_fp8 = m.qat_on,
             .out_dt = m.act,
+            .ratio = picks.ratio,
         });
         if (pf) |p| try p.mark(.core, &.{o});
+        if (width_probe) |t| try t.put("a_o_{d}", .{li}, o);
         return attnOut(sc, m, li, ly, o, m.qat_on);
     }
     const one_pass = fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd);
@@ -2494,6 +2516,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         try p.mark(.hc_attn, &.{ h, s.pre, s.post, s.comb });
     }
     try tapInput(m, li, .attn_in, h);
+    if (width_probe) |t| try t.put("attn_in_{d}", .{li}, h);
     if (m.trace) |t| {
         const sa = try pa.mix.split(sc, m);
         try t.put("hc_pre_{d}", .{li}, sa.pre);
@@ -2509,6 +2532,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         break :blk try sc.keep(asc.out(o));
     };
     if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
+    if (width_probe) |t| try t.put("attn_{d}", .{li}, a);
     const pf = try hcPre(sc, m, x, .{ .y = a, .prev = pa.mix }, none, &ly.hc_ffn, ly.ffn_norm);
     var mix = pf.mix;
     const x1 = pf.x1;
@@ -2519,6 +2543,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     }
     try tapInput(m, li, .ffn_in, h2);
     if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
+    if (width_probe) |t| try t.put("ffn_in_{d}", .{li}, h2);
     if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(x2), .pre = sc.out(mix.sp.?.pre) };
     const r = try router(sc, m, li, h2, sh.img, &mix);
     const sf = try mix.splitOnce(sc, m);
@@ -2534,6 +2559,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         u.pre = sc.out(sf.pre);
     }
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
+    if (width_probe) |t| try t.put("ffn_{d}", .{li}, y);
     return .{ .x = sc.out(try hcExpand(sc, m, x1, y, sf.post, sf.comb)), .pre = sc.out(sf.pre) };
 }
 
@@ -3289,6 +3315,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
         try if (wait) mlx.check(mlx.mlx_array_eval(p.targets[t])) else ev.append(gpa, p.targets[t]);
     };
     p.sh.img = p.img;
+    if (width_probe) |t| try t.put("x_in_{d}", .{li}, p.x);
     const out = try block(&sc, m, p.st, li, p.x, p.cpre, p.p0, &p.sh, p.span, null);
     _ = mlx.mlx_array_free(p.x);
     _ = mlx.mlx_array_free(p.cpre);
@@ -3342,6 +3369,7 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         try t.input(t.ctx, c.layers, .head_in, try tsc.rms(try hcCollapse(&tsc, p.x, p.cpre), m.norm, c.eps));
     }
     if (res.ctx == null) res = try headLogits(m, p, want);
+    if (width_probe) |t| try t.put("logits", .{}, res);
     if (prof(m, L)) |pf| {
         pf.restart();
         try pf.mark(.head, &.{res});

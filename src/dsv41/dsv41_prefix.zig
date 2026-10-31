@@ -228,7 +228,7 @@ pub fn markRows(cache: *transformer.KVCache) !void {
 /// Names the stored layout for the SSD cache namespace: a restore point written under another layout, or
 /// with a different set of slots, is never read.
 pub fn namespaceTag(dspark: bool) []const u8 {
-    return if (dspark) "dsv41-state-v3-dspark" else "dsv41-state-v3";
+    return if (dspark) "dsv41-state-v4-dspark" else "dsv41-state-v3";
 }
 
 /// Tokens of compressed rows and index keys one `g<n>` segment of an SSD entry holds.
@@ -419,7 +419,7 @@ test "layoutKey: a boot that drops other experts or picks leniently has its own 
     // The served keys are unchanged, and a model without DSpark has no verify rows to sum differently.
     try testing.expectEqualStrings("dsv41-state-v3", full);
     try testing.expectEqualStrings("dsv41-state-v3-simd", k_simd);
-    try testing.expectEqualStrings(namespaceTag(true), k_dspark);
+    try testing.expectEqualStrings("dsv41-state-v4-dspark", k_dspark);
     const no_dspark = try layoutKey(a, false, true, true, false, null, 0);
     defer a.free(no_dspark);
     try testing.expectEqualStrings(full, no_dspark);

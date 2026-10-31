@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 138 vars. By kind: tradeoff levers 14, diagnostics 52, microbenches 19, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 143 vars. By kind: tradeoff levers 14, diagnostics 52, microbenches 19, test-only seams 48, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -97,7 +97,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load; arm list; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `qwen4_qsa_gather.zig` | QSA prefill/wide meters | test | no |
 
-## Test-only seams (43)
+## Test-only seams (48)
 
 Inputs and hooks that real-pack tests and scripts use.
 
@@ -109,6 +109,7 @@ Inputs and hooks that real-pack tests and scripts use.
 | `QWEN4_FIXTURE`, `QWEN4_FIXTURE_BF16`, `QWEN4_FIXTURE_VISION`, `QWEN4_ROWS_OLD`, `QWEN4_TEST_HF_MODEL`, `QWEN4_TEST_PREFIX_TOKENS`, `QWEN4_VERIFY_BENCH`, `QWEN4_YARN_FIXTURES`, `QWEN4_BF16_STREAM_MODEL` | `qwen4_fixture_test.zig`, `mrope.zig`, `expert_io.zig` | oracle fixtures, HF source dir and probe switches for the Qwen4 oracle tests | test | yes: tests/CLAUDE |
 | `QWEN4_TEST_MODEL` | `qwen4_fixture_test.zig:474, 618, 641, +24`, `qwen4_generate_test.zig:387, 531, 640` | `<pack dir>` for the real-pack Qwen4 tests; they skip without it | test | yes: mlx-serve-sync, server-lifecycle, tests/CLAUDE |
 | `QWEN_VISION_TEST_MODEL`, `QWEN_VISION_FIXTURE`, `QWEN_PREPROCESS_FIXTURE`, `QV_GH`, `QV_GW`, `QWEN_MID_SYSTEM_MODEL_DIR` | `qwen_vision.zig`, `chat.zig` | Qwen vision/preprocess oracle inputs and a chat-template pack | test | yes: server-tool-calling, tests/CLAUDE |
+| `SUSHI_DSV41_REAL_PACK`, `SUSHI_DSV41_PROBE_AT`, `SUSHI_DSV41_PROBE_WIDTH`, `SUSHI_DSV41_PROBE_TEXT`, `SUSHI_DSV41_PROBE_VERBOSE` | `dsv41_generate_test.zig` | the real-pack width probe (skips without `SUSHI_DSV41_REAL_PACK=<pack dir>`): at each context in `PROBE_AT` (comma list, default 17) of `PROBE_TEXT` (a text file with more tokens than the largest context + width + 1) a `PROBE_WIDTH`-row verify (default 4) must give every row the bits of its own one-row round, layer by layer; `PROBE_VERBOSE` prints each differing tensor | test | yes: dsv41-arch, testsuite |
 | `SUSHI_FORCE_BATCHED` | `scheduler.zig:1209` | `1` routes single-slot ticks through the batched kernel (`tests/test_batched_equivalence.sh`) | boot | yes: tests/CLAUDE |
 | `SUSHI_MEMORY_AUDIT_MODEL`, `SUSHI_TOKENIZER_PARITY_FIXTURE` | `server.zig`, `model_load.zig`, `tokenizer.zig` | memory-bill audit pack and tokenizer parity fixture | test | no |
 | `SUSHI_MLX_FAULT_CHUNK`, `SUSHI_MLX_FAULT_STEP` | `mlx.zig` | `<n>` latches a synthetic Metal OOM at the n-th prefill-chunk check / decode step (`tests/test_mlx_error_recovery.sh`) | once | yes: tests/CLAUDE |
