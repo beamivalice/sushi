@@ -392,17 +392,25 @@ Decode attention core, `sushi-ubench run dsv41.attn_decode` (`dsv41_attn_decode`
 
 **Fewer launches a token** (a custom-kernel launch costs host CPU on the Super cores, which share the die and its heat with the GPU: MLX builds the
 primitive, its output array and graph node, and hashes the source on every launch; a serial decode token ran ~965 of them). A fusion lands where the
-output bytes are the unfused kernels' and the GPU time is no worse (`sushi-ubench run dsv41.launch_fusions`).
+output bytes are the unfused kernels' and the GPU time is no worse (`sushi-ubench run dsv41.launch_fusions`, `dsv41.reduce_expand`).
 - **Router + FFN hc split** (`dsv41_route_split`, -1 launch a layer): the two share no data, so the split rides the router's launch. Putting it in
   the router's own threadgroup (simdgroup 0, after the picks) was 3 to 5% slower than the two launches, which overlap; a second threadgroup per row
   runs it beside the picks as two launches did. The split arrays are now outputs of the router, so they leave with the picks' submit unchanged
   (`ride` is a no-op there). The router is made in `block`'s scope, not `moe`'s, so the split outlives the FFN scope.
 - **Window row + query rotation** (`dsv41_rope_kv`, -1 a layer): the window row's norm (three barriers) takes the first threadgroups, so it starts
   with the rotation, not after it (put last it was 5% slower than the pair).
+- **Routed reduce writes the stream** (`rate_groups.moeDecodeClampedSharedFusedExpand`, `StreamExpand`; -1 custom launch and the bf16 cast of the sum a
+  layer): on the route-spec queue the finish reduce rounds the sum to the stream's dtype and applies `hcExpand`'s TF32-class arithmetic
+  (operands truncated to 10 mantissa bits, `(p0 + p1) + (p2 + p3)`, uncontracted) in the simdgroup that stores it, its stream operands loaded before the
+  barrier. It engages only where `hcExpand` is the kernel (`foldsExpand`: `hcExpandServes`, no trace, tap or profile, a backbone layer at decode
+  width); a settle that finds a missed pick runs the sum and `hcExpand` as before, so the rebuilt stream is the same bytes
+  (`dsv41 stq: queueing the routed chains ...` counts `expands_folded` and compares the queued packs with the drained one).
 
 Microbenches (commit 551d6122, ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC, median of rounds of 40 dependent layers, us a layer, link included):
 `dsv41.launch_fusions` router + split 24.0 -> 20.1 (4 rows), window row + rotation 18.3 -> 16.4 (1 row) and 14.7 -> 13.6 (4 rows), with the
-1-row router pair bimodal on the unfused arm (61.4 median, 31.7 to 69.8).
+1-row router pair bimodal on the unfused arm (61.4 median, 31.7 to 69.8); `dsv41.reduce_expand` (layer 2 chain with the shared expert, 11 rounds of 16)
+157.1 (cast + expand kernel) against 157.5 at 1 row, 293.1 against 293.5 at 2, 543.0 against 542.3 at 4 and 1043.9 against 1043.0 at 8: a tie
+(the expand costs ~3.5 us either way) that removes two dispatches.
 
 Rejected: folding `sushi_exl3_rows_finish` (~140 a token) into the rows kernel, the last-arriving threadgroup of a tile summing the split partials in
 the same order. It needs a device counter that is zero when a launch starts; MLX zeroes only through `init_value` (one fill dispatch per output,

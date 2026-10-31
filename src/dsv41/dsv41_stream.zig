@@ -1367,6 +1367,7 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         eager.m.route_spec_rebuilds = std.math.maxInt(u32);
         const kept0 = model.spec_kept;
         const rebuilt0 = model.spec_rebuilt;
+        const folded0 = model.expands_folded;
         var at: usize = 0;
         for ([_]usize{ 20, 1, 1, 5, 1, 3, 1, 16, 1, 1, 1, 1, 2, 1, 1 }) |n| {
             const take = @min(n, ids.len - at);
@@ -1387,6 +1388,8 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         const kept = model.spec_kept - kept0;
         const rebuilt = model.spec_rebuilt - rebuilt0;
         if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq route-spec slots {d}: {d} layers kept, {d} rebuilt\n", .{ slots, kept, rebuilt });
+        // The queued and eager packs' decode layers write their stream in the reduce; the drained pack's expand is the kernel.
+        try testing.expectEqual(slots != 8, model.expands_folded > folded0);
         if (slots == 8) {
             try testing.expectEqual(@as(u64, 0), kept + rebuilt);
         } else if (slots <= 3) {

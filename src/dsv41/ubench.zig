@@ -11,8 +11,9 @@ const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
+const exl3 = @import("sushi_exl3");
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, reduce_expand };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -1190,3 +1191,17 @@ fn runLaunchFusions(run: *report.Run) anyerror!void {
         }
     }
 }
+
+// ── dsv41.reduce_expand ─────────────────────────────────────────────────
+
+pub const reduce_expand: report.Bench = .{
+    .name = "dsv41.reduce_expand",
+    .scope = .dsv41,
+    .what = "the plan's layer 2 chain with the shared expert (top-6, 5120): its reduce, the sum's bf16 cast and the hyper-connection expand kernel as three launches, against the reduce writing the stream itself; the chain alone",
+    .unit = .us,
+    .steps = 16,
+    .axes = &.{.{ .name = "rows", .values = &.{ "1", "2", "4", "8" } }},
+    .arms = &.{ "reduce_cast_expand", "reduce_expand", "reduce" },
+    .ref = "reduce_cast_expand",
+    .run = exl3.ubench.runReduceExpand,
+};

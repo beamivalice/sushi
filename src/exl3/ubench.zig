@@ -793,6 +793,149 @@ pub fn sharedFoldDsv41(run: *report.Run) anyerror!void {
     }
 }
 
+// ---- dsv41.reduce_expand: the decode reduce writing the new hyper-connection stream ----
+
+/// `dsv41_hc_expand`'s arithmetic (one thread an output element), the standalone expand the fold removes.
+const BENCH_EXPAND_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const int d = int(thread_position_in_grid.x), l = int(thread_position_in_grid.y), k = int(thread_position_in_grid.z);
+    \\const int D = x_shape[2];
+    \\if (d >= D) return;
+    \\const size_t xo = size_t(l) * 4 * D + d;
+    \\const float yv = float(y[size_t(l) * D + d]);
+    \\float p[4];
+    \\for (int j = 0; j < 4; ++j) p[j] = as_type<float>(as_type<uint>(comb[l * 16 + j * 4 + k]) & 0xFFFFE000u) * as_type<float>(as_type<uint>(float(x[xo + size_t(j) * D])) & 0xFFFFE000u);
+    \\out[xo + size_t(k) * D] = T(post[l * 4 + k] * yv + ((p[0] + p[1]) + (p[2] + p[3])));
+;
+
+var bench_expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn benchExpand(s: mlx.mlx_stream, x: mlx.mlx_array, y: mlx.mlx_array, post: mlx.mlx_array, comb: mlx.mlx_array) !mlx.mlx_array {
+    const k = try kernels.getNamedKernel(&bench_expand_kernel, "sushi_exl3_bench_hc_expand", &.{ "x", "y", "post", "comb" }, &.{"out"}, BENCH_EXPAND_SOURCE, "");
+    const sh = mlx.getShape(x);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, sh.len, mlx.mlx_array_dtype(x)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", mlx.mlx_array_dtype(x)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast((HIDDEN + 255) / 256 * 256), sh[0], 4));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    const ov = try kernels.applyOuts(s, k, &.{ x, y, post, comb }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+    return out;
+}
+
+const ExpandCtx = struct {
+    base: Ctx,
+    se: rate_groups.SharedExpert,
+    stream: mlx.mlx_array,
+    post: mlx.mlx_array,
+    comb: mlx.mlx_array,
+    arm: usize,
+};
+
+fn expandStep(c: ExpandCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    const expand: ?rate_groups.StreamExpand = if (c.arm == 1) .{ .x = c.stream, .post = c.post, .comb = c.comb } else null;
+    const y = (try rate_groups.moeDecodeClampedSharedFusedExpand(s, x, c.base.rb, c.base.routes[i % ROUTE_SETS], c.base.scores, c.base.topk, .float32, c.se, LIMIT, expand)) orelse return error.SharedFuseDeclined;
+    if (c.arm != 0) return y;
+    defer _ = mlx.mlx_array_free(y);
+    var yb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(yb);
+    try mlx.check(mlx.mlx_astype(&yb, y, .bfloat16, s));
+    return benchExpand(s, c.stream, yb, c.post, c.comb);
+}
+
+const ExpandSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize, c: ExpandCtx };
+
+fn expandSample(smp: ExpandSample, arm: usize) anyerror!f64 {
+    var c = smp.c;
+    c.arm = arm;
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, c, expandStep);
+    const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
+}
+
+pub fn runReduceExpand(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0xd54f);
+    const rnd = prng.random();
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    const lay = LAYOUTS[0];
+    var banks: [8]root.Bank = undefined;
+    for (lay.groups, 0..) |g, i| banks[i] = try bench.makeBank(rnd, HIDDEN, INTER, g.n, g.experts, 0.02, 0.9);
+    var rb = try rate_groups.Ragged.init(s, banks[0..lay.groups.len]);
+    defer rb.deinit();
+    const st = rb.storage();
+    const vec = mlx.mlx_vector_array_new_data(&st, st.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+    for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
+    var sbank = try bench.makeBank(rnd, HIDDEN, INTER, .{ 64, 64, 64 }, 1, 0.02, 0.9);
+    defer bench.freeBank(&sbank);
+    for (run.axis("rows")) |rows_text| {
+        const rows = try std.fmt.parseInt(usize, rows_text, 10);
+        var routes: [ROUTE_SETS]mlx.mlx_array = undefined;
+        _ = makeRoutes(rnd, &rb, rows, lay.topk, .uniform, &routes);
+        defer for (routes) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const xh = try std.heap.page_allocator.alloc(u16, rows * HIDDEN);
+        defer std.heap.page_allocator.free(xh);
+        const sh = try std.heap.page_allocator.alloc(u16, rows * 4 * HIDDEN);
+        defer std.heap.page_allocator.free(sh);
+        for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
+        for (sh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 30)) >> 16);
+        var scv: [256 * 6]f32 = undefined;
+        for (&scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+        var pv: [8 * 4]f32 = undefined;
+        for (&pv) |*v| v.* = rnd.float(f32) * 1.5;
+        var cv: [8 * 16]f32 = undefined;
+        for (&cv) |*v| v.* = rnd.float(f32);
+        const r: c_int = @intCast(rows);
+        const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ r, @intCast(HIDDEN) }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(x0);
+        const stream = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{ r, 4, @intCast(HIDDEN) }, 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(stream);
+        const scores = mlx.mlx_array_new_data(&scv, &[_]c_int{@intCast(rows * lay.topk)}, 1, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        const post = mlx.mlx_array_new_data(&pv, &[_]c_int{ r, 4 }, 2, .float32);
+        defer _ = mlx.mlx_array_free(post);
+        const comb = mlx.mlx_array_new_data(&cv, &[_]c_int{ r, 4, 4 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(comb);
+        const base: Ctx = .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = r, .topk = @intCast(lay.topk), .prefill = false };
+        const smp: ExpandSample = .{ .s = s, .x0 = x0, .steps = run.steps(16), .c = .{ .base = base, .se = .{ .bank = sbank, .dec = exl3.Decode.tabled(.spec1, .w15) }, .stream = stream, .post = post, .comb = comb, .arm = 0 } };
+        var got: [2]mlx.mlx_array = undefined;
+        for (&got, 0..) |*g, arm| {
+            var c = smp.c;
+            c.arm = arm;
+            g.* = try expandStep(c, s, 0, x0);
+        }
+        defer for (got) |g| {
+            _ = mlx.mlx_array_free(g);
+        };
+        var cat: [2]mlx.mlx_array = undefined;
+        for (&cat, got) |*h, g| {
+            h.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_contiguous(h, g, false, s));
+        }
+        defer for (cat) |h| {
+            _ = mlx.mlx_array_free(h);
+        };
+        try mlx.check(mlx.mlx_array_eval(cat[0]));
+        try mlx.check(mlx.mlx_array_eval(cat[1]));
+        const n = mlx.mlx_array_size(cat[0]) * mlx.mlx_array_itemsize(cat[0]);
+        const pa: [*]const u8 = @ptrCast(mlx.mlx_array_data_uint8(cat[0]) orelse return error.Unreadable);
+        const pb: [*]const u8 = @ptrCast(mlx.mlx_array_data_uint8(cat[1]) orelse return error.Unreadable);
+        if (!std.mem.eql(u8, pa[0..n], pb[0..n])) run.invalid("the reduce's stream differs from the cast and expand kernel's");
+        const label = try std.fmt.allocPrint(run.a, "L2 rows {d}", .{rows});
+        try run.interleave(label, smp, expandSample);
+    }
+}
+
 const MCG_W15: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
 
 const RATES_TEXT = [_][]const u8{

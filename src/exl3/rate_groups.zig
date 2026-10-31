@@ -800,8 +800,13 @@ const FuseKey = struct {
 const FusedStage = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config };
 var fused_stages: std.AutoHashMapUnmanaged(FuseKey, FusedStage) = .empty;
 var fused_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const ReduceKey = struct { hidden: c_int, rows: c_int, topk: c_int };
-var fused_reduce_cfgs: kernel_src.CfgCache(ReduceKey, 8) = .{};
+const ReduceKey = struct { hidden: c_int, rows: c_int, topk: c_int, expand_dt: ?mlx.mlx_dtype = null };
+var fused_reduce_cfgs: kernel_src.CfgCache(ReduceKey, 16) = .{};
+var fused_reduce_expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// The hyper-connection expand a decode reduce can write its sum through: the stream `x` `[rows, 4, hidden]`, the new
+/// stream's `post` `[rows, 4]` and `comb` `[rows, 4, 4]` (f32).
+pub const StreamExpand = struct { x: mlx.mlx_array, post: mlx.mlx_array, comb: mlx.mlx_array };
 /// Test and bench arm: which part's threadgroups the fused grid lists first.
 pub var fused_shared_first: bool = false;
 
@@ -1020,6 +1025,53 @@ const REDUCE_FUSED_SOURCE: [:0]const u8 =
     \\}
 ;
 
+/// The stream operands the expand reads, loaded by the simdgroup that stores it before the other simdgroups finish.
+const REDUCE_EXPAND_PREFETCH: [:0]const u8 =
+    \\float pxv[4][4];
+    \\float pcb[16];
+    \\float ppost[4];
+    \\if (sg == 0u) {
+    \\  const size_t pxo = (size_t)row * 4u * (size_t)(ODIM) + base;
+    \\  for (uint u = 0u; u < 4u; u++) {
+    \\    for (uint j = 0u; j < 4u; j++) pxv[u][j] = as_type<float>(as_type<uint>(float(x1[pxo + j * uint(ODIM) + lane + 32u * u])) & 0xFFFFE000u);
+    \\  }
+    \\  for (uint i = 0u; i < 16u; i++) pcb[i] = as_type<float>(as_type<uint>(comb[row * 16u + i]) & 0xFFFFE000u);
+    \\  for (uint k = 0u; k < 4u; k++) ppost[k] = post[row * 4u + k];
+    \\}
+    \\
+;
+
+/// The four-copy stream the reduce's sums feed (`[rows, 4, ODIM]`, element type XT): out copy k of a column is
+/// `post[k] * y + ((c0 * x0 + c1 * x1) + (c2 * x2 + c3 * x3))` with `c = comb[j, k]`, the products of mantissa-truncated
+/// (10 bits) operands, which is the f32 matmul of the op chain on a NAX GPU; `y` is rounded to XT first, as the chain's input.
+const REDUCE_EXPAND_STORE: [:0]const u8 =
+    \\{
+    \\#pragma clang fp contract(off)
+    \\    const float yv[4] = {float(XT(T(float(T(a0)) + float(ST(b0))))), float(XT(T(float(T(a1)) + float(ST(b1))))), float(XT(T(float(T(a2)) + float(ST(b2))))), float(XT(T(float(T(a3)) + float(ST(b3)))))};
+    \\    const size_t xo = (size_t)row * 4u * (size_t)(ODIM) + base;
+    \\    for (uint u = 0u; u < 4u; u++) {
+    \\      for (uint k = 0u; k < 4u; k++) {
+    \\        float p[4];
+    \\        for (uint j = 0u; j < 4u; j++) p[j] = pcb[j * 4u + k] * pxv[u][j];
+    \\        y[xo + k * uint(ODIM) + lane + 32u * u] = XT(ppost[k] * yv[u] + ((p[0] + p[1]) + (p[2] + p[3])));
+    \\      }
+    \\    }
+    \\}
+;
+
+const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
+    REDUCE_FUSED_SOURCE,
+    "const float scv = 0.08838834764831845f;",
+    REDUCE_EXPAND_PREFETCH ++ "const float scv = 0.08838834764831845f;"),
+    "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));",
+    REDUCE_EXPAND_STORE),
+    "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));",
+    ""),
+    "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));",
+    ""),
+    "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));",
+    "");
+
 var unit_score: ?mlx.mlx_array = null;
 
 fn unitScore() mlx.mlx_array {
@@ -1030,24 +1082,33 @@ fn unitScore() mlx.mlx_array {
     return a;
 }
 
-fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
-    const key: ReduceKey = .{ .hidden = rb.hidden, .rows = rows, .topk = topk };
+fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, expand: ?StreamExpand) !mlx.mlx_array {
+    const xdt = if (expand) |e| mlx.mlx_array_dtype(e.x) else out_dtype;
+    const key: ReduceKey = .{ .hidden = rb.hidden, .rows = rows, .topk = topk, .expand_dt = if (expand != null) xdt else null };
     const cfg = fused_reduce_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        const sh = if (rows == 1) [_]c_int{ rb.hidden, 0 } else [_]c_int{ rows, rb.hidden };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, if (rows == 1) 1 else 2, out_dtype));
+        const sh = if (expand != null) [_]c_int{ rows, 4 * rb.hidden } else if (rows == 1) [_]c_int{ rb.hidden, 0 } else [_]c_int{ rows, rb.hidden };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, if (expand == null and rows == 1) 1 else 2, xdt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * (topk + 1) * @divExact(rb.hidden, 128), rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32 * (topk + 1), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", out_dtype));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "ST", .bfloat16));
+        if (expand != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "XT", xdt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", rb.hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
         fused_reduce_cfgs.put(key, c);
         break :blk c;
     };
+    const ins = [_]mlx.mlx_array{ down, rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore() };
+    if (expand) |e| {
+        const kernel = try kernels.getNamedKernel(&fused_reduce_expand_kernel, "sushi_exl3_down_reduce_fused_expand", &.{ "inner", "svh", "slots", "sc", "s_inner", "s_svh", "unit", "x1", "post", "comb" }, &.{"y"}, REDUCE_EXPAND_SOURCE, "");
+        const ov = try kernels.applyOuts(s, kernel, &(ins ++ [_]mlx.mlx_array{ e.x, e.post, e.comb }), cfg, 1);
+        defer _ = mlx.mlx_vector_array_free(ov);
+        return getOut(ov, 0);
+    }
     const kernel = try kernels.getNamedKernel(&fused_reduce_kernel, "sushi_exl3_down_reduce_fused_shared", &.{ "inner", "svh", "slots", "sc", "s_inner", "s_svh", "unit" }, &.{"y"}, REDUCE_FUSED_SOURCE, "");
-    const ov = try kernels.applyOuts(s, kernel, &.{ down, rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore() }, cfg, 1);
+    const ov = try kernels.applyOuts(s, kernel, &ins, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     return getOut(ov, 0);
 }
@@ -1069,6 +1130,12 @@ fn sharedRate(se: SharedExpert, rb: *const Ragged, rows: usize) ?struct { n: u32
 /// sum plus the shared chain's bf16 output, in `out_dtype`, with the bytes `moeDecodeClamped` gives that output as its
 /// `shared`. Null where the chain does not apply and the shared expert runs on its own.
 pub fn moeDecodeClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, out_dtype: mlx.mlx_dtype, se: SharedExpert, limit: c_int) !?mlx.mlx_array {
+    return moeDecodeClampedSharedFusedExpand(s, x, rb, slots, scores, topk, out_dtype, se, limit, null);
+}
+
+/// `moeDecodeClampedSharedFused`, its sum written through `expand` into the new stream `[rows, 4, hidden]` (the sum rounded
+/// to the stream's dtype first) where given.
+pub fn moeDecodeClampedSharedFusedExpand(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, out_dtype: mlx.mlx_dtype, se: SharedExpert, limit: c_int, expand: ?StreamExpand) !?mlx.mlx_array {
     if (rb.prefill_only or !preparedOn(rb) or mlx.mlx_array_dtype(x) != .bfloat16 or topk > kernels.REDUCE_MAX_TOPK - 1) return null;
     if (rb.tile_major and !kernels.gemvLayout(1).funnel) return null;
     const rows = mlx.getShape(x)[0];
@@ -1162,7 +1229,7 @@ pub fn moeDecodeClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *con
     defer _ = mlx.mlx_array_free(down);
     const sdown = try getOut(down_ov, 1);
     defer _ = mlx.mlx_array_free(sdown);
-    return try reduceFused(s, down, rb, slots, scores, sdown, se, rows, topk, out_dtype);
+    return try reduceFused(s, down, rb, slots, scores, sdown, se, rows, topk, out_dtype, expand);
 }
 
 // ---- Qwen's shared expert inside the unprepared decode chain ----
@@ -2616,6 +2683,59 @@ fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, hidden: usize, inter
         try std.testing.expectEqual(before + 5, kernels.fusedDispatchCount());
         try std.testing.expectEqualSlices(u8, want_bytes, got_bytes);
     }
+    try expandedReduceCase(t, s, &f, se, limit, dec, want_bytes, hidden, rows, seed);
+}
+
+fn truncMantissa(v: f32) f32 {
+    return @bitCast(@as(u32, @bitCast(v)) & 0xFFFFE000);
+}
+
+fn roundBf16(v: f32) u16 {
+    const b: u32 = @bitCast(v);
+    return @intCast((b +% 0x7fff +% ((b >> 16) & 1)) >> 16);
+}
+
+/// The reduce written through a stream expand gives the bf16 stream the sum's host expand gives: the sum rounded to bf16,
+/// operands truncated to 10 mantissa bits, `post * y + ((p0 + p1) + (p2 + p3))` uncontracted.
+fn expandedReduceCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture, se: SharedExpert, limit: c_int, dec: exl3.Decode, sum_bytes: []const u8, hidden: usize, rows: usize, seed: u64) !void {
+    var prng = std.Random.DefaultPrng.init(seed ^ 0xe7a);
+    const rnd = prng.random();
+    const xs = try t.alloc(u16, rows * 4 * hidden);
+    defer t.free(xs);
+    for (xs) |*v| v.* = roundBf16((rnd.float(f32) * 2 - 1) * 30);
+    const post = try t.alloc(f32, rows * 4);
+    defer t.free(post);
+    for (post) |*v| v.* = rnd.float(f32) * 1.5;
+    const comb = try t.alloc(f32, rows * 16);
+    defer t.free(comb);
+    for (comb) |*v| v.* = rnd.float(f32);
+    const r: c_int = @intCast(rows);
+    const h: c_int = @intCast(hidden);
+    const xa = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ r, 4, h }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(xa);
+    const pa = mlx.mlx_array_new_data(post.ptr, &[_]c_int{ r, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(pa);
+    const ca = mlx.mlx_array_new_data(comb.ptr, &[_]c_int{ r, 4, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(ca);
+    const xb = try cast(s, f.x, .bfloat16);
+    defer _ = mlx.mlx_array_free(xb);
+    kernels.setDecodeParams(dec);
+    const got = (try moeDecodeClampedSharedFusedExpand(s, xb, &f.rb, f.slots, f.scores, f.topk(), .float32, se, limit, .{ .x = xa, .post = pa, .comb = ca })) orelse return error.TestUnexpectedResult;
+    defer _ = mlx.mlx_array_free(got);
+    var holder = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(holder);
+    const got_bytes = std.mem.bytesAsSlice(u16, try bytesOf(s, got, &holder));
+    const sums = std.mem.bytesAsSlice(f32, sum_bytes);
+    try std.testing.expectEqual(rows * 4 * hidden, got_bytes.len);
+    for (0..rows) |l| for (0..hidden) |d| {
+        const yv: f32 = @bitCast(@as(u32, roundBf16(sums[l * hidden + d])) << 16);
+        for (0..4) |k| {
+            var p: [4]f32 = undefined;
+            for (0..4) |j| p[j] = truncMantissa(comb[l * 16 + j * 4 + k]) * truncMantissa(@bitCast(@as(u32, xs[(l * 4 + j) * hidden + d]) << 16));
+            const want = roundBf16(post[l * 4 + k] * yv + ((p[0] + p[1]) + (p[2] + p[3])));
+            try std.testing.expectEqual(want, got_bytes[(l * 4 + k) * hidden + d]);
+        }
+    };
 }
 
 test "exl3 rate groups: the shared expert riding the decode launches writes the shared chain folded into the reduce, 1 to 16 rows" {

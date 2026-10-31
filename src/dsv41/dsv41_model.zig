@@ -2235,11 +2235,14 @@ fn moeWide(sc: *Scope, m: *const Model, li: usize, h: A, r: kernels.Routes, sy: 
     return out;
 }
 
+/// The stream `x` `[L, hc, dim]` that a routed sum is expanded into: `hcExpand(x, sum, post, comb)`.
+pub const Expand = struct { x: A, post: A, comb: A };
+
 /// The shared expert's `[L, dim]` output, or the layer to run it from: at decode width the routed chain takes the
 /// expert into its own launches, so it is built only where that chain does not apply.
 pub const SharedOp = union(enum) {
     array: A,
-    layer: struct { m: *const Model, li: usize },
+    layer: struct { m: *const Model, li: usize, expand: ?Expand = null },
 
     pub fn value(self: SharedOp, sc: *Scope, x: A) !A {
         return switch (self) {
@@ -2254,9 +2257,10 @@ fn sharedBank(ly: *const Layer) ?exl3.rate_groups.SharedExpert {
     return .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
 }
 
-fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int, expand: ?Expand) !?A {
     const se = sharedBank(ly) orelse return null;
-    const y = try exl3.rate_groups.moeDecodeClampedSharedFused(sc.s, x, rb, flat, scores, k, .float32, se, limit) orelse return null;
+    const epi: ?exl3.rate_groups.StreamExpand = if (expand) |e| .{ .x = e.x, .post = e.post, .comb = e.comb } else null;
+    const y = try exl3.rate_groups.moeDecodeClampedSharedFusedExpand(sc.s, x, rb, flat, scores, k, .float32, se, limit, epi) orelse return null;
     return try sc.keep(y);
 }
 
@@ -2281,15 +2285,18 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
     const scores = try sc.reshape(try sc.astype(wts, .float32), &.{ci(L) * k});
     try dec.requireTable();
     exl3.kernels.setDecodeParams(dec);
+    // `shared.layer.expand`: the new stream rather than the sum, written by the reduce where it can, else by `hcExpand`.
+    const expand: ?Expand = if (shared == .layer) shared.layer.expand else null;
     // The decode reduce returns one row as `[dim]`.
     if (L <= exl3.kernels.DECODE_ROWS_MAX) {
         if (shared == .layer) {
-            if (try routedWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k)) |y| return sc.reshape(y, &.{ ci(L), ci(dim(x, 1)) });
+            if (try routedWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k, expand)) |y| return sc.reshape(y, if (expand) |e| mlx.getShape(e.x) else &.{ ci(L), ci(dim(x, 1)) });
         }
         const sy = try shared.value(sc, x);
         // The shared chain left its own codec active.
         exl3.kernels.setDecodeParams(dec);
-        return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, sy, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
+        const y = try sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, sy, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
+        return if (expand) |e| hcExpand(sc, shared.layer.m, e.x, try sc.astype(y, shared.layer.m.act), e.post, e.comb) else y;
     }
     if (shared == .layer) {
         if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k, early)) |y| return y;
@@ -2358,13 +2365,25 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) 
     return ly.shared[2].apply(sc, act);
 }
 
+/// Whether the layer's routed chain, queued from the cache map, writes the new hyper-connection stream itself: a trellis
+/// layer of the backbone at decode width, where `hcExpand` is the kernel and nothing reads the sum.
+fn foldsExpand(m: *const Model, sh: *const Shared, li: usize, x1: A) bool {
+    const rows = dim(x1, 0);
+    return m.fused and mlx.streamIsGpu(m.s) and sh.spec_on and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
+        li < m.cfg.layers and rows <= exl3.kernels.DECODE_ROWS_MAX and m.trace == null and m.tap == null and prof(m, rows) == null and
+        kernels.hcExpandServes(x1) and mlx.mlx_array_dtype(x1) == m.act;
+}
+
 /// `r`: the router's picks, made in the caller's scope so the hc split they may carry outlives this one.
 /// `ride`: arrays independent of the router (the FFN's hc split) that go out with its picks.
-fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Routes, ride: []const A) !A {
+/// `expand`: the stream the sum is expanded into, which only the route-spec queue takes (`foldsExpand`); the result is then
+/// the new stream.
+fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Routes, ride: []const A, expand: ?Expand) !A {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const pf = prof(m, dim(h, 0));
     if (pf) |p| try p.mark(.router, &.{ r.idx, r.wts });
+    if (expand) |e| if (!foldsExpand(m, sh, li, e.x)) return error.Dsv41ExpandNotFolded;
     if (c.expert_dec) |dec| {
         if (li >= c.layers) {
             return sc.astype(try stqRouted(sc, dec, @intFromFloat(c.swiglu_limit), &m.dspark.?.stq[li - c.layers], h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } }), m.act);
@@ -2382,7 +2401,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
             @memcpy(rode[0..ride.len], ride);
             const rode_n = ride.len + @intFromBool(pred.ctx != null);
             if (pred.ctx != null) rode[ride.len] = pred;
-            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } }, if (pred.ctx != null) rode[0..rode_n] else null);
+            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li, .expand = expand } }, if (pred.ctx != null) rode[0..rode_n] else null);
             const out = try sc.astype(q.out, m.act);
             sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts) };
             if (pred.ctx != null) {
@@ -2547,10 +2566,13 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(x2), .pre = sc.out(mix.sp.?.pre) };
     const r = try router(sc, m, li, h2, sh.img, &mix);
     const sf = try mix.splitOnce(sc, m);
+    const folded = foldsExpand(m, sh, li, x1);
+    expands_folded += @intFromBool(folded);
     const y = blk: {
         var fsc = Scope.init(sc.a, sc.s);
         defer fsc.deinit();
-        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, r, &.{ sf.pre, sf.post, sf.comb })));
+        const expand: ?Expand = if (folded) .{ .x = x1, .post = sf.post, .comb = sf.comb } else null;
+        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, r, &.{ sf.pre, sf.post, sf.comb }, expand)));
     };
     if (sh.spec) |*u| {
         u.x1 = sc.out(x1);
@@ -2560,7 +2582,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     }
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
     if (width_probe) |t| try t.put("ffn_{d}", .{li}, y);
-    return .{ .x = sc.out(try hcExpand(sc, m, x1, y, sf.post, sf.comb)), .pre = sc.out(sf.pre) };
+    return .{ .x = sc.out(if (folded) y else try hcExpand(sc, m, x1, y, sf.post, sf.comb)), .pre = sc.out(sf.pre) };
 }
 
 // ── the forward ──────────────────────────────────────────────────────────
@@ -3068,6 +3090,8 @@ const Unresolved = struct {
     }
 };
 
+/// Layers whose queued routed chain wrote the new stream itself (`foldsExpand`); a test counts a pass's.
+pub var expands_folded: u64 = 0;
 pub var spec_kept: u64 = 0;
 pub var spec_rebuilt: u64 = 0;
 /// Prefetch predictions computed (`predictLogits`); a test reads it to see that unprefetchable targets cost none.

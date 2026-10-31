@@ -456,6 +456,10 @@ into `moeDecodeClamped`'s reduce.
 - **Proof** (`exl3 rate groups: the shared expert riding ...`): bytes equal to `moeClamped` plus the folded reduce at 1
   to 16 rows (512/256 over four rate groups with a mixed class), a DSpark stage's one group at top-3, and the real
   5120/2304 geometry at 1, 2, 4 and 6 rows, with either part's threadgroups first, and five launches per layer.
+- **The reduce writes the new stream** (`moeDecodeClampedSharedFusedExpand`, DeepSeek's route-spec queue): the finish reduce takes the
+  stream `x [rows, 4, hidden]`, `post` and `comb` and stores `hcExpand`'s result (the sum rounded to the stream dtype, operands truncated to 10
+  mantissa bits, uncontracted) instead of the sum, so the bf16 cast and the expand kernel are gone. Proof: `exl3 rate groups: the shared expert
+  riding ...` compares the stream with a host expand of the unfused sum; ubench in [dsv41-arch](dsv41-arch.md).
 - **Launches**: 10 a layer become 5, so 200 fewer per serial token (40 layers) and per verify round, and 15 fewer on a
   drafting round (three DSpark stage layers). A launch costs ~1.76 us of gap; the saving is larger because the shared
   chain's tails fill with routed work.
