@@ -34,8 +34,10 @@ runs); 3 the box refused the run.
 ## The quiet box, taken by the binary
 
 1. Refuse a binary older than HEAD or built from a dirty tree (untracked files do not count).
-2. Refuse below `taskpolicy -a` priority, or while a `sushi` server or another GPU tool runs.
-3. Take the GPU lock as `ubench:<bench>`, then touch `~/.sushi/runs/QUIET` and wait until no `zig`, `clang` or `ld` runs.
+2. Refuse below `taskpolicy -a` priority.
+3. Take the GPU lock as `ubench:<bench>` (queueing behind a locked server rather than refusing), then wait up to 60 s for
+   a `sushi` server or another GPU tool to exit; one still live runs outside the lock and refuses the run. Then touch
+   `~/.sushi/runs/QUIET` and wait until no `zig`, `clang` or `ld` runs.
 4. Refuse on battery.
 5. Fans to max (renewed every 5 min), idle until the hottest die sensor is under 50 °C (at most 180 s), run, fans back
    to auto, release the lock, remove QUIET.

@@ -160,6 +160,9 @@ Never wait on `pgrep -f "<string>"`: every agent shell's own `zsh -c "<command>"
 forever. Wait on an END marker the job writes after it exits (`echo "END <job> rc=$?" >> <phases file>`), on a PID
 captured at launch (`kill -0 $pid`), or on `pgrep -x <binary>` / `ps -axo pid,comm` filtered on the executable name.
 
+Run scripts run under zsh, which does not word-split an unquoted expansion: `for x in ${ARMS:-a b}` loops once over
+"a b". Write `${=ARMS}`, or loop over an array.
+
 ## 6. Check what actually ran
 
 - Launch flags outrank `model-settings.json`; confirm from the load lines (`[kv-cache] … (source)`,

@@ -138,14 +138,33 @@ const Box = struct {
     quiet: []const u8,
     contended: bool,
 
-    /// The facts steps 1-3 and 6 of the quiet box read; a contended run reads none of them.
+    /// The facts the quiet box refuses on before it queues for the lock; a contended run reads none of them. Other GPU
+    /// jobs are judged once the lock is ours (`waitForGpuJobs`), so a locked job ahead in the queue is waited for.
     fn refusal(self: Box, buf: []u8) ?[]const u8 {
         if (self.contended) return null;
-        var facts: box.Facts = .{ .dirty = stamp.dirty, .pri = box.priority(self.a, self.io), .gpu_jobs = box.liveGpuJobs(self.a, self.io), .power = box.power(self.a, self.io) };
+        var facts: box.Facts = .{ .dirty = stamp.dirty, .pri = box.priority(self.a, self.io), .power = box.power(self.a, self.io) };
         const head = box.runOut(self.a, self.io, &.{ "git", "-C", self.repo, "rev-parse", "HEAD" });
         const now = if (head) |h| std.mem.trim(u8, h, " \n\r\t") else "unreadable";
         if (!std.mem.eql(u8, now, stamp.commit)) facts.stale = std.fmt.allocPrint(self.a, "built from {s}, HEAD is {s}", .{ shortSha(stamp.commit), shortSha(now) }) catch "commit differs";
         return box.firstRefusal(facts, buf);
+    }
+
+    /// The live GPU jobs still running after `box.gpu_job_grace_s` with the lock held, or null once none is left.
+    fn waitForGpuJobs(self: Box) ?[]u8 {
+        var waited: u32 = 0;
+        while (!cancelled.load(.acquire)) {
+            const jobs = box.liveGpuJobs(self.a, self.io);
+            switch (box.gpuJobsVerdict(jobs != null, waited)) {
+                .go => return null,
+                .refuse => return jobs,
+                .wait => {},
+            }
+            self.a.free(jobs.?);
+            if (waited % queue_log_s == 0) log.info("[ubench] lock held, waiting for a GPU job to exit\n", .{});
+            std.Io.sleep(self.io, .fromSeconds(5), .real) catch {};
+            waited += 5;
+        }
+        return null;
     }
 
     fn waitForBuilds(self: Box) void {
@@ -219,6 +238,11 @@ fn runOne(a: std.mem.Allocator, io: std.Io, b: Box, ra: report.RunArgs, plan: re
         return e;
     };
     defer box.lockRelease(io, b.lock_script, owner);
+    if (!b.contended) if (b.waitForGpuJobs()) |jobs| {
+        box.lockRelease(io, b.lock_script, owner);
+        fail(exit_refused, "another GPU job is live outside the GPU lock ({s})", .{std.mem.trim(u8, jobs, " \r\n")});
+    };
+    if (cancelled.load(.acquire)) return error.Interrupted;
 
     var die_start: ?f64 = null;
     if (!b.contended) {

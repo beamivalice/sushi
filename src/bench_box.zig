@@ -120,6 +120,17 @@ pub fn liveGpuJobs(a: std.mem.Allocator, io: std.Io) ?[]u8 {
     return out;
 }
 
+/// Once the lock is ours, a previous holder's server gets this long to exit; a GPU job still live after it runs outside
+/// the lock (an owner's server) and refuses the run.
+pub const gpu_job_grace_s: u32 = 60;
+
+pub const GpuWait = enum { go, wait, refuse };
+
+pub fn gpuJobsVerdict(live: bool, waited_s: u32) GpuWait {
+    if (!live) return .go;
+    return if (waited_s >= gpu_job_grace_s) .refuse else .wait;
+}
+
 pub fn buildsRunning(a: std.mem.Allocator, io: std.Io) bool {
     const out = runOut(a, io, &.{ "pgrep", "-x", "zig|clang|clang\\+\\+|ld" }) orelse return false;
     defer a.free(out);
@@ -131,7 +142,6 @@ pub const Facts = struct {
     stale: ?[]const u8 = null,
     dirty: bool = false,
     pri: ?i32 = null,
-    gpu_jobs: ?[]const u8 = null,
     power: Power = .ac,
 };
 
@@ -139,7 +149,6 @@ pub fn firstRefusal(f: Facts, buf: []u8) ?[]const u8 {
     if (f.stale) |why| return std.fmt.bufPrint(buf, "stale binary: {s}; rebuild with `zig build ubench`", .{why}) catch why;
     if (f.dirty) return "built from a dirty tree: commit, then rebuild with `zig build ubench` (or --contended for a look)";
     if (f.pri) |p| if (p < interactive_pri) return std.fmt.bufPrint(buf, "base priority {d} is below {d}: run it under `taskpolicy -a sushi-ubench ...`", .{ p, interactive_pri }) catch "base priority too low";
-    if (f.gpu_jobs) |jobs| return std.fmt.bufPrint(buf, "another GPU job is live ({s})", .{std.mem.trim(u8, jobs, " \r\n")}) catch "another GPU job is live";
     if (f.power != .ac) return "not on AC power";
     return null;
 }
@@ -197,9 +206,16 @@ test "box: the first thing wrong is the refusal, and a clean box has none" {
     try testing.expectEqual(@as(?[]const u8, null), firstRefusal(.{}, &buf));
     try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .stale = "built abc, HEAD def", .dirty = true }, &buf).?, "stale binary") != null);
     try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .dirty = true, .pri = 4 }, &buf).?, "dirty tree") != null);
-    try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .pri = 4, .gpu_jobs = "1 sushi" }, &buf).?, "taskpolicy -a") != null);
-    try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .pri = 31, .gpu_jobs = "812 sushi\n" }, &buf).?, "812 sushi") != null);
+    try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .pri = 4 }, &buf).?, "taskpolicy -a") != null);
     try testing.expect(std.mem.indexOf(u8, firstRefusal(.{ .power = .battery }, &buf).?, "AC power") != null);
+}
+
+test "box: a GPU job seen once the lock is ours is waited out for the grace, then refuses the run" {
+    try testing.expectEqual(GpuWait.go, gpuJobsVerdict(false, 0));
+    try testing.expectEqual(GpuWait.wait, gpuJobsVerdict(true, 0));
+    try testing.expectEqual(GpuWait.wait, gpuJobsVerdict(true, gpu_job_grace_s - 5));
+    try testing.expectEqual(GpuWait.refuse, gpuJobsVerdict(true, gpu_job_grace_s));
+    try testing.expectEqual(GpuWait.go, gpuJobsVerdict(false, gpu_job_grace_s));
 }
 
 test "bench cooldown: no first reading skips the idle, any reading keeps it" {
