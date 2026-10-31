@@ -102,7 +102,7 @@ pub fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: 
 }
 
 fn withTextPromptBos(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u32) ![]u32 {
-    const bos = config.textPromptBosId() orelse return allocator.dupe(u32, body);
+    const bos = config.text_prompt_bos orelse return allocator.dupe(u32, body);
     const ids = try allocator.alloc(u32, body.len + 1);
     ids[0] = bos;
     @memcpy(ids[1..], body);
@@ -702,17 +702,15 @@ test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 4
     }
 }
 
-test "a text prompt opens with BOS on DeepSeek only, never with Qwen's endoftext" {
+test "a text prompt opens with BOS only where the model's template opens with it, never with an endoftext BOS" {
     const a = testing.allocator;
     var ds = model_mod.ModelConfig{};
-    ds.model_type = "deepseek_v41";
-    ds.bos_token_id = 0;
+    ds.text_prompt_bos = 0;
     const with = try withTextPromptBos(a, &ds, &.{ 671, 6102 });
     defer a.free(with);
     try testing.expectEqualSlices(u32, &.{ 0, 671, 6102 }, with);
 
     var qwen = model_mod.ModelConfig{};
-    qwen.model_type = "qwen4_exp";
     qwen.bos_token_id = 248044;
     const without = try withTextPromptBos(a, &qwen, &.{ 671, 6102 });
     defer a.free(without);

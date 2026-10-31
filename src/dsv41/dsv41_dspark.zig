@@ -72,7 +72,7 @@ pub fn dsparkDiag() DsparkDiag {
 /// round. Adaptive rounds only; a forced or seeded width keeps its rows.
 fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []u32) !usize {
     const remaining = self.max_tokens - self.completion_tokens;
-    const cap = @min(drafts.len, remaining -| 1, self.dspark_copy_rows - 1);
+    const cap = @min(drafts.len, remaining -| 1, (self.dspark_copy_rows orelse dsv41_exact_verify_rows) - 1);
     const block: usize = if (self.xfm.dsv41) |m| m.cfg.dspark.block else return 0;
     if (cap <= block) return 0;
     const idx = try self.mtpLookupIndex(allocator);

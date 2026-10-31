@@ -1016,7 +1016,8 @@ pub const Generator = struct {
     /// Whether adaptive rounds may draft from the context (`mtp_lookup.matchBest`) ahead of the stage block; a test turns it off.
     dspark_copy: bool = true,
     /// Rows a copy round verifies at most.
-    dspark_copy_rows: usize = dsv41_dspark.dsv41_exact_verify_rows,
+    /// Null: the widest exactly verified block.
+    dspark_copy_rows: ?usize = null,
     dspark_copy_backoff: mtp_lookup.CopyBackoff = .{},
     /// Per-phase wall-time trace (SUSHI_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
