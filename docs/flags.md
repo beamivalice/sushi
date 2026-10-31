@@ -107,7 +107,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 ## Subcommands
 
-`pull <model>` and `list` take no flags and reject any extra argument (`HF_TOKEN` is read from the environment); `pull` accepts only the `beamster` org. `serve` and `run <model>` take every flag above.
+`pull <model>`, `list` and `repack <pack>` take no flags and reject any extra argument (`HF_TOKEN` is read from the environment); `pull` accepts only the `beamster` org. `serve` and `run <model>` take every flag above.
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
@@ -126,6 +126,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `update`: `--force` | off → update while a sushi of this install runs (update.zig:713) | user | help; 0 tests | keep |
 | `update`: `--rollback` | off → swap `<install>.previous` back (update.zig:715) | user | help; 1 test | keep |
 | `update`: `--relaunch --` | internal: the updater restarts the server with its argv (update.zig:717) | dev | not in help (internal); 1 test | keep: plumbing, not a user flag |
+| `repack <pack>` | none: one positional, any `-flag` is refused → pair-major rewrite in place, resumable ([pack-format](pack-format.md#repack)) | operator | help, pack-format; tests in dsv41/repack_test.zig | keep: owner-approved subcommand |
 | `kld`: `--model` | required → pack to score or capture (kld.zig:99) | dev | help, quality-kld | keep |
 | `kld`: `--prompts` | required for capture → `standard4`, a fixture dir, `*.txt` dir or `.jsonl` (kld.zig:100) | dev | help, quality-kld | keep |
 | `kld`: `--out` | required for capture → fixture output dir (kld.zig:101) | dev | help, quality-kld | keep |

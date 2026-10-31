@@ -74,6 +74,29 @@ names it; absent is the pack order.
   `Exl3ShardStampMismatch` (a shard of routed trellis tensors whose stamp is not the config's order),
   `Exl3TileOrderNeedsGroups` (a `pair_major` layer that is not rate-grouped).
 
+<a id="repack"></a>
+#### `sushi repack <pack>`
+
+`sushi repack <pack>` (one positional, no flags; a path, relative directory or known alias, never downloaded) turns a
+pack-order `deepseek_v41` STQ pack into the pair-major one, in place. It is the one repacker.
+
+- It writes the shard layout above (trellis, scales, pads; `__metadata__` keeps its source fields and adds `tile_order`).
+- Refusals before any write: `RepackNotDownloaded`, `RepackArchitectureUnsupported`, `Exl3TileOrderUnsupported` (not
+  STQ, or another `tile_order`), `Exl3ShardStampMismatch`, `Exl3TileOrderMixed` (a shard with both orders, or a
+  pair-major shard not written by this command), `Exl3TileOrderNeedsGroups`, `RepackShardIsLink` (a routed shard that
+  is a symlink), `RepackNoSpace` (free disk under the largest remaining shard plus 1 GiB), `RepackPackLocked`
+  (`.sushi-repack.lock` holds a live pid; a dead pid's lock is taken over), `RepackPackInUse` (another process has a
+  shard open: a running server would read pair-major bytes under the pack order). A pack whose config already says
+  `pair_major` prints "already pair-major" and exits 0.
+- Per shard: write `<shard>.repack-tmp` (parallel workers at fixed offsets, so the bytes do not depend on the thread
+  count), `F_FULLFSYNC`, re-read it with `F_NOCACHE` and compare with the original (every `trellis_pm` expert through
+  `layout.tileMajorInverse`, every other tensor byte for byte, pads zero, header equal to the plan), rename over the
+  shard, fsync the directory. Peak extra disk is one shard. Then the index (renamed keys, pads), then `config.json`
+  (`tile_order` inserted into `expert_quant`, every other byte unchanged), then the loader's own pre-load checks.
+- A run cut short leaves shards in both orders under a pack-order index and config, which the loader refuses
+  (`Exl3TileOrderMixed` / `Exl3TileOrderMismatch`); repeating the command skips the pair-major shards that pass the
+  structure check and finishes. The output is byte-identical run to run and box to box.
+
 ### MTP bank
 
 The MTP head's own MoE layer is the same three tensors under the head's prefix

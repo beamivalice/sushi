@@ -2762,6 +2762,27 @@ test "dsv41 pair-major: the repacker's pair-major copy of the tiny pack gives th
     try expectPmParity(dir, siblingPm(&buf, dir) orelse return error.SkipZigTest, 0, &.{ 8, 6 });
 }
 
+test "dsv41 pair-major: `sushi repack` of a copy of the tiny pack gives a pack that serves the pack-order pack's bytes (DSV41_STQ_TINY)" {
+    const dir = try stqDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const copy = buf[0..n];
+    var src = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
+    defer src.close(io);
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const bytes = try src.readFileAlloc(io, entry.name, testing.allocator, .limited(64 << 20));
+        defer testing.allocator.free(bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = entry.name, .data = bytes });
+    }
+    try testing.expectEqual(@import("repack.zig").Outcome.repacked, try @import("repack.zig").repackPack(testing.allocator, io, copy, .{ .workers = 2 }));
+    try expectPmParity(dir, copy, 0, &.{ 8, 6 });
+}
+
 test "dsv41 pair-major: a pack-order pool cannot take pair-major tiles, and a uniform layer cannot be pair-major (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();

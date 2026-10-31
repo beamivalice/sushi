@@ -9,6 +9,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Streamed experts fill faster with identical output**: a fill's reads are split across the I/O workers by cost per read as well as by bytes, so a run of small scale reads no longer queues behind the last large one.
 - **DeepSeek-V4.1 `/v1/completions` with a text prompt no longer ends at the first token**: the prompt now opens with the model's BOS, as the chat template and a token-id prompt already did.
 - **DeepSeek-V4.1 DSpark drafts from the context when the output copies it**: an echoed file or an edit that leaves most lines alone verifies up to seven copied tokens a round instead of the stage block, with greedy text unchanged. Ported from CommunityServe/plugins #15, thanks @STRML.
+- **DeepSeek-V4.1 packs can be pair-major**: `expert_quant.tile_order` names a `trellis_pm` layout the streaming engine reads without reshuffling tiles, with page-aligned experts read straight into page-aligned pools, and an older build refuses such a pack by name. `sushi repack <pack>` rewrites a pack-order STQ pack into it in place, replacing a shard only after its rewrite reads back equal, and resumes after an interruption.
 - **DeepSeek-V4.1 DSpark greedy text no longer depends on the verify-width mix**: the decode attention split a verify
   row's columns by its block's width, so the same request could differ between runs; it now gives the same text every run.
 - **DeepSeek-V4.1 decode spends less CPU per token with byte-identical output**: fewer Metal command buffers per layer,

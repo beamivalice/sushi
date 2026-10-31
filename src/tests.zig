@@ -203,6 +203,8 @@ test {
     _ = @import("bench.zig");
     _ = @import("gpu_clock.zig");
     _ = @import("cli.zig");
+    _ = @import("dsv41/repack.zig");
+    _ = @import("dsv41/repack_test.zig");
     _ = @import("repl_tools.zig");
     _ = @import("repl_input.zig");
     _ = @import("launch.zig");

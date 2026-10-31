@@ -29,6 +29,7 @@ const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const pack_cmds = @import("dsv41/commands.zig");
 const bench_mod = @import("bench.zig");
 const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
@@ -137,6 +138,11 @@ fn printUsage(io: std.Io) void {
         \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
         \\                      (routed experts as EXL3). `sushi convert --help`
         \\                      for options
+        \\  repack <pack>       Rewrite an STQ pack in place into the
+        \\                      pair-major layout (no flags). A shard is replaced
+        \\                      only after its rewrite reads back equal; a cut-off
+        \\                      run resumes when repeated. Stop any server using
+        \\                      the pack first. Never downloads.
         \\  update              Replace this install with the newest release,
         \\                      after checking its SHA-256, its signature and
         \\                      that it runs; the old one stays as
@@ -508,11 +514,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "repack")) {
+            try pack_cmds.repack.cmdRepack(allocator, io, args[2..]);
+            return;
         } else if (std.mem.eql(u8, cmd, "update")) {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, repack, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -912,7 +921,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--drop-expert") and i + 1 < args.len) {
             i += 1;
-            model_mod.drop_expert = @import("dsv41/expert_usage.zig").parseCount(args[i]) orelse {
+            model_mod.drop_expert = pack_cmds.expert_usage.parseCount(args[i]) orelse {
                 log.err("--drop-expert: expected a multiple of 8 routed experts per layer (0 = off); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };

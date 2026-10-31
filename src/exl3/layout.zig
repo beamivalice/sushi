@@ -147,6 +147,16 @@ pub fn tileMajor(comptime T: type, dst: []T, src: []const T, it: usize, ot: usiz
     };
 }
 
+/// `tileMajor` undone: an expert's `[OT/2][IT][2][n]` tiles back into the pack order `[IT][OT][n]`.
+pub fn tileMajorInverse(comptime T: type, dst: []T, src: []const T, it: usize, ot: usize, n: usize) void {
+    std.debug.assert(ot % 2 == 0 and dst.len == it * ot * n and src.len == dst.len);
+    for (0..ot / 2) |pair| for (0..it) |tk| for (0..2) |o| {
+        const to = (tk * ot + pair * 2 + o) * n;
+        const from = ((pair * it + tk) * 2 + o) * n;
+        @memcpy(dst[to..][0..n], src[from..][0..n]);
+    };
+}
+
 test "exl3 layout: tile-major puts an output pair's k range in one run" {
     const it = 5;
     const ot = 4;
@@ -201,4 +211,20 @@ test "exl3 layout: a layer admits a pair-major bank by its 5-D shape and refuses
     var mixed = Layout.init(256, 128, .{ .n = 64 });
     _ = try mixed.add("gate_proj.g0.trellis_pm", &.{ 3, 4, 16, 2, 32 }, .u16);
     try t.expectError(error.Exl3TileOrderMixed, mixed.add("up_proj.g0.trellis", &.{ 3, 16, 8, 32 }, .u16));
+}
+
+test "exl3 layout: tile-major inverse returns the pack order for odd and even grids" {
+    for ([_][3]usize{ .{ 5, 4, 3 }, .{ 1, 2, 1 }, .{ 16, 8, 24 }, .{ 3, 10, 7 } }) |g| {
+        const it, const ot, const n = g;
+        const src = try std.testing.allocator.alloc(u16, it * ot * n);
+        defer std.testing.allocator.free(src);
+        for (src, 0..) |*v, i| v.* = @truncate(i *% 40503 +% 17);
+        const major = try std.testing.allocator.alloc(u16, src.len);
+        defer std.testing.allocator.free(major);
+        const back = try std.testing.allocator.alloc(u16, src.len);
+        defer std.testing.allocator.free(back);
+        tileMajor(u16, major, src, it, ot, n);
+        tileMajorInverse(u16, back, major, it, ot, n);
+        try std.testing.expectEqualSlices(u16, src, back);
+    }
 }
