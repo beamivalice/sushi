@@ -166,16 +166,19 @@ their matrix: `tests/CLAUDE.md`.
 
 ## Releases & benchmarking
 
-`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` (`sushi bench`: code and prose arms, ONE cold prefill each,
-8k restore windows, 3 decode samples a rung) on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw, GLM 2.4bpw, DeepSeek STQ 1.75bpw),
-report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per release. Protocol:
-[process-measurement](docs/process-measurement.md#release-bench). `/bench` for methodology: same-methodology cells only, spec
-cells are variance (sample across boots), an A/B arm is proven by ENGAGEMENT lines in its log. Interleave A/B kernels in
-ONE process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for
-cross-engine comparisons only.
+`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw,
+GLM 2.4bpw, DeepSeek STQ 1.75bpw), report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per
+release. Protocol: [process-measurement](docs/process-measurement.md#release-bench).
+- Release order:
+  1. Local tests, then commit and push the version bump.
+  2. `./release.sh` (CI builds the DRAFT), running beside the local perf and KLD gates.
+  3. Both green: publish the draft. Any issue: fix, push, delete the draft and its tag, rerun `./release.sh`.
 
-Release notes thank every outside contributor by @handle for each merged PR the release ships (`gh pr list --state
-merged` since the last tag); a credit missed in a shipped release goes into the next one, marked as belated.
+`/bench` for methodology: same-methodology cells only. Interleave A/B kernels in ONE process (separate runs drift 15%);
+same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for cross-engine comparisons only.
+
+Release notes thank every outside contributor by @handle for each merged PR the release ships; a missed credit goes
+into the next release, marked as belated (`/release`).
 
 A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
 owner-approved card; the README pack line follows once the repo is live.
