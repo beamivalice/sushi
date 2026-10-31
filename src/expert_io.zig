@@ -252,12 +252,16 @@ fn jobIsDirect(spans: []const FillSpan, job: ReadJob, page: u64) bool {
     return true;
 }
 
+/// A read's latency in bytes the SSD could move meanwhile; without it a byte split piles a run of small reads onto
+/// one worker.
+pub const READ_COST_BYTES: u64 = 1 << 20;
+
 pub fn partitionByMidpoint(allocator: std.mem.Allocator, jobs: []const ReadJob, workers: usize) ![]usize {
     if (workers == 0) return error.InvalidFillPool;
     const bounds = try allocator.alloc(usize, workers + 1);
     errdefer allocator.free(bounds);
     var total: u64 = 0;
-    for (jobs) |j| total += j.len;
+    for (jobs) |j| total += j.len + READ_COST_BYTES;
     for (bounds) |*b| b.* = jobs.len;
     bounds[0] = 0;
     if (total == 0 or jobs.len == 0) {
@@ -268,11 +272,11 @@ pub fn partitionByMidpoint(allocator: std.mem.Allocator, jobs: []const ReadJob, 
     var owner = try allocator.alloc(usize, jobs.len);
     defer allocator.free(owner);
     for (jobs, 0..) |j, i| {
-        const mid = cursor + j.len / 2;
+        const mid = cursor + (j.len + READ_COST_BYTES) / 2;
         var w = @as(usize, @intCast(mid * @as(u64, workers) / total));
         if (w >= workers) w = workers - 1;
         owner[i] = w;
-        cursor += j.len;
+        cursor += j.len + READ_COST_BYTES;
     }
     var w: usize = 0;
     var i: usize = 0;
@@ -1139,6 +1143,19 @@ test "expert io fill lands a tile span in tile-major order and leaves its neighb
     layout.tileMajor(u8, &want, file.bytes[515..][0..tiled.len], it, ot, n * 2);
     try t.expectEqualSlices(u8, &want, &tiled);
     try t.expectEqualSlices(u8, file.bytes[515 + tiled.len ..][0..plain.len], &plain);
+}
+
+test "expert io fill plan keeps a layer's tail scale reads off its last big read's worker" {
+    const t = std.testing;
+    // Three big reads first in the file, six small ones last, each landing in its own destination.
+    var dst: [9 * 4096]u8 align(align_bytes) = undefined;
+    var spans: [9]FillSpan = undefined;
+    for (&spans, 0..) |*s, i| s.* = .{ .file = 0, .offset = i * (4 << 20), .len = if (i < 3) 2211840 else 10240, .dst = dst[i * 4096 ..].ptr };
+    var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 4, false);
+    defer plan.deinit();
+    var w: usize = 0;
+    while (!(plan.bounds[w] <= 2 and 2 < plan.bounds[w + 1])) w += 1;
+    try t.expect(plan.bounds[w + 1] - 3 <= 2);
 }
 
 test "expert io fill attributes a span past eof while other spans complete" {

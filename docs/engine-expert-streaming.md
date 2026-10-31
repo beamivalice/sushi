@@ -274,6 +274,11 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   into the slab by `layout.tileMajor`, in place of the direct read or the bounce copy. It is never coalesced with a
   neighbour, so a job is one projection of one expert (at most ~6 MB) and the bounce the ledger already bills
   (`BOUNCE_BYTES`) is the only scratch. A pool-to-union or union-to-pool copy stays a memcpy: both are tile-major.
+- **A fill's reads split across workers by cost, not bytes** (`partitionByMidpoint`, `READ_COST_BYTES` = 1 MiB per
+  read): a byte split in file-offset order piles a run of small scale reads onto the worker that also holds the last
+  big trellis read. DeepSeek STQ 1.75bpw, budget 60, 1000 greedy tokens (base eba709e8, legacy layout): replay 1.484
+  -> 1.394 ms/fill, fill_s 24.94 -> 24.04, prefetch job 27616 -> 26532 ms, host wait 5543 -> 4778 ms, second-half
+  decode 25.52 -> 26.45 tok/s, output identical.
 - `FillPool` workers park on their condition without broadcasting: `submit` signals after every push, and a
   broadcast before the wait makes idle workers wake each other forever.
 - `PageSlab` epoch leases (`free → filling → ready → leased → readers_complete → reclaimable`, CPU writes only in

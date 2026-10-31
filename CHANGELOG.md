@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Streamed experts fill faster with identical output**: a fill's reads are split across the I/O workers by cost per read as well as by bytes, so a run of small scale reads no longer queues behind the last large one.
 - **DeepSeek-V4.1 `/v1/completions` with a text prompt no longer ends at the first token**: the prompt now opens with the model's BOS, as the chat template and a token-id prompt already did.
 - **DeepSeek-V4.1 DSpark drafts from the context when the output copies it**: an echoed file or an edit that leaves most lines alone verifies up to seven copied tokens a round instead of the stage block, with greedy text unchanged. Ported from CommunityServe/plugins #15, thanks @STRML.
 - **DeepSeek-V4.1 DSpark greedy text no longer depends on the verify-width mix**: the decode attention split a verify
