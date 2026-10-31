@@ -18,6 +18,9 @@
 #  12. run releases on success, failure and SIGTERM, passes the exit code and stdin, records the command's PID
 #  13. status flags OVERDUE past --max-min, never stops the holder; bad --max-min / --pid usage exits 2
 #  14. waiters behind a dead holder never hold the lock at the same time
+#  15. once the lock is taken, the command waits until available memory stops rising (a previous holder's memory is
+#      still coming back), at most the settle cap; with memory flat it starts at once
+#  16. status names a QUIET marker and its age
 #
 # No GPU, no model, seconds.
 #
@@ -38,6 +41,8 @@ BG=
 trap 'for p in $BG; do kill $p 2>/dev/null; done; rm -rf "$TMP"' EXIT
 export GPU_LOCK_DIR="$TMP/gpu.lock.d"
 export GPU_LOCK_POLL_S=1
+export GPU_LOCK_SETTLE_MAX_S=0
+export GPU_LOCK_QUIET="$TMP/QUIET"
 
 queued() { $LOCK status | sed -nE 's/^ +[0-9]+\. ([^ ]+).*/\1/p' | tr '\n' ' '; }
 # Wait (max 5 s) until <owner> is in the queue, so tickets are taken in a known order.
@@ -217,6 +222,33 @@ done
 wait
 [ ! -s "$TMP/overlap" ]; check $? "concurrent waiters behind a dead holder never overlap (got: $(cat "$TMP/overlap"))"
 [ "$($LOCK status)" = free ]; check $? "status is free after the concurrent waiters"
+
+# Settle: a fake memory reading rises by 4 GB a sample for two samples, then stays flat.
+cat > "$TMP/mem.sh" <<'MEM'
+#!/bin/bash
+n=$(cat "$1" 2>/dev/null || echo 0); echo $((n + 1)) > "$1"
+[ "$n" -lt 2 ] && echo $((60000 + n * 4096)) || echo 68192
+MEM
+chmod +x "$TMP/mem.sh"
+GPU_LOCK_SETTLE_MAX_S=30 GPU_LOCK_SETTLE_POLL_S=0 GPU_LOCK_MEM_CMD="$TMP/mem.sh $TMP/mem.n" \
+  $LOCK run settler -- sh -c "cat '$TMP/mem.n' > '$TMP/mem.at'"
+[ "$(cat "$TMP/mem.at" 2>/dev/null)" -ge 3 ] 2>/dev/null; check $? "run starts its command only once memory stops rising (samples: $(cat "$TMP/mem.at" 2>/dev/null))"
+echo 0 > "$TMP/flat.n"
+printf '#!/bin/bash\necho 50000\n' > "$TMP/flat.sh"; chmod +x "$TMP/flat.sh"
+t0=$(date +%s)
+GPU_LOCK_SETTLE_MAX_S=30 GPU_LOCK_SETTLE_POLL_S=1 GPU_LOCK_MEM_CMD="$TMP/flat.sh" $LOCK run flat -- true
+[ $(($(date +%s) - t0)) -le 3 ]; check $? "with memory flat, run starts within one poll"
+printf '#!/bin/bash\nn=$(cat "$1"); echo $((n + 1)) > "$1"; echo $((n * 4096))\n' > "$TMP/rise.sh"; chmod +x "$TMP/rise.sh"
+echo 0 > "$TMP/rise.n"
+err=$(GPU_LOCK_SETTLE_MAX_S=2 GPU_LOCK_SETTLE_POLL_S=1 GPU_LOCK_MEM_CMD="$TMP/rise.sh $TMP/rise.n" $LOCK run riser -- true 2>&1)
+[ $? = 0 ] && case "$err" in *"still rising"*) true ;; *) false ;; esac; check $? "memory that keeps rising starts the command at the cap, with a note"
+[ "$($LOCK status)" = free ]; check $? "status is free after the settle runs"
+
+# QUIET
+touch "$GPU_LOCK_QUIET"
+[ "$($LOCK status | tail -1 | cut -d'(' -f1)" = "QUIET set 0 min ago " ]; check $? "status names a QUIET marker and its age, last"
+rm -f "$GPU_LOCK_QUIET"
+[ "$($LOCK status)" = free ]; check $? "status is free with no QUIET marker"
 
 echo "gpu-lock: $PASS passed, $FAIL failed"
 [ $FAIL = 0 ]

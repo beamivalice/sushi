@@ -19,6 +19,10 @@
 #                                 (refused unless it names the holder)
 #   gpu-lock.sh status            holder, its PID and age, OVERDUE past its declared max, then the live queue in order
 #
+# Once the lock is taken (`run` and `acquire`), it waits until available memory stops rising, at most
+# GPU_LOCK_SETTLE_MAX_S (default 60; 0 skips): a previous holder's memory comes back seconds after its process exits,
+# and a model load that checks free memory at start would fail its preflight in that gap.
+# `status` also names a QUIET marker (~/.sushi/runs/QUIET) and its age: a stale one blocks every build on the box.
 # A holder whose recorded PID (`run`, or `acquire --pid`) is gone is freed by the next `acquire` or `status`. A live holder past its
 # --max-min (default 15) is only flagged OVERDUE; stopping it is the coordinator's call.
 # Waiters are served first-come-first-served: only the lowest live ticket may take
@@ -29,6 +33,9 @@ set -u
 L="${GPU_LOCK_DIR:-/tmp/sushi-gpu.lock.d}"
 Q="$L.queue"
 POLL="${GPU_LOCK_POLL_S:-5}"
+SETTLE_MAX="${GPU_LOCK_SETTLE_MAX_S:-60}"
+SETTLE_POLL="${GPU_LOCK_SETTLE_POLL_S:-2}"
+QUIET="${GPU_LOCK_QUIET:-$HOME/.sushi/runs/QUIET}"
 
 # A ticket is a symlink $Q/<n> whose text is "<pid> <owner>": created atomically, contents
 # included. A served ticket reads "done" and stays until a higher ticket prunes it, so the
@@ -63,6 +70,27 @@ reap() {
   echo "gpu-lock: freed the lock of ${o%% *}: holder pid $p is gone" >&2
 }
 
+# Available memory in MiB: free, inactive, speculative and purgeable pages (GPU_LOCK_MEM_CMD replaces it in tests).
+avail_mb() {
+  if [ -n "${GPU_LOCK_MEM_CMD:-}" ]; then $GPU_LOCK_MEM_CMD; return; fi
+  vm_stat | awk '/page size of/ {ps = $8} /^Pages (free|inactive|speculative|purgeable):/ {n += $NF}
+    END {printf "%d\n", n * ps / 1048576}'
+}
+
+# Waits until two readings a poll apart differ by under 512 MiB, or the cap passes.
+settle() {
+  local i prev cur
+  [ "$SETTLE_MAX" -gt 0 ] || return 0
+  prev=$(avail_mb)
+  for ((i = 0; i < SETTLE_MAX / (SETTLE_POLL > 0 ? SETTLE_POLL : 1); i++)); do
+    sleep "$SETTLE_POLL"
+    cur=$(avail_mb)
+    [ $((cur - prev)) -lt 512 ] && return 0
+    prev=$cur
+  done
+  echo "gpu-lock: available memory still rising after ${SETTLE_MAX}s; starting anyway" >&2
+}
+
 # take <owner> <pid|empty> <max-min>
 take() {
   local owner=$1 n last t ahead
@@ -86,6 +114,7 @@ take() {
   echo "$3" > "$L/max_min"
   [ -z "$2" ] || echo "$2" > "$L/pid"
   ln -s done "$Q/.done.$$" && mv -f "$Q/.done.$$" "$Q/$n"
+  settle
 }
 
 # release_as <owner> [break]: fails unless <owner> holds the lock
@@ -179,6 +208,9 @@ case "${1:-}" in
       i=$((i + 1))
       echo "  $i. ${v#* } (pid ${v%% *}, ticket $t)"
     done
+    if [ -e "$QUIET" ]; then
+      echo "QUIET set $((($(date +%s) - $(stat -f %m "$QUIET")) / 60)) min ago ($QUIET)"
+    fi
     ;;
   *) usage ;;
 esac

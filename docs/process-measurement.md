@@ -61,6 +61,10 @@ scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd...>
   to check (PID, END marker, log) and stop, then `scripts/gpu-lock.sh break <holder>`, which frees the lock only if it
   names the current holder, so it cannot break a newer one. Only the coordinator breaks a lock. A lock with no PID
   (a plain `acquire`, or the old script's) is never auto-freed; `break` is its only way out.
+- Once the lock is taken, `run` and `acquire` wait until available memory (free + inactive + speculative + purgeable
+  pages) stops rising, at most 60 s (`GPU_LOCK_SETTLE_MAX_S`): a previous holder's memory comes back seconds after it
+  exits, and a boot in that gap failed its preflight at 103 of 108.8 GB. `status` ends with a `QUIET set N min ago`
+  line while the marker exists, so a stale one (it blocks every build) is visible.
 
 ## 4. Restore QoS for agent-launched jobs
 
