@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1 `/v1/completions` with a text prompt no longer ends at the first token**: the prompt now opens with the model's BOS, as the chat template and a token-id prompt already did.
 - **DeepSeek-V4.1 DSpark greedy text no longer depends on the verify-width mix**: the decode attention split a verify
   row's columns by its block's width, so the same request could differ between runs; it now gives the same text every run.
 - **DeepSeek-V4.1 decode spends less CPU per token with byte-identical output**: fewer Metal command buffers per layer,

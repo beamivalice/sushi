@@ -101,6 +101,14 @@ pub fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: 
     return tok.decode(allocator, shown.items);
 }
 
+fn withTextPromptBos(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u32) ![]u32 {
+    const bos = config.textPromptBosId() orelse return allocator.dupe(u32, body);
+    const ids = try allocator.alloc(u32, body.len + 1);
+    ids[0] = bos;
+    @memcpy(ids[1..], body);
+    return ids;
+}
+
 const CompletionPrompt = union(enum) {
     text: []const u8,
     /// Caller frees.
@@ -263,7 +271,11 @@ pub fn handleCompletions(
 
     // Tokenize prompt directly (no chat template); token ids are taken as sent.
     const prompt_ids = switch (prompt) {
-        .text => |s| try tok.encode(allocator, s),
+        .text => |s| blk: {
+            const piece = try tok.encode(allocator, s);
+            defer allocator.free(piece);
+            break :blk try withTextPromptBos(allocator, config, piece);
+        },
         .ids => |ids| try allocator.dupe(u32, ids),
         else => unreachable,
     };
@@ -688,6 +700,23 @@ test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 4
             .missing => try std.testing.expect(got == .missing),
         }
     }
+}
+
+test "a text prompt opens with BOS on DeepSeek only, never with Qwen's endoftext" {
+    const a = testing.allocator;
+    var ds = model_mod.ModelConfig{};
+    ds.model_type = "deepseek_v41";
+    ds.bos_token_id = 0;
+    const with = try withTextPromptBos(a, &ds, &.{ 671, 6102 });
+    defer a.free(with);
+    try testing.expectEqualSlices(u32, &.{ 0, 671, 6102 }, with);
+
+    var qwen = model_mod.ModelConfig{};
+    qwen.model_type = "qwen4_exp";
+    qwen.bos_token_id = 248044;
+    const without = try withTextPromptBos(a, &qwen, &.{ 671, 6102 });
+    defer a.free(without);
+    try testing.expectEqualSlices(u32, &.{ 671, 6102 }, without);
 }
 
 test "echoRejectReason: echo is refused by name, never silently dropped" {

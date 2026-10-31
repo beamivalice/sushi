@@ -791,6 +791,12 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
 
+    /// The id a raw-text prompt must open with. DeepSeek's chat template writes BOS itself and its base
+    /// model collapses to EOS without one; Qwen's config "BOS" is `<|endoftext|>`, which must not open a prompt.
+    pub fn textPromptBosId(self: *const ModelConfig) ?u32 {
+        return if (self.isDsv41()) self.bos_token_id else null;
+    }
+
     /// The context an auto boot serves when memory admits it, ahead of the margined memory ceiling; 0 = none.
     pub fn defaultContext(self: *const ModelConfig) u32 {
         const want = self.serve_defaults.context;
@@ -1492,7 +1498,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (v == .bool) config.attn_output_gate = v.bool;
     }
 
-    if (cfg_obj.get("bos_token_id")) |v| {
+    if (cfgField(cfg_obj, "bos_token_id") orelse root.get("bos_token_id")) |v| {
         if (v == .integer and v.integer >= 0) config.bos_token_id = try cfgInt(u32, v);
     }
 
@@ -4318,4 +4324,10 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
     try testing.expectError(error.OwnedImportCopied, wrapOwned(empty, &.{0}, .uint8));
     try testing.expectEqual(start, owned_bytes.load(.monotonic));
     try testing.expectEqual(refused + 1, refused_imports.load(.monotonic));
+}
+
+test "a text prompt's BOS comes from the release config, whose bos_token_id sits outside text_config" {
+    var config = try parseConfigFromJson(testing.allocator, dsv41_config.release_config);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u32, 0), config.textPromptBosId());
 }
