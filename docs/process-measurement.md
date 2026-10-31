@@ -31,9 +31,8 @@ echo "$(git rev-parse --short HEAD) $(stat -f %Sm zig-out/bin/sushi)" > <run>.bi
 ## 3. Take the lock for exactly one run
 
 ```sh
-scripts/gpu-lock.sh acquire <owner>
 # one boot+probe, one KLD, one microbench, one pilot or one trace
-scripts/gpu-lock.sh release <owner>
+scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd...>
 ```
 
 `sushi-ubench` takes and releases the lock itself ([process-ubench](process-ubench.md)).
@@ -50,12 +49,18 @@ scripts/gpu-lock.sh release <owner>
   whose text is `<pid> <owner>`) and only the lowest live ticket may take the lock, so a later arrival that polls
   faster cannot jump the queue. A ticket whose waiter process is gone is skipped and pruned. `scripts/gpu-lock.sh
   status` prints the holder (or `free`), then the queue in order.
-- In a script: `trap "scripts/gpu-lock.sh release <owner>" EXIT` right after the acquire.
-- A dead holder (its run is gone but `status` still names it) blocks every waiter: `acquire` exits once it holds the
-  lock, so no live PID is recorded and no script can tell a dead holder from a slow one. A worker that suspects one
-  reports it to the coordinator and keeps waiting. The coordinator checks that the holder's run is gone (its PID, END
-  marker, log), then runs `scripts/gpu-lock.sh break <holder>`, which frees the lock only if it names the current
-  holder, so it cannot break a newer one. The next ticket then takes the lock. Only the coordinator breaks a lock.
+- `run` takes the lock, runs the command, releases on any exit (a signal included) and exits with the command's
+  status. It records the command's PID as the holder. Prefer it to `acquire` + `release`.
+- Plain `acquire <owner> [--max-min N]` records no holder PID (its caller often exits before the job runs), so it is
+  never auto-freed: only `release` or the coordinator's `break` frees it. `--pid P` (the job's PID) opts into
+  auto-free. In a script: `trap "scripts/gpu-lock.sh release <owner>" EXIT` right after the acquire.
+- `--max-min N` (default 15) is the run's declared length: declare it for anything longer. `status` prints the
+  holder, then its PID, age and declared max, with `OVERDUE` once the age passes it, then the queue.
+- A dead holder (its recorded PID, from `run` or `--pid`, is gone) is freed by the next `acquire` or `status`, which logs one stderr line
+  naming the owner; the queue then proceeds. Nothing kills a live holder. An OVERDUE or idle one is the coordinator's
+  to check (PID, END marker, log) and stop, then `scripts/gpu-lock.sh break <holder>`, which frees the lock only if it
+  names the current holder, so it cannot break a newer one. Only the coordinator breaks a lock. A lock with no PID
+  (a plain `acquire`, or the old script's) is never auto-freed; `break` is its only way out.
 
 ## 4. Restore QoS for agent-launched jobs
 

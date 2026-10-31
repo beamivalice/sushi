@@ -13,6 +13,11 @@
 #   8. status lists the holder, then the queue in ticket order
 #   9. break (coordinator only, for a dead holder) frees the lock only when it names the holder
 #  10. a waiter whose environment breaks `ls` still takes its ticket behind the queue
+#  11. a plain acquire records no PID and is never auto-freed; a holder whose recorded PID (acquire --pid) died is
+#      freed by the next acquire and by status; a lock with no PID file stays until break clears it
+#  12. run releases on success, failure and SIGTERM, passes the exit code and stdin, records the command's PID
+#  13. status flags OVERDUE past --max-min, never stops the holder; bad --max-min / --pid usage exits 2
+#  14. waiters behind a dead holder never hold the lock at the same time
 #
 # No GPU, no model, seconds.
 #
@@ -123,6 +128,95 @@ wait_exit $FIRST 5; check $? "first is served before the blind waiter"
 $LOCK release first
 wait_exit $BLIND 5; check $? "the blind waiter is served next"
 $LOCK release blind
+
+# Make a lock dir by hand: <owner> <pid|-> [age seconds] (owner file in the old "<owner> <time>" format).
+forge() {
+  mkdir "$GPU_LOCK_DIR" || return 1
+  echo "$1 2026-01-01 00:00:00" > "$GPU_LOCK_DIR/owner"
+  [ "$2" = - ] && return 0
+  echo $(($(date +%s) - ${3:-0})) > "$GPU_LOCK_DIR/start"
+  echo 15 > "$GPU_LOCK_DIR/max_min"
+  echo "$2" > "$GPU_LOCK_DIR/pid"
+}
+dead_pid() { sleep 0 & local p=$!; wait $p; echo $p; }
+
+# A plain acquire records no PID: its caller may exit before the job runs, so it is never auto-freed.
+( $LOCK acquire plain; sleep 60 ) & HOLDER=$!; BG="$BG $HOLDER"
+for i in $(seq 50); do [ "$($LOCK status | head -1 | cut -d' ' -f1)" = plain ] && break; sleep 0.1; done
+$LOCK status | grep -qx '  no pid recorded'; check $? "plain acquire records no pid"
+pkill -P $HOLDER sleep; kill -9 $HOLDER; wait $HOLDER 2>/dev/null
+$LOCK status 2> /dev/null | grep -q '^plain '; check $? "a plain acquire is not auto-freed when its caller dies"
+$LOCK break plain 2> /dev/null; check $? "break frees a plain acquire"
+
+# acquire --pid records the job's PID and is freed when it dies.
+sleep 60 & JOB=$!; BG="$BG $JOB"
+$LOCK acquire pidded --pid $JOB
+$LOCK status | grep -q "^  pid $JOB alive, held 0 min of 15 max\$"; check $? "acquire --pid records the given PID"
+kill $JOB; wait $JOB 2>/dev/null
+$LOCK status 2> "$TMP/err" | grep -qx free; check $? "status frees a lock whose --pid holder died"
+grep -q 'freed the lock of pidded' "$TMP/err"; check $? "the auto-free logs the owner to stderr"
+
+forge deadlock "$(dead_pid)"
+$LOCK acquire after-dead; check $? "acquire frees a dead holder and takes the lock"
+$LOCK status | grep -q '^after-dead '; check $? "status names the waiter that replaced the dead holder"
+$LOCK release after-dead
+
+forge oldfmt -
+$LOCK status | head -2 | tr '\n' '|' | grep -q '^oldfmt .*|  no pid recorded|$'; check $? "status shows an old-format lock without a PID"
+GPU_LOCK_POLL_S=0.1 $LOCK acquire behind-old & OLD=$!; BG="$BG $OLD"
+sleep 1
+kill -0 $OLD 2>/dev/null; check $? "a lock without a PID file is not auto-freed"
+$LOCK status | grep -q '^oldfmt '; check $? "the old-format holder is kept"
+$LOCK break oldfmt; check $? "break clears an old-format lock"
+wait_exit $OLD 5; check $? "the waiter behind the broken old-format lock is served"
+$LOCK release behind-old
+
+forge live-break $$
+$LOCK break live-break; check $? "break still frees a live holder that names itself"
+[ "$($LOCK status)" = free ]; check $? "status is free after break"
+
+# run
+$LOCK run ok -- true; check $? "run passes exit status 0"
+$LOCK run bad -- sh -c 'exit 7'; [ $? = 7 ]; check $? "run passes the command's exit code"
+[ "$($LOCK status)" = free ]; check $? "run released after success and failure"
+[ "$(echo hello | $LOCK run piped -- cat)" = hello ]; check $? "run passes stdin to the command"
+$LOCK run nocmd -- 2>/dev/null; [ $? = 2 ]; check $? "run without a command is a usage error"
+$LOCK run x --max-min 0 -- true 2>/dev/null; [ $? = 2 ]; check $? "--max-min 0 is a usage error"
+$LOCK acquire x --max-min abc 2>/dev/null; [ $? = 2 ]; check $? "a non-numeric --max-min is a usage error"
+$LOCK run x --pid 1 -- true 2>/dev/null; [ $? = 2 ]; check $? "run refuses --pid"
+
+$LOCK run term -- sleep 60 & RUN=$!; BG="$BG $RUN"
+for i in $(seq 50); do [ "$($LOCK status | head -1 | cut -d' ' -f1)" = term ] && break; sleep 0.1; done
+for i in $(seq 50); do CMD=$(pgrep -P $RUN); [ -n "$CMD" ] && break; sleep 0.1; done
+for i in $(seq 50); do $LOCK status | grep -q "^  pid $CMD alive" && break; sleep 0.1; done
+$LOCK status | grep -q "^  pid $CMD alive"; check $? "run records the command's PID as the holder"
+kill -TERM $RUN
+wait_exit $RUN 5; [ $? = 143 ]; check $? "run exits 143 on SIGTERM"
+[ "$($LOCK status)" = free ]; check $? "run released after SIGTERM"
+kill -0 "$CMD" 2>/dev/null; [ $? != 0 ]; check $? "SIGTERM reached the command"
+
+$LOCK run second-in-line -- true & BG="$BG $!"
+$LOCK run first-in-line -- sleep 1 & BG="$BG $!"
+wait; [ "$($LOCK status)" = free ]; check $? "run waiters drain the queue"
+
+# OVERDUE
+$LOCK acquire slow --max-min 1 --pid $$
+$LOCK status | grep -q '^  pid .* of 1 max$'; check $? "status shows the declared max and no OVERDUE when fresh"
+echo $(($(date +%s) - 3600)) > "$GPU_LOCK_DIR/start"
+$LOCK status | grep -q 'held 60 min of 1 max OVERDUE'; check $? "status flags OVERDUE past --max-min"
+$LOCK status | grep -q '^slow '; check $? "an OVERDUE live holder is not freed"
+$LOCK release slow
+
+# Waiters behind a dead holder never overlap.
+forge ghosts "$(dead_pid)"
+: > "$TMP/overlap"
+for w in c1 c2 c3 c4; do
+  ( GPU_LOCK_POLL_S=0.05 $LOCK acquire $w && { mkdir "$TMP/in" 2>/dev/null || echo $w >> "$TMP/overlap"; sleep 0.2; rmdir "$TMP/in" 2>/dev/null; $LOCK release $w; } ) &
+  BG="$BG $!"
+done
+wait
+[ ! -s "$TMP/overlap" ]; check $? "concurrent waiters behind a dead holder never overlap (got: $(cat "$TMP/overlap"))"
+[ "$($LOCK status)" = free ]; check $? "status is free after the concurrent waiters"
 
 echo "gpu-lock: $PASS passed, $FAIL failed"
 [ $FAIL = 0 ]

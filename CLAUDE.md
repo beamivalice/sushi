@@ -234,12 +234,13 @@ Procedures and examples: [docs/process-measurement.md](docs/process-measurement.
 **GPU sharing.** The lock is for jobs that need the box to themselves: a full model load (server boot, KLD, live test)
 and a quiet-box bench or timing whose absolute number is recorded. Conversions, pilots, builds and tests run in
 parallel without it, as long as the total fits memory: never beside a MiMo-size (≥ 90 GB) load, and a quiet bench waits.
-- Acquire the lock immediately before EACH run and release right after: `scripts/gpu-lock.sh acquire|release <owner>`;
-  waiters are served FIFO by ticket, `status` shows holder + queue (`${GPU_LOCK_DIR:-/tmp/sushi-gpu.lock.d}`).
+- Take the lock right before EACH run: `scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd>` (releases on any
+  exit; `acquire|release` if it cannot wrap). Declare `--max-min` over ~15 min; model-free tests
+  never take it. FIFO by ticket; `status`: holder, age, queue (`$GPU_LOCK_DIR`).
 - Never hold it across a batch or queue, or while analysing, editing, building or waiting. An A B B A re-acquires per
   arm. Every brief that runs on the GPU names the lock.
-- A holder that looks dead (its run gone, lock still held): a worker never breaks it; it tells the coordinator, who
-  verifies the run is gone, clears it with `gpu-lock.sh break <holder>`, and the queue proceeds.
+- A dead `run` holder frees itself. A plain-`acquire`, OVERDUE or idle one: workers report it; the coordinator
+  verifies, stops it, runs `gpu-lock.sh break <holder>`.
 
 **Baselines.**
 - Never rerun an old-binary/old-code baseline that is already recorded: run only the new arm and compare it with the
