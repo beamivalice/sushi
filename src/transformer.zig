@@ -1770,6 +1770,7 @@ pub const Transformer = struct {
             self.dsv41_experts = null;
         }
         if (self.dsv41_stq_experts) |st| {
+            st.deinit();
             self.allocator.destroy(st);
             self.dsv41_stq_experts = null;
         }

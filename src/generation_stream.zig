@@ -1221,6 +1221,10 @@ pub fn handleStreamingGeneration(
     // think block is open and unclosed (47.99 us/token at 113 KB).
     var think_scan: think_tags.ThinkScan = .{};
     // Gate through streamThinkGateScan only, and reset the scan wherever the buffer is cleared.
+    // The tool gate and the held thought are memoized the same way; the thought scan also resets
+    // whenever `text_delivered` moves, for it reads only the undelivered rest.
+    var tool_scan: think_tags.ToolHoldScan = .{};
+    var thought_scan: think_tags.ThoughtScan = .{};
     // When tools are present, buffer individual token texts for deferred streaming
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
@@ -1364,7 +1368,7 @@ pub fn handleStreamingGeneration(
 
             const buf = text_buf.items;
             const undelivered = buf[text_delivered..];
-            const maybe_tool = think_tags.streamShouldBufferForTools(buf);
+            const maybe_tool = think_tags.streamShouldBufferForToolsScan(buf, &tool_scan);
 
             if (!maybe_tool) {
                 // No tool call pattern — ask the shared gate (think_tags.streamThinkGate,
@@ -1395,7 +1399,7 @@ pub fn handleStreamingGeneration(
                         // reasoning token; at the cap the latch stops every
                         // later emitter from shipping the remainder.
                         if (!budget_exhausted) {
-                            if (think_tags.heldThoughtSoFar(undelivered, opens_think, think_closed)) |settled| {
+                            if (think_tags.heldThoughtSoFarScan(undelivered, opens_think, think_closed, &tool_scan, &thought_scan)) |settled| {
                                 if (think_tags.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
                                     try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, fresh);
                                     reasoning_streamed = settled.len;
@@ -1424,6 +1428,8 @@ pub fn handleStreamingGeneration(
                         text_buf.clearRetainingCapacity();
                         text_delivered = 0;
                         think_scan.reset();
+                        tool_scan = .{};
+                        thought_scan.reset();
                         think_closed = true;
                         // Past the cap the tail is exactly what the budget
                         // exists to withhold. This arm applied no budget at all,
@@ -1460,6 +1466,7 @@ pub fn handleStreamingGeneration(
                         }
                         token_texts.clearRetainingCapacity();
                         text_delivered = text_buf.items.len;
+                        thought_scan.reset();
                     },
                 }
             }

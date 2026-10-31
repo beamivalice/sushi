@@ -1387,6 +1387,10 @@ fn handleAnthropicStreaming(
     // think block is open and unclosed (47.99 us/token at 113 KB).
     var think_scan: think_tags.ThinkScan = .{};
     // Gate through streamThinkGateScan only, and reset the scan wherever the buffer is cleared.
+    // The tool gate and the held thought are memoized the same way; the thought scan also resets
+    // whenever `text_delivered` moves, for it reads only the undelivered rest.
+    var tool_scan: think_tags.ToolHoldScan = .{};
+    var thought_scan: think_tags.ThoughtScan = .{};
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
         for (token_texts.items) |t| allocator.free(t);
@@ -1468,7 +1472,7 @@ fn handleAnthropicStreaming(
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
             const undelivered = buf[text_delivered..];
-            const maybe_tool = think_tags.streamShouldBufferForTools(buf);
+            const maybe_tool = think_tags.streamShouldBufferForToolsScan(buf, &tool_scan);
 
             if (!maybe_tool) {
                 // Shared gate with the chat-completions stream (the two paths
@@ -1481,7 +1485,7 @@ fn handleAnthropicStreaming(
                     .hold_thinking => {
                         // Safe to stream: the tool gate just returned false, so these bytes
                         // are reasoning. Each iteration is one token, so the budget counts them.
-                        if (!budget_exhausted) if (think_tags.heldThoughtSoFar(undelivered, opens_think, think_closed)) |settled| {
+                        if (!budget_exhausted) if (think_tags.heldThoughtSoFarScan(undelivered, opens_think, think_closed, &tool_scan, &thought_scan)) |settled| {
                             if (think_tags.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
                                 try emitAnthropicThinking(allocator, stream, &block_index, &text_block_open, &thinking_block_open, &join, fresh);
                                 reasoning_streamed = settled.len;
@@ -1518,6 +1522,8 @@ fn handleAnthropicStreaming(
                         text_buf.clearRetainingCapacity();
                         text_delivered = 0;
                         think_scan.reset();
+                        tool_scan = .{};
+                        thought_scan.reset();
                         think_closed = true;
                     },
                     .flush_text => {
@@ -1530,6 +1536,7 @@ fn handleAnthropicStreaming(
                         }
                         token_texts.clearRetainingCapacity();
                         text_delivered = text_buf.items.len;
+                        thought_scan.reset();
                     },
                 }
             }

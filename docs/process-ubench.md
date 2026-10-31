@@ -95,6 +95,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `glm5.mla_decode_attn` | glm5 | one decode row's MLA attention as a 16-layer dependent chain, cumulative stages, by context |
 | `glm5.mla_chunk_attn` | glm5 | whole sparse attention of a short chunk on a kv8 state: scalar, packed FP32 composite, packed NAX, served |
 | `glm5.mla_chunk_stages` | glm5 | a 2048-row chunk's index scores, top-512 selection and whole attention, by context |
+| `shared.kernel_launch` | shared | the host side of one custom-kernel launch on tiny f16 inputs with a 1k or a 32k header, us a launch over 64 launches: the apply alone, and the apply plus its share of one eval of the batch |
 | `shared.exl3_rate_groups` | shared | one Flash-Next MoE layer as uniform n32, the masked `moeGroups` and the one-dispatch grouped chain: seven rate layouts at decode rows 1 and 4 and three at prefill chunks 512 and 2048, SPEC1 and PAIR1 |
 | `shared.exl3_rate_groups_rows` | shared | a DeepSeek-V4.1 layer (384 experts, four PAIR1 groups) through the grouped prefill chain with every expert routed 1 to 48 rows, as ms per layer, us per expert and TFLOP/s |
 | `shared.shared_expert_fold` | shared | one MoE layer with the shared expert separate, folded into the routed launches, and absent, over 8 distinct banks: Flash-Next (one bank, rate groups), GLM (one bank), DeepSeek-V4.1 (layer 2's four PAIR1 groups, with the fused chain's launch count), at 1 to 8 rows |

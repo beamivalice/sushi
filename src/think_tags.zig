@@ -397,6 +397,10 @@ fn invokeOpenerHoldsForTools(buf: []const u8) bool {
         if (after >= buf.len or std.ascii.isWhitespace(buf[after])) return true;
         scan = after;
     }
+    return invokeTailHolds(buf);
+}
+
+fn invokeTailHolds(buf: []const u8) bool {
     inline for (.{ FUNCTION_CALLS_TAG, BARE_INVOKE.invoke }) |marker| {
         var k: usize = 2;
         while (k < marker.len) : (k += 1) if (std.mem.endsWith(u8, buf, marker[0..k])) return true;
@@ -672,13 +676,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
         //     an unclosed tail is truncated reasoning, never content.
         //   • No literal opener + no template opener → the model answered
         //     directly (Gemma style); keep the answer visible as content.
-        if (thinkOpenTagLenAt(text) != null or std.mem.startsWith(u8, text, "<|channel>thought")) {
-            const start: usize = if (thinkOpenTagLenAt(text)) |l| l else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
-            const reasoning = std.mem.trimStart(u8, text[start..], "\n ");
-            return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
-        }
-        if (opened_by_template) {
-            const reasoning = std.mem.trimStart(u8, text, "\n ");
+        if (openThoughtBody(text, opened_by_template)) |reasoning| {
             return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
         }
         // Prose answer that ENDS by opening a new, unclosed thought block
@@ -706,6 +704,16 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
         return .{ .reasoning_content = null, .content = std.mem.trimStart(u8, content, "\n ") };
     }
     return .{ .reasoning_content = null, .content = text };
+}
+
+/// The reasoning of a thought that has no close yet and starts `text` (its literal opener, or the
+/// template's), or null when `text` does not start one.
+fn openThoughtBody(text: []const u8, opened_by_template: bool) ?[]const u8 {
+    if (thinkOpenTagLenAt(text) != null or std.mem.startsWith(u8, text, "<|channel>thought")) {
+        const start: usize = if (thinkOpenTagLenAt(text)) |l| l else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
+        return std.mem.trimStart(u8, text[start..], "\n ");
+    }
+    return if (opened_by_template) std.mem.trimStart(u8, text, "\n ") else null;
 }
 
 const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
@@ -954,9 +962,12 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // Claude-style `<function_calls>` / `<invoke name="…">`.
     if (invokeOpenerHoldsForTools(buf)) return true;
 
-    // Trailing partial prefixes — the next streamed token could complete any
-    // of these into a real tool open. Order doesn't matter; first endsWith
-    // hit wins. Listed shortest-first for legibility.
+    return toolTailHolds(buf);
+}
+
+/// Trailing partial prefixes — the next streamed token could complete any
+/// of these into a real tool open.
+fn toolTailHolds(buf: []const u8) bool {
     const tail_prefixes = [_][]const u8{
         "<",     "<t",     "<to",     "<too",     "<tool",
         "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
@@ -1021,6 +1032,104 @@ fn functionOpenerHoldsForTools(buf: []const u8) bool {
         scan = tag_end + 1;
     }
     return false;
+}
+
+/// `streamShouldBufferForTools` kept over a growing buffer, so a token costs its own bytes plus a marker's
+/// overlap, not the whole reply. A marker is judged from bytes that cannot change, so its verdict latches
+/// (`held`); only an opener still arriving (`pending`) is judged again. Reset wherever the buffer is cleared.
+pub const ToolHoldScan = struct {
+    checked: usize = 0,
+    held: bool = false,
+    pending: bool = false,
+    tool_from: usize = 0,
+    func_from: usize = 0,
+    /// Bytes before this hold no `>` for the `<function` opener at `func_from`, once `func_open`.
+    func_gt: usize = 0,
+    func_open: bool = false,
+    invoke_from: usize = 0,
+    /// Bytes the last call searched; test-visible.
+    last_scan_span: usize = 0,
+
+    const needles = [_][]const u8{ "<|tool_call", "<｜DSML｜", "</｜DSML｜", FUNCTION_CALLS_TAG };
+    const overlap = blk: {
+        var longest: usize = "\"name\"".len;
+        for (needles ++ [_][]const u8{ "<tool", "<function", BARE_INVOKE.invoke }) |n| longest = @max(longest, n.len);
+        break :blk longest - 1;
+    };
+
+    fn advance(self: *ToolHoldScan, buf: []const u8) void {
+        self.pending = false;
+        if (self.held) return;
+        const from = self.checked -| overlap;
+        self.last_scan_span = buf.len - from;
+        const win = buf[from..];
+        if (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, win, "\"name\"") != null) return self.latch();
+        for (needles) |n| if (std.mem.indexOf(u8, win, n) != null) return self.latch();
+
+        var scan = @max(self.tool_from, from);
+        while (std.mem.indexOfPos(u8, buf, scan, "<tool")) |p| {
+            const after = p + "<tool".len;
+            if (after >= buf.len) {
+                self.pending = true;
+                break;
+            }
+            switch (buf[after]) {
+                '>', ' ', '\t', '\n', '_', '|' => return self.latch(),
+                else => {},
+            }
+            scan = after;
+            self.tool_from = after;
+        }
+
+        scan = if (self.func_open) self.func_from else @max(self.func_from, from);
+        self.func_open = false;
+        while (std.mem.indexOfPos(u8, buf, scan, "<function")) |p| {
+            const after = p + "<function".len;
+            if (after >= buf.len) {
+                self.pending = true;
+                break;
+            }
+            if (!std.ascii.isWhitespace(buf[after])) {
+                scan = after;
+                self.func_from = after;
+                continue;
+            }
+            const gt = std.mem.indexOfScalarPos(u8, buf, @max(after, self.func_gt), '>') orelse {
+                self.func_from = p;
+                self.func_gt = buf.len;
+                self.func_open = true;
+                self.pending = true;
+                break;
+            };
+            if (miniCpm5AttrValue(buf[after..gt], "name")) |v| if (v.len > 0) return self.latch();
+            scan = gt + 1;
+            self.func_from = scan;
+        }
+
+        scan = @max(self.invoke_from, from);
+        while (std.mem.indexOfPos(u8, buf, scan, BARE_INVOKE.invoke)) |p| {
+            const after = p + BARE_INVOKE.invoke.len;
+            if (after >= buf.len) {
+                self.pending = true;
+                break;
+            }
+            if (std.ascii.isWhitespace(buf[after])) return self.latch();
+            scan = after;
+            self.invoke_from = after;
+        }
+        self.checked = buf.len;
+    }
+
+    fn latch(self: *ToolHoldScan) void {
+        self.held = true;
+    }
+};
+
+/// `streamShouldBufferForTools` with the per-token rescan memoized; the same verdict at every prefix.
+pub fn streamShouldBufferForToolsScan(buf: []const u8, scan: *ToolHoldScan) bool {
+    if (buf.len < scan.checked) scan.* = .{};
+    scan.advance(buf);
+    return scan.held or scan.pending or toolTailHolds(buf) or invokeTailHolds(buf);
 }
 
 /// Streaming-only: what should a tools-enabled SSE path do with the buffered
@@ -1167,6 +1276,77 @@ pub fn heldThoughtSoFar(buf: []const u8, opens_think: bool, think_closed: bool) 
     if (!prompt_opened and thinkOpenTagLenAt(buf) == null) return null;
     const reasoning = splitThinkBlock(buf, true, prompt_opened).reasoning_content orelse return null;
     return settledReasoning(reasoning);
+}
+
+/// `heldThoughtSoFar` kept over the growing undelivered text: the close scan is a `ThinkScan`, and the
+/// leaked-markup cut is judged once per byte. Reset whenever the undelivered text starts anew.
+pub const ThoughtScan = struct {
+    think: ThinkScan = .{},
+    /// Offset in the undelivered text of the thought body the fields below describe.
+    body_at: usize = 0,
+    checked: usize = 0,
+    mini_from: usize = 0,
+    mini_evidence: bool = false,
+    mini_cut: ?usize = null,
+    /// Bytes the last call searched; test-visible.
+    last_scan_span: usize = 0,
+
+    const overlap = @max("<function".len, "</function>".len) - 1;
+
+    pub fn reset(self: *ThoughtScan) void {
+        self.* = .{};
+    }
+
+    fn advance(self: *ThoughtScan, body: []const u8, body_at: usize) void {
+        if (body_at != self.body_at or body.len < self.checked) {
+            const think = self.think;
+            self.* = .{ .think = think, .body_at = body_at };
+        }
+        const from = self.checked -| overlap;
+        self.last_scan_span = self.think.last_scan_span + body.len - from;
+        const win = body[from..];
+        if (!self.mini_evidence)
+            self.mini_evidence = std.mem.indexOf(u8, win, "<param") != null or std.mem.indexOf(u8, win, "</function>") != null;
+        var scan = @max(self.mini_from, from);
+        // The caller's tool gate was clear, so no opener is cut short and every `<function ` has its `>`.
+        while (self.mini_cut == null) {
+            const p = std.mem.indexOfPos(u8, body, scan, "<function") orelse break;
+            const after = p + "<function".len;
+            if (after >= body.len) break;
+            if (!std.ascii.isWhitespace(body[after])) {
+                scan = after;
+                self.mini_from = after;
+                continue;
+            }
+            const gt = std.mem.indexOfScalarPos(u8, body, after, '>') orelse break;
+            if (std.mem.indexOf(u8, body[after..gt], "name=") != null) self.mini_cut = p;
+            scan = gt;
+            self.mini_from = gt;
+        }
+        self.checked = body.len;
+    }
+};
+
+/// `heldThoughtSoFar` with the per-token rescan memoized; the same answer. `hold` is the scan that judged
+/// the buffer `buf` ends: while it is clear, no other tool opener can cut the thought, so only the
+/// MiniCPM5 attribute form is looked for.
+pub fn heldThoughtSoFarScan(
+    buf: []const u8,
+    opens_think: bool,
+    think_closed: bool,
+    hold: *const ToolHoldScan,
+    scan: *ThoughtScan,
+) ?[]const u8 {
+    const prompt_opened = opens_think and !think_closed;
+    if (!prompt_opened and thinkOpenTagLenAt(buf) == null) return null;
+    scan.think.advance(buf);
+    if (hold.held or hold.pending or scan.think.saw_channel_close or scan.think.close != null)
+        return heldThoughtSoFar(buf, opens_think, think_closed);
+    const body = openThoughtBody(buf, prompt_opened).?;
+    scan.advance(body, @intFromPtr(body.ptr) - @intFromPtr(buf.ptr));
+    const cut = if (scan.mini_evidence) scan.mini_cut orelse body.len else body.len;
+    const kept = if (cut == body.len) body else std.mem.trimEnd(u8, body[0..cut], "\n\r\t ");
+    return if (kept.len > 0) settledReasoning(kept) else null;
 }
 
 /// `streamThinkGate2` with the per-token rescan memoized. Byte-identical
@@ -2255,6 +2435,87 @@ test "ThinkScan: reset() re-arms the cursor when the stream buffer is cleared" {
     scan.reset();
     // Same scan struct, fresh (shorter) buffer: must not carry the old close.
     try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGateScan("<think>more", true, false, false, &scan));
+}
+
+/// Drives the memoized tool gate and held-thought split chunk by chunk over `raw` and fails at the first
+/// chunk where either differs from the whole-buffer function. Chunks are 1..9 bytes, so markers split
+/// across arrivals at every offset; `delivered` models text the stream already shipped (the thought scan
+/// then covers only the undelivered rest, as the stream resets it).
+pub fn expectIncrementalGatesAgree(raw: []const u8, seed: usize) !void {
+    const max_steps = 300;
+    for ([_]usize{ 0, raw.len / 3 }) |delivered| {
+        for ([_]bool{ false, true }) |opens_think| {
+            var hold: ToolHoldScan = .{};
+            var thought: ThoughtScan = .{};
+            var rng = std.Random.DefaultPrng.init(seed);
+            var n: usize = 0;
+            while (n < raw.len) {
+                n = @min(raw.len, n + @max(1 + rng.random().uintLessThan(usize, 9), raw.len / max_steps));
+                const buf = raw[0..n];
+                const want_hold = streamShouldBufferForTools(buf);
+                const got_hold = streamShouldBufferForToolsScan(buf, &hold);
+                if (want_hold != got_hold) {
+                    std.debug.print("tool gate at {d} of \"{s}\": {} != {}\n", .{ n, raw[0..@min(raw.len, 300)], got_hold, want_hold });
+                    return error.IncrementalGateDiverged;
+                }
+                if (want_hold or n < delivered) continue;
+                const undelivered = buf[delivered..];
+                const want = heldThoughtSoFar(undelivered, opens_think, false);
+                const got = heldThoughtSoFarScan(undelivered, opens_think, false, &hold, &thought);
+                const same = if (want) |w| got != null and std.mem.eql(u8, w, got.?) else got == null;
+                if (!same) {
+                    std.debug.print("held thought at {d} (delivered {d}, opens {}) of \"{s}\": {?s} != {?s}\n", .{ n, delivered, opens_think, raw[0..@min(raw.len, 300)], got, want });
+                    return error.IncrementalGateDiverged;
+                }
+            }
+        }
+    }
+}
+
+test "ToolHoldScan and ThoughtScan: incremental verdicts match the full rescan at every split" {
+    const corpus = [_][]const u8{
+        "plain visible prose with no markup at all",
+        "<think>reasoning here</think>the answer",
+        "<think>plan <tool_call>f</tool_call> done",
+        "<think>use `<function name=\"x\">` here\n<param>a</param> then <function name=\"shell\">",
+        "<think>say <function foo> then <function bar baz> and <functional> and <function\tname=\"\"> end",
+        "<think>x <function name=> <param a> y <function name=\"s\"> z",
+        "<think>a < b, <functio, <tool, <toolkit>, <tools> end</think>ok",
+        "<think>write <invoke> then <invoked> and <invoke name=\"a\"><parameter name=\"b\">1</parameter></invoke>",
+        "<think>note </invoke> and <parameter x> only",
+        "<think>call <function_calls><invoke name=\"a\"></invoke></function_calls>",
+        "{\"name\":\"shell\",\"arguments\":{}}",
+        "{\"a\":1} and later \"name\" appears",
+        "<think>dsml <\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls> and </\xef\xbd\x9cDSML\xef\xbd\x9c end",
+        "<|channel>thought plan<channel|>visible <|tool_call>call:x{}<tool_call|>",
+        "<think>  \n  spaced   </think>  after",
+        "<think>a</think>b<think>c <function name=\"q\"> <param>",
+        "<think>\n\n  <think>nested",
+    };
+    for (corpus, 0..) |raw, i| try expectIncrementalGatesAgree(raw, i);
+}
+
+test "ToolHoldScan and ThoughtScan: per-token work does not grow with the reply" {
+    var hold: ToolHoldScan = .{};
+    var thought: ThoughtScan = .{};
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    var max_hold: usize = 0;
+    var max_thought: usize = 0;
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) {
+        const token = if (i == 0) "<think>" else if (i % 50 == 0) " <functional> <function foo> " else "reasoning words ";
+        try buf.appendSlice(testing.allocator, token);
+        try testing.expect(!streamShouldBufferForToolsScan(buf.items, &hold));
+        _ = heldThoughtSoFarScan(buf.items, false, false, &hold, &thought);
+        if (i == 0) continue;
+        max_hold = @max(max_hold, hold.last_scan_span);
+        max_thought = @max(max_thought, thought.last_scan_span);
+    }
+    try testing.expect(buf.items.len > 300_000);
+    // One token plus the longest marker's overlap, not the 300 KB reply.
+    try testing.expect(max_hold <= 64);
+    try testing.expect(max_thought <= 128);
 }
 
 test "streaming content agrees with the non-streaming split on leading whitespace" {

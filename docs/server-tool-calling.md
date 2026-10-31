@@ -156,6 +156,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   thought the model opens after visible text then split over the WHOLE buffer and shipped that text again as
   reasoning (the block read `Done\n<think>plan` after `Done` had streamed). The end-of-stream path already had this
   shape, since it rebuilds from the pending tokens only.
+- **A per-token stream check scans only new bytes** (`ThinkScan`, `ToolHoldScan`, `ThoughtScan`: a marker overlap, not the
+  reply); each has a whole-buffer twin kept as its oracle, and reset wherever its buffer starts anew (split, flush).
+  Guards: the `incremental` tests in `think_tags.zig`, the format corpus and the tool-traffic replay.
 - Thinking-off is enforced in the PROMPT; generated reasoning is ALWAYS delivered (every site splits via
   `splitThinkBlock(text, true, …)`).
 - **A thought is decided at its first byte when no opener can start it** (`think_tags.thinkOpenerPossible`: every opener
@@ -196,4 +199,6 @@ A short exact cycle convicts on SPAN (`degenerate.degenerate_loop_min_span` 128;
 THREE low ratios incl. PROGRESS (1024-token window, `degenerate.near_repeat_min_span` 4096), long-period tier 9..64 at 10 reps.
 Cuts are intentional stops: `finish_reason "stop"`, `finish_details:{"type":"repetition_loop"}`, `[loop-stop]`
 logged, non-streaming trimmed to the span start. Guard: `tests/test_loop_stop_signal.sh`.
+The decode loop asks every tick through `degenerate.TailGuard`, which counts the window's distinct tokens as tokens arrive and runs the
+full near-repeat judgement only when that vocabulary ratio could convict; `degenerateTail` is its oracle and must give the same verdict.
 - **A loop convicted inside an open thought closes the thought instead of ending the turn** (`closeThoughtOnLoop`): a `stop` with no answer or call reads as a finished agent turn. The reasoning budget's early-stop line and closer are committed once per request (`[loop-recover]`) and the model answers; an answer-side loop, a second loop or no room before `max_tokens` keeps the cut. The line is built when the loop is convicted (`server.loopCloseBound`), never armed at request start: a request carrying a `think_bound` is refused DFlash2 (`glmDflashEligible`). The forced tokens ride `commitThoughtClose` like the budget's, so stream and non-stream see the same bytes.

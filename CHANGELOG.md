@@ -4,6 +4,13 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **DeepSeek-V4.1 decode spends less CPU per token with byte-identical output**: fewer Metal command buffers per layer,
+  MLX no longer rebuilds and hashes a custom kernel's source on every launch, a DSpark verify round waits on the host
+  only for its argmax, idle expert prefetches are skipped, and a streamed reply no longer rescans the whole answer on
+  every token.
+
 ## v1.4.1 — Faster DeepSeek prefill, DeepSeek with no flags
 
 - **DeepSeek-V4.1 prefills up to 47% faster and decodes up to 13% faster**: on an M5 Max with the 1.75bpw pack at 128K

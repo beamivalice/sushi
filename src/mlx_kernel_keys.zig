@@ -121,3 +121,114 @@ pub fn apply(k: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, cfg: ml
     last_key.appendSlice(gpa, key.items) catch {};
     if (log_on) log.info("[kernel-build] #{d} {s}\n", .{ new_keys, key.items });
 }
+
+const probe_source =
+    \\uint i = thread_position_in_grid.x;
+    \\out[i] = x[i] + b[i & 3u];
+;
+
+/// `out = x + b[i & 3]` over n values; x is 0.5 * i, so every dtype below holds each value exactly.
+fn probeRun(k: mlx.mlx_fast_metal_kernel, s: mlx.mlx_stream, dtype: mlx.mlx_dtype, b_len: c_int, out: []f32) !void {
+    const n: c_int = @intCast(out.len);
+    var x_vals: [64]f32 = undefined;
+    var b_vals: [64]f32 = undefined;
+    for (0..out.len) |i| x_vals[i] = 0.5 * @as(f32, @floatFromInt(i));
+    for (0..@intCast(b_len)) |i| b_vals[i] = 0.25 * @as(f32, @floatFromInt(i + 1));
+    const x32 = mlx.mlx_array_new_data(&x_vals, &[_]c_int{n}, 1, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    const b32 = mlx.mlx_array_new_data(&b_vals, &[_]c_int{b_len}, 1, .float32);
+    defer _ = mlx.mlx_array_free(b32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    var b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_astype(&x, x32, dtype, s));
+    try mlx.check(mlx.mlx_astype(&b, b32, dtype, s));
+    const inputs = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ x, b }, 2);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{n}, 1, dtype));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, n, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 16, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "UNUSED", 7));
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, k, inputs, cfg, s));
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+    var y32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y32);
+    try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(y32));
+    @memcpy(out, mlx.mlx_array_data_float32(y32).?[0..out.len]);
+}
+
+test "one kernel object across input dtypes and bindings: same outputs, one library key per source" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const names = [_][*:0]const u8{ "x", "b" };
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_kernel_keys_probe", iv, ov, probe_source, "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+
+    // Constant-bound b in f32 and f16, then a device-bound b (16 values) in f32: three sources, three keys.
+    const Case = struct { dtype: mlx.mlx_dtype, b_len: c_int };
+    const cases = [_]Case{ .{ .dtype = .float32, .b_len = 4 }, .{ .dtype = .float16, .b_len = 4 }, .{ .dtype = .float32, .b_len = 16 } };
+    const base = trackForTest();
+    var got: [32]f32 = undefined;
+    for (0..3) |_| {
+        for (cases) |c| {
+            try probeRun(k, s, c.dtype, c.b_len, &got);
+            for (got, 0..) |v, i| try t.expectEqual(0.5 * @as(f32, @floatFromInt(i)) + 0.25 * @as(f32, @floatFromInt((i & 3) + 1)), v);
+        }
+        try t.expectEqual(base + 3, count());
+    }
+}
+
+extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx.mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int;
+
+test "template args of one value and different kinds each get their own source" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const names = [_][*:0]const u8{"x"};
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    // An int 1 and a bool true both name the kernel `_1`, but sizeof(N) tells the two sources apart.
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_kernel_keys_kind", iv, ov, "out[thread_position_in_grid.x] = float(sizeof(N)) + x[0] * 0.0f;", "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const x = mlx.mlx_array_new_data(&data, &[_]c_int{10}, 1, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const inputs = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{x}, 1);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    for (0..3) |_| for ([_]bool{ false, true }) |as_bool| {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 4, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 4, 1, 1));
+        try mlx.check(if (as_bool) mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "N", true) else mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", 1));
+        var outs_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outs_vec);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs_vec, k, inputs, cfg, s));
+        var y = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, outs_vec, 0));
+        try mlx.check(mlx.mlx_array_eval(y));
+        const got = mlx.mlx_array_data_float32(y).?;
+        try t.expectEqual(@as(f32, if (as_bool) 1 else 4), got[0]);
+    };
+}

@@ -230,3 +230,20 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
     // model output that the layer correctly declines to fabricate) are reported.
     if (g_fail_count != 0) return error.ToolTrafficReplayFailed;
 }
+
+test "tool traffic replay: the incremental stream gates agree with the full rescan on captured replies" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var line_it = std.mem.splitScalar(u8, fixture, '\n');
+    var idx: usize = 0;
+    while (line_it.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        _ = arena_state.reset(.retain_capacity);
+        const rec = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), line, .{});
+        if (rec != .object) continue;
+        const raw = rec.object.get("raw") orelse continue;
+        idx += 1;
+        try think_tags.expectIncrementalGatesAgree(raw.string, idx);
+    }
+    try testing.expect(idx > 0);
+}

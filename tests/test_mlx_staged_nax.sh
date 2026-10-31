@@ -50,7 +50,7 @@ if [ -f "$STAGE/.version" ]; then
       *) fail "$module staged revision differs from source pin $pinned" ;;
     esac
   done
-  patch_sha=$(cat patches/mlx-transient-cap.patch patches/mlxc-gather-qmm-global-scale.patch patches/mlxc-transient-cap.patch | shasum | cut -c1-12)
+  patch_sha=$(cat patches/mlx-transient-cap.patch patches/mlx-custom-kernel-source-cache.patch patches/mlxc-gather-qmm-global-scale.patch patches/mlxc-transient-cap.patch | shasum | cut -c1-12)
   case "$stamp" in
     *" patch=$patch_sha "*) ok "staged mlx and mlx-c patches match source" ;;
     *) fail "staged mlx and mlx-c patches differ from source $patch_sha" ;;

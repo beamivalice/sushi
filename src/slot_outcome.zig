@@ -55,7 +55,17 @@ pub const LoopStop = struct {
 /// Pure decision + trim point. The three tiers live in degenerate.zig
 /// (`degenerateTail`); this is where their verdict becomes server behaviour.
 pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
-    const d = degenerate.degenerateTail(generated_ids) orelse return null;
+    return loopStopOf(degenerate.degenerateTail(generated_ids));
+}
+
+/// `loopStopDecision` over `generated_ids[start..]` for the decode loop, which asks after every tick of a list that
+/// only grows: `guard` carries what the earlier ticks counted.
+pub fn loopStopDecisionTracked(guard: *degenerate.TailGuard, generated_ids: []const u32, start: usize) ?LoopStop {
+    return loopStopOf(guard.degenerateTail(generated_ids, start));
+}
+
+fn loopStopOf(tail: ?degenerate.DegenerateTail) ?LoopStop {
+    const d = tail orelse return null;
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 

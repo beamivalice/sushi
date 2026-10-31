@@ -909,6 +909,7 @@ pub const Generator = struct {
     /// scans only this suffix; a later loop in the answer is still handled by
     /// the ordinary repetition-stop policy.
     loop_guard_start: usize = 0,
+    loop_guard: degenerate.TailGuard = .{},
     consecutive_pad: u32 = 0, // count of consecutive token-0 (pad) generations
     timeout_ns: u64, // 0 = no timeout; measures SILENCE, not total time (see StallClock)
     stall: degenerate.StallClock = .{},

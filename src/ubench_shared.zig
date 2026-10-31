@@ -1,4 +1,5 @@
-//! Benches that cross model families. `shared.shared_expert_fold` times one MoE layer with the shared expert as its own
+//! Benches that cross model families. `shared.kernel_launch` times the host side of one custom-kernel launch;
+//! `shared.shared_expert_fold` times one MoE layer with the shared expert as its own
 //! kernels, folded into the routed launches, and absent, for Flash-Next, GLM and DeepSeek-V4.1. Run by `sushi-ubench`,
 //! never by a test; the bytes of every arm are asserted by the tests beside the folds.
 const std = @import("std");
@@ -14,7 +15,7 @@ const Arr = mlx.mlx_array;
 const Ops = qwen.Ops;
 const Bank = @import("glm5/glm5_decode.zig").Bank;
 
-pub const benches = [_]report.Bench{shared_expert_fold};
+pub const benches = [_]report.Bench{ shared_expert_fold, kernel_launch };
 
 const alloc = std.heap.page_allocator;
 const max_layers = 32;
@@ -218,5 +219,112 @@ fn runQwen(run: *report.Run, s: mlx.mlx_stream, grouped: bool) !void {
         const rung: QwenRung = .{ .s = s, .rows = rows, .layers = layers, .dec = dec, .weights = weights[0..layers], .chains = chains[0..layers], .ids = ids[0..layers], .scores = scores[0..layers] };
         const label = try std.fmt.allocPrint(run.a, "qwen4 {s} rows {d}", .{ if (grouped) "grouped" else "bank", rows });
         try run.interleave(label, &rung, qwenSample);
+    }
+}
+
+// ── custom-kernel launch: the host's side of `mlx_fast_metal_kernel_apply` and of its eval ──
+
+const launch_max_steps = 256;
+const launch_width = 4096;
+
+pub const kernel_launch: report.Bench = .{
+    .name = "shared.kernel_launch",
+    .scope = .shared,
+    .what = "host us of one custom-kernel launch on tiny inputs (f16 x, w, 4-value scale; 4096 outputs) with a 1k or a 32k header: the apply alone, and apply plus its share of one eval of the batch",
+    .unit = .us,
+    .steps = 64,
+    .axes = &.{.{ .name = "header", .values = &.{ "1k", "32k" }, .numeric = false }},
+    .arms = &.{ "apply", "apply_eval" },
+    .ref = "apply",
+    .run = runLaunch,
+};
+
+const launch_source =
+    \\uint i = thread_position_in_grid.x;
+    \\out[i] = x[i] * w[i] + sc[i & 3u] + T(helper_0(1.0f));
+;
+
+const LaunchRung = struct {
+    s: mlx.mlx_stream,
+    kernel: mlx.mlx_fast_metal_kernel,
+    x: Arr,
+    w: Arr,
+    sc: Arr,
+    steps: usize,
+};
+
+/// Nanoseconds per launch; the arm decides whether the eval of the batch is inside the clock.
+fn launchSample(r: *const LaunchRung, arm: usize) anyerror!f64 {
+    const inputs = mlx.mlx_vector_array_new_data(&[_]Arr{ r.x, r.w, r.sc }, 3);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{launch_width}, 1, .float16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, launch_width, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .float16));
+    const batch = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(batch);
+    const sw = io_util.Stopwatch.init(io());
+    for (0..r.steps) |_| {
+        var outs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, r.kernel, inputs, cfg, r.s));
+        var y = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+        try mlx.check(mlx.mlx_vector_array_append_value(batch, y));
+    }
+    const apply_ns = sw.read();
+    try mlx.check(mlx.mlx_eval(batch));
+    const ns = if (arm == 0) apply_ns else sw.read();
+    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(r.steps));
+}
+
+/// Helper functions to pad a kernel header to `bytes`, the size of a real sushi kernel's source.
+fn launchHeader(bytes: usize) ![:0]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    var n: usize = 0;
+    while (text.items.len < bytes) : (n += 1) try text.print(alloc, "static inline float helper_{d}(float v) {{ return v * 1.0001f + {d}.0f; }}\n", .{ n, n });
+    const out = try alloc.allocSentinel(u8, text.items.len, 0);
+    @memcpy(out, text.items);
+    return out;
+}
+
+fn runLaunch(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    const steps = @min(run.steps(64), launch_max_steps);
+    var vals: [launch_width]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = 0.001 * @as(f32, @floatFromInt(i % 97));
+    const x32 = mlx.mlx_array_new_data(&vals, &[_]c_int{launch_width}, 1, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    const sc32 = mlx.mlx_array_new_data(&vals, &[_]c_int{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(sc32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_astype(&x, x32, .float16, s));
+    try mlx.check(mlx.mlx_astype(&sc, sc32, .float16, s));
+    try eval(x);
+    try eval(sc);
+    const names = [_][*:0]const u8{ "x", "w", "sc" };
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    for (run.axis("header")) |size| {
+        const header = try launchHeader(if (std.mem.eql(u8, size, "1k")) 1024 else 32 * 1024);
+        defer alloc.free(header);
+        const name = try std.fmt.allocPrintSentinel(alloc, "sushi_ubench_launch_{s}", .{size}, 0);
+        defer alloc.free(name);
+        const kernel = mlx.mlx_fast_metal_kernel_new(name, iv, ov, launch_source, header, true, false);
+        if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+        defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
+        const rung: LaunchRung = .{ .s = s, .kernel = kernel, .x = x, .w = x, .sc = sc, .steps = steps };
+        const label = try std.fmt.allocPrint(run.a, "header {s}", .{size});
+        try run.interleave(label, &rung, launchSample);
     }
 }

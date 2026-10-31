@@ -848,12 +848,14 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     const prompt = ids[0..30];
     const steps: usize = 24;
 
+    // The warm-up's DSpark verifies defer their heads too.
+    const warmed = m.heads_deferred;
     var want = try lazyHeadSteps(a, &xfm, prompt, steps, false);
     defer want.deinit(a);
-    try testing.expectEqual(@as(u64, 0), m.heads_deferred);
+    try testing.expectEqual(warmed, m.heads_deferred);
     var got = try lazyHeadSteps(a, &xfm, prompt, steps, true);
     defer got.deinit(a);
-    try testing.expectEqual(@as(u64, steps), m.heads_deferred);
+    try testing.expectEqual(warmed + steps, m.heads_deferred);
     try testing.expectEqualSlices(u32, want.tokens.items, got.tokens.items);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(got.logits.items));
 

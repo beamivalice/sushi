@@ -2086,6 +2086,10 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     try std.testing.expect(checked > 0);
 }
 
+test "format corpus: the incremental stream gates agree with the full rescan on every recorded reply" {
+    for (corpus, 0..) |entry, i| try think_tags.expectIncrementalGatesAgree(entry.raw, i);
+}
+
 test "format corpus: history round-trip serialization survives any byte content" {
     // Inverse direction of the corpus: everything a model emits (and every
     // tool result an agent echoes back) re-enters the NEXT request's history

@@ -209,5 +209,6 @@ test {
     _ = @import("opencode_persist.zig");
     _ = @import("main.zig");
     _ = @import("mlx.zig");
+    _ = @import("mlx_kernel_keys.zig");
     _ = @import("test_models.zig");
 }

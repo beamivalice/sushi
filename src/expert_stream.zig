@@ -1333,6 +1333,16 @@ const CacheSnapshot = struct {
     ready: []bool,
     tick: u64,
 
+    fn take(allocator: std.mem.Allocator, cache: *const GroupCache) !CacheSnapshot {
+        const expert_to_slot = try allocator.dupe(i32, cache.expert_to_slot);
+        errdefer allocator.free(expert_to_slot);
+        const slot_to_expert = try allocator.dupe(u16, cache.slot_to_expert);
+        errdefer allocator.free(slot_to_expert);
+        const ages = try allocator.dupe(u64, cache.ages);
+        errdefer allocator.free(ages);
+        return .{ .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .ready = try allocator.dupe(bool, cache.ready), .tick = cache.tick };
+    }
+
     fn restore(self: *const CacheSnapshot, cache: *GroupCache) void {
         @memcpy(cache.expert_to_slot, self.expert_to_slot);
         @memcpy(cache.slot_to_expert, self.slot_to_expert);
@@ -1347,6 +1357,54 @@ const CacheSnapshot = struct {
         allocator.free(self.ages);
         allocator.free(self.ready);
         self.* = undefined;
+    }
+};
+
+const AgedSlot = struct { slot: u16, age: u64 };
+
+/// What puts a cache back as it was before a `resolve`. Experts that all sit ready only touch their slots' ages and
+/// the tick, which a log of those ages undoes; a miss can move any slot and takes a full copy.
+const CacheUndo = union(enum) {
+    touched: struct { tick: u64, first: usize, end: usize },
+    full: CacheSnapshot,
+
+    /// The log is the caller's, kept across routes; `experts` are the group-local ids about to be resolved.
+    fn begin(allocator: std.mem.Allocator, aged: *std.ArrayList(AgedSlot), cache: *const GroupCache, experts: []const u16) !CacheUndo {
+        if (allReady(cache, experts) and experts.len <= cache.ages.len) {
+            const first = aged.items.len;
+            for (experts) |expert| {
+                const slot: u16 = @intCast(cache.expert_to_slot[expert]);
+                try aged.append(allocator, .{ .slot = slot, .age = cache.ages[slot] });
+            }
+            return .{ .touched = .{ .tick = cache.tick, .first = first, .end = aged.items.len } };
+        }
+        return .{ .full = try CacheSnapshot.take(allocator, cache) };
+    }
+
+    fn allReady(cache: *const GroupCache, experts: []const u16) bool {
+        for (experts) |expert| {
+            if (expert >= cache.expert_to_slot.len) return false;
+            const raw = cache.expert_to_slot[expert];
+            if (raw < 0 or !cache.ready[@intCast(raw)]) return false;
+        }
+        return true;
+    }
+
+    fn restore(self: *const CacheUndo, aged: []const AgedSlot, cache: *GroupCache) void {
+        switch (self.*) {
+            .touched => |t| {
+                for (aged[t.first..t.end]) |entry| cache.ages[entry.slot] = entry.age;
+                cache.tick = t.tick;
+            },
+            .full => |*snapshot| snapshot.restore(cache),
+        }
+    }
+
+    fn deinit(self: *CacheUndo, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .touched => {},
+            .full => |*snapshot| snapshot.deinit(allocator),
+        }
     }
 };
 
@@ -1868,6 +1926,10 @@ pub const Engine = struct {
     fill_experts_total: u64 = 0,
     fill_bytes_total: u64 = 0,
     fill_ns_total: u64 = 0,
+    /// Full cache copies a route took to be able to undo itself (`CacheUndo`).
+    cache_snapshots: u64 = 0,
+    /// The ages a hit-only resolve overwrote, kept between routes.
+    age_log: std.ArrayList(AgedSlot) = .empty,
     copy_ns_total: u64 = 0,
     copy_bytes_total: u64 = 0,
     /// Wide routes whose fill the caller staged (`prepareHostStaged`).
@@ -2071,6 +2133,7 @@ pub const Engine = struct {
         self.releaseSlabs();
         for (self.layers) |*layer| if (layer.active) layer.cache.deinit();
         self.allocator.free(self.layers);
+        self.age_log.deinit(self.allocator);
         self.store.deinit();
         if (self.drop_owned) |d| {
             d.deinit();
@@ -2307,13 +2370,8 @@ pub const Engine = struct {
     }
 
     fn snapshotCache(self: *Engine, cache: *const GroupCache) !CacheSnapshot {
-        return .{
-            .expert_to_slot = try self.allocator.dupe(i32, cache.expert_to_slot),
-            .slot_to_expert = try self.allocator.dupe(u16, cache.slot_to_expert),
-            .ages = try self.allocator.dupe(u64, cache.ages),
-            .ready = try self.allocator.dupe(bool, cache.ready),
-            .tick = cache.tick,
-        };
+        self.cache_snapshots += 1;
+        return CacheSnapshot.take(self.allocator, cache);
     }
 
     fn runFill(self: *Engine, layer_index: u16, spans: []const io_mod.FillSpan) !void {
@@ -2376,6 +2434,14 @@ pub const Engine = struct {
         pf.mu.lockUncancelable(io);
         defer pf.mu.unlock(io);
         if (pf.len == Prefetcher.jobs_max) return;
+        // With no job on the layer the host owns its cache map, so a prediction that holds nothing new queues and wakes nothing.
+        if (!prefetchTouches(pf, layer)) {
+            const gl = self.layers[layer].grouped.?;
+            var want: [Prefetcher.rows_max * Prefetcher.cand_max]u16 = undefined;
+            var wanted: usize = 0;
+            for (0..rows) |r| self.collectWanted(layer, gl, cand[r * n ..][0..n], m, &want, &wanted);
+            if (wanted == 0) return;
+        }
         const job = &pf.jobs[(pf.head + pf.len) % Prefetcher.jobs_max];
         job.layer = layer;
         job.rows = @intCast(rows);
@@ -2443,6 +2509,23 @@ pub const Engine = struct {
         }
     }
 
+    /// Adds to `want` the first `m` of one row's ranked candidates the layer's pool does not hold ready.
+    fn collectWanted(self: *const Engine, layer: u16, gl: *const GroupedLayer, cand: []const u16, m: usize, want: []u16, wanted: *usize) void {
+        var taken: usize = 0;
+        for (cand) |expert| {
+            if (expert >= gl.expertCount() or self.isDropped(layer, expert)) continue;
+            const g = gl.groups.groupOf(expert);
+            const raw = gl.caches[g].expert_to_slot[expert - gl.groups.base[g]];
+            if (raw >= 0 and gl.caches[g].ready[@intCast(raw)]) continue;
+            taken += 1;
+            if (std.mem.indexOfScalar(u16, want[0..wanted.*], expert) == null) {
+                want[wanted.*] = expert;
+                wanted.* += 1;
+            }
+            if (taken == m) break;
+        }
+    }
+
     /// Reads the job's uncached experts into their pools. Where anything fails the pool is left as it was.
     fn prefetchFill(self: *Engine, pf: *Prefetcher, job: *const Prefetcher.Job) !void {
         const layer = &self.layers[job.layer];
@@ -2451,21 +2534,7 @@ pub const Engine = struct {
         const count: usize = gl.groups.count;
         var want: [Prefetcher.rows_max * Prefetcher.cand_max]u16 = undefined;
         var wanted: usize = 0;
-        for (0..job.rows) |r| {
-            var taken: usize = 0;
-            for (job.cand[r][0..job.n]) |expert| {
-                if (expert >= gl.expertCount() or self.isDropped(job.layer, expert)) continue;
-                const g = gl.groups.groupOf(expert);
-                const raw = gl.caches[g].expert_to_slot[expert - gl.groups.base[g]];
-                if (raw >= 0 and gl.caches[g].ready[@intCast(raw)]) continue;
-                taken += 1;
-                if (std.mem.indexOfScalar(u16, want[0..wanted], expert) == null) {
-                    want[wanted] = expert;
-                    wanted += 1;
-                }
-                if (taken == job.m) break;
-            }
-        }
+        for (0..job.rows) |r| self.collectWanted(job.layer, gl, job.cand[r][0..job.n], job.m, &want, &wanted);
         if (wanted == 0) return;
 
         var snapshots: [quant.rate_group_limit]CacheSnapshot = undefined;
@@ -2891,14 +2960,16 @@ pub const Engine = struct {
         const count: usize = gl.groups.count;
         if (layer.slabs.len != n) return error.MissingExpertSlab;
 
-        var snapshots: [quant.rate_group_limit]CacheSnapshot = undefined;
-        var snapshotted: usize = 0;
-        defer for (snapshots[0..snapshotted]) |*snapshot| snapshot.deinit(self.allocator);
-        while (snapshotted < count) : (snapshotted += 1) snapshots[snapshotted] = try self.snapshotCache(&gl.caches[snapshotted]);
+        self.age_log.clearRetainingCapacity();
+        var undos: [quant.rate_group_limit]CacheUndo = undefined;
+        var undoable: usize = 0;
+        defer for (undos[0..undoable]) |*undo| undo.deinit(self.allocator);
         var committed = false;
         var wrote_cache = false;
-        errdefer if (!committed) for (0..count) |g| {
-            if (wrote_cache) gl.caches[g].invalidateUnready() else snapshots[g].restore(&gl.caches[g]);
+        errdefer if (!committed) {
+            if (wrote_cache) {
+                for (0..count) |g| gl.caches[g].invalidateUnready();
+            } else for (undos[0..undoable], 0..) |*undo, g| undo.restore(self.age_log.items, &gl.caches[g]);
         };
 
         var resolutions: [quant.rate_group_limit]GroupResolution = undefined;
@@ -2913,6 +2984,9 @@ pub const Engine = struct {
                 for (occurrences) |expert| {
                     if (gl.groups.groupOf(expert) == resolved) try local.append(self.allocator, expert - gl.groups.base[resolved]);
                 }
+                undos[resolved] = try CacheUndo.begin(self.allocator, &self.age_log, &gl.caches[resolved], local.items);
+                undoable += 1;
+                self.cache_snapshots += @intFromBool(undos[resolved] == .full);
                 resolutions[resolved] = try gl.caches[resolved].resolve(self.allocator, local.items);
                 use_union = use_union or resolutions[resolved].workspace;
                 resolved += 1;
@@ -5206,6 +5280,48 @@ test "expert substitution stops swapping an expert out after the starvation limi
     try t.expectEqualSlices(u16, &.{ 0, 1, 2 }, &kept);
     var again = [_]u16{ 0, 1, 2 };
     try t.expectEqual(@as(u32, 1), sc.run(&again, &logits, &cached, 0.3, 3));
+}
+
+test "a cache undo puts a cache back after a resolve of hits or of misses, and copies the cache only for the misses" {
+    const t = std.testing;
+    var cache = try GroupCache.init(t.allocator, 3, 6);
+    defer cache.deinit();
+    var warm = try cache.resolve(t.allocator, &.{ 0, 1, 2 });
+    defer warm.deinit(t.allocator);
+    markResolvedReady(&cache, &warm);
+    var aged: std.ArrayList(AgedSlot) = .empty;
+    defer aged.deinit(t.allocator);
+    try aged.ensureTotalCapacity(t.allocator, 8);
+
+    var before = try CacheSnapshot.take(t.allocator, &cache);
+    defer before.deinit(t.allocator);
+    // Hits need no allocation at all, repeats of an expert included.
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    const hit_undo = try CacheUndo.begin(failing.allocator(), &aged, &cache, &.{ 2, 0, 2 });
+    try t.expect(hit_undo == .touched);
+    var hit = try cache.resolve(t.allocator, &.{ 2, 0, 2 });
+    hit.deinit(t.allocator);
+    try t.expect(!std.mem.eql(u64, before.ages, cache.ages));
+    hit_undo.restore(aged.items, &cache);
+    try expectCacheIs(&before, &cache);
+
+    var miss_undo = try CacheUndo.begin(t.allocator, &aged, &cache, &.{ 0, 4 });
+    defer miss_undo.deinit(t.allocator);
+    try t.expect(miss_undo == .full);
+    var miss = try cache.resolve(t.allocator, &.{ 0, 4 });
+    miss.deinit(t.allocator);
+    try t.expect(cache.expert_to_slot[4] >= 0);
+    miss_undo.restore(aged.items, &cache);
+    try expectCacheIs(&before, &cache);
+}
+
+fn expectCacheIs(want: *const CacheSnapshot, cache: *const GroupCache) !void {
+    const t = std.testing;
+    try t.expectEqualSlices(i32, want.expert_to_slot, cache.expert_to_slot);
+    try t.expectEqualSlices(u16, want.slot_to_expert, cache.slot_to_expert);
+    try t.expectEqualSlices(u64, want.ages, cache.ages);
+    try t.expectEqualSlices(bool, want.ready, cache.ready);
+    try t.expectEqual(want.tick, cache.tick);
 }
 
 test "group cache reports only ready residents as cached" {

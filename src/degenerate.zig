@@ -99,6 +99,12 @@ fn DistinctSet(comptime cap: usize) type {
     };
 }
 
+/// The vocabulary ratio of the near-repeat judgement: the window recycles a small vocabulary. The `TailGuard` reads
+/// the same rule from its running count.
+fn tokenRatioPasses(distinct: usize, window_len: usize) bool {
+    return @as(f32, @floatFromInt(distinct)) / @as(f32, @floatFromInt(window_len)) <= near_repeat_max_token_ratio;
+}
+
 /// The three-ratio judgement over ONE window-sized span. Split out so the trim
 /// search can slide the same window backwards without re-deriving the rule.
 fn nearRepeatWindowIsDegenerate(window: []const u32) bool {
@@ -106,8 +112,7 @@ fn nearRepeatWindowIsDegenerate(window: []const u32) bool {
     // distinct (the healthy case, which is also the hot one).
     var toks = DistinctSet(near_repeat_window * 2){};
     for (window) |t| _ = toks.insert(t);
-    const token_ratio = @as(f32, @floatFromInt(toks.n)) / @as(f32, @floatFromInt(window.len));
-    if (token_ratio > near_repeat_max_token_ratio) return false;
+    if (!tokenRatioPasses(toks.n, window.len)) return false;
 
     var grams = DistinctSet(near_repeat_window * 2){};
     var i: usize = 0;
@@ -240,6 +245,12 @@ fn trailingCycleStart(tokens: []const u32, p: usize) usize {
 /// `slot_outcome.loopStopReason`: the exact tiers speak first, and the fuzzy
 /// near-repeat tier only ever judges spans they have already declined.
 pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
+    return degenerateTailWindowed(tokens, null);
+}
+
+/// `degenerateTail`, with the number of distinct tokens in the last `near_repeat_window` of `tokens` when the caller
+/// already counts them: a window above the vocabulary ratio is acquitted without being rebuilt.
+fn degenerateTailWindowed(tokens: []const u32, window_distinct: ?usize) ?DegenerateTail {
     if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, degenerate_loop_reps, degenerate_loop_min_span)) |p| {
         return .{ .tier = .exact_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
@@ -253,6 +264,7 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
         return .{ .tier = .long_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
     if (tokens.len < near_repeat_window) return null;
+    if (window_distinct) |d| if (!tokenRatioPasses(d, near_repeat_window)) return null;
     if (!nearRepeatWindowIsDegenerate(tokens[tokens.len - near_repeat_window ..])) return null;
 
     // Slide the window back while it keeps convicting. A restatement loop
@@ -276,6 +288,96 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
     if (tokens.len - start < near_repeat_min_span) return null;
     return .{ .tier = .near_repeat, .start = start };
 }
+
+/// Distinct-token counts of the last `near_repeat_window` tokens, open-addressed with backward-shift deletion so
+/// a token leaving the window costs what one entering it does.
+const WindowCounts = struct {
+    const cap = near_repeat_window * 2;
+    keys: [cap]u32 = @splat(0),
+    counts: [cap]u16 = @splat(0),
+    distinct: usize = 0,
+    /// Table operations so far (add, remove, rebuild): the unit a tick's work is bounded in.
+    ops: u64 = 0,
+
+    fn home(key: u32) usize {
+        return (key *% 0x9E3779B1) >> @intCast(32 - std.math.log2(cap));
+    }
+
+    fn clear(self: *WindowCounts) void {
+        @memset(&self.counts, 0);
+        self.distinct = 0;
+    }
+
+    fn add(self: *WindowCounts, key: u32) void {
+        self.ops += 1;
+        var i = home(key);
+        while (self.counts[i] != 0 and self.keys[i] != key) i = (i + 1) % cap;
+        if (self.counts[i] == 0) {
+            self.keys[i] = key;
+            self.distinct += 1;
+        }
+        self.counts[i] += 1;
+    }
+
+    fn remove(self: *WindowCounts, key: u32) void {
+        self.ops += 1;
+        var i = home(key);
+        while (self.keys[i] != key or self.counts[i] == 0) i = (i + 1) % cap;
+        self.counts[i] -= 1;
+        if (self.counts[i] != 0) return;
+        self.distinct -= 1;
+        var hole = i;
+        var j = i;
+        while (true) {
+            j = (j + 1) % cap;
+            if (self.counts[j] == 0) return;
+            const h = home(self.keys[j]);
+            // The entry at j stays unless its home lies cyclically in (hole, j].
+            const stays = if (hole <= j) hole < h and h <= j else hole < h or h <= j;
+            if (stays) continue;
+            self.keys[hole] = self.keys[j];
+            self.counts[hole] = self.counts[j];
+            self.counts[j] = 0;
+            hole = j;
+        }
+    }
+};
+
+/// `degenerateTail` for a loop guard that asks every tick over a list that only grows: the vocabulary count of the
+/// near-repeat window moves by the tokens each tick appended, and the full judgement runs only when that count is
+/// low enough to convict. Same verdicts as `degenerateTail(ids[start..])`.
+pub const TailGuard = struct {
+    counts: WindowCounts = .{},
+    start: usize = 0,
+    /// The end of `ids` the counts cover, and the token before it.
+    seen: usize = 0,
+    last: u32 = 0,
+
+    /// `ids[start..]` is the span to judge. A list that shrank, a moved `start`, or a changed last-seen token
+    /// rebuilds the counts from the window.
+    pub fn degenerateTail(self: *TailGuard, ids: []const u32, start: usize) ?DegenerateTail {
+        self.sync(ids, start);
+        return degenerateTailWindowed(ids[start..], self.counts.distinct);
+    }
+
+    fn sync(self: *TailGuard, ids: []const u32, start: usize) void {
+        const tokens = ids[start..];
+        const resumes = self.start == start and ids.len >= self.seen and
+            (self.seen == start or ids[self.seen - 1] == self.last);
+        if (resumes) {
+            for (tokens[self.seen - start ..], self.seen - start..) |t, i| {
+                self.counts.add(t);
+                if (i >= near_repeat_window) self.counts.remove(tokens[i - near_repeat_window]);
+            }
+        } else {
+            self.counts.clear();
+            for (tokens[tokens.len -| near_repeat_window..]) |t| self.counts.add(t);
+        }
+        self.start = start;
+        self.seen = ids.len;
+        if (ids.len > start) self.last = ids[ids.len - 1];
+    }
+};
 
 /// Stall clock for the request timeout: the deadline measures time since the
 /// last PRODUCED token, not since the request started. A wall-clock request
@@ -661,4 +763,118 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
     const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.long_cycle, d.tier);
     try testing.expectEqual(@as(usize, 2 + cycle.len), d.start);
+}
+
+/// Both ticks of a guard and the pure function over the same span give one verdict.
+fn expectGuardAgrees(guard: *TailGuard, ids: []const u32, start: usize) !void {
+    const want = degenerateTail(ids[start..]);
+    const got = guard.degenerateTail(ids, start);
+    try testing.expectEqual(want == null, got == null);
+    if (want) |w| {
+        try testing.expectEqual(w.tier, got.?.tier);
+        try testing.expectEqual(w.start, got.?.start);
+    }
+}
+
+/// Ticks `guard` over `ids` the way a decode loop does: `stride_seed` picks how many tokens each tick appended.
+fn guardTicksAgree(ids: []const u32, start: usize, stride_seed: u32) !void {
+    var guard: TailGuard = .{};
+    var rng = stride_seed;
+    var at: usize = start;
+    while (at < ids.len) {
+        rng = rng *% 1664525 +% 1013904223;
+        at = @min(ids.len, at + 1 + (rng >> 16) % 4);
+        try expectGuardAgrees(&guard, ids[0..at], start);
+    }
+}
+
+test "TailGuard: every tick's verdict is degenerateTail's, through a healthy start, a convicting loop and a file that ends" {
+    const al = testing.allocator;
+    const phrasings = [_][]const u32{
+        &[_]u32{ 1, 2, 3, 4, 5 },
+        &[_]u32{ 1, 2, 3, 5, 4 },
+        &[_]u32{ 1, 2, 4, 3, 5 },
+    };
+    var restating = std.ArrayList(u32).empty;
+    defer restating.deinit(al);
+    for (0..900) |i| try restating.append(al, @intCast(1000 + i));
+    var rng: u32 = 12345;
+    while (restating.items.len < 900 + near_repeat_min_span + 1500) {
+        rng = rng *% 1664525 +% 1013904223;
+        try restating.appendSlice(al, phrasings[(rng >> 16) % phrasings.len]);
+    }
+    try guardTicksAgree(restating.items, 0, 1);
+    try guardTicksAgree(restating.items, 0, 2);
+    // A reset guard start (a reasoning boundary) leaves the earlier tokens out of the judged span.
+    try guardTicksAgree(restating.items, 1337, 3);
+
+    var grid = std.ArrayList(u32).empty;
+    defer grid.deinit(al);
+    var seed: u32 = 777;
+    while (grid.items.len < 2800) {
+        try grid.append(al, 200);
+        for (0..24) |col| {
+            seed = seed *% 1664525 +% 1013904223;
+            try grid.append(al, if (col == 0 or col == 23 or (seed >> 16) % 10 < 3) 101 else 100);
+        }
+        try grid.appendSlice(al, &[_]u32{ 200, 201, 202 });
+    }
+    try guardTicksAgree(grid.items, 0, 4);
+
+    var cycle = std.ArrayList(u32).empty;
+    defer cycle.deinit(al);
+    try cycle.appendSlice(al, &[_]u32{ 7, 8, 9, 10 });
+    for (0..degenerate_loop_min_span) |_| try cycle.appendSlice(al, &[_]u32{ 101, 102, 103 });
+    try guardTicksAgree(cycle.items, 0, 5);
+
+    var narrow = std.ArrayList(u32).empty;
+    defer narrow.deinit(al);
+    for (0..3000) |_| {
+        rng = rng *% 1664525 +% 1013904223;
+        try narrow.append(al, 50 + (rng >> 16) % 90);
+    }
+    try guardTicksAgree(narrow.items, 0, 6);
+}
+
+test "TailGuard: a list that shrank or changed under it is judged afresh" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    var rng: u32 = 99;
+    for (0..3000) |_| {
+        rng = rng *% 1664525 +% 1013904223;
+        try ids.append(al, 10 + (rng >> 16) % 100);
+    }
+    var guard: TailGuard = .{};
+    try expectGuardAgrees(&guard, ids.items[0..2500], 0);
+    try expectGuardAgrees(&guard, ids.items[0..1500], 0);
+    try expectGuardAgrees(&guard, ids.items[0..2900], 0);
+    ids.items[2899] = 5000;
+    try expectGuardAgrees(&guard, ids.items[0..2900], 0);
+    try expectGuardAgrees(&guard, ids.items[0..3000], 2000);
+    try expectGuardAgrees(&guard, ids.items[0..3000], 0);
+}
+
+test "TailGuard: a tick's table work is the tokens it appended, whatever the window holds" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    var rng: u32 = 4242;
+    for (0..6000) |_| {
+        rng = rng *% 1664525 +% 1013904223;
+        try ids.append(al, (rng >> 16) % 3000);
+    }
+    var guard: TailGuard = .{};
+    var at: usize = 1;
+    while (at <= 2 * near_repeat_window) : (at += 1) _ = guard.degenerateTail(ids.items[0..at], 0);
+    // Each token enters the table once and leaves it once.
+    for (2 * near_repeat_window..ids.items.len - 5) |end| {
+        const before = guard.counts.ops;
+        _ = guard.degenerateTail(ids.items[0 .. end + 1], 0);
+        try testing.expect(guard.counts.ops - before <= 2);
+    }
+    // A block of five in one tick: two table operations apiece.
+    const before = guard.counts.ops;
+    _ = guard.degenerateTail(ids.items, 0);
+    try testing.expect(guard.counts.ops - before <= 10);
 }

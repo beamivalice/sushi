@@ -618,7 +618,8 @@ pick sat in the slot the GPU read, else the exact sum. A miss rebuilds the layer
 stream, `Unresolved`), restores what the successor's pass changed (`Undo`: the open pooling group, the verify copies, the
 compressed/index row counts and, over several rows, the window ring, because a later row's write can land on a slot an
 earlier row still reads; a one-row pass's ring slot and appended rows are written again at the same places) and runs the
-successor again. Only the settle touches the cache, so a discarded route moves no LRU or stat. The picks of a layer
+successor again. The settle keeps its pick and slot buffers between layers (`StqStream.picks`, `slots`), and the layers of a pass share
+the position and group-count arrays they have in common (`Shared.index`, one build per distinct key). Only the settle touches the cache, so a discarded route moves no LRU or stat. The picks of a layer
 are verified against the pool before any later layer's, so a DSpark target, a verify round's rows and the state arrays
 of a kept layer never come from a wrong sum. An Engram layer is rebuilt from the rows its pass read once
 (`Pass.engram_rows`). A layer the stream cannot queue (resident, released, lossy pick) settles its predecessor first; a
@@ -626,8 +627,11 @@ pass that rebuilt 3 layers plus a third of those built (`Model.route_spec_rebuil
 not wait for its embedding, and queues the head from the last layer's queued sum before settling it (a rebuild builds the
 head again), so the GPU's only idle points are the logits read and the host's sampling. A pipelined one-row greedy
 decode (`ForwardCtx.lazy_logits`, set by the Generator when the request reads only the argmax) takes the logits back
-unevaluated, so the sampler's argmax rides the head's wait (`Model.heads_deferred`); logprobs, penalties, grammar, DSpark
-verify and every wider pass keep the waited head. On the same gate (text, no tap/trace/profile, layer 0 not an Engram
+unevaluated, so the sampler's argmax rides the head's wait (`Model.heads_deferred`); logprobs, penalties, grammar and every
+wider pass keep the waited head. A DSpark verify defers its head the same way (`verify` sets `defer_head`: the round's
+verdict is a value built on the logits), and neither it nor `finishVerify` waits on anything else: the stage-window rows
+`v.mh` and a rolled-back open group stay lazy for the next pass's layer evaluation, so the argmax is the round's only
+wait besides the layers' pick reads (`dsv41 DSpark: a verify round waits on neither ...`, `readsAt`). On the same gate (text, no tap/trace/profile, layer 0 not an Engram
 layer) the forward queues the argmax, the embedding gather and layer 0 before the host reads the token
 (`dsv41_model.extendLazy`, `Model.lazy_starts`); the host then reads the token, hashes it for the Engram rows and runs
 layer 1 on. A token the pass refuses (an image id without image rows) restores layer 0's state (`Undo`) and the next
@@ -640,6 +644,14 @@ runs beside the gate GEMV and not in a buffer of its own behind the routed chain
 die < 50 C at boot, `taskpolicy -a`), same text. The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
 round's kept rows ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
+
+A submit costs host CPU (a Metal command buffer), so two with no host wait between them are one: the prefetch
+prediction rides the picks' `submitWith`, and the routed `out` and a DSpark target leave with the layer's end-of-layer
+`async_eval`. A decode layer queues 3 command buffers when the host reads its picks (picks with the hc split, shared expert,
+layer) and 1 when its chain is queued from the map: the host reads those picks only after the next layer is submitted, so they
+leave with the layer's own `async_eval`. A prefetch prediction keeps the picks' early submit (2 buffers), so the prefetch is not
+issued a layer's GPU time later (`dsv41 stq: a queued decode layer is one command buffer ...`, `async_evals`).
+A submit stays where the host waits next: the picks and the shared expert before `apply`'s read, the exact stream of a rollback, the queued head.
 
 | Proof (`DSV41_STQ_TINY`, a pack made from the `--geometry stq` fixture) | Bar |
 |---|---|

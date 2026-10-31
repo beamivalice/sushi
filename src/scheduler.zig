@@ -4130,7 +4130,7 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
     const loop_guard_start = gen.loopGuardStart();
-    if (slot_outcome.loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+    if (slot_outcome.loopStopDecisionTracked(&gen.loop_guard, gen.generated_ids.items, loop_guard_start)) |relative_stop| {
         if (gen.hasPrePayloadConstraint()) {
             switch (try gen.forceConstraintTransition(slot.allocator)) {
                 .committed => |boundary| {
