@@ -174,14 +174,11 @@ pub fn build(b: *std.Build) void {
     test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
     const run_host_tests = b.addRunArtifact(host_tests);
     test_host_step.dependOn(&run_host_tests.step);
-    if (test_filter == null) test_step.dependOn(&run_host_tests.step);
-    // A filtered run stays one binary: bucket filters OR with the user's, they cannot narrow it.
+    test_step.dependOn(&run_host_tests.step);
     const unit_tests: []const *std.Build.Step.Compile = if (test_model == .exl3 or test_model == .enc)
         &.{}
-    else if (test_filter) |f|
-        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .root_module = test_mod, .filters = f })}) catch @panic("OOM")
     else
-        addTestBuckets(b, test_mod, test_model);
+        addTestBuckets(b, test_mod, test_model, test_filter);
     for (unit_tests) |unit_test| {
         test_build.dependOn(&b.addInstallArtifact(unit_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_unit_tests = b.addRunArtifact(unit_test);
@@ -197,10 +194,8 @@ pub fn build(b: *std.Build) void {
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
     const exl3_tests: []const *std.Build.Step.Compile = if (test_model != null and test_model != .exl3)
         &.{}
-    else if (test_filter) |f|
-        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .name = "exl3-test", .root_module = exl3_test_mod, .filters = f })}) catch @panic("OOM")
     else
-        addExl3TestBins(b, exl3_test_mod);
+        addExl3TestBins(b, exl3_test_mod, test_filter);
     for (exl3_tests) |exl3_test| {
         test_build.dependOn(&b.addInstallArtifact(exl3_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         test_step.dependOn(&b.addRunArtifact(exl3_test).step);
@@ -292,14 +287,32 @@ const test_dirs = [_][]const u8{ "src", "src/qwen4", "src/mimo2", "src/glm5", "s
 /// A test's model is its file's folder; the src root is shared.
 const TestModel = enum { qwen4, mimo2, glm5, dsv41, exl3, enc };
 
-fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []const *std.Build.Step.Compile {
+/// Zig keeps a test when its fully qualified name holds any filter, and filters OR, so a user's filter cannot narrow
+/// a bucket's: the scan names each test in full and keeps those the user's filters select.
+fn selectedByUser(user: ?[]const []const u8, full: []const u8) bool {
+    const filters = user orelse return true;
+    for (filters) |f| if (std.mem.indexOf(u8, full, f) != null) return true;
+    return false;
+}
+
+/// The filter that selects a user-matched test. Filters reach `zig test` in a response file whose parser reads a quote
+/// or backslash as syntax, so a name is cut at its first one; the cut must not select a test the user's filters skip.
+fn nameFilter(full: []const u8, all: []const []const u8, user: []const []const u8) []const u8 {
+    const cut = full[0 .. std.mem.indexOfAny(u8, full, "'\"\\") orelse return full];
+    for (all) |other| if (std.mem.indexOf(u8, other, cut) != null and !selectedByUser(user, other))
+        std.debug.panic("rename the test \"{s}\": its filter cannot avoid a quote or backslash", .{full});
+    return cut;
+}
+
+fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, user: ?[]const []const u8) []const *std.Build.Step.Compile {
     const io = b.graph.io;
     const host_stems = hostStems(b);
     var stems: std.ArrayList([]const u8) = .empty;
-    var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
+    var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8, full: []const u8 }) = .empty;
     // A scoped run names each test of a root file that another model's file name ends with ("model" in
     // "dsv41_model"), since a filter matches anywhere in a test name.
     var skipped: std.ArrayList([]const u8) = .empty;
+    var all_names: std.ArrayList([]const u8) = .empty;
     var top: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     for (test_dirs) |dir_path| {
         const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
@@ -321,14 +334,25 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
             b.dependOnFileContents(b.path(b.fmt("{s}/{s}", .{ dir_path, entry.name })));
             const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
             var lines = std.mem.splitScalar(u8, source, '\n');
+            var owner: []const u8 = "";
             while (lines.next()) |line| {
+                if ((std.mem.startsWith(u8, line, "pub const ") or std.mem.startsWith(u8, line, "const ")) and std.mem.endsWith(u8, line, " = struct {"))
+                    owner = line[std.mem.indexOf(u8, line, "const ").? + "const ".len .. line.len - " = struct {".len];
                 const indent = std.mem.indexOf(u8, line, "test \"") orelse continue;
-                if (indent == 0 and model != null and std.mem.endsWith(u8, line, "\" {"))
-                    top.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt("{s}.test.{s}", .{ stem, line["test \"".len .. line.len - "\" {".len] }) }) catch @panic("OOM");
+                if (indent == 0 and (model != null or user != null) and std.mem.endsWith(u8, line, "\" {")) {
+                    const full = b.fmt("{s}.test.{s}", .{ stem, line["test \"".len .. line.len - "\" {".len] });
+                    all_names.append(b.allocator, full) catch @panic("OOM");
+                    top.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = full }) catch @panic("OOM");
+                }
                 if (indent == 0 or std.mem.trim(u8, line[0..indent], " ").len != 0) continue;
                 if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
                     std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
-                nested.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt(".test.{s}", .{line[indent + "test \"".len .. line.len - "\" {".len]}) }) catch @panic("OOM");
+                const name = line[indent + "test \"".len .. line.len - "\" {".len];
+                // A nested test is `<stem>.<Struct>.test.<name>`; only a struct opened at column 0 is understood.
+                if (user != null and (indent != 4 or owner.len == 0)) std.debug.panic("{s}: cannot name the nested test: {s}", .{ entry.name, line });
+                const full = b.fmt("{s}.{s}.test.{s}", .{ stem, owner, name });
+                nested.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt(".test.{s}", .{name}), .full = full }) catch @panic("OOM");
+                all_names.append(b.allocator, full) catch @panic("OOM");
             }
         }
     }
@@ -364,6 +388,10 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
     for (0..test_buckets.len + 1) |i| {
         var filters: std.ArrayList([]const u8) = .empty;
         for (stems.items, bucket) |stem, k| if (k == i) {
+            if (user) |u| {
+                for (top.items) |t| if (std.mem.eql(u8, t.stem, stem) and selectedByUser(u, t.filter)) filters.append(b.allocator, nameFilter(t.filter, all_names.items, u)) catch @panic("OOM");
+                continue;
+            }
             const bare = stem[0 .. stem.len - ".test.".len];
             const shadowed = for (skipped.items) |sk| {
                 if (std.mem.endsWith(u8, sk, bare)) break true;
@@ -378,7 +406,10 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []c
             const owner = for (stems.items, bucket) |stem, k| {
                 if (std.mem.eql(u8, stem, n.stem)) break k;
             } else unreachable;
-            if (owner == i) filters.append(b.allocator, n.filter) catch @panic("OOM");
+            if (owner != i) continue;
+            if (user) |u| {
+                if (selectedByUser(u, n.full)) filters.append(b.allocator, nameFilter(n.full, all_names.items, u)) catch @panic("OOM");
+            } else filters.append(b.allocator, n.filter) catch @panic("OOM");
         }
         if (filters.items.len == 0) continue;
         const name = if (i < test_buckets.len) b.fmt("test-{s}", .{test_buckets[i][0]}) else "test-rest";
@@ -456,9 +487,10 @@ const Exl3Test = struct { filter: []const u8, weight: u16, bin: usize = 0 };
 
 /// The exl3 tests compile and run as several binaries. A filter matches `<file stem>.test.<name>`,
 /// so each test is a filter of its own, found by scanning src/exl3, and the tests are balanced by weight.
-fn addExl3TestBins(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
+fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []const u8) []const *std.Build.Step.Compile {
     const io = b.graph.io;
     var tests: std.ArrayList(Exl3Test) = .empty;
+    var all_names: std.ArrayList([]const u8) = .empty;
     var dir = buildRootHandle(b).openDir(io, "src/exl3", .{ .iterate = true }) catch |e| std.debug.panic("src/exl3/: {t}", .{e});
     defer dir.close(io);
     var files = dir.iterate();
@@ -477,9 +509,14 @@ fn addExl3TestBins(b: *std.Build, root: *std.Build.Module) []const *std.Build.St
             for (exl3_test_weights) |w| if (std.mem.indexOf(u8, name, w[0]) != null) {
                 weight = w[1];
             };
-            tests.append(b.allocator, .{ .filter = b.fmt("{s}.test.{s}", .{ stem, name }), .weight = weight }) catch @panic("OOM");
+            const full = b.fmt("{s}.test.{s}", .{ stem, name });
+            all_names.append(b.allocator, full) catch @panic("OOM");
+            if (selectedByUser(user, full)) tests.append(b.allocator, .{ .filter = full, .weight = weight }) catch @panic("OOM");
         }
     }
+    if (user) |u| for (tests.items) |*t| {
+        t.filter = nameFilter(t.filter, all_names.items, u);
+    };
     std.mem.sortUnstable(Exl3Test, tests.items, {}, struct {
         fn lt(_: void, x: Exl3Test, y: Exl3Test) bool {
             return if (x.weight != y.weight) x.weight > y.weight else std.mem.lessThan(u8, x.filter, y.filter);
