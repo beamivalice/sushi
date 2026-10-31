@@ -10,7 +10,7 @@ The order is fixed:
 
 1. **Write the failing test first.** It must fail for the right reason — i.e. the symptom you're fixing or the capability you're adding. If you can't articulate a failing test, you don't yet understand the change you're making.
 2. **Make it pass.** Minimum code to flip the test green; no opportunistic refactoring in the same step.
-3. **Run the full suite** (`zig build test` + the relevant integration script) — a green new test doesn't excuse a red regression elsewhere.
+3. **Run the subset the change reaches** (the row of [docs/testsuite.md](../docs/testsuite.md#what-a-change-runs) that fits it, plus the relevant integration script). A green new test doesn't excuse a red regression elsewhere. The full suite runs only for a wide stacked change or a version bump.
 4. **Then iterate** — refactor / clean up / extend, with the test as a tripwire.
 
 Concrete rules for each change class:
