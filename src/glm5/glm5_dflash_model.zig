@@ -586,6 +586,8 @@ fn expectArrayBits(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
     try mlx.check(mlx.mlx_array_eval(x));
     try mlx.check(mlx.mlx_array_eval(y));
     const n = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+    // MLX gives an empty array no data pointer.
+    if (n == 0) return;
     try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(x).?[0..n], mlx.mlx_array_data_uint8(y).?[0..n]);
 }
 

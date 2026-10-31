@@ -617,7 +617,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const dumping = moeDumpBeginForward();
     defer if (dumping) moeDumpForwardDone();
     self.fwd_gen +%= 1; // per-forward QSA scratch key
-    const ml = self.moe_layers.?;
+    const ml = self.moe_layers orelse return error.MissingWeight;
     const offset = ctx.moe_seq_offset.*;
     const cfg = &self.config;
     const is_mimo = std.mem.eql(u8, cfg.model_type, "mimo_v2");

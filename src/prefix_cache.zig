@@ -8675,11 +8675,12 @@ test "SSD-first: an in-flight write does not stall the tick — the entry is re-
     // Generous allowance: this test is about the write state, not the cap.
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
+    // Held before the commits: the second commit flushes the first entry, which a running writer would finish.
+    hc.disk.?.writer.?.setPaused(true);
+    defer hc.disk.?.writer.?.setPaused(false);
     _ = try hc.commit(&cache, &tok_a, false);
     _ = try hc.commit(&cache, &tok_b, false);
 
-    hc.disk.?.writer.?.setPaused(true);
-    defer hc.disk.?.writer.?.setPaused(false);
     hc.spillIdleEntries(s);
     // It returned, the index knows the entry, and RAM still holds it.
     try testing.expect(hc.disk.?.writer.?.pendingBytes() > 0);
@@ -10011,12 +10012,13 @@ test "SSD-first: the durability check STATS the chunks — a truncated file is n
     hc.disk.?.enableBackgroundWriter();
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
+    // Pass 1 stages A with the writer held; pass 2, after the files land, is the healthy control.
+    // Held before the commits: the second commit flushes the first entry, which a running writer would finish.
+    hc.disk.?.writer.?.setPaused(true);
+    defer hc.disk.?.writer.?.setPaused(false);
     _ = try hc.commit(&cache, &tok_a, false);
     _ = try hc.commit(&cache, &tok_b, false);
 
-    // Pass 1 stages A with the writer held; pass 2, after the files land, is the healthy control.
-    hc.disk.?.writer.?.setPaused(true);
-    defer hc.disk.?.writer.?.setPaused(false);
     hc.spillIdleEntries(s);
     try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
     hc.disk.?.writer.?.setPaused(false);

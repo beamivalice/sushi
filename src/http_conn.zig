@@ -448,7 +448,7 @@ pub fn routeExists(path: []const u8) bool {
 fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
     const mb = 1024 * 1024;
     return std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds the {d} MB limit", .{
-        (got + mb - 1) / mb, cap / mb,
+        got / mb + @intFromBool(got % mb != 0), cap / mb,
     }) catch "Request body too large";
 }
 

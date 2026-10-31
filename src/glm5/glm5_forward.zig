@@ -1159,13 +1159,15 @@ pub fn nonzeroDecodeFixture(weights: *model.Weights) !model.ModelConfig {
 pub fn expectArrayBits(a: Arr, b: Arr) !void {
     try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
     try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    // MLX gives an empty array no data pointer.
+    const count = mlx.mlx_array_size(a);
+    if (count == 0) return;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     const av = try ops.cast(a, .float32);
     const bv = try ops.cast(b, .float32);
     try mlx.check(mlx.mlx_array_eval(av));
     try mlx.check(mlx.mlx_array_eval(bv));
-    const count = mlx.mlx_array_size(av);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(av).?[0..count]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(bv).?[0..count]));
 }
 

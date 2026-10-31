@@ -120,6 +120,7 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A struct inside a generic fn that captures NO comptime param is memoized to ONE type.
 - `openDirAbsolute` on an empty/relative path is ReleaseFast UB — guard every site.
 - `.string` on unchecked `std.json.Value` panics.
+- `clearRetainingCapacity` poisons the cleared bytes (0xAA) in safe builds: never return `list.items` and clear it in a `defer`; drop the length with `items.len = 0`.
 - A test that aliases embedded bytes through an alignment cast is a coin flip per binary: copy fixtures to aligned
   storage (Debug builds catch what ReleaseFast hides).
 - A failing `std.debug.assert` is UB in ReleaseFast: the full suite can pass while the same test, filtered alone,

@@ -199,9 +199,11 @@ pub const ContentStream = struct {
     }
 
     /// The reply ended outside a thought: the withheld whitespace ships, as every token's did before.
+    /// Valid until the next `deliver`: the length drops without `clearRetainingCapacity`, which poisons the bytes.
     pub fn finish(self: *ContentStream) []const u8 {
-        defer self.held.clearRetainingCapacity();
-        return self.held.items;
+        const tail = self.held.items;
+        self.held.items.len = 0;
+        return tail;
     }
 };
 
