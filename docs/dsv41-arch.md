@@ -619,6 +619,18 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   2 workers 55.8 ms, more than 4 nothing). The predictor costs ~0.9 ms a round at R4 (a 7.9 MB f32 gate read a layer). At one
   row it measured 41.0 -> 42.4 tok/s on a cold cache but lost on a warmed one (46.6/49.8 -> 46.0/46.1 on main `d810c50c`), so
   a one-row forward is left alone.
+  Gated by misses (`prefetch_gate.zig`): the prefetch adds reads, so where the SSD is the bottleneck it loses. After each
+  forward of 1 to 16 rows an EMA (window 8) of distinct missed experts per row (`union_members - hits`) decides; at 8 or more
+  the prefetch is off (no prediction GEMV, no reads) and it returns when the EMA falls below 8. Adaptive DSpark, greedy md5
+  equal in every arm, P2 = rename in a 4129-token file, 800 tokens (diag branch `diag/dsv41-prefetch`, scratch): at
+  `--ssd-budget-gb 60` the ungated prefetch lost 8.5% on P2 (off 30.91 / 30.90 vs on 28.32 / 28.53 / 28.49 / 28.46 tok/s;
+  89 misses x 9.3 MB per 134 ms round is SSD-bound, the prefetch adds ~66 reads a pass of which 78% go unused, and its fills
+  evict experts that then miss); at 108 it ties on P2 (off 81.7 / 80.1, on 80.4 / 82.65) and gains 2.6% on P1 (41.6 / 41.9
+  vs 40.6 / 40.5), halving multi-row misses 4.5 to 2.1 a pass. Misses a row with the prefetch off: at 108 at most 2.2 (5.0 for
+  the 7 passes after a 4k prefill), at 60 at least 12.6 at one row and 18-29 multi-row. The "forced R4" numbers above (59.0 to
+  53.2 ms) are forced 4-row verifies, not the adaptive path, which mixes in 1-row rounds where the prefetch never runs. Lost, kept out: one-row prefetch (-4 to -12% at 60,
+  the host waits), LOWAGE (reads doubled), CANCEL (never fires), d=2, a wider set; skipping when warm and a cheaper predictor
+  are worth under 0.5%. The `[dsv41] expert prefetch on|off (misses/row ema X)` line marks a gate change.
 
 Differences from mlx-serve: the attention-output fp8 round trip stays (upstream drops it), the verify block takes the same
 masked argmax as serial decode, and a verify is not split from the draft with a host sync per Markov step (the chain is

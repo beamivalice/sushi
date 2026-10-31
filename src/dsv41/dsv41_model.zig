@@ -28,6 +28,7 @@ const dim = sc_mod.dim;
 const ci = sc_mod.ci;
 const evalAll = sc_mod.evalAll;
 const Config = cfg_mod.Config;
+const PrefetchGate = @import("prefetch_gate.zig").PrefetchGate;
 const prefetch_cand_max = @import("../expert_stream.zig").Prefetcher.cand_max;
 
 /// Rows one attention span handles: the compressed rows each query gathers are its largest
@@ -731,6 +732,7 @@ pub const Model = struct {
     prefetch_lead_rows: u8 = 0,
     prefetch_n: u8 = 12,
     prefetch_m: u8 = 1,
+    prefetch_gate: PrefetchGate = .{},
     /// Layers a pass may rebuild, plus a third of the layers built so far, before it stops queueing: a cold pool misses
     /// on most layers, and each miss costs the successor's work twice.
     route_spec_rebuilds: u32 = 3,
@@ -3180,7 +3182,7 @@ fn prefetchTarget(m: *const Model, li: usize, rows: usize) ?usize {
         .resident => return null,
         .hook => |hk| hk,
     };
-    if (hk.prefetch == null or rows < 2 or rows > NARROW_ROWS) return null;
+    if (hk.prefetch == null or rows < 2 or rows > NARROW_ROWS or !m.prefetch_gate.on()) return null;
     const lead: usize = m.prefetch_lead_rows;
     if (lead == 0 or li + lead >= m.cfg.layers) return null;
     if (hk.can_prefetch) |can| if (!can(hk.ctx, li + lead)) return null;

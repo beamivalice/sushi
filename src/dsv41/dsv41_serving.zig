@@ -122,12 +122,22 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
     defer m.defer_head = false;
     const last = if (lazy) try dsv41_model.extendLazy(m, flat, &one) else try dsv41_model.extendAhead(m, host, .last, dsv41_model.SPAN, vision, ahead);
     defer _ = mlx.mlx_array_free(last);
-    if (self.expert_stream) |engine| engine.finishForward(n);
+    if (self.expert_stream) |engine| observeMisses(m, engine, n);
     ctx.cache.step = st.n;
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, self.s));
     return out;
+}
+
+/// Ends the engine's forward and feeds its distinct missed experts to the prefetch gate.
+fn observeMisses(m: *dsv41_model.Model, engine: *expert_stream_mod.Engine, rows: usize) void {
+    engine.finishForward(rows);
+    const last = engine.breakdown();
+    const was = m.prefetch_gate.on();
+    m.prefetch_gate.observe(rows, last.union_members - last.hits);
+    if (was != m.prefetch_gate.on())
+        log.info("[dsv41] expert prefetch {s} (misses/row ema {d:.1})\n", .{ if (was) "off" else "on", m.prefetch_gate.ema });
 }
 
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
@@ -150,7 +160,7 @@ pub fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !
     }
     const all = try dsv41_model.verify(m, ids);
     defer _ = mlx.mlx_array_free(all);
-    if (self.expert_stream) |engine| engine.finishForward(ids.len);
+    if (self.expert_stream) |engine| observeMisses(m, engine, ids.len);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, all, &[_]c_int{ 1, @intCast(ids.len), @intCast(m.cfg.vocab) }, 3, self.s));

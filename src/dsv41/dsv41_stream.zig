@@ -1786,6 +1786,43 @@ test "dsv41 prefetch: a layer that cannot be prefetched is not predicted, and th
     try testing.expectEqual(before, model.prefetch_predicted);
 }
 
+test "dsv41 prefetch: with the miss gate off, verify rounds predict and queue nothing and give the plain model's bytes (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var plain: StqServed = undefined;
+    try plain.init(dir, .bfloat16, true, true, 3, s);
+    defer plain.deinit();
+    var armed: StqServed = undefined;
+    try armed.init(dir, .bfloat16, true, true, 3, s);
+    defer armed.deinit();
+    try enablePrefetch(&armed, 2, 8, 2);
+    armed.m.prefetch_gate.ema = 100;
+    const a = try model.extend(plain.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try model.extend(armed.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(b);
+    try expectSameBits(&sc, a, b);
+    const before = model.prefetch_predicted;
+    for ([_]usize{ 5, 3 }) |rows| {
+        const x = try model.verify(plain.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(x);
+        const y = try model.verify(armed.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(y);
+        try expectSameBits(&sc, x, y);
+        try model.finishVerify(plain.m, 1);
+        try model.finishVerify(armed.m, 1);
+    }
+    try testing.expectEqual(before, model.prefetch_predicted);
+    try testing.expectEqual(@as(u64, 0), armed.engine.prefetcher.?.jobs_queued.load(.monotonic));
+}
+
 test "dsv41 drop: the STQ pack with experts dropped gives the logits of the full pools under the same router mask, bit for bit, and never reads or caches a dropped expert (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();

@@ -218,7 +218,7 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   returns (`specGrouped`, `prepareHost*`, `swapGroupedMisses`, `borrowLayer`, `restoreLayer` call it, `warmCache` and
   `deinit` drain the thread); only layers `d >= 2` ahead are targeted, so no queued chain reads a slot the job writes;
   the prefetch pool has its own fill workers (inside `BOUNCE_BYTES`, so no new bill); it changes what is cached, never
-  the arithmetic. A target that `Engine.canPrefetch` refuses is not predicted at all, and a prediction whose candidates the pool already holds queues and wakes nothing (the line's `jobs queued` counts only jobs with something to read). `[expert-stream] prefetch: ...` is the engagement line. Measurements: [dsv41-arch](dsv41-arch.md#stq).
+  the arithmetic. The prefetch is gated by the misses a row (`Model.prefetch_gate`, [dsv41-arch](dsv41-arch.md#stq)): at 8 or more distinct missed experts a row it predicts and reads nothing. A target that `Engine.canPrefetch` refuses is not predicted at all, and a prediction whose candidates the pool already holds queues and wakes nothing (the line's `jobs queued` counts only jobs with something to read). `[expert-stream] prefetch: ...` is the engagement line. Measurements: [dsv41-arch](dsv41-arch.md#stq).
   The host's wait is `specGrouped` of the targeted layer (the settle's `prepareHost` finds the job done) and the job's SSD read is
   the time it waits out: a map read mid-job lists the job's experts as misses, so the settle would rebuild the layer; the wait stays.
 - A rate-grouped route (`prepareGrouped`) must be able to undo its cache moves when it fails before writing a slab: a group whose
