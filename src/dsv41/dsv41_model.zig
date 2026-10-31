@@ -599,8 +599,12 @@ pub const Profile = struct {
         self.last = std.Io.Timestamp.now(self.io, .boot);
     }
 
+    /// Evaluates the stage's live outputs; an empty one (`none`, an arm the stage did not take) is skipped.
     fn mark(self: *Profile, stage: Stage, xs: []const A) !void {
-        try evalAll(xs);
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (xs) |x| if (x.ctx != null) try mlx.check(mlx.mlx_vector_array_append_value(vec, x));
+        try mlx.check(mlx.mlx_eval(vec));
         const now = std.Io.Timestamp.now(self.io, .boot);
         const into = if (self.decoder) &self.dec else &self.ns;
         into[@backingInt(stage)] += @intCast(self.last.durationTo(now).nanoseconds);
@@ -1913,7 +1917,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     const fus = fusedOn(sc, m);
     const pf = prof(m, L);
     const in = try attnIn(sc, m, ly, h);
-    if (pf) |p| try p.mark(.attn_in, in[0..if (in[2].ctx != null) 3 else 2]);
+    if (pf) |p| try p.mark(.attn_in, &in);
     const qr = try sc.rms(in[0], ly.q_norm, c.eps);
     try tapInput(m, li, .q_lora, qr);
     const q_proj = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) });
@@ -1938,7 +1942,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         // The ring holds this chunk's rows before the kernel reads them; the heads leave inverse-rotated.
         try ls.win.write(kv, p0, sc.s);
         const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
-        if (pf) |p| try p.mark(.indexer, if (picks.comp_rows.ctx != null) &.{ picks.comp_rows, picks.topk } else &.{ls.win.buf});
+        if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf, picks.comp_rows, picks.topk });
         if (width_probe) |t| {
             try t.put("a_q_{d}", .{li}, q);
             if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
@@ -1992,10 +1996,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         const band = try ssc.op2(mlx.mlx_logical_and, try ssc.op2(mlx.mlx_less_equal, kpos, qpos), try ssc.op2(mlx.mlx_greater, kpos, try ssc.sub(qpos, try ssc.i(ci(window)))));
 
         const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
-        if (pf) |p| {
-            const got = [_]A{ keys_w, picks.comp_rows, picks.topk };
-            try p.mark(.indexer, got[0..if (picks.comp_rows.ctx != null) 3 else 1]);
-        }
+        if (pf) |p| try p.mark(.indexer, &.{ keys_w, picks.comp_rows, picks.topk });
         const K = if (picks.any()) dim(picks.topk, 1) else 0;
         const head = if (one_pass)
             try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act, if (fold) kernels.Epilogue{ .freqs = rope, .rd = rd, .pos0 = p0 + a, .qat = m.qat_on, .og = c.o_groups } else null, m.attn_nax and kernels.attnNaxFits(H, hd))
@@ -6451,5 +6452,20 @@ test "dsv41 submit: arrays riding the picks' submit are computed with it, and th
         }
         const got = [_][]const f32{ try sc_mod.hostF32(rode.pre), try sc_mod.hostF32(rode.post), try sc_mod.hostF32(rode.comb) };
         for (got, want) |g, w| try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w), std.mem.sliceAsBytes(g));
+    }
+}
+
+test "dsv41 profile: a stage mark evaluates every live array it is given and skips the empty ones" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const a = try sc.add(try sc.floats(&.{ 1, 2 }, &.{2}), try sc.f(1));
+    const b = try sc.mul(try sc.floats(&.{ 3, 4 }, &.{2}), try sc.f(2));
+    var pf = Profile.init(false);
+    try pf.mark(.indexer, &.{ a, none, b });
+    for ([_]A{ a, b }) |x| {
+        var avail = false;
+        _ = mlx._mlx_array_is_available(&avail, x);
+        try testing.expect(avail);
     }
 }
