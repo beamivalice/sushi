@@ -177,13 +177,14 @@ release. Protocol: [process-measurement](docs/process-measurement.md#release-ben
 same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for cross-engine comparisons only.
 
 Release notes thank every outside contributor by @handle for each merged PR the release ships; a missed credit goes
-into the next release, marked as belated (`/release`).
+into the next release as belated (`/release`).
 
 A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
 owner-approved card; the README pack line follows once the repo is live.
 
-- **Adding a pack** updates, in the same landing, its `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`),
-  the tier table and recommended launch in `docs/usage.md`, and the README pack line once the repo is live.
+- **Adding a pack** (pair-major: [tile order](docs/pack-format.md#tile-order)) updates, in the same landing, its
+  `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`), the tier table and recommended launch in
+  `docs/usage.md`, and the README pack line once the repo is live.
 
 ## Conventions
 

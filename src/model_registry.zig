@@ -1227,7 +1227,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
@@ -1248,6 +1248,10 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "Exl3GateUpRateMismatch")) return error.Exl3GateUpRateMismatch;
             if (std.mem.eql(u8, n, "Exl3WindowUnsupported")) return error.Exl3WindowUnsupported;
             if (std.mem.eql(u8, n, "Exl3ShardStampMismatch")) return error.Exl3ShardStampMismatch;
+            if (std.mem.eql(u8, n, "Exl3TileOrderUnsupported")) return error.Exl3TileOrderUnsupported;
+            if (std.mem.eql(u8, n, "Exl3TileOrderMixed")) return error.Exl3TileOrderMixed;
+            if (std.mem.eql(u8, n, "Exl3TileOrderMismatch")) return error.Exl3TileOrderMismatch;
+            if (std.mem.eql(u8, n, "Exl3TileOrderNeedsGroups")) return error.Exl3TileOrderNeedsGroups;
             if (std.mem.eql(u8, n, "Exl3CodebookTableUnknown")) return error.Exl3CodebookTableUnknown;
             if (std.mem.eql(u8, n, "Exl3CodebookTableDigestMismatch")) return error.Exl3CodebookTableDigestMismatch;
             if (std.mem.eql(u8, n, "Exl3CodebookTableWindowMismatch")) return error.Exl3CodebookTableWindowMismatch;
@@ -1281,6 +1285,10 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.Exl3TrellisGeometry, loadErrorFromName("Exl3TrellisGeometry"));
         try std.testing.expectEqual(error.Exl3WindowUnsupported, loadErrorFromName("Exl3WindowUnsupported"));
         try std.testing.expectEqual(error.Exl3ShardStampMismatch, loadErrorFromName("Exl3ShardStampMismatch"));
+        try std.testing.expectEqual(error.Exl3TileOrderUnsupported, loadErrorFromName("Exl3TileOrderUnsupported"));
+        try std.testing.expectEqual(error.Exl3TileOrderMixed, loadErrorFromName("Exl3TileOrderMixed"));
+        try std.testing.expectEqual(error.Exl3TileOrderMismatch, loadErrorFromName("Exl3TileOrderMismatch"));
+        try std.testing.expectEqual(error.Exl3TileOrderNeedsGroups, loadErrorFromName("Exl3TileOrderNeedsGroups"));
         try std.testing.expectEqual(error.Exl3CodebookTableUnknown, loadErrorFromName("Exl3CodebookTableUnknown"));
         try std.testing.expectEqual(error.Exl3CodebookTableDigestMismatch, loadErrorFromName("Exl3CodebookTableDigestMismatch"));
         try std.testing.expectEqual(error.Exl3CodebookTableWindowMismatch, loadErrorFromName("Exl3CodebookTableWindowMismatch"));

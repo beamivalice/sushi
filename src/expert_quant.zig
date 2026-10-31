@@ -42,6 +42,8 @@ pub const Geometry = struct {
     /// without the other).
     drop_n: u16 = 0,
     drop: ?*const expert_usage.Drop = null,
+    /// `expert_quant.tile_order`: the order the pack's routed trellis tensors are stored in.
+    tile_order: expert_exl3.TileOrder = .pack,
 
     /// Routed experts a layer that can still be picked.
     pub fn kept(self: Geometry) u16 {
@@ -898,6 +900,14 @@ pub const LayerGroups = struct {
     n: [rate_group_limit][3]u32 = @splat(@splat(0)),
     /// Experts of each group `--drop-expert` leaves unloaded; they keep their ids and positions in the pack.
     dropped: [rate_group_limit]u16 = @splat(0),
+    /// Each pool's trellis starts at a multiple of this many bytes (a pair-major pack's page, for direct reads); 0: packed.
+    align_bytes: u32 = 0,
+
+    /// What alignment can add to a layer's trellis storage: under one `align_bytes` before each pool but the first,
+    /// for each projection.
+    pub fn padBytes(self: *const LayerGroups) u64 {
+        return if (self.align_bytes == 0 or self.count == 0) 0 else 3 * @as(u64, self.count - 1) * self.align_bytes;
+    }
 
     pub fn keptOf(self: *const LayerGroups, g: usize) u16 {
         return self.experts[g] - self.dropped[g];
@@ -921,14 +931,14 @@ pub const LayerGroups = struct {
     pub fn allBytes(self: *const LayerGroups, hidden: u32, inter: u32) u64 {
         var total: u64 = 0;
         for (0..self.count) |g| total += @as(u64, self.keptOf(g)) * self.expertBytes(g, hidden, inter);
-        return total;
+        return total + self.padBytes();
     }
 
     /// One expert of every group that still has one: the least a cache of this layer can hold.
     pub fn floorBytes(self: *const LayerGroups, hidden: u32, inter: u32) u64 {
         var total: u64 = 0;
         for (0..self.count) |g| total += self.expertBytes(g, hidden, inter);
-        return total;
+        return total + self.padBytes();
     }
 };
 
@@ -946,6 +956,8 @@ pub const QuantStore = struct {
     packed_n: [component_count]u32 = @splat(0),
     /// One entry per layer; `count` 0 is a uniform layer.
     layer_groups: []LayerGroups = &.{},
+    /// The order the source trellis tiles lie in, which a fill must land in the pools' own.
+    tile_order: expert_exl3.TileOrder = .pack,
 
     pub fn groupsOf(self: *const QuantStore, layer: u16) ?*const LayerGroups {
         if (layer >= self.layer_groups.len or self.layer_groups[layer].count == 0) return null;
@@ -1009,7 +1021,7 @@ pub const QuantStore = struct {
             };
             grouped = true;
             out.layer_floor_bytes = @max(out.layer_floor_bytes, lg.floorBytes(self.geometry.hidden, self.geometry.intermediate));
-            out.union_meta_bytes += @as(u64, self.geometry.kept()) * rate_group_meta_bytes;
+            out.union_meta_bytes += @as(u64, self.geometry.kept()) * rate_group_meta_bytes + lg.padBytes();
             out.all_bytes += lg.allBytes(self.geometry.hidden, self.geometry.intermediate) + @as(u64, self.geometry.kept()) * rate_group_meta_bytes;
         }
         if (grouped and uniform) out.union_sets = 2;
@@ -1116,6 +1128,10 @@ pub const QuantStore = struct {
             );
         } else {
             var metadata_ready = false;
+            if (chosen == .exl3_k4) {
+                store.tile_order = try tileOrderOfMap(weight_map);
+                if (store.tile_order != geometry.tile_order) return error.Exl3TileOrderMismatch;
+            }
             for (first_layer..geometry.layers) |layer_usize| {
                 const layer: u16 = @intCast(layer_usize);
                 if (chosen == .exl3_k4 and exl3LayerGrouped(weight_map, exl3_prefix, layer)) {
@@ -1127,6 +1143,7 @@ pub const QuantStore = struct {
                     metadata_ready = true;
                     continue;
                 }
+                if (store.tile_order == .pair_major) return error.Exl3TileOrderNeedsGroups;
                 for (0..component_count) |ci| {
                     const c: Component = @fromBackingInt(@intCast(ci));
                     if (chosen == .mxfp4_split and partOf(c) == .biases) {
@@ -1309,8 +1326,46 @@ pub const QuantStore = struct {
 
 fn exl3LayerGrouped(map: std.json.ObjectMap, prefix: []const u8, layer: u16) bool {
     var buf: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{s}{d}.mlp.switch_mlp.gate_proj.g0.trellis", .{ prefix, layer }) catch return false;
-    return map.get(key) != null;
+    for ([_][]const u8{ "trellis", "trellis_pm" }) |leaf| {
+        const key = std.fmt.bufPrint(&buf, "{s}{d}.mlp.switch_mlp.gate_proj.g0.{s}", .{ prefix, layer, leaf }) catch return false;
+        if (map.get(key) != null) return true;
+    }
+    return false;
+}
+
+/// The tile order every routed trellis key of `map` (the layers' and a DSpark stage's) names; a map naming both is
+/// mixed, and one naming neither is the pack order.
+pub fn tileOrderOfMap(map: std.json.ObjectMap) !expert_exl3.TileOrder {
+    const marker = ".mlp.switch_mlp.";
+    var seen_pack = false;
+    var seen_major = false;
+    for (map.keys()) |key| {
+        const at = std.mem.indexOf(u8, key, marker) orelse continue;
+        const name = @import("sushi_exl3").group_layout.Name.parse(key[at + marker.len ..]) catch continue;
+        if (name.part != 0) continue;
+        if (name.pair_major) seen_major = true else seen_pack = true;
+    }
+    if (seen_pack and seen_major) return error.Exl3TileOrderMixed;
+    return if (seen_major) .pair_major else .pack;
+}
+
+pub fn tileOrderOfDir(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !expert_exl3.TileOrder {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+    defer dir.close(io);
+    const raw = try dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(64 * 1024 * 1024));
+    defer allocator.free(raw);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return error.InvalidSafetensorsIndex;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSafetensorsIndex;
+    const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
+    if (map != .object) return error.InvalidSafetensorsIndex;
+    return tileOrderOfMap(map.object);
+}
+
+/// A shard that holds routed trellis tensors stamps the order they are stored in, or nothing for the pack order.
+fn checkTileStamp(allocator: std.mem.Allocator, file: *SourceFile, order: expert_exl3.TileOrder) !void {
+    try cacheSourceHeader(allocator, file);
+    try @import("sushi_exl3").shardTileOrderAgrees(order, io_mod.metadataString(file.header.?.parsed.value.object, "tile_order"));
 }
 
 /// A rate-grouped layer's tensors (`<proj>_proj.gN.<trellis|suh|svh>`) as one span per expert and component, the
@@ -1341,6 +1396,7 @@ fn populateExl3GroupedLayer(
         if (entry.value_ptr.* != .string) return error.InvalidSafetensorsIndex;
         const name = try gl.Name.parse(key[start.len..]);
         const file = try openSource(allocator, files_list, model_dir, entry.value_ptr.string);
+        if (name.part == 0) try checkTileStamp(allocator, &files_list.items[file], store.tile_order);
         const region = io_mod.tensorRegion(allocator, files_list.items[file].fd, key) catch |err| return switch (err) {
             error.MissingSafetensorsTensor => error.MissingExpertTensor,
             error.SafetensorsTensorOutOfBounds => error.ExpertTensorOutOfBounds,
@@ -1362,7 +1418,9 @@ fn populateExl3GroupedLayer(
         };
     }
     try plan.finish(geometry.experts, 1, false, geometry.experts);
-    var lg: LayerGroups = .{ .count = @intCast(plan.count) };
+    // A pair-major pack starts every trellis on a page of its shard, so its pools start on pages and a fill can skip the bounce.
+    const on_pages = store.tile_order == .pair_major;
+    var lg: LayerGroups = .{ .count = @intCast(plan.count), .align_bytes = if (on_pages) @intCast(io_mod.pageSize()) else 0 };
     var at: u32 = 0;
     var weight_total: [3]u64 = @splat(0);
     const tiles: u64 = (@as(u64, geometry.hidden) / 16) * (geometry.intermediate / 16);
@@ -1486,9 +1544,9 @@ fn cachedTensorRegion(file: *const SourceFile, key: []const u8) !io_mod.TensorRe
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;
-    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 4)
+    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 5)
         return error.InvalidSafetensorsTensor;
-    var dimensions: [4]u64 = .{ 0, 0, 0, 0 };
+    var dimensions: [5]u64 = .{ 0, 0, 0, 0, 0 };
     var elements: u64 = 1;
     for (shape.array.items, 0..) |dim, i| {
         if (dim != .integer or dim.integer <= 0) return error.InvalidSafetensorsTensor;

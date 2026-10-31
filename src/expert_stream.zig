@@ -1450,9 +1450,11 @@ const GroupedLayer = struct {
     cache_ragged: Ragged = .{},
     union_ragged: Ragged = .{},
     tile_major: bool = false,
+    /// The source stores trellis tiles already in the pools' tile-major order: a fill reads them as they are.
+    source_tile_major: bool = false,
 
-    fn init(allocator: std.mem.Allocator, groups: quant.LayerGroups, hidden: u32, inter: u32, allot_bytes: u64, tile_major: bool) !GroupedLayer {
-        var self: GroupedLayer = .{ .groups = groups, .hidden = hidden, .inter = inter, .tile_major = tile_major };
+    fn init(allocator: std.mem.Allocator, groups: quant.LayerGroups, hidden: u32, inter: u32, allot_bytes: u64, tile_major: bool, source_tile_major: bool) !GroupedLayer {
+        var self: GroupedLayer = .{ .groups = groups, .hidden = hidden, .inter = inter, .tile_major = tile_major, .source_tile_major = source_tile_major };
         errdefer self.deinitCaches();
         try self.sizePools(allot_bytes);
         var union_at: [3]u64 = @splat(0);
@@ -1464,6 +1466,8 @@ const GroupedLayer = struct {
             self.union_base[g] = union_slots;
             union_slots += groups.keptOf(g);
             for (0..3) |pi| {
+                cache_at[pi] = self.padTo(cache_at[pi]);
+                union_at[pi] = self.padTo(union_at[pi]);
                 self.cache_off[g][pi] = cache_at[pi];
                 self.union_off[g][pi] = union_at[pi];
                 cache_at[pi] += self.slots[g] * self.trellisBytes(g, pi);
@@ -1472,6 +1476,15 @@ const GroupedLayer = struct {
         }
         try self.initCaches(allocator);
         return self;
+    }
+
+    /// `at` moved up to the next pool start; every pool of a layer whose pack lies page-aligned starts on a page.
+    fn padTo(self: *const GroupedLayer, at: u64) u64 {
+        return if (self.groups.align_bytes == 0) at else std.mem.alignForward(u64, at, self.groups.align_bytes);
+    }
+
+    fn alignWords(self: *const GroupedLayer) u64 {
+        return @max(1, self.groups.align_bytes / 2);
     }
 
     fn expertCount(self: *const GroupedLayer) usize {
@@ -1488,9 +1501,10 @@ const GroupedLayer = struct {
     /// slot, paid first; `ExpertCacheTooSmall` when one slot per group does not fit.
     fn sizePools(self: *GroupedLayer, allot_bytes: u64) !void {
         const count: usize = self.groups.count;
+        const pad = self.groups.padBytes();
         var pinned: [quant.rate_group_limit]bool = @splat(false);
         while (true) {
-            var spare = allot_bytes;
+            var spare = std.math.sub(u64, allot_bytes, pad) catch return error.ExpertCacheTooSmall;
             var free_bytes: u64 = 0;
             for (0..count) |g| {
                 if (!pinned[g]) {
@@ -1533,9 +1547,9 @@ const GroupedLayer = struct {
 
     /// Elements of projection pi's flat trellis storage holding `per_group[g]` slots of every group.
     fn trellisElems(self: *const GroupedLayer, pi: usize, per_group: []const u32) usize {
-        var total: u64 = 0;
-        for (0..self.groups.count) |g| total += @as(u64, per_group[g]) * self.trellisBytes(g, pi) / 2;
-        return @intCast(total);
+        var bytes: u64 = 0;
+        for (0..self.groups.count) |g| bytes = self.padTo(bytes) + @as(u64, per_group[g]) * self.trellisBytes(g, pi);
+        return @intCast(bytes / 2);
     }
 
     /// Bytes of one slot's piece of component `ci` in group g.
@@ -1559,10 +1573,10 @@ const GroupedLayer = struct {
     }
 
     /// The fill of component `ci` of one expert of group `g` from `source` into `dst`; a trellis lands tile-major
-    /// when the layer is.
+    /// when the layer is, by a reshuffle unless the source already is.
     fn fillSpan(self: *const GroupedLayer, source: SourceSpan, dst: []u8, g: usize, ci: usize) io_mod.FillSpan {
         var span: io_mod.FillSpan = .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr };
-        if (self.tile_major and ci % 3 == 0) {
+        if (self.tile_major and !self.source_tile_major and ci % 3 == 0) {
             const pi = ci / 3;
             const it: u32 = (if (pi == 2) self.inter else self.hidden) / 16;
             const ot: u32 = (if (pi == 2) self.hidden else self.inter) / 16;
@@ -1588,13 +1602,13 @@ const GroupedLayer = struct {
         try self.buildCacheBank(s, cache);
         errdefer self.cache_ragged.deinit();
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
-        self.union_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(true, &pool_buf), slabTriple(union_set, 0), slabTriple(union_set, 1), slabTriple(union_set, 2));
+        self.union_ragged = try Ragged.initPoolsAligned(s, self.hidden, self.inter, self.pools(true, &pool_buf), self.alignWords(), slabTriple(union_set, 0), slabTriple(union_set, 1), slabTriple(union_set, 2));
         self.union_ragged.tile_major = self.tile_major;
     }
 
     fn buildCacheBank(self: *GroupedLayer, s: mlx.mlx_stream, cache: []const SlabOperand) !void {
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
-        self.cache_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(false, &pool_buf), slabTriple(cache, 0), slabTriple(cache, 1), slabTriple(cache, 2));
+        self.cache_ragged = try Ragged.initPoolsAligned(s, self.hidden, self.inter, self.pools(false, &pool_buf), self.alignWords(), slabTriple(cache, 0), slabTriple(cache, 1), slabTriple(cache, 2));
         self.cache_ragged.tile_major = self.tile_major;
     }
 
@@ -1977,6 +1991,8 @@ pub const Engine = struct {
     pub fn initWithOptions(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, requested_bytes: u64, s: mlx.mlx_stream, opts: Options) !Engine {
         var store = try ExpertStore.openLayout(allocator, model_dir, geometry, opts.layout);
         errdefer store.deinit();
+        // Pair-major tiles are the pools' tile-major order; the pack order's pools cannot take them without a reshuffle back.
+        if (store.quantized) |q| if (q.tile_order == .pair_major and !opts.tile_major) return error.Exl3TileOrderNeedsTileMajor;
         var sized = geometry;
         if (store.quantized) |*q| sized.shape = q.shape();
         const plan = try cachePlanBytesForGeometry(requested_bytes, sized, store.perExpertBytes());
@@ -2021,7 +2037,7 @@ pub const Engine = struct {
                 const layer_allot = if (plan.resident)
                     groups.allBytes(geometry.hidden, geometry.intermediate)
                 else if (allot) |bytes| bytes[layer_index] else @as(u64, plan.slots_per_layer) * plan.expert_bytes;
-                grouped.* = GroupedLayer.init(allocator, groups.*, geometry.hidden, geometry.intermediate, layer_allot, opts.tile_major) catch |err| {
+                grouped.* = GroupedLayer.init(allocator, groups.*, geometry.hidden, geometry.intermediate, layer_allot, opts.tile_major, q.tile_order == .pair_major) catch |err| {
                     allocator.destroy(grouped);
                     return err;
                 };
@@ -2218,6 +2234,18 @@ pub const Engine = struct {
         self.forward_clock = Clock.init();
     }
 
+    /// Every fill since boot, the serving pool's and the prefetcher's.
+    pub fn fillStats(self: *const Engine) io_mod.FillStats {
+        var out: io_mod.FillStats = if (self.io_pool) |p| p.stats() else .{};
+        if (self.prefetcher) |pf| {
+            const more = pf.pool.stats();
+            out.bytes_read += more.bytes_read;
+            out.bytes_bounced += more.bytes_bounced;
+            out.bytes_reshuffled += more.bytes_reshuffled;
+        }
+        return out;
+    }
+
     pub fn breakdown(self: *const Engine) Breakdown {
         return self.last;
     }
@@ -2248,7 +2276,8 @@ pub const Engine = struct {
         // At debug level every prefill chunk gets its line: a chunk is one forward, so the schedule would skip them.
         if (!scheduled and !acc.probe and !(rows > 64 and log.isDebug())) return;
         const fill_seconds = @as(f64, @floatFromInt(acc.fill_ns)) / 1e9;
-        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d} copy_ms={d:.1} unions={d} staged_routes={d}\n", .{
+        const fills = self.fillStats();
+        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d} copy_ms={d:.1} unions={d} staged_routes={d} bounced_gb={d:.3} reshuffled_gb={d:.3} reads={d} reads_direct={d} issued_gb={d:.3} pread_s={d:.2} fill_s={d:.2}\n", .{
             acc.forward,
             acc.rows,
             @as(f64, @floatFromInt(acc.wall_ns)) / 1e6,
@@ -2265,6 +2294,13 @@ pub const Engine = struct {
             @as(f64, @floatFromInt(acc.copy_ns)) / 1e6,
             acc.unions,
             self.staged_routes,
+            @as(f64, @floatFromInt(fills.bytes_bounced)) / 1e9,
+            @as(f64, @floatFromInt(fills.bytes_reshuffled)) / 1e9,
+            fills.reads_issued,
+            fills.reads_direct,
+            @as(f64, @floatFromInt(fills.bytes_issued)) / 1e9,
+            @as(f64, @floatFromInt(fills.pread_ns)) / 1e9,
+            @as(f64, @floatFromInt(self.fill_ns_total)) / 1e9,
         });
         log.info("[expert-stream] route forward={d} rows={d} probe={} linear n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2} full n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2}\n", .{
             acc.forward,
@@ -2693,7 +2729,7 @@ pub const Engine = struct {
         errdefer self.dropUnion();
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
         for (self.layers[self.borrow_from..]) |*layer| if (layer.grouped) |g| {
-            g.union_ragged = try Ragged.initPools(self.s, g.hidden, g.inter, g.pools(true, &pool_buf), slabTriple(self.grouped_union, 0), slabTriple(self.grouped_union, 1), slabTriple(self.grouped_union, 2));
+            g.union_ragged = try Ragged.initPoolsAligned(self.s, g.hidden, g.inter, g.pools(true, &pool_buf), g.alignWords(), slabTriple(self.grouped_union, 0), slabTriple(self.grouped_union, 1), slabTriple(self.grouped_union, 2));
             g.union_ragged.tile_major = g.tile_major;
         };
     }
@@ -3600,7 +3636,7 @@ test "expert stream rate-grouped pools and the union hold the kept experts of ea
     groups.n[1] = .{ 32, 32, 40 };
     groups.n[2] = .{ 24, 24, 24 };
     groups.base[0..3].* = .{ 0, 3, 33 };
-    var layer = try GroupedLayer.init(t.allocator, groups, 2560, 640, 1 << 40, false);
+    var layer = try GroupedLayer.init(t.allocator, groups, 2560, 640, 1 << 40, false, false);
     defer layer.deinitCaches();
     // A bill that holds everything caps every pool at its kept experts, never its stored ones.
     try t.expectEqualSlices(u32, &.{ 3, 20, 94 }, layer.slots[0..3]);

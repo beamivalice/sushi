@@ -2623,3 +2623,251 @@ test "dsv41 stq: a settle's scratch grows once and then serves every smaller or 
     }
     try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
+
+const pm_pack = @import("../pair_major_pack_test.zig");
+const io_mod = @import("../expert_io.zig");
+
+const PmDir = struct {
+    tmp: testing.TmpDir,
+    path: []u8,
+
+    fn make(src: []const u8, fault: pm_pack.Fault) !PmDir {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &buf);
+        const path = try testing.allocator.dupe(u8, buf[0..n]);
+        errdefer testing.allocator.free(path);
+        try pm_pack.write(testing.allocator, src, path, fault);
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn makeAligned(src: []const u8) !PmDir {
+        return makeAlignedExcept(src, "");
+    }
+
+    fn makeAlignedExcept(src: []const u8, off_page: []const u8) !PmDir {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &buf);
+        const path = try testing.allocator.dupe(u8, buf[0..n]);
+        errdefer testing.allocator.free(path);
+        try pm_pack.writeAlignedExcept(testing.allocator, src, path, io_mod.pageSize(), off_page);
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *PmDir) void {
+        testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
+/// `direct_bytes`: at least this many fill bytes of the resident load (every expert read once) skip the bounce buffer.
+fn expectPmParity(dir: []const u8, pm_path: []const u8, direct_bytes: u64, budgets: []const u64) !void {
+    try mlx.requireGpu();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    for (budgets) |slots| {
+        var legacy: StqServed = undefined;
+        try legacy.init(dir, .bfloat16, true, true, slots, s);
+        defer legacy.deinit();
+        var major: StqServed = undefined;
+        try major.init(pm_path, .bfloat16, true, true, slots, s);
+        defer major.deinit();
+        var at: usize = 0;
+        for ([_]usize{ 20, 2, 5, 3, 4, 6, 1, 1, 9 }) |n| {
+            const take = @min(n, ids.len - at);
+            if (take == 0) break;
+            const a = try model.extend(legacy.m, ids[at..][0..take], .all);
+            defer _ = mlx.mlx_array_free(a);
+            const b = try model.extend(major.m, ids[at..][0..take], .all);
+            defer _ = mlx.mlx_array_free(b);
+            at += take;
+            const ga = try model.hostRows(&sc, a);
+            defer testing.allocator.free(ga);
+            const gb = try model.hostRows(&sc, b);
+            defer testing.allocator.free(gb);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ga), std.mem.sliceAsBytes(gb));
+        }
+        var da = try model.draft(legacy.m, ids[0], true);
+        defer da.deinit();
+        var db = try model.draft(major.m, ids[0], true);
+        defer db.deinit();
+        try testing.expectEqualSlices(u32, da.ids, db.ids);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(da.logits), std.mem.sliceAsBytes(db.logits));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(da.conf), std.mem.sliceAsBytes(db.conf));
+        const old = legacy.engine.fillStats();
+        const new = major.engine.fillStats();
+        try testing.expect(old.bytes_reshuffled > 0);
+        try testing.expectEqual(@as(u64, 0), new.bytes_reshuffled);
+        try testing.expect(new.bytes_read > 0);
+        if (slots == 8) try testing.expect(new.bytes_read - new.bytes_bounced >= direct_bytes);
+    }
+}
+
+/// The repacker's own copy of the tiny pack, beside it as `<DSV41_STQ_TINY>-pm`, when it exists.
+fn siblingPm(buf: []u8, dir: []const u8) ?[]const u8 {
+    const path = std.fmt.bufPrint(buf, "{s}-pm", .{dir}) catch return null;
+    var d = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return null;
+    d.close(std.Io.Threaded.global_single_threaded.io());
+    return path;
+}
+
+test "dsv41 pair-major: a pair-major STQ pack serves the pack-order pack's bytes over prefill, decode, verify rows and the DSpark draft, its fills reshuffling no tile (DSV41_STQ_TINY)" {
+    const dir = try stqDir();
+    var pm = try PmDir.make(dir, .none);
+    defer pm.deinit();
+    try expectPmParity(dir, pm.path, 0, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: a page-aligned pair-major pack reads the experts whose spans and pools lie on pages directly, and serves the pack-order pack's bytes (DSV41_STQ_TINY)" {
+    if (io_mod.pageSize() != 16384) return error.SkipZigTest;
+    const dir = try stqDir();
+    var pm = try PmDir.makeAligned(dir);
+    defer pm.deinit();
+    // Down group 2 holds two experts at n = 64, one page each, in each of the 8 layers.
+    try expectPmParity(dir, pm.path, 8 * 2 * 16384, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: a pair-major pack with one trellis off its page still pads its pools and reads the down experts that fill a page directly (DSV41_STQ_TINY)" {
+    if (io_mod.pageSize() != 16384) return error.SkipZigTest;
+    const dir = try stqDir();
+    var pm = try PmDir.makeAlignedExcept(dir, ".up_proj.g0.");
+    defer pm.deinit();
+    try expectPmParity(dir, pm.path, 8 * 2 * 16384, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: the resident bill and load of a padded pair-major pack equal the pack-order pack's (DSV41_STQ_TINY)" {
+    if (io_mod.pageSize() != 16384) return error.SkipZigTest;
+    const dir = try stqDir();
+    var pm = try PmDir.makeAligned(dir);
+    defer pm.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const source = @import("dsv41_source.zig");
+    try testing.expectEqual(try source.residentBytes(io, testing.allocator, dir), try source.residentBytes(io, testing.allocator, pm.path));
+    try testing.expectEqual(try source.dsparkBytes(io, testing.allocator, dir), try source.dsparkBytes(io, testing.allocator, pm.path));
+}
+
+test "dsv41 pair-major: the repacker's pair-major copy of the tiny pack gives the same bytes (DSV41_STQ_TINY, its -pm sibling)" {
+    const dir = try stqDir();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try expectPmParity(dir, siblingPm(&buf, dir) orelse return error.SkipZigTest, 0, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: a pack-order pool cannot take pair-major tiles, and a uniform layer cannot be pair-major (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var pm = try PmDir.make(dir, .none);
+    defer pm.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try @import("../model.zig").parseConfig(io, testing.allocator, pm.path);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(exl3.format.TileOrder.pair_major, config.expert_tile_order);
+    try testing.expectError(error.Exl3TileOrderNeedsTileMajor, stream.Engine.initWithOptions(testing.allocator, pm.path, config.expertGeometry(), 1 << 30, mlx.gpuStream(), .{ .layout = .exl3_k4, .tile_major = false }));
+}
+
+test "dsv41 pair-major: a pack whose order the config, the index, the shapes or the shard stamps disagree on is refused by name before a weight loads (DSV41_STQ_TINY)" {
+    const dir = try stqDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const model_mod = @import("../model.zig");
+    const source = @import("dsv41_source.zig");
+    const Case = struct {
+        fault: pm_pack.Fault,
+        config: ?anyerror = null,
+        validate: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{ .fault = .none },
+        .{ .fault = .bad_order_value, .config = error.Exl3TileOrderUnsupported },
+        .{ .fault = .mixed_keys, .config = error.Exl3TileOrderMixed },
+        .{ .fault = .config_without_keys, .config = error.Exl3TileOrderMismatch },
+        .{ .fault = .shape_mismatch, .validate = error.Exl3GroupGeometry },
+        .{ .fault = .stamp_missing, .validate = error.Exl3ShardStampMismatch },
+        .{ .fault = .stamp_on_legacy, .validate = error.Exl3ShardStampMismatch },
+    };
+    for (cases) |c| {
+        var pm = try PmDir.make(dir, c.fault);
+        defer pm.deinit();
+        if (c.config) |want| {
+            try testing.expectError(want, model_mod.parseConfig(io, testing.allocator, pm.path));
+            continue;
+        }
+        var config = try model_mod.parseConfig(io, testing.allocator, pm.path);
+        defer config.deinit(testing.allocator);
+        const got = source.validateTileOrder(io, testing.allocator, pm.path, config.expert_tile_order, config.hidden_size, config.moe_intermediate_size);
+        if (c.validate) |want| try testing.expectError(want, got) else try got;
+    }
+}
+
+test "dsv41 pair-major: the expert store refuses a swapped grid and an unstamped shard itself, so a caller that skips the loader's check still never reads garbage (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]struct { fault: pm_pack.Fault, want: anyerror }{
+        .{ .fault = .shape_mismatch, .want = error.Exl3GroupGeometry },
+        .{ .fault = .stamp_missing, .want = error.Exl3ShardStampMismatch },
+        .{ .fault = .stamp_on_legacy, .want = error.Exl3ShardStampMismatch },
+    }) |c| {
+        var pm = try PmDir.make(dir, c.fault);
+        defer pm.deinit();
+        var config = try @import("../model.zig").parseConfig(io, testing.allocator, pm.path);
+        defer config.deinit(testing.allocator);
+        try testing.expectError(c.want, stream.Engine.initWithOptions(testing.allocator, pm.path, config.expertGeometry(), 1 << 30, mlx.gpuStream(), .{ .layout = .exl3_k4, .tile_major = true }));
+    }
+}
+
+test "dsv41 pair-major: the transformer loads a pair-major pack through the one loader and serves the pack-order pack's logits (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try stqDir();
+    var pm = try PmDir.make(dir, .none);
+    defer pm.deinit();
+    const model_mod = @import("../model.zig");
+    const Transformer = @import("../transformer.zig").Transformer;
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+
+    var config = try model_mod.parseConfig(io, testing.allocator, pm.path);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(exl3.format.TileOrder.pair_major, config.expert_tile_order);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try testing.allocator.dupe(u8, pm.path);
+
+    var served: StqServed = undefined;
+    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    defer served.deinit();
+    var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, pm.path, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, testing.allocator, config, &weights);
+    defer xfm.deinit();
+
+    var at: usize = 0;
+    for ([_]usize{ 25, 1, 1, 7, 1 }) |n| {
+        const take = @min(n, ids.len - at);
+        const chunk = try sc.ints(@as([]const i32, @ptrCast(ids[at .. at + take])), &.{ 1, @intCast(take) });
+        const logits = try xfm.forward(chunk);
+        defer _ = mlx.mlx_array_free(logits);
+        const want = try model.extend(served.m, ids[at .. at + take], .last);
+        defer _ = mlx.mlx_array_free(want);
+        at += take;
+        const got = try model.hostRows(&sc, logits);
+        defer testing.allocator.free(got);
+        const exp = try model.hostRows(&sc, want);
+        defer testing.allocator.free(exp);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(exp), std.mem.sliceAsBytes(got));
+    }
+}

@@ -244,6 +244,18 @@ pub fn kFromPackedDim(packed_hw: usize) ?Rate {
     return .{ .n = @intCast(packed_hw) };
 }
 
+/// How a routed expert's trellis tiles lie in the pack: `[IT][OT][n]` (`pack`), or `[OT/2][IT][2][n]` (`pair_major`),
+/// the order the decode and prefill kernels read.
+pub const TileOrder = enum {
+    pack,
+    pair_major,
+
+    /// The `expert_quant.tile_order` value; the legacy order is the field's absence.
+    pub fn fromName(name: []const u8) ?TileOrder {
+        return if (std.mem.eql(u8, name, "pair_major")) .pair_major else null;
+    }
+};
+
 pub fn f16BitsToF32(bits: u16) f32 {
     return @floatCast(@as(f16, @bitCast(bits)));
 }

@@ -8,6 +8,8 @@ pub const Name = struct {
     projection: u32,
     part: u32,
     grouped: bool,
+    /// The trellis is stored `trellis_pm`, in `format.TileOrder.pair_major`.
+    pair_major: bool = false,
 
     pub fn parse(name: []const u8) !Name {
         var it = std.mem.splitScalar(u8, name, '.');
@@ -23,17 +25,41 @@ pub const Name = struct {
             if (group >= max_groups) return error.Exl3GroupNameInvalid;
             leaf = it.next() orelse return error.Exl3GroupNameInvalid;
         }
-        const part: u32 = if (std.mem.eql(u8, leaf, "trellis")) 0 else if (std.mem.eql(u8, leaf, "suh")) 1 else if (std.mem.eql(u8, leaf, "svh")) 2 else return error.Exl3GroupNameInvalid;
+        const pair_major = std.mem.eql(u8, leaf, "trellis_pm");
+        const part: u32 = if (pair_major or std.mem.eql(u8, leaf, "trellis")) 0 else if (std.mem.eql(u8, leaf, "suh")) 1 else if (std.mem.eql(u8, leaf, "svh")) 2 else return error.Exl3GroupNameInvalid;
         if (it.next() != null) return error.Exl3GroupNameInvalid;
-        return .{ .group = group, .projection = p, .part = part, .grouped = grouped };
+        return .{ .group = group, .projection = p, .part = part, .grouped = grouped, .pair_major = pair_major };
+    }
+
+    pub fn tileOrder(self: Name) format.TileOrder {
+        return if (self.pair_major) .pair_major else .pack;
     }
 };
+
+pub const TileDims = struct { it: u64, ot: u64, n: u64 };
+
+/// The tile grid of a trellis tensor: `[E, IT, OT, n]`, or `[E, OT/2, IT, 2, n]` for `pair_major`; null when the
+/// shape is not that order's.
+pub fn tileDims(order: format.TileOrder, shape: []const u64) ?TileDims {
+    return switch (order) {
+        .pack => if (shape.len == 4) .{ .it = shape[1], .ot = shape[2], .n = shape[3] } else null,
+        .pair_major => if (shape.len == 5 and shape[3] == 2) .{ .it = shape[2], .ot = shape[1] * 2, .n = shape[4] } else null,
+    };
+}
 
 pub const Group = struct {
     experts: u32 = 0,
     rates: [3]format.Rate = @splat(.{ .n = 0 }),
     mask: u16 = 0,
 };
+
+/// The rate of a trellis tensor of `order` over an `input` x `output` projection: its grid must be that projection's.
+pub fn trellisRate(order: format.TileOrder, shape: []const u64, input: u32, output: u32) !format.Rate {
+    const dims = tileDims(order, shape) orelse return error.Exl3GroupGeometry;
+    if (dims.it != input / 16 or dims.ot != output / 16) return error.Exl3GroupGeometry;
+    const halfwords = std.math.cast(usize, dims.n) orelse return error.Exl3TrellisGeometry;
+    return format.kFromPackedDim(halfwords) orelse error.Exl3TrellisGeometry;
+}
 
 pub const Layout = struct {
     hidden: u32,
@@ -44,6 +70,8 @@ pub const Layout = struct {
     groups: [max_groups]Group = @splat(.{}),
     count: usize = 0,
     grouped: ?bool = null,
+    /// The order of the layer's trellis tensors; null before the first.
+    tile_order: ?format.TileOrder = null,
     /// The streaming engine serves rate groups (pruned layers still refuse it).
     streams_groups: bool = false,
     bytes: u64 = 0,
@@ -59,14 +87,15 @@ pub const Layout = struct {
         const input = if (name.projection == 2) self.intermediate else self.hidden;
         const output = if (name.projection == 2) self.hidden else self.intermediate;
         if (input == 0 or output == 0 or input % 128 != 0 or output % 128 != 0) return error.Exl3GroupGeometry;
-        if (shape.len != (if (name.part == 0) @as(usize, 4) else 2)) return error.Exl3GroupGeometry;
-        if (shape[0] == 0 or shape[0] > std.math.maxInt(c_int)) return error.Exl3GroupGeometry;
+        if (name.part != 0 and shape.len != 2) return error.Exl3GroupGeometry;
+        if (shape.len == 0 or shape[0] == 0 or shape[0] > std.math.maxInt(c_int)) return error.Exl3GroupGeometry;
         const group = &self.groups[name.group];
         if (group.experts != 0 and group.experts != shape[0]) return error.Exl3GroupGeometry;
         var rate: format.Rate = .{ .n = 0 };
         if (name.part == 0) {
-            if (shape[1] != input / 16 or shape[2] != output / 16) return error.Exl3GroupGeometry;
-            rate = format.kFromPackedDim(shape[3]) orelse return error.Exl3TrellisGeometry;
+            const order = name.tileOrder();
+            if (self.tile_order) |o| if (o != order) return error.Exl3TileOrderMixed;
+            rate = try trellisRate(order, shape, input, output);
             if (rate.n > self.ceiling.n) return error.Exl3TrellisGeometry;
             if (!rate.in(self.rates)) return error.Exl3CodebookTableRateMissing;
         } else if (shape[1] != (if (name.part == 1) input else output)) return error.Exl3GroupGeometry;
@@ -76,6 +105,7 @@ pub const Layout = struct {
         for (shape) |d| bytes = std.math.mul(u64, bytes, d) catch return error.ResidentBytesOverflow;
         self.bytes = std.math.add(u64, self.bytes, bytes) catch return error.ResidentBytesOverflow;
         self.grouped = name.grouped;
+        if (name.part == 0) self.tile_order = name.tileOrder();
         self.count = @max(self.count, name.group + 1);
         group.experts = @intCast(shape[0]);
         group.mask |= bit;
@@ -129,4 +159,46 @@ test "exl3 layout: tile-major puts an output pair's k range in one run" {
         const want = src[(tk * ot + pair * 2 + o) * n ..][0..n];
         try std.testing.expectEqualSlices(u16, want, dst[((pair * it + tk) * 2 + o) * n ..][0..n]);
     };
+}
+
+test "exl3 layout: a pair-major trellis is named trellis_pm and its 5-D shape is read as the same tile grid" {
+    const name = try Name.parse("gate_proj.g1.trellis_pm");
+    try std.testing.expect(name.pair_major and name.part == 0 and name.group == 1);
+    try std.testing.expectEqual(format.TileOrder.pair_major, name.tileOrder());
+    try std.testing.expect(!(try Name.parse("gate_proj.g1.trellis")).pair_major);
+    try std.testing.expectError(error.Exl3GroupNameInvalid, Name.parse("gate_proj.g1.suh_pm"));
+    try std.testing.expectError(error.Exl3GroupNameInvalid, Name.parse("gate_proj.trellis_pm.x"));
+
+    const d = tileDims(.pair_major, &.{ 3, 4, 16, 2, 24 }).?;
+    try std.testing.expectEqual(TileDims{ .it = 16, .ot = 8, .n = 24 }, d);
+    try std.testing.expectEqual(TileDims{ .it = 16, .ot = 8, .n = 24 }, tileDims(.pack, &.{ 3, 16, 8, 24 }).?);
+    try std.testing.expectEqual(@as(?TileDims, null), tileDims(.pair_major, &.{ 3, 16, 8, 24 }));
+    try std.testing.expectEqual(@as(?TileDims, null), tileDims(.pair_major, &.{ 3, 4, 16, 3, 24 }));
+    try std.testing.expectEqual(@as(?TileDims, null), tileDims(.pack, &.{ 3, 4, 16, 2, 24 }));
+}
+
+test "exl3 layout: a layer admits a pair-major bank by its 5-D shape and refuses a bank of the wrong grid or a mixed one" {
+    const t = std.testing;
+    const rate: format.Rate = .{ .n = 32 };
+    var ok = Layout.init(256, 128, .{ .n = 64 });
+    _ = try ok.add("gate_proj.g0.trellis_pm", &.{ 3, 4, 16, 2, 32 }, .u16);
+    _ = try ok.add("down_proj.g0.trellis_pm", &.{ 3, 8, 8, 2, 32 }, .u16);
+    try t.expectEqual(format.TileOrder.pair_major, ok.tile_order.?);
+    try t.expectEqual(rate.n, ok.groups[0].rates[0].n);
+    try t.expectEqual(rate.n, ok.groups[0].rates[2].n);
+
+    var wrong = Layout.init(256, 128, .{ .n = 64 });
+    // The legacy grid of gate (16 x 8 tiles) under the pair-major rank, and a pair axis that is not 2.
+    try t.expectError(error.Exl3GroupGeometry, wrong.add("gate_proj.g0.trellis_pm", &.{ 3, 16, 8, 32 }, .u16));
+    try t.expectError(error.Exl3GroupGeometry, wrong.add("gate_proj.g0.trellis_pm", &.{ 3, 4, 16, 4, 32 }, .u16));
+    // Out tiles halved wrongly (OT/2 = 8 would mean 16 output tiles) and an input grid that is the output's.
+    try t.expectError(error.Exl3GroupGeometry, wrong.add("gate_proj.g0.trellis_pm", &.{ 3, 8, 16, 2, 32 }, .u16));
+    try t.expectError(error.Exl3GroupGeometry, wrong.add("gate_proj.g0.trellis_pm", &.{ 3, 16, 4, 2, 32 }, .u16));
+    try t.expectError(error.Exl3TrellisGeometry, wrong.add("gate_proj.g0.trellis_pm", &.{ 3, 4, 16, 2, 66 }, .u16));
+    // The legacy 4-D shape under the legacy name does not read a pair-major tensor.
+    try t.expectError(error.Exl3GroupGeometry, wrong.add("gate_proj.g0.trellis", &.{ 3, 4, 16, 2, 32 }, .u16));
+
+    var mixed = Layout.init(256, 128, .{ .n = 64 });
+    _ = try mixed.add("gate_proj.g0.trellis_pm", &.{ 3, 4, 16, 2, 32 }, .u16);
+    try t.expectError(error.Exl3TileOrderMixed, mixed.add("up_proj.g0.trellis", &.{ 3, 16, 8, 32 }, .u16));
 }

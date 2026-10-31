@@ -212,6 +212,11 @@ fn spanLess(_: void, a: FillSpan, b: FillSpan) bool {
     return a.offset < b.offset;
 }
 
+fn onPages(s: FillSpan) bool {
+    const page: u64 = @intCast(pageSize());
+    return s.offset % page == 0 and s.len % page == 0 and @intFromPtr(s.dst) % page == 0;
+}
+
 pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_bytes: u64) ![]ReadJob {
     if (max_bytes == 0) return error.InvalidCoalesceBound;
     var jobs: std.ArrayList(ReadJob) = .empty;
@@ -229,6 +234,10 @@ pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_
             if (next.len == 0) return error.InvalidFillSpan;
             if (next.file != file or next.offset != offset + len) break;
             if (next.tile != null or spans[first].tile != null) break;
+            // A page-aligned span whose neighbour in the file lands elsewhere reads alone, straight into its slot,
+            // instead of inside a bounced run.
+            const prev = spans[i - 1];
+            if (next.dst != prev.dst + @as(usize, @intCast(prev.len)) and (onPages(prev) or onPages(next))) break;
             if (len + next.len > max_bytes) break;
             len += next.len;
         }
@@ -324,6 +333,9 @@ pub const FillStats = struct {
     bytes_read: u64 = 0,
     bytes_issued: u64 = 0,
     bytes_bounced: u64 = 0,
+    /// Tile bytes `layout.tileMajor` moved on the CPU while landing them.
+    bytes_reshuffled: u64 = 0,
+    reads_direct: u64 = 0,
     reads_issued: u64 = 0,
     pread_ns: u64 = 0,
     max_worker_bytes: u64 = 0,
@@ -578,6 +590,7 @@ pub const FillPool = struct {
         const job = plan.jobs[index];
         const len: usize = @intCast(job.len);
         var head: usize = 0;
+        var reshuffled: u64 = 0;
         var read_offset: u64 = job.offset;
         var target: []u8 = undefined;
         if (job.direct) {
@@ -621,6 +634,7 @@ pub const FillPool = struct {
                 if (s1.tile) |tile| if (take == sl) {
                     const bytes = 2 * @as(usize, tile.n);
                     layout.tileMajor(u8, s1.dst[0..sl], target[head + written ..][0..sl], tile.it, tile.ot, bytes);
+                    reshuffled += sl;
                     written += sl;
                     continue;
                 };
@@ -632,6 +646,8 @@ pub const FillPool = struct {
         self.stats_acc.bytes_read += delivered;
         self.stats_acc.bytes_issued += result.done;
         self.stats_acc.bytes_bounced += if (job.direct) 0 else delivered;
+        self.stats_acc.bytes_reshuffled += reshuffled;
+        self.stats_acc.reads_direct += @intFromBool(job.direct);
         self.stats_acc.reads_issued += 1;
         self.stats_acc.pread_ns += elapsed;
         self.workers[worker].bytes += delivered;
@@ -1158,6 +1174,43 @@ test "expert io fill plan keeps a layer's tail scale reads off its last big read
     try t.expect(plan.bounds[w + 1] - 3 <= 2);
 }
 
+test "expert io fill counts the tile bytes it reshuffles, and a page-aligned span with no tile reads direct" {
+    const t = std.testing;
+    const page = pageSize();
+    var file = try TestFile.make(t.allocator, "tm.bin", page * 4, 0x31);
+    defer file.deinit(t.allocator);
+    const fd = try file.open(t.allocator);
+    defer _ = std.c.close(fd);
+    const pool = try FillPool.create(t.allocator, .{ .workers = 1 });
+    defer pool.destroy();
+
+    const it = 2;
+    const ot = 4;
+    const n = 4;
+    const bytes = it * ot * n * 2;
+    const dst = try alignedDest(t.allocator, page);
+    defer t.allocator.free(dst);
+    {
+        const spans = [_]FillSpan{.{ .file = 0, .offset = 0, .len = bytes, .dst = dst.ptr, .tile = .{ .it = it, .ot = ot, .n = n } }};
+        var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 1, false);
+        defer plan.deinit();
+        try pool.run(&.{fd}, &plan);
+        try t.expectEqual(@as(u64, bytes), pool.stats().bytes_reshuffled);
+    }
+    pool.resetStats();
+    {
+        const spans = [_]FillSpan{.{ .file = 0, .offset = page, .len = page, .dst = dst.ptr }};
+        var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 1, false);
+        defer plan.deinit();
+        try pool.run(&.{fd}, &plan);
+        const st = pool.stats();
+        try t.expectEqual(@as(u64, 0), st.bytes_reshuffled);
+        try t.expectEqual(@as(u64, 0), st.bytes_bounced);
+        try t.expectEqual(@as(u64, page), st.bytes_read);
+        try t.expectEqualSlices(u8, file.bytes[page..][0..page], dst[0..page]);
+    }
+}
+
 test "expert io fill attributes a span past eof while other spans complete" {
     const t = std.testing;
     var file = try TestFile.make(t.allocator, "short.bin", 8192, 0xabc);
@@ -1337,7 +1390,7 @@ pub const TensorRegion = struct {
     data_offset: u64,
     tensor_offset: u64,
     tensor_bytes: u64,
-    shape: [4]u64,
+    shape: [5]u64,
     rank: u8,
     dtype: Dtype,
 };
@@ -1378,6 +1431,14 @@ pub const SafetensorsHeader = struct {
         self.parsed.deinit();
     }
 };
+
+/// The string a shard's `__metadata__` holds under `key` (the empty string for a value that is not one), or null.
+pub fn metadataString(header: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const meta = header.get("__metadata__") orelse return null;
+    if (meta != .object) return null;
+    const v = meta.object.get(key) orelse return null;
+    return if (v == .string) v.string else "";
+}
 
 /// Fills `window` (page-aligned, starting at the page-aligned file offset `start`) until file
 /// offset `end` is covered; the read may stop short of the last page at end of file.
@@ -1513,8 +1574,8 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;
-    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 4) return error.InvalidSafetensorsTensor;
-    var dimensions: [4]u64 = .{ 0, 0, 0, 0 };
+    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 5) return error.InvalidSafetensorsTensor;
+    var dimensions: [5]u64 = .{ 0, 0, 0, 0, 0 };
     var elements: u64 = 1;
     for (shape.array.items, 0..) |dim, i| {
         if (dim != .integer or dim.integer <= 0) return error.InvalidSafetensorsTensor;

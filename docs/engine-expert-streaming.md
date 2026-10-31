@@ -279,6 +279,15 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   big trellis read. DeepSeek STQ 1.75bpw, budget 60, 1000 greedy tokens (base eba709e8, legacy layout): replay 1.484
   -> 1.394 ms/fill, fill_s 24.94 -> 24.04, prefetch job 27616 -> 26532 ms, host wait 5543 -> 4778 ms, second-half
   decode 25.52 -> 26.45 tok/s, output identical.
+- **A pair-major pack** ([pack-format](pack-format.md#tile-order)) is stored in the pools' own tile-major order, so its
+  spans carry no `tile`: they coalesce and, where the file offset, the length and the destination lie on pages, are read
+  straight into the slab. Every rate-group pool of the layer starts on a page too (`LayerGroups.align_bytes`; slots inside a pool keep their packed stride, so a group whose expert is
+  not a page multiple is direct only at the slots that land on pages). The padding is billed with the layer
+  (`LayerGroups.padBytes` in `allBytes`, `floorBytes` and the union workspace). A pair-major pack needs tile-major
+  pools (`Exl3TileOrderNeedsTileMajor` otherwise).
+- The `[expert-stream] forward=` line ends with `bounced_gb` (bytes read through the bounce buffer since boot) and
+  `reshuffled_gb` (tile bytes the CPU permuted); a pair-major pack on aligned shards shows both falling to the share
+  of reads that cannot be direct, `reshuffled_gb` at 0.
 - `FillPool` workers park on their condition without broadcasting: `submit` signals after every push, and a
   broadcast before the wait makes idle workers wake each other forever.
 - `PageSlab` epoch leases (`free → filling → ready → leased → readers_complete → reclaimable`, CPU writes only in

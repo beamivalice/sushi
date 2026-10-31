@@ -47,6 +47,8 @@ pub const Ragged = struct {
     prefill_only: bool = false,
     /// Every projection's tiles are in `layout.tileMajor` order, which only the funnel decode kernels read.
     tile_major: bool = false,
+    /// Each pool's first tile starts at a multiple of this many u16 elements of the flat trellis (`initPoolsAligned`).
+    align_words: u64 = 1,
     /// The rate group each pool's experts belong to (`initSplit` serves a group as two pools).
     origin: [max_groups]u8 = blk: {
         var o: [max_groups]u8 = undefined;
@@ -140,8 +142,14 @@ pub const Ragged = struct {
     /// `init`. `trellis[p]` is the flat U16 storage of projection p (pools back to back), `suh[p]` and `svh[p]` hold
     /// one row per slot over all pools. The handles are retained; the storage stays the caller's.
     pub fn initPools(s: mlx.mlx_stream, hidden: u32, inter: u32, pools: []const Pool, trellis: [3]mlx.mlx_array, suh: [3]mlx.mlx_array, svh: [3]mlx.mlx_array) !Ragged {
-        if (pools.len == 0 or pools.len > max_groups) return error.Exl3GroupMissing;
-        var self: Ragged = .{};
+        return initPoolsAligned(s, hidden, inter, pools, 1, trellis, suh, svh);
+    }
+
+    /// `initPools` with every pool's trellis starting at a multiple of `align_words` u16 elements, so a pool's first slot
+    /// can take a page-aligned read.
+    pub fn initPoolsAligned(s: mlx.mlx_stream, hidden: u32, inter: u32, pools: []const Pool, align_words: u64, trellis: [3]mlx.mlx_array, suh: [3]mlx.mlx_array, svh: [3]mlx.mlx_array) !Ragged {
+        if (pools.len == 0 or pools.len > max_groups or align_words == 0) return error.Exl3GroupMissing;
+        var self: Ragged = .{ .align_words = align_words };
         errdefer self.deinit();
         self.hidden = @intCast(hidden);
         self.inter = @intCast(inter);
@@ -162,6 +170,8 @@ pub const Ragged = struct {
             self.rates[g] = pool.rates;
             self.base[g] = self.experts;
             self.experts_of[g] = pool.slots;
+            // The meta table counts u32 words; the flat trellis array, u16 elements.
+            for (&words) |*w| w.* = std.mem.alignForward(u64, w.*, @max(1, align_words / 2));
             for (0..pool.slots) |local| {
                 try meta.appendSlice(std.heap.page_allocator, &.{ pool.rates[0], pool.rates[1], pool.rates[2], @intCast(g) });
                 for (0..3) |pi| {
@@ -185,6 +195,7 @@ pub const Ragged = struct {
         for (0..self.count) |g| {
             var view: root.Bank = undefined;
             const slots: c_int = @intCast(self.experts_of[g]);
+            for (&at) |*a| a.* = @intCast(std.mem.alignForward(u64, @intCast(a.*), self.align_words));
             for (0..3) |pi| {
                 const in_dim: c_int = if (pi == 2) self.inter else self.hidden;
                 const out_dim: c_int = if (pi == 2) self.hidden else self.inter;

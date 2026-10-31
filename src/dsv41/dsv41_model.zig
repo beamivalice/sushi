@@ -3899,17 +3899,21 @@ fn loadStqExperts(m: *Model, w: *model_mod.Weights, si: usize) !exl3.Ragged {
     var named: usize = 0;
     defer for (names[0..named], lens[0..named]) |*b, n| source.drop(w, b[0..n]);
     var probe: NameBuf = undefined;
-    const grouped = w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g0.trellis", .{si})) != null;
+    const major = w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g0.trellis_pm", .{si})) != null or
+        w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.trellis_pm", .{si})) != null;
+    const order: exl3.format.TileOrder = if (major) .pair_major else .pack;
+    const leaves = [3][]const u8{ if (major) "trellis_pm" else "trellis", "suh", "svh" };
+    const grouped = w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g0.{s}", .{ si, leaves[0] })) != null;
     var count: usize = 0;
     while (count < banks.len) : (count += 1) {
-        if (grouped and w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g{d}.trellis", .{ si, count })) == null) break;
+        if (grouped and w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g{d}.{s}", .{ si, count, leaves[0] })) == null) break;
         if (!grouped and count == 1) break;
         var g: [16]u8 = undefined;
         const tag = if (grouped) try std.fmt.bufPrint(&g, ".g{d}", .{count}) else "";
         inline for (.{ "gate", "up", "down" }) |pn| {
             var parts: [3]A = undefined;
-            inline for (.{ "trellis", "suh", "svh" }, 0..) |part, pi| {
-                const name = try key(&names[named], "mtp.{d}.mlp.switch_mlp." ++ pn ++ "_proj{s}." ++ part, .{ si, tag });
+            for (leaves, 0..) |part, pi| {
+                const name = try key(&names[named], "mtp.{d}.mlp.switch_mlp." ++ pn ++ "_proj{s}.{s}", .{ si, tag, part });
                 lens[named] = name.len;
                 named += 1;
                 parts[pi] = try getW(w, name);
@@ -3926,7 +3930,7 @@ fn loadStqExperts(m: *Model, w: *model_mod.Weights, si: usize) !exl3.Ragged {
         }
     };
     var drop_ctx: drop_group.Ctx = .{ .w = w, .names = names[0 .. count * 9], .lens = lens[0 .. count * 9] };
-    var rb = try owned_mod.raggedOwned(m.s, banks[0..count], .{ .ctx = &drop_ctx, .run = drop_group.run });
+    var rb = try owned_mod.raggedOwned(m.s, banks[0..count], order, .{ .ctx = &drop_ctx, .run = drop_group.run });
     errdefer rb.deinit();
     if (rb.experts != c.dspark.experts or rb.hidden != c.dim or rb.inter != c.moe_inter) {
         log.err("deepseek_v41: DSpark stage {d}'s trellis experts are {d} of {d}x{d}, config says {d} of {d}x{d}\n", .{ si, rb.experts, rb.hidden, rb.inter, c.dspark.experts, c.dim, c.moe_inter });

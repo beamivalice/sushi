@@ -39,6 +39,41 @@ rather than refused; a wider one refuses.
 `in` and `out` are the tile grid times 16, and the Hadamard block is 128
 (`H128`), so both must be multiples of it.
 
+<a id="tile-order"></a>
+### Tile order: `trellis` and `trellis_pm`
+
+A pack stores a routed expert's tiles either in the pack order above, `[IT][OT][n]` per expert (`IT` = in/16, `OT` =
+out/16), or in the order the decode and prefill kernels read, `pair_major`: `[OT/2][IT][2][n]` per expert, so an
+output tile pair's whole K range is one run (`layout.tileMajor` maps the first into the second). `expert_quant.tile_order`
+names it; absent is the pack order.
+
+| `expert_quant.tile_order` | trellis tensor | dtype | shape |
+|---|---|---|---|
+| absent | `…{P}[.gN].trellis` | `U16` | `[E, IT, OT, n]` |
+| `"pair_major"` | `…{P}[.gN].trellis_pm` | `U16` | `[E, OT/2, IT, 2, n]` |
+
+- The bytes of expert `e` of a `trellis_pm` tensor are `layout.tileMajor` of the bytes of expert `e` of the `trellis` it
+  replaces. `suh`, `svh` and every other tensor keep their names, shapes and bytes. The rename is deliberate: a build
+  that does not know `trellis_pm` finds no `trellis` and refuses the pack, never reading tiles in the wrong order.
+- It covers every routed trellis of the pack, the layers' and an MTP or DSpark head's (`mtp.{i}.mlp.switch_mlp…`).
+- A shard that holds routed trellis tensors carries `tile_order` in its safetensors `__metadata__` (`pair_major`; the
+  pack order stamps nothing).
+- A reader takes `IT`, `OT` and `n` from the 5-D shape (`OT = 2 * shape[1]`, `IT = shape[2]`, `shape[3] = 2`).
+- **Shard layout.** A layer shard's data runs, for gate, up, down, each by group `gN` ascending: `trellis_pm`, its
+  `.suh`, its `.svh`; then every other tensor in source order. The header is padded with spaces to a 16 KiB multiple
+  and every `trellis_pm` starts on a 16 KiB page of the file. Where the previous tensor does not end on a page, a
+  zero-filled `__pad__.<shard stem>.<i>` tensor (`U8`, 1-D, under 16384 bytes) fills the gap and is listed in the index
+  (safetensors readers reject gaps). The engine skips every `__pad__.` key: it is not loaded, billed or validated.
+- Only `deepseek_v41` reads `pair_major`. Its streaming engine lands the bytes in the slot pools unchanged: no CPU
+  reshuffle, and a read whose file offset, length and destination lie on pages goes straight into the slab. A
+  pair-major pack's rate-group pools always start on pages (the layer's bill grows by under one page per pool, per
+  projection), so a trellis that is off its page costs only its own reads their direct path.
+- Refused by name: `Exl3TileOrderUnsupported` (a value other than `pair_major`, or `pair_major` under another
+  architecture), `Exl3TileOrderMixed` (both keys in one pack or layer), `Exl3TileOrderMismatch` (the index names the
+  other order than the config), `Exl3GroupGeometry` (a `trellis_pm` shape that is not its projection's grid),
+  `Exl3ShardStampMismatch` (a shard of routed trellis tensors whose stamp is not the config's order),
+  `Exl3TileOrderNeedsGroups` (a `pair_major` layer that is not rate-grouped).
+
 ### MTP bank
 
 The MTP head's own MoE layer is the same three tensors under the head's prefix
@@ -96,6 +131,8 @@ stacked bank per projection with its own rate, read from its own trellis shape.
   (`expert_exl3_kernels.setDecodeParams`) before every dispatch, so packs with
   different codebooks can be resident together, and every weight kernel
   inlines its `exl3_pairh`.
+- `tile_order` — `pair_major` when the routed trellises are stored `trellis_pm` ([tile order](#tile-order)); absent
+  for the pack order. Any other value is `Exl3TileOrderUnsupported`.
 - `window` — the codeword width the search hashed, 8..16. **Absent means 16.**
   The same bitstream decodes to different weights at each width, so a window
   this build cannot decode is `Exl3WindowUnsupported`, never a fallback to 16.
@@ -224,6 +261,7 @@ string, because that is all safetensors stores. The engine reads these keys:
 | `k` | the rate as written, e.g. `2.25` or `4` |
 | `codebook` | `mul1` \| `mcg` \| `std1` \| `spec1` \| `pair1` |
 | `window` | the codeword width, e.g. `12` |
+| `tile_order` | `pair_major` on a shard holding `trellis_pm` tensors ([tile order](#tile-order)); absent otherwise |
 
 A converter adds its own provenance keys beside them; the engine reads none of
 those. `sushi convert exl3` writes `encoder`, `quantizer`, `global_scale_search`, `calib_sha256`, `calib_tokens` and

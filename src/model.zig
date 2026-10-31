@@ -133,6 +133,7 @@ pub const ModelConfig = struct {
     expert_quant_table: ?u8 = null,
     /// The bank rates the pack's codebook table has a row for (bit n/2); null admits every rate.
     expert_quant_rates: ?u128 = null,
+    expert_tile_order: expert_exl3.TileOrder = .pack,
     /// How the trunk projections a pack stores as trellis banks decode (`trunk_quant`); null for an all-affine trunk.
     trunk_quant: ?expert_exl3.Decode = null,
     expert_source_dir: ?[]u8 = null,
@@ -830,6 +831,7 @@ pub const ModelConfig = struct {
             .first_moe_layer = @intCast(self.first_k_dense_replace),
             .exl3_n = self.expert_quant_rate.n,
             .exl3_rates = self.expert_quant_rates,
+            .tile_order = self.expert_tile_order,
             .shape = self.expert_shape,
             .drop_n = self.drop_expert,
         };
@@ -1150,6 +1152,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 config.expert_quant_window = spec.window;
                 config.expert_quant_table = spec.table;
                 config.expert_quant_rates = spec.rates;
+                config.expert_tile_order = spec.tile_order;
+                // Only the DeepSeek loader reads pair-major tiles; the index must name the order the config does.
+                if (spec.tile_order == .pair_major and !config.isDsv41()) return error.Exl3TileOrderUnsupported;
+                if (try expert_quant.tileOrderOfDir(allocator, io, model_dir) != spec.tile_order) return error.Exl3TileOrderMismatch;
                 var k_buf: [8]u8 = undefined;
                 log.info("[expert-exl3] engaged K={s} codebook={s} window={d}\n", .{ spec.rate.kText(&k_buf), @tagName(spec.codebook), spec.window.bits() });
             }
@@ -2110,7 +2116,9 @@ fn loadWeightsDsv41(io: std.Io, allocator: std.mem.Allocator, model_dir: []const
         log.err("deepseek_v41: model.safetensors.index.json does not list every routed expert (layout {s}); the download is incomplete\n", .{@tagName(config.expert_layout)});
         return error.ExpertLayoutUnsupported;
     }
-    return @import("dsv41/dsv41_source.zig").loadResident(io, allocator, model_dir, .{ .dspark = config.dsparkOn(), .vision = load_vision and config.has_vision });
+    const source = @import("dsv41/dsv41_source.zig");
+    try source.validateTileOrder(io, allocator, model_dir, config.expert_tile_order, config.hidden_size, config.moe_intermediate_size);
+    return source.loadResident(io, allocator, model_dir, .{ .dspark = config.dsparkOn(), .vision = load_vision and config.has_vision });
 }
 
 pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout, vision: bool, keep_mtp: bool) !Weights {
@@ -4328,4 +4336,32 @@ test "a text prompt's BOS comes from the release config, whose bos_token_id sits
     var config = try parseConfigFromJson(testing.allocator, dsv41_config.release_config);
     defer config.deinit(testing.allocator);
     try testing.expectEqual(@as(?u32, 0), config.text_prompt_bos);
+}
+
+test "a pair-major pack is refused by name by an architecture that reads only the pack order" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const order = ",\"expert_quant\":{\"format\":\"exl3\",\"k\":4,\"codebook\":\"mcg\",\"tile_order\":\"pair_major\"}";
+    for ([_]struct { config: []const u8, first: usize, layers: usize, prefix: []const u8 }{
+        .{ .config = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ order), .first = 0, .layers = 48, .prefix = "language_model.model.layers." },
+        .{ .config = "{\"model_type\":\"mimo_v2\",\"hidden_size\":384,\"vocab_size\":128,\"num_hidden_layers\":4,\"intermediate_size\":1536," ++
+            "\"num_attention_heads\":4,\"num_key_value_heads\":2,\"head_dim\":192,\"v_head_dim\":128,\"hybrid_layer_pattern\":[0,1,1,0],\"sliding_window\":128," ++
+            "\"n_routed_experts\":16,\"num_experts_per_tok\":4,\"moe_intermediate_size\":192,\"moe_layer_freq\":[0,1,1,1],\"eos_token_id\":17" ++ order ++ "}", .first = 1, .layers = 4, .prefix = "model.layers." },
+    }) |c| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var index: std.ArrayList(u8) = .empty;
+        defer index.deinit(testing.allocator);
+        try index.appendSlice(testing.allocator, "{\"weight_map\":{");
+        var first = true;
+        for (c.first..c.layers) |layer| for ([_][]const u8{ "gate", "up", "down" }) |proj| for ([_][]const u8{ "trellis_pm", "suh", "svh" }) |leaf| {
+            try index.print(testing.allocator, "{s}\"{s}{d}.mlp.switch_mlp.{s}_proj.{s}\":\"model.safetensors\"", .{ if (first) "" else ",", c.prefix, layer, proj, leaf });
+            first = false;
+        };
+        try index.appendSlice(testing.allocator, "}}");
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = c.config });
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &buf);
+        try testing.expectError(error.Exl3TileOrderUnsupported, parseConfig(io, testing.allocator, buf[0..n]));
+    }
 }

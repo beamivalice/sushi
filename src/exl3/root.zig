@@ -174,6 +174,9 @@ pub const Spec = struct {
     rates: ?u128 = null,
     /// The pack's STD1 or SPEC1 table (`Decode.table`); null for every other codebook.
     table: ?u8 = null,
+    /// `expert_quant.tile_order`: how the routed experts' trellis tiles lie. A host that reads only the pack order
+    /// refuses `pair_major`, whose tensors are named `trellis_pm`.
+    tile_order: format.TileOrder = .pack,
 };
 
 /// `k` is a rate, integer or fractional: admitted only when 16k is an even
@@ -200,7 +203,13 @@ fn windowFromConfig(v: ?std.json.Value) ?format.Window {
 }
 
 pub fn parseExpertQuant(obj: std.json.ObjectMap) !Spec {
-    return parseQuantBlock(obj.get("expert_quant") orelse return error.ExpertLayoutUnsupported);
+    const block = obj.get("expert_quant") orelse return error.ExpertLayoutUnsupported;
+    var spec = try parseQuantBlock(block);
+    if (block.object.get("tile_order")) |v| {
+        if (v != .string) return error.Exl3TileOrderUnsupported;
+        spec.tile_order = format.TileOrder.fromName(v.string) orelse return error.Exl3TileOrderUnsupported;
+    }
+    return spec;
 }
 
 /// One `expert_quant`-shaped block (`trunk_quant` too): format, k, codebook, window and the STQ table.
@@ -225,6 +234,13 @@ pub fn parseQuantBlock(block: std.json.Value) !Spec {
     const table = try codebook_tables.resolve(block.object, codebook, window);
     if (!rate.in(table.rates())) return error.Exl3CodebookTableRateMissing;
     return .{ .rate = rate, .codebook = codebook, .window = window, .rates = table.rates(), .table = codebook_tables.index(table) };
+}
+
+/// A shard that holds routed trellis tensors stamps the order they are stored in (`tile_order`), and nothing for the
+/// pack order; any other stamp, or one that differs from `expert_quant.tile_order`, is `Exl3ShardStampMismatch`.
+pub fn shardTileOrderAgrees(order: format.TileOrder, stamp: ?[]const u8) !void {
+    const stamped: format.TileOrder = if (stamp) |v| format.TileOrder.fromName(v) orelse return error.Exl3ShardStampMismatch else .pack;
+    if (stamped != order) return error.Exl3ShardStampMismatch;
 }
 
 pub fn shardStampAgrees(spec: Spec, k: ?[]const u8, codebook: ?[]const u8, window: ?[]const u8) !void {
@@ -268,6 +284,18 @@ test "an EXL3 pack's codeword window is 16 unless its config names one this buil
     try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, base ++ ",\"window\":17}}"));
     try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, base ++ ",\"window\":7}}"));
     try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, base ++ ",\"window\":\"12\"}}"));
+}
+
+test "an expert_quant tile_order names pair_major, absence is the pack order, any other value is refused by name" {
+    const t = std.testing;
+    const base = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\"";
+    try t.expectEqual(format.TileOrder.pack, (try specFromConfigJson(t.allocator, base ++ "}}")).tile_order);
+    try t.expectEqual(format.TileOrder.pair_major, (try specFromConfigJson(t.allocator, base ++ ",\"tile_order\":\"pair_major\"}}")).tile_order);
+    for ([_][]const u8{ "\"pack\"", "\"Pair_Major\"", "\"\"", "1", "null", "true" }) |bad| {
+        var buf: [160]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&buf, "{s},\"tile_order\":{s}}}}}", .{ base, bad });
+        try t.expectError(error.Exl3TileOrderUnsupported, specFromConfigJson(t.allocator, raw));
+    }
 }
 
 test "an EXL3 pack naming a codebook this build does not decode is refused" {

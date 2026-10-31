@@ -112,15 +112,21 @@ pub const Release = struct {
     run: *const fn (?*anyopaque, usize) void,
 };
 
+fn gridOf(order: exl3.format.TileOrder, shape: []const c_int) ?exl3.group_layout.TileDims {
+    var wide: [5]u64 = undefined;
+    if (shape.len > wide.len) return null;
+    for (shape, 0..) |d, i| wide[i] = std.math.cast(u64, d) orelse return null;
+    return exl3.group_layout.tileDims(order, wide[0..shape.len]);
+}
+
 /// The ragged bank `exl3.Ragged.init` builds from `banks`, with its nine storage arrays in owned regions: each
-/// projection's trellis and scales are the groups' bytes back to back.
-pub fn raggedOwned(s: mlx.mlx_stream, banks: []const exl3.Bank, release: ?Release) !exl3.Ragged {
+/// projection's trellis and scales are the groups' bytes back to back. `order` is how the trellis arrays are shaped.
+pub fn raggedOwned(s: mlx.mlx_stream, banks: []const exl3.Bank, order: exl3.format.TileOrder, release: ?Release) !exl3.Ragged {
     const max_groups = exl3.group_layout.max_groups;
     if (banks.len == 0 or banks.len > max_groups) return error.Exl3GroupMissing;
-    const g0 = mlx.getShape(banks[0].gate.trellis);
-    if (g0.len != 4) return error.BadExl3Shape;
-    const hidden: usize = @intCast(g0[1] * 16);
-    const inter: usize = @intCast(g0[2] * 16);
+    const g0 = gridOf(order, mlx.getShape(banks[0].gate.trellis)) orelse return error.BadExl3Shape;
+    const hidden: usize = @intCast(g0.it * 16);
+    const inter: usize = @intCast(g0.ot * 16);
     var pools: [max_groups]exl3.rate_groups.Pool = undefined;
     var trellis_bytes: [3]usize = @splat(0);
     var rows: usize = 0;
@@ -133,10 +139,11 @@ pub fn raggedOwned(s: mlx.mlx_stream, banks: []const exl3.Bank, release: ?Releas
             const sh = mlx.getShape(p.trellis);
             const ss = mlx.getShape(p.suh);
             const sv = mlx.getShape(p.svh);
-            if (sh.len != 4 or sh[0] != e or sh[1] * 16 != in or sh[2] * 16 != out or mlx.mlx_array_dtype(p.trellis) != .uint16 or
+            const grid = gridOf(order, sh) orelse return error.BadExl3Shape;
+            if (sh[0] != e or grid.it * 16 != in or grid.ot * 16 != out or mlx.mlx_array_dtype(p.trellis) != .uint16 or
                 ss.len != 2 or ss[0] != e or ss[1] != in or sv.len != 2 or sv[0] != e or sv[1] != out or
                 mlx.mlx_array_dtype(p.suh) != .float16 or mlx.mlx_array_dtype(p.svh) != .float16) return error.BadExl3Shape;
-            pools[g].rates[pi] = (exl3.format.kFromPackedDim(@intCast(sh[3])) orelse return error.BadExl3Shape).n;
+            pools[g].rates[pi] = (exl3.format.kFromPackedDim(@intCast(grid.n)) orelse return error.BadExl3Shape).n;
             trellis_bytes[pi] += mlx.mlx_array_size(p.trellis) * 2;
         }
         rows += @intCast(e);
@@ -183,7 +190,9 @@ pub fn raggedOwned(s: mlx.mlx_stream, banks: []const exl3.Bank, release: ?Releas
         arrays[3 + pi] = try model.wrapOwned(taken(&regions[3 + pi]), &.{ rc, in }, .float16);
         arrays[6 + pi] = try model.wrapOwned(taken(&regions[6 + pi]), &.{ rc, out }, .float16);
     }
-    return exl3.Ragged.initPools(s, @intCast(hidden), @intCast(inter), pools[0..banks.len], arrays[0..3].*, arrays[3..6].*, arrays[6..9].*);
+    var rb = try exl3.Ragged.initPools(s, @intCast(hidden), @intCast(inter), pools[0..banks.len], arrays[0..3].*, arrays[3..6].*, arrays[6..9].*);
+    rb.tile_major = order == .pair_major;
+    return rb;
 }
 
 /// What an owned set holds, by where its buffers live.
@@ -270,7 +279,7 @@ test "dsv41 owned: the owned ragged bank is exl3.Ragged.init's storage, meta, vi
             std.debug.assert(g + 1 == seen);
         }
     };
-    var got = try raggedOwned(cpu, &banks, .{ .ctx = null, .run = Released.run });
+    var got = try raggedOwned(cpu, &banks, .pack, .{ .ctx = null, .run = Released.run });
     defer got.deinit();
     try testing.expectEqual(banks.len, Released.seen);
 

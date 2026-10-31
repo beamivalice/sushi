@@ -53,6 +53,13 @@ existing struct literals keep working), `format.Codebook` gains `std1`, `spec1` 
 A `Decode` that names std1 or spec1 without its table is refused by name (`Exl3CodebookTableUnknown`) at the dispatch, never
 decoded. A host that only ever sees MCG and MUL1 packs needs no change.
 
+`Spec` also gains `tile_order` (`format.TileOrder`, default `.pack`): `expert_quant.tile_order: "pair_major"` stores the
+routed trellises as `trellis_pm` in the kernels' own order ([pack-format](pack-format.md#tile-order)). A host that binds
+only `…trellis` finds no tensor and refuses such a pack on its own; it should still refuse on `Spec.tile_order` by name.
+`group_layout.Name.parse` accepts `trellis_pm` (`Name.pair_major`), `group_layout.trellisRate` and `tileDims` read either
+order's shape, and `shardTileOrderAgrees` checks a shard's `tile_order` stamp. Only this repo's DeepSeek loader reads
+`pair_major` today.
+
 The module's tests run as their own artifacts (`exl3-test-N`) on `zig build test`; a change that
 passes them and keeps the names above is safe to re-vendor.
 
