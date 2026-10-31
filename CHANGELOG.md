@@ -7,9 +7,9 @@ earlier history is mlx-serve's, in that project's changelog.
 ## Unreleased
 
 - **DeepSeek-V4.1 decode spends less CPU per token with byte-identical output**: fewer Metal command buffers per layer,
-  MLX no longer rebuilds and hashes a custom kernel's source on every launch, a DSpark verify round waits on the host
-  only for its argmax, idle expert prefetches are skipped, and a streamed reply no longer rescans the whole answer on
-  every token.
+  two fewer kernel launches per layer, custom kernels handed to MLX without comments or unused helpers, a DSpark verify
+  round waits on the host only for its argmax, idle expert prefetches are skipped, and a streamed reply no longer
+  rescans the whole answer on every token.
 
 ## v1.4.1 — Faster DeepSeek prefill, DeepSeek with no flags
 

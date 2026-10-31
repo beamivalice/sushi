@@ -374,6 +374,8 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_gate`, `dsv41_route`, `dsv41_topk`, `dsv41_topk_chunk`, `dsv41_topk_merge` | router logits (the router read as stored, bf16, and widened in the kernel), softplus scores/top-k/normalize, the indexer's top-k (a decode block over 131072+ scores splits each row over 8 chunks and merges their picks) | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index, the split the one-threadgroup picks in the same order |
 | `dsv41_dense_f32x` | the f32 matmul of the compressor projections | decode rows | vs f64 truth |
 | `dsv41_rope_tail`, `dsv41_kv_row` | `rotate` plus the QAT round trip (q, indexer q/k, compressed latent, inverse rotation of the heads); the window row's rms norm, rotation and fp8 round trip | every width | bit for bit (rms in MLX's accumulation order) |
+| `dsv41_rope_kv` | `dsv41_kv_row` and the query's `dsv41_rope_tail` as one launch (the window rows in the first threadgroups, the rotation after) | the attention sublayer when the query and the window row share a dtype and the profiler is off | bit for bit both kernels (`dsv41 rope kv`) |
+| `dsv41_route_split` | `dsv41_route` and the FFN stage's `dsv41_hc_split`: the grid's second threadgroup of a row is the split | a narrow FFN stage whose mixes are still unsplit (`HcMix.z`) | bit for bit both kernels (`dsv41 route split`) |
 | `dsv41_unpack_picks` | a decode block's picks of the packed store: the id clamp, two gathers, FP4 unpack, mask and row numbering (7 dispatches a layer) | `packedPicks` when the picked rows are handed over unpacked (decode, narrow blocks) | bytes: rows and ids of `packedPicksOps` over both FP4 stores, clamped and masked ids |
 | `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
 | `dsv41_attn_fused` (`_fp4`) | a wide span's whole `attnCore`: window band and picked rows read by index (`_fp4`: straight from the packed FP4 store), online f32 softmax with the sink, no gathered rows or logits | wide chunks (more than 16 rows) on the GPU stream, bf16 activations, 16 divides the heads | 4e-6 to 1.3e-5 of peak against the CPU f32 `attnCore`, where the GPU `attnCore` is 3.5e-4 to 7e-4; the tiny oracle (4 heads) never engages it |
@@ -387,6 +389,26 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 
 `dsv41_unpack_picks` (decode picks glue, 7 dispatches to 1): `sushi-ubench run dsv41.picks_glue` (62f2245d code, quiet, 9 rounds of 40 dependent layers, `taskpolicy -a`, AC, GPU lock; 512 picks of 512-wide FP4 rows with holes, median us a layer including a 4 us link): op chain 26.7 / 23.0 / 18.6 / 23.0 to kernel 16.1 / 14.9 / 12.2 / 15.1 at 1024 and 16384 rows x 1 and 4 query rows; 27.1 to 23.3 at 262144 rows. One kernel a layer; bytes equal to the chain.
 Decode attention core, `sushi-ubench run dsv41.attn_decode` (`dsv41_attn_decode`/`_split`/`_merge`, 40 dependent calls, 15 rounds, quiet, `taskpolicy -a`, GPU lock, AC, 85ec48c1): 36.8 us a call at 512 picks over 4k compressed rows, 35.9 over 250k, 22.7 at 64 picks over 4k. Scoring RB of a simdgroup's rows (their dots) ahead of the serial recurrence, same expressions and bytes, was slower: RB 1/2/4/8 at 512 picks over 4k 39.2/42.0/42.0/46.0 us (a variant keeping the rows in registers 57 to 92 us). The serial walk is not what bounds the kernel.
+
+**Fewer launches a token** (a custom-kernel launch costs host CPU on the Super cores, which share the die and its heat with the GPU: MLX builds the
+primitive, its output array and graph node, and hashes the source on every launch; a serial decode token ran ~965 of them). A fusion lands where the
+output bytes are the unfused kernels' and the GPU time is no worse (`sushi-ubench run dsv41.launch_fusions`).
+- **Router + FFN hc split** (`dsv41_route_split`, -1 launch a layer): the two share no data, so the split rides the router's launch. Putting it in
+  the router's own threadgroup (simdgroup 0, after the picks) was 3 to 5% slower than the two launches, which overlap; a second threadgroup per row
+  runs it beside the picks as two launches did. The split arrays are now outputs of the router, so they leave with the picks' submit unchanged
+  (`ride` is a no-op there). The router is made in `block`'s scope, not `moe`'s, so the split outlives the FFN scope.
+- **Window row + query rotation** (`dsv41_rope_kv`, -1 a layer): the window row's norm (three barriers) takes the first threadgroups, so it starts
+  with the rotation, not after it (put last it was 5% slower than the pair).
+
+Microbenches (commit 551d6122, ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC, median of rounds of 40 dependent layers, us a layer, link included):
+`dsv41.launch_fusions` router + split 24.0 -> 20.1 (4 rows), window row + rotation 18.3 -> 16.4 (1 row) and 14.7 -> 13.6 (4 rows), with the
+1-row router pair bimodal on the unfused arm (61.4 median, 31.7 to 69.8).
+
+Rejected: folding `sushi_exl3_rows_finish` (~140 a token) into the rows kernel, the last-arriving threadgroup of a tile summing the split partials in
+the same order. It needs a device counter that is zero when a launch starts; MLX zeroes only through `init_value` (one fill dispatch per output,
+the partials included), and a persistent self-resetting counter races with the duplicate launch of a layer the route-spec rollback rebuilds while the
+discarded build is still in flight. A geometry without the split changes the f32 summation order, so it is a KLD matter. Gate + router in one threadgroup:
+one threadgroup would read the 384 x 5120 router weight alone. `dsv41_unpack_picks` into the attention kernel: 64 heads would each unpack the picked rows.
 
 **Attention core on the matrix units (landed).** `Model.attn_nax` is on by default: a wide span's attention runs on `dsv41_attn_nax` wherever
 `attnNaxFits` holds (an M5 with NAX, 16 divides the heads, width a multiple of 256) and the load's trial passes
@@ -637,9 +659,9 @@ layer) the forward queues the argmax, the embedding gather and layer 0 before th
 layer 1 on. A token the pass refuses (an image id without image rows) restores layer 0's state (`Undo`) and the next
 forward at that position gives the bytes of one that never saw it (`dsv41 generator: a one-row decode that hands its
 logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit). The FFN's hc split
-(`sf`: pre, post, comb) is submitted with the picks (`submitWith`, `Spec.queue`'s `ride`), so the one-simdgroup Sinkhorn
-runs beside the gate GEMV and not in a buffer of its own behind the routed chain; same kernel, same bytes
-(`dsv41 submit`). Together with the picks kernel and the hc expand grid, serial `--no-mtp` decode at 4.7k went
+(`sf`: pre, post, comb) is a second threadgroup of the router's launch (`dsv41_route_split`) and leaves with the picks (`submitWith`,
+`Spec.queue`'s `ride`), so the one-simdgroup Sinkhorn runs beside the picks and not in a buffer of its own behind the routed chain; same bytes
+(`dsv41 submit`, `dsv41 route split`). Together with the picks kernel and the hc expand grid, serial `--no-mtp` decode at 4.7k went
 52.65 / 51.85 -> 54.42 / 53.53 tok/s (r2 / r3, A B B A, one boot an arm, b95886f8 vs this stack, AC, GPU lock, fans max,
 die < 50 C at boot, `taskpolicy -a`), same text. The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
 round's kept rows ...`). Kernel shapes, arms and timings:

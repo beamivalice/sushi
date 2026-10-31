@@ -320,7 +320,7 @@ fn runLaunch(run: *report.Run) anyerror!void {
         defer alloc.free(header);
         const name = try std.fmt.allocPrintSentinel(alloc, "sushi_ubench_launch_{s}", .{size}, 0);
         defer alloc.free(name);
-        const kernel = mlx.mlx_fast_metal_kernel_new(name, iv, ov, launch_source, header, true, false);
+        const kernel = mlx.kernelNewSource(name, iv, ov, launch_source, header, true, false);
         if (kernel.ctx == null) return error.MetalKernelCompileFailed;
         defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
         const rung: LaunchRung = .{ .s = s, .kernel = kernel, .x = x, .w = x, .sc = sc, .steps = steps };

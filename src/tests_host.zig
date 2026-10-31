@@ -43,4 +43,5 @@ test {
     _ = @import("bench_box.zig");
     _ = @import("ubench_report.zig");
     _ = @import("mrope.zig");
+    _ = @import("metal_minify.zig");
 }

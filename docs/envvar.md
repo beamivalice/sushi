@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 137 vars. By kind: tradeoff levers 14, diagnostics 51, microbenches 19, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 138 vars. By kind: tradeoff levers 14, diagnostics 52, microbenches 19, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (51)
+## Diagnostics (52)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -63,6 +63,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_EXPERT_DEFER_SYNC` | `qwen4_forward.zig:2007` | `1` forces synchronous expert verification for an exact schedule comparison | once | yes: engine-expert-streaming |
 | `SUSHI_FORCE_GPU_FAMILY_FALLBACK` | `nax_gate.zig:136, exl3/expert_exl3_kernels.zig:1112` | `1` pretends the matrix units are absent to rehearse the M1-M4 path on an M5; the EXL3 and verify-qmm parity tests set it | once | yes: glm5-arch, glm5-kernels, glm5-perf, ... |
 | `SUSHI_KERNEL_BUILD_LOG` | `mlx_kernel_keys.zig` (the `mlx_fast_metal_kernel_*` wrappers of `mlx.zig`) | `1` logs every custom-kernel library key MLX has not compiled yet as `[kernel-build] #N name src=... template args -> outputs in: inputs`; each is a Metal compile on the inference thread | once | yes: engine-mlx-gotchas |
+| `SUSHI_KERNEL_RAW_SOURCE` | `mlx.zig` (`mlx_fast_metal_kernel_new`) | `1` hands MLX every custom kernel's source and header as written instead of minified and shaken, so a Metal compile error names the source lines | once | yes: engine-mlx-gotchas |
 | `SUSHI_KVQ_PARITY_TRACE`, `SUSHI_MIMO_VISION_DIAG`, `SUSHI_EXL3_PARITY_TRACE` | `test_support.zig`, `mimo_forward.zig`, `mimo_vision.zig`, `mimo_fixture_test.zig` | prints extra parity / vision diagnostics inside a test (the EXL3 one: the MiMo EXL3 tests' relative RMS) | test | yes: CLAUDE |
 | `SUSHI_LAYER_CAP` | `forward_diag.zig:63` | `<n>` runs only the first n layers so a ms-vs-layers slope is measurable (`tests/fwd_ubench.sh`) | once | yes: tests/CLAUDE |
 | `SUSHI_LMHEAD_SHORTLIST_AUDIT` | `transformer.zig:1821` | `1` re-reads the full head on every shortlist row and counts disagreements | once | yes: engine-mtp, mimo2-perf |

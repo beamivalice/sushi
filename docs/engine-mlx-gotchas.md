@@ -24,7 +24,7 @@ permutation before comparing bytes; grouping by the other arm's IDs is invalid.
 ## The transient cap patch
 
 `patches/mlx-transient-cap.patch` (mlx) and `patches/mlxc-transient-cap.patch` (mlx-c C ABI) are applied by
-`build-mlx.sh`; the stamp's `patch=` hashes all four patches. Stock `MetalAllocator` counts an imported (no-copy)
+`build-mlx.sh`; the stamp's `patch=` hashes all three patches. Stock `MetalAllocator` counts an imported (no-copy)
 buffer in `active_memory_`, `malloc` never refuses and `set_memory_limit` only throttles eval, so nothing could bound
 what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed-buffer pool).
 - `external_memory_` is the imported bytes (`make_buffer` adds, `release` subtracts); transient = active - external.
@@ -79,9 +79,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   template arg: read it from `threads_per_grid`, an input's `_shape`, or a small input buffer. DeepSeek's index top-k
   width and packed-KV row counts did, and decode below 512 tokens of context compiled a library every token (the
   "slow state"). `SUSHI_KERNEL_BUILD_LOG=1` logs each new key; guard: the `dsv41 kernels:` zero-new-library tests.
-- **A `metal_kernel` closure builds its Metal source once per kernel name** (`patches/mlx-custom-kernel-source-cache.patch`,
-  applied by `build-mlx.sh`): a launch used to rebuild the source, copy it and hash it again; keep one kernel object per
-  kernel, never one per launch, or the closure's cache is lost. The library key is unchanged.
+- **MLX rebuilds and hashes a kernel's whole source and header on every launch**: `mlx_fast_metal_kernel_new` minifies
+  both once and drops the header's struct, alias and function definitions the source never reaches
+  (`metal_minify.zig`). `SUSHI_KERNEL_RAW_SOURCE=1` passes the text as written. Guard: the `a minified kernel gives` test.
 
 ## Laziness and barriers
 

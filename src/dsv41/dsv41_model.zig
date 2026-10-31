@@ -1900,9 +1900,12 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     if (pf) |p| try p.mark(.attn_in, in[0..if (in[2].ctx != null) 3 else 2]);
     const qr = try sc.rms(in[0], ly.q_norm, c.eps);
     try tapInput(m, li, .q_lora, qr);
-    const q = try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) }), rope, pos, false, .none, null);
+    const q_proj = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) });
+    const joint = fus and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
+    const rk = if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
+    const q = if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
     if (pf) |p| try p.mark(.q, &.{ qr, q });
-    const kv = try windowRow(sc, m, ly, in[1], rope, pos);
+    const kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
     if (pf) |p| try p.mark(.kv_row, &.{kv});
 
     if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, in[2], sh);
@@ -2085,7 +2088,7 @@ fn fusedOn(sc: *const Scope, m: *const Model) bool {
 
 /// The router's picks `idx` (`[L, k]` ids) and their weights `wts` (`[L, k]` f32): sqrt-softplus scores, the f32
 /// bias picks only, normalized, times the routed scale.
-fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !kernels.Routes {
+fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix) !kernels.Routes {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const K = ly.top_k;
@@ -2097,7 +2100,13 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !kernels.Routes 
             try kernels.gateLogits(sc, h, ly.gate_w)
         else
             try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32)));
-        var r = try kernels.route(sc, logits, bias, K, norm, c.route_scale);
+        var r = if (mix) |mx| blk: {
+            if (mx.sp != null or mx.z.ctx == null) break :blk try kernels.route(sc, logits, bias, K, norm, c.route_scale);
+            // The FFN stage's mixes are split in the router's launch.
+            const rs = try kernels.routeSplit(sc, logits, bias, K, norm, c.route_scale, mx.z, c.hc_mult, c.hc_iters, try kernels.hcEps(sc, c.eps, c.hc_eps));
+            mx.sp = .{ .pre = rs.split.pre, .post = rs.split.post, .comb = rs.split.comb };
+            break :blk rs.routes;
+        } else try kernels.route(sc, logits, bias, K, norm, c.route_scale);
         r.logits = logits;
         try traceRoutes(m, li, logits, r);
         try tapRoutes(sc, m, li, r);
@@ -2156,11 +2165,12 @@ fn sharedQuant(ly: *const Layer) ?kernels.SharedLins {
 
 /// One token's FFN as two kernels (routed and shared gate-up, then routed and shared down summed and expanded
 /// into `x1` by `sf`): the new stream, or null where they do not apply.
-fn ffnDecode(sc: *Scope, m: *const Model, li: usize, h: A, x1: A, sf: qat_mod.Split) !?A {
+fn ffnDecode(sc: *Scope, m: *const Model, li: usize, h: A, x1: A, mix: *HcMix) !?A {
     const c = &m.cfg;
     if (c.expert_dec != null or m.tap != null or !fusedOn(sc, m) or dim(h, 0) != 1 or !kernels.moeDecodeFits(c.dim, c.moe_inter)) return null;
     const sh = sharedQuant(&m.layers[li]) orelse return null;
-    const r = try router(sc, m, li, h, none);
+    const r = try router(sc, m, li, h, none, mix);
+    const sf = try mix.splitOnce(sc, m);
     const lease = try leaseBanks(sc, m, li, r.idx);
     defer releaseBanks(m, li);
     errdefer _ = mlx.mlx_synchronize(sc.s);
@@ -2326,12 +2336,11 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) 
     return ly.shared[2].apply(sc, act);
 }
 
+/// `r`: the router's picks, made in the caller's scope so the hc split they may carry outlives this one.
 /// `ride`: arrays independent of the router (the FFN's hc split) that go out with its picks.
-fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, ride: []const A) !A {
-    const img = sh.img;
+fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Routes, ride: []const A) !A {
     const c = &m.cfg;
     const ly = &m.layers[li];
-    const r = try router(sc, m, li, h, img);
     const pf = prof(m, dim(h, 0));
     if (pf) |p| try p.mark(.router, &.{ r.idx, r.wts });
     if (c.expert_dec) |dec| {
@@ -2432,6 +2441,11 @@ const HcMix = struct {
     sp: ?qat_mod.Split = null,
     z: A = none,
 
+    fn splitOnce(self: *HcMix, sc: *Scope, m: *const Model) !qat_mod.Split {
+        self.sp = try self.split(sc, m);
+        return self.sp.?;
+    }
+
     fn split(self: HcMix, sc: *Scope, m: *const Model) !qat_mod.Split {
         if (self.sp) |s| return s;
         const c = &m.cfg;
@@ -2496,17 +2510,22 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     };
     if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
     const pf = try hcPre(sc, m, x, .{ .y = a, .prev = pa.mix }, none, &ly.hc_ffn, ly.ffn_norm);
+    var mix = pf.mix;
     const x1 = pf.x1;
-    const sf = try pf.mix.split(sc, m);
     const h2 = pf.h;
-    if (prof(m, dim(x, 0))) |p| try p.mark(.hc_ffn, &.{ h2, x1, sf.pre, sf.post, sf.comb });
+    if (prof(m, dim(x, 0))) |p| {
+        const s = try mix.splitOnce(sc, m);
+        try p.mark(.hc_ffn, &.{ h2, x1, s.pre, s.post, s.comb });
+    }
     try tapInput(m, li, .ffn_in, h2);
     if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
-    if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, sf)) |x2| return .{ .x = sc.out(x2), .pre = sc.out(sf.pre) };
+    if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(x2), .pre = sc.out(mix.sp.?.pre) };
+    const r = try router(sc, m, li, h2, sh.img, &mix);
+    const sf = try mix.splitOnce(sc, m);
     const y = blk: {
         var fsc = Scope.init(sc.a, sc.s);
         defer fsc.deinit();
-        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, &.{ sf.pre, sf.post, sf.comb })));
+        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, r, &.{ sf.pre, sf.post, sf.comb })));
     };
     if (sh.spec) |*u| {
         u.x1 = sc.out(x1);
@@ -5920,7 +5939,7 @@ fn expectMaskedRoute(sc: *Scope, full: *Model, cut: *Model, d: *const expert_usa
     const c = &full.cfg;
     const k = c.top_k;
     const rows: usize = @intCast(dim(h, 0));
-    const r = try router(sc, cut, li, h, none);
+    const r = try router(sc, cut, li, h, none, null);
     const idx = try sc_mod.hostI32(try sc.astype(r.idx, .int32));
     const wts = try sc_mod.hostF32(r.wts);
 
@@ -5973,7 +5992,7 @@ fn expectStoredRouterExact(dir: []const u8) !void {
     const Bits = struct { logits: []const f32, idx: []const i32, wts: []const f32 };
     const bits = struct {
         fn of(sc_: *Scope, m_: *Model, li: usize, h: A) !Bits {
-            const r = try router(sc_, m_, li, h, none);
+            const r = try router(sc_, m_, li, h, none, null);
             return .{ .logits = try sc_mod.hostF32(r.logits), .idx = try sc_mod.hostI32(try sc_.astype(r.idx, .int32)), .wts = try sc_mod.hostF32(r.wts) };
         }
     }.of;
@@ -6173,11 +6192,11 @@ test "dsv41 vision: an image row picks its experts by the image bias, a text row
     for (0..m.cfg.layers) |li| {
         const ly = &m.layers[li];
         const k = ly.top_k;
-        const text = try router(&sc, m, li, h, none);
-        const mixed = try router(&sc, m, li, h, img);
+        const text = try router(&sc, m, li, h, none, null);
+        const mixed = try router(&sc, m, li, h, img, null);
         const saved = ly.gate_bias;
         ly.gate_bias = ly.gate_bias_vl;
-        const vl = try router(&sc, m, li, h, none);
+        const vl = try router(&sc, m, li, h, none, null);
         ly.gate_bias = saved;
         const mixed_idx = try sc_mod.hostI32(try sc.astype(mixed.idx, .int32));
         const text_idx = try sc_mod.hostI32(try sc.astype(text.idx, .int32));

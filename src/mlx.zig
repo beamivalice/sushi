@@ -5,6 +5,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("log.zig");
+const io_util = @import("io_util.zig");
+const metal_minify = @import("metal_minify.zig");
 pub const kernel_keys = @import("mlx_kernel_keys.zig");
 
 // ── Opaque handle types ──
@@ -375,7 +377,31 @@ pub fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_ker
 pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
+var raw_source_env: ?bool = null;
+
+/// Every custom kernel enters MLX here with its source and header minified once, the header without the helpers the
+/// source never reaches: MLX rebuilds and hashes both on every launch. `SUSHI_KERNEL_RAW_SOURCE=1` passes them as
+/// written, so a Metal compile error names the source lines.
 pub fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
+    if (io_util.diagEnvOnCached(&raw_source_env, "SUSHI_KERNEL_RAW_SOURCE")) return kernelNewSource(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    const alloc = std.heap.page_allocator;
+    const text = minifiedText(alloc, source, header) catch return kernelNewSource(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    defer alloc.free(text.source);
+    defer alloc.free(text.header);
+    return kernelNewSource(name, input_names, output_names, text.source, text.header, ensure_row_contiguous, atomic_outputs);
+}
+
+/// A kernel's source and header minified, the header without the helpers the source never reaches.
+fn minifiedText(alloc: std.mem.Allocator, source: [*:0]const u8, header: [*:0]const u8) !struct { source: [:0]u8, header: [:0]u8 } {
+    const src = try metal_minify.minify(alloc, std.mem.span(source));
+    errdefer alloc.free(src);
+    const whole = try metal_minify.minify(alloc, std.mem.span(header));
+    defer alloc.free(whole);
+    return .{ .source = src, .header = try metal_minify.shake(alloc, whole, src) };
+}
+
+/// The kernel exactly as given; MLX copies both strings.
+pub fn kernelNewSource(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
     const k = raw_kernel.mlx_fast_metal_kernel_new(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
     kernel_keys.kernelNew(k, name, source, header, ensure_row_contiguous, atomic_outputs);
     return k;
@@ -1349,4 +1375,74 @@ test "requireGpu skips a test when MLX has no GPU backend" {
     try std.testing.expectError(error.SkipZigTest, requireGpu());
     no_gpu_backend_cache = false;
     try requireGpu();
+}
+
+test "a minified kernel gives the bytes of the same kernel as written" {
+    try requireGpu();
+    const header =
+        \\// a comment with an open /* and a // inside
+        \\#define SCALE(v) \
+        \\    ((v) * 1.5f + /* inline */ 0.25f)
+        \\template <typename T, int N>
+        \\struct Acc { T v; };
+        \\static inline float blend(float a, float b) {
+        \\    /* two blank lines follow */
+        \\
+        \\
+        \\    return SCALE(a) - b * 0.5f;
+        \\}
+        \\#if 1
+        \\#define K 3
+        \\#else
+        \\#define K 4
+        \\#endif
+        \\struct Unused { float v; };
+        \\static inline float never_called(float v) { return Unused{v}.v * 7.0f; }
+        \\
+    ;
+    const source =
+        \\uint i = thread_position_in_grid.x;   // lane
+        \\Acc<float, K> acc;
+        \\acc.v = blend(x[i], 2.0f) + float(K);
+        \\out[i] = acc.v - -x[i] * 0.5f;
+    ;
+    const t = std.testing;
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    const names = [_][*:0]const u8{"x"};
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx_vector_string_free(iv);
+    const ov = mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx_vector_string_free(ov);
+    const as_written = kernelNewSource("sushi_minify_probe_raw", iv, ov, source, header, true, false);
+    defer _ = mlx_fast_metal_kernel_free(as_written);
+    const minified = mlx_fast_metal_kernel_new("sushi_minify_probe_min", iv, ov, source, header, true, false);
+    defer _ = mlx_fast_metal_kernel_free(minified);
+    try t.expect(as_written.ctx != null and minified.ctx != null);
+
+    var data: [256]f32 = undefined;
+    for (&data, 0..) |*v, i| v.* = 0.37 * @as(f32, @floatFromInt(i)) - 11.0;
+    const x = mlx_array_new_data(&data, &[_]c_int{256}, 1, .float32);
+    defer _ = mlx_array_free(x);
+    const inputs = mlx_vector_array_new_data(&[_]mlx_array{x}, 1);
+    defer _ = mlx_vector_array_free(inputs);
+    var results: [2][256]f32 = undefined;
+    for ([_]mlx_fast_metal_kernel{ as_written, minified }, 0..) |k, which| {
+        const cfg = mlx_fast_metal_kernel_config_new();
+        defer _ = mlx_fast_metal_kernel_config_free(cfg);
+        try check(mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{256}, 1, .float32));
+        try check(mlx_fast_metal_kernel_config_set_grid(cfg, 256, 1, 1));
+        try check(mlx_fast_metal_kernel_config_set_thread_group(cfg, 64, 1, 1));
+        var outs_vec = mlx_vector_array_new();
+        defer _ = mlx_vector_array_free(outs_vec);
+        try check(mlx_fast_metal_kernel_apply(&outs_vec, k, inputs, cfg, s));
+        var y = mlx_array_new();
+        defer _ = mlx_array_free(y);
+        try check(mlx_vector_array_get(&y, outs_vec, 0));
+        try check(mlx_array_eval(y));
+        @memcpy(&results[which], mlx_array_data_float32(y).?[0..256]);
+    }
+    try t.expectEqualSlices(u8, std.mem.sliceAsBytes(&results[0]), std.mem.sliceAsBytes(&results[1]));
+    try t.expectApproxEqAbs(1.5 * data[5] + 0.25 - 1.0 + 3.0 + 0.5 * data[5], results[0][5], 1e-4);
 }

@@ -12,7 +12,7 @@ const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -1032,6 +1032,161 @@ fn runHcStages(run: *report.Run) anyerror!void {
             var s: HcStagesSample = .{ .gpu = gpu, .d = d, .z = z, .stage = stage };
             const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ stage, L });
             try run.interleave(label, &s, sampleHcStages);
+        }
+    }
+}
+
+// ── dsv41.launch_fusions ────────────────────────────────────────────────
+
+pub const launch_fusions: report.Bench = .{
+    .name = "dsv41.launch_fusions",
+    .scope = .dsv41,
+    .what = "pairs of decode kernels that became one launch, as 40 dependent layers at the release geometry: the router and the FFN hc split (E384, top-6); the query rotation and the window row (64 heads x 512, bf16); the chain's link between layers alone",
+    .unit = .us,
+    .steps = 40,
+    .axes = &.{
+        .{ .name = "fusion", .values = &.{ "route_split", "rope_kv" }, .numeric = false },
+        .{ .name = "L", .values = &.{ "1", "4" } },
+    },
+    .arms = &.{ "separate", "fused", "link" },
+    .ref = "separate",
+    .run = runLaunchFusions,
+};
+
+const FUSION_LINK_SOURCE: [:0]const u8 =
+    \\const uint i = thread_position_in_grid.x;
+    \\if (i >= uint(N)) return;
+    \\out[i] = base[i];
+    \\if (i == 0u && float(dep_a[0]) == 1.5e30f) out[0] = T(float(dep_b[0]));
+    \\if (i == 0u && float(dep_b[1]) == 1.5e30f) out[0] = T(float(dep_a[1]));
+;
+
+var fusion_link_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// `base` again (`[rows, cols]`), but only once `dep_a` and `dep_b` exist: the next layer's input.
+fn fusionLink(sc: *Scope, base: A, dep_a: A, dep_b: A) !A {
+    const k = try qat_mod.kernelNew(&fusion_link_kernel, "dsv41_ubench_fusion_link", &.{ "base", "dep_a", "dep_b" }, &.{"out"}, FUSION_LINK_SOURCE, "");
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const sh = mlx.getShape(base);
+    const dt = mlx.mlx_array_dtype(base);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, sh.len, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", ci(mlx.mlx_array_size(base))));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(@max(mlx.mlx_array_size(base), 1)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    var o: [1]A = undefined;
+    try qat_mod.applyKernel(sc, k, &.{ base, dep_a, dep_b }, cfg, &o);
+    return o[0];
+}
+
+const FusionData = struct {
+    gpu: mlx.mlx_stream,
+    rope: bool,
+    steps: usize,
+    logits: A,
+    bias: A,
+    z: A,
+    eps: A,
+    q: A,
+    kv: A,
+    w: A,
+    freqs: A,
+    pos: A,
+};
+
+fn sampleFusion(d: *FusionData, arm: usize) anyerror!f64 {
+    var sc = Scope.init(alloc, d.gpu);
+    defer sc.deinit();
+    var sw = io_util.Stopwatch.init(io());
+    var ev: [2]A = undefined;
+    if (d.rope) {
+        var q = d.q;
+        var kv = d.kv;
+        for (0..d.steps) |_| {
+            switch (arm) {
+                0 => {
+                    ev[0] = try kernels.ropeTail(&sc, q, d.freqs, d.pos, 64, false, .none, null);
+                    ev[1] = try kernels.kvRow(&sc, kv, d.w, d.freqs, d.pos, 64, 1e-6, true);
+                },
+                1 => {
+                    const r = try kernels.ropeKv(&sc, q, kv, d.w, d.freqs, d.pos, 64, 1e-6, true);
+                    ev = .{ r.q, r.kv };
+                },
+                else => ev = .{ q, kv },
+            }
+            q = try fusionLink(&sc, d.q, ev[0], ev[1]);
+            kv = try fusionLink(&sc, d.kv, ev[1], ev[0]);
+        }
+        try evalAll(&.{ q, kv });
+    } else {
+        var logits = d.logits;
+        var all: std.ArrayList(A) = .empty;
+        defer all.deinit(alloc);
+        for (0..d.steps) |_| {
+            switch (arm) {
+                0 => {
+                    const r = try kernels.route(&sc, logits, d.bias, 6, true, 1.5);
+                    ev = .{ r.wts, (try kernels.hcSplitZ(&sc, d.z, 4, 20, d.eps)).comb };
+                },
+                1 => {
+                    const r = try kernels.routeSplit(&sc, logits, d.bias, 6, true, 1.5, d.z, 4, 20, d.eps);
+                    ev = .{ r.routes.wts, r.split.comb };
+                },
+                else => ev = .{ logits, d.z },
+            }
+            logits = try fusionLink(&sc, d.logits, ev[0], ev[1]);
+        }
+        try evalAll(&.{logits});
+    }
+    return @as(f64, @floatFromInt(sw.read())) / @as(f64, @floatFromInt(d.steps));
+}
+
+fn runLaunchFusions(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    var l_buf: [8]usize = undefined;
+    const f32t = mlx.mlx_dtype.float32;
+    for (try axisInts(run, "L", &l_buf)) |L| {
+        var sc = Scope.init(alloc, gpu);
+        defer sc.deinit();
+        const l: c_int = ci(L);
+        var f: [32]f32 = undefined;
+        qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
+        var p: [8]i32 = undefined;
+        for (0..L) |i| p[i] = 4000 + @as(i32, @intCast(i));
+        var d: FusionData = .{
+            .gpu = gpu,
+            .rope = false,
+            .steps = run.steps(40),
+            .logits = try kernels.randn(&sc, &.{ l, 384 }, f32t, 41, 2.5),
+            .bias = try kernels.randn(&sc, &.{ 1, 384 }, f32t, 42, 0.3),
+            .z = try kernels.randn(&sc, &.{ l, 24 }, f32t, 43, 2.0),
+            .eps = try kernels.hcEps(&sc, 1e-6, 1e-6),
+            .q = try sc.astype(try kernels.randn(&sc, &.{ l, 64, 512 }, f32t, 191, 3.0), .bfloat16),
+            .kv = try sc.astype(try kernels.randn(&sc, &.{ l, 512 }, f32t, 192, 5.0), .bfloat16),
+            .w = try sc.astype(try sc.add(try kernels.randn(&sc, &.{512}, f32t, 193, 0.3), try sc.f(1.0)), .bfloat16),
+            .freqs = try sc.floats(&f, &.{32}),
+            .pos = try sc.ints(p[0..L], &.{l}),
+        };
+        try evalAll(&.{ d.logits, d.bias, d.z, d.eps, d.q, d.kv, d.w, d.freqs, d.pos });
+        for ([_][]const u8{ "route_split", "rope_kv" }) |name| {
+            if (!listed(run.axis("fusion"), name)) continue;
+            d.rope = std.mem.eql(u8, name, "rope_kv");
+            if (d.rope) {
+                const wq = try sc_mod.hostF32(try sc.astype(try kernels.ropeTail(&sc, d.q, d.freqs, d.pos, 64, false, .none, null), f32t));
+                const wk = try sc_mod.hostF32(try sc.astype(try kernels.kvRow(&sc, d.kv, d.w, d.freqs, d.pos, 64, 1e-6, true), f32t));
+                const g = try kernels.ropeKv(&sc, d.q, d.kv, d.w, d.freqs, d.pos, 64, 1e-6, true);
+                if (!std.mem.eql(u8, std.mem.sliceAsBytes(wq), std.mem.sliceAsBytes(try sc_mod.hostF32(try sc.astype(g.q, f32t)))) or
+                    !std.mem.eql(u8, std.mem.sliceAsBytes(wk), std.mem.sliceAsBytes(try sc_mod.hostF32(try sc.astype(g.kv, f32t))))) run.invalid("the fused launch's bytes differ from the two kernels'");
+            } else {
+                const wr = try kernels.route(&sc, d.logits, d.bias, 6, true, 1.5);
+                const ws = try kernels.hcSplitZ(&sc, d.z, 4, 20, d.eps);
+                const g = try kernels.routeSplit(&sc, d.logits, d.bias, 6, true, 1.5, d.z, 4, 20, d.eps);
+                if (!std.mem.eql(u8, std.mem.sliceAsBytes(try sc_mod.hostF32(wr.wts)), std.mem.sliceAsBytes(try sc_mod.hostF32(g.routes.wts))) or
+                    !std.mem.eql(u8, std.mem.sliceAsBytes(try sc_mod.hostF32(ws.comb)), std.mem.sliceAsBytes(try sc_mod.hostF32(g.split.comb)))) run.invalid("the fused launch's bytes differ from the two kernels'");
+            }
+            const label = try std.fmt.allocPrint(run.a, "{s} L {d}", .{ name, L });
+            try run.interleave(label, &d, sampleFusion);
         }
     }
 }

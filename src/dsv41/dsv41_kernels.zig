@@ -424,8 +424,21 @@ const DENSE_F32X_SOURCE =
     \\}
 ;
 
+/// `ROUTE_SOURCE` beside the hc split of the row's mixes `z` (`HC_SPLIT_BODY`), which the router does not wait for or
+/// feed: the grid's second threadgroup of a row is the split, so the two run on different cores as two launches did.
+const ROUTE_SPLIT_SOURCE =
+    \\if (threadgroup_position_in_grid.x == 1u) {
+    \\#pragma clang fp contract(off)
+    \\  if (simdgroup_index_in_threadgroup != 0u) return;
+    \\  const int l = threadgroup_position_in_grid.y;
+++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
+    \\  return;
+    \\}
+++ ROUTE_SOURCE;
+
 var gate_def = Def{ .name = "dsv41_gate", .ins = &.{ "x", "w" }, .outs = &.{"logits"}, .source = GATE_SOURCE };
 var route_def = Def{ .name = "dsv41_route", .ins = &.{ "logits", "bias", "scal" }, .outs = &.{ "idx", "wts" }, .source = ROUTE_SOURCE };
+var route_split_def = Def{ .name = "dsv41_route_split", .ins = &.{ "logits", "bias", "scal", "z", "eps" }, .outs = &.{ "idx", "wts", "pre", "post", "comb" }, .source = ROUTE_SPLIT_SOURCE };
 var topk_def = Def{ .name = "dsv41_topk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_SOURCE, .header = TOPK_HEADER };
 var topk_chunk_def = Def{ .name = "dsv41_topk_chunk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_CHUNK_SOURCE, .header = TOPK_HEADER };
 var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk" }, .outs = &.{"out"}, .source = TOPK_MERGE_SOURCE, .header = TOPK_HEADER };
@@ -460,6 +473,22 @@ pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !
         .{ .shape = &.{ ci(L), ci(k) }, .dt = .float32 },
     }, .{ tg, L, 1 }, .{ tg, 1, 1 }, &.{ .{ .name = "K", .v = ci(k) }, .{ .name = "NORM", .v = @intFromBool(norm) } }, &.{}, &o);
     return .{ .idx = o[0], .wts = o[1] };
+}
+
+/// `route` and `hcSplitZ(z)` in one launch.
+pub fn routeSplit(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32, z: A, hc: usize, iters: usize, eps: A) !struct { routes: Routes, split: HcSplit } {
+    const L = dim(logits, 0);
+    const E = dim(logits, 1);
+    const tg = (E + 31) / 32 * 32;
+    var o: [5]A = undefined;
+    try launch(sc, &route_split_def, &.{ logits, bias, try f32Const(sc, &.{scale}), z, eps }, &.{
+        .{ .shape = &.{ ci(L), ci(k) }, .dt = .uint32 },
+        .{ .shape = &.{ ci(L), ci(k) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
+    }, .{ 2 * tg, L, 1 }, .{ tg, 1, 1 }, &.{ .{ .name = "K", .v = ci(k) }, .{ .name = "NORM", .v = @intFromBool(norm) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(iters) } }, &.{}, &o);
+    return .{ .routes = .{ .idx = o[0], .wts = o[1] }, .split = .{ .pre = o[2], .post = o[3], .comb = o[4] } };
 }
 
 /// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
@@ -521,6 +550,9 @@ const ROPE_TAIL_SOURCE =
     \\#pragma clang fp contract(off)
     \\const uint i = thread_position_in_grid.x;
     \\if (QK == 0 && i >= threads_per_grid.x) return;
+++ ROPE_TAIL_BODY;
+
+const ROPE_TAIL_BODY =
     \\const int c = i % D, row = i / ROW;
     \\const int head = D - RD;
     \\float r = float(x[i]);
@@ -545,8 +577,11 @@ const ROPE_TAIL_SOURCE =
 const KV_ROW_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int l = threadgroup_position_in_grid.y;
-    \\const uint t = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\threadgroup float local_sums[32], inv_s[1];
+++ KV_ROW_BODY;
+
+const KV_ROW_BODY =
+    \\const uint t = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const size_t base = size_t(l) * D;
     \\float xs[4], acc = 0.0f;
     \\for (int i = 0; i < 4; ++i) {
@@ -591,6 +626,28 @@ const KV_ROW_SOURCE =
     \\for (int i = 0; i < 4; ++i) if (int(t) * 4 + i < D) out[base + int(t) * 4 + i] = T(r[i]);
 ;
 
+/// `KV_ROW_BODY` over the window rows `kx` in the first threadgroups, one row a threadgroup, and `ROPE_TAIL_BODY` over the
+/// queries `qx` in the rest (the row walk's barriers start first and overlap the rotation); the two read and write nothing
+/// in common. QK is 0 and INV 0.
+const ROPE_KV_SOURCE =
+    \\#pragma clang fp contract(off)
+    \\threadgroup float local_sums[32], inv_s[1];
+    \\const uint tgid = threadgroup_position_in_grid.x, rows = kx_shape[0];
+    \\if (tgid < rows) {
+    \\  const int l = int(tgid);
+    \\  const device T* x = kx;
+    \\  device T* out = kout;
+++ KV_ROW_BODY ++
+    \\} else {
+    \\  const uint i = (tgid - rows) * threads_per_threadgroup.x + thread_position_in_threadgroup.x;
+    \\  if (i >= rows * ROW) return;
+    \\  const device T* x = qx;
+    \\  device T* out = qout;
+++ ROPE_TAIL_BODY ++
+    \\}
+;
+
+var rope_kv_def = Def{ .name = "dsv41_rope_kv", .ins = &.{ "qx", "kx", "w", "freqs", "pos", "eps" }, .outs = &.{ "qout", "kout" }, .source = ROPE_KV_SOURCE, .header = qat_mod.QAT_HEADER };
 var rope_tail_def = Def{ .name = "dsv41_rope_tail", .ins = &.{ "x", "freqs", "pos" }, .outs = &.{"out"}, .source = ROPE_TAIL_SOURCE, .header = qat_mod.QAT_HEADER };
 var kv_row_def = Def{ .name = "dsv41_kv_row", .ins = &.{ "x", "w", "freqs", "pos", "eps" }, .outs = &.{"out"}, .source = KV_ROW_SOURCE, .header = qat_mod.QAT_HEADER };
 
@@ -613,6 +670,30 @@ pub fn ropeTail(sc: *Scope, x: A, freqs: A, pos: A, rd: usize, inverse: bool, qa
         .{ .name = "INV", .v = @intFromBool(inverse) },
     }, &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = odt } }, &o);
     return o[0];
+}
+
+/// `ropeTail(q, .none)` of the queries `q` `[L, H, D]` and `kvRow(kv)` of the window rows `kv` `[L, D]`, in one launch; the
+/// two share the dtype and `D`.
+pub fn ropeKv(sc: *Scope, q: A, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f32, qat: bool) !struct { q: A, kv: A } {
+    const n = mlx.mlx_array_size(q);
+    const L = dim(kv, 0);
+    const D = dim(kv, 1);
+    const dt = mlx.mlx_array_dtype(kv);
+    const tg = ((D + 3) / 4 + 31) / 32 * 32;
+    const qtgs = (n + tg - 1) / tg;
+    var o: [2]A = undefined;
+    try launch(sc, &rope_kv_def, &.{ q, kv, w, freqs, pos, try f32Const(sc, &.{eps}) }, &.{
+        .{ .shape = mlx.getShape(q), .dt = dt },
+        .{ .shape = &.{ ci(L), ci(D) }, .dt = dt },
+    }, .{ (qtgs + L) * tg, 1, 1 }, .{ tg, 1, 1 }, &.{
+        .{ .name = "RD", .v = ci(rd) },
+        .{ .name = "D", .v = ci(D) },
+        .{ .name = "ROW", .v = ci(n / dim(q, 0)) },
+        .{ .name = "QK", .v = 0 },
+        .{ .name = "INV", .v = 0 },
+        .{ .name = "QAT", .v = @intFromBool(qat) },
+    }, &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = dt } }, &o);
+    return .{ .q = o[0], .kv = o[1] };
 }
 
 /// Whether `kvRow` serves rows of `D` channels.
@@ -3004,6 +3085,27 @@ test "dsv41 route: the experts are the composed chain's, their weights its score
     }
 }
 
+test "dsv41 route split: the router and the hc split in one launch give the two kernels' bytes" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const eps = try hcEps(&sc, 1e-6, 1e-6);
+    for ([_]usize{ 384, 256, 40 }) |E| for ([_]usize{ 1, 2, 5, 16 }) |L| for ([_]f32{ 0.3, 4.0 }) |mag| {
+        const logits = try randn(&sc, &.{ ci(L), ci(E) }, .float32, 41, 2.5);
+        const bias = try randn(&sc, &.{ 1, ci(E) }, .float32, 42, 0.3);
+        const z = try randn(&sc, &.{ ci(L), 24 }, .float32, 43, mag);
+        const k: usize = if (E == 40) 4 else 6;
+        const want_r = try route(&sc, logits, bias, k, true, 1.5);
+        const want_s = try hcSplitZ(&sc, z, 4, 20, eps);
+        const got = try routeSplit(&sc, logits, bias, k, true, 1.5, z, 4, 20, eps);
+        try testing.expectEqualSlices(i32, try sc_mod.hostI32(try sc.astype(want_r.idx, .int32)), try sc_mod.hostI32(try sc.astype(got.routes.idx, .int32)));
+        try expectBitEqual("route wts", try sc_mod.hostF32(got.routes.wts), try sc_mod.hostF32(want_r.wts));
+        try expectBitEqual("split pre", try sc_mod.hostF32(got.split.pre), try sc_mod.hostF32(want_s.pre));
+        try expectBitEqual("split post", try sc_mod.hostF32(got.split.post), try sc_mod.hostF32(want_s.post));
+        try expectBitEqual("split comb", try sc_mod.hostF32(got.split.comb), try sc_mod.hostF32(want_s.comb));
+    };
+}
+
 test "dsv41 topk: the picks are the k largest in index order, ties to the lower index" {
     try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
@@ -3206,6 +3308,25 @@ test "dsv41 kv row: the rms norm, rotation and fp8 round trip are the composed c
         const want = if (qat) try qat_mod.qat(&sc, normed, .fp8_ue8m0, 32) else normed;
         const got = try kvRow(&sc, kv, w, freqs, pos, 64, 1e-6, qat);
         try expectBitEqual("kv row", try hostOf(&sc, got), try hostOf(&sc, want));
+    };
+}
+
+test "dsv41 rope kv: the query rotation and the window row in one launch give the two kernels' bytes" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const freqs = try ropeFreqs(&sc);
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]bool{ true, false }) |qat| for ([_]usize{ 1, 2, 9, 47 }) |L| for ([_]c_int{ 64, 8 }) |H| {
+        const li = ci(L);
+        const q = try sc.astype(try randn(&sc, &.{ li, H, 512 }, .float32, 191, 3.0), dt);
+        const kv = try sc.astype(try randn(&sc, &.{ li, 512 }, .float32, 192, 5.0), dt);
+        const w = try sc.astype(try sc.add(try randn(&sc, &.{512}, .float32, 193, 0.3), try sc.f(1.0)), dt);
+        const pos = try positions(&sc, 4000, L, 1);
+        const want_q = try ropeTail(&sc, q, freqs, pos, 64, false, .none, null);
+        const want_kv = try kvRow(&sc, kv, w, freqs, pos, 64, 1e-6, qat);
+        const got = try ropeKv(&sc, q, kv, w, freqs, pos, 64, 1e-6, qat);
+        try expectBitEqual("rope kv q", try hostOf(&sc, got.q), try hostOf(&sc, want_q));
+        try expectBitEqual("rope kv row", try hostOf(&sc, got.kv), try hostOf(&sc, want_kv));
     };
 }
 
@@ -3823,7 +3944,7 @@ test "dsv41 kernels: a new row count, pick count, split count or context width c
     const keys = mlx.kernel_keys;
     _ = keys.trackForTest();
     const freqs = try ropeFreqs(&sc);
-    const Arm = enum { rope, rope_qat, topk, qat, pack, attn };
+    const Arm = enum { rope, rope_qat, rope_kv, route_split, topk, qat, pack, attn };
     for (std.enums.values(Arm)) |arm| {
         var seen: usize = 0;
         // The first size builds the arm's libraries; every later size must reuse them (all of 8 rows or more: MLX binds
@@ -3833,6 +3954,8 @@ test "dsv41 kernels: a new row count, pick count, split count or context width c
             const out = switch (arm) {
                 .rope => try ropeTail(&sc, try randn(&sc, &.{ ci(n), 4, 128 }, .bfloat16, 1, 1.0), freqs, try positions(&sc, 9, n, 1), 64, false, .none, null),
                 .rope_qat => try ropeTail(&sc, try randn(&sc, &.{ ci(n), 128 }, .bfloat16, 2, 1.0), freqs, try positions(&sc, 9, n, 1), 64, false, .fp4_e4m3, null),
+                .rope_kv => (try ropeKv(&sc, try randn(&sc, &.{ ci(n), 4, 512 }, .bfloat16, 6, 1.0), try randn(&sc, &.{ ci(n), 512 }, .bfloat16, 7, 1.0), try randn(&sc, &.{512}, .bfloat16, 8, 1.0), freqs, try positions(&sc, 9, n, 1), 64, 1e-6, true)).q,
+                .route_split => (try routeSplit(&sc, try randn(&sc, &.{ ci(n), 64 }, .float32, 9, 1.0), try randn(&sc, &.{ 1, 64 }, .float32, 10, 1.0), 6, true, 1.0, try randn(&sc, &.{ ci(n), 24 }, .float32, 11, 1.0), 4, 20, try hcEps(&sc, 1e-6, 1e-6))).split.comb,
                 .topk => try topkIndices(&sc, try randn(&sc, &.{ 2, 40 }, .float32, 3, 1.0), n),
                 .qat => try qat_mod.qat(&sc, try randn(&sc, &.{ ci(n), 64 }, .bfloat16, 4, 1.0), .fp8_ue8m0, 32),
                 .pack => blk: {
