@@ -275,6 +275,21 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `src/dsv41/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
   `stb_image` (JPEG, PNG, GIF first frame, BMP) + libwebp decode image input; `lib/stb_image_impl.c` names the formats compiled in.
 
+<a id="machine-state"></a>
+## Machine state
+
+The engine runs on the user's machine and reads no more of it than the job needs:
+- aggregate readings only: system memory and CPU percent for `/metrics` and the status bar, wired bytes to wait out a
+  Metal free (`status.zig`);
+- its own I/O timings (expert fills);
+- other processes only to protect its own files, and only by path: `sushi update` refuses while a sushi binary runs from
+  the install dir, `sushi repack` while any process holds a shard open.
+
+A reading reaches the user only as a visible log or status line ("machine under heavy load" at most). The engine
+never names another program, never reads temperatures or per-process load, and never writes a reading to a file of
+its own. `sushi bench` and `sushi-ubench` are the exception: box-measurement tools the user starts, they read fans,
+power, temperature and GPU jobs and print them in their report.
+
 ## Config reading
 
 - `generation_config.json` `eos_token_id` is part of the stop set (additive). Read `text_config` FIRST, then root,

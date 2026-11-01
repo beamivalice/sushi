@@ -170,17 +170,17 @@ GLM 2.4bpw, DeepSeek STQ 1.75bpw), report in `docs/bench/v<ver>/`, vs the previo
 release. Protocol: [process-measurement](docs/process-measurement.md#release-bench).
 - Release order: local tests, push the version bump; `./release.sh` (CI's DRAFT) beside the local perf and KLD gates;
   both green: publish. Any issue: fix, push, delete the draft and its tag, rerun it.
-- Future repo work (a deferred task or plan) goes to `docs/private/future.md`, never agent memory. A
-  release starts by reading it and telling the owner what is due.
+- Deferred repo work goes to `docs/private/future.md`, never agent memory; a release starts by reading it and
+  telling the owner what is due.
 
 `/bench` for methodology: same-methodology cells only. Interleave A/B kernels in ONE process (separate runs drift 15%);
 same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for cross-engine comparisons only.
 
-Release notes thank every outside contributor by @handle for each merged PR the release ships; a missed credit goes
-into the next release as belated (`/release`).
+Release notes thank each outside contributor by @handle per merged PR; a missed credit goes in the next release
+(`/release`).
 
 A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
-owner-approved card; the README pack line follows once the repo is live.
+owner-approved card.
 
 - **Adding a pack** (pair-major: [tile order](docs/pack-format.md#tile-order)) updates, in the same landing, its
   `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`), the tier table and recommended launch in
@@ -216,6 +216,8 @@ owner-approved card; the README pack line follows once the repo is live.
   ([server-http-apis](docs/server-http-apis.md), [server-tool-calling](docs/server-tool-calling.md)).
 - A pack is judged by KLD against a lossless teacher, never by bytes against another pack
   ([quality-kld](docs/quality-kld.md)).
+- The engine reads only aggregate machine load and its own I/O timings, states them only in a visible log line, and
+  never names another program ([server-lifecycle](docs/server-lifecycle.md#machine-state)).
 
 ## Debugging
 
@@ -260,8 +262,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Quiet window: a timed run first touches `~/.sushi/runs/QUIET` and waits until no `zig`/`clang` runs; no worker
   starts a build or test while that file exists. The GPU lock does not stop compiles.
 - Measure only what the diff touches: no arm whose code path is unchanged, no metric the change cannot move.
-- Bench thermal: fans to max; before each server, and between the code and prose arms too, idle until the hottest die
-  sensor (`fanctl status`) is under 50 °C, at most 3 min; fans back to auto after. One A then one B suffices; A B B A only when the expected difference is within a few percent.
+- Bench thermal: fans to max; before each server and between arms, idle until the hottest die sensor (`fanctl
+  status`) is under 50 °C, at most 3 min; fans back to auto after. A then B suffices; A B B A only for a few-% gap.
 - Never slot a GPU job into a bench's cooldown idle: the next server starts throttled.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
 - **The box is macOS, with no `setsid` binary.** To detach a long job, run `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
@@ -274,8 +276,7 @@ bit-identical lands whatever its size. A change that alters output lands only th
 **Coordinator.**
 - Reports partial work to the owner every :00 and :30 while work runs.
 - Relays owner decisions and rule changes to ALL live workers at once.
-- Keeps docs/ fresh: every landing updates the matching doc (knowledge, numbers, lessons learned) in the same
-  landing, and this index when a doc appears.
+- Checks each landing updated its matching doc, and this index when a doc appears.
 
 **Workers.**
 - Report progress and blockers to the coordinator; commit per step; don't push or merge unless told.
