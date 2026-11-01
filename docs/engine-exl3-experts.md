@@ -206,6 +206,12 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   same bytes (every reader byte test, every rate and codebook). Ours before -> after, 4096 tokens, one projection:
   n56 -17% (turbo parity), n52 -6%, n58 -7%, n60 -5%, n62 -4%; n32, n42, n64 unchanged. n52, n58, n60, n62 stay
   3-15% above turbo's flat curve (not the decode share; unroll 1 does not move them).
+- **Wider routed windows lose at DeepSeek's geometry too** (5120/2304, PAIR1 n24 to n40, 384 experts, top-6, lognormal
+  routing sigma 0.7, a throwaway ubench on a7242135, GPU lock, QUIET, `taskpolicy -a`, A B C
+  interleaved, outputs bit-identical): the routed chain with 48- and 64-row windows against 32 is 1.03 / 1.10 at 2048 rows,
+  1.11-1.18 / 1.32-1.37 at 4096 and 1.0-1.2 / 1.35-1.52 at 8192 (layers 2 and 23, the larger rungs on a hot die). Replacing
+  the decode arithmetic by a word reinterpretation in the 32-row body saves only 3% of the chain at 2048 rows (5% at 4096),
+  so the ceiling of sharing decodes is below the register cost of four 16x32 accumulators.
 - Dead for prefill routing: a counting sort (histogram, scan, stable scatter) in place of the argsort, exact with
   ties: -0.03 to -0.16 ms per MoE layer as a component, yet Qwen 2.6bpw prefill 5-10% slower in an A B B A (de867e94 era).
 - **The SwiGLU chain is f32**: gate, up, sigmoid, SiLU and their product stay in f32 registers through the multiply
