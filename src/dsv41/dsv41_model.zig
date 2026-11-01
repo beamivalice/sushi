@@ -182,8 +182,8 @@ pub const Experts = union(enum) {
         /// Profiling: the stream's cumulative host time (SSD reads and cache copies), in ns.
         host_ns: ?*const fn (ctx: *anyopaque) u64 = null,
         /// Experts layer `layer` is expected to pick, read into its pool before its chain is queued: for each of `rows` rows,
-        /// `n` ranked candidates, of which the first `m` the pool lacks are read.
-        prefetch: ?*const fn (ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void = null,
+        /// `n` ranked candidates with the predicted pick score of each, of which the first `m` the pool lacks are read.
+        prefetch: ?*const fn (ctx: *anyopaque, layer: usize, cand: []const u16, score: []const f32, rows: usize, n: usize, m: usize) void = null,
         /// Whether `prefetch` would keep a prediction for `layer`; where not, none is computed.
         can_prefetch: ?*const fn (ctx: *anyopaque, layer: usize) bool = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
@@ -3226,9 +3226,9 @@ fn predictLogits(sc: *Scope, m: *const Model, h: A, j: usize) !A {
     return sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(w, .float32)));
 }
 
-/// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias), best first.
-fn rankPicks(logits: []const f32, bias: []const f32, out: []u16) void {
-    var best: [prefetch_cand_max]f32 = undefined;
+/// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias), best first;
+/// `best` receives their scores.
+fn rankPicks(logits: []const f32, bias: []const f32, out: []u16, best: []f32) void {
     var filled: usize = 0;
     for (logits, bias, 0..) |x, b, e| {
         const soft = if (x > 20) x else std.math.log1p(std.math.exp(x));
@@ -3255,8 +3255,9 @@ fn issuePrefetch(m: *const Model, u: *const Unresolved) !void {
     const E = bias.len;
     const n: usize = @min(m.prefetch_n, prefetch_cand_max, E);
     var cand: [16 * prefetch_cand_max]u16 = undefined;
-    for (0..rows) |r| rankPicks(logits[r * E ..][0..E], bias, cand[r * n ..][0..n]);
-    prefetch(hk.ctx, u.pred_layer, cand[0 .. rows * n], rows, n, m.prefetch_m);
+    var score: [16 * prefetch_cand_max]f32 = undefined;
+    for (0..rows) |r| rankPicks(logits[r * E ..][0..E], bias, cand[r * n ..][0..n], score[r * n ..][0..n]);
+    prefetch(hk.ctx, u.pred_layer, cand[0 .. rows * n], score[0 .. rows * n], rows, n, m.prefetch_m);
 }
 
 /// The host's check of an unresolved layer: null when its queued chain stands, else the layer's exact output stream.

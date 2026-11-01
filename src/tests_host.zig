@@ -44,4 +44,5 @@ test {
     _ = @import("ubench_report.zig");
     _ = @import("mrope.zig");
     _ = @import("metal_minify.zig");
+    _ = @import("prefetch_plan.zig");
 }

@@ -213,12 +213,17 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   `picks_sync`, `engram`, `state`, `head`) and logs their mean per forward at debug level every 64 forwards.
 - DeepSeek-V4.1 STQ also reads experts ahead (`Engine.prefetch`, `Prefetcher`): a layer's router input times the gate
   matrix of the layer `d` ahead (d = 3, for forwards of 2 or more rows only: at one row the GEMV and the waits cost more than the misses they save; `Model.prefetch_lead_rows`) ranks that layer's experts, the
-  host passes each row's first uncached one of its top 12 to a thread that reads them into the pool before the layer's
+  host passes each row's first uncached one of its top 12, with its predicted pick score, to a thread that reads them into the pool before the layer's
   chain is queued, so the miss becomes a hit. Rules: a job owns its layer's cache and slabs until `prefetchWait(layer)`
   returns (`specGrouped`, `prepareHost*`, `swapGroupedMisses`, `borrowLayer`, `restoreLayer` call it, `warmCache` and
   `deinit` drain the thread); only layers `d >= 2` ahead are targeted, so no queued chain reads a slot the job writes;
-  the prefetch pool has its own fill workers (inside `BOUNCE_BYTES`, so no new bill; below the 108 GB budget it is never created and its share stays billed); it changes what is cached, never
-  the arithmetic. The prefetch exists only from an `--ssd-budget-gb` of 108 (`prefetchOn`, decided at load; below it no thread, pool or bounce buffer is created, [dsv41-arch](dsv41-arch.md#stq)). A target that `Engine.canPrefetch` refuses is not predicted at all, and a prediction whose candidates the pool already holds queues and wakes nothing (the line's `jobs queued` counts only jobs with something to read). `[expert-stream] prefetch: ...` is the engagement line. Measurements: [dsv41-arch](dsv41-arch.md#stq).
+  the prefetch pool has its own fill workers (inside `BOUNCE_BYTES`, so no new bill; with `--ssd-prefetch 0` or a resident load it is never created and its share stays billed); it changes what is cached, never
+  the arithmetic. The prefetch exists on every streamed load with `--ssd-prefetch` above 0 (default 65; `startExpertPrefetch`, decided at load; at 0 no probe, thread, pool or bounce buffer is created, [dsv41-arch](dsv41-arch.md#stq)).
+  Its reads are metered (`prefetch_plan.PrefetchCredit`): `Engine.finishForward` refills a credit from the forward's wall time and its demand fill bytes
+  only (`pct x max read rate x wall - demand`, the leftover carried at most one round's grant), each job spends its share of the grant (a round's grant over the
+  layers a prediction can target) plus what earlier jobs left, and a read is one whole expert or none. A job ranks the distinct experts its rows want
+  (`rankWanted`: rows that want it, then the predicted pick score, then the earlier row) and reads down that order while the credit holds; the ones left over count in
+  `experts_skipped`. `Engine.probeReadRate` measures the maximum before the cache warm and leaves no trace in the caches or the engine's totals. A target that `Engine.canPrefetch` refuses is not predicted at all (that includes a round whose credit and job slice hold less than the smallest expert: a starved prefetch runs no GEMV and queues no job), and a prediction whose candidates the pool already holds queues and wakes nothing (the line's `jobs queued` counts only jobs with something to read). `[expert-stream] prefetch: ...` is the engagement line (jobs queued, read, experts read, skipped for lack of credit). Measurements: [dsv41-arch](dsv41-arch.md#stq).
   The host's wait is `specGrouped` of the targeted layer (the settle's `prepareHost` finds the job done) and the job's SSD read is
   the time it waits out: a map read mid-job lists the job's experts as misses, so the settle would rebuild the layer; the wait stays.
 - A rate-grouped route (`prepareGrouped`) must be able to undo its cache moves when it fails before writing a slab: a group whose

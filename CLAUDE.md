@@ -112,7 +112,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, stamp check | mimo2-arch |
 | `expert_quant.zig` / `exl3/` (`sushi_exl3` module) / `trunk_stq.zig` | expert layout, EXL3/STQ decoders and kernels, rate groups, dense linears; trellis trunk banks | engine-exl3-experts |
 | `encoder/` | `sushi convert exl3`: trellis search, source readers, trunk/shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
-| `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
+| `expert_stream.zig` / `prefetch_plan.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract | engine-kv-cache |
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `disk_placement.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier, budget, roots | engine-prefix-cache |

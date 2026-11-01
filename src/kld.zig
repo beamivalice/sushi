@@ -41,6 +41,7 @@ pub const Options = struct {
     /// DeepSeek only, compare only: the student drops this many routed experts a layer by the pack's usage list.
     drop_expert: u16 = 0,
     ssd_budget_bytes: u64 = 0,
+    ssd_prefetch: ?u8 = null,
     pick_tolerance: f32 = 0,
     wired_margin_bytes: u64 = 0,
     enable_mtp: bool = false,
@@ -88,6 +89,7 @@ const ValueFlag = enum {
     qwen_gdn,
     drop_expert,
     ssd_budget_gb,
+    ssd_prefetch,
     expert_pick_tolerance,
     wired_margin_gib,
     batch_windows,
@@ -110,6 +112,7 @@ const value_flags = [_]struct { []const u8, ValueFlag }{
         .{ "--qwen-gdn", .qwen_gdn },
         .{ "--drop-expert", .drop_expert },
         .{ "--ssd-budget-gb", .ssd_budget_gb },
+        .{ "--ssd-prefetch", .ssd_prefetch },
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
         .{ "--wired-margin-gib", .wired_margin_gib },
         .{ "--batch-windows", .batch_windows },
@@ -171,6 +174,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
                 .drop_expert => o.drop_expert = @import("dsv41/expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
+                .ssd_prefetch => o.ssd_prefetch = model_mod.parseSsdPrefetch(v) orelse return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
                 .batch_windows => o.batch_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
@@ -232,6 +236,7 @@ pub const USAGE =
     \\  --drop-expert <n>     compare only, DeepSeek-V4.1 only: drop the n least-used routed experts of every layer by
     \\                        the pack's expert_usage.json (a multiple of 8; 0 = off). The teacher is never pruned.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
+    \\  --ssd-prefetch <n>    streamed-expert prefetch read cap: percent (0..100, default 65) of the SSD read rate; 0 = no prefetch
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
@@ -907,6 +912,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     errdefer allocator.destroy(self);
     model_mod.qwen_gdn_f32 = opts.qwen_gdn_f32;
     model_mod.drop_expert = opts.drop_expert;
+    model_mod.ssd_prefetch = opts.ssd_prefetch;
     self.* = .{
         .allocator = allocator,
         .io = io,
@@ -918,7 +924,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     };
     errdefer self.config.deinit(allocator);
     try dsv_capture.refuse(&self.config, opts);
-    if (server_mod.archFlagRefusal(&self.config, .{ .drop_expert = opts.drop_expert != 0 })) |why| {
+    if (server_mod.archFlagRefusal(&self.config, .{ .drop_expert = opts.drop_expert != 0, .ssd_prefetch = opts.ssd_prefetch != null })) |why| {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
     }
@@ -2057,6 +2063,16 @@ test "kld: --qwen-gdn 16 stores the GDN state in bf16, 32 is the default width" 
     try testing.expect(!narrow.qwen_gdn_f32);
     const wide = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--qwen-gdn", "32" });
     try testing.expect(wide.qwen_gdn_f32);
+}
+
+test "kld: --ssd-prefetch is an integer 0..100" {
+    try testing.expectEqual(@as(?u8, null), (try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f" })).ssd_prefetch);
+    for ([_][]const u8{ "0", "65", "100" }) |ok| {
+        const o = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--ssd-prefetch", ok });
+        try testing.expectEqual(@as(?u8, try std.fmt.parseInt(u8, ok, 10)), o.ssd_prefetch);
+    }
+    for ([_][]const u8{ "101", "-1", "abc", "" }) |bad|
+        try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--ssd-prefetch", bad }));
 }
 
 test "kld: --drop-expert is a student-side multiple of 8, and a capture refuses it because the teacher is exact" {

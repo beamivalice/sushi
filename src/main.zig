@@ -345,6 +345,13 @@ fn printUsage(io: std.Io) void {
         \\                        TOTAL resident target of <n> GiB; the expert
         \\                        cache is what is left after the trunk, the
         \\                        prefill union and the fill buffers.
+        \\  --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 65).
+        \\                        The share, in percent (0..100), of this Mac's SSD
+        \\                        read rate (measured at load) that the expert
+        \\                        reads of a streamed load may use, the reads a
+        \\                        route waits for and the prefetch's together.
+        \\                        0 = no prefetch; lower it to leave the SSD to
+        \\                        other programs.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -936,6 +943,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             ssd_budget_bytes = server_mod.parseSsdBudgetGb(args[i]) catch {
                 log.err("--ssd-budget-gb: expected an integer in 1..512; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--ssd-prefetch") and i + 1 < args.len) {
+            i += 1;
+            model_mod.ssd_prefetch = model_mod.parseSsdPrefetch(args[i]) orelse {
+                log.err("--ssd-prefetch: expected an integer in 0..100; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else {

@@ -19,6 +19,19 @@ pub fn parseQwenGdn(value: []const u8) ?bool {
 /// `parseConfig` copies it into every load's config.
 pub var drop_expert: u16 = 0;
 
+/// `--ssd-prefetch`: the percent of the SSD's read rate the expert prefetch may spend; null = not given.
+pub var ssd_prefetch: ?u8 = null;
+
+pub const default_ssd_prefetch: u8 = 65;
+
+/// The `--ssd-prefetch` value: an integer 0..100, else null.
+pub fn parseSsdPrefetch(value: []const u8) ?u8 {
+    if (value.len == 0 or value.len > 3) return null;
+    for (value) |c| if (c < '0' or c > '9') return null;
+    const pct = std.fmt.parseInt(u8, value, 10) catch return null;
+    return if (pct <= 100) pct else null;
+}
+
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
 const dsv41_config = @import("dsv41/dsv41_config.zig");
@@ -144,6 +157,9 @@ pub const ModelConfig = struct {
     expert_cache_bytes: u64 = 0,
     /// `--drop-expert`: routed experts a layer that are never loaded or picked.
     drop_expert: u16 = 0,
+    /// `--ssd-prefetch` as given, and the model-settings.json `ssd_prefetch`; the flag wins (`ssdPrefetchPct`).
+    ssd_prefetch: ?u8 = null,
+    ssd_prefetch_override: ?u8 = null,
     expert_ssd_budget_bytes: u64 = 0,
     expert_workspace_bytes: u64 = 0,
     /// What the streamed store bills beyond its mean expert, set by the streaming plan.
@@ -791,6 +807,11 @@ pub const ModelConfig = struct {
         return if (self.isDsv41()) dsv41_pool_bytes else 0;
     }
 
+    /// Percent of the SSD read rate the expert prefetch may use: the launch flag, else the model setting, else the default.
+    pub fn ssdPrefetchPct(self: *const ModelConfig) u8 {
+        return self.ssd_prefetch orelse self.ssd_prefetch_override orelse default_ssd_prefetch;
+    }
+
     pub fn isDsv41(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
@@ -1121,6 +1142,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     errdefer config.deinit(allocator);
     config.gdn_state_f32 = qwen_gdn_f32;
     config.drop_expert = drop_expert;
+    config.ssd_prefetch = ssd_prefetch;
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (std.c.getenv("SUSHI_NGRAM_BF16_DIR")) |raw| {
@@ -3936,6 +3958,19 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
         try t.expectEqual(c.rate_n, meta.expert_quant_rate.?.n);
         try t.expectEqual(@as(u32, 48), meta.num_hidden_layers);
     }
+}
+
+test "--ssd-prefetch is an integer 0..100, the flag outranks the model setting and that the default" {
+    const t = std.testing;
+    for ([_][]const u8{ "0", "65", "100", "065" }) |ok| try t.expect(parseSsdPrefetch(ok) != null);
+    try t.expectEqual(@as(?u8, 65), parseSsdPrefetch("65"));
+    for ([_][]const u8{ "101", "-1", "abc", "", "6.5", "+5", " 5", "1000", "256" }) |bad| try t.expectEqual(@as(?u8, null), parseSsdPrefetch(bad));
+    var c = ModelConfig{};
+    try t.expectEqual(@as(u8, 65), c.ssdPrefetchPct());
+    c.ssd_prefetch_override = 30;
+    try t.expectEqual(@as(u8, 30), c.ssdPrefetchPct());
+    c.ssd_prefetch = 0;
+    try t.expectEqual(@as(u8, 0), c.ssdPrefetchPct());
 }
 
 test "--drop-expert reaches the geometry as a count of experts the bill leaves out" {

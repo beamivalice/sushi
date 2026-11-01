@@ -619,20 +619,28 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   2 workers 55.8 ms, more than 4 nothing). The predictor costs ~0.9 ms a round at R4 (a 7.9 MB f32 gate read a layer). At one
   row it measured 41.0 -> 42.4 tok/s on a cold cache but lost on a warmed one (46.6/49.8 -> 46.0/46.1 on main `d810c50c`), so
   a one-row forward is left alone.
-  On by the SSD budget, once, at load (`dsv41_serving.prefetchOn`): from `--ssd-budget-gb 108` up the prefetch runs; below it
-  nothing is created (no hook, no workers, no buffers) and the load logs `[dsv41] expert prefetch on|off (ssd budget N GB, on
-  from 108)`. The prefetch adds reads, so where the SSD is the bottleneck it loses. Measured on scratch `5ea5784c` (main
-  `0d1aba98`; adaptive DSpark, legacy STQ-1.75bpw pack, greedy md5 equal in every arm, ReleaseFast, `taskpolicy -a`, GPU lock
-  a boot, die 49-50 C), prefetch forced off vs on: P2 (rename in a 4129-token file, 800 tokens) -8.5% at 60, -13.7% at 75, -6.7%
-  at 90; P1 (free prose) ties at 75 and 90. At 108, on off off on in one session: P2 102.9 vs 99.1 tok/s (+3.8%, misses
-  0.97 vs 1.29 a token); P1 47.48 vs 46.90 at a matched low-row DSpark mix and 41.74 vs 37.68 / 33.49 at a high-row one.
-  At 60 the round is SSD-bound (89 misses x 9.3 MB per 134 ms round); at 75-90 only ~40% of the prefetched experts are
-  used, its fills evict about as many demand experts as it catches, and its reads cut the demand fill rate ~20%; at 108
-  the cache is roomy enough that those evictions cost a third of what it catches. A miss-rate gate (EMA of missed experts a row, off at 8 or more) shipped first and was
-  removed: the budget decides. The "forced R4" numbers above (59.0 to 53.2 ms) are forced 4-row verifies, not the adaptive
-  path, which mixes in 1-row rounds where the prefetch never runs. Lost, kept out: one-row prefetch (-4 to -12% at 60, the
-  host waits), LOWAGE (reads doubled), CANCEL (never fires), d=2, a wider set; skipping when warm and a cheaper predictor are
-  worth under 0.5%.
+  Metered by `--ssd-prefetch N` (0..100, default 65; `dsv41_serving.startExpertPrefetch`, decided once at load). At N > 0 on a
+  streamed load, before the cache warm, `Engine.probeReadRate` reads random uncached experts through the serving pool, k = 2, 4 and
+  8 a layer across the layers for ~50 ms each (~150 ms), restores the caches and counters, and takes the best rate as this Mac's
+  maximum; the load logs `[dsv41] expert prefetch on: N% of X.X GB/s (probe k2/k4/k8 a/b/c GB/s)`. N = 0 creates nothing (no probe, hook,
+  workers or buffers) and logs `expert prefetch off (--ssd-prefetch 0)`. The prefetch spends a credit (`prefetch_plan.PrefetchCredit`):
+  each forward grants `N% x max rate x wall - demand fill bytes` (never negative), the unspent grant carries at most one round, each
+  job (a layer's prediction) may spend its share of the grant over the target layers plus what earlier jobs left, and a read is one
+  whole expert. A job reads the experts its rows want in the order of `rankWanted` (rows wanting it, predicted router score, earlier
+  row) until the credit stops, and while the credit cannot cover one whole expert no prediction runs at all; `[expert-stream] prefetch:` counts the skipped. Why: uncapped, the prefetch adds reads that compete with
+  the misses a route waits for, and where the SSD is the bottleneck it loses. Sweep on scratch `87a5b11a` (main `bd59796c`; adaptive
+  DSpark, legacy STQ-1.75bpw pack, ReleaseFast, `taskpolicy -a`, GPU lock a boot, greedy md5 equal in 32 requests), P2 (rename in a
+  4129-token file, 800 tokens), `--ssd-budget-gb 90`: prefetch off 75.95 / 74.27 tok/s, uncapped 71.32 (-5.0%), a cap of 2 experts a
+  layer (the scratch's stand-in for the credit) 80.60 / 79.46 (+6.6%); a read budget at 0.80 of the rate loses, 0.50-0.65 wins; at 108 every arm is within +-2%, at 75 the cap of 2
+  ties. The earlier forced on/off numbers (60: -8.5%, 75: -13.7%, 90: -6.7%, 108: +3.8% for P2) were uncapped. Probe on that box:
+  k=8 reads 9.3-9.7 GB/s (k=2 about 9.2, k=1 7.3-7.9), which the default 65 was calibrated against. The shipped credit, code `adb62d21`
+  (same pack, adaptive DSpark, default `--ssd-prefetch 65`, ReleaseFast, `taskpolicy -a`, GPU lock, fans max, one boot each, greedy md5 equal
+  to the scratch runs): at `--ssd-budget-gb 90` the probe read 8.9 / 8.8 / 9.2 GB/s at k=2 / 4 / 8 (65% of 9.2), P1 35.32 and P2 79.25 tok/s
+  (rows a forward 1.09 / 7.28; prefetch 509 jobs, 635 experts read and 1602 skipped for lack of credit by the end of P2); at 60 the probe read
+  8.7 / 9.0 / 9.1 (die 57 C at the start), P1 28.37 and P2 37.97 tok/s, only 141 jobs queued over P2's ~110 rounds because demand fills
+  the budget and no prediction runs. Another binary and boot than the scratch rows (P2 off 75.95 / 74.27 at 90, 38.40 at 60). Lost, kept out: one-row prefetch
+  (-4 to -12% at 60, the host waits), LOWAGE (reads doubled), CANCEL (never fires), d=2, a wider set; skipping when warm and a cheaper
+  predictor are worth under 0.5%.
 
 Differences from mlx-serve: the attention-output fp8 round trip stays (upstream drops it), the verify block takes the same
 masked argmax as serial decode, and a verify is not split from the draft with a host sync per Markov step (the chain is

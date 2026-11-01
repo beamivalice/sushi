@@ -188,6 +188,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
+    config.ssd_prefetch_override = o.ssd_prefetch;
     config.preserve_thinking_override = o.preserve_thinking;
     config.think_penalty_override = o.think_penalty;
     config.logit_bias_file_override = o.logit_bias_file;
@@ -1708,6 +1709,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         .drop_expert = params.config.drop_expert != 0,
+        .ssd_prefetch = params.config.ssd_prefetch != null,
         .mtp_typical = generate_mod.mtp_acceptance_explicit and generate_mod.mtp_acceptance_default == .typical,
         .mtp_tokenv3 = generate_mod.mtp_acceptance_explicit and generate_mod.mtp_acceptance_default == .tokenv3,
         .mtp_greedy_tail = generate_mod.mtp_greedy_tail_explicit,
@@ -1715,6 +1717,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
     }
+    if (@import("server.zig").settingsSsdPrefetchIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     if (@import("server.zig").settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     if (@import("server.zig").settingsMtpIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());

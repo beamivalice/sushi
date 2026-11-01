@@ -5950,12 +5950,13 @@ pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const 
 }
 
 /// The launch flags a load can be refused for, as the process was started.
-pub const LaunchFlagUse = struct { kv_quant: bool = false, qwen_gdn_16: bool = false, mtp_head_kv_quant: bool = false, drop_expert: bool = false, mtp_typical: bool = false, mtp_tokenv3: bool = false, mtp_greedy_tail: bool = false };
+pub const LaunchFlagUse = struct { kv_quant: bool = false, qwen_gdn_16: bool = false, mtp_head_kv_quant: bool = false, drop_expert: bool = false, ssd_prefetch: bool = false, mtp_typical: bool = false, mtp_tokenv3: bool = false, mtp_greedy_tail: bool = false };
 
 /// A launch flag with nothing to act on in this arch, named with the reason; null when every flag given applies.
 /// An explicit flag is refused rather than ignored, before the weights load.
 pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse) ?[]const u8 {
     if (use.drop_expert and !config.isDsv41()) return "--drop-expert has no effect on this model: only deepseek_v41 packs carry an expert usage list; drop the flag";
+    if (use.ssd_prefetch and !config.isDsv41()) return "--ssd-prefetch has no effect on this model: it has no expert prefetcher; drop the flag";
     if (!config.isDsv41()) return null;
     if (use.kv_quant) return "--kv-quant has no effect on deepseek_v41: its compressed state is stored as the QAT round trips left it, so there is no KV cache to quantize; drop the flag";
     if (use.qwen_gdn_16) return "--qwen-gdn has no effect on deepseek_v41: it has no GatedDeltaNet layers; drop the flag";
@@ -5964,6 +5965,12 @@ pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse)
     if (use.mtp_tokenv3) return "--mtp-tokenv3 has no effect on deepseek_v41: DSpark accepts drafts by the exact rule only; drop the flag";
     if (use.mtp_greedy_tail) return "--mtp-greedy-tail has no effect on deepseek_v41: DSpark drafts one block from the trunk's own state, with no MTP tail; drop the flag";
     return null;
+}
+
+/// A model-settings.json `ssd_prefetch` on an arch with no expert prefetcher is ignored with this one line, as `kv_quant` is.
+pub fn settingsSsdPrefetchIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
+    if (config.isDsv41() or config.ssd_prefetch_override == null) return null;
+    return "model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher";
 }
 
 /// A model-settings.json `kv_quant` on an arch with no KV cache is ignored with this one line, never a refusal:
@@ -12123,6 +12130,24 @@ test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail wi
     qwen4.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
     qwen4.mtp_greedy_tail_override = true;
     try t.expect(settingsMtpIgnoredLine(&qwen4) == null);
+}
+
+test "--ssd-prefetch is refused where there is no expert prefetcher, before the weights load, and its model setting is ignored there" {
+    const t = std.testing;
+    const use = LaunchFlagUse{ .ssd_prefetch = true };
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    dsv41.ssd_prefetch_override = 30;
+    try t.expect(archFlagRefusal(&dsv41, use) == null);
+    try t.expect(settingsSsdPrefetchIgnoredLine(&dsv41) == null);
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
+        var cfg = model_mod.ModelConfig{ .model_type = arch };
+        const why = archFlagRefusal(&cfg, use) orelse return error.TestExpectedRefusal;
+        try t.expect(std.mem.startsWith(u8, why, "--ssd-prefetch"));
+        try t.expect(archFlagRefusal(&cfg, .{}) == null);
+        try t.expect(settingsSsdPrefetchIgnoredLine(&cfg) == null);
+        cfg.ssd_prefetch_override = 30;
+        try t.expect(settingsSsdPrefetchIgnoredLine(&cfg) != null);
+    }
 }
 
 test "--drop-expert is refused on every arch but deepseek_v41, before the weights load" {

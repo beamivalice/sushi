@@ -6,6 +6,8 @@ const kernels = @import("expert_bf16_kernels.zig");
 pub const quant = @import("expert_quant.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_usage = @import("dsv41/expert_usage.zig");
+const prefetch_plan = @import("prefetch_plan.zig");
+const PrefetchCredit = prefetch_plan.PrefetchCredit;
 const Ragged = sushi_exl3.Ragged;
 
 pub const Span = struct {
@@ -1890,18 +1892,27 @@ pub const Prefetcher = struct {
     pub const rows_max = 16;
     pub const cand_max = 12;
     const jobs_max = 32;
+    comptime {
+        std.debug.assert(rows_max * cand_max <= prefetch_plan.candidates_max);
+    }
 
     const Job = struct {
         layer: u16,
         rows: u8,
         n: u8,
         m: u8,
-        cand: [rows_max][cand_max]u16,
+        /// `rows` rows of `n` ranked candidates, and the router pick score predicted for each.
+        cand: [prefetch_plan.candidates_max]u16,
+        score: [prefetch_plan.candidates_max]f32,
     };
 
     pool: *io_mod.FillPool,
     thread: std.Thread,
     mu: std.Io.Mutex = .init,
+    /// Read budget; `mu` guards it, the host refills it and the thread spends it.
+    credit: PrefetchCredit,
+    /// The fewest bytes one expert read takes; below it in credit no prediction is worth making.
+    min_bytes: u64 = 0,
     cv: std.Io.Condition = .init,
     jobs: [jobs_max]Job = undefined,
     head: usize = 0,
@@ -1913,9 +1924,17 @@ pub const Prefetcher = struct {
     jobs_queued: std.atomic.Value(u64) = .init(0),
     jobs_run: std.atomic.Value(u64) = .init(0),
     experts_read: std.atomic.Value(u64) = .init(0),
+    /// Wanted experts a job did not read for lack of credit.
+    experts_skipped: std.atomic.Value(u64) = .init(0),
     host_wait_ns: std.atomic.Value(u64) = .init(0),
     job_ns: std.atomic.Value(u64) = .init(0),
 };
+
+pub const probe_widths = [_]usize{ 2, 4, 8 };
+const probe_ns: u64 = 50 * std.time.ns_per_ms;
+
+/// What `Engine.probeReadRate` read: the rate at each of `probe_widths` and the best of them, in bytes a second.
+pub const ProbeReading = struct { bps: [probe_widths.len]f64, max_bps: f64 };
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -2273,6 +2292,12 @@ pub const Engine = struct {
             acc.unions += layer.stats.unions;
         }
         self.last = acc;
+        if (self.prefetcher) |pf| {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            pf.mu.lockUncancelable(io);
+            pf.credit.refill(wall_ns, acc.fill_bytes);
+            pf.mu.unlock(io);
+        }
         const scheduled = self.forward_count <= 2 or self.forward_count % BREAKDOWN_EVERY == 0;
         // At debug level every prefill chunk gets its line: a chunk is one forward, so the schedule would skip them.
         if (!scheduled and !acc.probe and !(rows > 64 and log.isDebug())) return;
@@ -2429,15 +2454,15 @@ pub const Engine = struct {
     }
 
 
-    /// Starts the prefetch thread; a no-op where one runs already.
-    pub fn startPrefetch(self: *Engine) !void {
+    /// Starts the prefetch thread, reading within `credit`; a no-op where one runs already.
+    pub fn startPrefetch(self: *Engine, credit: PrefetchCredit) !void {
         if (self.prefetcher != null) return;
         const pf = try self.allocator.create(Prefetcher);
         errdefer self.allocator.destroy(pf);
         const serving = (self.io_pool orelse return error.MissingFillPool).opts;
         const pool = try io_mod.FillPool.create(self.allocator, .{ .workers = @min(serving.workers, FILL_WORKERS), .bounce_cap = serving.bounce_cap, .coalesce_max = COALESCE_MAX });
         errdefer pool.destroy();
-        pf.* = .{ .pool = pool, .thread = undefined };
+        pf.* = .{ .pool = pool, .thread = undefined, .credit = credit, .min_bytes = self.smallestExpertBytes() };
         pf.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, prefetchMain, .{ self, pf });
         self.prefetcher = pf;
     }
@@ -2456,35 +2481,65 @@ pub const Engine = struct {
     }
 
     /// Whether `layer` can be prefetched: a rate-grouped pool that is neither released nor resident.
+    /// Not while the credit and the next job's slice cannot cover one whole expert: the prediction would cost a GEMV
+    /// and a job to read nothing. Takes the prefetch mutex, so a caller holding it must not call this.
     pub fn canPrefetch(self: *const Engine, layer: u16) bool {
-        if (self.prefetcher == null or layer >= self.layers.len) return false;
+        const pf = self.prefetcher orelse return false;
+        if (!self.prefetchable(layer)) return false;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.mu.lockUncancelable(io);
+        defer pf.mu.unlock(io);
+        return pf.credit.affords(pf.min_bytes);
+    }
+
+    fn smallestExpertBytes(self: *const Engine) u64 {
+        var least: u64 = std.math.maxInt(u64);
+        for (self.layers, 0..) |*layer, li| {
+            const gl = layer.grouped orelse continue;
+            if (!layer.active) continue;
+            for (0..gl.expertCount()) |e| {
+                if (self.isDropped(@intCast(li), @intCast(e))) continue;
+                least = @min(least, self.expertReadBytes(@intCast(li), @intCast(e)));
+            }
+        }
+        return if (least == std.math.maxInt(u64)) 0 else least;
+    }
+
+    fn prefetchable(self: *const Engine, layer: u16) bool {
+        if (layer >= self.layers.len) return false;
         const state = &self.layers[layer];
         return state.grouped != null and state.active and !state.borrowed and state.resident_map.ctx == null and state.slabs.len == quant.component_count;
     }
 
+    /// The layers a prediction made `lead` layers ahead can fill.
+    pub fn prefetchTargets(self: *const Engine, lead: usize) usize {
+        var count: usize = 0;
+        for (lead..self.layers.len) |layer| count += @intFromBool(self.prefetchable(@intCast(layer)));
+        return count;
+    }
+
     /// Queues the experts `layer` is expected to pick: for each of `rows` rows, the first `m` of its `n` ranked candidates
-    /// (`cand`, `n` per row) that the pool does not hold. Best effort and never blocking; a full queue drops the job.
-    pub fn prefetch(self: *Engine, layer: u16, cand: []const u16, rows: usize, n: usize, m: usize) void {
+    /// (`cand`, `n` per row, with the predicted pick `score` of each) that the pool does not hold. Best effort and never
+    /// blocking; a full queue drops the job.
+    pub fn prefetch(self: *Engine, layer: u16, cand: []const u16, score: []const f32, rows: usize, n: usize, m: usize) void {
         const pf = self.prefetcher orelse return;
-        if (!self.canPrefetch(layer) or rows == 0 or rows > Prefetcher.rows_max or n == 0 or n > Prefetcher.cand_max or cand.len != rows * n) return;
+        if (!self.canPrefetch(layer) or rows == 0 or rows > Prefetcher.rows_max or n == 0 or n > Prefetcher.cand_max or cand.len != rows * n or score.len != cand.len) return;
         const io = std.Io.Threaded.global_single_threaded.io();
         pf.mu.lockUncancelable(io);
         defer pf.mu.unlock(io);
         if (pf.len == Prefetcher.jobs_max) return;
         // With no job on the layer the host owns its cache map, so a prediction that holds nothing new queues and wakes nothing.
         if (!prefetchTouches(pf, layer)) {
-            const gl = self.layers[layer].grouped.?;
-            var want: [Prefetcher.rows_max * Prefetcher.cand_max]u16 = undefined;
-            var wanted: usize = 0;
-            for (0..rows) |r| self.collectWanted(layer, gl, cand[r * n ..][0..n], m, &want, &wanted);
-            if (wanted == 0) return;
+            var want: [prefetch_plan.candidates_max]u16 = undefined;
+            if (self.rankedWanted(layer, cand, score, rows, n, m, &want) == 0) return;
         }
         const job = &pf.jobs[(pf.head + pf.len) % Prefetcher.jobs_max];
         job.layer = layer;
         job.rows = @intCast(rows);
         job.n = @intCast(n);
         job.m = @intCast(@min(m, n));
-        for (0..rows) |r| @memcpy(job.cand[r][0..n], cand[r * n ..][0..n]);
+        @memcpy(job.cand[0..cand.len], cand);
+        @memcpy(job.score[0..score.len], score);
         pf.len += 1;
         _ = pf.live.fetchAdd(1, .release);
         _ = pf.jobs_queued.fetchAdd(1, .monotonic);
@@ -2546,21 +2601,25 @@ pub const Engine = struct {
         }
     }
 
-    /// Adds to `want` the first `m` of one row's ranked candidates the layer's pool does not hold ready.
-    fn collectWanted(self: *const Engine, layer: u16, gl: *const GroupedLayer, cand: []const u16, m: usize, want: []u16, wanted: *usize) void {
-        var taken: usize = 0;
-        for (cand) |expert| {
-            if (expert >= gl.expertCount() or self.isDropped(layer, expert)) continue;
-            const g = gl.groups.groupOf(expert);
-            const raw = gl.caches[g].expert_to_slot[expert - gl.groups.base[g]];
-            if (raw >= 0 and gl.caches[g].ready[@intCast(raw)]) continue;
-            taken += 1;
-            if (std.mem.indexOfScalar(u16, want[0..wanted.*], expert) == null) {
-                want[wanted.*] = expert;
-                wanted.* += 1;
-            }
-            if (taken == m) break;
+    /// The experts the rows want of `layer`, best first, into `want` (`prefetch_plan.rankWanted`); the pool's ready
+    /// experts and the dropped ones are not wanted.
+    fn rankedWanted(self: *const Engine, layer: u16, cand: []const u16, score: []const f32, rows: usize, n: usize, m: usize, want: []u16) usize {
+        const gl = self.layers[layer].grouped.?;
+        var held: [prefetch_plan.candidates_max]bool = undefined;
+        for (cand, held[0..cand.len]) |expert, *h| {
+            h.* = expert >= gl.expertCount() or self.isDropped(layer, expert) or blk: {
+                const g = gl.groups.groupOf(expert);
+                const raw = gl.caches[g].expert_to_slot[expert - gl.groups.base[g]];
+                break :blk raw >= 0 and gl.caches[g].ready[@intCast(raw)];
+            };
         }
+        return prefetch_plan.rankWanted(cand, score, held[0..cand.len], rows, n, m, want);
+    }
+
+    pub fn expertReadBytes(self: *const Engine, layer: u16, expert: u16) u64 {
+        var bytes: u64 = 0;
+        for (0..quant.component_count) |ci| bytes += self.store.spanAt(layer, expert, ci).len;
+        return bytes;
     }
 
     /// Reads the job's uncached experts into their pools. Where anything fails the pool is left as it was.
@@ -2569,9 +2628,19 @@ pub const Engine = struct {
         const gl = layer.grouped orelse return;
         const n = quant.component_count;
         const count: usize = gl.groups.count;
-        var want: [Prefetcher.rows_max * Prefetcher.cand_max]u16 = undefined;
+        var want: [prefetch_plan.candidates_max]u16 = undefined;
+        const total = @as(usize, job.rows) * job.n;
+        const ranked = self.rankedWanted(job.layer, job.cand[0..total], job.score[0..total], job.rows, job.n, job.m, &want);
+        if (ranked == 0) return;
         var wanted: usize = 0;
-        for (0..job.rows) |r| self.collectWanted(job.layer, gl, job.cand[r][0..job.n], job.m, &want, &wanted);
+        {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            pf.mu.lockUncancelable(io);
+            defer pf.mu.unlock(io);
+            pf.credit.beginJob();
+            while (wanted < ranked and pf.credit.take(self.expertReadBytes(job.layer, want[wanted]))) wanted += 1;
+        }
+        _ = pf.experts_skipped.fetchAdd(ranked - wanted, .monotonic);
         if (wanted == 0) return;
 
         var snapshots: [quant.rate_group_limit]CacheSnapshot = undefined;
@@ -2633,6 +2702,69 @@ pub const Engine = struct {
 
     pub fn cancelFills(self: *Engine) void {
         if (self.io_pool) |pool| pool.requestCancel();
+    }
+
+    /// The read rate the serving pool reaches on this machine: random uncached experts read a layer after another, `k`
+    /// to a layer at each of `probe_widths`, for `probe_ns` each. The caches and counters are put back as they were.
+    pub fn probeReadRate(self: *Engine) !ProbeReading {
+        var out: ProbeReading = .{ .bps = @splat(0), .max_bps = 0 };
+        if (self.plan.resident) return out;
+        const Held = struct { layer: u16, caches: [quant.rate_group_limit]CacheSnapshot, count: usize, stats: LayerStats };
+        var held: std.ArrayList(Held) = .empty;
+        defer {
+            for (held.items) |*h| {
+                const gl = self.layers[h.layer].grouped.?;
+                for (h.caches[0..h.count], gl.caches[0..h.count]) |*snapshot, *cache| {
+                    snapshot.restore(cache);
+                    snapshot.deinit(self.allocator);
+                }
+                self.layers[h.layer].stats = h.stats;
+            }
+            held.deinit(self.allocator);
+        }
+        for (self.layers, 0..) |*layer, li| {
+            const gl = layer.grouped orelse continue;
+            if (!layer.active or layer.borrowed) continue;
+            var entry: Held = .{ .layer = @intCast(li), .caches = undefined, .count = 0, .stats = layer.stats };
+            errdefer for (entry.caches[0..entry.count]) |*snapshot| snapshot.deinit(self.allocator);
+            while (entry.count < gl.groups.count) : (entry.count += 1) entry.caches[entry.count] = try self.snapshotCache(&gl.caches[entry.count]);
+            try held.append(self.allocator, entry);
+        }
+        const totals = .{ self.fill_experts_total, self.fill_bytes_total, self.fill_ns_total, self.cache_snapshots, self.copy_ns_total, self.copy_bytes_total };
+        defer {
+            self.fill_experts_total, self.fill_bytes_total, self.fill_ns_total, self.cache_snapshots, self.copy_ns_total, self.copy_bytes_total = totals;
+        }
+        var prng = std.Random.DefaultPrng.init(0x5eed);
+        const rnd = prng.random();
+        for (probe_widths, &out.bps) |k, *bps| {
+            const bytes0 = self.fill_bytes_total;
+            var clock = Clock.init();
+            var elapsed: u64 = 0;
+            var visits: usize = 0;
+            while (held.items.len != 0 and elapsed < probe_ns and visits < 4 * held.items.len) : (visits += 1) {
+                const h = held.items[visits % held.items.len];
+                const gl = self.layers[h.layer].grouped.?;
+                var picks: [probe_widths[probe_widths.len - 1]]u16 = undefined;
+                var got: usize = 0;
+                var tries: usize = 0;
+                while (got < k and tries < 1000) : (tries += 1) {
+                    const e: u16 = @intCast(rnd.uintLessThan(usize, gl.expertCount()));
+                    if (self.isDropped(h.layer, e) or std.mem.indexOfScalar(u16, picks[0..got], e) != null) continue;
+                    const g = gl.groups.groupOf(e);
+                    if (gl.caches[g].expert_to_slot[e - gl.groups.base[g]] >= 0) continue;
+                    picks[got] = e;
+                    got += 1;
+                }
+                if (got != 0) {
+                    var prepared = try self.prepareHost(h.layer, picks[0..got]);
+                    prepared.deinit();
+                }
+                elapsed += clock.lap();
+            }
+            bps.* = prefetch_plan.readRate(self.fill_bytes_total - bytes0, elapsed);
+        }
+        out.max_bps = prefetch_plan.probeMax(&out.bps);
+        return out;
     }
 
     pub fn warmCache(self: *Engine) !void {

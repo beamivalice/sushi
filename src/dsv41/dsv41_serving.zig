@@ -5,6 +5,7 @@ const dsv41_stream = @import("dsv41_stream.zig");
 const kernels = @import("dsv41_kernels.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
+const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
 const expert_quant_mod = @import("../expert_quant.zig");
@@ -20,13 +21,8 @@ const ForwardCtx = trf.ForwardCtx;
 const Transformer = trf.Transformer;
 const initModuleShell = trf.initModuleShell;
 
-/// Below this SSD budget the prefetch's extra reads compete with the misses for the SSD and lose or tie.
-const prefetch_min_budget: u64 = 108 << 30;
-
-/// Whether the expert prefetch runs for an `--ssd-budget-gb` of `budget_bytes` (0 on a resident load).
-pub fn prefetchOn(budget_bytes: u64) bool {
-    return budget_bytes >= prefetch_min_budget;
-}
+/// Layers ahead of a layer whose picks its router input predicts.
+const prefetch_lead_rows: u8 = 3;
 
 pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
     const stq = config.dsv41.?.expert_dec != null;
@@ -61,15 +57,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg };
         mdl.experts = .{ .hook = experts.hook() };
         shell.dsv41_stq_experts = experts;
-        const budget_gb = config.expert_ssd_budget_bytes >> 30;
-        var prefetching = false;
-        if (prefetchOn(config.expert_ssd_budget_bytes)) {
-            if (engine.startPrefetch()) {
-                mdl.prefetch_lead_rows = 3;
-                prefetching = true;
-            } else |e| log.warn("[dsv41] expert prefetch off: {s}\n", .{@errorName(e)});
-        }
-        log.info("[dsv41] expert prefetch {s} (ssd budget {d} GB, on from {d})\n", .{ if (prefetching) "on" else "off", budget_gb, prefetch_min_budget >> 30 });
+        try startExpertPrefetch(engine, mdl, config.ssdPrefetchPct());
     } else {
         const experts = try allocator.create(dsv41_stream.Stream);
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };
@@ -90,6 +78,35 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     // The warm's transients leave the pool, so the load's memory reading is the model's.
     _ = mlx.mlx_clear_cache();
     return shell;
+}
+
+/// Starts the expert prefetch at `pct` percent of the read rate the serving pool measures now, or none at 0 or on a
+/// resident load. A failure to start leaves the load without a prefetch.
+fn startExpertPrefetch(engine: *expert_stream_mod.Engine, mdl: *dsv41_model.Model, pct: u8) !void {
+    if (pct == 0) {
+        log.info("[dsv41] expert prefetch off (--ssd-prefetch 0)\n", .{});
+        return;
+    }
+    if (engine.plan.resident) {
+        log.info("[dsv41] expert prefetch off (every routed expert is resident)\n", .{});
+        return;
+    }
+    const probe = engine.probeReadRate() catch |e| {
+        log.warn("[dsv41] expert prefetch off: the read-rate probe failed ({s})\n", .{@errorName(e)});
+        return;
+    };
+    if (probe.max_bps <= 0) {
+        log.warn("[dsv41] expert prefetch off: the read-rate probe read nothing\n", .{});
+        return;
+    }
+    const targets = engine.prefetchTargets(prefetch_lead_rows);
+    const credit = PrefetchCredit.init(pct, probe.max_bps, targets);
+    engine.startPrefetch(credit) catch |e| {
+        log.warn("[dsv41] expert prefetch off: {s}\n", .{@errorName(e)});
+        return;
+    };
+    mdl.prefetch_lead_rows = prefetch_lead_rows;
+    log.info("[dsv41] expert prefetch on: {d}% of {d:.1} GB/s (probe k2/k4/k8 {d:.1}/{d:.1}/{d:.1} GB/s)\n", .{ pct, probe.max_bps / 1e9, probe.bps[0] / 1e9, probe.bps[1] / 1e9, probe.bps[2] / 1e9 });
 }
 
 /// Whether the chunk's CED decoder tail is read by nothing (`dsv41_model.extendState`): no restore point at its end,
@@ -188,11 +205,4 @@ test "tailUnread: a chunk is state only when no point is taken and the next chun
     try t.expect(tailUnread(128, 2048, 129, false));
     try t.expect(!tailUnread(128, 128, 2048, false));
     try t.expect(!tailUnread(0, 2048, 2048, false));
-}
-
-test "dsv41 prefetch: it is on from a 108 GB budget and off below it or on a resident load" {
-    try std.testing.expect(!prefetchOn(0));
-    try std.testing.expect(!prefetchOn((108 << 30) - 1));
-    try std.testing.expect(prefetchOn(108 << 30));
-    try std.testing.expect(prefetchOn(120 << 30));
 }

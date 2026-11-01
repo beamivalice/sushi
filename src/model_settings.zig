@@ -120,6 +120,7 @@ pub const Override = struct {
     mtp_acceptance: ?mtp_acceptance.Mode = null,
     mtp_greedy_tail: ?bool = null,
     ssd_budget_gb: ?u32 = null,
+    ssd_prefetch: ?u8 = null,
     preserve_thinking: ?bool = null,
     think_penalty: ?f32 = null,
     logit_bias_file: ?@import("logit_bias.zig").FilePath = null,
@@ -127,7 +128,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
-            o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.preserve_thinking == null and
+            o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
             o.think_penalty == null and o.logit_bias_file == null and o.vision == null;
     }
 };
@@ -193,6 +194,12 @@ fn fromValue(v: std.json.Value) Override {
         },
         else => {},
     };
+    if (obj.get("ssd_prefetch")) |g| switch (g) {
+        .integer => |i| if (i >= 0 and i <= 100) {
+            o.ssd_prefetch = @intCast(i);
+        },
+        else => {},
+    };
     if (obj.get("preserve_thinking")) |p| switch (p) {
         .bool => |b| o.preserve_thinking = b,
         else => {},
@@ -244,7 +251,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} preserve_thinking={s} think_penalty={d} vision={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -252,6 +259,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         o.ssd_budget_gb orelse 0,
+        o.ssd_prefetch,
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
         o.think_penalty orelse 0,
         if (o.vision) |v| (if (v) "on" else "off") else "default",
@@ -320,6 +328,17 @@ test "model_settings: ssd_budget_gb rides the same file as the other keys" {
     try std.testing.expect(s.lookup("/m/c").isEmpty());
     try std.testing.expectEqual(@as(?u32, null), s.lookup("/m/d").ssd_budget_gb);
     try std.testing.expect(!s.lookup("/m/a").isEmpty());
+}
+
+test "model_settings: ssd_prefetch is 0..100, a zero is a setting" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"ssd_prefetch": 40}, "/m/b": {"ssd_prefetch": 0}, "/m/c": {"ssd_prefetch": 101}, "/m/d": {"ssd_prefetch": "40"}, "/m/e": {"ssd_prefetch": -1}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?u8, 40), s.lookup("/m/a").ssd_prefetch);
+    try std.testing.expectEqual(@as(?u8, 0), s.lookup("/m/b").ssd_prefetch);
+    try std.testing.expect(!s.lookup("/m/b").isEmpty());
+    for ([_][]const u8{ "/m/c", "/m/d", "/m/e" }) |path| try std.testing.expect(s.lookup(path).isEmpty());
 }
 
 test "an explicit --mtp / --no-mtp outranks the per-model mtp, which outranks the default" {

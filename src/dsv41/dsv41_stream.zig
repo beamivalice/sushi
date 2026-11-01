@@ -14,6 +14,7 @@ const Scope = sc_mod.Scope;
 const Config = cfg_mod.Config;
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
+const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
 
 pub fn geometry(cfg: *const Config) stream.Geometry {
     return .{
@@ -205,7 +206,7 @@ pub const StqStream = struct {
         const ids = try sc_mod.hostI32(idx);
         if (self.engine.prefetcher) |pf| {
             self.settles +%= 1;
-            if (self.settles % 4096 == 0) log.info("[expert-stream] prefetch: {d} jobs queued, {d} read {d} experts in {d:.1} ms, the host waited {d:.1} ms for them\n", .{ pf.jobs_queued.load(.monotonic), pf.jobs_run.load(.monotonic), pf.experts_read.load(.monotonic), @as(f64, @floatFromInt(pf.job_ns.load(.monotonic))) / 1e6, @as(f64, @floatFromInt(pf.host_wait_ns.load(.monotonic))) / 1e6 });
+            if (self.settles % 4096 == 0) log.info("[expert-stream] prefetch: {d} jobs queued, {d} read {d} experts ({d} skipped for lack of credit) in {d:.1} ms, the host waited {d:.1} ms for them\n", .{ pf.jobs_queued.load(.monotonic), pf.jobs_run.load(.monotonic), pf.experts_read.load(.monotonic), pf.experts_skipped.load(.monotonic), @as(f64, @floatFromInt(pf.job_ns.load(.monotonic))) / 1e6, @as(f64, @floatFromInt(pf.host_wait_ns.load(.monotonic))) / 1e6 });
         }
         self.engine.noteRoute(@intCast(layer), false, .{ .ids_wait_ns = clock.lap() });
         const host = try scratch(u16, &self.picks, gpa, ids.len);
@@ -245,9 +246,9 @@ pub const StqStream = struct {
         return out;
     }
 
-    fn prefetchOpaque(ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void {
+    fn prefetchOpaque(ctx: *anyopaque, layer: usize, cand: []const u16, score: []const f32, rows: usize, n: usize, m: usize) void {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        self.engine.prefetch(@intCast(layer), cand, rows, n, m);
+        self.engine.prefetch(@intCast(layer), cand, score, rows, n, m);
     }
 
     fn canPrefetchOpaque(ctx: *anyopaque, layer: usize) bool {
@@ -1596,7 +1597,7 @@ test "dsv41 stq: queued routed chains leave a verify round's kept rows, the DSpa
 }
 
 fn enablePrefetch(served: *StqServed, lead_rows: u8, n: u8, m: u8) !void {
-    try served.engine.startPrefetch();
+    try served.engine.startPrefetch(PrefetchCredit.unmetered);
     served.m.prefetch_lead_rows = lead_rows;
     served.m.prefetch_n = n;
     served.m.prefetch_m = m;
@@ -1694,17 +1695,18 @@ test "dsv41 prefetch: experts read ahead leave the pool, the map and the slab by
     var ahead: StqServed = undefined;
     try ahead.init(dir, .bfloat16, true, false, 4, s);
     defer ahead.deinit();
-    try ahead.engine.startPrefetch();
+    try ahead.engine.startPrefetch(PrefetchCredit.unmetered);
     var routed: StqServed = undefined;
     try routed.init(dir, .bfloat16, true, false, 4, s);
     defer routed.deinit();
     const layer: u16 = 3;
-    // Two rows of three ranked candidates; each asks for its first two: the experts 5, 1 and 6.
+    // Two rows of three ranked candidates; each asks for its first two: the experts 1 (both rows), 5 and 6.
     const cand = [_]u16{ 5, 1, 7, 1, 6, 2 };
-    ahead.engine.prefetch(layer, &cand, 2, 3, 2);
+    const ranked_scores = [_]f32{ 6, 5, 4, 3, 2, 1 };
+    ahead.engine.prefetch(layer, &cand, &ranked_scores, 2, 3, 2);
     ahead.engine.prefetchWait(layer);
     {
-        var p = try routed.engine.prepareHost(layer, &.{ 5, 1, 6 });
+        var p = try routed.engine.prepareHost(layer, &.{ 1, 5, 6 });
         p.deinit();
     }
     const a = &ahead.engine.layers[layer];
@@ -1723,7 +1725,7 @@ test "dsv41 prefetch: experts read ahead leave the pool, the map and the slab by
     try testing.expectEqual(filled, ahead.engine.fill_experts_total);
     try testing.expectEqual(@as(u64, 3), ahead.engine.prefetcher.?.experts_read.load(.monotonic));
     // Experts the pool holds are not read again.
-    ahead.engine.prefetch(layer, &cand, 2, 3, 2);
+    ahead.engine.prefetch(layer, &cand, &ranked_scores, 2, 3, 2);
     ahead.engine.prefetchWait(layer);
     try testing.expectEqual(@as(u64, 3), ahead.engine.prefetcher.?.experts_read.load(.monotonic));
 }
@@ -1751,9 +1753,15 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
         try narrow.init(dir, .bfloat16, true, true, slots, s);
         defer narrow.deinit();
         try enablePrefetch(&narrow, 2, 3, 1);
+        // A credit of one expert a job, so most of what the rows want goes unread.
+        var metered: StqServed = undefined;
+        try metered.init(dir, .bfloat16, true, true, slots, s);
+        defer metered.deinit();
+        try enablePrefetch(&metered, 2, 8, 2);
+        metered.engine.prefetcher.?.credit = oneExpertAJob(&metered.engine);
         const pa = try model.extend(plain.m, ids[0..20], .last);
         _ = mlx.mlx_array_free(pa);
-        for ([_]*StqServed{ &wide, &narrow }) |served| {
+        for ([_]*StqServed{ &wide, &narrow, &metered }) |served| {
             const pb = try model.extend(served.m, ids[0..20], .last);
             _ = mlx.mlx_array_free(pb);
         }
@@ -1762,7 +1770,7 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
         for ([_][2]usize{ .{ 0, 0 }, .{ 5, 2 }, .{ 0, 0 }, .{ 0, 0 }, .{ 6, 0 }, .{ 4, 3 }, .{ 0, 0 }, .{ 3, 1 }, .{ 0, 0 }, .{ 0, 0 }, .{ 2, 1 }, .{ 0, 0 } }) |round| {
             const a = if (round[0] == 0) try model.extend(plain.m, ids[at..][0..1], .all) else try model.verify(plain.m, ids[at..][0..round[0]]);
             defer _ = mlx.mlx_array_free(a);
-            for ([_]*StqServed{ &wide, &narrow }) |served| {
+            for ([_]*StqServed{ &wide, &narrow, &metered }) |served| {
                 const c = if (round[0] == 0) try model.extend(served.m, ids[at..][0..1], .all) else try model.verify(served.m, ids[at..][0..round[0]]);
                 defer _ = mlx.mlx_array_free(c);
                 try expectSameBits(&sc, a, c);
@@ -1773,12 +1781,52 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
                 try model.finishVerify(plain.m, round[1]);
                 try model.finishVerify(wide.m, round[1]);
                 try model.finishVerify(narrow.m, round[1]);
+                try model.finishVerify(metered.m, round[1]);
                 at += round[1] + 1;
             }
         }
         try testing.expect(wide.engine.prefetcher.?.experts_read.load(.monotonic) > 0);
         try testing.expect(narrow.engine.prefetcher.?.experts_read.load(.monotonic) > 0);
+        const meter = metered.engine.prefetcher.?;
+        try testing.expect(meter.experts_read.load(.monotonic) > 0);
+        try testing.expect(meter.experts_skipped.load(.monotonic) > 0);
     }
+}
+
+/// A credit that grants every job the bytes of the layer's largest expert, however many jobs ran before it.
+fn oneExpertAJob(engine: *const stream.Engine) PrefetchCredit {
+    var widest: u64 = 0;
+    for (0..engine.geometry.experts) |e| widest = @max(widest, engine.expertReadBytes(3, @intCast(e)));
+    return .{ .pct = 0, .max_bps = 0, .target_layers = 1, .credit = std.math.inf(f64), .share = @floatFromInt(widest) };
+}
+
+test "dsv41 prefetch: the read-rate probe leaves the caches and the engine's counters as a load without it (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    const s = mlx.gpuStream();
+    var plain: StqServed = undefined;
+    try plain.init(dir, .bfloat16, true, false, 4, s);
+    defer plain.deinit();
+    var probed: StqServed = undefined;
+    try probed.init(dir, .bfloat16, true, false, 4, s);
+    defer probed.deinit();
+    try plain.engine.warmCache();
+    const reading = try probed.engine.probeReadRate();
+    try testing.expect(reading.max_bps > 0);
+    try probed.engine.warmCache();
+    for (plain.engine.layers, probed.engine.layers) |a, b| {
+        const ga = a.grouped orelse continue;
+        for (ga.caches[0..ga.groups.count], b.grouped.?.caches[0..ga.groups.count]) |ca, cb| {
+            try testing.expectEqualSlices(i32, ca.expert_to_slot, cb.expert_to_slot);
+            try testing.expectEqualSlices(u16, ca.slot_to_expert, cb.slot_to_expert);
+            try testing.expectEqualSlices(bool, ca.ready, cb.ready);
+            try testing.expectEqualSlices(u64, ca.ages, cb.ages);
+            try testing.expectEqual(ca.tick, cb.tick);
+        }
+        try testing.expectEqual(a.stats.fill_bytes, b.stats.fill_bytes);
+    }
+    try testing.expectEqual(plain.engine.fill_experts_total, probed.engine.fill_experts_total);
+    try testing.expectEqual(plain.engine.fill_bytes_total, probed.engine.fill_bytes_total);
 }
 
 test "dsv41 prefetch: one-row decode steps ask for nothing and keep the bytes (DSV41_STQ_TINY)" {
@@ -1817,21 +1865,21 @@ test "dsv41 prefetch: candidates the pool already holds queue no job, the rest q
     var served: StqServed = undefined;
     try served.init(dir, .bfloat16, true, false, 4, s);
     defer served.deinit();
-    try served.engine.startPrefetch();
+    try served.engine.startPrefetch(PrefetchCredit.unmetered);
     const pf = served.engine.prefetcher.?;
     const layer: u16 = 3;
-    served.engine.prefetch(layer, &.{ 5, 1, 1, 6 }, 2, 2, 2);
+    served.engine.prefetch(layer, &.{ 5, 1, 1, 6 }, &.{ 4, 3, 2, 1 }, 2, 2, 2);
     served.engine.prefetchWait(layer);
     try testing.expectEqual(@as(u64, 1), pf.jobs_queued.load(.monotonic));
     const waited = pf.host_wait_ns.load(.monotonic);
     // The pool holds every candidate the rows ask for.
-    served.engine.prefetch(layer, &.{ 5, 1, 1, 6 }, 2, 2, 2);
+    served.engine.prefetch(layer, &.{ 5, 1, 1, 6 }, &.{ 4, 3, 2, 1 }, 2, 2, 2);
     try testing.expectEqual(@as(u32, 0), pf.live.load(.acquire));
     try testing.expectEqual(@as(u64, 1), pf.jobs_queued.load(.monotonic));
     served.engine.prefetchWait(layer);
     try testing.expectEqual(waited, pf.host_wait_ns.load(.monotonic));
     // Row 0 now lacks 7.
-    served.engine.prefetch(layer, &.{ 5, 7, 1, 6 }, 2, 2, 2);
+    served.engine.prefetch(layer, &.{ 5, 7, 1, 6 }, &.{ 4, 3, 2, 1 }, 2, 2, 2);
     served.engine.prefetchWait(layer);
     try testing.expectEqual(@as(u64, 2), pf.jobs_queued.load(.monotonic));
     try testing.expectEqual(@as(u64, 2), pf.jobs_run.load(.monotonic));
@@ -1872,6 +1920,45 @@ test "dsv41 prefetch: a layer that cannot be prefetched is not predicted, and th
         try model.finishVerify(armed.m, 1);
     }
     try testing.expectEqual(before, model.prefetch_predicted);
+}
+
+test "dsv41 prefetch: with no credit for one whole expert a round predicts nothing and queues nothing, and the bytes stay (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var plain: StqServed = undefined;
+    try plain.init(dir, .bfloat16, true, true, 3, s);
+    defer plain.deinit();
+    var starved: StqServed = undefined;
+    try starved.init(dir, .bfloat16, true, true, 3, s);
+    defer starved.deinit();
+    try enablePrefetch(&starved, 2, 8, 2);
+    // Demand alone fills the budget: the grant of every round is 0.
+    starved.engine.prefetcher.?.credit = PrefetchCredit.init(65, 1e9, 4);
+    starved.engine.prefetcher.?.credit.refill(std.time.ns_per_s, 1 << 40);
+    const before = model.prefetch_predicted;
+    const a = try model.extend(plain.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try model.extend(starved.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(b);
+    try expectSameBits(&sc, a, b);
+    for ([_]usize{ 5, 3 }) |rows| {
+        const x = try model.verify(plain.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(x);
+        const y = try model.verify(starved.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(y);
+        try expectSameBits(&sc, x, y);
+        try model.finishVerify(plain.m, 1);
+        try model.finishVerify(starved.m, 1);
+    }
+    try testing.expectEqual(before, model.prefetch_predicted);
+    try testing.expectEqual(@as(u64, 0), starved.engine.prefetcher.?.jobs_queued.load(.monotonic));
 }
 
 test "dsv41 prefetch: a model that never started it predicts and queues nothing in verify rounds and gives the bytes of one that did (DSV41_STQ_TINY)" {
