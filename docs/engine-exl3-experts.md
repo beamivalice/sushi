@@ -246,7 +246,9 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   GPU-built window table (`C + E_g` windows from `g * C + base_g`, C = ceil(rows * topk / WIN)). A combine dispatch
   (24 planes at most) joins the planes. N stays compile-time in the NAX body. Prepare, mid and the inverse-indexed
   finish run once over the concatenated scales. Bytes equal the uniform prefill when the groups share one rate. Up to
-  512 experts (one window threadgroup).
+  512 experts (one window threadgroup). The folded DeepSeek chain (`moePrefillSharedFusedEarly`, up to 6 groups) skips the
+  combine: its mid and finish kernels take every group's plane and read a row from the plane of its expert's group
+  (`meta[eid * 8 + 3]`), the bytes the combine copied.
 - **`moeGroups` is the test reference, not a served path**: it decodes every out-of-group slot at local expert 0
   with weight 0, sums each group's slots in f32 and adds the group totals in f32. Its output differs from the
   served path by at most one rounding of the output dtype; a KLD gate judges that.
@@ -538,6 +540,26 @@ the fold leaves of the shared stage is those GEMMs (2.2 to 2.6 ms of a 2048-row 
   die 49 C at boot, GPU lock, one A then one B, A = e7a7571c, B = 73aac2a9's engine, a 32768-token code prompt, one cold
   prefill each): the 2048-row chunk at position 28672 takes 1369.0 ms on A (shared 81.8 + routed 466.7) and 1326.3 ms on B
   (the shared stage is folded into routed, 515.2: 548.5 -> 515.2), prefill 1460.3 -> 1494.1 tok/s (+2.3%), same first token.
+- **Planes read in place** (no combine copy of the gate, up and down planes; bytes equal the combine path at 17 to 2500
+  rows, five groups with a mixed class at 5120/2304 up to 2048 rows): `sushi-ubench run dsv41.shared_prefill`, a7242135 + this change
+  (combine arm = the same kernels fed the combined plane in every slot), ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC,
+  die 49 C at start (87 C at the end), median of 9 interleaved rounds of 16 steps, us:
+
+  | layout, rows | combined | in place | in place / combined |
+  |---|---|---|---|
+  | L2, 2048 | 25279 | 24481 | 0.968 |
+  | L2, 4096 | 44398 | 42535 | 0.958 |
+  | L5, 2048 | 26323 | 25350 | 0.963 |
+  | L5, 4096 | 52961 | 51372 | 0.970 |
+  | L23, 2048 | 26556 | 25360 | 0.955 |
+  | L23, 4096 | 54743 | 52793 | 0.964 |
+
+  0.8 to 1.2 ms off a 2048-row layer; at 512 rows 0.7 to 1.5% (an earlier 7-round run). Not built: the clamped SwiGLU in the gate/up
+  GEMM's epilogue. It would save the f16 gate and up planes' write and read (about 0.45 ms a 2048-row layer, 1.5% of a chunk) but needs two
+  trellis accumulators and a 128-wide Hadamard on one NAX tile, against "the kernel is register/occupancy bound" above.
+  Live (`tests/bench.sh --rungs 4k,8k,16k,32k`, STQ 1.75bpw pair-major pack, default budget, debug log, fans max, GPU lock,
+  `taskpolicy -a`; one boot each, A a7242135, B d989d9ea, about 90 min apart): code prefill windows 8k-32k 1377-1420 -> 1443-1493
+  tok/s, median 2048-row chunk 1483 -> 1407 ms, of which ~40 ms is a shorter SSD fill in B (run-to-run), not this change.
 
 **The trunk GEMM is not a prefill lever.** At 512 rows the sorted trellis GEMM matches MLX's mxfp8 GEMM and comes
 within ~15% of affine-4. Times in µs, trellis GEMM / mxfp8 / affine-4, interleaved:

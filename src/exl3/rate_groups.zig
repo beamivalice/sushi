@@ -1704,7 +1704,15 @@ const PLANE_NAMES = blk: {
     break :blk names;
 };
 
+var combine_launches: usize = 0;
+
+/// Combine chains run so far; a test seam.
+pub fn combineCount() usize {
+    return combine_launches;
+}
+
 fn combine(s: mlx.mlx_stream, planes: []const mlx.mlx_array, sorted: mlx.mlx_array, meta: mlx.mlx_array) !mlx.mlx_array {
+    combine_launches += 1;
     const sh = mlx.getShape(planes[0]);
     var prev: ?mlx.mlx_array = null;
     defer if (prev) |p| {
@@ -1789,14 +1797,33 @@ pub const EarlyPlanes = struct {
     }
 };
 
-/// One projection's GEMM, once per group over the group's own window segment and bank view, combined. `keep` takes a
-/// handle to each group's plane.
-fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, sorted: mlx.mlx_array, w: *const GroupWindows, win: c_int, keep: ?*[max_groups]mlx.mlx_array) !mlx.mlx_array {
-    var planes: [max_groups]mlx.mlx_array = undefined;
-    var made: usize = 0;
-    defer for (planes[0..made]) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
+/// Planes a direct consumer binds: one per rate group, valid on that group's rows only.
+const DIRECT_PLANES: usize = 6;
+
+const GroupPlanes = struct {
+    arr: [max_groups]mlx.mlx_array = undefined,
+    made: usize = 0,
+
+    fn deinit(self: *GroupPlanes) void {
+        for (self.arr[0..self.made]) |a| {
+            _ = mlx.mlx_array_free(a);
+        }
+        self.made = 0;
+    }
+
+    /// The planes padded to `DIRECT_PLANES` by repeating the last, whose cases a consumer never reaches.
+    fn bound(self: *const GroupPlanes) [DIRECT_PLANES]mlx.mlx_array {
+        var out: [DIRECT_PLANES]mlx.mlx_array = undefined;
+        for (&out, 0..) |*o, i| o.* = self.arr[@min(i, self.made - 1)];
+        return out;
+    }
+};
+
+/// One projection's GEMM, once per group over the group's own window segment and bank view. `keep` takes a handle to
+/// each group's plane.
+fn gemmPlanes(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, w: *const GroupWindows, win: c_int, keep: ?*[max_groups]mlx.mlx_array) !GroupPlanes {
+    var planes: GroupPlanes = .{};
+    errdefer planes.deinit();
     for (0..rb.count) |g| {
         const lo: c_int = @as(c_int, @intCast(g)) * w.per_all + @as(c_int, @intCast(rb.base[g]));
         const len = w.per_all + @as(c_int, @intCast(rb.experts_of[g]));
@@ -1808,18 +1835,25 @@ fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize
         try mlx.check(mlx.mlx_slice(&nlives, w.nlives, &[_]c_int{lo}, 1, &[_]c_int{lo + len}, 1, &[_]c_int{1}, 1, s));
         const bank = rb.views[g];
         const trellis = projOf(bank, pi).trellis;
-        planes[made] = try kernels.innerGemmSortedTableOrdered(s, x, trellis, w.local, win, true, .{ .starts = starts, .nlives = nlives, .nwin = len }, if (rb.tile_major) .tile_major else .pack);
+        planes.arr[g] = try kernels.innerGemmSortedTableOrdered(s, x, trellis, w.local, win, true, .{ .starts = starts, .nlives = nlives, .nwin = len }, if (rb.tile_major) .tile_major else .pack);
+        planes.made += 1;
         if (keep) |k| {
             k[g] = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&k[g], planes[made]));
+            try mlx.check(mlx.mlx_array_set(&k[g], planes.arr[g]));
         }
-        made += 1;
     }
-    if (made == 1) {
-        made = 0;
-        return planes[0];
+    return planes;
+}
+
+/// `gemmPlanes` combined into one plane.
+fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, sorted: mlx.mlx_array, w: *const GroupWindows, win: c_int, keep: ?*[max_groups]mlx.mlx_array) !mlx.mlx_array {
+    var planes = try gemmPlanes(s, x, rb, pi, w, win, keep);
+    defer planes.deinit();
+    if (planes.made == 1) {
+        planes.made = 0;
+        return planes.arr[0];
     }
-    return combine(s, planes[0..made], sorted, rb.meta);
+    return combine(s, planes.arr[0..planes.made], sorted, rb.meta);
 }
 
 /// Routed SwiGLU over prefill rows `x` [rows, hidden]: the served prefill chain (token prepare, gate
@@ -1868,6 +1902,30 @@ pub fn moePrefillEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, s
 
 // ---- Prefill with the shared expert riding the routed launches ----
 
+/// Assigns `ptr` the plane `name{pg}`: the first plane, then one override per further group.
+fn planePick(comptime ptr: []const u8, comptime name: []const u8) []const u8 {
+    comptime var out: []const u8 = ptr ++ " = " ++ name ++ "0;\n";
+    inline for (1..DIRECT_PLANES) |i| {
+        const k = std.fmt.comptimePrint("{d}", .{i});
+        out = out ++ "if (pg == " ++ k ++ "u) " ++ ptr ++ " = " ++ name ++ k ++ ";\n";
+    }
+    return out;
+}
+
+fn planeNames(comptime name: []const u8) [DIRECT_PLANES][*:0]const u8 {
+    comptime var out: [DIRECT_PLANES][*:0]const u8 = undefined;
+    inline for (&out, 0..) |*o, i| o.* = std.fmt.comptimePrint("{s}{d}", .{ name, i });
+    return out;
+}
+
+/// `MID_SOURCE` reading the gate and up rows from the plane of the row's rate group (`ig0..`, `iu0..`) instead of a
+/// combined one.
+const MID_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
+    kernels.MID_SOURCE,
+    "const uint eid = uint(slots[slot]);",
+    "const uint eid = uint(slots[slot]);\nconst uint pg = meta[eid * 8u + 3u];\nconst device half *ig;\nconst device half *iu;\n" ++ planePick("ig", "ig") ++ planePick("iu", "iu"),
+);
+
 /// The shared expert's SwiGLU as the forward builds it from the shared linears' bf16 outputs: f32 ops, rounded to bf16
 /// once more before the down projection.
 const SHARED_MID_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
@@ -1905,6 +1963,16 @@ const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.me
     "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));",
     "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
 
+/// `PREFILL_REDUCE_SOURCE` reading a routed row from the plane of its rate group (`inner0..`).
+const PREFILL_REDUCE_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
+    PREFILL_REDUCE_SOURCE,
+    "const device half *rows_in = own ? s_inner : inner;",
+    "const uint pg = own ? 0u : meta[uint(slots[slot]) * 8u + 3u];\nconst device half *inner;\n" ++ planePick("inner", "inner") ++ "const device half *rows_in = own ? s_inner : inner;",
+);
+
+const MID_PLANES_INS = planeNames("ig") ++ planeNames("iu") ++ [_][*:0]const u8{ "svhg", "svhu", "suhd", "slots", "meta" };
+const REDUCE_PLANES_INS = planeNames("inner") ++ [_][*:0]const u8{ "svh", "slots", "sc", "s_inner", "s_svh", "unit", "inverse", "meta" };
+
 const PrefillStage = enum { prep, mid };
 
 /// What shapes a prefill stage's launch: `n` routed slots (`rows * topk`) beside the shared expert's `rows`.
@@ -1940,8 +2008,8 @@ fn prefillParts(alloc: std.mem.Allocator, stage: PrefillStage, g: PrefillGeo) !s
             return .{
                 .a = .{
                     .launch = .{ .tgs = .{ tgs, g.n, 1 }, .threads = 32, .ints = try intArgs(alloc, .{ .{ "ODIM", g.inter }, .{ "CLAMP_LIMIT", g.limit } }), .outs = try outs1(alloc, try halfOut(alloc, g.n, g.inter)) },
-                    .body = kernels.MID_SOURCE,
-                    .ins = &.{ "ig", "iu", "svhg", "svhu", "suhd", "slots" },
+                    .body = MID_PLANES_SOURCE,
+                    .ins = &MID_PLANES_INS,
                     .outs = &.{"yd"},
                 },
                 .b = .{
@@ -1975,7 +2043,7 @@ fn applyPrefillFused(s: mlx.mlx_stream, f: PrefillFused, a: []const mlx.mlx_arra
     defer _ = mlx.mlx_fast_metal_kernel_config_free(f.cfg);
     const grid = mlx.mlx_array_new_data(&f.grid, &[_]c_int{f.grid.len}, 1, .uint32);
     defer _ = mlx.mlx_array_free(grid);
-    var all: [16]mlx.mlx_array = undefined;
+    var all: [32]mlx.mlx_array = undefined;
     @memcpy(all[0..a.len], a);
     @memcpy(all[a.len..][0..b.len], b);
     all[a.len + b.len] = grid;
@@ -2022,7 +2090,7 @@ pub fn moePrefillClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *co
 /// apply, with `early` untouched).
 pub fn moePrefillSharedFusedEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, se: SharedExpert, early: ?*EarlyPlanes) !?mlx.mlx_array {
     if (mlx.mlx_array_dtype(x) != .bfloat16 or topk + 1 > kernels.REDUCE_MAX_TOPK or limit < 0) return null;
-    if (@rem(rb.hidden, 128) != 0 or @rem(rb.inter, 128) != 0 or !sharedServed(se, rb)) return null;
+    if (@rem(rb.hidden, 128) != 0 or @rem(rb.inter, 128) != 0 or !sharedServed(se, rb) or rb.count > DIRECT_PLANES) return null;
     try se.dec.requireTable();
     const routed_dec = kernels.activeDecode();
     const rows = mlx.getShape(x)[0];
@@ -2062,12 +2130,14 @@ pub fn moePrefillSharedFusedEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *cons
     defer for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    const g = try groupedGemm(s, prep_g, rb, 0, sorted, &w, win, if (early) |e| &e.gate else null);
-    defer _ = mlx.mlx_array_free(g);
-    const u = try groupedGemm(s, prep_u, rb, 1, sorted, &w, win, if (early) |e| &e.up else null);
-    defer _ = mlx.mlx_array_free(u);
+    var gp = try gemmPlanes(s, prep_g, rb, 0, &w, win, if (early) |e| &e.gate else null);
+    defer gp.deinit();
+    var up = try gemmPlanes(s, prep_u, rb, 1, &w, win, if (early) |e| &e.up else null);
+    defer up.deinit();
 
-    const mid_ov = try applyPrefillFused(s, try prefillFused(.mid, geo), &.{ g, u, rb.svh[0], rb.svh[1], rb.suh[2], sorted }, &.{ sg, su, se.bank.gate.svh, se.bank.up.svh, se.bank.down.suh }, 2);
+    const gb = gp.bound();
+    const ub = up.bound();
+    const mid_ov = try applyPrefillFused(s, try prefillFused(.mid, geo), &(gb ++ ub ++ [_]mlx.mlx_array{ rb.svh[0], rb.svh[1], rb.suh[2], sorted, rb.meta }), &.{ sg, su, se.bank.gate.svh, se.bank.up.svh, se.bank.down.suh }, 2);
     defer _ = mlx.mlx_vector_array_free(mid_ov);
     const mid = try getOut(mid_ov, 0);
     defer _ = mlx.mlx_array_free(mid);
@@ -2076,9 +2146,9 @@ pub fn moePrefillSharedFusedEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *cons
 
     const sd = try sharedGemm(s, smid, se.bank.down, se.dec, routed_dec, zeros, rows);
     defer _ = mlx.mlx_array_free(sd);
-    const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win, null);
-    defer _ = mlx.mlx_array_free(d);
-    const out = try prefillReduce(s, d, w.inverse, rb, slots, scores, sd, se, rows, topk);
+    var dp = try gemmPlanes(s, mid, rb, 2, &w, win, null);
+    defer dp.deinit();
+    const out = try prefillReduce(s, dp.bound(), w.inverse, rb, slots, scores, sd, se, rows, topk);
     prefill_folded += 1;
     return out;
 }
@@ -2090,7 +2160,7 @@ pub fn prefillFoldedCount() usize {
     return prefill_folded;
 }
 
-fn prefillReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int) !mlx.mlx_array {
+fn prefillReduce(s: mlx.mlx_stream, down: [DIRECT_PLANES]mlx.mlx_array, inverse: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, sdown: mlx.mlx_array, se: SharedExpert, rows: c_int, topk: c_int) !mlx.mlx_array {
     const key: ReduceKey = .{ .hidden = rb.hidden, .rows = rows, .topk = topk };
     const cfg = prefill_reduce_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
@@ -2105,8 +2175,8 @@ fn prefillReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array,
         prefill_reduce_cfgs.put(key, c);
         break :blk c;
     };
-    const kernel = try kernels.getNamedKernel(&prefill_reduce_kernel, "sushi_exl3_prefill_reduce_fused_shared", &.{ "inner", "svh", "slots", "sc", "s_inner", "s_svh", "unit", "inverse" }, &.{"y"}, PREFILL_REDUCE_SOURCE, "");
-    const ov = try kernels.applyOuts(s, kernel, &.{ down, rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore(), inverse }, cfg, 1);
+    const kernel = try kernels.getNamedKernel(&prefill_reduce_kernel, "sushi_exl3_prefill_reduce_fused_shared_planes", &REDUCE_PLANES_INS, &.{"y"}, PREFILL_REDUCE_PLANES_SOURCE, "");
+    const ov = try kernels.applyOuts(s, kernel, &(down ++ [_]mlx.mlx_array{ rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore(), inverse, rb.meta }), cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     return getOut(ov, 0);
 }
@@ -3029,11 +3099,13 @@ fn sharedPrefillCase(t: std.mem.Allocator, s: mlx.mlx_stream, hidden: usize, int
     try std.testing.expect(live > want_bytes.len / 8);
     kernels.setDecodeParams(dec);
     kernels.resetFusedDispatchCount();
+    const combines_before = combineCount();
     const got = (try moePrefillClampedSharedFused(s, xb, &f.rb, f.slots, f.scores, f.topk(), limit, se)) orelse return error.TestUnexpectedResult;
     defer _ = mlx.mlx_array_free(got);
     var cg = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cg);
     const got_bytes = try bytesOf(s, got, &cg);
+    try std.testing.expectEqual(combines_before, combineCount());
     try std.testing.expectEqual(dec, kernels.activeDecode());
     try std.testing.expectEqualSlices(u8, want_bytes, got_bytes);
 }
@@ -3046,7 +3118,7 @@ test "exl3 rate groups: the shared expert riding the prefill launches writes the
     const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 40, 40, 40 }, .{ 32, 26, 24 } };
     const experts = [_]u32{ 20, 12, 16, 8 };
     // 4000 pushes the gate and up past the clamp, 400 stays inside it.
-    for ([_]f32{ 400, 4000 }) |x_scale| for ([_]usize{ 17, 33, 128, 600 }) |rows| try sharedPrefillCase(t.allocator, s, 512, 256, &rates, &experts, rows, 6, x_scale, 0x91 + rows);
+    for ([_]f32{ 400, 4000 }) |x_scale| for ([_]usize{ 17, 33, 128, 600, 2500 }) |rows| try sharedPrefillCase(t.allocator, s, 512, 256, &rates, &experts, rows, 6, x_scale, 0x91 + rows);
 }
 
 test "exl3 rate groups: the shared expert riding the prefill launches at 5120x2304 with 384 experts in five groups, 17 to 2048 rows" {
