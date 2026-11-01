@@ -624,9 +624,11 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   from 108)`. The prefetch adds reads, so where the SSD is the bottleneck it loses. Measured on scratch `5ea5784c` (main
   `0d1aba98`; adaptive DSpark, legacy STQ-1.75bpw pack, greedy md5 equal in every arm, ReleaseFast, `taskpolicy -a`, GPU lock
   a boot, die 49-50 C), prefetch forced off vs on: P2 (rename in a 4129-token file, 800 tokens) -8.5% at 60, -13.7% at 75, -6.7%
-  at 90, a tie at 108; P1 (free prose) +2.6% at 108. At 60 the round is SSD-bound (89 misses x 9.3 MB per 134 ms round), the
-  prefetch adds ~66 reads a pass of which 78% go unused, and its fills evict experts that then miss; at 108 it halves
-  multi-row misses (4.5 to 2.1 a pass). A miss-rate gate (EMA of missed experts a row, off at 8 or more) shipped first and was
+  at 90; P1 (free prose) ties at 75 and 90. At 108, on off off on in one session: P2 102.9 vs 99.1 tok/s (+3.8%, misses
+  0.97 vs 1.29 a token); P1 47.48 vs 46.90 at a matched low-row DSpark mix and 41.74 vs 37.68 / 33.49 at a high-row one.
+  At 60 the round is SSD-bound (89 misses x 9.3 MB per 134 ms round); at 75-90 only ~40% of the prefetched experts are
+  used, its fills evict about as many demand experts as it catches, and its reads cut the demand fill rate ~20%; at 108
+  the cache is roomy enough that those evictions cost a third of what it catches. A miss-rate gate (EMA of missed experts a row, off at 8 or more) shipped first and was
   removed: the budget decides. The "forced R4" numbers above (59.0 to 53.2 ms) are forced 4-row verifies, not the adaptive
   path, which mixes in 1-row rounds where the prefetch never runs. Lost, kept out: one-row prefetch (-4 to -12% at 60, the
   host waits), LOWAGE (reads doubled), CANCEL (never fires), d=2, a wider set; skipping when warm and a cheaper predictor are
