@@ -22,7 +22,7 @@ pub var drop_expert: u16 = 0;
 /// `--ssd-prefetch`: the percent of the SSD's read rate the expert prefetch may spend; null = not given.
 pub var ssd_prefetch: ?u8 = null;
 
-pub const default_ssd_prefetch: u8 = 65;
+pub const default_ssd_prefetch: u8 = 0;
 
 /// The `--ssd-prefetch` value: an integer 0..100, else null.
 pub fn parseSsdPrefetch(value: []const u8) ?u8 {
@@ -3966,7 +3966,7 @@ test "--ssd-prefetch is an integer 0..100, the flag outranks the model setting a
     try t.expectEqual(@as(?u8, 65), parseSsdPrefetch("65"));
     for ([_][]const u8{ "101", "-1", "abc", "", "6.5", "+5", " 5", "1000", "256" }) |bad| try t.expectEqual(@as(?u8, null), parseSsdPrefetch(bad));
     var c = ModelConfig{};
-    try t.expectEqual(@as(u8, 65), c.ssdPrefetchPct());
+    try t.expectEqual(@as(u8, 0), c.ssdPrefetchPct());
     c.ssd_prefetch_override = 30;
     try t.expectEqual(@as(u8, 30), c.ssdPrefetchPct());
     c.ssd_prefetch = 0;

@@ -7,7 +7,7 @@ earlier history is mlx-serve's, in that project's changelog.
 ## Unreleased
 
 - **DeepSeek-V4.1 decode recomputes only the missed picks of a route-spec rebuild**: when a speculated route leaves some experts off the cache map, only those experts run again and join the kept ones in the same order, with byte-identical text.
-- **DeepSeek-V4.1 expert prefetch runs on every streamed load within `--ssd-prefetch` (default 65)**: the expert reads of a route and of the prefetch together stay under that percent of this Mac's measured SSD read rate, so the prefetch no longer slows an SSD-bound budget; `0` turns it off.
+- **DeepSeek-V4.1 expert prefetch is opt-in with `--ssd-prefetch N` (default 0, off; 65 is the tuned cap)**: the expert reads of a route and of the prefetch together stay under that percent of this Mac's measured SSD read rate, so the prefetch never slows an SSD-bound budget.
 - **Streamed experts fill faster with identical output**: a fill's reads are split across the I/O workers by cost per read as well as by bytes, so a run of small scale reads no longer queues behind the last large one.
 - **DeepSeek-V4.1 `/v1/completions` with a text prompt no longer ends at the first token**: the prompt now opens with the model's BOS, as the chat template and a token-id prompt already did.
 - **DeepSeek-V4.1 DSpark drafts from the context when the output copies it**: an echoed file or an edit that leaves most lines alone verifies up to seven copied tokens a round instead of the stage block, with greedy text unchanged. Ported from CommunityServe/plugins #15, thanks @STRML.

@@ -153,10 +153,11 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
   shard plus 1 GiB, and repeating it after an interruption finishes the job.
 - **`--drop-expert n`** (multiple of 8) skips the `n` least-used experts a layer, freeing 2.1–2.5 GB at 8 and 4.3–5.0 GB
   at 16. It is lossy: check it with `sushi kld compare` ([dsv41-arch](dsv41-arch.md#drop-expert)).
-- **`--ssd-prefetch <n>` (0..100, default 65) caps the SSD reads of a streamed DeepSeek load.** At load sushi measures how fast this Mac's SSD
-  reads experts, and the reads a route waits for plus the ones the prefetch makes ahead of it together stay under `n` percent of
-  that rate; the prefetch uses only what the waiting reads leave. `--ssd-prefetch 0` turns the prefetch off. Lower it to leave the
-  SSD to other programs; `ssd_prefetch` in `model-settings.json` sets it per model, and a flag outranks it. Other models refuse the flag.
+- **`--ssd-prefetch <n>` (0..100, default 0 = off) turns on the expert prefetch of a streamed DeepSeek load and caps its SSD reads.**
+  At load sushi measures how fast this Mac's SSD reads experts, and the reads a route waits for plus the ones the prefetch makes
+  ahead of it together stay under `n` percent of that rate; the prefetch uses only what the waiting reads leave. 65 is the tuned
+  cap; it pays on a fast SSD at a mid budget and nothing elsewhere. `ssd_prefetch` in `model-settings.json` sets it per model,
+  and a flag outranks it. Other models refuse the flag.
 - **Refused flags:** `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` and
   `--mtp-greedy-tail` stop the load, since the model has none of those parts ([dsv41-parity](dsv41-parity.md)).
 

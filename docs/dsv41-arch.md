@@ -619,7 +619,9 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   2 workers 55.8 ms, more than 4 nothing). The predictor costs ~0.9 ms a round at R4 (a 7.9 MB f32 gate read a layer). At one
   row it measured 41.0 -> 42.4 tok/s on a cold cache but lost on a warmed one (46.6/49.8 -> 46.0/46.1 on main `d810c50c`), so
   a one-row forward is left alone.
-  Metered by `--ssd-prefetch N` (0..100, default 65; `dsv41_serving.startExpertPrefetch`, decided once at load). At N > 0 on a
+  Off by default (owner call): it paid only at `--ssd-budget-gb 90` on the M5 (+6.6% P2); it ties at 75 and 108, and at 60 demand
+  fills leave it no credit; 65 is the tuned cap to turn it on.
+  Metered by `--ssd-prefetch N` (0..100, default 0; `dsv41_serving.startExpertPrefetch`, decided once at load). At N > 0 on a
   streamed load, before the cache warm, `Engine.probeReadRate` reads random uncached experts through the serving pool, k = 2, 4 and
   8 a layer across the layers for ~50 ms each (~150 ms), restores the caches and counters, and takes the best rate as this Mac's
   maximum; the load logs `[dsv41] expert prefetch on: N% of X.X GB/s (probe k2/k4/k8 a/b/c GB/s)`. N = 0 creates nothing (no probe, hook,
@@ -633,8 +635,8 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   4129-token file, 800 tokens), `--ssd-budget-gb 90`: prefetch off 75.95 / 74.27 tok/s, uncapped 71.32 (-5.0%), a cap of 2 experts a
   layer (the scratch's stand-in for the credit) 80.60 / 79.46 (+6.6%); a read budget at 0.80 of the rate loses, 0.50-0.65 wins; at 108 every arm is within +-2%, at 75 the cap of 2
   ties. The earlier forced on/off numbers (60: -8.5%, 75: -13.7%, 90: -6.7%, 108: +3.8% for P2) were uncapped. Probe on that box:
-  k=8 reads 9.3-9.7 GB/s (k=2 about 9.2, k=1 7.3-7.9), which the default 65 was calibrated against. The shipped credit, code `adb62d21`
-  (same pack, adaptive DSpark, default `--ssd-prefetch 65`, ReleaseFast, `taskpolicy -a`, GPU lock, fans max, one boot each, greedy md5 equal
+  k=8 reads 9.3-9.7 GB/s (k=2 about 9.2, k=1 7.3-7.9), which the cap 65 was calibrated against. The shipped credit, code `adb62d21`
+  (same pack, adaptive DSpark, `--ssd-prefetch 65`, then the default, ReleaseFast, `taskpolicy -a`, GPU lock, fans max, one boot each, greedy md5 equal
   to the scratch runs): at `--ssd-budget-gb 90` the probe read 8.9 / 8.8 / 9.2 GB/s at k=2 / 4 / 8 (65% of 9.2), P1 35.32 and P2 79.25 tok/s
   (rows a forward 1.09 / 7.28; prefetch 509 jobs, 635 experts read and 1602 skipped for lack of credit by the end of P2); at 60 the probe read
   8.7 / 9.0 / 9.1 (die 57 C at the start), P1 28.37 and P2 37.97 tok/s, only 141 jobs queued over P2's ~110 rounds because demand fills

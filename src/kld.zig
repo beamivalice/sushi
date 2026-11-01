@@ -236,7 +236,7 @@ pub const USAGE =
     \\  --drop-expert <n>     compare only, DeepSeek-V4.1 only: drop the n least-used routed experts of every layer by
     \\                        the pack's expert_usage.json (a multiple of 8; 0 = off). The teacher is never pruned.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
-    \\  --ssd-prefetch <n>    streamed-expert prefetch read cap: percent (0..100, default 65) of the SSD read rate; 0 = no prefetch
+    \\  --ssd-prefetch <n>    streamed-expert prefetch read cap: percent (0..100, default 0) of the SSD read rate; 0 = no prefetch
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)

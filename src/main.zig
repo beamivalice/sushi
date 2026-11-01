@@ -345,13 +345,13 @@ fn printUsage(io: std.Io) void {
         \\                        TOTAL resident target of <n> GiB; the expert
         \\                        cache is what is left after the trunk, the
         \\                        prefill union and the fill buffers.
-        \\  --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 65).
+        \\  --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 0, off).
         \\                        The share, in percent (0..100), of this Mac's SSD
         \\                        read rate (measured at load) that the expert
         \\                        reads of a streamed load may use, the reads a
         \\                        route waits for and the prefetch's together.
-        \\                        0 = no prefetch; lower it to leave the SSD to
-        \\                        other programs.
+        \\                        0 = no prefetch; 65 is the tuned cap on a fast
+        \\                        SSD; lower it to leave the SSD to other programs.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model

@@ -2201,13 +2201,13 @@ fn prefetchAt(dir: []const u8, budget_gb: u64, pct: ?u8, cache_bytes: u64) !bool
     return on;
 }
 
-test "dsv41 prefetch: --ssd-prefetch 0 creates no prefetch machinery, any other value does on a streamed load at any budget (DSV41_STQ_TINY)" {
+test "dsv41 prefetch: --ssd-prefetch 0 and the default create no prefetch machinery, any other value does on a streamed load at any budget (DSV41_STQ_TINY)" {
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const streamed: u64 = 3 << 19;
     for ([_]u64{ 1, 107, 108 }) |budget| {
         try testing.expect(!try prefetchAt(dir, budget, 0, streamed));
         try testing.expect(try prefetchAt(dir, budget, 65, streamed));
-        try testing.expect(try prefetchAt(dir, budget, null, streamed));
+        try testing.expect(!try prefetchAt(dir, budget, null, streamed));
     }
     try testing.expect(try prefetchAt(dir, 1, 1, streamed));
     try testing.expect(!try prefetchAt(dir, 108, 65, 64 << 20));

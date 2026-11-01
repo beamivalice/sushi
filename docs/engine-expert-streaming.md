@@ -218,7 +218,7 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   returns (`specGrouped`, `prepareHost*`, `swapGroupedMisses`, `borrowLayer`, `restoreLayer` call it, `warmCache` and
   `deinit` drain the thread); only layers `d >= 2` ahead are targeted, so no queued chain reads a slot the job writes;
   the prefetch pool has its own fill workers (inside `BOUNCE_BYTES`, so no new bill; with `--ssd-prefetch 0` or a resident load it is never created and its share stays billed); it changes what is cached, never
-  the arithmetic. The prefetch exists on every streamed load with `--ssd-prefetch` above 0 (default 65; `startExpertPrefetch`, decided at load; at 0 no probe, thread, pool or bounce buffer is created, [dsv41-arch](dsv41-arch.md#stq)).
+  the arithmetic. The prefetch exists on every streamed load with `--ssd-prefetch` above 0 (default 0, off; `startExpertPrefetch`, decided at load; at 0 no probe, thread, pool or bounce buffer is created, [dsv41-arch](dsv41-arch.md#stq)).
   Its reads are metered (`prefetch_plan.PrefetchCredit`): `Engine.finishForward` refills a credit from the forward's wall time and its demand fill bytes
   only (`pct x max read rate x wall - demand`, the leftover carried at most one round's grant), each job spends its share of the grant (a round's grant over the
   layers a prediction can target) plus what earlier jobs left, and a read is one whole expert or none. A job ranks the distinct experts its rows want
