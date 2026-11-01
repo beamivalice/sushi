@@ -2179,3 +2179,28 @@ test "dsv41 DSpark: on the real pack each row of a wide verify is the bits of it
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+fn prefetchAtBudget(dir: []const u8, budget_gb: u64) !bool {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_ssd_budget_bytes = budget_gb << 30;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    const on = xfm.expert_stream.?.prefetcher != null;
+    try testing.expectEqual(on, xfm.dsv41.?.prefetch_lead_rows != 0);
+    return on;
+}
+
+test "dsv41 prefetch: a load starts the prefetch machinery from a 108 GB budget and not below (DSV41_STQ_TINY)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    try testing.expect(!try prefetchAtBudget(dir, 107));
+    try testing.expect(try prefetchAtBudget(dir, 108));
+}

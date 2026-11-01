@@ -20,6 +20,14 @@ const ForwardCtx = trf.ForwardCtx;
 const Transformer = trf.Transformer;
 const initModuleShell = trf.initModuleShell;
 
+/// Below this SSD budget the prefetch's extra reads compete with the misses for the SSD and lose or tie.
+const prefetch_min_budget: u64 = 108 << 30;
+
+/// Whether the expert prefetch runs for an `--ssd-budget-gb` of `budget_bytes` (0 on a resident load).
+pub fn prefetchOn(budget_bytes: u64) bool {
+    return budget_bytes >= prefetch_min_budget;
+}
+
 pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
     const stq = config.dsv41.?.expert_dec != null;
     if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
@@ -53,9 +61,15 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg };
         mdl.experts = .{ .hook = experts.hook() };
         shell.dsv41_stq_experts = experts;
-        if (engine.startPrefetch()) {
-            mdl.prefetch_lead_rows = 3;
-        } else |e| log.warn("[dsv41] expert prefetch off: {s}\n", .{@errorName(e)});
+        const budget_gb = config.expert_ssd_budget_bytes >> 30;
+        var prefetching = false;
+        if (prefetchOn(config.expert_ssd_budget_bytes)) {
+            if (engine.startPrefetch()) {
+                mdl.prefetch_lead_rows = 3;
+                prefetching = true;
+            } else |e| log.warn("[dsv41] expert prefetch off: {s}\n", .{@errorName(e)});
+        }
+        log.info("[dsv41] expert prefetch {s} (ssd budget {d} GB, on from {d})\n", .{ if (prefetching) "on" else "off", budget_gb, prefetch_min_budget >> 30 });
     } else {
         const experts = try allocator.create(dsv41_stream.Stream);
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };
@@ -122,22 +136,12 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
     defer m.defer_head = false;
     const last = if (lazy) try dsv41_model.extendLazy(m, flat, &one) else try dsv41_model.extendAhead(m, host, .last, dsv41_model.SPAN, vision, ahead);
     defer _ = mlx.mlx_array_free(last);
-    if (self.expert_stream) |engine| observeMisses(m, engine, n);
+    if (self.expert_stream) |engine| engine.finishForward(n);
     ctx.cache.step = st.n;
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, self.s));
     return out;
-}
-
-/// Ends the engine's forward and feeds its distinct missed experts to the prefetch gate.
-fn observeMisses(m: *dsv41_model.Model, engine: *expert_stream_mod.Engine, rows: usize) void {
-    engine.finishForward(rows);
-    const last = engine.breakdown();
-    const was = m.prefetch_gate.on();
-    m.prefetch_gate.observe(rows, last.union_members - last.hits);
-    if (was != m.prefetch_gate.on())
-        log.info("[dsv41] expert prefetch {s} (misses/row ema {d:.1})\n", .{ if (was) "off" else "on", m.prefetch_gate.ema });
 }
 
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
@@ -160,7 +164,7 @@ pub fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !
     }
     const all = try dsv41_model.verify(m, ids);
     defer _ = mlx.mlx_array_free(all);
-    if (self.expert_stream) |engine| observeMisses(m, engine, ids.len);
+    if (self.expert_stream) |engine| engine.finishForward(ids.len);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, all, &[_]c_int{ 1, @intCast(ids.len), @intCast(m.cfg.vocab) }, 3, self.s));
@@ -184,4 +188,11 @@ test "tailUnread: a chunk is state only when no point is taken and the next chun
     try t.expect(tailUnread(128, 2048, 129, false));
     try t.expect(!tailUnread(128, 128, 2048, false));
     try t.expect(!tailUnread(0, 2048, 2048, false));
+}
+
+test "dsv41 prefetch: it is on from a 108 GB budget and off below it or on a resident load" {
+    try std.testing.expect(!prefetchOn(0));
+    try std.testing.expect(!prefetchOn((108 << 30) - 1));
+    try std.testing.expect(prefetchOn(108 << 30));
+    try std.testing.expect(prefetchOn(120 << 30));
 }

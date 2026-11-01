@@ -1874,7 +1874,7 @@ test "dsv41 prefetch: a layer that cannot be prefetched is not predicted, and th
     try testing.expectEqual(before, model.prefetch_predicted);
 }
 
-test "dsv41 prefetch: with the miss gate off, verify rounds predict and queue nothing and give the plain model's bytes (DSV41_STQ_TINY)" {
+test "dsv41 prefetch: a model that never started it predicts and queues nothing in verify rounds and gives the bytes of one that did (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
@@ -1884,31 +1884,31 @@ test "dsv41 prefetch: with the miss gate off, verify rounds predict and queue no
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
-    var plain: StqServed = undefined;
-    try plain.init(dir, .bfloat16, true, true, 3, s);
-    defer plain.deinit();
-    var armed: StqServed = undefined;
-    try armed.init(dir, .bfloat16, true, true, 3, s);
-    defer armed.deinit();
-    try enablePrefetch(&armed, 2, 8, 2);
-    armed.m.prefetch_gate.ema = 100;
-    const a = try model.extend(plain.m, ids[0..20], .last);
+    var off: StqServed = undefined;
+    try off.init(dir, .bfloat16, true, true, 3, s);
+    defer off.deinit();
+    var on: StqServed = undefined;
+    try on.init(dir, .bfloat16, true, true, 3, s);
+    defer on.deinit();
+    try enablePrefetch(&on, 2, 8, 2);
+    const a = try model.extend(off.m, ids[0..20], .last);
     defer _ = mlx.mlx_array_free(a);
-    const b = try model.extend(armed.m, ids[0..20], .last);
+    const b = try model.extend(on.m, ids[0..20], .last);
     defer _ = mlx.mlx_array_free(b);
     try expectSameBits(&sc, a, b);
-    const before = model.prefetch_predicted;
     for ([_]usize{ 5, 3 }) |rows| {
-        const x = try model.verify(plain.m, ids[20..][0..rows]);
+        const before = model.prefetch_predicted;
+        const x = try model.verify(off.m, ids[20..][0..rows]);
         defer _ = mlx.mlx_array_free(x);
-        const y = try model.verify(armed.m, ids[20..][0..rows]);
+        try testing.expectEqual(before, model.prefetch_predicted);
+        const y = try model.verify(on.m, ids[20..][0..rows]);
         defer _ = mlx.mlx_array_free(y);
+        try testing.expect(model.prefetch_predicted > before);
         try expectSameBits(&sc, x, y);
-        try model.finishVerify(plain.m, 1);
-        try model.finishVerify(armed.m, 1);
+        try model.finishVerify(off.m, 1);
+        try model.finishVerify(on.m, 1);
     }
-    try testing.expectEqual(before, model.prefetch_predicted);
-    try testing.expectEqual(@as(u64, 0), armed.engine.prefetcher.?.jobs_queued.load(.monotonic));
+    try testing.expect(off.engine.prefetcher == null);
 }
 
 test "dsv41 drop: the STQ pack with experts dropped gives the logits of the full pools under the same router mask, bit for bit, and never reads or caches a dropped expert (DSV41_STQ_TINY)" {
