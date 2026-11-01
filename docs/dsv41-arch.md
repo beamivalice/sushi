@@ -281,6 +281,10 @@ Prefill width:
   MiB to serve) advertises 974848 (1M raw, less the auto margin) where the whole-scores bill advertised ~740k. With the
   borrow, budget 117 still advertises it on wired 124000 ([borrow](dsv41-memory.md#borrow)).
 - An explicit `--prefill-chunk` outranks both.
+- A wider chunk does not pay on an STQ pack: the GPU time of a prompt row is flat in the width (a7242135, `sushi bench`
+  4k-32k, one boot each, `--drop-expert 128 --ssd-budget-gb 108` resident: 623 / 628 / 641 ms per 1k rows at 2048 / 4096 / 8192,
+  code windows within 3%), since the routed trellis GEMM is bound per row, not by its weight decode (wider windows lose, [engine-exl3-experts](engine-exl3-experts.md)). Streamed at
+  the default budget, 4096 rows peak at 118.8 GB of 128 and the first chunk of a boot took 17-22 s against 1.7 s at 2048.
 
 Other pieces:
 - A wide chunk's Engram rows are read ahead on a host thread over the whole chunk (`prefetchEngram`). They are
@@ -325,6 +329,9 @@ After CED and the fused gather-attention (budget 96, chunk 1024, synced stage pr
   expert is read and run once per 2048 rows.
 - A layer-ahead read of the next layer's experts (its router on this layer's rows) guessed ~28% of what it read and
   ~24% of the picks; a cold novel 10k prompt ran 294 tok/s without it and 296 with it, so it was cut.
+- A same-layer read-ahead (the layer's router on the stream before attention, its predicted misses read during attention)
+  named 85% of the missed bytes but read 2.5x the fill bytes; live 4k-32k code prefill ran 1-7% slower (on 61daded0, pair-major
+  STQ, default budget, one boot each; the fill fell 202 -> 158 ms a 2048-row chunk, the GPU tail rose 601 -> 749), so it was not merged.
 
 <a id="oracle"></a>
 ## Oracle and what is proven
