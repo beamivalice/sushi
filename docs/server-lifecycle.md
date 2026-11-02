@@ -139,9 +139,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
-- **The prefix cache's tiers are launch flags only** (no `model-settings.json` key): RAM retention is off unless
+- **Server-wide keys live under the file's `"server"` object** (a model's key is its absolute path, so they never meet):
+  `prefix_cache_disk_gb` (the SSD tier's size, 0 = off) and `models_dir` (the discovery folder when no `--model-dir` is
+  given, else `~/.sushi/models`). The order is the same: `--prefix-cache-disk` / `--model-dir` outrank the file, which
+  outranks the default; a file value counts as the operator's own number (no formula sizing). `main.zig` records which
+  flags were given (`model_settings.launch_locks`), and `GET /v1/settings` reports those keys locked. The web UI edits the
+  file through `POST /v1/settings` (validated, temp file + rename, [server-http-apis](server-http-apis.md#ssd-prefix-cache-and-settings-v1prefix-cache-v1settings));
+  `model_settings.model_keys` is the one list of editable per-model keys. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
+- **The prefix cache's other tiers are launch flags only**: RAM retention is off unless
   `--prefix-cache-mem` is given with a size (`off` or `0` keeps it off), and the SSD tier is on unless `--prefix-cache-disk 0`
-  or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)).
+  or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)); its size alone has the
+  `server.prefix_cache_disk_gb` key.
 - A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
   cold loads, and logs its resolved value with its source at load.
 - Load-time context bills see explicit KV and MTP choices before `Scheduler.init` returns, including `--no-mtp`.

@@ -267,6 +267,213 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     return o;
 }
 
+// ── Editing ──
+
+/// One editable per-model key. Every key is stamped at load, so a change reaches a loaded model at its next load.
+pub const KeySpec = struct {
+    name: []const u8,
+    kind: enum { int, bool, number, choice },
+    min: f64 = 0,
+    max: f64 = 0,
+    choices: []const []const u8 = &.{},
+};
+
+pub const model_keys = [_]KeySpec{
+    .{ .name = "ctx_size", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
+    .{ .name = "kv_quant", .kind = .choice, .choices = &.{ "off", "4", "6", "8" } },
+    .{ .name = "mtp", .kind = .bool },
+    .{ .name = "mtp_acceptance", .kind = .choice, .choices = &.{ "exact", "typical", "tokenv3" } },
+    .{ .name = "mtp_greedy_tail", .kind = .bool },
+    .{ .name = "ssd_budget_gb", .kind = .int, .min = 1, .max = 512 },
+    .{ .name = "ssd_prefetch", .kind = .int, .min = 0, .max = 100 },
+    .{ .name = "preserve_thinking", .kind = .bool },
+    .{ .name = "think_penalty", .kind = .number, .min = 0, .max = think_penalty_max },
+    .{ .name = "vision", .kind = .bool },
+};
+
+/// Server-wide keys, under the file's `"server"` object (a model's key is its absolute path, so the two never meet).
+pub const server_keys = [_]KeySpec{
+    .{ .name = "models_dir", .kind = .choice },
+    .{ .name = "prefix_cache_disk_gb", .kind = .int, .min = 0, .max = 1 << 20 },
+};
+
+pub const server_section = "server";
+
+pub const EditError = error{ UnknownSetting, InvalidSetting };
+
+pub fn findKey(specs: []const KeySpec, name: []const u8) ?KeySpec {
+    for (specs) |k| if (std.mem.eql(u8, k.name, name)) return k;
+    return null;
+}
+
+/// Is `v` a value the key takes? A `choice` with no list (models_dir) takes an absolute path.
+pub fn validate(spec: KeySpec, v: std.json.Value) EditError!void {
+    switch (spec.kind) {
+        .bool => if (v != .bool) return error.InvalidSetting,
+        .int => switch (v) {
+            .integer => |i| if (@as(f64, @floatFromInt(i)) < spec.min or @as(f64, @floatFromInt(i)) > spec.max) return error.InvalidSetting,
+            else => return error.InvalidSetting,
+        },
+        .number => {
+            const x: f64 = switch (v) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| f,
+                else => return error.InvalidSetting,
+            };
+            if (!(x >= spec.min and x <= spec.max)) return error.InvalidSetting;
+        },
+        .choice => {
+            const text: []const u8 = switch (v) {
+                .string => |t| t,
+                .integer => |i| switch (i) {
+                    0 => "off",
+                    4 => "4",
+                    6 => "6",
+                    8 => "8",
+                    else => return error.InvalidSetting,
+                },
+                else => return error.InvalidSetting,
+            };
+            if (spec.choices.len == 0) {
+                if (text.len == 0 or text.len > std.fs.max_path_bytes or !std.fs.path.isAbsolute(text)) return error.InvalidSetting;
+                return;
+            }
+            for (spec.choices) |c| if (std.mem.eql(u8, c, text)) return;
+            return error.InvalidSetting;
+        },
+    }
+}
+
+pub const Edit = struct {
+    key: []const u8,
+    /// Null removes the key.
+    value: ?std.json.Value,
+};
+
+var write_mu: std.Io.Mutex = .init;
+
+/// Applies `edits` to the object keyed `section` (a model path, or `server_section`) and rewrites the file through a
+/// temp file and a rename. Keys and sections it does not touch are kept as they are; an emptied section goes.
+pub fn writeEdits(alloc: std.mem.Allocator, io: std.Io, path: []const u8, section: []const u8, edits: []const Edit) !void {
+    write_mu.lockUncancelable(io);
+    defer write_mu.unlock(io);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    var root: std.json.ObjectMap = .empty;
+    if (existing) |body| {
+        const tree = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return error.MalformedSettingsFile;
+        if (tree != .object) return error.MalformedSettingsFile;
+        root = tree.object;
+    }
+    var sec: std.json.ObjectMap = if (root.get(section)) |v| (if (v == .object) v.object else .empty) else .empty;
+    for (edits) |e| {
+        if (e.value) |v| {
+            try sec.put(arena, try arena.dupe(u8, e.key), v);
+        } else {
+            _ = sec.orderedRemove(e.key);
+        }
+    }
+    if (sec.count() == 0) {
+        _ = root.orderedRemove(section);
+    } else {
+        try root.put(arena, try arena.dupe(u8, section), .{ .object = sec });
+    }
+    const out = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
+
+    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp{d}", .{ path, std.c.getpid() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = out });
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try std.Io.Dir.renameAbsolute(tmp, path, io);
+}
+
+pub const Server = struct {
+    models_dir: ?[]const u8 = null,
+    prefix_cache_disk_gb: ?u32 = null,
+};
+
+/// The file's `"server"` section. `models_dir` borrows from `self`.
+pub fn server(self: *const Settings) Server {
+    const p = self.parsed orelse return .{};
+    const root = switch (p.value) {
+        .object => |o| o,
+        else => return .{},
+    };
+    const sec = switch (root.get(server_section) orelse return .{}) {
+        .object => |o| o,
+        else => return .{},
+    };
+    var out: Server = .{};
+    if (sec.get("models_dir")) |v| if (v == .string and std.fs.path.isAbsolute(v.string)) {
+        out.models_dir = v.string;
+    };
+    if (sec.get("prefix_cache_disk_gb")) |v| if (v == .integer and v.integer >= 0 and v.integer <= server_keys[1].max) {
+        out.prefix_cache_disk_gb = @intCast(v.integer);
+    };
+    return out;
+}
+
+/// The raw per-model object (for the editor), or null.
+pub fn modelObject(self: *const Settings, model_path: []const u8) ?std.json.ObjectMap {
+    const p = self.parsed orelse return null;
+    const root = switch (p.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const want = trimSlash(model_path);
+    var it = root.iterator();
+    while (it.next()) |kv| {
+        if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) continue;
+        return switch (kv.value_ptr.*) {
+            .object => |o| o,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// A launch flag that pins a key: set by `main.zig` once the arguments are parsed, read by the settings API.
+pub const Lock = struct {
+    set: bool = false,
+    buf: [32]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn pin(self: *Lock, comptime fmt: []const u8, args: anytype) void {
+        self.set = true;
+        self.len = 0;
+        const printed = std.fmt.bufPrint(&self.buf, fmt, args) catch return;
+        self.len = @intCast(printed.len);
+    }
+
+    pub fn text(self: *const Lock) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+pub const LaunchLocks = struct {
+    models: [model_keys.len]Lock = @splat(.{}),
+    models_dir: Lock = .{},
+    prefix_cache_disk_gb: Lock = .{},
+
+    pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
+        for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
+        return null;
+    }
+
+    pub fn modelMut(self: *LaunchLocks, name: []const u8) *Lock {
+        for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
+        unreachable;
+    }
+};
+
+pub var launch_locks: LaunchLocks = .{};
+
 test "model_settings: parse + lookup with and without trailing slash" {
     var s = try parse(std.testing.allocator,
         \\{"/m/a/": {"ctx_size": 65536, "kv_quant": "8", "mtp": false}, "/m/b": {"kv_quant": 4}, "/m/c": {"kv_quant": "6"}}
@@ -450,4 +657,78 @@ test "model_settings: vision is a bool, anything else is unset" {
     try std.testing.expect(!s.lookup("/m/a").isEmpty());
     try std.testing.expectEqual(@as(?bool, false), s.lookup("/m/b").vision);
     try std.testing.expect(s.lookup("/m/c").isEmpty());
+}
+
+test "model_settings: validate takes the values the loader reads and names the rest" {
+    const t = std.testing;
+    const ok = [_]struct { k: []const u8, v: std.json.Value }{
+        .{ .k = "ctx_size", .v = .{ .integer = 32768 } },
+        .{ .k = "kv_quant", .v = .{ .string = "8" } },
+        .{ .k = "kv_quant", .v = .{ .integer = 0 } },
+        .{ .k = "mtp", .v = .{ .bool = false } },
+        .{ .k = "mtp_acceptance", .v = .{ .string = "typical" } },
+        .{ .k = "ssd_prefetch", .v = .{ .integer = 0 } },
+        .{ .k = "think_penalty", .v = .{ .integer = 2 } },
+        .{ .k = "think_penalty", .v = .{ .float = 0.5 } },
+    };
+    for (ok) |c| try validate(findKey(&model_keys, c.k).?, c.v);
+    const bad = [_]struct { k: []const u8, v: std.json.Value }{
+        .{ .k = "ctx_size", .v = .{ .integer = 0 } },
+        .{ .k = "kv_quant", .v = .{ .string = "5" } },
+        .{ .k = "mtp", .v = .{ .string = "on" } },
+        .{ .k = "mtp_acceptance", .v = .{ .string = "fast" } },
+        .{ .k = "ssd_budget_gb", .v = .{ .integer = 513 } },
+        .{ .k = "ssd_prefetch", .v = .{ .integer = 101 } },
+        .{ .k = "think_penalty", .v = .{ .float = 20.5 } },
+        .{ .k = "vision", .v = .{ .integer = 1 } },
+    };
+    for (bad) |c| try t.expectError(error.InvalidSetting, validate(findKey(&model_keys, c.k).?, c.v));
+    try t.expect(findKey(&model_keys, "logit_bias_file") == null);
+    try validate(findKey(&server_keys, "models_dir").?, .{ .string = "/Users/x/models" });
+    try t.expectError(error.InvalidSetting, validate(findKey(&server_keys, "models_dir").?, .{ .string = "models" }));
+    try t.expectError(error.InvalidSetting, validate(findKey(&server_keys, "prefix_cache_disk_gb").?, .{ .integer = -1 }));
+}
+
+test "model_settings: writeEdits keeps what it does not touch, round-trips through lookup, and removes an emptied section" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/sub/model-settings.json", .{dir});
+
+    try writeEdits(t.allocator, io, path, "/m/a", &.{
+        .{ .key = "kv_quant", .value = .{ .string = "4" } },
+        .{ .key = "mtp", .value = .{ .bool = false } },
+    });
+    try writeEdits(t.allocator, io, path, server_section, &.{
+        .{ .key = "prefix_cache_disk_gb", .value = .{ .integer = 40 } },
+        .{ .key = "models_dir", .value = .{ .string = "/models" } },
+    });
+    try writeEdits(t.allocator, io, path, "/m/a", &.{.{ .key = "ctx_size", .value = .{ .integer = 8192 } }});
+    {
+        var s = load(t.allocator, io, path);
+        defer s.deinit();
+        const o = s.lookup("/m/a");
+        try t.expectEqual(@as(?u32, 8192), o.ctx_size);
+        try t.expectEqual(@as(?bool, false), o.mtp);
+        try t.expectEqualStrings("4", o.kv_quant.?.wireName());
+        try t.expectEqual(@as(?u32, 40), server(&s).prefix_cache_disk_gb);
+        try t.expectEqualStrings("/models", server(&s).models_dir.?);
+    }
+    try writeEdits(t.allocator, io, path, "/m/a", &.{
+        .{ .key = "kv_quant", .value = null },
+        .{ .key = "mtp", .value = null },
+        .{ .key = "ctx_size", .value = null },
+    });
+    var s = load(t.allocator, io, path);
+    defer s.deinit();
+    try t.expect(s.lookup("/m/a").isEmpty());
+    try t.expect(modelObject(&s, "/m/a") == null);
+    try t.expectEqual(@as(?u32, 40), server(&s).prefix_cache_disk_gb);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/model-settings.json", .data = "[1,2" });
+    try t.expectError(error.MalformedSettingsFile, writeEdits(t.allocator, io, path, "/m/a", &.{.{ .key = "mtp", .value = .{ .bool = true } }}));
 }

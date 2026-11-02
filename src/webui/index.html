@@ -684,7 +684,47 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 #viewNav a:hover { color: var(--text); text-decoration: none; }
 #viewNav a[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
 /* Hidden by visibility, not display or removal: the chat keeps its layout, scroll offset and running stream. */
-#appMain[data-view="dashboard"] #chatPanel { visibility: hidden; pointer-events: none; }
+#appMain[data-view="dashboard"] #chatPanel,
+#appMain[data-view="settings"] #chatPanel,
+#appMain[data-view="models"] #chatPanel { visibility: hidden; pointer-events: none; }
+body[data-mode="compact"] .adv { display: none !important; }
+body[data-mode="advanced"] .cmp { display: none !important; }
+#dashPanel .tiles-cmp { grid-template-columns: repeat(2, 1fr); }
+@media (min-width: 900px) { #dashPanel .tiles-cmp { grid-template-columns: repeat(3, 1fr); } }
+#dashPanel .tiles-cmp .tile .v { font-size: 30px; overflow-wrap: anywhere; }
+#modeToggle { font-size: 12.5px; }
+.adminPanel { position: absolute; inset: 0; overflow: auto; background: var(--bg); color: var(--text); font-size: 13px; }
+.adminPanel[hidden] { display: none; }
+.adminPanel .a-head { padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 2; }
+.adminPanel h1 { font-size: 17px; margin: 0; }
+.adminPanel .a-sub { color: var(--text-2); margin-top: 2px; }
+.adminPanel .a-main { padding: 14px 20px 28px; display: grid; gap: 14px; max-width: 1100px; margin: 0 auto; }
+.adminPanel .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.adminPanel .card h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.adminPanel .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-variant-numeric: tabular-nums; }
+.adminPanel .kv > :nth-child(odd) { color: var(--text-2); }
+.adminPanel .muted { color: var(--text-2); }
+.adminPanel .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.adminPanel .row input[type="text"], .adminPanel .row input[type="number"] { width: auto; flex: 1 1 260px; max-width: 460px; padding: 5px 8px; border-radius: 6px; font-size: 13px; }
+.adminPanel .row input[type="number"] { flex: 0 0 120px; }
+.adminPanel .note { color: var(--text-2); margin-top: 6px; line-height: 1.4; }
+.adminPanel .result { margin-top: 8px; min-height: 18px; }
+.adminPanel .result.err { color: var(--err); }
+.adminPanel table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.adminPanel th, .adminPanel td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.adminPanel th { color: var(--text-2); font-weight: 500; font-size: 12px; }
+.adminPanel td.num, .adminPanel th.num { text-align: right; }
+.adminPanel .tablewrap { overflow-x: auto; }
+.adminPanel .chip { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; border: 1px solid var(--border-strong); color: var(--text-2); }
+.adminPanel .chip.ready { background: var(--ok-soft, transparent); color: var(--ok, var(--text)); border-color: var(--ok, var(--border-strong)); }
+.adminPanel .chip.flag { color: var(--err); border-color: var(--err); }
+.adminPanel .chip.file { color: var(--accent-2); border-color: var(--accent-2); }
+.adminPanel select, .adminPanel input.val { width: auto; min-width: 120px; padding: 4px 28px 4px 8px; border-radius: 6px; font-size: 13px; }
+.adminPanel input.val { padding-right: 8px; }
+.adminPanel .mhead { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.adminPanel .mname { font-size: 14px; font-weight: 600; }
+.adminPanel details > summary { cursor: pointer; margin-top: 10px; color: var(--text-2); }
+.adminPanel .extra:empty { display: none; }
 #dashPanel {
   --d-bg: var(--bg); --d-panel: var(--surface); --d-ink: var(--text); --d-muted: var(--text-2); --d-line: var(--border); --d-grid: var(--surface-2); --d-accent: var(--accent);
   --d-c1: #d9480f; --d-c2: #1971c2; --d-c3: #2f9e44; --d-c4: #7048e8; --d-ok: #2f9e44; --d-warn: #e8590c; --d-bad: #c92a2a;
@@ -866,10 +906,13 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   <nav id="viewNav" aria-label="Views">
     <a id="navChat" href="/chat" aria-current="page">Chat</a>
     <a id="navDashboard" href="/dashboard">Dashboard</a>
+    <a id="navModels" href="/models">Models</a>
+    <a id="navSettings" href="/settings">Settings</a>
   </nav>
   <span class="spacer"></span>
   <div class="topbar-actions">
     <span id="serverDot" title="Server status"><span class="dot" id="serverDotLight"></span><span class="lbl" id="serverDotLabel">Checking…</span></span>
+    <button class="btn small ghost" id="modeToggle" type="button" title="Compact shows the essentials; Advanced shows every detail"></button>
     <button class="icon-btn" id="forgetKeyButton" title="Forget the API key" aria-label="Forget the API key" hidden><svg><use href="#i-key"/></svg></button>
     <button class="icon-btn" id="themeToggle" title="Theme" aria-label="Toggle theme"><svg id="themeToggleIcon"><use href="#i-auto"/></svg></button>
   </div>
@@ -980,7 +1023,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   <div class="d-head">
     <h1><span class="d-dot" id="dashDot"></span>Monitor<span class="d-ver" id="dashVer"></span></h1>
     <div class="controls">
-      <label>Every <select id="dashInterval">
+      <label class="adv">Every <select id="dashInterval">
         <option value="2000" selected>2 s</option><option value="3000">3 s</option>
         <option value="5000">5 s</option><option value="10000">10 s</option></select></label>
       <label>Window <select id="dashWindow">
@@ -994,7 +1037,20 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     <button id="dashEnableMetrics" type="button" hidden>Enable metrics</button>
   </div>
   <div class="d-main">
-  <section class="tiles">
+  <section class="cmp tiles tiles-cmp">
+    <div class="tile"><div class="k">Model</div><div class="v" id="dashCmModel">-</div><div class="s" id="dashCmModelS">&nbsp;</div></div>
+    <div class="tile"><div class="k">Decode</div><div class="v" id="dashCmGen">-</div><div class="s">tokens per second</div></div>
+    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashCmPre">-</div><div class="s">tokens per second</div></div>
+    <div class="tile"><div class="k">Memory</div><div class="v" id="dashCmMem">-</div><div class="s" id="dashCmMemS">&nbsp;</div></div>
+    <div class="tile"><div class="k">SSD cache</div><div class="v" id="dashCmSsd">-</div><div class="s" id="dashCmSsdS">&nbsp;</div></div>
+    <div class="tile"><div class="k">Requests</div><div class="v" id="dashCmReq">-</div><div class="s">running / waiting</div></div>
+  </section>
+  <section class="cmp charts">
+    <div class="card"><h2>Speed (tok/s)<span class="legend"><span><i style="background:var(--d-c1)"></i>decode</span><span><i style="background:var(--d-c2)"></i>prefill</span></span></h2><canvas id="dashCSpd"></canvas></div>
+    <div class="card"><h2>Memory (GiB)</h2><canvas id="dashCMemc"></canvas></div>
+  </section>
+
+  <section class="adv tiles">
     <div class="tile"><div class="k">Decode</div><div class="v" id="dashTGen">-</div><div class="s">tok/s</div></div>
     <div class="tile"><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">tok/s</div></div>
     <div class="tile"><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
@@ -1005,7 +1061,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     <div class="tile"><div class="k">Served</div><div class="v" id="dashTServed">-</div><div class="s" id="dashTServedS">output tokens</div></div>
   </section>
 
-  <section class="card">
+  <section class="card adv">
     <h2>Sessions<span class="legend"><span><i style="background:var(--d-c2)"></i>restored from cache</span><span><i style="background:var(--d-c1)"></i>new this request</span></span></h2>
     <div class="tablewrap"><table class="sessions">
       <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"></colgroup>
@@ -1014,7 +1070,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     </table></div>
   </section>
 
-  <section class="card">
+  <section class="card adv">
     <details id="dashModelsBox">
       <summary><h2><span>Models</span></h2></summary>
       <div class="tablewrap"><table class="models">
@@ -1026,7 +1082,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     </details>
   </section>
 
-  <section class="charts">
+  <section class="charts adv">
     <div class="card"><h2>Prefill (tok/s)</h2><canvas id="dashCPre"></canvas></div>
     <div class="card"><h2>Decode (tok/s)</h2><canvas id="dashCDec"></canvas></div>
     <div class="card"><h2>Requests<span class="legend"><span><i style="background:var(--d-c1)"></i>running</span><span><i style="background:var(--d-c2)"></i>prefilling</span><span><i style="background:var(--d-c3)"></i>waiting</span><span><i style="background:var(--d-c4)"></i>batched</span></span></h2><canvas id="dashCReq"></canvas></div>
@@ -1035,7 +1091,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   </section>
 
 
-  <section class="row2">
+  <section class="row2 adv">
     <div class="card"><h2>Latency (mean since start)</h2><div class="kv" id="dashLat"></div></div>
     <div class="card"><h2>Request totals</h2><div class="kv" id="dashTotals"></div></div>
     <div class="card"><h2>Time to first token<span class="legend">requests per bucket</span></h2><div class="hist" id="dashHTtft"></div><div class="histlabels" id="dashHlTtft"></div></div>
@@ -1043,6 +1099,52 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     <div class="card"><h2>Prefix cache writes<span class="legend">SSD, since the server started</span></h2><div class="kv" id="dashWrites"></div><div class="foot" style="text-align:left">Filesystem writes, not SSD wear. A rewritten file counts again.</div></div>
   </section>
 </div>
+</section>
+<section id="modelsPanel" class="adminPanel" aria-label="Models" hidden>
+  <div class="a-head"><h1>Models</h1><div class="a-sub" id="modelsDir"></div></div>
+  <div class="a-main">
+    <div id="modelsStatus" class="result" role="status"></div>
+    <div id="modelsList" class="a-main" style="padding:0"></div>
+    <div id="modelsExtra" class="extra"></div>
+  </div>
+</section>
+<section id="settingsPanel" class="adminPanel" aria-label="Settings" hidden>
+  <div class="a-head"><h1>Settings</h1><div class="a-sub" id="settingsFile"></div></div>
+  <div class="a-main">
+    <section class="card" id="cacheCard">
+      <h2>SSD prefix cache</h2>
+      <div class="kv" id="cacheKv"></div>
+      <div class="row">
+        <label for="cacheGb">Assigned space</label>
+        <input id="cacheGb" class="val" type="number" min="0" step="1" aria-label="Assigned SSD prefix cache space in GB">
+        <span class="muted">GB</span>
+        <button class="btn small primary" id="cacheSave" type="button">Save</button>
+        <button class="btn small" id="cacheDefault" type="button">Use the default</button>
+      </div>
+      <div class="note" id="cacheNote"></div>
+      <div class="result" id="cacheResult" role="status"></div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Cache</th><th>Model</th><th class="num">Size</th><th class="num">Entries</th><th>Last used</th><th class="num adv">Tier use</th><th class="num adv">Written</th></tr></thead>
+        <tbody id="cacheRows"></tbody>
+      </table></div>
+      <div class="row">
+        <button class="btn small danger" id="clearStale" type="button">Clear Stale Caches</button>
+        <button class="btn small danger" id="clearAll" type="button">Clear All Caches</button>
+      </div>
+      <div class="note">Stale: no loaded model uses it (an old build, a changed pack or an unloaded model). A loaded model's cache is cleared from the Models tab.</div>
+    </section>
+    <section class="card" id="dirCard">
+      <h2>Models directory</h2>
+      <div class="kv" id="dirKv"></div>
+      <div class="row">
+        <input id="dirPath" type="text" autocomplete="off" aria-label="Models directory" placeholder="/absolute/path/to/models">
+        <button class="btn small primary" id="dirSave" type="button">Save and rescan</button>
+        <button class="btn small" id="dirDefault" type="button">Use the default</button>
+      </div>
+      <div class="note" id="dirNote"></div>
+      <div class="result" id="dirResult" role="status"></div>
+    </section>
+  </div>
 </section>
 </main>
 </div>
@@ -2740,6 +2842,312 @@ async function init() {
 }
 init();
 </script>
+<script id="adminScript">
+/* Models and Settings views: the settings file and the SSD prefix cache, through /v1/settings and /v1/prefix-cache. */
+function adminBytes(n) {
+  n = Number(n) || 0;
+  const g = n / 1024 ** 3;
+  if (g >= 1) return `${g.toFixed(g >= 100 ? 0 : g >= 10 ? 1 : 2)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(0)} MB`;
+  return `${Math.round(n / 1024)} KB`;
+}
+function adminAgo(unixSec, nowMs) {
+  if (!unixSec) return "-";
+  const s = Math.max(0, Math.round(nowMs / 1000 - unixSec));
+  if (s < 90) return "just now";
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 129600) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} days ago`;
+}
+// Bytes per second between two readings of a tier's cumulative write counter; null until there are two, and across a reset.
+function adminWriteRate(prev, now) {
+  if (!prev || now.t <= prev.t || now.written < prev.written) return null;
+  return (now.written - prev.written) / ((now.t - prev.t) / 1000);
+}
+// A control's text as the JSON value the API takes. Empty means "use the default" (null removes the key).
+function adminControlValue(spec, text) {
+  text = String(text).trim();
+  if (text === "") return { ok: true, value: null };
+  if (spec.type === "bool") return text === "true" || text === "false" ? { ok: true, value: text === "true" } : { ok: false };
+  if (spec.type === "choice") return !spec.choices || spec.choices.includes(text) ? { ok: true, value: text } : { ok: false };
+  const x = Number(text);
+  if (!Number.isFinite(x) || x < spec.min || x > spec.max) return { ok: false };
+  if (spec.type === "int" && !Number.isInteger(x)) return { ok: false };
+  return { ok: true, value: x };
+}
+function adminFileText(value) {
+  return value === null || value === undefined ? "" : String(value);
+}
+// The keys whose control differs from the file: { set: {key: value|null}, bad: key|null }.
+function adminChanges(specs, settings, texts) {
+  const set = {};
+  for (const spec of specs) {
+    if (settings[spec.name]?.locked || !(spec.name in texts)) continue;
+    const parsed = adminControlValue(spec, texts[spec.name]);
+    if (!parsed.ok) return { set: {}, bad: spec.name };
+    const file = settings[spec.name]?.file ?? null;
+    if (parsed.value !== file) set[spec.name] = parsed.value;
+  }
+  return { set, bad: null };
+}
+// Decode and prefill tok/s between two server samples ([t_ms, gen_tokens, prefill_tokens, ...]); 0 across a gap or on
+// the first sample. A prefill counter that fell started a new prefill, so its value is the tokens added.
+function historyRates(prev, row, gapMs) {
+  if (!prev) return { gen: 0, pre: 0 };
+  const ms = row[0] - prev[0];
+  if (!(ms > 0) || ms > gapMs) return { gen: 0, pre: 0 };
+  return { gen: Math.max(0, row[1] - prev[1]) / (ms / 1000), pre: (row[2] < prev[2] ? row[2] : row[2] - prev[2]) / (ms / 1000) };
+}
+// Compact (the default) shows the essentials; Advanced shows every detail. The choice is remembered.
+function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact"; }
+function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Compact view"; }
+(() => {
+  const q = (id) => document.getElementById(id);
+  const readMode = () => { try { return uiModeOf(localStorage.getItem("sushi-ui-mode")); } catch { return "compact"; } };
+  const applyMode = (mode) => { document.body.dataset.mode = mode; q("modeToggle").textContent = uiModeLabel(mode); };
+  applyMode(readMode());
+  q("modeToggle").addEventListener("click", () => {
+    const next = document.body.dataset.mode === "compact" ? "advanced" : "compact";
+    try { localStorage.setItem("sushi-ui-mode", next); } catch {}
+    applyMode(next);
+    window.dispatchEvent(new Event("resize"));
+  });
+  const EXPERT = new Set(["mtp_acceptance", "mtp_greedy_tail", "ssd_budget_gb", "ssd_prefetch", "preserve_thinking", "think_penalty"]);
+  const LABEL = {
+    ctx_size: ["Context size", "Tokens of context the model serves; empty lets the server size it to memory."],
+    kv_quant: ["KV cache precision", "off keeps the cache in 16 bits; 4, 6 and 8 quantize it."],
+    mtp: ["Multi-token prediction", "Drafts tokens with the model's own head. Default: on where the pack has one."],
+    mtp_acceptance: ["MTP acceptance", "How a draft token is accepted."],
+    mtp_greedy_tail: ["MTP greedy tail", "Take the last draft token greedily."],
+    ssd_budget_gb: ["SSD expert budget (GB)", "For packs whose experts stream from SSD: the memory the experts may use."],
+    ssd_prefetch: ["SSD prefetch (%)", "Share of the SSD read rate the expert prefetch may use; 0 is off."],
+    preserve_thinking: ["Keep earlier thinking", "Keep earlier turns' reasoning in the prompt."],
+    think_penalty: ["Think penalty", "Pushes the model to close its thought sooner; 0 to 20."],
+    vision: ["Vision tower", "Load the image tower."],
+  };
+  const state = { settings: null, cache: null, prev: new Map(), rates: new Map(), view: "chat", timer: null, busy: false };
+  const el = (tag, attrs, ...kids) => {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else if (v !== false && v != null) n.setAttribute(k, v === true ? "" : v);
+    }
+    for (const kid of kids) if (kid != null) n.append(kid);
+    return n;
+  };
+  const say = (id, text, err) => { const n = q(id); n.textContent = text; n.className = "result" + (err ? " err" : ""); };
+  const errText = (e) => { const m = String(e?.message || e); const j = m.indexOf("{"); try { return JSON.parse(m.slice(j)).error.message; } catch { return m; } };
+  const kvFill = (node, rows) => { node.replaceChildren(...rows.flatMap(([k, v]) => [el("span", { text: k }), el("span", { text: v })])); };
+  const postJson = (path, body) => apiJson(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+  function cacheRowFor(modelId) { return (state.cache?.namespaces || []).find((n) => n.model === modelId); }
+
+  function renderSettings() {
+    const s = state.settings, c = state.cache;
+    if (!s || !c) return;
+    q("settingsFile").textContent = `Saved in ${s.file}. A launch flag outranks the file.`;
+    const gb = s.server.prefix_cache_disk_gb;
+    const writes = [...state.rates.values()].reduce((a, r) => a + (r || 0), 0);
+    const anyRate = [...state.rates.values()].some((r) => r != null);
+    kvFill(q("cacheKv"), [
+      ["Cache folder", c.root],
+      ["Disk free", c.volume ? `${adminBytes(c.volume.free_bytes)} of ${adminBytes(c.volume.total_bytes)}` : "unknown"],
+      ["Assigned space", gb.locked ? `${adminBytes(gb.effective_bytes)} (launch flag --prefix-cache-disk ${gb.flag})` : `${adminBytes(gb.effective_bytes)} (${gb.source})`],
+      ["All caches on disk", adminBytes(c.total_bytes)],
+      ["Write rate", anyRate ? `${adminBytes(writes)}/s` : "-"],
+    ]);
+    const input = q("cacheGb");
+    if (document.activeElement !== input) input.value = adminFileText(gb.file);
+    input.placeholder = String(Math.round(gb.effective_bytes / 1024 ** 3));
+    input.disabled = q("cacheSave").disabled = q("cacheDefault").disabled = gb.locked;
+    q("cacheNote").textContent = gb.locked
+      ? "A launch flag sets this size; start the server without it to change it here."
+      : "A running cache takes a new size at once and drops its oldest entries to fit. 0 turns the cache off at the next model load.";
+    const now = Date.now();
+    q("cacheRows").replaceChildren(...c.namespaces.map((n) => el("tr", {},
+      el("td", { text: n.id.slice(0, 8), title: n.id }),
+      el("td", { class: n.model ? "" : "muted", text: n.model || (n.held_by_other_process ? "in use by another server" : "stale") }),
+      el("td", { class: "num", text: adminBytes(n.bytes) }),
+      el("td", { class: "num", text: String(n.entries) }),
+      el("td", { text: adminAgo(n.newest_mtime, now) }),
+      el("td", { class: "num adv", text: n.tier ? `${adminBytes(n.tier.used_bytes)} / ${adminBytes(n.tier.cap_bytes)}` : "-" }),
+      el("td", { class: "num adv", text: n.tier ? adminBytes(n.tier.written_bytes) : "-" }))));
+    if (!c.namespaces.length) q("cacheRows").append(el("tr", {}, el("td", { colspan: 7, class: "muted", text: "Nothing cached yet." })));
+
+    const d = s.server.models_dir;
+    kvFill(q("dirKv"), [
+      ["In use", d.boot_roots.join(", ") || "(none)"],
+      ["Default", d.default],
+      ["Setting", d.locked ? `launch flag --model-dir ${d.flag}` : d.file || "not set"],
+    ]);
+    if (document.activeElement !== q("dirPath")) q("dirPath").value = d.file || "";
+    q("dirPath").placeholder = d.default;
+    q("dirPath").disabled = q("dirSave").disabled = q("dirDefault").disabled = d.locked;
+    q("dirNote").textContent = d.locked
+      ? "A --model-dir flag sets the folders; start the server without it to change them here."
+      : "Saving rescans, so the Models tab lists the new folder's models at once; models of the folder in use stay listed until the server restarts. Packs fetched with `sushi pull` still land in ~/.sushi/models.";
+  }
+
+  function modelCard(m, specs) {
+    const cache = cacheRowFor(m.id);
+    const loaded = m.state === "ready";
+    const controls = {};
+    const rows = specs.map((spec) => {
+      const st = m.settings[spec.name], [label, help] = LABEL[spec.name] || [spec.name, ""];
+      let input;
+      const initial = adminFileText(st.file);
+      if (spec.type === "bool" || spec.type === "choice") {
+        const opts = spec.type === "bool" ? ["true", "false"] : spec.choices;
+        input = el("select", { disabled: st.locked, "aria-label": label }, el("option", { value: "", text: "default" }),
+          ...opts.map((o) => el("option", { value: o, text: spec.type === "bool" ? (o === "true" ? "on" : "off") : o })));
+      } else {
+        input = el("input", { class: "val", type: "number", step: spec.type === "int" ? 1 : 0.1, min: spec.min, max: spec.max, disabled: st.locked, "aria-label": label });
+      }
+      input.value = st.locked ? "" : initial;
+      controls[spec.name] = input;
+      const where = st.locked ? el("span", { class: "chip flag", text: `launch flag: ${st.flag}`, title: "A launch flag outranks the settings file" })
+        : el("span", { class: "chip " + (st.source === "file" ? "file" : ""), text: st.source });
+      return el("tr", { class: EXPERT.has(spec.name) ? "adv" : "" }, el("td", { text: label, title: help }), el("td", {}, input), el("td", {}, where), el("td", { class: "muted", text: help }));
+    });
+    const result = el("div", { class: "result", role: "status" });
+    const save = el("button", { class: "btn small primary", type: "button", text: "Save settings", onclick: async () => {
+      const { set, bad } = adminChanges(specs, m.settings, Object.fromEntries(Object.entries(controls).map(([k, c]) => [k, c.value])));
+      if (bad) { result.className = "result err"; result.textContent = `${LABEL[bad]?.[0] || bad}: not a valid value`; return; }
+      if (!Object.keys(set).length) { result.className = "result"; result.textContent = "Nothing changed."; return; }
+      try {
+        const r = await postJson("/v1/settings", { model: m.id, set });
+        result.className = "result";
+        result.textContent = r.model_loaded ? "Saved. The loaded model uses the new values after a reload." : "Saved. They apply when the model next loads.";
+        await refresh();
+      } catch (e) { result.className = "result err"; result.textContent = errText(e); }
+    } });
+    const actions = [];
+    if (loaded) {
+      actions.push(el("button", { class: "btn small", type: "button", text: "Reload with saved settings", onclick: () => modelAction(m, "reload") }));
+      actions.push(el("button", { class: "btn small", type: "button", text: "Unload", onclick: () => modelAction(m, "unload") }));
+    } else if (m.state === "unloaded" || m.state === "error_state") {
+      actions.push(el("button", { class: "btn small primary", type: "button", text: "Load", onclick: () => modelAction(m, "load") }));
+    }
+    const cacheLine = cache
+      ? el("div", { class: "row" }, el("span", { text: `SSD cache: ${adminBytes(cache.bytes)}, ${cache.entries} ${cache.entries === 1 ? "entry" : "entries"}` }),
+        el("button", { class: "btn small danger", type: "button", text: `Clear ${m.id}'s cache`, onclick: () => clearModel(m, result) }))
+      : el("div", { class: "note", text: loaded ? "No SSD cache for this model." : "Load the model to manage its SSD cache here; the Settings tab deletes caches no loaded model uses." });
+    return el("section", { class: "card", "data-model": m.id },
+      el("div", { class: "mhead" },
+        el("div", {}, el("span", { class: "mname", text: m.id }), " ", el("span", { class: "muted", text: m.bytes_on_disk ? adminBytes(m.bytes_on_disk) : "" })),
+        el("div", { class: "row", style: "margin:0" }, el("span", { class: "chip " + (loaded ? "ready" : ""), text: loaded ? "loaded" : m.state === "unloaded" ? "not loaded" : m.state }), ...actions)),
+      cacheLine,
+      el("details", { open: loaded }, el("summary", { text: "Settings for this model" }),
+        el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Setting", "Value", "Source", ""].map((t) => el("th", { text: t })))), el("tbody", {}, ...rows))),
+        el("div", { class: "row" }, save), result,
+        el("div", { class: "note", text: "Changes apply when the model next loads. A value pinned by a launch flag is locked, because the flag outranks the file." })));
+  }
+
+  function renderModels() {
+    const s = state.settings;
+    if (!s) return;
+    q("modelsDir").textContent = (s.server.models_dir.boot_roots || []).join(", ");
+    const list = q("modelsList");
+    const open = new Set([...list.querySelectorAll("details[open]")].map((d) => d.closest("[data-model]")?.dataset.model));
+    list.replaceChildren(...s.models.map((m) => modelCard(m, s.model_keys)));
+    for (const d of list.querySelectorAll("details")) d.open = open.has(d.closest("[data-model]").dataset.model) || d.open;
+    if (!s.models.length) list.append(el("div", { class: "card muted", text: "No models found in the models directory." }));
+  }
+
+  async function modelAction(m, what) {
+    state.busy = true;
+    say("modelsStatus", `${what === "unload" ? "Unloading" : what === "reload" ? "Reloading" : "Loading"} ${m.id}...`);
+    try {
+      if (what !== "load") await postJson("/v1/unload-model", { model: m.id });
+      if (what !== "unload") await postJson("/v1/load-model", { model: m.id });
+      say("modelsStatus", `${m.id}: done.`);
+    } catch (e) { say("modelsStatus", errText(e), true); }
+    state.busy = false;
+    await refresh();
+  }
+
+  async function clearModel(m, result) {
+    const row = cacheRowFor(m.id);
+    if (!confirm(`Delete ${m.id}'s SSD cache (${adminBytes(row?.bytes || 0)})? It rebuilds as you chat.`)) return;
+    try {
+      const r = await postJson("/v1/prefix-cache/clear", { scope: "model", model: m.id });
+      result.className = "result";
+      result.textContent = `Freed ${adminBytes(r.freed_bytes)}.`;
+      await refresh();
+      result.textContent = `Freed ${adminBytes(r.freed_bytes)}.`;
+    } catch (e) { result.className = "result err"; result.textContent = errText(e); }
+  }
+
+  async function clearScope(scope, question) {
+    if (!confirm(question)) return;
+    try {
+      const r = await postJson("/v1/prefix-cache/clear", { scope });
+      const parts = [`Freed ${adminBytes(r.freed_bytes)}.`];
+      if (r.busy_models?.length) parts.push(`Busy, not cleared: ${r.busy_models.join(", ")}.`);
+      if (r.skipped_live_namespaces) parts.push(`${r.skipped_live_namespaces} in use by another server, kept.`);
+      await refresh();
+      say("cacheResult", parts.join(" "));
+    } catch (e) { say("cacheResult", errText(e), true); }
+  }
+
+  async function saveSetting(key, value, resultId) {
+    try {
+      const r = await postJson("/v1/settings", { server: { [key]: value } });
+      await refresh();
+      say(resultId, `Saved: ${r.applied[key]}.`);
+    } catch (e) { say(resultId, errText(e), true); }
+  }
+
+  function sampleRates(cache, now) {
+    for (const n of cache.namespaces) {
+      if (!n.tier) continue;
+      const cur = { t: now, written: n.tier.written_bytes }, prev = state.prev.get(n.id);
+      state.rates.set(n.id, adminWriteRate(prev, cur));
+      state.prev.set(n.id, cur);
+    }
+  }
+
+  async function refresh() {
+    if (state.busy && state.view === "models") return;
+    try {
+      const [s, c] = await Promise.all([apiJson("/v1/settings"), apiJson("/v1/prefix-cache")]);
+      sampleRates(c, Date.now());
+      state.settings = s; state.cache = c;
+      if (state.view === "settings") renderSettings(); else renderModels();
+    } catch (e) {
+      say(state.view === "settings" ? "cacheResult" : "modelsStatus", errText(e), true);
+    }
+  }
+
+  q("cacheSave").addEventListener("click", () => {
+    const text = q("cacheGb").value.trim();
+    const v = adminControlValue({ type: "int", min: 0, max: 1048576 }, text);
+    if (!v.ok || v.value === null) return say("cacheResult", "Enter a whole number of GB (0 turns the cache off).", true);
+    saveSetting("prefix_cache_disk_gb", v.value, "cacheResult");
+  });
+  q("cacheDefault").addEventListener("click", () => saveSetting("prefix_cache_disk_gb", null, "cacheResult"));
+  q("dirSave").addEventListener("click", () => {
+    const text = q("dirPath").value.trim();
+    if (!text.startsWith("/")) return say("dirResult", "Enter an absolute folder path.", true);
+    saveSetting("models_dir", text, "dirResult");
+  });
+  q("dirDefault").addEventListener("click", () => saveSetting("models_dir", null, "dirResult"));
+  q("clearStale").addEventListener("click", () => clearScope("stale", "Clear every SSD cache except the loaded models'? Caches of models that are not loaded are deleted too; they rebuild on use."));
+  q("clearAll").addEventListener("click", () => clearScope("all", "Clear every SSD cache, including the loaded models'? Caches rebuild as you chat."));
+
+  window.sushiAdmin = {
+    show(view) {
+      state.view = view;
+      q("modelsPanel").hidden = view !== "models";
+      q("settingsPanel").hidden = view !== "settings";
+      clearInterval(state.timer);
+      state.timer = null;
+      if (view !== "models" && view !== "settings") return;
+      refresh();
+      state.timer = setInterval(() => { if (!document.hidden && !state.busy) refresh(); }, 5000);
+    },
+  };
+})();
+</script>
 <script id="dashboardScript">
 
 (() => {
@@ -2760,6 +3168,11 @@ init();
   const restarts = []; // times the server was seen restarting, drawn on the charts
   const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [] };
   const lastGen = new Map(); // request_id -> {gen, t}
+  // The server keeps the history (one sample per sampler tick); the page asks for what it has not seen, so a tab that
+  // was in the background fills in on return and every point is plotted at the server's own time.
+  let lastHistT = 0, histPrev = null, lastRates = { gen: 0, pre: 0 };
+  const HIST = { t: 0, gen: 1, pre: 2, run: 3, wait: 4, pref: 5, batch: 6, gpu: 7, mem: 8, act: 9, cache: 10 };
+  const GAP_MS = 3.5 * 2000; // more than this between two samples is a gap, drawn as one
 
   $('pause').onclick = () => {
     paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause';
@@ -2814,7 +3227,7 @@ init();
       try {
         const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), Math.max(3000, iv * 2));
         let r;
-        try { r = await api('/metrics.json', { signal: ctl.signal }); } finally { clearTimeout(to); }
+        try { r = await api('/metrics.json?since=' + lastHistT, { signal: ctl.signal }); } finally { clearTimeout(to); }
         permanent = r.status === 503 || r.status === 401;
         metricsOff = r.status === 503;
         syncEnableButton();
@@ -2848,6 +3261,19 @@ init();
       amplification: onDisk > 0 ? total / onDisk : null };
   }
   function push(k, v) { series[k].push(v); }
+  // Appends the server samples newer than the last one seen; returns the latest decode and prefill rates (tok/s).
+  function ingestHistory(samples) {
+    let rates = lastRates;
+    for (const r of samples) {
+      if (r[HIST.t] <= lastHistT) continue;
+      const { gen: g, pre: p } = historyRates(histPrev, r, GAP_MS);
+      push('t', r[HIST.t]); push('gen', g); push('pre', p);
+      push('run', r[HIST.run]); push('wait', r[HIST.wait]); push('pref', r[HIST.pref]); push('batch', r[HIST.batch]);
+      push('gpu', r[HIST.gpu]); push('mem', r[HIST.mem] / 1024); push('act', gib(r[HIST.act])); push('cache', gib(r[HIST.cache]));
+      lastHistT = r[HIST.t]; histPrev = r; rates = { gen: g, pre: p };
+    }
+    return rates;
+  }
   function trim(now) {
     const cut = now - (+$('window').value) * 1000;
     while (restarts.length && restarts[0] < now - 3600000) restarts.shift();
@@ -2858,32 +3284,39 @@ init();
     const now = Date.now(), c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
     // A restarted server starts its counters from zero: mark it and drop rate state built on the old values.
     if (lastCounters && Object.keys(c).some(k => (c[k] || 0) < (lastCounters[k] || 0))) {
-      restarts.push(now); prev = null; lastGen.clear(); propsAt = 0;
+      restarts.push(now); prev = null; histPrev = null; lastGen.clear(); propsAt = 0;
       restartNote = 'Server restarted at ' + new Date(now).toLocaleTimeString();
     }
     lastCounters = c;
     // Sushi refreshes these token gauges only every ~2 s (its sampler thread), so between
     // two fast polls the value often hasn't moved yet. Measure the rate between actual
     // changes instead of between polls, and only call it 0 once nothing moved for a while.
-    const pollDt = prev ? (now - prev.t) / 1000 : 1;
-    const rate = (st, v, resets) => {
-      if (!st) return { at: now, v, r: 0 };
-      if (v === st.v) return (now - st.at > 3200) ? { ...st, r: 0, idle: true } : st;
-      const added = resets && v < st.v ? v : v - st.v;  // a new prefill restarts its count
-      const dt = Math.min((now - st.at) / 1000, Math.max(SAMPLE_S, pollDt)); // don't spread a burst over idle time
-      return { at: now, v, r: added > 0 && dt > 0 ? added / dt : 0 };
-    };
-    const genSt = rate(prev?.genSt, g.generation_tokens_live || 0, false);
-    const preSt = rate(prev?.preSt, g.prefill_tokens_live || 0, true);
-    const gen = genSt.r, pre = preSt.r;
-    prev = { t: now, g, genSt, preSt };
+    const hs = d.history?.samples;
+    let gen, pre;
+    if (hs) {
+      ({ gen, pre } = lastRates = ingestHistory(hs));
+      trim(lastHistT || now);
+    } else {
+      const pollDt = prev ? (now - prev.t) / 1000 : 1;
+      const rate = (st, v, resets) => {
+        if (!st) return { at: now, v, r: 0 };
+        if (v === st.v) return (now - st.at > 3200) ? { ...st, r: 0, idle: true } : st;
+        const added = resets && v < st.v ? v : v - st.v;  // a new prefill restarts its count
+        const dt = Math.min((now - st.at) / 1000, Math.max(SAMPLE_S, pollDt)); // don't spread a burst over idle time
+        return { at: now, v, r: added > 0 && dt > 0 ? added / dt : 0 };
+      };
+      const genSt = rate(prev?.genSt, g.generation_tokens_live || 0, false);
+      const preSt = rate(prev?.preSt, g.prefill_tokens_live || 0, true);
+      prev = { t: now, g, genSt, preSt };
+      gen = genSt.r; pre = preSt.r;
 
-    push('t', now); push('gen', gen); push('pre', pre);
-    push('run', g.requests_running || 0); push('wait', g.requests_waiting || 0);
-    push('pref', g.requests_prefilling || 0); push('batch', g.batched_group_size || 0);
-    push('gpu', g.gpu_utilization_pct || 0); push('mem', (g.memory_mb || 0) / 1024);
-    push('act', gib(g.mlx_active_bytes || 0)); push('cache', gib(g.mlx_cache_bytes || 0));
-    trim(now);
+      push('t', now); push('gen', gen); push('pre', pre);
+      push('run', g.requests_running || 0); push('wait', g.requests_waiting || 0);
+      push('pref', g.requests_prefilling || 0); push('batch', g.batched_group_size || 0);
+      push('gpu', g.gpu_utilization_pct || 0); push('mem', (g.memory_mb || 0) / 1024);
+      push('act', gib(g.mlx_active_bytes || 0)); push('cache', gib(g.mlx_cache_bytes || 0));
+      trim(now);
+    }
     let onDisk = 0;
     for (const p of modelProps.values()) if (p && typeof p === 'object') onDisk += p.settings?.prefix_cache?.disk_used_bytes || 0;
     const writes = prefixWrites(d.prefix_cache_writes, prevWrites, now, onDisk);
@@ -2946,6 +3379,7 @@ init();
     hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     hist('e2e', h.e2e_request_latency_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     sessions(d.sessions || [], now, g);
+    renderCompact();
     drawAll();
   }
 
@@ -3068,6 +3502,24 @@ init();
     refreshPhaseTip();
   }
 
+  // The Compact view's tiles: what is loaded, speed, memory, SSD cache and load.
+  function renderCompact() {
+    if (!lastData) return;
+    const { d, gen, pre } = lastData, g = d.gauges || {};
+    const ready = modelList.filter(m => m.state === 'ready').map(m => shortName(m.id));
+    $('cm-model').textContent = ready.length ? ready.join(', ') : 'none loaded';
+    $('cm-model-s').textContent = ready.length ? 'loaded' : 'a request loads one';
+    $('cm-gen').textContent = fmt(gen, 1);
+    $('cm-pre').textContent = fmt(pre, 0);
+    $('cm-mem').textContent = fmt((g.memory_mb || 0) / 1024, 1) + ' GiB';
+    $('cm-mem-s').textContent = serverInfo.free != null ? bytes(serverInfo.free) + ' available' : 'in use by sushi';
+    let used = 0, cap = 0;
+    for (const p of modelProps.values()) if (p && typeof p === 'object') { used += p.settings?.prefix_cache?.disk_used_bytes || 0; cap = Math.max(cap, p.settings?.prefix_cache?.disk_bytes || 0); }
+    $('cm-ssd').textContent = cap ? bytes(used) : 'off';
+    $('cm-ssd-s').textContent = cap ? 'of ' + bytes(cap) + ' assigned' : 'SSD prefix cache is off';
+    $('cm-req').textContent = `${g.requests_running || 0} / ${g.requests_waiting || 0}`;
+  }
+
   const css = n => getComputedStyle($('panel')).getPropertyValue(n).trim();
 
   const hover = {}; // canvas id -> mouse x/y in CSS px while the pointer is over it
@@ -3112,13 +3564,18 @@ init();
 
     for (const [k, color, fill] of lines) {
       const s = series[k]; if (!n) continue;
-      ctx.beginPath();
-      for (let i = 0; i < n; i++) { const x = X(t[i]), y = Y(s[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
-      if (fill) {
-        ctx.save(); ctx.lineTo(X(t[n - 1]), Y(0)); ctx.lineTo(X(t[0]), Y(0)); ctx.closePath();
-        ctx.globalAlpha = .12; ctx.fillStyle = css(color); ctx.fill(); ctx.restore();
-        ctx.beginPath(); for (let i = 0; i < n; i++) { const x = X(t[i]), y = Y(s[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+      if (fill) { // one fill per run of samples; a gap is not bridged
+        ctx.save(); ctx.globalAlpha = .12; ctx.fillStyle = css(color);
+        for (let a = 0; a < n;) {
+          let b = a; while (b + 1 < n && t[b + 1] - t[b] <= GAP_MS) b++;
+          ctx.beginPath(); ctx.moveTo(X(t[a]), Y(0));
+          for (let i = a; i <= b; i++) ctx.lineTo(X(t[i]), Y(s[i]));
+          ctx.lineTo(X(t[b]), Y(0)); ctx.closePath(); ctx.fill(); a = b + 1;
+        }
+        ctx.restore();
       }
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) { const x = X(t[i]), y = Y(s[i]); i && t[i] - t[i - 1] <= GAP_MS ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
       ctx.save();
       if (near && near !== k) ctx.globalAlpha = .45;
       ctx.strokeStyle = css(color); ctx.lineWidth = near === k ? 3 : 2; ctx.lineJoin = 'round'; ctx.stroke();
@@ -3177,7 +3634,7 @@ init();
     cache: { name: 'MLX cache', fmt: gb, help: 'Freed buffers MLX keeps for reuse. Held by the process but not in use; a steady climb here explains footprint growth.' },
   };
 
-  for (const id of ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem']) {
+  for (const id of ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem', 'c-spd', 'c-memc']) {
     const cv = $(id);
     cv.addEventListener('pointermove', e => { const r = cv.getBoundingClientRect(); hover[id] = { x: e.clientX - r.left, y: e.clientY - r.top }; drawAll(); });
     cv.addEventListener('pointerleave', () => { delete hover[id]; hideTip(); drawAll(); });
@@ -3188,6 +3645,11 @@ init();
 
   function drawAll() {
     if (!dashActive) return;
+    if (document.body.dataset.mode === 'compact') {
+      chart('c-spd', [['pre', '--d-c2'], ['gen', '--d-c1', true]]);
+      chart('c-memc', [['mem', '--d-c1', true]], { dec: 1 });
+      return;
+    }
     chart('c-pre', [['pre', '--d-c2', true]]);
     chart('c-dec', [['gen', '--d-c1', true]]);
     chart('c-req', [['wait', '--d-c3'], ['pref', '--d-c2'], ['batch', '--d-c4'], ['run', '--d-c1']]);
@@ -3231,6 +3693,7 @@ init();
         serverProps && serverProps.then(p => p && renderServer(p)),
       ]);
       $('models-updated').textContent = 'Last updated ' + new Date().toLocaleTimeString();
+      renderCompact();
       const first = ready.map(m => modelProps.get(m.id)).find(p => p && typeof p === 'object');
       if (first) renderServer(first);
     } catch { /* the metrics poll already reports connection problems */ }
@@ -3247,6 +3710,7 @@ init();
     setHtml($('ver'), (ver ? ` v${esc(ver)}` : '') + (p.update?.available
       ? ` <span class="badge" title="${esc(p.update.command || 'brew upgrade sushi')}">Update ${esc(p.update.latest || '')} available</span>` : ''));
     serverInfo = { free: mem.available_bytes, peak: mem.peak_bytes, disk: pc.disk_bytes ? pc : null };
+    renderCompact();
     if (serverInfo.free != null) $('t-mem-s').textContent = bytes(serverInfo.free) + ' free';
     drawAll();
   }
@@ -3341,8 +3805,9 @@ init();
   });
 
 
-  const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard' };
-  const viewOf = p => p === VIEW_PATH.dashboard ? 'dashboard' : 'chat';
+  const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard', models: '/models', settings: '/settings' };
+  const NAV_ID = { chat: 'navChat', dashboard: 'navDashboard', models: 'navModels', settings: 'navSettings' };
+  const viewOf = p => Object.keys(VIEW_PATH).find(v => VIEW_PATH[v] === p) ?? 'chat';
   const chatTitle = document.title;
   let panelScroll = 0, chatFocus = null, switching = false;
   // The nav link takes focus when clicked, so the chat's last focused element is tracked as it moves.
@@ -3354,24 +3819,24 @@ init();
     if (!switching && !(e.relatedTarget && e.relatedTarget.closest('#viewNav'))) chatFocus = null;
   });
   function applyView(view) {
-    const dash = view === 'dashboard';
+    const dash = view === 'dashboard', chat = view === 'chat';
     const chatPanel = document.getElementById('chatPanel');
     switching = true;
     if (!dash && dashActive) { panelScroll = $('panel').scrollTop; hideTip(); }
     dashActive = dash;
     $('panel').hidden = !dash;
     // inert (with the CSS visibility rule) keeps the hidden chat out of tab order and the accessibility tree.
-    chatPanel.inert = dash;
+    chatPanel.inert = !chat;
     document.getElementById('appMain').dataset.view = view;
-    document.getElementById('navChat').setAttribute('aria-current', dash ? 'false' : 'page');
-    document.getElementById('navDashboard').setAttribute('aria-current', dash ? 'page' : 'false');
-    document.title = dash ? 'sushi · dashboard' : chatTitle;
+    for (const v of Object.keys(NAV_ID)) document.getElementById(NAV_ID[v]).setAttribute('aria-current', v === view ? 'page' : 'false');
+    document.title = chat ? chatTitle : 'sushi · ' + view;
+    window.sushiAdmin?.show(view);
     if (dash) {
       $('panel').scrollTop = panelScroll;
       bgStopped = false; propsAt = 0;
       if (lastData) render(lastData);
       drawAll(); pollServer(); pollSoon();
-    } else if (chatFocus?.isConnected) chatFocus.focus({ preventScroll: true });
+    } else if (chat && chatFocus?.isConnected) chatFocus.focus({ preventScroll: true });
     switching = false;
   }
   function goTo(view) {
@@ -3379,7 +3844,7 @@ init();
     history.pushState(null, '', VIEW_PATH[view]);
     applyView(view);
   }
-  for (const [id, view] of [['navChat', 'chat'], ['navDashboard', 'dashboard']]) {
+  for (const [view, id] of Object.entries(NAV_ID)) {
     document.getElementById(id).addEventListener('click', e => {
       if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
       e.preventDefault(); goTo(view);

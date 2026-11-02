@@ -402,6 +402,11 @@ pub fn appendUnclaimedCached(buf: []Session, live_n: usize, cached: []const Sess
 /// Write all metrics as a JSON object to `w`.
 /// Called only on the scrape connection thread.
 pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Writer) !void {
+    return renderJsonWith(m, sessions, null, w);
+}
+
+/// `history` is a ready `"history":{...}` member (`metrics_history.Ring.writeSince`), appended as the last key.
+pub fn renderJsonWith(m: *const Metrics, sessions: []const Session, history: ?[]const u8, w: *std.Io.Writer) !void {
     const ns_to_s = 1.0 / 1_000_000_000.0;
 
     try w.print(
@@ -486,7 +491,9 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             s.request_id, @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.max_tokens, s.elapsed_seconds, s.state_bytes,
         });
     }
-    try w.print("]}}", .{});
+    try w.writeAll("]");
+    if (history) |h| try w.print(",{s}", .{h});
+    try w.writeAll("}");
 }
 
 // ---------------------------------------------------------------------------

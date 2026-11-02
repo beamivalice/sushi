@@ -1,6 +1,6 @@
 #!/bin/bash
 # sushi-test: tier=live boot=api
-# Integration tests for the opt-in observability layer (--metrics):
+# Integration tests for the observability layer (on by default; --no-metrics opts out):
 #   * GET /metrics       — Prometheus text exposition (headless scraping)
 #   * GET /metrics.json  — open JSON feed of the same counters
 #

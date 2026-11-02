@@ -69,6 +69,9 @@ const http_conn = @import("http_conn.zig");
 const request_media = @import("request_media.zig");
 const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
+const prefix_cache_admin = @import("prefix_cache_admin.zig");
+const metrics_history = @import("metrics_history.zig");
+const settings_api = @import("settings_api.zig");
 const logprobs = @import("logprobs.zig");
 /// Global flag set by signal handler for graceful shutdown.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -530,7 +533,8 @@ fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *http_conn.Conn, roo
 }
 
 fn isChatPagePath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/chat") or std.mem.eql(u8, path, "/dashboard");
+    return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/chat") or std.mem.eql(u8, path, "/dashboard") or
+        std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/settings");
 }
 
 /// The chat page URL printed at startup. A wildcard bind is shown as loopback,
@@ -1632,7 +1636,10 @@ pub fn handleConnection(
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
-            try instr.renderJson(m, liveSessions(registry, &sessions), &out.writer);
+            var history: std.Io.Writer.Allocating = .init(allocator);
+            defer history.deinit();
+            if (metrics_history.sinceParam(raw_path)) |since| try metrics_history.process.writeSince(stream.io, since, &history.writer);
+            try instr.renderJsonWith(m, liveSessions(registry, &sessions), if (history.written().len > 0) history.written() else null, &out.writer);
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
@@ -1710,6 +1717,32 @@ pub fn handleConnection(
         // default). The stub stays registered so it can reload. Idempotent.
         log.debug("POST /v1/unload-model -> 200\n", .{});
         try handleUnloadModelStrict(allocator, stream, request_body);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/settings")) {
+        if (std.mem.eql(u8, method, "GET")) {
+            try settings_api.handleGet(allocator, stream);
+        } else if (std.mem.eql(u8, method, "POST")) {
+            try settings_api.handlePost(allocator, stream, request_body);
+        } else {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use GET to read the settings and POST to change them", 405);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/prefix-cache")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use GET for the prefix cache listing", 405);
+            return;
+        }
+        try prefix_cache_admin.handleList(allocator, stream);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/prefix-cache/clear")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to clear the prefix cache", 405);
+            return;
+        }
+        try prefix_cache_admin.handleClear(allocator, stream, request_body);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
@@ -8222,6 +8255,20 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
     ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic));
     ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
+
+    metrics_history.process.push(ctx.scheduler.io, .{
+        .t_ms = io_util.nowMs(ctx.scheduler.io),
+        .gen_tokens = ctx.metrics.generation_tokens_live.load(),
+        .prefill_tokens = ctx.metrics.prefill_tokens_live.load(),
+        .mlx_active = mlx_active,
+        .mlx_cache = mlx_cache,
+        .memory_mb = @intCast(@min(ctx.metrics.memory_mb.load(), std.math.maxInt(u32))),
+        .gpu_pct = @intCast(@min(ctx.metrics.gpu_utilization_pct.load(), 100)),
+        .running = @intCast(@min(running, std.math.maxInt(u16))),
+        .waiting = @intCast(@min(waiting, std.math.maxInt(u16))),
+        .prefilling = @intCast(@min(ctx.metrics.requests_prefilling.load(), std.math.maxInt(u16))),
+        .batched = @intCast(@min(ctx.metrics.batched_group_size.load(), std.math.maxInt(u16))),
+    });
 }
 
 const IdleEvictCtx = struct {

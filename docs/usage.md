@@ -168,6 +168,9 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 - A restore point sits every 8192 tokens and at each prompt's end, so a 1M-token conversation takes about 0.9 GB of
   SSD (DeepSeek), 7-14 GB of points plus 16 GB of rows (Qwen) or 24 GB (GLM): raise `--prefix-cache-disk` for long
   contexts. A conversation past the budget drops its oldest points first.
+- `--no-metrics` turns off `/metrics`, `/metrics.json` and the dashboard's charts (on by default; `--metrics` is still accepted and does nothing).
+  The page at `/` has Chat, Dashboard, Models and Settings views: the SSD prefix cache's size, per-model disk use and
+  clear buttons, the models folder and each model's `model-settings.json` keys are edited in Settings and Models.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt.
 - `--prefill-chunk 2048` caps the prompt step per forward; a request that does not fit steps down.
 

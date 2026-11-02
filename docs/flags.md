@@ -20,7 +20,8 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--api-key` | none → required on every request, loopback exempt (main.zig:728) | operator | help, server-http-apis; 2 tests | keep |
 | `--api-key-strict` | off → also require the key from loopback (main.zig:732) | operator | help; 1 test | keep: embedders on shared machines |
 | `--api-key-env` | none → read the key from a named env var so argv does not carry it (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
-| `--metrics` | off → Prometheus `/metrics` and `/metrics.json` (main.zig:726); `POST /metrics/enable` turns them on at runtime | operator | help, server-http-apis; 10 tests, 2 scripts | keep |
+| `--no-metrics` | off → turns off Prometheus `/metrics` and `/metrics.json`, which are ON by default; `POST /metrics/enable` turns them back on at runtime | operator | help, server-http-apis, usage | keep |
+| `--metrics` | accepted and does nothing (metrics are on by default); kept so existing launch lines still start | operator | help | keep as a no-op alias; cut at the next major version |
 | `--max-concurrent` | `1` → only sizes the submit queue (`n + 32`) and floors the prefix-cache capacity; slots batch at any value (main.zig:913) | dead | help; server-lifecycle; 21 tests, 2 scripts | cut: the queue depth is fixed, batching is the model's answer, not this number |
 | `--parent-pid` | none → exit when that pid dies (main.zig:811) | operator | help, server-http-apis; 1 test | keep: for a host that embeds the engine |
 | `--timeout` | `300` → stall timeout in seconds, 0 = none (main.zig:690) | operator | help, server-http-apis; 1 test | keep |
@@ -34,7 +35,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
 | `--model` | `~/.sushi/models` default → model directory (main.zig:611) | operator | help, usage; 135 tests | keep |
-| `--model-dir` | none → repeatable discovery root, up to 8 (main.zig:916) | operator | help, server-lifecycle; 27 tests | keep |
+| `--model-dir` | none → repeatable discovery root, up to 8 (main.zig:916) | operator | help, server-lifecycle; 27 tests | keep; the settings-file key `server.models_dir` is the default folder when no flag is given (a flag outranks it) |
 | `--max-resident-models` | `3` → cap on loaded models, bad value falls back to 3 (main.zig:933) | machine | help; 5 tests | keep |
 | `--max-resident-mem` | `auto` = 80% of the wired limit → cap on summed resident bytes (main.zig:939) | machine | help, server-lifecycle; 0 tests | keep |
 | `--idle-evict-secs` | off → unload a model idle this long (main.zig:959) | machine | help; 1 test | keep |
@@ -81,7 +82,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 |---|---|---|---|---|
 | `--prefix-cache-entries` | `32` → hot-cache capacity, `0` disables all reuse; a bad value silently becomes 1 (main.zig:840) | user | help, usage, engine-prefix-cache; 41 tests, 2 scripts | keep |
 | `--prefix-cache-mem` | off → RAM retention with this byte budget, `0` or `off` keeps it off (main.zig:843) | machine | help, usage, engine-prefix-cache; 19 tests, 2 scripts | keep |
-| `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep |
+| `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep; also the settings-file key `server.prefix_cache_disk_gb`, edited from the web UI (a flag outranks it) |
 | `--ssm-checkpoint-max` | `16` → checkpoint states held in memory per entry (the SSD restore points are never thinned by it), `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
 
 ## Sampling and reasoning defaults

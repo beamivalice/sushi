@@ -246,8 +246,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - A JSON request nests at most `chat.max_json_nesting` (256) levels, checked on the raw body before any route parses it (HTTP and each WebSocket message); an assistant history `tool_calls[].arguments` nested deeper is sent to the template as a string. A schema nests at most `json_schema.max_schema_depth` (64).
 - A request reader waits at most `REQUEST_READ_LIMIT_MS` (30 s) between bytes and for its whole head, then drops the connection without a reply, so a silent or dripping client never holds its thread; a `Content-Length` sums into the size check with saturating arithmetic, so a wrapping value is a 413 instead of a small allocation.
 - A schema `pattern` repeat count is at most 1000 and its NFA at most 32768 states (`regex.zig`); past either, `compile` fails with `InvalidPattern`.
-- `--metrics`: zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`.
-- **Metrics at runtime**: `POST /metrics/enable` turns the same core on in a server booted without `--metrics` (200
+- Metrics are ON by default (`--no-metrics` is the opt-out; `--metrics` is accepted and does nothing); TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`. Cost with metrics on: per request a handful of relaxed atomic adds at `finishSlot`; per decode tick one atomic store (`inflight_generated_tokens`) and the live-session rows (`publishLiveKvResidency`: one clock read and a ~200 B row copy per decoding slot, under the `queue_mu` hold the cull already takes); per prefill chunk one atomic store and the same row publish; every 2 s the sampler thread (two MLX allocator counter reads, two syscalls, one brief `queue_mu` hold, one ring push). Nothing runs per token. With `--no-metrics` none of it runs.
+- **History ring**: the sampler also pushes one sample per 2 s tick (the token gauges only move once per tick) into `metrics_history.process`, a fixed ring of 1800 samples (one hour, 56 B each, about 100 KB static, no allocation). `GET /metrics.json?since=<unix ms>` adds `"history":{interval_ms,capacity,fields,samples:[[t_ms,gen_tokens,prefill_tokens,running,waiting,prefilling,batched,gpu_pct,memory_mb,mlx_active,mlx_cache],...]}` with the samples newer than `since` (`since=0` is everything kept); without `since` the feed is unchanged. The dashboard backfills from it when it was in the background and plots by `t_ms`, so a hidden tab leaves no gap and a real gap (server down) is drawn as one.
+- **Metrics at runtime**: `POST /metrics/enable` turns the same core on in a server booted with `--no-metrics` (200
   `{"metrics":true,"already_enabled":false}`, and `true` on every later call: idempotent; any other method is a 405). There is
   no off switch. It sits behind the `--api-key` gate like the other mutating routes and refuses a foreign `Origin` (403, same
   rule as `/v1/load-model`); `curl -X POST http://127.0.0.1:12345/metrics/enable` needs no Origin. The state is readable from
@@ -293,7 +294,43 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
   each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
 
-## Chat page (`GET /`, `GET /chat`, `GET /dashboard`)
+## SSD prefix cache and settings (`/v1/prefix-cache`, `/v1/settings`)
+
+All four routes sit behind `--api-key` like the other admin routes, and a request carrying a foreign `Origin` is a 403
+(`crossOriginRefused`). Code: `src/prefix_cache_admin.zig`, `src/settings_api.zig`.
+
+- `GET /v1/prefix-cache`: `{root, volume:{free_bytes,total_bytes}|null, total_bytes, namespaces:[{id, bytes, entries,
+  newest_mtime (unix s), model|null, stale, held_by_other_process, tier:{used_bytes,cap_bytes,entries,written_bytes}|null}]}`.
+  A namespace is a `<16 hex>` directory of the cache root (`SUSHI_PREFIX_CACHE_DIR`, else `~/.sushi/kv-cache`) holding
+  `e<id>` entry directories (a private `p<pid>-<n>` root inside it counts too). `bytes` is the size on disk with a
+  hard-linked file counted once; `entries` counts entry directories with a `meta.json`. `model` is the loaded model whose
+  tier lives there (and `tier` its live numbers, published by the inference thread); `stale` means no loaded model uses it
+  and no other server holds its lock (`held_by_other_process`). A symlink or a folder that is not a namespace name is never listed.
+  `tier.written_bytes` is cumulative since the tier opened; a client takes the write rate between two polls.
+- `POST /v1/prefix-cache/clear` `{"scope":"model","model":id}` | `{"scope":"stale"}` | `{"scope":"all"}` answers `{scope,
+  freed_bytes, model_freed_bytes, model_entries_removed, stale_freed_bytes, stale_namespaces_removed,
+  skipped_live_namespaces, refused_symlinks, busy_models}`. `model` empties that model's tier on the inference thread (its
+  sole owner): staged writes are fenced, the index, `total_bytes` and the files go together, and the tier takes new writes
+  at once. It is refused with 409 `model_busy` while a request holds the model (retry; it is not queued), and 409
+  `model_not_loaded` for a model without a tier. `stale` deletes the namespace directories no loaded model uses, each under
+  the root's lock (a root another server holds is skipped), and never follows a symlink out of the cache root. `all` is both,
+  with busy models listed and left alone.
+- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir` and
+  `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, `source` `flag|file|default`, `locked`), the
+  `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
+  `locked`. `POST /v1/settings` takes `{"server":{key:value|null}}` and/or `{"model":id,"set":{key:value|null}}`; null removes
+  a key. Unknown keys are a 400 `unknown_setting`, a bad value a 400 `invalid_setting`, a `models_dir` that is not a readable
+  folder a 400, an unknown model a 404, a settings file that is not a JSON object a 409; every key is checked before anything
+  is written, and the write is a temp file plus rename. A key a launch flag pins is still written (it applies at a start
+  without the flag) and reported with the flag's source. Per-model keys are stamped at load, so they apply at the model's next
+  load (the page offers the reload). `prefix_cache_disk_gb` reaches the running tiers at once (the tier re-derives its budget
+  and evicts down to it); 0 and removal apply at the next load. `models_dir` triggers a rescan that adds the folder's models
+  (add-only; the boot discovery follows it at the next start).
+- The page shows both in its **Models** (`/models`: per-model size, load/unload, settings, that model's cache) and
+  **Settings** (`/settings`: SSD cache size, status, per-namespace rows and the clear buttons, models directory) views.
+  Guards: `tests/test_prefix_cache_admin.sh`, `node tests/test_webui_admin.cjs`.
+
+## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`)
 
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
@@ -311,6 +348,16 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
   401 stops the hidden poll until the dashboard is shown again. It follows the chat's
   theme. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
+- **Compact and Advanced**: a header toggle (remembered in `localStorage` `sushi-ui-mode`, Compact the default) switches
+  the page's detail level through `body[data-mode]`. Compact shows what is loaded, decode and prefill tok/s, memory used and
+  available, the SSD cache's use and the request count as big tiles, with a speed chart and a memory chart; Advanced is the
+  full dashboard (sessions, models table, every chart, latency, histograms, write counters). Elements only Advanced shows carry
+  the `adv` class, Compact-only ones `cmp`; the Models and Settings views hide their expert rows and columns the same way.
+- **The dashboard's charts come from the server's history**, not from the page's own polls: each poll asks
+  `/metrics.json?since=<last sample time>`, appends the new samples with decode and prefill rates taken between neighbouring
+  samples (`historyRates`), and plots at the server's `t_ms`. A tab in the background does not poll, and on return the next
+  poll fills the whole interval in; two samples more than 7 s apart (the server was down, or the ring was cut) are drawn as a
+  gap, never joined. Without a `history` key (an older server) the page falls back to client-time points.
 - The dashboard's **Prefix cache writes** card (the last card) shows the `prefix_cache_writes` totals: bytes written since
   the server started, the rate between the last two polls (`-` on the first poll and across a restart), bytes written per
   byte now on disk (the sum of every ready model's `/props` `disk_used_bytes`, refreshed every 15 s), one row per kind and

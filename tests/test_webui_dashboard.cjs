@@ -48,6 +48,12 @@ function installStubs(config) {
         return json({ metrics: true, already_enabled: false });
       case '/metrics.json':
         if (stub.metricsStatus !== 200) return json({ error: { message: 'metrics off' } }, stub.metricsStatus);
+        if (stub.history) {
+          const since = Number(url.searchParams.get('since') || 0), t0 = Date.now() - 20000;
+          const fields = ['t_ms', 'gen_tokens', 'prefill_tokens', 'running', 'waiting', 'prefilling', 'batched', 'gpu_pct', 'memory_mb', 'mlx_active', 'mlx_cache'];
+          const samples = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => [t0 + (i < 5 ? i : i + 15) * 1000, i * 40, 0, 1, 0, 0, 0, 50, 4096, 2 ** 30, 2 ** 30]).filter((r) => r[0] > since);
+          return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1 }, histograms: {}, sessions: [], history: { interval_ms: 2000, capacity: 1800, fields, samples } });
+        }
         return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, prefill_tokens_live: stub.prefillTick = (stub.prefillTick ?? 0) + (stub.prefillStep ?? 0), gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
       case '/v1/chat/completions': {
         stub.streams += 1;
@@ -77,6 +83,8 @@ async function openPage(browser, urlPath, config = {}, fakeClock = false) {
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   await page.route(`${ORIGIN}/**`, (route) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
+  // The page opens in Compact; these checks read the Advanced cards unless a test asks for the other mode.
+  await page.addInitScript((mode) => { try { localStorage.setItem('sushi-ui-mode', mode); } catch { /* storage off */ } }, config.mode ?? 'advanced');
   await page.addInitScript(installStubs, { metricsStatus: 200, firstWords: 'Streaming '.repeat(400), ...config });
   if (fakeClock) await page.clock.install();
   await page.goto(`${ORIGIN}${urlPath}`);
@@ -379,7 +387,7 @@ async function main() {
       const { page, errors, context } = await openPage(browser, '/dashboard', { prefillStep: 800 });
       const axisTop = (id) => page.evaluate((canvas) => Math.max(0, ...(window.__axis[canvas] ?? []).filter((t) => /^\d+(\.\d+)?k?$/.test(t)).map((t) => parseFloat(t) * (t.endsWith('k') ? 1000 : 1))), id);
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
-      const cards = await page.evaluate(() => [...document.querySelectorAll('#dashPanel .charts .card')].map((card) => ({ title: card.querySelector('h2').firstChild.textContent, legends: card.querySelectorAll('.legend').length, canvas: card.querySelector('canvas').id })));
+      const cards = await page.evaluate(() => [...document.querySelectorAll('#dashPanel .charts.adv .card')].map((card) => ({ title: card.querySelector('h2').firstChild.textContent, legends: card.querySelectorAll('.legend').length, canvas: card.querySelector('canvas').id })));
       assert.deepEqual(cards.slice(0, 2).map((card) => card.title), ['Prefill (tok/s)', 'Decode (tok/s)'], 'prefill and decode are separate cards');
       assert.deepEqual(cards.slice(0, 2).map((card) => card.legends), [0, 0], 'a single series needs no legend');
       assert.equal(new Set(cards.map((card) => card.canvas)).size, cards.length, 'every card draws on its own canvas');
@@ -399,6 +407,35 @@ async function main() {
       const before = await page.evaluate(() => window.__clears);
       await page.evaluate(() => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'night' ? 'day' : 'night'; });
       await page.waitForFunction((was) => window.__clears > was, before, { timeout: 2000 });
+      await context.close();
+    }
+    {
+      // Compact is the default: the essentials are visible, the detailed cards are not, and the header toggle flips it.
+      const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'compact' });
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      const visible = (sel) => page.evaluate((s) => { const n = document.querySelector(s); return !!n && n.getClientRects().length > 0; }, sel);
+      assert.equal(await visible('#dashCmGen'), true, 'the compact tiles show');
+      assert.equal(await visible('#dashCSpd'), true, 'and the speed chart');
+      assert.equal(await visible('#dashSessions'), false, 'the sessions table is an Advanced detail');
+      assert.equal(await visible('#dashCReq'), false, 'so are the request and GPU charts');
+      assert.equal(await page.textContent('#modeToggle'), 'Advanced view');
+      await page.click('#modeToggle');
+      assert.equal(await page.evaluate(() => document.body.dataset.mode), 'advanced');
+      assert.equal(await visible('#dashSessions'), true);
+      assert.equal(await visible('#dashCmGen'), false);
+      assert.equal(await page.evaluate(() => localStorage.getItem('sushi-ui-mode')), 'advanced', 'the choice is remembered');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // The charts take their points from the server's history: a page that never polled while hidden still shows every
+      // sample, each at the server's time, and a long silence between two samples stays a gap.
+      const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', history: true });
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      await page.waitForFunction(() => window.__stub.calls.some((call) => call.path === '/metrics.json' && /since=\d{6,}/.test(call.search)), null, { timeout: 15000 });
+      assert.equal(await page.evaluate(() => window.__stub.calls.find((call) => call.path === '/metrics.json').search), '?since=0', 'the first poll asks for everything');
+      assert.deepEqual(errors, []);
       await context.close();
     }
     console.log('Web UI dashboard: passed');

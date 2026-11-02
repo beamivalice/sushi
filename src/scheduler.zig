@@ -86,6 +86,7 @@ const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 const slot_outcome = @import("slot_outcome.zig");
 const mtp_tick = @import("mtp_tick.zig");
+const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const slot_admission = @import("slot_admission.zig");
 const vision_queue = @import("vision_queue.zig");
 const model_load = @import("model_load.zig");
@@ -1130,6 +1131,8 @@ pub const Scheduler = struct {
     /// after marking the entry `.evicting` + draining its refcount; the
     /// inference thread frees the mlx state (stream-bound, like cleanup).
     unload_queue: std.ArrayList(*UnloadRequest),
+    /// SSD prefix-tier clears (`POST /v1/prefix-cache/clear`): the tier is the inference thread's.
+    prefix_clear_queue: std.ArrayList(*prefix_cache_admin.ClearRequest),
     /// Slots awaiting cleanup. The conn thread queues a slot here in
     /// `complete()` instead of calling `slot.deinit()` directly — `deinit`
     /// frees mlx_arrays via refcount-decrement, and the underlying GPU
@@ -1258,6 +1261,7 @@ pub const Scheduler = struct {
             .vision_queue = std.ArrayList(*vision_queue.VisionEncodeRequest).empty,
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
+            .prefix_clear_queue = std.ArrayList(*prefix_cache_admin.ClearRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
             .abandoned = null,
             .orphan_vision = undefined,
@@ -1360,6 +1364,13 @@ pub const Scheduler = struct {
             req.done_mu.unlock(self.io);
         }
         self.unload_queue.deinit(self.allocator);
+        for (self.prefix_clear_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.prefix_clear_queue.deinit(self.allocator);
 
         // Plan 05: mlx-allocating state lives on the `LoadedModel` owned by
         // the registry. We can't free the entries here (registry teardown
@@ -1874,6 +1885,22 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
     }
 
+    /// Runs an SSD prefix-tier job (a clear, or a new byte ceiling) on the inference thread and waits for the answer.
+    pub fn prefixAdmin(self: *Scheduler, req_in: prefix_cache_admin.ClearRequest) !prefix_cache_admin.ClearRequest {
+        var req = req_in;
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.prefix_clear_queue.append(self.allocator, &req);
+            self.queue_cond.broadcast(self.io);
+        }
+        req.done_mu.lockUncancelable(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        req.done_mu.unlock(self.io);
+        return req;
+    }
+
     pub const UnloadedIdle = struct { id: []const u8, bytes: u64 };
 
     /// Unloads the least recently used resident model nobody holds, other than `keep`, on the
@@ -2215,7 +2242,8 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.abandoned != null or
         sch.orphan_vision_n > 0 or
         sch.load_queue.items.len > 0 or
-        sch.unload_queue.items.len > 0;
+        sch.unload_queue.items.len > 0 or
+        sch.prefix_clear_queue.items.len > 0;
 }
 
 /// `--gpu-warm-secs` (0 = off): how long after its last prefill or decode the idle inference
@@ -2335,6 +2363,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         // Unload work item (one per tick, like load — heavy, and we re-check
         // the loop between them).
         var unload_req: ?*UnloadRequest = null;
+        var clear_req: ?*prefix_cache_admin.ClearRequest = null;
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
@@ -2348,6 +2377,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             }
             load_req = teardown.load;
             unload_req = teardown.unload;
+            // After the teardown settles, like a load: a finished slot's flush has run by then.
+            if (sch.cleanup_queue.items.len == 0 and sch.prefix_clear_queue.items.len > 0) clear_req = sch.prefix_clear_queue.orderedRemove(0);
         }
         for (cleanup_batch[0..cleanup_n]) |s| {
             // Decode-phase cancel: `complete()` pulled this slot straight
@@ -2386,6 +2417,10 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         for (vision_batch[0..vision_n]) |req| vision_queue.runVisionEncode(sch, req);
         if (load_req) |req| model_load.runLoadRequest(sch, req);
         if (unload_req) |req| model_load.runUnloadRequest(sch, req);
+        if (clear_req) |req| {
+            prefix_cache_admin.runClear(sch.io, req);
+            publishDiskStats(sch);
+        }
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
         switch (gpuWarmBeforePark(worked, unload_req != null)) {
             .keep => {},
@@ -2963,7 +2998,7 @@ pub fn publishDiskStats(sch: *Scheduler) void {
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten() };
+                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten(), .namespace = prefix_cache_admin.namespaceOfRoot(d.root, d.private_root) };
             };
         }
         entry.disk_stats.publish(snap);

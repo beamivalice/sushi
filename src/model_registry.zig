@@ -28,6 +28,7 @@ const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
+const model_settings = @import("model_settings.zig");
 const io_util = @import("io_util.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
@@ -136,13 +137,21 @@ pub const MemoryContextRefusal = struct {
 /// One model's SSD prefix tier as the inference thread last saw it: the budget, bytes in use, entry
 /// count and bytes written since the tier opened. A sequence lock keeps a reader's numbers from one publish.
 pub const DiskStats = struct {
-    pub const Snapshot = struct { budget: u64 = 0, used: u64 = 0, entries: u64 = 0, written: u64 = 0 };
+    pub const Snapshot = struct {
+        budget: u64 = 0,
+        used: u64 = 0,
+        entries: u64 = 0,
+        written: u64 = 0,
+        /// The fingerprint directory the tier lives in, as a number; 0 with no tier.
+        namespace: u64 = 0,
+    };
 
     seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     budget: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     used: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     entries: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     written: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    namespace: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Inference thread only (the single writer).
     pub fn publish(self: *DiskStats, snap: Snapshot) void {
@@ -151,6 +160,7 @@ pub const DiskStats = struct {
         self.used.store(snap.used, .seq_cst);
         self.entries.store(snap.entries, .seq_cst);
         self.written.store(snap.written, .seq_cst);
+        self.namespace.store(snap.namespace, .seq_cst);
         _ = self.seq.fetchAdd(1, .seq_cst);
     }
 
@@ -163,6 +173,7 @@ pub const DiskStats = struct {
                 .used = self.used.load(.seq_cst),
                 .entries = self.entries.load(.seq_cst),
                 .written = self.written.load(.seq_cst),
+                .namespace = self.namespace.load(.seq_cst),
             };
             if (self.seq.load(.seq_cst) == before) return snap;
         }
@@ -835,8 +846,22 @@ pub const ModelRegistry = struct {
     /// number of stubs added. No roots (a `--model`-only
     /// server) rescans nothing.
     pub fn rescan(self: *ModelRegistry) !u32 {
-        const roots = if (self.discovery) |d| d.roots else &.{};
-        if (roots.len == 0) return 0;
+        const boot_roots = if (self.discovery) |d| d.roots else &.{};
+        if (boot_roots.len == 0) return 0;
+        // The settings file's models directory joins the boot roots, so a changed one is found without a restart.
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings.load(self.allocator, self.io, model_settings.defaultPath(&path_buf));
+        defer file.deinit();
+        var with_file: [9][]const u8 = undefined;
+        const roots = blk: {
+            if (model_settings.launch_locks.models_dir.set) break :blk boot_roots;
+            const dir = model_settings.server(&file).models_dir orelse break :blk boot_roots;
+            if (boot_roots.len >= with_file.len) break :blk boot_roots;
+            for (boot_roots) |r| if (std.mem.eql(u8, r, dir)) break :blk boot_roots;
+            @memcpy(with_file[0..boot_roots.len], boot_roots);
+            with_file[boot_roots.len] = dir;
+            break :blk with_file[0 .. boot_roots.len + 1];
+        };
         var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer found.deinit();
         var added: u32 = 0;

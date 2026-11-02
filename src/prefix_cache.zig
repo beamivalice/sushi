@@ -4031,6 +4031,17 @@ pub const HotPrefixCache = struct {
         self.current_kv_bytes = 0;
     }
 
+    /// Empty the SSD tier only: staged writes are fenced off, the index and the files go together. The RAM tier stays.
+    pub fn clearDisk(self: *HotPrefixCache) void {
+        const d = &(self.disk orelse return);
+        if (d.writer) |w| w.fence(null);
+        d.invalidateAll();
+        self.disk_dirty = false;
+        if (self.pending_disk) |*p| p.deinit(self.allocator);
+        self.pending_disk = null;
+        self.last_restored_disk_id = null;
+    }
+
     /// Drop the most recently committed entry — used after a pad-only
     /// generation: the entry we just wrote may have stale K/V from the bad
     /// generation in tail positions. Other entries from prior healthy

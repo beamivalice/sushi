@@ -317,6 +317,19 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - Guards: `Qwen SSD-only: a prefill holds at most two checkpoint states...` and `with an SSD tier the RAM entry keeps only
   its newest two checkpoints` (prefix_cache.zig), `an SSD tier bounds the checkpoints a Qwen prefill holds` (server.zig).
 
+<a id="admin"></a>
+## Listing and clearing from the admin API
+
+- `src/prefix_cache_admin.zig` lists the cache root's namespaces and clears them
+  ([server-http-apis](server-http-apis.md#ssd-prefix-cache-and-settings-v1prefix-cache-v1settings)). A model's clear is a job on
+  the scheduler's `prefix_clear_queue`, run by the inference thread between ticks (`runClear` → `HotPrefixCache.clearDisk`):
+  the tier has one owner, so nothing races the index, and the writer is fenced (`Writer.fence(null)`) before
+  `DiskTier.invalidateAll` deletes the entries, which keeps the queue, `total_bytes` and the files consistent and the tier writable.
+  A model with a request holding it (`refcount > 0`) is refused, not queued. The tier's namespace is published beside its
+  numbers (`DiskStats.namespace`, the fingerprint directory as a number), which is how the listing names the owner without
+  touching the tier from a connection thread. The stale delete takes each root's `.lock` like `sweepBase`, so a root another
+  process owns is skipped. A new `prefix_cache_disk_gb` runs the same way (`set_cap`: `operator_cap` then `refreshDiskBudget`).
+
 <a id="one-tier-per-root"></a>
 ## One live tier per root
 

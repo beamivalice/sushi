@@ -1,14 +1,14 @@
 #!/bin/bash
 # sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
-# Runtime metrics: a server booted WITHOUT --metrics turns them on through `POST /metrics/enable`.
+# Runtime metrics: a server booted with --no-metrics turns them on through `POST /metrics/enable`.
 #
 #  1. Off: GET /metrics and /metrics.json are 503 and the 503 body names the endpoint; GET /metrics/enable is 405.
 #  2. A foreign Origin is refused (403) and nothing turns on.
 #  3. POST /metrics/enable is 200 {"metrics":true,"already_enabled":false}; both feeds answer 200 at once.
 #  4. A second POST is 200 with already_enabled true (idempotent).
 #  5. Under --api-key --api-key-strict: no key and a wrong key are 401 and leave metrics off; the Bearer key enables.
-#  6. --metrics at boot still works: the feeds are 200 and a POST reports already_enabled.
+#  6. A default boot has them on from the start (the feeds are 200, a POST reports already_enabled), and --metrics is accepted and does nothing.
 #
 # Fully hermetic: an EMPTY --model-dir discovers zero models, so nothing loads. Do not run it beside another
 # sushi server on the box without a free port.
@@ -78,8 +78,8 @@ enable() { curl -s -X POST "$BASE/metrics/enable" "$@"; }
 
 echo "Runtime metrics (port $PORT)"
 
-echo "[1/6] off by default"
-if boot; then
+echo "[1/6] off with --no-metrics"
+if boot --no-metrics; then
     check "GET /metrics is 503" "$(is "$(code "$BASE/metrics")" 503)"
     check "GET /metrics.json is 503" "$(is "$(code "$BASE/metrics.json")" 503)"
     check "the 503 body names POST /metrics/enable" \
@@ -108,11 +108,11 @@ if boot; then
     check "the boot log names the runtime enable once" \
         "$([ "$(grep -c 'ENABLED at runtime' "$LOG")" = 1 ] && echo 1 || echo 0)"
 else
-    check "boot without --metrics" 0
+    check "boot with --no-metrics" 0
 fi
 
 echo "[5/6] --api-key --api-key-strict binds the route"
-if boot --api-key enable-test-key --api-key-strict; then
+if boot --no-metrics --api-key enable-test-key --api-key-strict; then
     check "no key is 401" "$(is "$(code -X POST "$BASE/metrics/enable")" 401)"
     check "a wrong key is 401" "$(is "$(code -X POST -H 'Authorization: Bearer nope' "$BASE/metrics/enable")" 401)"
     check "metrics are still off" \
@@ -125,7 +125,20 @@ else
     check "boot with --api-key" 0
 fi
 
-echo "[6/6] --metrics at boot is unchanged"
+echo "[6/6] metrics are on by default; --metrics is a no-op alias"
+if boot; then
+    check "a default boot serves /metrics.json" "$(is "$(code "$BASE/metrics.json")" 200)"
+    check "and /metrics" "$(is "$(code "$BASE/metrics")" 200)"
+    sleep 3
+    check "?since=0 carries the server's history ring with a sample" \
+        "$(curl -s "$BASE/metrics.json?since=0" | python3 -c 'import json,sys; h=json.load(sys.stdin)["history"]; assert h["interval_ms"]==2000 and len(h["samples"])>=1 and len(h["samples"][0])==len(h["fields"])' 2>/dev/null && echo 1 || echo 0)"
+    check "?since=<future> returns no samples" \
+        "$(curl -s "$BASE/metrics.json?since=99999999999999" | python3 -c 'import json,sys; assert json.load(sys.stdin)["history"]["samples"]==[]' 2>/dev/null && echo 1 || echo 0)"
+    check "no ?since leaves the feed as it was (no history key)" \
+        "$(curl -s "$BASE/metrics.json" | python3 -c 'import json,sys; assert "history" not in json.load(sys.stdin)' 2>/dev/null && echo 1 || echo 0)"
+else
+    check "default boot" 0
+fi
 if boot --metrics; then
     check "GET /metrics.json is 200 from the start" "$(is "$(code "$BASE/metrics.json")" 200)"
     check "POST reports already_enabled" \

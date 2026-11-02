@@ -401,6 +401,8 @@ const ROUTE_PATHS = [_][]const u8{
     "/",
     "/chat",
     "/dashboard",
+    "/models",
+    "/settings",
     "/detokenize",
     "/health",
     "/metrics",
@@ -415,8 +417,11 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/messages/count_tokens",
     "/v1/models",
     "/v1/models/rescan",
+    "/v1/prefix-cache",
+    "/v1/prefix-cache/clear",
     "/v1/responses",
     "/v1/responses/compact",
+    "/v1/settings",
     "/v1/tools",
     "/v1/unload-model",
     "/v1/update",
@@ -429,7 +434,8 @@ pub fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const
         std.mem.eql(u8, method, "GET") and ws_mod.isUpgrade(headers)
     else
         std.mem.eql(u8, path, "/v1/load-model") or std.mem.eql(u8, path, "/v1/unload-model") or
-            std.mem.eql(u8, path, "/v1/models/rescan") or std.mem.eql(u8, path, "/metrics/enable");
+            std.mem.eql(u8, path, "/v1/models/rescan") or std.mem.eql(u8, path, "/v1/prefix-cache/clear") or
+            std.mem.eql(u8, path, "/v1/prefix-cache") or std.mem.eql(u8, path, "/v1/settings") or std.mem.eql(u8, path, "/metrics/enable");
     if (!guarded) return false;
     const origin = findHeaderValueCI(headers, "origin") orelse return false;
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
@@ -1693,6 +1699,8 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
         .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://evil.test\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/unload-model", .headers = "Origin: null\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "ORIGIN: http://127.0.0.1:12346\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/prefix-cache/clear", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/prefix-cache/clear", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://evil.test\r\n", .refused = true },
         .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://evil.test\r\n", .refused = true },
         .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://localhost:12345\r\n", .refused = false },

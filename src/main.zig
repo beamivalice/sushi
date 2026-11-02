@@ -373,8 +373,9 @@ fn printUsage(io: std.Io) void {
         \\  --gpu-warm-secs <n> Keep the GPU awake for this many seconds after
         \\                        the last request, so the next one starts
         \\                        without a wake-up delay (default: 60, 0 = off).
-        \\  --metrics           Enable Prometheus metrics at GET /metrics (opt-in;
-        \\                        zero cost when off). Also GET /metrics.json.
+        \\  --no-metrics        Turn off the metrics at GET /metrics and /metrics.json
+        \\                        (on by default; POST /metrics/enable turns them back
+        \\                        on). --metrics is accepted and does nothing.
         \\  --no-tool-autocorrect
         \\                      Disable tool-call ARGUMENT auto-correct — the
         \\                        coercion of parsed args to the tool schema's
@@ -585,7 +586,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
-    var metrics_enabled = false;
+    var metrics_enabled = true;
     var log_level_explicit = false;
     var decode_share_flag: ?[]const u8 = null;
     var i: usize = arg_start;
@@ -718,6 +719,8 @@ pub fn main(init: std.process.Init) !void {
             drafter_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--metrics")) {
             metrics_enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--no-metrics")) {
+            metrics_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--api-key") and i + 1 < args.len) {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
@@ -1005,6 +1008,13 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    pinLaunchFlags(.{
+        .ctx_size = ctx_size,
+        .kv_quant = if (kv_quant_explicit) kv_quant_config.wireName() else null,
+        .mtp = if (mtp_explicit) enable_mtp else null,
+        .vision = if (vision) true else if (no_vision) false else null,
+        .models_dir = models_root,
+    });
     if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
         log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
         std.process.exit(1);
@@ -1048,7 +1058,27 @@ pub fn main(init: std.process.Init) !void {
     })) {
         const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
         default_models_root_storage = try cli_mod.modelsRootPath(allocator, home);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
+        defer file.deinit();
+        if (model_settings_mod.server(&file).models_dir) |dir| {
+            if (std.Io.Dir.openDirAbsolute(io, dir, .{})) |d| {
+                d.close(io);
+                allocator.free(default_models_root_storage.?);
+                default_models_root_storage = try allocator.dupe(u8, dir);
+            } else |_| log.warn("[model-settings] server.models_dir {s} cannot be opened, using the default models directory\n", .{dir});
+        }
         models_root = default_models_root_storage;
+    }
+    {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
+        defer file.deinit();
+        if (!server_mod.prefix_cache_disk_explicit) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
+            server_mod.prefix_cache_disk_bytes = @as(u64, gb) << 30;
+            server_mod.prefix_cache_disk_explicit = true;
+            log.info("[model-settings] server.prefix_cache_disk_gb {d} sets the SSD prefix cache budget\n", .{gb});
+        };
     }
 
     // `sushi run` on a TTY quiets logs to warn (unless --log-level was
@@ -1161,7 +1191,7 @@ pub fn main(init: std.process.Init) !void {
         if (t) |thread| thread.detach();
     }
 
-    // Observability: `--metrics` turns the process-wide core on before serving; without it the core stays off
+    // Observability: the process-wide core is on before serving; `--no-metrics` keeps it off
     // until POST /metrics/enable. Every LoadParams builder reads it back as the scheduler's initial sink.
     if (metrics_enabled) _ = metrics_mod.process.enable();
 
@@ -1776,6 +1806,23 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 }
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
+/// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
+fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8 }) void {
+    const locks = &model_settings_mod.launch_locks;
+    if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
+    if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
+    if (given.mtp) |m| locks.modelMut("mtp").pin("{s}", .{if (m) "on" else "off"});
+    if (generate_mod.mtp_acceptance_explicit) locks.modelMut("mtp_acceptance").pin("set", .{});
+    if (generate_mod.mtp_greedy_tail_explicit) locks.modelMut("mtp_greedy_tail").pin("set", .{});
+    if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
+    if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
+    if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
+    if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
+    if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
+    if (server_mod.prefix_cache_disk_explicit) locks.prefix_cache_disk_gb.pin("{d}", .{server_mod.prefix_cache_disk_bytes >> 30});
+    if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
+}
+
 fn flagInt(comptime T: type, flag: []const u8, text: []const u8, min: T) T {
     return cli_mod.parseFlagInt(T, text, min) orelse {
         log.err("{s}: expected a whole number of at least {d}; got '{s}'\n", .{ flag, min, text });

@@ -6,6 +6,12 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Metrics are on by default**: `/metrics`, `/metrics.json` and the dashboard work without a flag; `--no-metrics` turns them off, and `--metrics` is still accepted and does nothing.
+- **The dashboard's charts no longer break when the tab is in the background**: the server keeps the last hour of samples and the page fills the missing interval from `/metrics.json?since=` when you come back, drawing a real outage as a gap.
+- **The web page opens in a Compact view**: big tiles for the loaded model, tokens per second, memory, SSD cache and requests, with two charts; an Advanced toggle in the header brings back the full dashboard, and the Models and Settings tabs hide their expert rows in Compact.
+
+- **The web page has Models and Settings tabs for the SSD prefix cache, the models folder and each model's settings**: Settings shows the cache's assigned size (editable, applied to a running cache at once), disk use per model with stale caches marked, the write rate, and buttons that clear a model's cache, delete the caches no loaded model uses, or clear them all; Models lists each model with its size, load and unload, its cache and its `model-settings.json` keys with their source, a key a launch flag sets shown locked. `GET /v1/prefix-cache`, `POST /v1/prefix-cache/clear` and `GET`/`POST /v1/settings` serve them behind `--api-key`.
+
 - **DeepSeek-V4.1 decode recomputes only the missed picks of a route-spec rebuild**: when a speculated route leaves some experts off the cache map, only those experts run again and join the kept ones in the same order, with byte-identical text.
 - **DeepSeek-V4.1 expert prefetch is opt-in with `--ssd-prefetch N` (default 0, off; 65 is the tuned cap)**: the expert reads of a route and of the prefetch together stay under that percent of this Mac's measured SSD read rate, so the prefetch never slows an SSD-bound budget.
 - **Streamed experts fill faster with identical output**: a fill's reads are split across the I/O workers by cost per read as well as by bytes, so a run of small scale reads no longer queues behind the last large one.
