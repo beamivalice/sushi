@@ -4466,6 +4466,21 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       e.preventDefault(); goTo(view);
     });
   }
+  // Cmd+1..4 (Ctrl+1..4 off a Mac) click the tabs in their order, so a form with unsaved edits still asks first.
+  const NAV_ORDER = ['dashboard', 'chat', 'models', 'settings'];
+  const onMac = /Mac/.test(navigator.platform);
+  NAV_ORDER.forEach((v, i) => {
+    const link = document.getElementById(NAV_ID[v]);
+    link.setAttribute('aria-keyshortcuts', `Meta+${i + 1}`);
+    link.title = `${link.textContent} (${onMac ? '⌘' : 'Ctrl+'}${i + 1})`;
+  });
+  document.addEventListener('keydown', e => {
+    if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.repeat) return;
+    const i = ['Digit1', 'Digit2', 'Digit3', 'Digit4'].indexOf(e.code);
+    if (i < 0 || document.getElementById('appShell')?.inert || document.querySelector('dialog[open]')) return;
+    e.preventDefault();
+    document.getElementById(NAV_ID[NAV_ORDER[i]]).click();
+  });
   new MutationObserver(themeChanged).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   window.addEventListener('popstate', () => applyView(viewOf(location.pathname)));
   applyView(viewOf(location.pathname));

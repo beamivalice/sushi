@@ -406,6 +406,8 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
 - The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings** navigator in the top bar switches the views of that one page in place (`history.pushState`,
   `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
+  Cmd+1..4 (Ctrl+1..4 off a Mac) click the four tabs in that order, so unsaved Models/Settings edits still ask; they do
+  nothing behind the API key overlay or an open dialog. A browser that reserves those keys for its own tabs keeps them.
 - **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 4 s
   while the server is unreachable, 2 s while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only
   when the answer changed; no timer runs while the tab is hidden, and loads and unloads go through its `act`. There is

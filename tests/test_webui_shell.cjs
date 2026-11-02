@@ -233,6 +233,34 @@ async function main() {
     }
 
     {
+      // Cmd+1..4 (Ctrl+1..4 off a Mac) switch Dashboard, Chat, Models, Settings, even from the chat prompt, and each link names its key.
+      const { page, context } = await open(browser, makeServer(), '/');
+      await page.waitForSelector('#dashPanel:not([hidden])');
+      const at = () => new URL(page.url()).pathname;
+      await page.keyboard.press('Meta+2');
+      assert.equal(at(), '/chat', 'Cmd+2 opens the chat');
+      await page.click('#promptInput');
+      await page.keyboard.type('half a thought');
+      await page.keyboard.press('Meta+3');
+      assert.equal(at(), '/models', 'Cmd+3 works while typing in the prompt');
+      await page.keyboard.press('Control+4');
+      assert.equal(at(), '/settings', 'Ctrl+4 works too');
+      await page.keyboard.press('Meta+1');
+      assert.equal(at(), '/dashboard', 'Cmd+1 returns to the Dashboard');
+      await page.keyboard.press('Meta+Shift+2');
+      assert.equal(at(), '/dashboard', 'a shifted digit is not a tab switch');
+      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.getAttribute('aria-keyshortcuts'))), ['Meta+1', 'Meta+2', 'Meta+3', 'Meta+4']);
+      await page.keyboard.press('Meta+2');
+      assert.equal(await page.inputValue('#promptInput'), 'half a thought', 'the prompt survives the tab round trip');
+      await context.close();
+      const keyed = await open(browser, makeServer({ apiKey: 'sekret' }), '/chat');
+      await keyed.page.waitForSelector('#keyOverlay:not([hidden])');
+      await keyed.page.keyboard.press('Meta+1');
+      assert.equal(new URL(keyed.page.url()).pathname, '/chat', 'the key overlay keeps the shortcuts from switching the page behind it');
+      await keyed.context.close();
+    }
+
+    {
       // With --api-key and no stored key, the overlay owns the keyboard: nothing typed or tabbed reaches the page behind it.
       const { page, context } = await open(browser, makeServer({ apiKey: 'sekret' }), '/chat');
       await page.waitForSelector('#keyOverlay:not([hidden])');

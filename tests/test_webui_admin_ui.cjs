@@ -678,6 +678,16 @@ async function main() {
       assert.equal(await page.textContent('#modelsDetail h2'), 'GLM-B', 'back on the model that was open');
       assert.equal(await page.evaluate(() => location.hash), '#GLM-B');
     });
+    await scenario('Cmd+4 with unsaved edits asks like a click on Settings', { path: '/models#GLM-B' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.keyboard.press('Meta+4');
+      assert.equal(await dialogOpen(page), true, 'the shortcut asks before leaving a dirty form');
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.isVisible('#modelsPanel'), true);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+    });
     await scenario('a clean tab switch returns to the same model', { path: '/models' }, async ({ page }) => {
       await page.waitForSelector('.list [data-id="GLM-B"]');
       await page.click('.list [data-id="GLM-B"]');
