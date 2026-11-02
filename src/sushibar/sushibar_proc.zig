@@ -197,6 +197,17 @@ pub fn runCapture(argv: []const [*:0]const u8, out_path: [*:0]const u8) ?u8 {
     return if (bits & 0x7f == 0) @intCast((bits >> 8) & 0xff) else null;
 }
 
+/// `path` with every symlink resolved: Homebrew links `bin/sushibar` to the keg's `libexec/sushibar`, and the
+/// sibling `sushi` and the Cellar check belong to the keg.
+pub fn realPath(buf: []u8, path: []const u8) ?[]const u8 {
+    var in: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= in.len or buf.len < std.fs.max_path_bytes) return null;
+    @memcpy(in[0..path.len], path);
+    in[path.len] = 0;
+    const r = std.c.realpath(&in, buf.ptr) orelse return null;
+    return std.mem.span(r);
+}
+
 /// Replaces this process with `argv` (same pid, fds 0-2 kept, every other fd closed). Returns only on failure.
 pub fn execReplace(argv: []const [*:0]const u8) void {
     var args: [8:null]?[*:0]const u8 = @splat(null);
@@ -313,4 +324,29 @@ test "spawnDetached: the program leads a session of its own, with the arguments 
     var args: [args_cap]u8 = undefined;
     const got = argsOfPid(pid, &args).?;
     try std.testing.expect(std.mem.indexOf(u8, got, "/bin/sleep\x0030\x00") != null);
+}
+
+test "realPath: a Homebrew bin symlink resolves into the keg, where the sibling sushi and the Cellar check live" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "Cellar/sushi/1.0/libexec");
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Cellar/sushi/1.0/libexec/sushibar", .data = "" });
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = try std.fmt.bufPrintSentinel(&target_buf, "{s}/Cellar/sushi/1.0/libexec/sushibar", .{root}, 0);
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrintSentinel(&link_buf, "{s}/bin/sushibar", .{root}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlink(target.ptr, link.ptr));
+
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = realPath(&real_buf, link).?;
+    try std.testing.expectEqualStrings(target, real);
+    var sib: [std.fs.max_path_bytes]u8 = undefined;
+    const sushi = logic.siblingPath(&sib, real, "sushi").?;
+    try std.testing.expect(std.mem.endsWith(u8, sushi, "/Cellar/sushi/1.0/libexec/sushi"));
+    try std.testing.expect(logic.isBrewKeg(sushi));
+    try std.testing.expect(realPath(&real_buf, "/no/such/path") == null);
 }

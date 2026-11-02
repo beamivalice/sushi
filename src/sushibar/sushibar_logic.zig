@@ -71,18 +71,49 @@ pub const Sample = struct {
     prefilling: bool = false,
     /// The newest finished request that generated tokens: `generated_tokens / decode_seconds`.
     finished_tps: ?f64 = null,
+    /// The same request's prompt speed: `prompt_tokens / prefill_seconds`.
+    finished_prefill_tps: ?f64 = null,
     newest_finished_ms: i64 = 0,
+    mem_mb: ?u64 = null,
+    gpu_mhz: ?u64 = null,
+    gpu_pct: ?u64 = null,
+    /// `history` samples newer than the request's `since`.
+    hist: []const Hist = &.{},
 };
 
+pub const Hist = struct { t_ms: i64, gen: u64 };
+
 const Wire = struct {
-    gauges: struct { requests_prefilling: u64 = 0 } = .{},
+    gauges: struct {
+        requests_prefilling: u64 = 0,
+        memory_mb: u64 = 0,
+        gpu_clock_mhz: u64 = 0,
+        gpu_utilization_pct: u64 = 0,
+    } = .{},
     sessions: []const struct { request_id: u64 = 0, phase: []const u8 = "", generated_tokens: u64 = 0 } = &.{},
-    requests: []const struct { t_ms: i64 = 0, generated_tokens: u64 = 0, decode_seconds: f64 = 0 } = &.{},
+    requests: []const struct {
+        t_ms: i64 = 0,
+        prompt_tokens: u64 = 0,
+        prefill_seconds: f64 = 0,
+        generated_tokens: u64 = 0,
+        decode_seconds: f64 = 0,
+    } = &.{},
+    history: ?struct { fields: []const []const u8 = &.{}, samples: []const []const f64 = &.{} } = null,
 };
+
+fn nonZero(v: u64) ?u64 {
+    return if (v == 0) null else v;
+}
 
 pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
     const wire = try std.json.parseFromSliceLeaky(Wire, arena, body, .{ .ignore_unknown_fields = true });
-    var out: Sample = .{ .link = .up, .prefilling = wire.gauges.requests_prefilling > 0 };
+    var out: Sample = .{
+        .link = .up,
+        .prefilling = wire.gauges.requests_prefilling > 0,
+        .mem_mb = nonZero(wire.gauges.memory_mb),
+        .gpu_mhz = nonZero(wire.gauges.gpu_clock_mhz),
+        .gpu_pct = if (wire.gauges.gpu_clock_mhz > 0 or wire.gauges.gpu_utilization_pct > 0) wire.gauges.gpu_utilization_pct else null,
+    };
     var rows: std.ArrayList(Row) = .empty;
     for (wire.sessions) |s| {
         if (std.mem.eql(u8, s.phase, "decode")) try rows.append(arena, .{ .request_id = s.request_id, .generated = s.generated_tokens });
@@ -90,11 +121,48 @@ pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
     }
     out.decoding = rows.items;
     var newest_speed_ms: i64 = std.math.minInt(i64);
+    var newest_prefill_ms: i64 = std.math.minInt(i64);
     for (wire.requests) |r| {
         out.newest_finished_ms = @max(out.newest_finished_ms, r.t_ms);
+        if (r.t_ms >= newest_prefill_ms and r.prompt_tokens > 0 and r.prefill_seconds > 0)
+        {
+            newest_prefill_ms = r.t_ms;
+            out.finished_prefill_tps = @as(f64, @floatFromInt(r.prompt_tokens)) / r.prefill_seconds;
+        }
         if (r.generated_tokens == 0 or r.decode_seconds <= 0 or r.t_ms < newest_speed_ms) continue;
         newest_speed_ms = r.t_ms;
         out.finished_tps = @as(f64, @floatFromInt(r.generated_tokens)) / r.decode_seconds;
+    }
+    if (wire.history) |h| {
+        const ti = fieldIndex(h.fields, "t_ms");
+        const gi = fieldIndex(h.fields, "gen_tokens");
+        if (ti != null and gi != null) {
+            var list: std.ArrayList(Hist) = .empty;
+            for (h.samples) |row| {
+                if (row.len <= @max(ti.?, gi.?)) continue;
+                try list.append(arena, .{ .t_ms = @intFromFloat(row[ti.?]), .gen = @intFromFloat(@max(0, row[gi.?])) });
+            }
+            out.hist = list.items;
+        }
+    }
+    return out;
+}
+
+fn fieldIndex(fields: []const []const u8, name: []const u8) ?usize {
+    for (fields, 0..) |f, i| if (std.mem.eql(u8, f, name)) return i;
+    return null;
+}
+
+pub const ModelState = struct { ready: ?[]const u8 = null, loading: ?[]const u8 = null };
+
+/// Which model `/v1/models` lists as ready, and which as loading.
+pub fn parseModelState(arena: std.mem.Allocator, body: []const u8) !ModelState {
+    const List = struct { data: []const struct { id: []const u8 = "", state: []const u8 = "" } = &.{} };
+    const list = try std.json.parseFromSliceLeaky(List, arena, body, .{ .ignore_unknown_fields = true });
+    var out: ModelState = .{};
+    for (list.data) |m| {
+        if (out.ready == null and std.mem.eql(u8, m.state, "ready")) out.ready = m.id;
+        if (out.loading == null and std.mem.eql(u8, m.state, "loading")) out.loading = m.id;
     }
     return out;
 }
@@ -127,6 +195,7 @@ pub const Tracker = struct {
     prefilling: bool = false,
     live: ?f64 = null,
     last: ?f64 = null,
+    last_prefill: ?f64 = null,
 
     /// `now_ms` is read before the request went out, so the next `since` cannot skip a request.
     pub fn observe(self: *Tracker, now_ms: i64, sample: Sample) void {
@@ -136,6 +205,7 @@ pub const Tracker = struct {
         if (sample.link == .up) {
             self.since_ms = @max(sample.newest_finished_ms, now_ms);
             if (sample.finished_tps) |t| self.last = t;
+            if (sample.finished_prefill_tps) |t| self.last_prefill = t;
             const dt_ms = now_ms - self.prev_ms;
             if (self.prev_n > 0 and dt_ms > 0) {
                 var added: u64 = 0;
@@ -173,6 +243,11 @@ pub fn title(buf: []u8, v: View) []const u8 {
     return buf[0 .. base.len + tail.len];
 }
 
+/// The title shows the last request's speed, not a live one: drawn dim.
+pub fn titleDim(v: View) bool {
+    return v.link == .up and !v.decoding and !v.prefilling and v.last != null;
+}
+
 fn titleBase(buf: []u8, v: View) []const u8 {
     var num: [32]u8 = undefined;
     const text = switch (v.link) {
@@ -184,7 +259,7 @@ fn titleBase(buf: []u8, v: View) []const u8 {
         else if (v.prefilling)
             std.fmt.bufPrint(buf, "prefill…", .{})
         else if (v.last) |t|
-            std.fmt.bufPrint(buf, "last {s} tok/s", .{speedText(&num, t)})
+            std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, t)})
         else
             std.fmt.bufPrint(buf, "", .{}),
     };
@@ -311,36 +386,26 @@ pub const UpdateView = struct {
     path: UpdatePath = .none,
 };
 
-pub fn versionText(buf: []u8, v: UpdateView) []const u8 {
-    const t = if (v.bar_version.len == 0)
-        std.fmt.bufPrint(buf, "sushi version unknown", .{})
-    else if (v.server_version.len > 0 and !std.mem.eql(u8, v.server_version, v.bar_version))
-        std.fmt.bufPrint(buf, "sushi {s} (server on this port: {s})", .{ v.bar_version, v.server_version })
-    else
-        std.fmt.bufPrint(buf, "sushi {s}", .{v.bar_version});
-    return t catch "sushi";
-}
-
 pub fn checkLabel(buf: []u8, v: UpdateView) []const u8 {
     const t = switch (v.busy) {
-        .checking => std.fmt.bufPrint(buf, "Checking for updates…", .{}),
+        .checking => std.fmt.bufPrint(buf, "Checking…", .{}),
         .updating => std.fmt.bufPrint(buf, "Updating…", .{}),
         .none => if (v.note.len > 0)
-            std.fmt.bufPrint(buf, "Check for Updates — {s}", .{v.note})
+            std.fmt.bufPrint(buf, "Check for Updates… — {s}", .{v.note})
         else
-            std.fmt.bufPrint(buf, "Check for Updates", .{}),
+            std.fmt.bufPrint(buf, "Check for Updates…", .{}),
     };
-    return t catch "Check for Updates";
+    return t catch "Check for Updates…";
 }
 
 /// The update item's label, or null while there is nothing newer.
 pub fn updateLabel(buf: []u8, v: UpdateView) ?[]const u8 {
     if (!v.available) return null;
-    const t = if (v.path == .brew)
-        std.fmt.bufPrint(buf, "● sushi {s} available: {s}", .{ v.latest, v.command })
-    else
-        std.fmt.bufPrint(buf, "● Update to sushi {s}", .{v.latest});
-    return t catch "● Update";
+    return std.fmt.bufPrint(buf, "Update to sushi {s}", .{v.latest}) catch "Update";
+}
+
+pub fn copyLabel(buf: []u8, command: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "Copy “{s}”", .{command}) catch "Copy command";
 }
 
 pub fn updateEnabled(v: UpdateView) bool {
@@ -409,6 +474,205 @@ pub fn enabled(s: Server) Enabled {
         .start = s.sushi_found and s.link == .offline and !s.ours_alive and !s.port_taken,
         .stop = s.ours_alive or s.sushi_listening,
     };
+}
+
+pub const ToggleAction = enum { none, start, stop };
+pub const Toggle = struct { label: []const u8, enabled: bool, action: ToggleAction, symbol: []const u8 };
+
+/// The one Start/Stop item: Stop (with an ellipsis when it asks first) wherever a sushi listens on the port.
+pub fn toggle(s: Server, stopping: bool) Toggle {
+    if (stopping) return .{ .label = "Stopping…", .enabled = false, .action = .none, .symbol = "hourglass" };
+    if (s.ours_alive and s.link == .offline) return .{ .label = "Starting…", .enabled = false, .action = .none, .symbol = "hourglass" };
+    if (s.ours_alive or s.sushi_listening)
+        return .{ .label = if (s.ours_alive) "Stop Server" else "Stop Server…", .enabled = true, .action = .stop, .symbol = "stop.fill" };
+    const can = enabled(s).start;
+    return .{ .label = "Start Server", .enabled = can, .action = if (can) .start else .none, .symbol = "play.fill" };
+}
+
+/// The pages need a server that answers.
+pub fn openEnabled(link: Link) bool {
+    return link != .offline;
+}
+
+// ── The header card ──────────────────────────────────────────────────────
+
+pub const Tone = enum { green, orange, grey };
+pub const Pill = struct { label: []const u8, tone: Tone };
+
+pub fn pillFor(link: Link, loading: bool, updating: bool, starting: bool) Pill {
+    if (updating) return .{ .label = "Updating…", .tone = .orange };
+    return switch (link) {
+        .offline => if (starting) .{ .label = "Loading", .tone = .orange } else .{ .label = "Stopped", .tone = .grey },
+        .unauthorized => .{ .label = "Key needed", .tone = .orange },
+        .metrics_off => .{ .label = "Metrics off", .tone = .grey },
+        .up => if (loading) .{ .label = "Loading", .tone = .orange } else .{ .label = "Running", .tone = .green },
+    };
+}
+
+pub fn thousands(buf: []u8, n: u64) []const u8 {
+    var digits: [20]u8 = undefined;
+    const d = std.fmt.bufPrint(&digits, "{d}", .{n}) catch return "?";
+    var i: usize = 0;
+    for (d, 0..) |c, k| {
+        if (k > 0 and (d.len - k) % 3 == 0 and i < buf.len) {
+            buf[i] = ',';
+            i += 1;
+        }
+        if (i < buf.len) {
+            buf[i] = c;
+            i += 1;
+        }
+    }
+    return buf[0..i];
+}
+
+pub const HeaderIn = struct {
+    link: Link,
+    port: u16,
+    loading: bool = false,
+    updating: bool = false,
+    starting: bool = false,
+    model: ?[]const u8 = null,
+    mem_mb: ?u64 = null,
+    bar_version: []const u8 = "",
+    update_available: bool = false,
+    latest: []const u8 = "",
+    up_to_date: bool = false,
+    decoding: bool = false,
+    live: ?f64 = null,
+    last: ?f64 = null,
+    last_prefill: ?f64 = null,
+    gpu_mhz: ?u64 = null,
+    gpu_pct: ?u64 = null,
+};
+
+pub const Stat = struct { value: []const u8, label: []const u8 };
+
+pub const Header = struct {
+    color_icon: bool,
+    version: []const u8,
+    /// The end of `version` that the card draws in the accent colour.
+    version_tail: []const u8,
+    pill: Pill,
+    line1: []const u8,
+    line2: []const u8,
+    show_stats: bool,
+    stats: [3]Stat,
+    a11y: []const u8,
+};
+
+const dash = "–";
+
+fn fmt(a: std.mem.Allocator, comptime f: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(a, f, args) catch "";
+}
+
+/// Everything the menu's header card shows, as strings; the view only draws them.
+pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
+    const answering = in.link != .offline;
+    var h: Header = undefined;
+    h.color_icon = answering;
+    h.pill = pillFor(in.link, in.loading, in.updating, in.starting);
+    h.version_tail = "";
+    h.version = if (in.update_available and in.latest.len > 0)
+        fmt(a, "{s}{s}", .{ in.bar_version, blk: {
+            h.version_tail = fmt(a, " · {s} available", .{in.latest});
+            break :blk h.version_tail;
+        } })
+    else if (in.up_to_date and in.bar_version.len > 0)
+        fmt(a, "{s} · up to date", .{in.bar_version})
+    else
+        in.bar_version;
+    if (in.link == .offline) {
+        h.line1 = if (in.starting) "Starting…" else "Not running";
+        h.line2 = fmt(a, "Port {d}", .{in.port});
+    } else if (in.link == .unauthorized) {
+        h.line1 = "API key required";
+        h.line2 = fmt(a, "Port {d}", .{in.port});
+    } else if (in.model) |m| {
+        h.line1 = m;
+        h.line2 = if (in.loading)
+            fmt(a, "Loading · Port {d}", .{in.port})
+        else if (in.mem_mb) |mb|
+            fmt(a, "Port {d} · {d:.1} GB in use", .{ in.port, @as(f64, @floatFromInt(mb)) / 1024.0 })
+        else
+            fmt(a, "Port {d}", .{in.port});
+    } else {
+        h.line1 = "No model loaded";
+        h.line2 = fmt(a, "Port {d}", .{in.port});
+    }
+    h.show_stats = in.link == .up and in.model != null;
+
+    var tmp: [32]u8 = undefined;
+    const speed: ?f64 = if (in.decoding) in.live else in.last;
+    h.stats[0] = .{
+        .value = if (speed) |t| fmt(a, "{d:.1}", .{t}) else dash,
+        .label = if (!in.decoding and in.last != null) "DECODE · LAST" else "DECODE",
+    };
+    h.stats[1] = .{ .value = if (in.last_prefill) |t| try a.dupe(u8, thousands(&tmp, @intFromFloat(@round(t)))) else dash, .label = "PREFILL" };
+    const mhz_ok = (in.gpu_mhz orelse 0) > 0;
+    h.stats[2] = .{
+        .value = if (mhz_ok) try a.dupe(u8, thousands(&tmp, in.gpu_mhz.?)) else dash,
+        .label = if (in.gpu_pct) |p| fmt(a, "GPU MHZ · {d}%", .{p}) else "GPU MHZ",
+    };
+
+    var state_word: [24]u8 = undefined;
+    const word = std.ascii.lowerString(&state_word, if (in.link == .offline and !in.starting) "stopped" else h.pill.label);
+    var out = fmt(a, "sushi {s} on port {d}", .{ word, in.port });
+    if (in.link == .offline and !in.starting) out = fmt(a, "sushi stopped, port {d}", .{in.port});
+    if (in.model) |m| out = fmt(a, "{s}, {s}", .{ out, m });
+    if (speed) |t| out = fmt(a, "{s}, decode {d:.0} tokens per second", .{ out, t });
+    h.a11y = out;
+    return h;
+}
+
+// ── The sparkline ────────────────────────────────────────────────────────
+
+/// `x` is 0 (window start) to 1 (now), `v` the decode tok/s over the interval ending there; `gap` means no line
+/// joins it to the point before (server down, a restart, the first point).
+pub const SparkPoint = struct { x: f32, v: f32, gap: bool };
+
+pub const PlotPoint = struct { x: f64, y: f64, gap: bool };
+
+/// Sparkline points in view coordinates: the window spans `left` to `left + inner_w`, and the series' own peak (plus
+/// a tenth of headroom) sits at `top`, zero at `bottom`.
+pub fn plotSpark(out: []PlotPoint, pts: []const SparkPoint, left: f64, inner_w: f64, top: f64, bottom: f64) []PlotPoint {
+    var peak: f64 = 1;
+    for (pts) |p| peak = @max(peak, p.v);
+    peak *= 1.1;
+    const n = @min(out.len, pts.len);
+    for (pts[0..n], 0..) |p, i| {
+        const x01 = std.math.clamp(@as(f64, p.x), 0, 1);
+        out[i] = .{ .x = left + x01 * inner_w, .y = bottom - std.math.clamp(p.v / peak, 0, 1) * (bottom - top), .gap = p.gap };
+    }
+    return out[0..n];
+}
+
+const spark_max_dt_ms: i64 = 5000;
+
+pub fn sparkPoints(out: []SparkPoint, hist: []const Hist, now_ms: i64, window_ms: i64) []SparkPoint {
+    var n: usize = 0;
+    const start = now_ms - window_ms;
+    var prev_emitted = false;
+    var i: usize = 1;
+    while (i < hist.len and n < out.len) : (i += 1) {
+        const a = hist[i - 1];
+        const b = hist[i];
+        if (b.t_ms < start) continue;
+        const dt = b.t_ms - a.t_ms;
+        const x: f32 = @floatCast(@min(1.0, @as(f64, @floatFromInt(b.t_ms - start)) / @as(f64, @floatFromInt(window_ms))));
+        if (b.gen < a.gen or dt <= 0) {
+            out[n] = .{ .x = x, .v = 0, .gap = true };
+            prev_emitted = true;
+            n += 1;
+            continue;
+        }
+        const rate = @as(f64, @floatFromInt(b.gen - a.gen)) * 1000.0 / @as(f64, @floatFromInt(dt));
+        out[n] = .{ .x = x, .v = @floatCast(rate), .gap = !prev_emitted or dt > spark_max_dt_ms };
+        prev_emitted = true;
+        n += 1;
+    }
+    return out[0..n];
 }
 
 // ── Pid files and processes ──────────────────────────────────────────────
@@ -485,6 +749,9 @@ pub fn planStop(ours: ?i32, watched: u16, listeners: []const Listener) StopPlan 
 pub fn parsePortText(text: []const u8) ?u16 {
     return parsePort(std.mem.trim(u8, text, " \t\r\n"));
 }
+
+pub const port_placeholder: [*:0]const u8 = "e.g. 8080";
+pub const port_hint: [*:0]const u8 = "1–65535";
 
 /// An explicit `--port` beats the saved one, which beats the server's default.
 pub fn choosePort(explicit: ?u16, saved: ?u16) u16 {
@@ -672,29 +939,235 @@ test "update: sushibar relaunches only when the sushi beside it changed version"
     try std.testing.expect(!relaunchNeeded("", "1.6.0"));
 }
 
-test "update menu: version line, check item, update item and the brew command" {
-    var b: [160]u8 = undefined;
-    var c: [160]u8 = undefined;
-    try std.testing.expectEqualStrings("sushi 1.5.0", versionText(&b, .{ .bar_version = "1.5.0", .server_version = "1.5.0" }));
-    try std.testing.expectEqualStrings("sushi 1.5.0 (server on this port: 1.4.0)", versionText(&b, .{ .bar_version = "1.5.0", .server_version = "1.4.0" }));
-    try std.testing.expectEqualStrings("sushi version unknown", versionText(&b, .{}));
-    try std.testing.expectEqualStrings("Check for Updates", checkLabel(&b, .{}));
-    try std.testing.expectEqualStrings("Check for Updates — Up to date", checkLabel(&b, .{ .note = "Up to date" }));
-    try std.testing.expectEqualStrings("Checking for updates…", checkLabel(&b, .{ .busy = .checking }));
-    try std.testing.expectEqualStrings("Updating…", checkLabel(&b, .{ .busy = .updating }));
-    try std.testing.expect(updateLabel(&b, .{}) == null);
-    try std.testing.expectEqualStrings("● Update to sushi 1.6.0", updateLabel(&b, .{ .available = true, .latest = "1.6.0", .path = .server }).?);
-    try std.testing.expectEqualStrings("● sushi 1.6.0 available: brew upgrade sushi", updateLabel(&c, .{ .available = true, .latest = "1.6.0", .path = .brew, .command = "brew upgrade sushi" }).?);
-    try std.testing.expect(updateEnabled(.{ .available = true, .latest = "1.6.0", .path = .server }));
-    try std.testing.expect(!updateEnabled(.{ .available = true, .latest = "1.6.0", .path = .brew }));
-    try std.testing.expect(!updateEnabled(.{ .available = true, .latest = "1.6.0", .path = .cli, .busy = .updating }));
-}
-
 test "update menu: a dot on the button while an update waits" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("•", title(&b, .{ .link = .up, .update_waiting = true }));
-    try std.testing.expectEqualStrings("last 88.0 tok/s •", title(&b, .{ .link = .up, .last = 88, .update_waiting = true }));
+    try std.testing.expectEqualStrings("88.0 tok/s •", title(&b, .{ .link = .up, .last = 88, .update_waiting = true }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .update_waiting = false }));
+}
+
+test "header: the pill names the server's state" {
+    try std.testing.expectEqualStrings("Running", pillFor(.up, false, false, false).label);
+    try std.testing.expectEqual(Tone.green, pillFor(.up, false, false, false).tone);
+    try std.testing.expectEqualStrings("Loading", pillFor(.up, true, false, false).label);
+    try std.testing.expectEqualStrings("Loading", pillFor(.offline, false, false, true).label);
+    try std.testing.expectEqualStrings("Stopped", pillFor(.offline, false, false, false).label);
+    try std.testing.expectEqual(Tone.grey, pillFor(.offline, false, false, false).tone);
+    try std.testing.expectEqualStrings("Key needed", pillFor(.unauthorized, false, false, false).label);
+    try std.testing.expectEqual(Tone.orange, pillFor(.unauthorized, false, false, false).tone);
+    try std.testing.expectEqualStrings("Metrics off", pillFor(.metrics_off, false, false, false).label);
+    try std.testing.expectEqualStrings("Updating…", pillFor(.up, false, true, false).label);
+    try std.testing.expectEqual(Tone.orange, pillFor(.up, false, true, false).tone);
+}
+
+test "header: thousands separators" {
+    var b: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("0", thousands(&b, 0));
+    try std.testing.expectEqualStrings("999", thousands(&b, 999));
+    try std.testing.expectEqualStrings("5,844", thousands(&b, 5844));
+    try std.testing.expectEqualStrings("1,195", thousands(&b, 1195));
+    try std.testing.expectEqualStrings("1,234,567", thousands(&b, 1234567));
+}
+
+test "header: a running model with throughput" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const h = try buildHeader(arena.allocator(), .{
+        .link = .up, .port = 12345, .model = "DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .mem_mb = 49971,
+        .bar_version = "1.5.0-dev1", .up_to_date = true,
+        .decoding = true, .live = 105.27, .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
+    });
+    try std.testing.expect(h.color_icon);
+    try std.testing.expectEqualStrings("1.5.0-dev1 · up to date", h.version);
+    try std.testing.expectEqualStrings("Running", h.pill.label);
+    try std.testing.expectEqualStrings("DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", h.line1);
+    try std.testing.expectEqualStrings("Port 12345 · 48.8 GB in use", h.line2);
+    try std.testing.expect(h.show_stats);
+    try std.testing.expectEqualStrings("105.3", h.stats[0].value);
+    try std.testing.expectEqualStrings("DECODE", h.stats[0].label);
+    try std.testing.expectEqualStrings("5,844", h.stats[1].value);
+    try std.testing.expectEqualStrings("PREFILL", h.stats[1].label);
+    try std.testing.expectEqualStrings("1,195", h.stats[2].value);
+    try std.testing.expectEqualStrings("GPU MHZ · 62%", h.stats[2].label);
+    try std.testing.expectEqualStrings("sushi running on port 12345, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw, decode 105 tokens per second", h.a11y);
+}
+
+test "header: idle shows the last request, gaps show a dash, an update is named" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const h = try buildHeader(arena.allocator(), .{
+        .link = .up, .port = 12345, .model = "m", .bar_version = "1.5.0", .update_available = true, .latest = "1.5.1",
+        .last = 88.04,
+    });
+    try std.testing.expectEqualStrings("1.5.0 · 1.5.1 available", h.version);
+    try std.testing.expectEqualStrings("88.0", h.stats[0].value);
+    try std.testing.expectEqualStrings("DECODE · LAST", h.stats[0].label);
+    try std.testing.expectEqualStrings("–", h.stats[1].value);
+    try std.testing.expectEqualStrings("–", h.stats[2].value);
+    try std.testing.expectEqualStrings("GPU MHZ", h.stats[2].label);
+    try std.testing.expectEqualStrings("Port 12345", h.line2);
+}
+
+test "header: no model, stopped, key needed, loading" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none = try buildHeader(a, .{ .link = .up, .port = 12345, .bar_version = "1.5.0" });
+    try std.testing.expectEqualStrings("No model loaded", none.line1);
+    try std.testing.expectEqualStrings("Port 12345", none.line2);
+    try std.testing.expect(!none.show_stats);
+    const stale = try buildHeader(a, .{ .link = .metrics_off, .port = 12345 });
+    try std.testing.expect(!stale.show_stats);
+    const off = try buildHeader(a, .{ .link = .offline, .port = 18801, .bar_version = "1.5.0" });
+    try std.testing.expect(!off.color_icon and !off.show_stats);
+    try std.testing.expectEqualStrings("Not running", off.line1);
+    try std.testing.expectEqualStrings("Port 18801", off.line2);
+    try std.testing.expectEqualStrings("sushi stopped, port 18801", off.a11y);
+    const key = try buildHeader(a, .{ .link = .unauthorized, .port = 12345 });
+    try std.testing.expectEqualStrings("API key required", key.line1);
+    try std.testing.expect(key.color_icon and !key.show_stats);
+    const load = try buildHeader(a, .{ .link = .up, .loading = true, .model = "Qwen", .port = 12345 });
+    try std.testing.expectEqualStrings("Qwen", load.line1);
+    try std.testing.expectEqualStrings("Loading · Port 12345", load.line2);
+}
+
+test "sparkline: rates between samples, gaps where the server was down or restarted" {
+    const win: i64 = 300_000;
+    const now: i64 = 1_000_000;
+    const h = [_]Hist{
+        .{ .t_ms = now - 10_000, .gen = 100 }, .{ .t_ms = now - 8_000, .gen = 300 }, .{ .t_ms = now - 6_000, .gen = 300 },
+        .{ .t_ms = now - 2_000, .gen = 50 }, // counter went back: a restart
+        .{ .t_ms = now, .gen = 150 },
+    };
+    var out: [8]SparkPoint = undefined;
+    const pts = sparkPoints(&out, &h, now, win);
+    try std.testing.expectEqual(@as(usize, 4), pts.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), pts[0].v, 1e-3);
+    try std.testing.expect(pts[0].gap);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), pts[1].v, 1e-3);
+    try std.testing.expect(!pts[1].gap);
+    try std.testing.expect(pts[2].gap);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), pts[3].v, 1e-3);
+    try std.testing.expect(!pts[3].gap);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), pts[3].x, 1e-6);
+    try std.testing.expect(pts[0].x > 0.97 and pts[0].x < 0.98);
+    const old = [_]Hist{ .{ .t_ms = now - 400_000, .gen = 1 }, .{ .t_ms = now - 398_000, .gen = 9 } };
+    try std.testing.expectEqual(@as(usize, 0), sparkPoints(&out, &old, now, win).len);
+    const down = [_]Hist{ .{ .t_ms = now - 60_000, .gen = 10 }, .{ .t_ms = now - 58_000, .gen = 30 }, .{ .t_ms = now - 20_000, .gen = 90 } };
+    const g = sparkPoints(&out, &down, now, win);
+    try std.testing.expect(g.len == 2 and g[1].gap);
+}
+
+test "sparkline plot: the window maps onto the inner width, nothing leaves it, a gap splits the path" {
+    const win: i64 = 300_000;
+    const now: i64 = 1_000_000;
+    const h = [_]Hist{
+        .{ .t_ms = now - win - 2_000, .gen = 0 }, .{ .t_ms = now - win, .gen = 200 }, .{ .t_ms = now - 150_000, .gen = 20_000 },
+        .{ .t_ms = now - 149_000, .gen = 20_100 }, .{ .t_ms = now - 100_000, .gen = 30_000 }, .{ .t_ms = now, .gen = 30_200 },
+    };
+    var sp: [8]SparkPoint = undefined;
+    const pts = sparkPoints(&sp, &h, now, win);
+    var pl: [8]PlotPoint = undefined;
+    const plot = plotSpark(&pl, pts, 12, 276, 4, 28);
+    try std.testing.expectEqual(pts.len, plot.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 12), plot[0].x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 288), plot[plot.len - 1].x, 1e-6);
+    for (plot) |p| {
+        try std.testing.expect(p.x >= 12 and p.x <= 288);
+        try std.testing.expect(p.y >= 4 and p.y <= 28);
+    }
+    try std.testing.expect(plot[1].gap and !plot[2].gap and plot[3].gap);
+    var peak: f64 = 28;
+    for (plot) |p| peak = @min(peak, p.y);
+    try std.testing.expect(peak > 4 and peak < 8);
+}
+
+test "header: an available update names its version in a tail of its own" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const up = try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .update_available = true, .latest = "1.5.1" });
+    try std.testing.expectEqualStrings("1.5.0 · 1.5.1 available", up.version);
+    try std.testing.expectEqualStrings(" · 1.5.1 available", up.version_tail);
+    const same = try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .up_to_date = true });
+    try std.testing.expectEqualStrings("", same.version_tail);
+}
+
+test "sparkline: /metrics.json history is read by field name" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\{"gauges":{"memory_mb":50000,"gpu_clock_mhz":1195,"gpu_utilization_pct":62,"requests_prefilling":0},"sessions":[],
+        \\"history":{"interval_ms":2000,"capacity":1800,"started_ms":1,"fields":["t_ms","gen_tokens","prefill_tokens","gpu_mhz"],
+        \\"samples":[[1700000000000,10,0,900],[1700000002000,50,0,1000]]},"requests":[
+        \\{"t_ms":5,"prompt_tokens":600,"prefill_seconds":0.5,"generated_tokens":10,"decode_seconds":1.0}]}
+    ;
+    const s = try parseMetrics(arena.allocator(), body);
+    try std.testing.expectEqual(@as(?u64, 50000), s.mem_mb);
+    try std.testing.expectEqual(@as(?u64, 1195), s.gpu_mhz);
+    try std.testing.expectEqual(@as(?u64, 62), s.gpu_pct);
+    try std.testing.expectEqual(@as(usize, 2), s.hist.len);
+    try std.testing.expectEqual(@as(i64, 1700000002000), s.hist[1].t_ms);
+    try std.testing.expectEqual(@as(u64, 50), s.hist[1].gen);
+    try std.testing.expectApproxEqAbs(@as(f64, 1200), s.finished_prefill_tps.?, 1e-6);
+    const bare = try parseMetrics(arena.allocator(), "{\"gauges\":{}}");
+    try std.testing.expect(bare.mem_mb == null and bare.gpu_mhz == null and bare.hist.len == 0);
+}
+
+test "models: ready and loading are told apart" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ready = try parseModelState(a, "{\"data\":[{\"id\":\"a\",\"state\":\"unloaded\"},{\"id\":\"b\",\"state\":\"ready\"}]}");
+    try std.testing.expectEqualStrings("b", ready.ready.?);
+    try std.testing.expect(ready.loading == null);
+    const loading = try parseModelState(a, "{\"data\":[{\"id\":\"c\",\"state\":\"loading\"}]}");
+    try std.testing.expect(loading.ready == null);
+    try std.testing.expectEqualStrings("c", loading.loading.?);
+}
+
+test "menu: the one server toggle" {
+    const t0 = toggle(.{ .link = .offline }, false);
+    try std.testing.expectEqualStrings("Start Server", t0.label);
+    try std.testing.expect(t0.enabled and t0.action == .start);
+    try std.testing.expectEqualStrings("play.fill", t0.symbol);
+    const ours = toggle(.{ .link = .up, .ours_alive = true }, false);
+    try std.testing.expectEqualStrings("Stop Server", ours.label);
+    try std.testing.expect(ours.enabled and ours.action == .stop);
+    try std.testing.expectEqualStrings("stop.fill", ours.symbol);
+    const foreign = toggle(.{ .link = .up, .sushi_listening = true }, false);
+    try std.testing.expectEqualStrings("Stop Server…", foreign.label);
+    const starting = toggle(.{ .link = .offline, .ours_alive = true }, false);
+    try std.testing.expectEqualStrings("Starting…", starting.label);
+    try std.testing.expect(!starting.enabled and starting.action == .none);
+    const stopping = toggle(.{ .link = .up, .ours_alive = true }, true);
+    try std.testing.expectEqualStrings("Stopping…", stopping.label);
+    try std.testing.expect(!stopping.enabled);
+    const taken = toggle(.{ .link = .offline, .port_taken = true }, false);
+    try std.testing.expect(!taken.enabled and taken.action == .none);
+    const nobin = toggle(.{ .link = .offline, .sushi_found = false }, false);
+    try std.testing.expect(!nobin.enabled);
+    try std.testing.expect(openEnabled(.up) and openEnabled(.unauthorized) and openEnabled(.metrics_off) and !openEnabled(.offline));
+}
+
+test "menu: update group labels" {
+    var b: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Check for Updates…", checkLabel(&b, .{}));
+    try std.testing.expectEqualStrings("Checking…", checkLabel(&b, .{ .busy = .checking }));
+    try std.testing.expectEqualStrings("Updating…", checkLabel(&b, .{ .busy = .updating }));
+    try std.testing.expectEqualStrings("Check for Updates… — disk full", checkLabel(&b, .{ .note = "disk full" }));
+    try std.testing.expectEqualStrings("Update to sushi 1.5.1", updateLabel(&b, .{ .available = true, .latest = "1.5.1", .path = .server }).?);
+    try std.testing.expect(updateLabel(&b, .{}) == null);
+    try std.testing.expectEqualStrings("Copy “brew upgrade sushi”", copyLabel(&b, "brew upgrade sushi"));
+}
+
+test "title: the last request's speed is dim and drops the word last" {
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("88.0 tok/s", title(&b, .{ .link = .up, .last = 88 }));
+    try std.testing.expect(titleDim(.{ .link = .up, .last = 88 }));
+    try std.testing.expect(!titleDim(.{ .link = .up, .decoding = true, .live = 5, .last = 88 }));
+    try std.testing.expect(!titleDim(.{ .link = .up }));
+    try std.testing.expect(!titleDim(.{ .link = .offline, .last = 4 }));
 }
 
 test "args: no argument runs on the server's default port" {
@@ -801,7 +1274,7 @@ test "title: live, last, prefill, idle, offline, unauthorized, metrics off" {
     try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .last = 9 }));
     try std.testing.expectEqualStrings("… tok/s", title(&b, .{ .link = .up, .decoding = true }));
     try std.testing.expectEqualStrings("prefill…", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
-    try std.testing.expectEqualStrings("last 88.0 tok/s", title(&b, .{ .link = .up, .last = 88 }));
+    try std.testing.expectEqualStrings("88.0 tok/s", title(&b, .{ .link = .up, .last = 88 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .last = 5, .decoding = true }));
     try std.testing.expectEqualStrings("key needed", title(&b, .{ .link = .unauthorized, .last = 5 }));

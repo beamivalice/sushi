@@ -45,9 +45,17 @@ pub fn nsString(s: [*:0]const u8) id {
 
 pub const Method = struct { selector: [*:0]const u8, imp: *const anyopaque, types: [*:0]const u8 };
 
+pub const NSPoint = extern struct { x: f64, y: f64 };
+pub const NSSize = extern struct { width: f64, height: f64 };
+pub const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
+
 /// A subclass of NSObject named `name` whose instance methods are `methods`.
 pub fn defineClass(name: [*:0]const u8, methods: []const Method) id {
-    const cls = objc_allocateClassPair(class("NSObject"), name, 0);
+    return defineSubclass("NSObject", name, methods);
+}
+
+pub fn defineSubclass(super: [*:0]const u8, name: [*:0]const u8, methods: []const Method) id {
+    const cls = objc_allocateClassPair(class(super), name, 0);
     for (methods) |m| _ = class_addMethod(cls, sel_registerName(m.selector), m.imp, m.types);
     objc_registerClassPair(cls);
     return cls;
@@ -67,4 +75,13 @@ pub fn copyText(text: [*:0]const u8) void {
     const pb = msg(id, class("NSPasteboard"), "generalPasteboard", .{});
     _ = msg(isize, pb, "clearContents", .{});
     _ = msg(bool, pb, "setString:forType:", .{ nsString(text), NSPasteboardTypeString });
+}
+
+/// An NSImage from SVG bytes, `w` x `h` points; a template image is tinted by the system.
+pub fn loadSvg(svg: []const u8, template: bool, w: f64, h: f64) id {
+    const data = msg(id, class("NSData"), "dataWithBytes:length:", .{ svg.ptr, svg.len });
+    const image = msg(id, msg(id, class("NSImage"), "alloc", .{}), "initWithData:", .{data});
+    msg(void, image, "setSize:", .{NSSize{ .width = w, .height = h }});
+    msg(void, image, "setTemplate:", .{template});
+    return image;
 }

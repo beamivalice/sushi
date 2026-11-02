@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 146 vars. By kind: tradeoff levers 14, diagnostics 52, microbenches 19, test-only seams 51, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 147 vars. By kind: tradeoff levers 14, diagnostics 52, microbenches 19, test-only seams 52, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -97,7 +97,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load; arm list; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `qwen4_qsa_gather.zig` | QSA prefill/wide meters | test | no |
 
-## Test-only seams (51)
+## Test-only seams (52)
 
 Inputs and hooks that real-pack tests and scripts use.
 
@@ -116,7 +116,8 @@ Inputs and hooks that real-pack tests and scripts use.
 | `SUSHI_TEST_LOAD_DELAY_MS` | `model_load.zig` (`startupLoadDelayMs`) | `<ms>` holds the `--model` startup load after its refusals, before the weights, so a test can observe the server listening during the load (`tests/test_early_listener.sh`) | load | yes: server-lifecycle, tests/CLAUDE |
 | `SUSHI_MODELS_DIR` | `test_models.zig:7` | root for real-pack tests (`${SUSHI_MODELS_DIR:-~/.sushi/models}`); the engine itself does not read it | test | yes: tests/CLAUDE |
 | `SUSHI_NO_SUCH_DIAG_SWITCH_PROBE` | `transformer.zig` | unit probe that `diagEnvOnCached` honors `0`/empty/set | test | no |
-| `SUSHIBAR_TEST_POLLS`, `SUSHIBAR_TEST_ACTIONS` | `sushibar_main.zig` (`readTestSeams`) | `sushibar` (not the engine): `N` prints each poll's title, status, Port data, version and update lines to stderr and quits after N polls; `start@2,stop@10,check@3,update@4,port18802@2,confirm@1` runs that action at that poll (`confirm` answers every stop confirmation Yes; without it a test never stops a sushi it did not start) (`tests/test_sushibar.sh`) | once | yes: tests/CLAUDE |
+| `SUSHIBAR_TEST_POLLS`, `SUSHIBAR_TEST_ACTIONS` | `sushibar_main.zig` (`readTestSeams`) | `sushibar` (not the engine): `N` prints each poll's title, status, Port data, version and update lines to stderr and quits after N polls; `start@2,stop@10,check@3,update@4,port18802@2,type8080@3,confirm@1` runs that action at that poll (`type<N>` types N into the Port field and applies it; `confirm` answers every stop confirmation Yes; without it a test never stops a sushi it did not start) (`tests/test_sushibar.sh`) | once | yes: tests/CLAUDE |
+| `SUSHIBAR_RENDER_HEADER` | `sushibar_main.zig` (`main`) | `sushibar` (not the engine): `<dir>` draws the menu's header card for five fixed sample states and the Port field (empty, invalid), light and dark, at 2x into PNGs in `<dir>` and exits, without a screen or a menu bar item | once | yes: server-lifecycle |
 | `SUSHI_UPDATE_API` | `update.zig:28` | replaces `https://api.github.com` for the update check (`tests/test_self_update.sh`) | per update check | yes: server-lifecycle, tests/CLAUDE |
 
 ## Paths and config (8)
