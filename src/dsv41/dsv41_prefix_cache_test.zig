@@ -530,7 +530,7 @@ test "DeepSeek SSD tier split: every restore point on the grid reads back the by
     try glm5_forward.expectArrayBits(cold, warm);
 }
 
-test "DeepSeek SSD tier split: a write-through prefill stages each point with only the rows past the store, and reports the bytes it staged (DSV41_TINY)" {
+test "DeepSeek SSD tier split: a write-through prefill stages the points on the grid and keeps the others live, never copying rows past the store (DSV41_TINY)" {
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -541,7 +541,7 @@ test "DeepSeek SSD tier split: a write-through prefill stages each point with on
     var net: Dsv41Net = undefined;
     try net.load();
     defer net.deinit();
-    var first_buf: [700]u32 = undefined;
+    var first_buf: [800]u32 = undefined;
     const first = dsv41LongPrompt(&net, &first_buf, null, 0);
 
     var hc = try dsv41SplitCache(io, base, "dsv41-split-wt", &net, 128);
@@ -557,8 +557,8 @@ test "DeepSeek SSD tier split: a write-through prefill stages each point with on
     var at: usize = 0;
     var seen_ssm: usize = 0;
     var seen_grown: usize = 0;
-    // Under the tier's floor nothing is written, so the first point is at 512.
-    for ([_]usize{ 512, 188 }, 0..) |n, step| {
+    // Under the tier's floor nothing is written, so the first point is at 512. 700 is off the 128-token grid.
+    for ([_]usize{ 512, 188, 68 }, 0..) |n, step| {
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at .. at + n], .last));
         at += n;
         try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
@@ -566,19 +566,182 @@ test "DeepSeek SSD tier split: a write-through prefill stages each point with on
         const before = hc.disk.?.point_bytes_written;
         hc.writeThroughDsv41(net.m, &cache, first[0..at], false, .{}, cps.items, s, "prefill");
         hc.disk.?.drainWriter();
+        try testing.expect(cps.items[cps.items.len - 1].isReleased());
+        // Every point is kept for the next turn's rollback, staged or not.
+        try testing.expectEqual(at, hc.live_dsv41.points.items[hc.live_dsv41.points.items.len - 1].pos);
+        if (step == 1) {
+            try testing.expectEqual(before, hc.disk.?.point_bytes_written);
+            try testing.expectEqual(@as(usize, 1), hc.disk.?.entries.items[0].ssm_positions.len);
+            continue;
+        }
         const e = &hc.disk.?.entries.items[0];
         // What the call reports is what the entry's files gained: the new point and the new segments.
         var gained: u64 = 0;
         for (e.ssm_bytes[seen_ssm..]) |b| gained += b;
         for (e.grown[seen_grown..]) |b| gained += b;
         try testing.expectEqual(gained, hc.disk.?.point_bytes_written - before);
-        // The first point stores four spans; the second only the one past them, not the rows from 0.
-        try testing.expectEqual(@as(usize, if (step == 0) 4 else 1), e.grown.len - seen_grown);
+        // The first point stores four spans; the one at 768 the two past them, and its file keeps no rows of its own.
+        try testing.expectEqual(@as(usize, if (step == 0) 4 else 2), e.grown.len - seen_grown);
         seen_ssm = e.ssm_bytes.len;
         seen_grown = e.grown.len;
-        try testing.expect(cps.items[cps.items.len - 1].isReleased());
     }
-    try testing.expectEqual(@as(usize, 2), hc.disk.?.entries.items[0].ssm_positions.len);
+    const e = &hc.disk.?.entries.items[0];
+    try testing.expectEqualSlices(u32, &.{ 512, 768 }, e.ssm_positions);
+    try testing.expectEqual(e.ssm_bytes[0], e.ssm_bytes[1]);
+}
+
+test "DeepSeek SSD tier split: an heir that restored from its donor links the donor's row segments, restores a full capture's bytes and outlives the donor (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [700]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    // The next turn repeats 400 tokens and goes its own way: the spans to 384 are the donor's rows.
+    var next_buf: [760]u32 = undefined;
+    for (&next_buf, 0..) |*t, i| t.* = if (i < 400) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    var want: [2]SSMCheckpoint = undefined;
+    var made: usize = 0;
+    defer for (want[0..made]) |*cp| cp.deinit(testing.allocator);
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-heir", &net, 128);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(first, &.{ 128, 128, 128, 128, 188 }, 0, &.{ 0, 1, 2, 3, 4 }, &cps);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+
+        // The heir's prefill takes the donor's point at 384 and writes the points behind it through.
+        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
+        try testing.expectEqual(@as(usize, 384), res.matched);
+        var at: usize = 384;
+        for ([_]usize{ 128, 128 }, 0..) |n, i| {
+            _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[at .. at + n], .last));
+            at += n;
+            want[i] = try dsv41_prefix.capture(testing.allocator, net.m, at);
+            made += 1;
+            var one = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, at)};
+            defer one[0].deinit(testing.allocator);
+            cache.step = at;
+            hc.writeThroughDsv41(net.m, &cache, next[0..at], false, .{}, &one, s, "prefill");
+        }
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+        const heir = &hc.disk.?.entries.items[1];
+        try testing.expectEqualSlices(u32, &.{ 512, 640 }, heir.ssm_positions);
+        try testing.expectEqual(@as(u32, 3), heir.inherited_grown);
+        try testing.expectEqual(@as(usize, 5), heir.grown.len);
+    }
+
+    // The donor's directory goes; a fresh tier restores each of the heir's points from what the heir kept.
+    var donor_dir_buf: [128]u8 = undefined;
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-heir", &net, 128);
+        defer hc.deinit();
+        const donor_dir = try std.fmt.bufPrint(&donor_dir_buf, "dsv41-heir/e{d}", .{hc.disk.?.entries.items[0].id});
+        try tmp.dir.deleteTree(io, donor_dir);
+    }
+    var hc = try dsv41SplitCache(io, base, "dsv41-heir", &net, 128);
+    defer hc.deinit();
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    for (want, [_]usize{ 512, 640 }) |w, p| {
+        var one = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer one.deinit();
+        var got = try hc.disk.?.restoreCheckpointInto(&one, 0, @intCast(p), dsv41_prefix.snapshotLayers(net.m), s);
+        defer got.deinit(testing.allocator);
+        try expectCheckpointBits(&w, &got);
+    }
+}
+
+test "DeepSeek SSD tier split: an heir that restored mid-span and recomputed rows up to the divergence stores its own rows there and restores its live state's bytes (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [700]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+    // The next turn repeats 400 tokens, but the donor has no point at 384: the heir restores at 256 and
+    // recomputes 256..400 itself, on chunks the donor never used.
+    var next_buf: [760]u32 = undefined;
+    for (&next_buf, 0..) |*t, i| t.* = if (i < 400) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    var want: [2]SSMCheckpoint = undefined;
+    var made: usize = 0;
+    defer for (want[0..made]) |*cp| cp.deinit(testing.allocator);
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-heir-mid", &net, 128);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(first, &.{ 128, 128, 256, 188 }, 0, &.{ 0, 1, 2, 3 }, &cps);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = first.len;
+        try dsv41_prefix.markRows(&cache);
+        _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+
+        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
+        try testing.expectEqual(@as(usize, 256), res.matched);
+        var at: usize = 256;
+        for ([_]usize{ 90, 38, 128, 128 }) |n| {
+            _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[at .. at + n], .last));
+            at += n;
+            if (at % 128 != 0 or at < kv_disk_cache.MIN_PERSIST_TOKENS) continue;
+            want[made] = try dsv41_prefix.capture(testing.allocator, net.m, at);
+            made += 1;
+            var one = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, at)};
+            defer one[0].deinit(testing.allocator);
+            cache.step = at;
+            hc.writeThroughDsv41(net.m, &cache, next[0..at], false, .{}, &one, s, "prefill");
+        }
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+        const heir = &hc.disk.?.entries.items[1];
+        try testing.expectEqualSlices(u32, &.{ 512, 640 }, heir.ssm_positions);
+        // Spans 1 and 2 (to 256) are the donor's rows; span 3 holds rows the heir computed.
+        try testing.expectEqual(@as(u32, 2), heir.inherited_grown);
+    }
+    var hc = try dsv41SplitCache(io, base, "dsv41-heir-mid", &net, 128);
+    defer hc.deinit();
+    // The donor holds its own state at 512 as well; the heir's entry is the one that must give its live state back.
+    for (want) |w| {
+        var one = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer one.deinit();
+        var got = try hc.disk.?.restoreCheckpointInto(&one, 1, @intCast(w.pos), dsv41_prefix.snapshotLayers(net.m), s);
+        defer got.deinit(testing.allocator);
+        try expectCheckpointBits(&w, &got);
+    }
 }
 
 test "DeepSeek decode point: a restore point taken mid-decode serves the next turn from RAM and from an SSD file, like cold on the same grid (DSV41_TINY)" {
@@ -690,6 +853,220 @@ test "DeepSeek decode point: a restore point taken mid-decode serves the next tu
     try glm5_forward.expectArrayBits(cold, warm);
 }
 
+const flush_first_len = 600;
+const flush_prompt_end = 570;
+const flush_thought = flush_first_len + 24;
+
+/// One tools-style turn over a split tier: a grid point and the prompt-end point written through, 24 decoded tokens, a
+/// thought point behind them, 16 more tokens, then the commit and the live record's publish. `want_*` are owned captures.
+fn flushTurn(net: *Dsv41Net, hc: *pc.HotPrefixCache, first: []const u32, gen: []const u32, want_end: *SSMCheckpoint, want_thought: *SSMCheckpoint) !void {
+    const s = mlx.gpuStream();
+    dsv41_model.resetState(net.m);
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    var at: usize = 0;
+    for ([_]usize{ 512, flush_prompt_end }) |point| {
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at..point], .last));
+        at = point;
+        if (point == flush_prompt_end) want_end.* = try dsv41_prefix.capture(testing.allocator, net.m, point);
+        try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, point));
+        cache.step = point;
+        hc.writeThroughDsv41(net.m, &cache, first[0..point], false, .{}, cps.items, s, "prefill");
+    }
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at..], .last));
+    for (gen[0..24]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
+    var tokens: [flush_thought]u32 = undefined;
+    @memcpy(tokens[0..flush_first_len], first);
+    @memcpy(tokens[flush_first_len..], gen[0..24]);
+    cache.step = flush_thought;
+    want_thought.* = try dsv41_prefix.capture(testing.allocator, net.m, flush_thought);
+    try hc.writeDecodePointDsv41(&cache, net.m, &tokens, false, .{}, s);
+    for (gen[24..]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
+    var all: [flush_first_len + 40]u32 = undefined;
+    @memcpy(all[0..flush_first_len], first);
+    @memcpy(all[flush_first_len..], gen);
+    cache.step = all.len;
+    try dsv41_prefix.markRows(&cache);
+    _ = try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
+    _ = hc.publishLiveDsv41(net.m, &all, false, .{}, cache.config);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+}
+
+fn flushTurnTokens(net: *const Dsv41Net, first_buf: *[flush_first_len]u32, gen: *[40]u32) []const u32 {
+    const first = dsv41LongPrompt(net, first_buf, null, 0);
+    for (gen, 0..) |*t, i| t.* = (net.ids[(i * 7 + 1) % net.ids.len] + 3) % 90;
+    return first;
+}
+
+fn expectPointOnDisk(hc: *pc.HotPrefixCache, net: *Dsv41Net, want: *const SSMCheckpoint) !void {
+    var one = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer one.deinit();
+    var got = try hc.disk.?.restoreCheckpointInto(&one, 0, @intCast(want.pos), dsv41_prefix.snapshotLayers(net.m), mlx.gpuStream());
+    defer got.deinit(testing.allocator);
+    try expectCheckpointBits(want, &got);
+}
+
+test "DeepSeek live flush: another conversation takes the model and every point of the first still stands on SSD, the earlier ones too, byte for byte (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [flush_first_len]u32 = undefined;
+    var gen: [40]u32 = undefined;
+    const first = flushTurnTokens(&net, &first_buf, &gen);
+    var other: [300]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = (net.ids[(i * 3 + 1) % net.ids.len] + 11) % 90;
+    try testing.expect(other[0] != first[0]);
+
+    var want_end: SSMCheckpoint = undefined;
+    var want_thought: SSMCheckpoint = undefined;
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-flush", &net, 128);
+        defer hc.deinit();
+        try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
+        // Until the handover only the grid point is on SSD; the other two ride the live record.
+        try testing.expectEqualSlices(u32, &.{512}, hc.disk.?.entries.items[0].ssm_positions);
+        try testing.expectEqual(@as(usize, 3), hc.live_dsv41.points.items.len);
+        const res = try dsv41Lookup(&hc, &net, &other);
+        try testing.expectEqual(@as(usize, 0), res.matched);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqualSlices(u32, &.{ 512, flush_prompt_end, flush_thought }, hc.disk.?.entries.items[0].ssm_positions);
+    }
+    defer want_end.deinit(testing.allocator);
+    defer want_thought.deinit(testing.allocator);
+    var hc = try dsv41SplitCache(io, base, "dsv41-flush", &net, 128);
+    defer hc.deinit();
+    try expectPointOnDisk(&hc, &net, &want_end);
+    try expectPointOnDisk(&hc, &net, &want_thought);
+}
+
+test "DeepSeek live flush: a clean shutdown flushes the same points, and a crash leaves the grid point to restore from and continue like cold (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [flush_first_len]u32 = undefined;
+    var gen: [40]u32 = undefined;
+    const first = flushTurnTokens(&net, &first_buf, &gen);
+    var next_buf: [flush_first_len + 60]u32 = undefined;
+    @memcpy(next_buf[0..flush_first_len], first);
+    @memcpy(next_buf[flush_first_len..flush_thought], gen[0..24]);
+    for (next_buf[flush_thought..], flush_thought..) |*t, i| t.* = (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    var want_end: SSMCheckpoint = undefined;
+    var want_thought: SSMCheckpoint = undefined;
+    {
+        // A crash: the process dies with the live record unflushed.
+        var hc = try dsv41SplitCache(io, base, "dsv41-crash", &net, 128);
+        defer hc.deinit();
+        try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
+    }
+    want_end.deinit(testing.allocator);
+    want_thought.deinit(testing.allocator);
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-crash", &net, 128);
+        defer hc.deinit();
+        try testing.expectEqualSlices(u32, &.{512}, hc.disk.?.entries.items[0].ssm_positions);
+        dsv41_model.resetState(net.m);
+        const res = try dsv41Lookup(&hc, &net, next);
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        const warm = try dsv41_model.extend(net.m, next[512..], .all);
+        defer _ = mlx.mlx_array_free(warm);
+        dsv41_model.resetState(net.m);
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[0..512], .last));
+        const cold = try dsv41_model.extend(net.m, next[512..], .all);
+        defer _ = mlx.mlx_array_free(cold);
+        try glm5_forward.expectArrayBits(cold, warm);
+    }
+
+    // A clean shutdown flushes first; the reboot restores the thought point.
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-clean", &net, 128);
+        defer hc.deinit();
+        try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
+        dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+        hc.disk.?.drainWriter();
+    }
+    defer want_end.deinit(testing.allocator);
+    defer want_thought.deinit(testing.allocator);
+    var hc = try dsv41SplitCache(io, base, "dsv41-clean", &net, 128);
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    const res = try dsv41Lookup(&hc, &net, next);
+    try testing.expectEqual(@as(usize, flush_thought), res.matched);
+    try testing.expect(hc.last_restored_disk_id != null);
+    var got = try dsv41_prefix.capture(testing.allocator, net.m, flush_thought);
+    defer got.deinit(testing.allocator);
+    try expectCheckpointBits(&want_thought, &got);
+    try expectPointOnDisk(&hc, &net, &want_end);
+}
+
+test "DeepSeek live flush: a point inside generated tokens a later turn overwrote is dropped, and a replaced state is not flushed (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [flush_first_len]u32 = undefined;
+    var gen: [40]u32 = undefined;
+    const first = flushTurnTokens(&net, &first_buf, &gen);
+    // The next prompt keeps the generation to its 4th token, so it rolls back to the prompt end and the thought point goes.
+    var next_buf: [flush_first_len + 50]u32 = undefined;
+    @memcpy(next_buf[0..flush_first_len], first);
+    @memcpy(next_buf[flush_first_len .. flush_first_len + 4], gen[0..4]);
+    for (next_buf[flush_first_len + 4 ..], flush_first_len + 4..) |*t, i| t.* = (net.ids[i % net.ids.len] + 1) % 90;
+    const next: []const u32 = &next_buf;
+
+    var want_end: SSMCheckpoint = undefined;
+    var want_thought: SSMCheckpoint = undefined;
+    var hc = try dsv41SplitCache(io, base, "dsv41-drop", &net, 128);
+    defer hc.deinit();
+    try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
+    defer want_end.deinit(testing.allocator);
+    defer want_thought.deinit(testing.allocator);
+    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
+    try testing.expectEqual(@as(usize, flush_prompt_end), res.matched);
+    try testing.expect(hc.last_restored_live);
+    // The turn ends having generated over the old rows.
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[flush_prompt_end..], .last));
+    _ = hc.publishLiveDsv41(net.m, next, false, .{}, target.config);
+    dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+    hc.disk.?.drainWriter();
+    for (hc.disk.?.entries.items) |*e| try testing.expect(std.mem.indexOfScalar(u32, e.ssm_positions, flush_thought) == null);
+    var found = false;
+    for (hc.disk.?.entries.items) |*e| found = found or std.mem.indexOfScalar(u32, e.ssm_positions, flush_prompt_end) != null;
+    try testing.expect(found);
+
+    // The state another conversation replaced has nothing to flush.
+    const before = hc.disk.?.point_bytes_written;
+    dsv41_model.resetState(net.m);
+    dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+    try testing.expectEqual(before, hc.disk.?.point_bytes_written);
+}
+
 test "DeepSeek live rollback: the state rolled back to each kept point is a full capture of that point, byte for byte (DSV41_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -720,7 +1097,7 @@ test "DeepSeek live rollback: the state rolled back to each kept point is a full
             at = mark;
             var cp = try dsv41_prefix.capture(a, net.m, mark);
             defer cp.deinit(a);
-            try live.keep(a, net.m, &cp);
+            try live.keep(a, net.m, &cp, false);
         }
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[at..45], .last));
         live.publish(a, net.m, turn[0..45], false, 0, null);
@@ -755,7 +1132,7 @@ test "DeepSeek live rollback: only a state still standing for the same history s
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[0..20], .last));
     var cp = try dsv41_prefix.capture(a, net.m, 20);
     defer cp.deinit(a);
-    try live.keep(a, net.m, &cp);
+    try live.keep(a, net.m, &cp, false);
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[20..], .last));
     const max: usize = std.math.maxInt(u32);
 
@@ -824,7 +1201,7 @@ test "DeepSeek live rollback: a turn that diverges inside the last turn's genera
         cache.step = all.len;
         try dsv41_prefix.markRows(&cache);
         _ = try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-        hc.publishLiveDsv41(net.m, &all, false, .{});
+        _ = hc.publishLiveDsv41(net.m, &all, false, .{}, cache.config);
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
         // The two points' fixed arrays and the history's ids ride beside the model's state.
@@ -902,7 +1279,7 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
             cache.step = tokens.len;
             try dsv41_prefix.markRows(&cache);
             _ = try h.commitWithState(&cache, tokens, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-            h.publishLiveDsv41(n.m, tokens, false, .{});
+            _ = h.publishLiveDsv41(n.m, tokens, false, .{}, kv_quant.KVQuantConfig.dense);
             h.flushPendingDisk(mlx.gpuStream());
             h.disk.?.drainWriter();
         }
@@ -960,7 +1337,7 @@ test "DeepSeek live rollback: a cancelled request's record, published at the cul
     {
         var cp = try dsv41_prefix.capture(a, net.m, 20);
         defer cp.deinit(a);
-        try live.keep(a, net.m, &cp);
+        try live.keep(a, net.m, &cp, false);
     }
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn_a[20..40], .last));
     live.publish(a, net.m, turn_a[0..40], false, 0, null);
@@ -974,7 +1351,7 @@ test "DeepSeek live rollback: a cancelled request's record, published at the cul
     {
         var cp = try dsv41_prefix.capture(a, net.m, 30);
         defer cp.deinit(a);
-        try live.keep(a, net.m, &cp);
+        try live.keep(a, net.m, &cp, false);
     }
 
     // C continues A's conversation: B's state is no state for it.

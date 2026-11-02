@@ -151,6 +151,8 @@ pub const IndexEntry = struct {
     /// an entry whose restore points hold their own rows.
     grown: []u64 = &.{},
     grown_span: u32 = 0,
+    /// The first `inherited_grown` of them are hard links into a donor entry's: this entry never billed them.
+    inherited_grown: u32 = 0,
     /// v9: the ringed layers' restore points (`r{pos}.safetensors`), ascending; empty for an
     /// entry whose layers all hold the prefix. A ringed entry restores only at one of them. Owned.
     rings: []RingFile = &.{},
@@ -407,6 +409,10 @@ pub const DiskTier = struct {
     ssm_budget_drops: usize = 0,
     /// Bytes of restore-point and row-segment files staged so far, for the write-through log line.
     point_bytes_written: u64 = 0,
+    /// Rows below this position are what the committing request took from a stored entry (a restore or a rollback);
+    /// the rows past it it computed itself. A row segment is linked from another entry only when its span ends at or
+    /// before it, so a restore of the heir is its own state's bytes.
+    rows_base: u32 = std.math.maxInt(u32),
     /// Bytes this tier wrote, by kind. Heap-allocated: the background writer holds the pointer.
     stats: *write_stats.Stats,
     /// Background writer (heap-allocated so the mutex survives `init`'s by-value
@@ -1995,8 +2001,15 @@ pub const DiskTier = struct {
         const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
         const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
         var written_bytes: u64 = 0;
-        const old_grown: []const u64 = if (extend_idx) |i| self.entries.items[i].grown else &[_]u64{};
-        const old_span: u32 = if (extend_idx) |i| self.entries.items[i].grown_span else 0;
+        var linked_grown = std.ArrayList(u64).empty;
+        defer linked_grown.deinit(self.allocator);
+        const seg_donor = if (extend_idx == null) self.segmentDonor(tokens, kv_target, has_tools, config, media) else null;
+        if (seg_donor) |d| self.linkInheritedSegments(d, id, ssm_checkpoints, kv_target, &linked_grown) catch |err| {
+            log.warn("  [disk-cache] segment share: e{d} writes its own row segments: {s}\n", .{ id, @errorName(err) });
+        };
+        const inherited_grown: u32 = if (extend_idx) |i| self.entries.items[i].inherited_grown else @intCast(linked_grown.items.len);
+        const old_grown: []const u64 = if (extend_idx) |i| self.entries.items[i].grown else linked_grown.items;
+        const old_span: u32 = if (extend_idx) |i| self.entries.items[i].grown_span else if (seg_donor) |d| self.entries.items[d.idx].grown_span else 0;
         var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, old_grown, old_span, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
             // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
             // would double-free (the fault-injection test segfaulted on exactly this).
@@ -2080,7 +2093,7 @@ pub const DiskTier = struct {
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
         var non_chunk: u64 = @as(u64, record.len) * 4 + spec_res.bytes;
         for (ssm_res.bytes) |b| non_chunk += b;
-        for (ssm_res.grown) |b| non_chunk += b;
+        for (ssm_res.grown[inherited_grown..]) |b| non_chunk += b;
         for (rings) |r| non_chunk += r.bytes;
         if (!qsa_res.inherited) non_chunk += qsa_res.bytes;
         var bytes: u64 = non_chunk;
@@ -2099,6 +2112,7 @@ pub const DiskTier = struct {
             .ssm_bytes = ssm_res.bytes,
             .grown = ssm_res.grown,
             .grown_span = ssm_res.grown_span,
+            .inherited_grown = inherited_grown,
             .spec_bytes = spec_res.bytes,
             .spec_dflash = spec_res.dflash,
             .spec_mtp = spec_res.mtp,
@@ -3527,7 +3541,18 @@ pub const DiskTier = struct {
         if (self.writer) |w| w.fence(dir_abs);
         var freed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
         for (e.ssm_bytes) |b| freed += b;
-        for (e.grown) |b| freed += b;
+        for (e.grown, 0..) |gb, i| {
+            const gp = std.fmt.allocPrint(self.allocator, "{s}g{d:0>5}.safetensors", .{ dir_abs, i + 1 }) catch {
+                freed += gb;
+                continue;
+            };
+            defer self.allocator.free(gp);
+            if (statFile(self.io, gp)) |st| {
+                if (st.nlink <= 1) freed += st.size;
+            } else if (i >= e.inherited_grown) {
+                freed += gb;
+            }
+        }
         for (e.rings) |r| freed += r.bytes;
         if (e.qsa_history_bytes > 0) {
             if (std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs})) |qp| {
@@ -3576,6 +3601,22 @@ pub const DiskTier = struct {
         return best;
     }
 
+    /// The resident entry holding the most row segments a new entry for `tokens` may link: whole spans inside the prefix
+    /// they share (`commitShares`). Not the chunk donor: a turn that crossed no grid point holds chunks and no segments.
+    fn segmentDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: CommitMedia) ?ChunkDonor {
+        const g = self.grown orelse return null;
+        if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
+        var best: ?ChunkDonor = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.poisoned or e.has_tools != has_tools or !std.meta.eql(e.quant, config) or e.grown_span != g.span) continue;
+            const common: u32 = @min(@min(@as(u32, @intCast(commonPrefixLen(e.tokens, tokens))), commitShares(e, media)), self.rows_base);
+            const usable: u32 = @min(@as(u32, @intCast(e.grown.len)), @min(common, kv_target) / g.span);
+            if (usable == 0) continue;
+            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable, .shared = common };
+        }
+        return best;
+    }
+
     /// `shared`: the leading tokens whose rows the donor and the heir provably agree on.
     pub const ChunkDonor = struct { idx: usize, id: u64, chunks: u32, shared: u32 };
 
@@ -3610,6 +3651,48 @@ pub const DiskTier = struct {
         mb /= 1024.0 * 1024.0;
         log.info("  [disk-cache] chunk share: e{d} inherits {d} chunks ({d:.1} MB) from e{d} by hard link\n", .{ id, linked, mb, d.id });
         return linked;
+    }
+
+    /// Hard-link the donor's landed row segments that a point of this commit leans on and whose whole span lies inside
+    /// the prefix donor and heir share: rows are append-only, so those bytes are the heir's own. Appends their sizes
+    /// to `out`; a failure unwinds every link, leaving `out` empty.
+    fn linkInheritedSegments(self: *DiskTier, d: ChunkDonor, id: u64, cps: ?[]const transformer_mod.SSMCheckpoint, kv_target: u32, out: *std.ArrayList(u64)) !void {
+        const g = self.grown orelse return;
+        const donor = &self.entries.items[d.idx];
+        if (donor.grown_span != g.span) return;
+        var lean: u32 = 0;
+        for (cps orelse return) |*cp| {
+            if (cp.isReleased() or cp.pos > kv_target) continue;
+            lean = @max(lean, pointSegments(g.divs, g.span, cp));
+        }
+        const limit = @min(@min(lean, @as(u32, @intCast(donor.grown.len))), @min(d.shared, kv_target) / g.span);
+        if (limit == 0) return;
+        var root_dir = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
+        defer root_dir.close(self.io);
+        errdefer {
+            var j: u32 = 1;
+            while (j <= out.items.len) : (j += 1) self.unlinkSegment(root_dir, id, j);
+            out.clearRetainingCapacity();
+        }
+        var j: u32 = 1;
+        while (j <= limit) : (j += 1) {
+            const old_abs = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/g{d:0>5}.safetensors", .{ self.root, d.id, j });
+            defer self.allocator.free(old_abs);
+            if (!self.chunkLanded(old_abs, donor.grown[j - 1])) break;
+            const old_sub = try std.fmt.allocPrint(self.allocator, "e{d}/g{d:0>5}.safetensors", .{ d.id, j });
+            defer self.allocator.free(old_sub);
+            const new_sub = try std.fmt.allocPrint(self.allocator, "e{d}/g{d:0>5}.safetensors", .{ id, j });
+            defer self.allocator.free(new_sub);
+            try std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{});
+            try out.append(self.allocator, donor.grown[j - 1]);
+        }
+        if (out.items.len > 0) log.info("  [disk-cache] segment share: e{d} inherits {d} row segments from e{d} by hard link\n", .{ id, out.items.len, d.id });
+    }
+
+    fn unlinkSegment(self: *DiskTier, root_dir: std.Io.Dir, id: u64, j: u32) void {
+        const sub = std.fmt.allocPrint(self.allocator, "e{d}/g{d:0>5}.safetensors", .{ id, j }) catch return;
+        defer self.allocator.free(sub);
+        root_dir.deleteFile(self.io, sub) catch {};
     }
 
     /// Has a chunk file landed: final name, recorded size, and no write to it queued or in flight?
@@ -3741,7 +3824,7 @@ pub const DiskTier = struct {
         }
         try out.appendSlice(a, "]");
         if (e.grown.len > 0) {
-            try out.print(a, ",\"grown\":{{\"span\":{d},\"bytes\":[", .{e.grown_span});
+            try out.print(a, ",\"grown\":{{\"span\":{d},\"inherited\":{d},\"bytes\":[", .{ e.grown_span, e.inherited_grown });
             for (e.grown, 0..) |gb, i| {
                 if (i > 0) try out.appendSlice(a, ",");
                 try out.print(a, "{d}", .{gb});
@@ -3843,7 +3926,14 @@ pub const DiskTier = struct {
     fn billChunksOnce(self: *DiskTier, e: *IndexEntry, seen: *std.AutoHashMap(u64, void)) void {
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
         for (e.ssm_bytes) |b| billed += b;
-        for (e.grown) |b| billed += b;
+        for (e.grown, 0..) |gb, i| {
+            const gp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/g{d:0>5}.safetensors", .{ self.root, e.id, i + 1 }) catch {
+                billed += gb;
+                continue;
+            };
+            defer self.allocator.free(gp);
+            billed += billSharedFile(self.io, gp, gb, seen);
+        }
         for (e.rings) |r| billed += r.bytes;
         if (e.qsa_history_bytes > 0) {
             if (std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id })) |qp| {
@@ -3872,20 +3962,7 @@ pub const DiskTier = struct {
                 continue;
             };
             defer self.allocator.free(cp);
-            const st = statFile(self.io, cp) orelse {
-                billed += cb;
-                continue;
-            };
-            if (st.nlink <= 1) {
-                billed += st.size;
-                continue;
-            }
-            const ino: u64 = @intCast(st.inode);
-            const gop = seen.getOrPut(ino) catch {
-                billed += st.size;
-                continue;
-            };
-            if (!gop.found_existing) billed += st.size;
+            billed += billSharedFile(self.io, cp, cb, seen);
         }
         e.bytes = billed;
     }
@@ -3906,8 +3983,8 @@ pub const DiskTier = struct {
         const version = jsonU64(obj, "v") orelse return null;
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
         // adds optional spec snapshots; v5 the qwen4_exp MTP head's QSA half; v6 inherited
-        // chunks; v9 ring restore points; v10 the media identity. All restore; a lower-version
-        // entry just carries none of the newer state, and a pre-v10 one holds no media row.
+        // chunks; v9 ring restore points; v10 the media identity; v11 row segments. All restore; a
+        // lower-version entry just carries none of the newer state, and a pre-v10 one holds no media row.
         if (version < 2 or version > 11) return null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
         const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
@@ -3988,6 +4065,7 @@ pub const DiskTier = struct {
         var grown_valid: usize = 0;
         var grown_span: u32 = 0;
         var grown_rec_span: u32 = 1;
+        var grown_inherited: u32 = 0;
         if (obj.get("grown")) |gv| grown_blk: {
             if (gv != .object) break :grown_blk;
             const span = jsonInt(u32, gv.object, "span") orelse break :grown_blk;
@@ -3995,6 +4073,7 @@ pub const DiskTier = struct {
             if (list_v != .array or span == 0) break :grown_blk;
             grown_recorded = list_v.array.items;
             grown_rec_span = span;
+            grown_inherited = jsonInt(u32, gv.object, "inherited") orelse break :grown_blk;
             for (grown_recorded, 1..) |bv, j| {
                 if (bv != .integer or bv.integer < 0) break;
                 const gp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/g{d:0>5}.safetensors", .{ self.root, id, j }) catch break;
@@ -4202,6 +4281,7 @@ pub const DiskTier = struct {
                 .tokens = tokens,
                 .grown = grown,
                 .grown_span = grown_span,
+                .inherited_grown = @min(grown_inherited, @as(u32, @intCast(grown_valid))),
                 .kv_len = @intCast(kv_len),
                 .has_tools = has_tools_v.bool,
                 .vision_key = vision_key,
@@ -4236,11 +4316,19 @@ pub const DiskTier = struct {
 
 // ── Small fs helpers ──
 
+/// What a scanned file adds to the bill: its size the first time its inode is seen, 0 after (hard links), `missing` if gone.
+fn billSharedFile(io: std.Io, path: []const u8, missing: u64, seen: *std.AutoHashMap(u64, void)) u64 {
+    const st = statFile(io, path) orelse return missing;
+    if (st.nlink <= 1) return st.size;
+    const gop = seen.getOrPut(@intCast(st.inode)) catch return st.size;
+    return if (gop.found_existing) 0 else st.size;
+}
+
 /// Bytes of an entry's files that are never shared: tokens.bin, the SSM checkpoints and the spec sidecar.
 fn nonChunkBytes(e: *const IndexEntry) u64 {
     var n: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
     for (e.ssm_bytes) |b| n += b;
-    for (e.grown) |b| n += b;
+    for (e.grown[@min(e.inherited_grown, e.grown.len)..]) |b| n += b;
     for (e.rings) |r| n += r.bytes;
     if (!e.inherited_qsa) n += e.qsa_history_bytes;
     return n;
@@ -5562,6 +5650,202 @@ test "DiskTier split rows: an entry's bill is the bytes its files hold, through 
     try testing.expectEqual(written, scanned.total_bytes);
     scanned.removeAt(0);
     try testing.expectEqual(@as(u64, 0), scanned.total_bytes);
+}
+
+/// A tier that may link a donor's files (`chunkShareDonor`), with the grown spec of `growTier`.
+fn shareGrowTier(io: std.Io, base: []const u8, fp: []const u8, writer: bool) !DiskTier {
+    var tier = try growTier(io, base, fp, true, writer);
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    return tier;
+}
+
+fn growSegStat(io: std.Io, tier: *const DiskTier, id: u64, j: usize) ?std.Io.File.Stat {
+    var buf: [1024]u8 = undefined;
+    const p = std.fmt.bufPrint(&buf, "{s}/e{d}/g{d:0>5}.safetensors", .{ tier.root, id, j }) catch return null;
+    return statFile(io, p);
+}
+
+/// Bytes the tier's entry directories hold, a hard-linked file once (meta.json aside).
+fn uniqueDirBytes(io: std.Io, tier: *const DiskTier) !u64 {
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    var sum: u64 = 0;
+    for (tier.entries.items) |*e| {
+        const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, e.id });
+        defer testing.allocator.free(dir);
+        var d = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
+        defer d.close(io);
+        var it = d.iterate();
+        while (try it.next(io)) |ent| {
+            if (ent.kind != .file or std.mem.eql(u8, ent.name, "meta.json")) continue;
+            const p = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir, ent.name });
+            defer testing.allocator.free(p);
+            const st = statFile(io, p).?;
+            if ((try seen.getOrPut(@intCast(st.inode))).found_existing) continue;
+            sum += st.size;
+        }
+    }
+    return sum;
+}
+
+/// The tokens of a conversation that rolled back to `shared` tokens and went on with other ones.
+fn divergedTokens(shared: usize) [600]u32 {
+    var out: [600]u32 = undefined;
+    for (&out, 0..) |*t, i| t.* = if (i < shared) @intCast(i + 7) else @intCast(9000 + i);
+    return out;
+}
+
+/// Commits a donor of 520 tokens with points on the 128-token grid, then an heir of 600 that shares `shared` tokens.
+fn commitDonorAndHeir(tier: *DiskTier, s: mlx.mlx_stream, shared: usize, heir_points: []const usize) !void {
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try fillCache(&donor_cache, s, 3, 520, 8, 0.0, .float32);
+    var a_tokens: [520]u32 = undefined;
+    for (&a_tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    try commitGrowPoints(tier, &donor_cache, &a_tokens, &.{ 128, 256, 384, 512 }, s);
+    tier.drainWriter();
+    const b_tokens = divergedTokens(shared);
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try fillCache(&heir_cache, s, 3, 600, 8, 0.0, .float32);
+    try commitGrowPoints(tier, &heir_cache, &b_tokens, heir_points, s);
+    tier.drainWriter();
+}
+
+test "DiskTier row-segment share: an heir links the donor's whole segments inside the shared prefix and writes the rest" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    for ([_]bool{ false, true }) |writer| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try shareGrowTier(io, base, "fp-gshare", writer);
+        defer tier.deinit();
+        // Rows 0..400 are shared: spans 1..3 (to 384) lie inside it, span 4 (to 512) straddles the divergence.
+        try commitDonorAndHeir(&tier, s, 400, &.{ 512, 577 });
+        const donor_id = tier.entries.items[0].id;
+        try testing.expectEqual(@as(usize, 2), tier.entryCount());
+        const heir = &tier.entries.items[1];
+        try testing.expectEqual(@as(u32, 3), heir.inherited_grown);
+        try testing.expectEqual(@as(usize, 4), heir.grown.len);
+        for (1..4) |j| {
+            const st = growSegStat(io, &tier, heir.id, j).?;
+            try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(st.nlink)));
+            try testing.expectEqual(growSegStat(io, &tier, donor_id, j).?.inode, st.inode);
+            try testing.expectEqual(tier.entries.items[0].grown[j - 1], heir.grown[j - 1]);
+        }
+        try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(growSegStat(io, &tier, heir.id, 4).?.nlink)));
+        // The heir's points read back the arrays a full capture holds, linked rows included.
+        for (heir.ssm_positions) |p| try expectGrowPoint(&tier, heir.id, p, s);
+
+        // A linked segment is billed once: the tier's bill is the bytes the directories hold.
+        try testing.expectEqual(try uniqueDirBytes(io, &tier), tier.total_bytes);
+
+        // Evicting the donor frees none of the linked segments, and the heir restores from them.
+        tier.removeAt(0);
+        const kept = &tier.entries.items[0];
+        try testing.expectEqual(heir.id, kept.id);
+        for (1..4) |j| try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(growSegStat(io, &tier, kept.id, j).?.nlink)));
+        for (kept.ssm_positions) |p| try expectGrowPoint(&tier, kept.id, p, s);
+        try testing.expectEqual(try uniqueDirBytes(io, &tier), tier.total_bytes);
+    }
+}
+
+test "DiskTier row-segment share: a scan accepts linked segments and bills each once; removing the last owner frees them" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var heir_id: u64 = 0;
+    {
+        var tier = try shareGrowTier(io, base, "fp-gscan", false);
+        defer tier.deinit();
+        try commitDonorAndHeir(&tier, s, 400, &.{ 512, 577 });
+        heir_id = tier.entries.items[1].id;
+    }
+    var scanned = try shareGrowTier(io, base, "fp-gscan", false);
+    defer scanned.deinit();
+    try testing.expectEqual(@as(usize, 2), scanned.entryCount());
+    try testing.expectEqual(try uniqueDirBytes(io, &scanned), scanned.total_bytes);
+    for (scanned.entries.items) |*e| {
+        if (e.id != heir_id) continue;
+        try testing.expectEqual(@as(u32, 3), e.inherited_grown);
+        try testing.expectEqual(@as(usize, 4), e.grown.len);
+        for (e.ssm_positions) |p| try expectGrowPoint(&scanned, e.id, p, s);
+    }
+    // Either owner may go first; the bytes leave with the last link.
+    scanned.removeAt(0);
+    try testing.expectEqual(try uniqueDirBytes(io, &scanned), scanned.total_bytes);
+    scanned.removeAt(0);
+    try testing.expectEqual(@as(u64, 0), scanned.total_bytes);
+}
+
+test "DiskTier row-segment share: the segments come from the entry that holds them, not from the newer entry that shares more chunks" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try shareGrowTier(io, base, "fp-gpick", false);
+    defer tier.deinit();
+    // A holds the segments. B is a later turn that diverged from A at 450 and wrote no point, so it holds none.
+    try commitDonorAndHeir(&tier, s, 450, &.{});
+    try testing.expectEqual(@as(usize, 0), tier.entries.items[1].grown.len);
+    // C continues B for 520 tokens: B shares more chunks with it than A does, A more segments.
+    var c_tokens: [600]u32 = undefined;
+    for (&c_tokens, 0..) |*t, i| t.* = if (i < 450) @intCast(i + 7) else if (i < 520) @intCast(9000 + i) else @intCast(20000 + i);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    try commitGrowPoints(&tier, &cache, &c_tokens, &.{ 512, 577 }, s);
+    tier.drainWriter();
+    const c = &tier.entries.items[2];
+    try testing.expectEqual(@as(u32, 3), c.inherited_grown);
+    try testing.expectEqual(@as(usize, 4), c.grown.len);
+    try testing.expectEqual(growSegStat(io, &tier, tier.entries.items[0].id, 1).?.inode, growSegStat(io, &tier, c.id, 1).?.inode);
+    for (c.ssm_positions) |p| try expectGrowPoint(&tier, c.id, p, s);
+}
+
+test "DiskTier row-segment share: only the segments below the rows the heir took from a stored entry are linked, the span it recomputed is written fresh" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try shareGrowTier(io, base, "fp-gbase", false);
+    defer tier.deinit();
+    // The heir shares 400 tokens but restored at 256: span 3 (256..384) holds rows it recomputed.
+    tier.rows_base = 256;
+    try commitDonorAndHeir(&tier, s, 400, &.{ 512, 577 });
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(@as(u32, 2), heir.inherited_grown);
+    try testing.expectEqual(@as(usize, 4), heir.grown.len);
+    try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(growSegStat(io, &tier, heir.id, 2).?.nlink)));
+    try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(growSegStat(io, &tier, heir.id, 3).?.nlink)));
+    for (heir.ssm_positions) |p| try expectGrowPoint(&tier, heir.id, p, s);
+}
+
+test "DiskTier row-segment share: a divergence inside the first span links nothing" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try shareGrowTier(io, base, "fp-gnone", true);
+    defer tier.deinit();
+    try commitDonorAndHeir(&tier, s, 100, &.{512});
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(@as(u32, 0), heir.inherited_grown);
+    try testing.expectEqual(@as(usize, 4), heir.grown.len);
+    for (1..5) |j| try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(growSegStat(io, &tier, heir.id, j).?.nlink)));
+    for (heir.ssm_positions) |p| try expectGrowPoint(&tier, heir.id, p, s);
 }
 
 test "DiskTier split rows: a lost row segment drops the points that lean on it and keeps the rest" {

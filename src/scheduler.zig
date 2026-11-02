@@ -48,7 +48,6 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
-const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
 const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
@@ -1085,6 +1084,8 @@ pub const Scheduler = struct {
     /// same lock (the `hot_cache_digests` discipline, on the queue instead).
     live_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
     live_session_count: usize = 0,
+    /// A DeepSeek live record holds restore points not yet on SSD: the idle park flushes them (`flushLiveStates`).
+    live_unflushed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Submit sequence the session rows carry as `request_id`: taken under
     /// `queue_mu` in `submit`, immutable on the slot, never reused.
     req_seq: u64 = 0,
@@ -2458,7 +2459,19 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (warm_ticks > 0) log.debug("[gpu-warm] idle window over after {d} ticks\n", .{warm_ticks});
                     warm_since = null;
                     warm_ticks = 0;
-                    sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                    if (sch.live_unflushed.load(.acquire)) {
+                        const timed_out = if (sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{
+                            .raw = .fromNanoseconds(live_flush_idle_secs * std.time.ns_per_s),
+                            .clock = .awake,
+                        } })) |_| false else |err| err == error.Timeout;
+                        if (timed_out and !hasWorkPendingLocked(sch)) {
+                            sch.queue_mu.unlock(sch.io);
+                            flushLiveStates(sch, "idle");
+                            sch.queue_mu.lockUncancelable(sch.io);
+                        }
+                    } else {
+                        sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                    }
                 }
             }
             if (sch.shutdown.load(.acquire)) break;
@@ -2623,6 +2636,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         // 5. Cull finished / errored / cancelled from `decoding`.
         cullDecoding(sch);
     }
+    flushLiveStates(sch, "shutdown");
     flushImatrixCaptures(sch);
 }
 
@@ -2748,6 +2762,33 @@ fn slotDonatedBytes(sch: *const Scheduler, s: *const Slot) u64 {
     return hc.donatedBytes(@intFromPtr(s));
 }
 
+/// Seconds of an empty queue after which a DeepSeek record's restore points that are not on SSD are written.
+const live_flush_idle_secs: u64 = 300;
+
+/// Writes the live restore points of one resident model that keeps any (DeepSeek). Inference thread.
+pub fn flushLiveState(entry: *model_registry_mod.LoadedModel, why: []const u8) void {
+    @import("dsv41/dsv41_prefix.zig").flushResident(entry, why);
+}
+
+/// `flushLiveState` for every resident model, the registry lock held only to list them.
+fn flushLiveStates(sch: *Scheduler, why: []const u8) void {
+    sch.live_unflushed.store(false, .release);
+    var picked: [16]*model_registry_mod.LoadedModel = undefined;
+    var n: usize = 0;
+    {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        defer sch.registry.mutex.unlock(sch.io);
+        var it = sch.registry.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            if (n < picked.len and entry_ptr.*.state == .ready) {
+                picked[n] = entry_ptr.*;
+                n += 1;
+            }
+        }
+    }
+    for (picked[0..n]) |entry| flushLiveState(entry, why);
+}
+
 /// Shutdown exit: an armed activation capture is written HERE, the last point
 /// this thread is alive. `Scheduler.deinit` unloads on the caller's thread,
 /// where the capture's mlx stream does not exist.
@@ -2809,7 +2850,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
     @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
-    if (slot.model.transformer) |t| if (t.dsv41) |dsv| hc.publishLiveDsv41(dsv, total_tokens, slot.has_tools, prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start));
+    dsv41_thought_point.publishLive(sch, slot, hc, total_tokens);
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-

@@ -15,6 +15,7 @@ const io_util = @import("../io_util.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const log = @import("../log.zig");
 const pc = @import("../prefix_cache.zig");
+const kv_quant = @import("../kv_quant.zig");
 
 /// Snapshot layers a restore point holds: each model slot's four arrays ride two layers' conv and ssm fields
 /// (the aux and pooled fields mean a QSA history to the cache, so they stay empty). A slot array the
@@ -49,6 +50,11 @@ fn captureWith(allocator: std.mem.Allocator, m: *model.Model, pos: usize, share:
     defer allocator.free(slots);
     @memset(slots, model.nil_slot);
     try if (share) model.captureStateShared(m, slots) else model.captureState(m, slots);
+    return fromSlots(allocator, slots, pos);
+}
+
+/// The checkpoint that takes ownership of the arrays in `slots`, which are freed on a failure.
+fn fromSlots(allocator: std.mem.Allocator, slots: []model.Slot, pos: usize) !transformer.SSMCheckpoint {
     const layers = allocator.alloc(transformer.SSMCacheEntrySnapshot, 2 * slots.len) catch |err| {
         for (slots) |*sl| model.freeSlot(sl);
         return err;
@@ -61,6 +67,15 @@ fn captureWith(allocator: std.mem.Allocator, m: *model.Model, pos: usize, share:
         };
     };
     return .{ .pos = pos, .layers = layers };
+}
+
+/// A kept point of the live state as the checkpoint `captureShared` took there, its rows views of the live ones.
+fn captureLive(allocator: std.mem.Allocator, m: *model.Model, p: *const LivePoint) !transformer.SSMCheckpoint {
+    const slots = try allocator.alloc(model.Slot, p.slots.len);
+    defer allocator.free(slots);
+    @memset(slots, model.nil_slot);
+    try model.captureLiveShared(m, p.slots, p.pos, slots);
+    return fromSlots(allocator, slots, p.pos);
 }
 
 /// Makes the request's state `cp` over the first `cp.pos` of `ids`; the checkpoint's arrays are shared.
@@ -80,7 +95,8 @@ pub fn restore(m: *model.Model, cp: *const transformer.SSMCheckpoint, ids: []con
 pub const live_point_cap: u32 = 8;
 
 /// One kept restore point: the fixed arrays (`captureState`'s non-row slots) at `pos`.
-pub const LivePoint = struct { pos: usize, slots: []model.Slot };
+/// `flushed`: the point's state is on SSD already (written through, or restored from there).
+pub const LivePoint = struct { pos: usize, slots: []model.Slot, flushed: bool = false };
 
 /// The slot's last request, as the next one can roll its live state back into: the points it took and the tokens the
 /// state covers. The rows are the live state's own, append-only, so a point costs its fixed arrays alone. Held only
@@ -91,7 +107,11 @@ pub const Live = struct {
     has_tools: bool = false,
     vision_key: u64 = 0,
     media_start: ?u32 = null,
+    /// The KV scheme of the slot cache the record was published from: the SSD tier keys its entries on it.
+    quant: kv_quant.KVQuantConfig = .dense,
     epoch: u64 = 0,
+    /// Rows below this position are the request's restore or rollback: taken from a stored entry, not computed by it.
+    base: usize = 0,
     /// A request finished over it; false while one is running, whose state is moving past the points.
     ready: bool = false,
 
@@ -106,6 +126,7 @@ pub const Live = struct {
         allocator.free(self.tokens);
         self.tokens = &.{};
         self.ready = false;
+        self.base = 0;
     }
 
     fn freePoint(allocator: std.mem.Allocator, p: *LivePoint) void {
@@ -123,7 +144,7 @@ pub const Live = struct {
     }
 
     /// Keeps the fixed arrays of `cp`, a point of the request now running, and drops the shallowest past the cap.
-    pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint) !void {
+    pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, flushed: bool) !void {
         if (self.ready) self.clear(allocator);
         const n_slots = model.slotCount(m);
         if (cp.layers.len != 2 * n_slots) return error.Dsv41CheckpointMismatch;
@@ -151,7 +172,28 @@ pub const Live = struct {
                 try mlx.check(mlx.mlx_array_set(&sl[k], a));
             }
         }
-        try self.points.append(allocator, .{ .pos = cp.pos, .slots = slots });
+        try self.points.append(allocator, .{ .pos = cp.pos, .slots = slots, .flushed = flushed });
+    }
+
+    /// `keep` for the point a request restored from: its rows below it came from a stored entry.
+    pub fn keepRestored(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, flushed: bool) !void {
+        try self.keep(allocator, m, cp, flushed);
+        self.base = cp.pos;
+    }
+
+    fn markFlushed(self: *Live, pos: usize) void {
+        for (self.points.items) |*p| {
+            if (p.pos == pos) p.flushed = true;
+        }
+    }
+
+    /// Whether a point of the record is still only here, not on SSD.
+    pub fn unflushed(self: *const Live) bool {
+        if (!self.ready) return false;
+        for (self.points.items) |p| {
+            if (!p.flushed) return true;
+        }
+        return false;
     }
 
     /// The request over the state finished with `tokens` as its history: its points become what the next one may roll back to.
@@ -203,6 +245,7 @@ pub const Live = struct {
         allocator.free(self.tokens);
         self.tokens = &.{};
         self.ready = false;
+        self.base = p.pos;
     }
 };
 
@@ -228,7 +271,7 @@ pub fn markRows(cache: *transformer.KVCache) !void {
 /// Names the stored layout for the SSD cache namespace: a restore point written under another layout, or
 /// with a different set of slots, is never read.
 pub fn namespaceTag(dspark: bool) []const u8 {
-    return if (dspark) "dsv41-state-v4-dspark" else "dsv41-state-v3";
+    return if (dspark) "dsv41-state-v5-dspark" else "dsv41-state-v4";
 }
 
 /// Tokens of compressed rows and index keys one `g<n>` segment of an SSD entry holds.
@@ -294,8 +337,25 @@ pub fn lookupAndRestoreDsv41(
 }
 
 /// DeepSeek: the live state rolled back in place to the deepest point of the slot's last request that this prompt
-/// shares, when no stored point reaches further: no read, no copy. Null leaves the state as it was.
+/// shares, when no stored point reaches further: no read, no copy. Null means the state is lost to this request:
+/// the record was flushed to SSD and cleared.
 pub fn rollbackLiveDsv41(
+    self: *pc.HotPrefixCache,
+    m: *dsv41_model.Model,
+    target_cache: *KVCache,
+    target_moe_seq_offset: *usize,
+    s: mlx.mlx_stream,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    media_limits: kv_disk_cache.MediaLimits,
+    ram_match: anytype,
+) ?pc.LookupResult {
+    if (rollbackLive(self, m, target_cache, target_moe_seq_offset, s, prompt_ids, has_tools, media_limits, ram_match)) |res| return res;
+    releaseLive(self, m, s, "handover");
+    return null;
+}
+
+fn rollbackLive(
     self: *pc.HotPrefixCache,
     m: *dsv41_model.Model,
     target_cache: *KVCache,
@@ -330,9 +390,9 @@ pub fn rollbackLiveDsv41(
     return .{ .matched = pos, .full_match = false, .slot_owned = true };
 }
 
-/// DeepSeek's write-through: the request's restore points so far go to the SSD tier and every one of them
-/// leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
-/// commit returns. Below the tier's floor nothing is written and the points stay for the commit.
+/// DeepSeek's write-through: the request's restore points on the tier's row-segment grid go to the SSD tier and every
+/// point leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
+/// commit returns. A point off the grid is kept live only (`Live`), whatever the tier does. Below the tier's floor nothing is written and the points stay for the commit.
 /// `held` names the phase that waited on the writer, for the log.
 pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
     if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
@@ -343,11 +403,17 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
         log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
         return;
     };
-    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.keep(self.allocator, m, cp) catch |err| {
+    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.keep(self.allocator, m, cp, false) catch |err| {
         log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
     };
+    // A point off the row-segment grid would copy the rows past the last segment into its own file; it stays live.
+    const span: usize = if (self.disk.?.grown) |g| g.span else 0;
+    for (cps) |*cp| if (!cp.isReleased() and span != 0 and cp.pos % span != 0) cp.release();
+    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.markFlushed(cp.pos);
     const staged_before = self.disk.?.point_bytes_written;
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+    self.disk.?.rows_base = @intCast(self.live_dsv41.base);
+    defer self.disk.?.rows_base = std.math.maxInt(u32);
     self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     for (cps) |*cp| cp.release();
@@ -364,8 +430,68 @@ pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCac
 }
 
 /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
-pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp) void {
+/// True when the record holds points that are not on SSD.
+pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, quant: kv_quant.KVQuantConfig) bool {
     self.live_dsv41.publish(self.allocator, m, tokens, has_tools, media.key, media.start);
+    self.live_dsv41.quant = quant;
+    return self.live_dsv41.unflushed();
+}
+
+/// The state is about to be replaced: its record reaches SSD (`flushLiveDsv41`), then goes.
+pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
+    flushLiveDsv41(self, m, s, why);
+    self.live_dsv41.clear(self.allocator);
+}
+
+/// `flushLiveDsv41` for a resident model, if it is a DeepSeek one. Inference thread.
+pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: []const u8) void {
+    const hc = if (entry.prefix_cache) |*p| p else return;
+    const xfm = entry.transformer orelse return;
+    flushLiveDsv41(hc, xfm.dsv41 orelse return, xfm.s, why);
+}
+
+/// Writes the live record's points that are not on SSD yet, while the rows they lean on are still the state's own: all
+/// of them (up to `live_point_cap`), so what a rewind of the last turns would restore from RAM restores from SSD too. Run
+/// where the state is about to be lost (another conversation takes the slot, unload, shutdown, idle) and before anything
+/// appends to it; a point a later prefill overwrote is no longer in the record. A text-only record: a media chain is not
+/// kept, and the points of a prompt with images stay live-only.
+pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
+    const live = &self.live_dsv41;
+    if (self.disk == null or !self.ssd_first or !live.ready or live.epoch != m.state_epoch or live.vision_key != 0) return;
+    const st = m.dec_state orelse return;
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (cps.items) |*cp| cp.deinit(self.allocator);
+        cps.deinit(self.allocator);
+    }
+    for (live.points.items) |*p| {
+        if (p.flushed or p.pos < kv_disk_cache.MIN_PERSIST_TOKENS or p.pos > @min(live.tokens.len, st.n)) continue;
+        var cp = captureLive(self.allocator, m, p) catch |err| {
+            log.warn("  [dsv41-prefix] live point at {d} not flushed: {s}\n", .{ p.pos, @errorName(err) });
+            continue;
+        };
+        cps.append(self.allocator, cp) catch {
+            cp.deinit(self.allocator);
+            continue;
+        };
+    }
+    if (cps.items.len == 0) return;
+    const top = cps.items[cps.items.len - 1].pos;
+    var cache = KVCache.initWithConfig(self.allocator, m.cfg.layers, live.quant) catch return;
+    defer cache.deinit();
+    cache.step = top;
+    markRows(&cache) catch |err| {
+        log.warn("  [dsv41-prefix] live points not flushed, rows not marked: {s}\n", .{@errorName(err)});
+        return;
+    };
+    const staged_before = self.disk.?.point_bytes_written;
+    var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+    self.disk.?.rows_base = @intCast(live.base);
+    defer self.disk.?.rows_base = std.math.maxInt(u32);
+    self.writeThroughHybrid(cache.entries, cache.config, live.tokens[0..top], live.has_tools, .{}, cps.items, std.math.maxInt(u64), s);
+    for (cps.items) |*cp| live.markFlushed(cp.pos);
+    const bytes = self.disk.?.point_bytes_written - staged_before;
+    log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, cps.items.len, top, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
 }
 
 test "layoutKey: a boot that drops other experts or picks leniently has its own namespace" {
@@ -417,9 +543,9 @@ test "layoutKey: a boot that drops other experts or picks leniently has its own 
     defer a.free(k_dspark_composed);
 
     // The served keys are unchanged, and a model without DSpark has no verify rows to sum differently.
-    try testing.expectEqualStrings("dsv41-state-v3", full);
-    try testing.expectEqualStrings("dsv41-state-v3-simd", k_simd);
-    try testing.expectEqualStrings("dsv41-state-v4-dspark", k_dspark);
+    try testing.expectEqualStrings("dsv41-state-v4", full);
+    try testing.expectEqualStrings("dsv41-state-v4-simd", k_simd);
+    try testing.expectEqualStrings("dsv41-state-v5-dspark", k_dspark);
     const no_dspark = try layoutKey(a, false, true, true, false, null, 0);
     defer a.free(no_dspark);
     try testing.expectEqualStrings(full, no_dspark);

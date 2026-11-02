@@ -96,10 +96,23 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   past the store. The manifest lists the segments' bytes (`grown`, v11, which an older reader drops); a scan keeps the
   contiguous valid segments and drops each point that leans on a lost one. Segment bytes ride the entry's bill
   (`nonChunkBytes`, `bytesFreedByRemoving`, `billChunksOnce`) and the pre-write estimate (`entryBytesAt`).
+- **A new entry inherits row segments from the entry holding the most** (`segmentDonor`, `linkInheritedSegments`, SSD-first
+  or a writer; not the chunk donor, which may be a later turn that crossed no grid point and holds none): the segments
+  whose whole span lies inside the prefix donor and heir share, which a point of the commit leans on,
+  are hard-linked (rows are append-only, so the bytes are the heir's own), and the heir writes the rest. The first
+  `inherited_grown` of its `grown` list (the manifest's `grown.inherited`) are billed by the donor, like
+  `inherited_chunks`; the filesystem is the refcount (`nlink`), so evicting either entry frees only the last link and a
+  scan bills an inode once. `entryBytesAt` still assumes none is shared. A turn that drops its predecessor's thinking
+  rewrote all of a 500k-token conversation's ~440 MB of rows into every new entry; it now writes the rows past the
+  divergence. Only a segment whose span ends at or before `DiskTier.rows_base` is linked (DeepSeek sets it to the request's
+  restore or rollback point, `Live.base`): a span holding rows the heir recomputed is written fresh, so a restore of the
+  heir is its live state's bytes.
 - **DeepSeek rolls its live state back before any stored restore** (`HotPrefixCache.rollbackLiveDsv41`,
   `dsv41_prefix.Live`; [dsv41-arch](dsv41-arch.md#prefix-cache)): the slot's last request keeps the fixed arrays of its
   deepest 8 points in RAM, and a prompt sharing its history rolls the model's state back to the deepest one it reaches
   unless a stored point reaches further. Valid only while `Model.state_epoch` is unchanged and a request finished over it.
+  Its off-grid points (prompt end, thought) are not written through; `flushLiveDsv41` writes them when the state is about to
+  be lost (handover, unload, 300 s idle, shutdown). A crash restores from the last grid point.
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
   (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
   tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves

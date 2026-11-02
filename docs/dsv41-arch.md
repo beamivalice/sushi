@@ -802,13 +802,16 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
 - **The SSD tier indexes by KV rows and this arch has none**: before a commit `dsv41_prefix.markRows` gives layer 0 of
   the slot's cache one zero byte per token, so the tier's chunk files, sizes, scan and eviction cover the entry
   (about 2 B a token); the forward never reads it. A restore (`DiskTier.restoreCheckpointInto`) loads the checkpoint
-  file and its row segments and proves the chunks cover its position. SSD-first, a prefill's points go to the tier as it takes them
+  file and its row segments and proves the chunks cover its position. SSD-first, a prefill's points on the row-segment grid go to the tier as it takes them
   (`HotPrefixCache.writeThroughDsv41`, armed whatever the new span): a point at or past the tier's 512-token floor shares
   the request's rows (`dsv41_prefix.captureShared`), is staged into the writer's bounded host buffers and released before
-  the next forward appends, the newest and the prompt-end snapshot included. Each logs `[dsv41-prefix] restore points to
+  the next forward appends. A point off the grid (the prompt-end snapshot, a thought point) is kept in `Live` only: staging
+  it would copy the rows past its last whole segment into its own file, again for every point, and a follow-up turn rolls
+  back to it from RAM instead of reading it. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
-- **Namespace**: `dsv41_prefix.layoutKey` (`model_load.diskLayoutKey`) is `namespaceTag` (`dsv41-state-v3`, or
-  `dsv41-state-v4-dspark` when the stages are resident: the per-row attention split moved the verify rows' bytes), then `-simd` when the SIMD attention kernel serves, `-composed` for a
+- **Namespace**: `dsv41_prefix.layoutKey` (`model_load.diskLayoutKey`) is `namespaceTag` (`dsv41-state-v4`, or
+  `dsv41-state-v5-dspark` when the stages are resident: the per-row attention split moved the verify rows' bytes; the tags moved
+  when segments became shared between entries and points started to be flushed lazily, and no reader of the old layout exists), then `-simd` when the SIMD attention kernel serves, `-composed` for a
   `SUSHI_DSV41_COMPOSED=1` boot, `-dsparkinexact` for `SUSHI_DSV41_DSPARK_EXACT=0` with DSpark, then the drop list and
   lossy pick. The key reads `Model.attn_nax` after the load's trial, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
   or a GPU without NAX never writes into the namespace the matrix-unit boots read (their key is unchanged). It is hashed
@@ -825,10 +828,12 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
 - **An SSD entry stores the rows once** (`dsv41_prefix.row_span` = 8192, `rowDivisors`, `DiskTier.setGrownSpec`): the
   compressed rows and index keys of every 8192 tokens are one `g<n>.safetensors` segment, appended as the entry grows;
   a point's `s<pos>.safetensors` keeps the window rings, open pooling groups, DSpark windows and the rows past its last
-  whole span (a grid point none, a prompt end under 8192 tokens). A restore reads the point and its first `pos / 8192`
+  whole span (a point the write-through stages is on the grid, so none). A restore reads the point and its first `pos / 8192`
   segments and joins them into the arrays a full capture holds, byte for byte. A grid point costs about 6 MB; the
   store about 890 B a token (`diskBytesPerToken` = rows plus the rings' share per span). Thinning a point never touches
-  a segment, and the store is not trimmed when the point that reached furthest goes. An entry at 393k tokens holds the
+  a segment, and the store is not trimmed when the point that reached furthest goes. A new entry hard-links the
+  donor's segments that lie wholly inside the prefix they share ([engine-prefix-cache](engine-prefix-cache.md)),
+  so a turn that drops its predecessor's thinking writes only the rows past the divergence. An entry at 393k tokens holds the
   48 spans (350 MB) and 49 points (about 300 MB), against four full copies of 28 to 357 MB.
 - **A follow-up turn rolls the live state back instead of reading SSD** (`dsv41_prefix.Live`, `dsv41_model.rollbackState`):
   rows are append-only, so a point at `p` is the fixed arrays at `p` (window rings, open pooling groups, DSpark
@@ -840,6 +845,24 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   or a row buffer exceeds what the prompt's own state would be billed with its quarter (`liveRowsFit`): the live rows
   past the point stay allocated, so they must fit that bill. The admission reserve adds 8 sets of fixed rings
   (`dsv41CheckpointReserve`). Log: `[dsv41-prefix] reused N of M prompt tokens from the live state`.
+- **Write cost of an agent conversation** (`DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw-repack-test`, default flags, `--log-level debug`,
+  30 turns of a tool-result chat from a 72k-token prompt to 176k, thinking on, greedy, max_tokens 512, `taskpolicy -a`, GPU lock, M5 Max;
+  main 543c25fd against the branch head 3a867948): staged restore points 3.63 GB over 51 writes (29 of them 0.07-0.16 GB) against
+  0.30 GB (one write over 0.05 GB) plus a 0.21 GB shutdown flush of 6 points; device bytes written during the run (`ioreg`
+  `Bytes (Write)`, all drivers, the debug log included) 3.79 GB against 0.79 GB, the cache directory 3.59 GB / 4228 files against
+  0.58 GB / 3985; the write stall inside the prefill (`prefill held`) 2.6 s against 2.1 s over the 30 turns. The first-turn and early-turn
+  speed of the two runs is not comparable (a cold page cache slowed the branch's first 7 turns). After a clean shutdown and a boot
+  the last prompt restored 176113 of 180308 tokens from SSD on both; after `kill -9` the branch restored the same point (the
+  shutdown flush's), main its prompt-end point.
+- **The live record reaches SSD only when the state is about to be lost** (`HotPrefixCache.flushLiveDsv41`, inference
+  thread): another conversation's lookup that does not roll back, a model unload, an idle queue for 300 s
+  (`live_flush_idle_secs`) and a clean shutdown write every point of the record that is not on SSD yet (up to 8: the
+  prompt-end and thought points; a grid point was written through), as one commit over the record's tokens with rows that
+  are views of the live ones (`dsv41_model.captureLiveShared`), before the new prefill touches them. A point a later
+  prefill overwrote was popped from the record by its rollback and is not written. A record with images is not flushed.
+  A crash flushes nothing: the cache restores from the last grid point (at most 8192 tokens of re-prefill). Log:
+  `[dsv41-prefix] live points to SSD (why): N points to P, X GB staged, held T ms`. The flush needs no bill of its own: the
+  points are the record's, the rows views, and the writer's bounded buffers take the bytes.
   A cancelled request (stop sequence, disconnect) publishes at the scheduler's cull (`commitsAtCull`), not at the cleanup
   drain: the cull drops it from `decoding`, so the next request is admitted over the model's state before `complete()`,
   and a later publish would pair this request's tokens with that request's points and epoch.
@@ -848,10 +871,10 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the
   generated tokens through the closer and the 5-20k tokens of a long thought need no re-prefill. A round that would
   commit past the closer is cut to end on it (`Generator.dspark_round_ends_at`: fewer verify rows, the pending token
-  still the trunk's own), so the state stands exactly behind it; the point is staged like an SSD-first prefill point
-  (`HotPrefixCache.writeDecodePointDsv41`: shared rows, released before the next forward) and logs
-  `[dsv41-prefix] restore points to SSD at P: X GB staged, decode held T ms`. Its bill is the prefill's
-  (`dsv41CheckpointReserve`: the writer permit and one set of fixed rings, held by the request's admission bill), so it
+  still the trunk's own), so the state stands exactly behind it; the point is taken like an SSD-first prefill point
+  (`HotPrefixCache.writeDecodePointDsv41`: shared rows, released before the next forward) and, being off the segment
+  grid, is kept live and written only by the flush below (`[dsv41-prefix] restore points to SSD at P: 0.00 GB staged, decode held T ms`).
+  Its bill is the prefill's (`dsv41CheckpointReserve`: one set of fixed rings, held by the request's admission bill), so it
   needs a prompt of the SSD floor (512 tokens) and checkpointing on. It is skipped for a thought under 512 tokens (the
   prompt-end snapshot's re-prefill is cheaper) and for one whose first or last token is `\n` or a space, which the
   server trims off the delivered `reasoning_content`. A client must send `reasoning_content` back verbatim, as the

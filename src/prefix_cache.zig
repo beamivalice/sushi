@@ -1438,7 +1438,7 @@ pub const HotPrefixCache = struct {
         self.last_restored_disk_id = null;
         self.last_restored_live = false;
         if (skip) {
-            if (rec == .dsv41) self.live_dsv41.clear(self.allocator);
+            if (rec == .dsv41) self.releaseLive(rec.dsv41, s, "handover");
             try target_cache.truncate(0, s);
             rec.reset();
             target_moe_seq_offset.* = 0;
@@ -1467,7 +1467,6 @@ pub const HotPrefixCache = struct {
 
         if (rec == .dsv41) {
             if (self.rollbackLiveDsv41(rec.dsv41, target_cache, target_moe_seq_offset, s, prompt_ids, has_tools, media_limits, match)) |res| return res;
-            self.live_dsv41.clear(self.allocator);
         }
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
@@ -1512,7 +1511,7 @@ pub const HotPrefixCache = struct {
                 };
                 target_moe_seq_offset.* = hm.cp;
                 self.last_restored_disk_id = d.entries.items[hm.idx].id;
-                self.live_dsv41.keep(self.allocator, rec.dsv41, &cp) catch {};
+                self.live_dsv41.keepRestored(self.allocator, rec.dsv41, &cp, true) catch {};
                 log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
                 return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
             }
@@ -1729,7 +1728,7 @@ pub const HotPrefixCache = struct {
             effective_matched = 0;
             if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, restore_cap)) |cp| {
                 try dsv41_prefix.restore(rec.dsv41, cp, prompt_ids);
-                self.live_dsv41.keep(self.allocator, rec.dsv41, cp) catch {};
+                self.live_dsv41.keepRestored(self.allocator, rec.dsv41, cp, false) catch {};
                 effective_matched = cp.pos;
             };
             if (effective_matched == 0) rec.reset();
@@ -3014,6 +3013,8 @@ pub const HotPrefixCache = struct {
     pub const writeDecodePointDsv41 = dsv41_prefix.writeDecodePointDsv41;
 
     pub const publishLiveDsv41 = dsv41_prefix.publishLiveDsv41;
+
+    pub const releaseLive = dsv41_prefix.releaseLive;
 
     /// Write the pending record whole and release it: its rows may be a finished request's own
     /// buffers, which nothing could read again to resume a partial entry.

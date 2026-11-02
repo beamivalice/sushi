@@ -2714,6 +2714,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
     const wired_before = status.getWiredMemBytes();
+    scheduler_mod.flushLiveState(entry, "unload");
     entry.unloadResident();
     if (entry.config) |c| @import("dsv41/dsv41_borrow.zig").unloadModelMlx(c);
     // unloadResident freed the arrays into MLX's allocator cache — clear it

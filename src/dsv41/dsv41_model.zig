@@ -2882,6 +2882,31 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
     if (m.hash != null) st.hist.shrinkRetainingCapacity(n);
 }
 
+/// The restore point `fixed` (a kept point's fixed arrays) at `n` as `captureStateShared` would hold it, for a state that
+/// has since moved on: the fixed arrays are shared, and the compressed and index rows are views of the live rows' first
+/// `n / ratio`, which are the point's own because rows are append-only. Checked whole before anything is taken.
+pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) !void {
+    const st = &(m.dec_state orelse return error.Dsv41NoLiveState);
+    if (st.verify != null or fixed.len != slotCount(m) or out.len != slotCount(m) or st.n < n) return error.Dsv41CheckpointMismatch;
+    for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |rows| if (rows.used < n / m.ratio(li)) return error.Dsv41CheckpointMismatch;
+    errdefer for (out) |*sl| freeSlot(sl);
+    for (st.layers, 0..) |*ls, li| {
+        const a = &out[2 * li];
+        for (0..3) |k| try shareInto(&a[k], fixed[2 * li][k]);
+        const r = n / m.ratio(li);
+        const b = &out[2 * li + 1];
+        if (ls.comp) |rows| {
+            b[0] = try headRows(rows.buf, r, m.s);
+            b[1] = try headRows(rows.sbuf, r, m.s);
+        }
+        if (ls.idx_k) |rows| {
+            b[2] = try headRows(rows.buf, r, m.s);
+            b[3] = try headRows(rows.sbuf, r, m.s);
+        }
+    }
+    for (st.ds, 0..) |_, si| try shareInto(&out[2 * st.layers.len + si][0], fixed[2 * st.layers.len + si][0]);
+}
+
 /// Sets the kernels off (the diagnostic `SUSHI_DSV41_COMPOSED`, the KLD A/B's teacher arm) or on, and says which.
 pub fn setFused(m: *Model, composed: bool) void {
     m.fused = !composed;

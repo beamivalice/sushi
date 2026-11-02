@@ -119,6 +119,14 @@ pub fn dsv41StateBytes(s: *const Slot) u64 {
     return bytes;
 }
 
+/// The request over a DeepSeek model's state finished with `tokens`: its record is published, and the idle flush armed
+/// when the record holds points that are not on SSD.
+pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, tokens: []const u32) void {
+    const dsv = (slot.model.transformer orelse return).dsv41 orelse return;
+    const media = prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start);
+    if (hc.publishLiveDsv41(dsv, tokens, slot.has_tools, media, slot.cache.config)) sch.live_unflushed.store(true, .release);
+}
+
 /// DeepSeek: a thinking request with tools is re-rendered with its thought, so the state right behind the generated
 /// `</think>` is a restore point the next turn's prompt shares (docs/dsv41-arch.md#prefix-cache). Only a DSpark round
 /// leaves the state on the emitted tokens, and only an SSD-first prefill has a tier to hand the point to.
@@ -337,7 +345,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     const hc = &model.prefix_cache.?;
     var cp = try dsv41_prefix.capture(a, m, 40);
     defer cp.deinit(a);
-    try hc.live_dsv41.keep(a, m, &cp);
+    try hc.live_dsv41.keep(a, m, &cp, false);
     var slot: Slot = undefined;
     slot.model = &model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
