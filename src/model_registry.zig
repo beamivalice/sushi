@@ -985,6 +985,17 @@ pub const ModelRegistry = struct {
         return true;
     }
 
+    /// The launch model's load, claimed before the listener accepts, the way a cold load claims its own: it lists
+    /// `loading`, a request for it waits in `ensureLoaded` instead of starting a second load, and its estimate counts in
+    /// another model's eviction gate. The caller holds the claim's reference until its boot is done.
+    pub fn claimStartupLoad(self: *ModelRegistry, entry: *LoadedModel, estimated: u64) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.tryBeginLoadLocked(entry)) return false;
+        self.reserveLoadLocked(entry, estimated);
+        return true;
+    }
+
     /// Phase D: roll back a failed load attempt back to `.unloaded` so a
     /// later request can retry. Caller holds `mutex`. The entry's resident
     /// fields should already be cleaned up (or never installed) before
@@ -1791,6 +1802,69 @@ test "ModelRegistry: ensureLoaded reports error_state" {
     try expectError(error.LoadFailed, reg.ensureLoaded("broken"));
     try testing.expect(stub.error_name != null);
     try testing.expectEqualStrings("MissingVisionWeights", stub.error_name.?);
+}
+
+const StartupWaiter = struct {
+    reg: *ModelRegistry,
+    got: ?anyerror!*LoadedModel = null,
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(self: *@This()) void {
+        self.got = self.reg.ensureLoaded("");
+        self.done.store(true, .release);
+    }
+    fn stillWaiting(self: *@This()) bool {
+        for (0..50) |_| {
+            if (self.done.load(.acquire)) return false;
+            const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = std.c.nanosleep(&ts, null);
+        }
+        return !self.done.load(.acquire);
+    }
+};
+
+test "ModelRegistry: a launch model claimed for its startup load lists loading, and a request waits for it" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("launch", "/path/to/launch", 1024);
+    try reg.setDefault("launch");
+    try testing.expect(reg.claimStartupLoad(e, 4096));
+    try testing.expect(!reg.claimStartupLoad(e, 4096));
+    const snap = try reg.snapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expectEqualStrings("loading", snap[0].state);
+    try testing.expectEqual(@as(u64, 4096), reg.reserved_bytes);
+
+    var w: StartupWaiter = .{ .reg = reg };
+    const t = try std.Thread.spawn(.{}, StartupWaiter.run, .{&w});
+    try testing.expect(w.stillWaiting());
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(e, 1000);
+    reg.mutex.unlock(reg.io);
+    t.join();
+    try testing.expectEqual(e, try w.got.?);
+    try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
+    try testing.expectEqual(@as(u32, 2), e.refcount.load(.acquire));
+    reg.release(e);
+    reg.releaseStatus(e);
+    try testing.expectEqual(@as(u32, 0), e.refcount.load(.acquire));
+}
+
+test "ModelRegistry: a startup load that fails reaches the waiting request by name" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("launch", "/path/to/launch", 1024);
+    try reg.setDefault("launch");
+    try testing.expect(reg.claimStartupLoad(e, 4096));
+    var w: StartupWaiter = .{ .reg = reg };
+    const t = try std.Thread.spawn(.{}, StartupWaiter.run, .{&w});
+    try testing.expect(w.stillWaiting());
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(e, "InsufficientMemory");
+    reg.mutex.unlock(reg.io);
+    t.join();
+    try expectError(error.InsufficientMemory, w.got.?);
+    try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
+    reg.releaseStatus(e);
 }
 
 test "ModelRegistry: memory-refused loads keep their identity, other failures expose their name" {

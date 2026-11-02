@@ -80,6 +80,32 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `serve`, `--serve`, `--host`, `--port`, and `--tool on` conflict with explicit prompts and fail before loading.
   Use the REPL for client-side tools. Guard: `tests/test_prompt_flags.py`; `SUSHI_PROMPT_MODEL` enables live Qwen checks.
 
+<a id="startup"></a>
+## Startup order
+
+A `--model` boot (`server.serve`) serves before its model is loaded:
+1. `ensurePortFree` (main.zig, before the config is read), then the listener binds.
+2. `Scheduler.init` claims the launch model's registry entry (`claimStartupLoad`: `loading`, the claim's reference,
+   its gate estimate) and spawns the inference thread, which runs the load's refusals: arch gate, launch-flag and KV
+   refusals, the streaming plan (`ExpertStreamingRequired`, the budget refusals), the memory preflight (context and
+   weights). `init` returns at `model_load.signalPrechecked`, just before the weights, so a refusal still exits
+   non-zero before anything is served, with the same message.
+3. The gauge sampler starts, `Server listening on …` is logged and the accept thread (`acceptLoop`) starts. Requests
+   are answered while the rest of the load runs ([server-http-apis](server-http-apis.md#during-the-load)).
+4. `awaitStartupLoad`. A failure here logs `[scheduler] model load failed: <name>`, answers every waiting request
+   with that error, stops the accept loop, drains the connection threads and exits non-zero (`error: LoadFailed`).
+   The server never stays up without its launch model: scripts and the app read the exit as the load's verdict.
+5. After the load, as before: the request hooks, idle eviction, the cache and `Concurrency:` lines, the SIGINT/SIGTERM
+   handlers, `on_ready`, the pinned context, the route list and `chat in your browser:`. Then `releaseStartupPin` and
+   `boot_gate.process.open`: a request that got the model earlier waits at the gate for this step, so it never runs
+   before the context is pinned or the hooks are in.
+- The signal handlers stay after the load: until then SIGTERM (and `--parent-pid`) ends the process at once, as a
+  load cannot be cancelled.
+- `SUSHI_TEST_LOAD_DELAY_MS` holds the startup load after its refusals (test seam, [envvar](envvar.md)). Guard:
+  `tests/test_early_listener.sh`.
+- Headless (`--model-dir`, no `--model`) and the embedded bench client (no listener) take the same path with nothing to
+  wait for.
+
 ## What loads
 
 - A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.
@@ -160,7 +186,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `server.prefix_cache_disk_gb` key.
 - A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
   cold loads, and logs its resolved value with its source at load.
-- Load-time context bills see explicit KV and MTP choices before `Scheduler.init` returns, including `--no-mtp`.
+- Load-time context bills see explicit KV and MTP choices from the load's start (`serve` publishes them before `Scheduler.init`), including `--no-mtp`.
 
 ## Scheduler and batching
 

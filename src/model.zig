@@ -2095,6 +2095,13 @@ pub fn isServedArch(model_type: []const u8) bool {
     return false;
 }
 
+/// The arch gate, also run at the top of a server load so its refusal lands before the listener serves.
+pub fn archGate(config: *const ModelConfig) error{ArchitectureUnsupported}!void {
+    if (isServedArch(config.model_type)) return;
+    log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2, glm5_next, deepseek_v41 only)\n", .{config.model_type});
+    return error.ArchitectureUnsupported;
+}
+
 /// The ONE weight-loader decision. A second construction site is how a
 /// subcommand ends up forwarding through a model the server never serves —
 /// a MiMo pack read without its source trunk binds the raw FP8 fused QKV.
@@ -2105,10 +2112,7 @@ pub fn loadWeightsForConfig(
     config: *const ModelConfig,
     load_vision: bool,
 ) !Weights {
-    if (!isServedArch(config.model_type)) {
-        log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2, glm5_next, deepseek_v41 only)\n", .{config.model_type});
-        return error.ArchitectureUnsupported;
-    }
+    try archGate(config);
     if (config.isDsv41()) return loadWeightsDsv41(io, allocator, model_dir, config, load_vision);
     if (config.expert_layout == .exl3_k4) try @import("mimo2/mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {

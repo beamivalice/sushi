@@ -66,6 +66,7 @@ const completions = @import("completions.zig");
 const responses_api = @import("responses_api.zig");
 const generation_stream = @import("generation_stream.zig");
 const http_conn = @import("http_conn.zig");
+const boot_gate = @import("boot_gate.zig");
 const request_media = @import("request_media.zig");
 const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
@@ -267,7 +268,7 @@ fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
     return choice.on and model_mod.isServedArch(config.model_type) and (!config.expert_streaming or config.stream_mtp_head);
 }
 
-/// Explicit launch choice, available to memory bills before Scheduler.init returns.
+/// Explicit launch choice, for the bills a load runs before `global_scheduler` is published.
 var configured_mtp: ?bool = null;
 
 /// THIS model's MTP decision and its source, the answer the load log and `/props` read.
@@ -1209,13 +1210,16 @@ pub fn parseToolCallsForRequest(
 /// `cfg` carries all process-wide defaults (context size, timeouts, PLD
 /// defaults, reasoning budget). It's copied into the module-level
 /// `server_config` before the listen loop starts.
+///
+/// Order: bind; start the launch model's load and wait out its refusals (`Scheduler.init`); serve while the rest of
+/// the load runs; then the post-load lines and hooks, which a request that got the model waits for (`boot_gate`).
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
     /// Phase A1: model load happens on the scheduler's inference thread. The
     /// caller (main.zig) is responsible only for CPU-side setup (config parse,
     /// tokenizer load, EOS resolution, chat-template load); everything that
-    /// touches mlx is done by `Scheduler.init` before this fn proceeds.
+    /// touches mlx is done on the inference thread.
     load_params: model_load.LoadParams,
     config: *const model_mod.ModelConfig,
     host: []const u8,
@@ -1223,7 +1227,7 @@ pub fn serve(
     cfg: ServerConfig,
 ) !void {
     server_config = cfg;
-    // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
+    // Before `Scheduler.init`: that call starts the model load and every load-time bill inside it
     // asks for the KV width.
     configured_kv_quant = if (load_params.kv_quant_explicit) load_params.kv_quant_config else null;
     defer configured_kv_quant = null;
@@ -1234,19 +1238,64 @@ pub fn serve(
 
     scheduler_mod.prefill_ubench_chunk = &requestPrefillChunkNow;
     defer scheduler_mod.prefill_ubench_chunk = null;
+
+    listen_host = host;
+    listen_port = port;
+    var listener: ?std.Io.net.Server = if (cfg.embedded_client != null) null else http_conn.startListener(host, port) catch |err| {
+        var msg_buf: [512]u8 = undefined;
+        if (startupRefusal(err, host, port, &msg_buf)) |msg| {
+            log.err("{s}\n", .{msg});
+            std.process.exit(1);
+        }
+        return err;
+    };
+    if (listener) |l| listen_port = l.socket.address.ip4.port;
+
+    const boots_model = !load_params.no_initial_load;
+    if (boots_model) boot_gate.process.begin();
+    defer if (!boot_gate.process.opened.isSet()) boot_gate.process.fail(io);
+
     // ── Phase A1: spin up the scheduler. Its inference thread does the
-    //    Transformer/vision/drafter load, JIT compile, and warmup before
-    //    `Scheduler.init` returns. From this point on, mlx ops are bound
-    //    to the inference thread's GPU stream.
-    var scheduler = try scheduler_mod.Scheduler.init(
+    //    Transformer/vision/drafter load, JIT compile, and warmup; mlx ops
+    //    are bound to that thread's GPU stream. `init` returns once the load
+    //    has passed its refusals, so a refusal still ends the boot unserved.
+    var scheduler = scheduler_mod.Scheduler.init(
         allocator,
         io,
         load_params,
         max_concurrent,
-    );
+    ) catch |err| {
+        if (listener) |*l| l.deinit(io);
+        return err;
+    };
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+    global_registry = scheduler.registry;
+    defer global_registry = null;
+
+    if (instr.current() != null) {
+        startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
+        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics and /metrics.json\n", .{ host, port });
+    }
+    // Registered after the scheduler's deinit defer, so it runs first and the sampler never reads a freed scheduler.
+    defer stopGaugeSampler();
+
+    var client_thread: ?std.Thread = null;
+    defer if (listener) |*l| http_conn.closeEmbeddedListener(io, l, client_thread) else if (client_thread) |t| t.join();
+    var accept_thread: ?std.Thread = null;
+    defer stopServing(&accept_thread);
+    if (listener != null) {
+        log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
+        if (boots_model) log.info("  {s} is loading: the page, /health, /v1/models, /props, /v1/settings and the metrics answer now; generation waits for the model\n", .{load_params.entry.id});
+        accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ allocator, io, &listener.? });
+    }
+
+    scheduler.awaitStartupLoad() catch |err| {
+        boot_gate.process.fail(io);
+        return err;
+    };
+
     // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
     scheduler_mod.prefill_admission_fits = &prefillFitsNow;
     defer scheduler_mod.prefill_admission_fits = null;
@@ -1277,13 +1326,6 @@ pub fn serve(
     scheduler_mod.vision_fit_fault = &towerFitFaultText;
     defer scheduler_mod.vision_encode_available = null;
 
-    if (instr.current() != null) {
-        startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
-        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics and /metrics.json\n", .{ host, port });
-    }
-    // Registered after the scheduler's deinit defer, so it runs first and the sampler never reads a freed scheduler.
-    defer stopGaugeSampler();
-
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
     // and never in `Scheduler.deinit` — see `IdleEvictCtx.stop`.
     var idle_evict_thread: ?std.Thread = null;
@@ -1298,9 +1340,6 @@ pub fn serve(
     }
     defer if (idle_evict_thread) |t| t.join();
     defer idle_evict_stop.store(true, .monotonic);
-
-    global_registry = scheduler.registry;
-    defer global_registry = null;
 
     // Plan 05: the hot prefix cache lives on the LoadedModel
     // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
@@ -1339,7 +1378,7 @@ pub fn serve(
     const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
     log.info("Concurrency: --max-concurrent={d}, {s} (arch: {s})\n", .{ max_concurrent, concurrencyClause(verdict), config.model_type });
     if (verdict == .ok and prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
-    // Install signal handlers for graceful shutdown
+    // Installed only now: until the load ends, a signal's default action ends the process mid-load.
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
         .mask = std.posix.sigemptyset(),
@@ -1348,20 +1387,6 @@ pub fn serve(
     std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
 
-    listen_host = host;
-    listen_port = port;
-    // Parse host address
-    var listener: ?std.Io.net.Server = if (cfg.embedded_client != null) null else http_conn.startListener(host, port) catch |err| {
-        var msg_buf: [512]u8 = undefined;
-        if (startupRefusal(err, host, port, &msg_buf)) |msg| {
-            log.err("{s}\n", .{msg});
-            std.process.exit(1);
-        }
-        return err;
-    };
-    var client_thread: ?std.Thread = null;
-    defer if (listener) |*l| http_conn.closeEmbeddedListener(io, l, client_thread) else if (client_thread) |t| t.join();
-    if (listener) |l| listen_port = l.socket.address.ip4.port;
     client_thread = if (server_config.on_ready) |ready| try ready(listen_port) else null;
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
@@ -1418,7 +1443,6 @@ pub fn serve(
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
     if (listener != null) {
-        log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
         if (g_api_key != null) {
             log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health and the chat page stay open)\n", .{});
         }
@@ -1454,9 +1478,25 @@ pub fn serve(
         });
     }
 
+    scheduler.releaseStartupPin();
+    boot_gate.process.open(io);
+
     if (cfg.embedded_client) |start| client_thread = try start();
 
-    // No listener: poll ignores a negative fd and sleeps out the timeout, so the loop still watches the shutdown flag.
+    if (accept_thread) |t| {
+        t.join();
+        accept_thread = null;
+    } else acceptLoop(allocator, io, null);
+    stopServing(&accept_thread);
+
+    responses_api.deinitGlobalResponseStore();
+
+    log.info("\nShutting down gracefully...\n", .{});
+}
+
+/// Accepts until shutdown, one detached thread per connection. With no listener (an embedded client) it only
+/// watches the shutdown flag: poll ignores a negative fd and sleeps out the timeout.
+fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.Server) void {
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = if (listener) |l| l.socket.handle else -1,
         .events = std.posix.POLL.IN,
@@ -1509,31 +1549,32 @@ pub fn serve(
         // Detach: a joinable handle dropped per request leaks a stack region; no spawn site may discard its handle.
         conn_thread.detach();
     }
+}
 
-    // Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): the accept
-    // loop has exited. Cancel every in-flight slot so its connection thread
-    // unblocks from waitNext and runs its `defer complete(...)`, then WAIT for
-    // all connection threads to finish before returning — `serve`'s caller runs
-    // `scheduler.deinit` on return, which frees the slot queues that an
-    // in-flight `complete()` is still touching. The inference thread is still
-    // alive here (deinit joins it only after we return), so cancelled slots
-    // settle promptly. Bounded so a wedged thread can't hang shutdown forever.
-    if (global_scheduler) |sch| sch.cancelAllInFlight();
-    {
-        var waited_ms: u64 = 0;
-        var idle_fds = [_]std.posix.pollfd{};
-        while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
-            _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
-            waited_ms += 20;
-        }
-        const remaining = active_conn_threads.load(.acquire);
-        if (remaining > 0)
-            log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
+/// Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): stop the accept
+/// loop, cancel every in-flight slot so its connection thread unblocks from
+/// waitNext and runs its `defer complete(...)`, then WAIT for all connection
+/// threads to finish — `serve` runs `scheduler.deinit` on return, which frees
+/// the slot queues that an in-flight `complete()` is still touching. The
+/// inference thread is still alive here (deinit joins it later), so cancelled
+/// slots settle promptly. Bounded so a wedged thread can't hang shutdown forever.
+/// Idempotent; also the cleanup of a boot whose load failed with the listener up.
+fn stopServing(accept_thread: *?std.Thread) void {
+    shutdown_requested.store(true, .release);
+    if (accept_thread.*) |t| {
+        t.join();
+        accept_thread.* = null;
     }
-
-    responses_api.deinitGlobalResponseStore();
-
-    log.info("\nShutting down gracefully...\n", .{});
+    if (global_scheduler) |sch| sch.cancelAllInFlight();
+    var waited_ms: u64 = 0;
+    var idle_fds = [_]std.posix.pollfd{};
+    while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
+        _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
+        waited_ms += 20;
+    }
+    const remaining = active_conn_threads.load(.acquire);
+    if (remaining > 0)
+        log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
 }
 
 fn handleConnectionThread(args: *http_conn.ConnThreadArgs) void {
@@ -1644,8 +1685,9 @@ pub fn handleConnection(
     //    of the Responses API are pure registry/store reads — no model
     //    needed.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
-        log.debug("GET  /health -> 200\n", .{});
-        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        const health = boot_gate.process.health();
+        log.debug("GET  /health -> {s}\n", .{health.status});
+        try sendResponse(stream, health.status, "application/json", health.body);
         return;
     }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
@@ -1935,6 +1977,8 @@ pub fn handleConnection(
     // A status read must not look like use — see `isStatusRoute`.
     const status_read = http_conn.isStatusRoute(method, path);
     defer if (status_read) scheduler.releaseStatus(lm) else scheduler.release(lm);
+    // The launch model turns ready before its boot pins its context and installs the request hooks.
+    boot_gate.process.waitOpen(stream.io);
 
     // A model loaded on demand freezes its own auto-context here, for the same
     // reason the `--model` primary does at startup: the number we advertise is
@@ -4931,7 +4975,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
 test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     // Live: the SSD-first budget billed the session at 22,464 MB with `--kv-quant 8` and with
     // `off` alike (dense 29,952 B/tok): `defaultKvBits` asked `global_scheduler`, which `serve`
-    // assigns only after `Scheduler.init` performs the load.
+    // assigns only after the load has run its preflight.
     const t = std.testing;
     var cfg = qwen4RequestTestConfig();
     cfg.mtp_override = false; // the MTP head's own term: `the load-time bill prices the MTP head ...`
@@ -7122,6 +7166,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
         },
     };
     defer scheduler.release(lm);
+    boot_gate.process.waitOpen(stream.io);
     // Promotion happens only past ensureLoaded's error switch: a load that
     // FAILED must never steal the default from a model that answers.
     if (make_default) {

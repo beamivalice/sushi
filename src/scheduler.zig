@@ -1202,11 +1202,15 @@ pub const Scheduler = struct {
     /// Owned, dupe'd error name (e.g. "MissingVisionWeights"). null on
     /// success. Freed in `deinit`.
     load_error_name: ?[]const u8,
+    /// Set (under `started_mu`) once the startup load has passed every refusal that runs before its weights load.
+    prechecked: bool,
+    /// The launch model's claim reference (`ModelRegistry.claimStartupLoad`), held until `releaseStartupPin`.
+    startup_pin: ?*LoadedModel,
 
-    /// Construct a Scheduler whose inference thread loads the model. Returns
-    /// only after load + (optional) warmup completes. On load failure, returns
-    /// `error.LoadFailed`; the inference thread has already cleaned up any
-    /// partially-allocated mlx state by then.
+    /// Construct a Scheduler whose inference thread loads the model. Returns once that load has passed every refusal
+    /// that runs before its weights load (`model_load.signalPrechecked`); the load runs on, and `awaitStartupLoad`
+    /// waits for it. A refusal returns `error.LoadFailed` here, before anything listens; the inference thread has
+    /// already cleaned up any partially-allocated mlx state by then.
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -1290,29 +1294,52 @@ pub const Scheduler = struct {
             .started_cond = .init,
             .load_failed = std.atomic.Value(bool).init(false),
             .load_error_name = null,
+            .prechecked = false,
+            .startup_pin = null,
         };
+
+        if (!params.no_initial_load and params.registry.claimStartupLoad(
+            params.entry,
+            model_load.gateEstimateBytes(params.entry.bytes_on_disk, params.config.num_hidden_layers, params.config.hidden_size),
+        )) self.startup_pin = params.entry;
+        errdefer self.releaseStartupPin();
 
         const ctx = ThreadCtx{ .scheduler = self, .params = params };
         self.inference_thread = try std.Thread.spawn(.{}, inferenceLoop, .{ctx});
 
-        // Wait until inference thread has loaded the model and (optionally)
-        // warmed up. submit() relies on xfm/weights being live.
         self.started_mu.lockUncancelable(io);
-        defer self.started_mu.unlock(io);
-        while (!self.started.load(.acquire)) {
+        while (!self.started.load(.acquire) and !self.prechecked) {
             self.started_cond.waitUncancelable(io, &self.started_mu);
         }
-
-        if (self.load_failed.load(.acquire)) {
-            // Inference thread already exited cleanly. Join + free + bubble up.
-            if (self.inference_thread) |t| t.join();
-            self.inference_thread = null;
-            const name = self.load_error_name orelse "unknown";
-            log.err("[scheduler] model load failed: {s}\n", .{name});
-            return error.LoadFailed;
-        }
-
+        self.started_mu.unlock(io);
+        if (self.started.load(.acquire)) try self.startupLoadOutcome();
         return self;
+    }
+
+    /// Blocks until the startup load is done. submit() relies on xfm/weights being live.
+    pub fn awaitStartupLoad(self: *Scheduler) !void {
+        self.started_mu.lockUncancelable(self.io);
+        while (!self.started.load(.acquire)) {
+            self.started_cond.waitUncancelable(self.io, &self.started_mu);
+        }
+        self.started_mu.unlock(self.io);
+        try self.startupLoadOutcome();
+    }
+
+    fn startupLoadOutcome(self: *Scheduler) !void {
+        if (!self.load_failed.load(.acquire)) return;
+        // Inference thread already exited cleanly. Join + bubble up.
+        if (self.inference_thread) |t| t.join();
+        self.inference_thread = null;
+        const name = self.load_error_name orelse "unknown";
+        log.err("[scheduler] model load failed: {s}\n", .{name});
+        return error.LoadFailed;
+    }
+
+    pub fn releaseStartupPin(self: *Scheduler) void {
+        const entry = self.startup_pin orelse return;
+        self.startup_pin = null;
+        self.registry.releaseStatus(entry);
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -1324,6 +1351,7 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
 
         if (self.inference_thread) |t| t.join();
+        self.releaseStartupPin();
 
         // Freed below the join: the publisher is gone, so this is the last writer.
         if (self.hot_cache_digests.len > 0) {
@@ -2332,7 +2360,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 
     // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
     //    binding). On failure, mark the entry `.error_state` in the
-    //    registry AND set load_failed so `Scheduler.init`'s parent sees
+    //    registry AND set load_failed so `Scheduler.init` (a refusal) or `awaitStartupLoad` sees
     //    the same shape it always has.
     //
     // Headless boot (`no_initial_load`): start with NO primary model. The

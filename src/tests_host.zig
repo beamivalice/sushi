@@ -38,6 +38,7 @@ test {
     _ = @import("dflash_policy.zig");
     _ = @import("opencode_persist.zig");
     _ = @import("parent_watch.zig");
+    _ = @import("boot_gate.zig");
     _ = @import("repl_input.zig");
     _ = @import("repl_tools.zig");
     _ = @import("update.zig");

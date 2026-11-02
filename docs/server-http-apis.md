@@ -87,6 +87,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   audio encoder, more than 1024 images a 400 with both counts, an encode failure a 500 (Anthropic: `api_error`).
   Stored Responses history keeps text only.
 
+<a id="during-the-load"></a>
+## During the launch model's load
+
+A `--model` boot listens once the load has passed its refusals ([server-lifecycle](server-lifecycle.md#startup)), and
+answers while the weights load:
+- **`/health` reports the boot** (`boot_gate.healthFor`): 503 `{"status":"loading"}` during the load, 200
+  `{"status":"ok"}` once the model is ready and its boot is done, 503 `{"status":"error"}` while a failed boot exits.
+  A readiness poll (the `run` REPL, `tests/lib/boot.sh`, scripts, load balancers) thus waits for the model as it did
+  when the port opened only after the load; a liveness probe reads any answer. Headless boots answer 200 at once.
+- The page (`/`, `/chat`, `/dashboard`, `/models`, `/settings`), `/v1/models` (the launch model's row has
+  `"state":"loading"`), `/props` (the no-model body with the live memory counters), `/metrics`, `/metrics.json`,
+  `GET`/`POST /v1/settings`, `GET /v1/prefix-cache`, the stored Responses routes and `/v1/models/rescan` answer at once.
+- A generation request (and `/tokenize`, `/detokenize`, `count_tokens`, `POST /v1/load-model` for the launch model)
+  waits in `ensureLoaded` for the load, as for a cold load, then at the boot gate until the context is pinned; a
+  failed load answers it with the load's named error (`sendLoadFailedResponse`, `sendNamedLoadRefusal`). A
+  prefix-cache clear waits for the inference thread, so for the load; `/v1/update` is refused as busy.
+- Guard: `tests/test_early_listener.sh`; the `boot gate:` and `ModelRegistry: a launch model claimed …` unit tests.
+
 ## Streaming
 
 - Chat usage reports `completion_tokens_details.reasoning_tokens` by tokenizing concatenated delivered reasoning; streaming includes it only with `stream_options.include_usage`.

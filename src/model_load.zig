@@ -80,7 +80,7 @@ pub const LoadParams = struct {
     entry: *LoadedModel,
     /// Heap-allocated parsed config. Ownership transfers to `entry` on
     /// successful load; caller must NOT deinit/free externally after
-    /// `Scheduler.init` returns.
+    /// a successful load.
     config: *ModelConfig,
     /// Heap-allocated tokenizer. Ownership transfers to `entry`.
     tok: *Tokenizer,
@@ -171,6 +171,22 @@ pub fn signalStarted(sch: *Scheduler) void {
     sch.started.store(true, .release);
     sch.started_cond.broadcast(sch.io);
 }
+/// The startup load passed every refusal that runs before its weights: `Scheduler.init` returns and the server
+/// listens while the rest of the load runs.
+pub fn signalPrechecked(sch: *Scheduler) void {
+    sch.started_mu.lockUncancelable(sch.io);
+    defer sch.started_mu.unlock(sch.io);
+    sch.prechecked = true;
+    sch.started_cond.broadcast(sch.io);
+}
+
+/// `SUSHI_TEST_LOAD_DELAY_MS=<ms>` holds the startup load after its refusals, so a test can observe the server
+/// while the model loads (tests/test_early_listener.sh).
+fn startupLoadDelayMs() u64 {
+    if (!io_util.diagEnvOn("SUSHI_TEST_LOAD_DELAY_MS")) return 0;
+    return std.fmt.parseInt(u64, std.mem.span(std.c.getenv("SUSHI_TEST_LOAD_DELAY_MS").?), 10) catch 0;
+}
+
 /// Set the load_error_name + flip load_failed. Best-effort dupe; on OOM the
 /// parent still sees `load_failed=true` and surfaces "unknown".
 pub fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
@@ -1715,6 +1731,7 @@ test "the eviction gate bills weights plus 10% headroom" {
 /// caller decides how to surface (startup → recordLoadError + signal
 /// started; on-demand → req.error_name + done broadcast).
 pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    try model_mod.archGate(params.config);
     var streaming_resident_bytes: ?u64 = null;
     var expert_source_assigned = false;
     errdefer if (expert_source_assigned) {
@@ -1938,6 +1955,15 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer if (drafter_path_owned.len > 0) sch.allocator.free(drafter_path_owned);
     if (params.drafter_dir.len > 0) {
         drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
+    }
+
+    if (@TypeOf(params) == LoadParams) {
+        signalPrechecked(sch);
+        const hold_ms = startupLoadDelayMs();
+        if (hold_ms > 0) {
+            log.info("[load] SUSHI_TEST_LOAD_DELAY_MS: holding the startup load {d} ms\n", .{hold_ms});
+            std.Io.sleep(sch.io, .fromMilliseconds(@intCast(hold_ms)), .awake) catch {};
+        }
     }
 
     // Weights — first mlx call. Binds the stream on this thread.

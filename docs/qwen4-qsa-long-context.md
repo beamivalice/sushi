@@ -91,7 +91,7 @@ separate M-RoPE guard.
   PROVABLY reclaimable bytes, refuses by NAME `PrefillDoesNotFit` → 400, defers a warm prompt to the `WarmPrefix`
   bill); ONE `[admission]` line.
 - The prefill width is per-REQUEST and re-chosen per CHUNK (`chooseRequestPrefillChunk`, `adaptivePrefillWidth`).
-- **Load-time bills** run INSIDE `Scheduler.init`: KV width from `configuredKvQuantFor(config)`, context from
+- **Load-time bills** run in the load, on the inference thread (the preflight before `Scheduler.init` returns): KV width from `configuredKvQuantFor(config)`, context from
   `resolvedContextForLoad` with the CONSTANT `CTX_SIZING_CACHE_RESERVE`, the hot-cache clamp reserves the ladder
   FLOOR. A KV bill is per CACHING LAYER (`kvBytesPerToken` via `attnCacheLayerCount`); `prefillStreamBytesPerToken`
   adds the arch's own streams (GDN chunk-wide q/k/v, MoE `top_k` replication); the chunk-independent part is a

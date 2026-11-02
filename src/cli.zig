@@ -1632,8 +1632,8 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
         } };
         _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
     }
-    // The initial load finishes BEFORE the listener binds, so an answering
-    // /health is the post-load moment. `run` quieted the log to warn on a TTY,
+    // /health answers 200 only once the launch model is loaded and its boot is
+    // done, so an ok /health is the post-load moment. `run` quieted the log to warn on a TTY,
     // so this one line is printed here rather than logged.
     var mem_buf: [160]u8 = undefined;
     if (formatMemorySummary(

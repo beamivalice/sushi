@@ -114,7 +114,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   ([engine-prefix-cache](glm5-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
-- Load-time bills run INSIDE `Scheduler.init` ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)).
+- Load-time bills run in the load on the inference thread; the preflight's run before `Scheduler.init` returns, so a refusal ends a `--model` boot before it serves ([qwen4-qsa-long-context](qwen4-qsa-long-context.md), [server-lifecycle](server-lifecycle.md#startup)).
 - **The kernel unwires a freed Metal buffer asynchronously** (~0.5 s for 50 GB): an unload and an eviction-before-load
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
