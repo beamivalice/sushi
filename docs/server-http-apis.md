@@ -354,9 +354,15 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   when a tier was resized, else "applies at the next model load"; 0 and removal apply at the next load. `models_dir`
   triggers a rescan that adds the folder's models, also on a `--model`-only server, and says how many (add-only; the boot
   discovery follows it at the next start).
-- The page shows both in its **Models** (`/models`: per-model size, load/unload, settings, that model's cache) and
-  **Settings** (`/settings`: SSD cache size, status, per-namespace rows and the clear buttons, models directory) views.
-  Guards: `tests/test_prefix_cache_admin.sh`, `node tests/test_webui_admin.cjs`.
+- The page shows both in its **Models** (`/models`: a list with a detail form per model: size, load/unload, settings, a
+  model's cache) and **Settings** (`/settings`: SSD cache size and use, per-namespace rows with their own Clear, the clear
+  buttons, models directory, version) views. The page is served by the same build as the API, so it reads these fields
+  without fallbacks: per model `keys` (which settings the model has), `loaded_with` (what the loaded model started with,
+  for the reload prompt) and `limits` (per key: `disabled`, `choices`, `max`, `requires`, `unset`, each with a `why`
+  the page shows on the row; a key outside `keys` with a `disabled` limit shows greyed in Advanced), `kv_quant` as
+  `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
+  /v1/prefix-cache/clear {"scope":"namespace","id":...}`. Guards: `tests/test_prefix_cache_admin.sh`,
+  `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 
 ## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`)
 
@@ -364,14 +370,18 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
   `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
-- A **Chat | Dashboard** navigator in the top bar switches two views of that one page in place (`history.pushState`,
+- A **Chat | Dashboard | Models | Settings** navigator in the top bar switches the views of that one page in place (`history.pushState`,
   `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
+- **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 2 s
+  while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only
+  when the answer changed; no timer runs while the tab is hidden, and loads and unloads go through its `act`. There is
+  no separate `/health` poll. `confirmAction` is the one confirmation dialog (destructive buttons name the bytes they free).
 - The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
-  `/v1/models` and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
+  `/v1/models` (through `modelStore`) and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
   charts need metrics: without them the page says so, shows an **Enable metrics** button (only while `/metrics.json` answers
   503; it `POST`s `/metrics/enable` with the chat's key, then polls at once, so the charts start without a reload and the
-  button goes away; a refusal leaves the button and says why), and the Models table still works. While hidden it polls only
+  button goes away; a refusal leaves the button and says why), and the page says metrics are off instead of drawing empty charts. While hidden it polls only
   `/metrics.json`, and only when no chat request is in flight and the browser tab is visible. Switches and tab
   returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
   401 stops the hidden poll until the dashboard is shown again. It follows the chat's
@@ -379,8 +389,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
 - **Compact and Advanced**: a header toggle (remembered in `localStorage` `sushi-ui-mode`, Compact the default) switches
   the page's detail level through `body[data-mode]`. Compact shows what is loaded, decode and prefill tok/s, memory used and
   available, the SSD cache's use and the request count as big tiles, with a speed chart and a memory chart; Advanced is the
-  full dashboard (sessions, models table, every chart, latency, histograms, write counters). Elements only Advanced shows carry
-  the `adv` class, Compact-only ones `cmp`; the Models and Settings views hide their expert rows and columns the same way.
+  full dashboard (sessions, every chart, latency, histograms, write counters; models live on the Models tab). Elements only
+  Advanced shows carry the `adv` class, Compact-only ones `cmp`; the Models and Settings views hide their expert rows
+  and columns the same way, and a model's settings form lists every key it has in Advanced but the common five in
+  Compact. The Advanced switch builds no Advanced DOM while Compact is shown.
 - **The dashboard's charts come from the server's history**, not from the page's own polls: each poll asks
   `/metrics.json?since=<last sample time>`, appends the new samples with decode and prefill rates taken between neighbouring
   samples (`historyRates`), and plots at the server's `t_ms`. A tab in the background does not poll, and on return the next
@@ -524,6 +536,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
   copyable. The upstream minified bundle is inline to keep the page self-contained; its license is in
   `src/webui/DOMPurify.LICENSE`. Updates should use a reviewed upstream release and rerun the renderer checks.
+- The page stays under 1 MB (`tests/test_webui.sh` checks it). Shared design tokens (`light-dark()` colours, one
+  spacing, type and radius scale) and components (`.btn`, `.badge`, `.card`, `.tile`, `.tbl`, `.set`, `.seg`, `confirm`
+  dialog) serve all four tabs; `node tests/test_webui_shell.cjs` guards the top bar, the 390 px phone fit of every tab, the
+  shared left edge and the font-size scale.
 - Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `node tests/test_webui_prefix_cache.cjs`, `node tests/test_webui_dashboard.cjs`, `tests/test_webui.sh`, and the
   `web tools:` unit test. Generate the
   browser renderer suite with `node tests/test_webui_render.cjs /tmp/sushi-render-tests/index.html`, serve that

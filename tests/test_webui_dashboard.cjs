@@ -94,6 +94,15 @@ function installStubs(config) {
   };
 }
 
+// Live intervals by delay and a count of armed timeouts; installed after load so it wraps the fake clock's timers.
+function trackTimers() {
+  const live = window.__intervals = new Map(), realSet = window.setInterval.bind(window), realClearI = window.clearInterval.bind(window), realTimeout = window.setTimeout.bind(window);
+  window.__timeouts = 0;
+  window.setInterval = (fn, ms, ...rest) => { const id = realSet(fn, ms, ...rest); live.set(id, ms); return id; };
+  window.clearInterval = (id) => { live.delete(id); return realClearI(id); };
+  window.setTimeout = (...args) => { window.__timeouts += 1; return realTimeout(...args); };
+}
+
 async function openPage(browser, urlPath, config = {}, fakeClock = false) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
@@ -148,7 +157,7 @@ async function main() {
       assert.notEqual(hiddenChat.display, 'none', 'the hidden chat keeps its layout');
       assert.ok(hiddenChat.width > 0 && hiddenChat.height > 0, 'and its size');
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
-      await page.waitForFunction(() => document.getElementById('dashModels').textContent.includes('test-model'), null, { timeout: 5000 });
+      await page.waitForFunction(() => document.getElementById('serverDotLabel').textContent.includes('test-model'), null, { timeout: 5000 });
       assert.notEqual(await page.evaluate(() => document.getElementById('dashCPre').width), 300, 'a visible dashboard draws its charts');
 
       await page.evaluate(() => window.__stub.openGate());
@@ -266,14 +275,14 @@ async function main() {
 
     {
       const { page, context } = await openPage(browser, '/dashboard', { metricsStatus: 503 });
-      await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
-      await page.waitForFunction(() => document.getElementById('dashModels').textContent.includes('test-model'));
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
+      await page.waitForFunction(() => document.getElementById('serverDotLabel').textContent.includes('test-model'));
       await context.close();
     }
 
     {
       const { page, errors, context } = await openPage(browser, '/dashboard', { metricsStatus: 503, key: 'k-12345' });
-      await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
       assert.equal(await page.isVisible('#dashEnableMetrics'), true, 'the button shows while metrics are off');
       const enables = () => page.evaluate(() => window.__stub.calls.filter((call) => call.path === '/metrics/enable'));
       assert.equal((await enables()).length, 0, 'nothing is enabled by itself');
@@ -292,7 +301,7 @@ async function main() {
 
     {
       const { page, context } = await openPage(browser, '/dashboard', { metricsStatus: 503, enableStatus: 500 });
-      await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
       await page.click('#dashEnableMetrics');
       await page.waitForFunction(() => /Could not enable metrics/.test(document.getElementById('dashStatus').textContent));
       assert.equal(await page.isVisible('#dashEnableMetrics'), true, 'a refused enable leaves the button for another try');
@@ -313,7 +322,7 @@ async function main() {
       await page.waitForSelector('#modelSelect option', { state: 'attached' });
       await page.fill('#promptInput', 'keep me');
       await page.click('#navDashboard');
-      await page.waitForFunction(() => /--metrics/.test(document.getElementById('dashStatus').textContent));
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
       await page.click('#dashEnableMetrics');
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       await page.click('#navChat');
@@ -439,8 +448,8 @@ async function main() {
       assert.equal(await visible('#dashCCpre') && await visible('#dashCCdec'), true, 'and the prefill and decode charts');
       assert.equal(await visible('#dashSessions'), false, 'the sessions table is an Advanced detail');
       assert.equal(await visible('#dashCReq'), false, 'so are the request and GPU charts');
-      assert.equal(await page.textContent('#modeToggle'), 'Advanced view');
-      await page.click('#modeToggle');
+      assert.equal(await page.getAttribute('#modeToggle [data-mode="compact"]', 'aria-pressed'), 'true', 'the switch shows the current mode');
+      await page.click('#modeToggle [data-mode="advanced"]');
       assert.equal(await page.evaluate(() => document.body.dataset.mode), 'advanced');
       assert.equal(await visible('#dashSessions'), true);
       assert.equal(await visible('#dashCmDec'), false);
@@ -464,7 +473,7 @@ async function main() {
       assert.ok(strip.h < 70, `a long model name does not grow the strip (${strip.h} px)`);
       assert.equal(await page.getAttribute('#dashCmModel', 'title'), name, 'the full name rides the title');
       assert.equal(await page.evaluate(() => getComputedStyle(document.getElementById('dashCmModel')).textOverflow), 'ellipsis');
-      assert.equal(await text('dashCmState'), compact === 'decode' ? 'Busy' : 'Idle');
+      assert.equal(await text('dashCmState'), compact === 'decode' ? 'Decoding' : 'Idle');
 
       const tiles = await page.evaluate(() => [...document.querySelectorAll('.tiles-cmp .tile')].map((t) => { const r = t.getBoundingClientRect(); return { h: Math.round(r.height), y: Math.round(r.y) }; }));
       assert.equal(tiles.length, 5);
@@ -518,6 +527,76 @@ async function main() {
       await page.waitForFunction(() => window.__stub.calls.some((call) => call.path === '/metrics.json' && /since=\d{6,}/.test(call.search)), null, { timeout: 15000 });
       assert.equal(await page.evaluate(() => window.__stub.calls.find((call) => call.path === '/metrics.json').search), '?since=0', 'the first poll asks for everything');
       assert.deepEqual(errors, []);
+      await context.close();
+    }
+    {
+      // Hovering a chart costs one redraw per frame and reads no style per colour.
+      const { page, errors, context } = await openPage(browser, '/dashboard', { compact: 'decode', mode: 'compact' });
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      await page.waitForTimeout(300);
+      const cost = await page.evaluate(async () => {
+        let styleReads = 0;
+        const real = window.getComputedStyle;
+        window.getComputedStyle = (...args) => { styleReads += 1; return real.apply(window, args); };
+        const clears0 = window.__clears, canvas = document.getElementById('dashCCdec'), box = canvas.getBoundingClientRect();
+        for (let i = 0; i < 20; i++) canvas.dispatchEvent(new PointerEvent('pointermove', { clientX: box.left + 100 + i, clientY: box.top + 60, bubbles: true }));
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        window.getComputedStyle = real;
+        return { styleReads, clears: window.__clears - clears0 };
+      });
+      assert.ok(cost.clears <= 2, `20 pointer moves redraw the hovered chart once (${cost.clears} clears)`);
+      assert.ok(cost.styleReads <= 3, `a redraw reads no style per colour (${cost.styleReads} reads)`);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // A Compact poll does not rebuild the Advanced cards; switching to Advanced fills them at once.
+      const { page, errors, context } = await openPage(browser, '/dashboard', { compact: 'decode', mode: 'compact' });
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      await page.evaluate(() => { window.__sanitized = 0; const real = DOMPurify.sanitize.bind(DOMPurify); DOMPurify.sanitize = (...args) => { window.__sanitized += 1; return real(...args); }; });
+      const seen = await page.evaluate(() => window.__stub.calls.filter((call) => call.path === '/metrics.json').length);
+      await page.waitForFunction((n) => window.__stub.calls.filter((call) => call.path === '/metrics.json').length > n + 1, seen, { timeout: 10000 });
+      assert.equal(await page.evaluate(() => window.__sanitized), 0, 'Compact polls build no Advanced markup');
+      await page.click('#modeToggle [data-mode="advanced"]');
+      assert.ok(await page.evaluate(() => document.getElementById('dashLat').children.length > 0), 'Advanced is filled the moment it is shown');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // Nothing ticks for a view that is not shown, and a hidden tab arms no timers.
+      const { page, context } = await openPage(browser, '/chat', {}, true);
+      await page.waitForSelector('#modelSelect option', { state: 'attached' });
+      await page.evaluate(trackTimers);
+      const fast = () => page.evaluate(() => [...window.__intervals.values()].filter((ms) => ms <= 1000).length);
+      assert.equal(await fast(), 0, 'the chat view runs no 1 s interval');
+      await page.click('#navDashboard');
+      assert.equal(await fast(), 1, 'the dashboard runs its server poll while shown');
+      await page.click('#navChat');
+      assert.equal(await fast(), 0, 'and drops it when it is hidden');
+      await page.evaluate(() => {
+        Object.defineProperty(document, 'hidden', { value: true, configurable: true });
+        document.dispatchEvent(new Event('visibilitychange'));
+        window.__timeouts = 0; window.__healthBefore = window.__stub.calls.filter((call) => call.path === '/health').length;
+      });
+      await page.clock.runFor(60_000);
+      const health = await page.evaluate(() => [window.__stub.calls.filter((call) => call.path === '/health').length, window.__healthBefore, window.__timeouts]);
+      assert.equal(health[0], health[1], 'a hidden tab does not ping /health');
+      assert.ok(health[2] <= 3, `a hidden tab arms no polling timers (${health[2]})`);
+      await context.close();
+    }
+
+    for (const [scheme, theme, bg, chart] of [['dark', 'system', 'rgb(15, 17, 21)', 'rgb(255, 138, 76)'], ['light', 'system', 'rgb(247, 245, 242)', 'rgb(217, 72, 15)'], ['light', 'night', 'rgb(15, 17, 21)', 'rgb(255, 138, 76)'], ['dark', 'day', 'rgb(247, 245, 242)', 'rgb(217, 72, 15)']]) {
+      // The stored theme wins over the system scheme; the page and the chart palette follow it.
+      const context = await browser.newContext({ colorScheme: scheme });
+      const page = await context.newPage();
+      await page.route(`${ORIGIN}/**`, (route) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
+      await page.addInitScript((value) => { try { localStorage.setItem('sushi-theme', value); } catch { /* storage off */ } }, theme);
+      await page.addInitScript(installStubs, { metricsStatus: 200 });
+      await page.goto(`${ORIGIN}/dashboard`);
+      const seen = await page.evaluate(() => { const probe = document.createElement('i'); probe.style.color = 'var(--c1)'; document.getElementById('dashPanel').append(probe); return { bg: getComputedStyle(document.body).backgroundColor, chart: getComputedStyle(probe).color, meta: document.querySelector('meta[name=theme-color]').content }; });
+      assert.deepEqual(seen, { bg, chart, meta: bg }, `${theme} theme under a ${scheme} system`);
       await context.close();
     }
     console.log('Web UI dashboard: passed');

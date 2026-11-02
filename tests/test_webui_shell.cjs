@@ -1,0 +1,217 @@
+// sushi-test: tier=hermetic needs=node,playwright
+// The page's shell in a real headless browser against a stubbed server: the top bar and the phone layout, the Compact and
+// Advanced switch, the shared page frame, the dashboard's offline and metrics-off states, the chat composer and drawers.
+// Needs Playwright with a Chromium build (global or local install); skips without one.
+const fs = require('node:fs');
+const path = require('node:path');
+const { execSync } = require('node:child_process');
+const assert = require('node:assert/strict');
+
+function loadPlaywright() {
+  const roots = [undefined];
+  try { roots.push(path.join(execSync('npm root -g', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(), 'playwright')); } catch {}
+  for (const root of roots) {
+    try { return require(root ?? 'playwright'); } catch {}
+  }
+  return null;
+}
+
+const html = fs.readFileSync('src/webui/index.html', 'utf8');
+const ORIGIN = 'http://sushi.test';
+const PHONE = { width: 390, height: 844 };
+
+function makeServer({ metrics = 200, loaded = true, down = false } = {}) {
+  const calls = [];
+  const state = { loaded };
+  const json = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
+  async function handle(route) {
+    const request = route.request(), url = new URL(request.url()), p = url.pathname;
+    if (/^\/(chat|dashboard|models|settings)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
+    calls.push({ path: p, method: request.method() });
+    if (down) return route.abort();
+    switch (p) {
+      case '/v1/models': return route.fulfill(json({ data: [{ id: 'Chat-A', state: state.loaded ? 'ready' : 'unloaded', loaded: state.loaded, capabilities: ['chat'], context_length: 8192, bytes_on_disk: 2 ** 30, input_modalities: ['text'] }] }));
+      case '/v1/load-model': state.loaded = true; return route.fulfill(json({ ok: true }));
+      case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 128 * 2 ** 30 }, batching: {} }));
+      case '/v1/tools': return route.fulfill(json({ edit_default: false }));
+      case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: 2 ** 30 } }, models: [] }));
+      case '/v1/prefix-cache': return route.fulfill(json({ root: '/c', volume: null, total_bytes: 0, namespaces: [] }));
+      case '/metrics.json': return metrics === 200 ? route.fulfill(json({ counters: {}, gauges: {}, histograms: {}, sessions: [] })) : route.fulfill(json({ error: { message: 'off' } }, metrics));
+      case '/metrics/enable': return route.fulfill(json({ metrics: true }));
+      default: return route.fulfill(json({}, 404));
+    }
+  }
+  return { handle, calls, state };
+}
+
+async function open(browser, server, urlPath, { viewport = { width: 1440, height: 900 }, mode = 'compact', scheme = 'dark', clock = false } = {}) {
+  const context = await browser.newContext({ viewport, colorScheme: scheme });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await page.route(`${ORIGIN}/**`, server.handle);
+  await page.addInitScript((m) => { try { localStorage.setItem('sushi-ui-mode', m); } catch { /* storage off */ } }, mode);
+  if (clock) await page.clock.install();
+  await page.goto(`${ORIGIN}${urlPath}`);
+  return { page, context, errors };
+}
+
+async function main() {
+  const playwright = loadPlaywright();
+  if (!playwright) { console.log('Web UI shell: skipped (Playwright is not installed)'); return; }
+  let browser;
+  try { browser = await playwright.chromium.launch(); } catch (error) {
+    console.log(`Web UI shell: skipped (no Chromium: ${String(error.message).split('\n')[0]})`);
+    return;
+  }
+  try {
+    {
+      // The phone: nothing scrolls sideways on any tab, and the More menu holds the view and theme switches.
+      const server = makeServer();
+      for (const view of ['/chat', '/dashboard', '/models', '/settings']) {
+        const { page, context } = await open(browser, server, view, { viewport: PHONE, mode: 'advanced' });
+        await page.waitForTimeout(500);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 390, `${view} fits 390 px`);
+        assert.equal(await page.isVisible('#serverDotLight'), true, 'the status dot stays');
+        await context.close();
+      }
+      const { page, context } = await open(browser, server, '/chat', { viewport: PHONE });
+      assert.equal(await page.isVisible('#modeToggle'), false, 'the segmented switch lives in the menu on a phone');
+      await page.click('#moreButton');
+      await page.click('#themeMenu [data-theme-mode="day"]');
+      assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'day');
+      await page.click('#modeToggleMenu [data-mode="advanced"]');
+      assert.equal(await page.evaluate(() => document.body.dataset.mode), 'advanced');
+      await context.close();
+    }
+
+    {
+      // One switch for the view: it names the current mode, and both Compact and Advanced reach every tab.
+      const server = makeServer();
+      const { page, context } = await open(browser, server, '/models');
+      assert.equal(await page.getAttribute('#modeToggle [data-mode="compact"]', 'aria-pressed'), 'true');
+      await page.click('#modeToggle [data-mode="advanced"]');
+      assert.equal(await page.getAttribute('#modeToggle [data-mode="advanced"]', 'aria-pressed'), 'true');
+      assert.equal(await page.getAttribute('#modeToggle [data-mode="compact"]', 'aria-pressed'), 'false');
+      assert.equal(await page.evaluate(() => localStorage.getItem('sushi-ui-mode')), 'advanced');
+      await page.click('#navChat');
+      assert.equal(await page.isVisible('#modeToggle'), true, 'the switch shows on every tab');
+      await page.waitForSelector('#perfStatus', { state: 'visible', timeout: 3000 });
+      await page.click('#modeToggle [data-mode="compact"]');
+      await page.waitForSelector('#perfStatus', { state: 'hidden', timeout: 3000 });
+      assert.match(await page.getAttribute('meta[name="theme-color"]', 'content'), /^#|^rgb/);
+      await context.close();
+    }
+
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 2000, height: 1050 }]) {
+      // Heading and content share one left edge on the tabs that use the page frame.
+      const server = makeServer();
+      for (const view of ['/dashboard', '/models', '/settings']) {
+        const { page, context } = await open(browser, server, view, { viewport });
+        await page.waitForSelector(`${view === '/dashboard' ? '#dashPanel' : view === '/models' ? '#modelsPanel' : '#settingsPanel'} .page-head h1`);
+        await page.waitForTimeout(400);
+        const edges = await page.evaluate(() => {
+          const panel = [...document.querySelectorAll('.panel')].find((p) => !p.hidden);
+          const h1 = panel.querySelector('h1').getBoundingClientRect().left;
+          const card = [...panel.querySelectorAll('.card')].find((c) => c.offsetParent !== null).getBoundingClientRect().left;
+          return { h1, card };
+        });
+        assert.ok(Math.abs(edges.h1 - edges.card) <= 1, `${view} at ${viewport.width}: heading ${edges.h1} and first card ${edges.card} share an edge`);
+        await context.close();
+      }
+    }
+
+    {
+      // The type scale: the sizes on screen are the seven of the design system (plus chat markdown headings).
+      const allowed = new Set([11, 12, 13, 15, 17, 22, 28]);
+      const server = makeServer();
+      for (const [view, mode] of [['/chat', 'advanced'], ['/dashboard', 'advanced'], ['/dashboard', 'compact'], ['/models', 'advanced'], ['/settings', 'advanced']]) {
+        const { page, context } = await open(browser, server, view, { mode });
+        await page.waitForTimeout(700);
+        const sizes = await page.evaluate(() => {
+          const found = new Map();
+          for (const e of document.querySelectorAll('body *')) {
+            if (!e.offsetParent && getComputedStyle(e).position !== 'fixed') continue;
+            if (![...e.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) continue;
+            if (e.closest('script, style, dialog:not([open]), [popover]:not(:popover-open)')) continue;
+            const size = parseFloat(getComputedStyle(e).fontSize);
+            found.set(size, e.className || e.tagName);
+          }
+          return [...found];
+        });
+        for (const [size, who] of sizes) assert.ok(allowed.has(size), `${view} ${mode}: ${size}px on ${who}`);
+        await context.close();
+      }
+    }
+
+    {
+      // Dashboard states: offline says so, metrics off is an explained card with the way out, Pause is not an error.
+      const { page, context } = await open(browser, makeServer({ down: true }), '/dashboard');
+      await page.waitForFunction(() => document.getElementById('dashCmState').textContent === 'Offline', null, { timeout: 15000 });
+      assert.equal(await page.textContent('#serverDotLabel'), 'Offline');
+      await context.close();
+    }
+    {
+      const server = makeServer({ metrics: 503 });
+      const { page, context } = await open(browser, server, '/dashboard');
+      await page.waitForSelector('#dashEnableMetrics');
+      assert.match(await page.textContent('#dashOff'), /--no-metrics/);
+      assert.equal(await page.isVisible('.tiles-cmp'), false, 'no empty tiles under the explanation');
+      assert.equal(await page.isVisible('.cm-strip'), true, 'the strip stays');
+      assert.equal(await page.evaluate(() => document.getElementById('dashDot').className.includes('err')), false, 'metrics off is not an error');
+      await context.close();
+    }
+    {
+      const { page, context } = await open(browser, makeServer(), '/dashboard');
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      await page.click('#dashPause');
+      assert.match(await page.getAttribute('#dashDot', 'class'), /\boff\b/, 'Paused is a grey dot');
+      assert.equal(await page.textContent('#dashStatus'), 'Paused');
+      await context.close();
+    }
+    {
+      const { page, context } = await open(browser, makeServer(), '/dashboard', { viewport: PHONE });
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      const rows = await page.evaluate(() => new Set([...document.querySelectorAll('.tiles-cmp .tile')].map((t) => Math.round(t.getBoundingClientRect().y))).size);
+      assert.equal(rows, 3, 'five Compact tiles take three rows on a phone');
+      await context.close();
+    }
+
+    {
+      // The chat on a phone: chips keep their icons, the drawers have a title, a close button and a scrim.
+      const { page, context } = await open(browser, makeServer(), '/chat', { viewport: PHONE });
+      await page.waitForSelector('#modelSelect option', { state: 'attached' });
+      const chips = await page.evaluate(() => [...document.querySelectorAll('.composer-row .chip-toggle')].filter((c) => c.offsetParent).map((c) => ({ id: c.id, w: c.getBoundingClientRect().width, clipped: c.scrollWidth > c.clientWidth })));
+      assert.ok(chips.every((c) => !c.clipped && c.w >= 28), `no clipped chip (${JSON.stringify(chips)})`);
+      assert.equal(await page.evaluate(() => document.getElementById('composerEffortName').getBoundingClientRect().width > 0), true, 'the effort word always shows');
+      assert.equal(await page.evaluate(() => document.querySelector('.composer-note')), null, 'the hint moved into the placeholder');
+      await page.click('#rightbarToggle');
+      assert.equal(await page.isVisible('#rightbarClose'), true);
+      assert.equal(await page.isVisible('#chatScrim'), true);
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'rightbarClose', 'focus moves into the drawer');
+      await page.click('#rightbarClose');
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'rightbarToggle', 'and back to its button');
+      await page.click('#sidebarToggle');
+      await page.waitForTimeout(300);
+      await page.mouse.click(385, 400);
+      assert.equal(await page.evaluate(() => document.getElementById('chatPanel').classList.contains('left-open')), false, 'a tap on the scrim closes the drawer');
+      await context.close();
+    }
+
+    {
+      // A model that is not loaded can be loaded from the chat, once.
+      const server = makeServer({ loaded: false });
+      const { page, context } = await open(browser, server, '/chat');
+      await page.waitForSelector('#modelStatus button');
+      await page.dblclick('#modelStatus button');
+      await page.waitForFunction(() => /Loaded/.test(document.getElementById('toastHost').textContent));
+      assert.equal(server.calls.filter((c) => c.path === '/v1/load-model').length, 1);
+      await page.waitForFunction(() => !document.querySelector('#modelStatus button'));
+      await context.close();
+    }
+    console.log('Web UI shell: passed');
+  } finally {
+    await browser.close();
+  }
+}
+main().catch((error) => { console.error(error); process.exitCode = 1; });

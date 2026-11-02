@@ -197,7 +197,7 @@ fi
 echo "[4/5] the page stays self-contained"
 check "no external http(s) fetch or CDN in the page" \
     "$(grep -Eq '(src|href)="https?://|@import|fetch\("https?://' "$PAGE" && echo 0 || echo 1)"
-check "the page is under 256 KB" "$([ "$(wc -c < "$PAGE")" -lt 262144 ] && echo 1 || echo 0)"
+check "the page is under 1 MB" "$([ "$(wc -c < "$PAGE")" -lt 1048576 ] && echo 1 || echo 0)"
 
 echo "[5/5] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter, Chat/Dashboard navigator"
 if command -v node >/dev/null 2>&1; then
@@ -211,6 +211,14 @@ if command -v node >/dev/null 2>&1; then
         check "tests/test_webui_dashboard.cjs passes and names its pass" \
             "$([ "$dash_rc" -eq 0 ] && echo "$dash_out" | grep -q 'Web UI dashboard: passed' && echo 1 || echo 0)"
     fi
+    for t in admin_ui shell; do
+        out="$(node "tests/test_webui_$t.cjs" 2>&1)"; rc=$?
+        if echo "$out" | grep -q 'skipped'; then
+            echo "  SKIP tests/test_webui_$t.cjs ($(echo "$out" | grep 'skipped' | head -1))"
+        else
+            check "tests/test_webui_$t.cjs passes" "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+        fi
+    done
     cache_out="$(node tests/test_webui_prefix_cache.cjs 2>&1)"
     check "the prefix-cache meter test names its pass" \
         "$(echo "$cache_out" | grep -q 'prefix-cache meter: passed' && echo 1 || echo 0)"

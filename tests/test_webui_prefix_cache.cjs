@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const source = fs.readFileSync('src/webui/index.html', 'utf8');
 const script = source.match(/<script>([\s\S]*?)<\/script>/)[1];
 const start = script.indexOf('function prefixCacheMeter(');
-const slice = script.slice(start, script.indexOf('async function refreshServerDot(', start));
+const slice = script.slice(start, script.indexOf('function loadVersion(', start));
 
 const nodes = {};
 const node = (id) => (nodes[id] ??= { id, hidden: false, textContent: '', style: {}, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
@@ -32,7 +32,7 @@ assert.equal(node('prefixCacheSection').hidden, true, 'hidden while the SSD tier
 page.renderPrefixCache({ disk_bytes: 20 * GiB, disk_used_bytes: 5 * GiB, disk_entries: 3 });
 assert.equal(node('prefixCacheSection').hidden, false);
 assert.equal(node('prefixCacheBar').style.width, '25%');
-assert.equal(node('prefixCacheUsage').textContent, '5.00 / 20.0 GB');
+assert.equal(node('prefixCacheUsage').textContent, '5.00 / 20.0 GiB');
 assert.equal(node('prefixCacheEntries').textContent, '3 entries');
 assert.equal(node('prefixCacheMeter').attrs['aria-valuenow'], '25');
 page.renderPrefixCache({ disk_bytes: 20 * GiB, disk_used_bytes: 1, disk_entries: 1 });
@@ -53,7 +53,7 @@ timers[0][0]();
 assert.equal(reads, 2);
 // apiJson resolves on a microtask; the render lands after it.
 Promise.resolve().then(() => Promise.resolve()).then(() => {
-  assert.equal(node('prefixCacheUsage').textContent, '2.00 / 10.0 GB');
+  assert.equal(node('prefixCacheUsage').textContent, '2.00 / 10.0 GiB');
   console.log('Web UI prefix-cache meter: passed');
 });
 

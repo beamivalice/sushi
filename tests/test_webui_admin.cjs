@@ -1,5 +1,5 @@
 // sushi-test: tier=hermetic needs=node
-// The Models and Settings views' pure functions (sizes, ages, write rate, control values and the changes a Save sends),
+// The Models and Settings views' pure functions (sizes, ages, control values and the changes a Save sends),
 // driven through the page's own script under node:vm, with no browser and no model.
 const fs = require('node:fs');
 const vm = require('node:vm');
@@ -11,10 +11,10 @@ const page = vm.createContext({});
 vm.runInContext(slice, page);
 
 const GiB = 1024 ** 3;
-assert.equal(page.adminBytes(5 * GiB), '5.00 GB');
-assert.equal(page.adminBytes(25 * GiB), '25.0 GB');
-assert.equal(page.adminBytes(300 * 1024 ** 2), '300 MB');
-assert.equal(page.adminBytes(0), '0 KB');
+assert.equal(page.adminBytes(5 * GiB), '5.00 GiB');
+assert.equal(page.adminBytes(25 * GiB), '25.0 GiB');
+assert.equal(page.adminBytes(300 * 1024 ** 2), '300 MiB');
+assert.equal(page.adminBytes(0), '0 KiB');
 
 const now = 1_700_000_000_000;
 assert.equal(page.adminAgo(0, now), '-');
@@ -22,12 +22,6 @@ assert.equal(page.adminAgo(now / 1000 - 30, now), 'just now');
 assert.equal(page.adminAgo(now / 1000 - 600, now), '10 min ago');
 assert.equal(page.adminAgo(now / 1000 - 7200, now), '2 h ago');
 assert.equal(page.adminAgo(now / 1000 - 3 * 86400, now), '3 days ago');
-
-// Write rate: bytes per second between two readings; none on the first, none across a counter reset.
-assert.equal(page.adminWriteRate(undefined, { t: 2000, written: 5 }), null);
-assert.equal(page.adminWriteRate({ t: 1000, written: 100 }, { t: 3000, written: 300 }), 100);
-assert.equal(page.adminWriteRate({ t: 1000, written: 100 }, { t: 3000, written: 50 }), null);
-assert.equal(page.adminWriteRate({ t: 3000, written: 100 }, { t: 3000, written: 150 }), null);
 
 const bool = { name: 'mtp', type: 'bool' };
 const int = { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 };
@@ -59,6 +53,33 @@ const changes = (texts) => JSON.parse(JSON.stringify(page.adminChanges(specs, se
 assert.deepEqual(changes({ mtp: 'false', ssd_prefetch: '40', think_penalty: '5', kv_quant: '4' }), { set: {}, bad: null });
 assert.deepEqual(changes({ mtp: 'true', ssd_prefetch: '', think_penalty: '5', kv_quant: '8' }), { set: { mtp: true, ssd_prefetch: null, kv_quant: '8' }, bad: null });
 assert.deepEqual(changes({ ssd_prefetch: '900' }), { set: {}, bad: 'ssd_prefetch' });
+assert.equal(page.adminBytes(1023.8 * 1024 ** 2), '1.00 GiB', 'no "1024 MiB"');
+assert.equal(page.adminBytes(110 * GiB), '110 GiB');
+assert.equal(page.adminTokens(131072), '128k');
+assert.equal(page.adminTokens(1048576), '1M');
+assert.equal(page.adminTokens(1000), '1000');
+assert.equal(page.adminProblem(int, '1e'), 'Enter a whole number from 0 to 100');
+assert.equal(page.adminProblem(int, '5'), null);
+assert.equal(page.adminFileText('8'), '8');
+assert.equal(page.adminFileText('off'), 'off');
+assert.equal(page.adminFileText(null), '');
+assert.equal(page.adminFileText(false), 'false');
+assert.equal(page.adminFileText(40), '40');
+// A stored "off" equals the control's "off", so an unrelated Save never rewrites or deletes it.
+const offKv = { ...settings, kv_quant: { file: 'off', locked: false } };
+const changesKv = (texts, bad) => JSON.parse(JSON.stringify(page.adminChanges(specs, offKv, texts, bad)));
+assert.deepEqual(changesKv({ kv_quant: 'off' }), { set: {}, bad: null });
+assert.deepEqual(changesKv({ mtp: 'true', kv_quant: 'off' }), { set: { mtp: true }, bad: null }, 'changing another key leaves kv_quant alone');
+// A number box holding half a number ("1e", "-") reads as empty; that is a bad value, not "remove the key".
+assert.equal(page.adminControlValue(int, '', true).ok, false);
+assert.deepEqual(changesKv({ ssd_prefetch: '' }, { ssd_prefetch: true }), { set: {}, bad: 'ssd_prefetch' });
+assert.deepEqual(changesKv({ ssd_prefetch: '' }), { set: { ssd_prefetch: null }, bad: null }, 'a truly empty box still removes the key');
+
+// Error text: the server's message, or a short line; never a page of HTML.
+assert.equal(page.adminErrorText(new Error('400 {"error":{"message":"models_dir is not a folder"}}')), 'models_dir is not a folder');
+assert.equal(page.adminErrorText(new Error('502 <html><body>Bad gateway</body></html>')), 'The server answered 502.');
+assert.equal(page.adminErrorText(new TypeError('Failed to fetch')), 'Cannot reach the server.');
+assert.equal(page.adminErrorText(new Error('500 ')), 'The server answered 500.');
 // The dashboard's rates come from the server's samples: exact between neighbours, zero across a gap or on the first.
 const rates = (a, b) => JSON.parse(JSON.stringify(page.historyRates(a, b, 7000)));
 assert.deepEqual(rates(null, [1000, 10, 5]), { gen: 0, pre: 0 });
@@ -72,6 +93,4 @@ assert.deepEqual(rates([3000, 10, 100], [3000, 20, 200]), { gen: 0, pre: 0 });
 assert.equal(page.uiModeOf(null), 'compact');
 assert.equal(page.uiModeOf('garbage'), 'compact');
 assert.equal(page.uiModeOf('advanced'), 'advanced');
-assert.equal(page.uiModeLabel('compact'), 'Advanced view');
-assert.equal(page.uiModeLabel('advanced'), 'Compact view');
 console.log('Web UI admin views: passed');
